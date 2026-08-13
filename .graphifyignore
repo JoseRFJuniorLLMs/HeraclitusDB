@@ -1,0 +1,5 @@
+*
+!crates/
+!crates/**
+!Cargo.toml
+!*.rs

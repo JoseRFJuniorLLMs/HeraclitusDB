@@ -1,0 +1,33 @@
+# HeraclitusDB — configuração de exemplo.
+# Copie para `config.local.toml` (ignorado pelo Git) e ajuste. Carregue com:
+#   heraclitus-server -- config.local.toml
+# Ou use as env `HERACLITUS_*` (têm prioridade) — ver abaixo.
+
+# Diretório de dados (log + views + keys). Default: ./data
+# Env: HERACLITUS_DATA_DIR
+data_dir = "./data"
+
+# Endereços de bind. Mantenha em 127.0.0.1 a menos que haja um proxy TLS à frente.
+# Env: HERACLITUS_GRPC_ADDR / HERACLITUS_REST_ADDR
+grpc_addr = "127.0.0.1:7474"
+rest_addr = "127.0.0.1:7475"
+
+# ── Segurança (novo) ─────────────────────────────────────────────────────────
+
+# Autenticação por bearer-token. Quando definido, TODA chamada gRPC exige
+# `authorization: Bearer <token>`. Comente/remova para deixar sem auth (default).
+# Env: HERACLITUS_AUTH_TOKEN
+# auth_token = "troque-por-um-segredo-forte"
+
+# Cifra em repouso (ChaCha20-Poly1305) com chave por agent_id em <data_dir>/keys.
+# Habilita crypto-shredding (admin op `shred:<agent_id>`). Default: false.
+# Env: HERACLITUS_ENCRYPTION=on
+# encryption_at_rest = true
+
+# ── Durabilidade / desempenho ────────────────────────────────────────────────
+# segment_max_bytes = 268435456          # 256 MB
+# memtable_cap = 100000
+# compaction_max_cores = 1
+# activation_decay = 0.5
+# Env: HERACLITUS_FSYNC=always | group_commit:5
+# fsync = { mode = "group_commit", interval_ms = 5 }

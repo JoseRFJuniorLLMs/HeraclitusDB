@@ -1,0 +1,6 @@
+{"lsn": 1, "timestamp": "2026-06-18T15:04:47.748827+00:00", "collection": "agent_test", "data": "Teste de gravação do GEMMA-AGENT", "hash": "f03126f8258840e7", "metadata": {"origem": "test_agent.py"}}
+{"lsn": 2, "timestamp": "2026-06-18T15:05:19.255140+00:00", "collection": "agent_test", "data": "Teste de gravação do GEMMA-AGENT", "hash": "f03126f8258840e7", "metadata": {"origem": "test_agent.py"}}
+{"lsn": 3, "timestamp": "2026-06-18T15:05:52.704964+00:00", "collection": "agent_test", "data": "Teste de gravação do GEMMA-AGENT", "hash": "f03126f8258840e7", "metadata": {"origem": "test_agent.py"}}
+{"lsn": 4, "timestamp": "2026-06-18T15:12:10.510174+00:00", "collection": "agent_test", "data": "Teste de gravação do GEMMA-AGENT", "hash": "f03126f8258840e7", "metadata": {"origem": "test_agent.py"}}
+{"lsn": 5, "timestamp": "2026-06-18T15:30:35.491951+00:00", "collection": "agent_test", "data": "Teste de gravação do GEMMA-AGENT", "hash": "f03126f8258840e7", "metadata": {"origem": "test_agent.py"}}
+{"lsn": 6, "timestamp": "2026-06-18T15:31:18.341108+00:00", "collection": "agent_test", "data": "Teste de gravação do GEMMA-AGENT", "hash": "f03126f8258840e7", "metadata": {"origem": "test_agent.py"}}

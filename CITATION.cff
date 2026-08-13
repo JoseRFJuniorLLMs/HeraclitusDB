@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+title: "HeraclitusDB: The Event-Sourced Memory Substrate for AI Agents"
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - family-names: "Ferreira Junior"
+    given-names: "José Ribamar"
+  - name: "Claude (Anthropic)"
+repository-code: "https://github.com/JoseRFJuniorLLMs/HeraclitusDB"
+license: Apache-2.0
+version: 0.1.0
+date-released: 2026-06-10
+abstract: >-
+  An event-sourced memory substrate for AI agents: an immutable append-only
+  log as the single source of truth, materialized views rebuilt by
+  deterministic replay, learned product-manifold geometry, ACT-R activation,
+  and consolidation as LSM-style compaction with total provenance.

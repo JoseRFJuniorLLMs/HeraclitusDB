@@ -1,0 +1,69 @@
+{
+  "_note": "REPRESENTATIVE LoCoMo-style sample (not the official 10-conversation set). Multi-session dialogue between two speakers with QA pairs labelled by category and gold evidence turn ids. Swap in the official LoCoMo JSON via the same schema to produce the headline number.",
+  "conversation_id": "sample-1",
+  "speakers": ["Caroline", "Melanie"],
+  "sessions": [
+    {
+      "session_id": "D1",
+      "date": "2023-05-08",
+      "turns": [
+        {"turn_id": "D1:1", "speaker": "Melanie", "text": "Hey Caroline! I finally adopted a dog last weekend, a beagle named Biscuit."},
+        {"turn_id": "D1:2", "speaker": "Caroline", "text": "That's wonderful! I've been thinking about getting a pet too. How old is Biscuit?"},
+        {"turn_id": "D1:3", "speaker": "Melanie", "text": "He's two years old. I got him from the shelter on Oak Street."},
+        {"turn_id": "D1:4", "speaker": "Caroline", "text": "Nice. By the way, I just started a new job at a marketing firm called BrightPath as a junior designer."},
+        {"turn_id": "D1:5", "speaker": "Melanie", "text": "Congrats on BrightPath! Is it downtown?"},
+        {"turn_id": "D1:6", "speaker": "Caroline", "text": "Yes, near the river. I bike there every morning, about 20 minutes."}
+      ]
+    },
+    {
+      "session_id": "D2",
+      "date": "2023-06-15",
+      "turns": [
+        {"turn_id": "D2:1", "speaker": "Caroline", "text": "Biscuit must be getting big. How's he doing with training?"},
+        {"turn_id": "D2:2", "speaker": "Melanie", "text": "Great actually. He learned to sit and stay. We go to the park on Maple Avenue every Sunday."},
+        {"turn_id": "D2:3", "speaker": "Melanie", "text": "Also, I switched careers, I'm now a nurse at the city hospital. Night shifts mostly."},
+        {"turn_id": "D2:4", "speaker": "Caroline", "text": "Wow, a nurse now! That's a big change from teaching. Proud of you."},
+        {"turn_id": "D2:5", "speaker": "Caroline", "text": "At BrightPath I got promoted to senior designer last week."},
+        {"turn_id": "D2:6", "speaker": "Melanie", "text": "Two promotions feels close! Let's celebrate. Maybe that Italian place, Luigi's?"}
+      ]
+    },
+    {
+      "session_id": "D3",
+      "date": "2023-08-02",
+      "turns": [
+        {"turn_id": "D3:1", "speaker": "Melanie", "text": "Sad news, Biscuit hurt his paw and had surgery. The vet on Oak Street fixed him up though."},
+        {"turn_id": "D3:2", "speaker": "Caroline", "text": "Oh no, poor Biscuit! Glad the vet helped. Is he resting?"},
+        {"turn_id": "D3:3", "speaker": "Melanie", "text": "Yes, lots of rest. The night shifts at the hospital make it hard to watch him, so my sister helps."},
+        {"turn_id": "D3:4", "speaker": "Caroline", "text": "I moved apartments, by the way. I now live on Pine Street, closer to BrightPath."},
+        {"turn_id": "D3:5", "speaker": "Melanie", "text": "Pine Street is lovely. Shorter bike ride now?"},
+        {"turn_id": "D3:6", "speaker": "Caroline", "text": "Just 10 minutes now. Half of what it used to be."}
+      ]
+    },
+    {
+      "session_id": "D4",
+      "date": "2023-10-20",
+      "turns": [
+        {"turn_id": "D4:1", "speaker": "Caroline", "text": "Biscuit's paw all healed? It's been a couple months."},
+        {"turn_id": "D4:2", "speaker": "Melanie", "text": "Fully healed and back to the Maple Avenue park every Sunday. He's three now, had a birthday."},
+        {"turn_id": "D4:3", "speaker": "Caroline", "text": "Three already! And I have news: I'm leaving BrightPath to start my own design studio."},
+        {"turn_id": "D4:4", "speaker": "Melanie", "text": "An entrepreneur! What will you call the studio?"},
+        {"turn_id": "D4:5", "speaker": "Caroline", "text": "RiverInk Design. Named after the river I used to bike along to the old office."},
+        {"turn_id": "D4:6", "speaker": "Melanie", "text": "RiverInk, I love it. From junior designer to studio owner in under a year."}
+      ]
+    }
+  ],
+  "qa": [
+    {"question": "What is the name of Melanie's dog?", "answer": "Biscuit", "evidence": ["D1:1"], "category": "single-hop"},
+    {"question": "What breed is Biscuit?", "answer": "beagle", "evidence": ["D1:1"], "category": "single-hop"},
+    {"question": "What company does Caroline work for as a designer?", "answer": "BrightPath", "evidence": ["D1:4"], "category": "single-hop"},
+    {"question": "What is Melanie's current profession?", "answer": "nurse", "evidence": ["D2:3"], "category": "single-hop"},
+    {"question": "Where does Melanie take Biscuit every Sunday?", "answer": "the park on Maple Avenue", "evidence": ["D2:2"], "category": "single-hop"},
+    {"question": "Which street did Caroline move to, and is it closer to her job?", "answer": "Pine Street, closer to BrightPath", "evidence": ["D3:4"], "category": "multi-hop"},
+    {"question": "Who helps Melanie watch Biscuit while he recovers, and why can't she always do it herself?", "answer": "her sister, because of her night shifts at the hospital", "evidence": ["D3:3"], "category": "multi-hop"},
+    {"question": "What did Caroline name her design studio and why?", "answer": "RiverInk Design, after the river she biked along to the old office", "evidence": ["D4:5"], "category": "multi-hop"},
+    {"question": "How did Caroline's bike commute time change after she moved?", "answer": "from about 20 minutes to 10 minutes", "evidence": ["D1:6", "D3:6"], "category": "temporal"},
+    {"question": "How old was Biscuit when he had his birthday in October 2023?", "answer": "three years old", "evidence": ["D4:2"], "category": "temporal"},
+    {"question": "Where did Biscuit have his paw surgery?", "answer": "the vet on Oak Street", "evidence": ["D3:1"], "category": "single-hop"},
+    {"question": "Did Caroline ever work as a nurse?", "answer": "No; Caroline is a designer. Melanie is the nurse.", "evidence": ["D1:4", "D2:3"], "category": "adversarial"}
+  ]
+}

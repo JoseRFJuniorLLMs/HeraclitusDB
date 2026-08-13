@@ -1,0 +1,9 @@
+grpcio>=1.50
+protobuf>=4.21
+
+[dev]
+grpcio-tools>=1.50
+pytest>=7
+
+[pandas]
+pandas>=1.5

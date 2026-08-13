@@ -1,0 +1,48 @@
+/target
+**/target
+*.log
+/data
+fuzz/corpus
+fuzz/artifacts
+.DS_Store
+__pycache__/
+*.pyc
+
+# LoCoMo dataset (downloaded, not vendored)
+bench/locomo/locomo10.json
+
+# Local config — contains secrets (auth_token, etc.). Never commit.
+config.local.toml
+*.local.toml
+
+# repos de referencia clonados so para estudo — nunca commitar
+bancos/
+
+# graphify: grafo de conhecimento gerado (derivado; nunca commitar)
+graphify-out/
+
+# python-embedded build artifacts
+sdk/python-embedded/target/
+sdk/python-embedded/*.so
+sdk/python-embedded/*.pyd
+**/__pycache__/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CODIGO-FONTE RUST — NUNCA COMMITAR (repositorio publico)
+# ─────────────────────────────────────────────────────────────────────────────
+crates/
+sim/
+fuzz/
+verus/
+tools/heraclitus-ingestor/
+sdk/python-embedded/
+
+# qualquer fonte Rust, onde quer que esteja
+*.rs
+
+# manifestos do workspace Rust
+Cargo.toml
+Cargo.lock
+**/Cargo.toml
+**/Cargo.lock
+rust-toolchain.toml

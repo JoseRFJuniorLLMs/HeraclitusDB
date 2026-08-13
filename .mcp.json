@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "heraclitusdb": {
+      "command": "C:\\Users\\web2a\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe",
+      "args": ["D:\\DEV\\HeraclitusDB\\mcp\\heraclitus_mcp.py"],
+      "env": {
+        "HERACLITUS_ADDR": "127.0.0.1:7474",
+        "HERACLITUS_REST_ADDR": "127.0.0.1:7475"
+      }
+    }
+  }
+}

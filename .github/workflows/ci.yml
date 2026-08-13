@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: tests (incl. proptest suites)
+        run: cargo test --workspace
+      - name: tests — analytics feature (DataFusion SQL over the log)
+        run: cargo test -p heraclitus-server --features analytics
+      - name: build check — gpu feature (wgpu dispatch; CI has no GPU, build only)
+        run: cargo build -p heraclitus-server --features gpu
+      - name: crash-injection gate (M0)
+        run: cargo test -p heraclitus-log --test crash_injection -- --nocapture
+        env:
+          CRASH_ITERS: "1000"
+      - name: format compat gate (v2/v3/v4 read-path)
+        run: cargo test -p heraclitus-log --test v2_compat
+
+  fuzz:
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: fuzz log decode (10 min budget)
+        run: cargo +nightly fuzz run log_decode -- -max_total_time=600
+        working-directory: .
+      - name: fuzz query parser (10 min budget, M4 gate)
+        run: cargo +nightly fuzz run query_parser -- -max_total_time=600
+        working-directory: .
+
+  bench-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: criterion compile check (no run)
+        run: cargo bench --workspace --no-run
