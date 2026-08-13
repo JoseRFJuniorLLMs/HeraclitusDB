@@ -30,12 +30,12 @@ sdk/python-embedded/*.pyd
 # ─────────────────────────────────────────────────────────────────────────────
 # CODIGO-FONTE RUST — NUNCA COMMITAR (repositorio publico)
 # ─────────────────────────────────────────────────────────────────────────────
-crates/
-sim/
-fuzz/
-verus/
-tools/heraclitus-ingestor/
-sdk/python-embedded/
+#crates/
+#sim/
+#fuzz/
+#verus/
+#tools/heraclitus-ingestor/
+#sdk/python-embedded/
 
 # qualquer fonte Rust, onde quer que esteja
 *.rs

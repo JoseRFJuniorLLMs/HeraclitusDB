@@ -1,0 +1,40 @@
+syntax = "proto3";
+package heraclitus.v1;
+
+// gRPC surface (§3.14): Append, Query, Recall, Subscribe(tail), Snapshot,
+// Admin{rebuild, demote, stats}.
+service Heraclitus {
+  rpc Append (AppendRequest) returns (AppendResponse);
+  rpc Query (QueryRequest) returns (QueryResponse);
+  rpc Recall (RecallRequest) returns (QueryResponse);
+  rpc Subscribe (SubscribeRequest) returns (stream EventMessage);
+  rpc Snapshot (SnapshotRequest) returns (SnapshotResponse);
+  rpc Admin (AdminRequest) returns (AdminResponse);
+}
+
+message AppendRequest {
+  string agent_id = 1;
+  string session_id = 2;
+  string kind = 3;             // Observation|Action|Message|<custom>
+  bytes content = 4;
+  repeated float hyp = 5;      // product-manifold embedding components
+  repeated float sph = 6;
+  repeated float euc = 7;
+  map<string, string> attrs = 8;
+  repeated string parents = 9; // ULID strings (provenance edges)
+}
+message AppendResponse { uint64 lsn = 1; }
+
+message QueryRequest { string gql = 1; }    // GQL subset incl. EXPLAIN/AS OF
+message QueryResponse { string json = 1; }  // rows (or plan text) as JSON
+
+message RecallRequest { string text = 1; uint32 k = 2; }
+
+message SubscribeRequest { uint64 from_lsn = 1; }
+message EventMessage { uint64 lsn = 1; string episode_json = 2; }
+
+message SnapshotRequest {}
+message SnapshotResponse { uint64 lsn = 1; }
+
+message AdminRequest { string op = 1; string arg = 2; } // rebuild|stats|verify
+message AdminResponse { bool ok = 1; string message = 2; }

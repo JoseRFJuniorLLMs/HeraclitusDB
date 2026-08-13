@@ -1,0 +1,16 @@
+syntax = "proto3";
+package heraclitus.raft.v1;
+
+// SPEC-015/021 — transporte gRPC para o consenso openraft. As mensagens
+// carregam o **bincode dos mesmos tipos serde do openraft** (idêntico ao
+// transporte TCP em heraclitus-raft::net) — é a camada fina de gRPC por cima,
+// não uma re-modelação protobuf dos tipos de raft. Três RPCs unários bastam
+// para eleição + replicação + snapshot.
+service RaftTransport {
+  rpc AppendEntries(RaftEnvelope) returns (RaftEnvelope);
+  rpc Vote(RaftEnvelope) returns (RaftEnvelope);
+  rpc InstallSnapshot(RaftEnvelope) returns (RaftEnvelope);
+}
+
+// Envelope opaco: `payload` é o bincode do pedido/resposta de raft.
+message RaftEnvelope { bytes payload = 1; }

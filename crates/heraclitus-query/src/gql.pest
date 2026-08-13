@@ -1,0 +1,93 @@
+// GQL subset grammar (§3.12). We do NOT invent a language: MATCH / WHERE /
+// RETURN / ORDER BY / LIMIT / CREATE, plus the three extensions —
+// AS OF, NEAREST, RECALL, PROVENANCE. Fuzzed from day one.
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+
+query = { SOI ~ explain? ~ require? ~ stmt ~ EOI }
+explain = { ^"EXPLAIN" }
+// M18 consistency contract: fail explicitly unless the backend has reached LSN X.
+require = { ^"REQUIRE" ~ ^"LSN" ~ ">=" ~ int }
+
+stmt = { simulate_stmt | match_stmt | create_stmt | recall_stmt | nearest_stmt | provenance_stmt | neighbors_stmt | traverse_stmt | fuse_stmt | resolve_stmt | cluster_stmt | hypotheses_stmt | why_stmt | community_stmt | metrics_stmt | decide_stmt | adapt_stmt }
+
+// ---- MATCH ----
+match_stmt = { ^"MATCH" ~ pattern ~ where_clause? ~ valid_at? ~ as_of? ~ return_clause ~ order_by? ~ limit? }
+// Bi-temporalidade (SQL:2011/XTDB): VALID AT filtra pelo tempo de VALIDADE do
+// facto no mundo real (attrs valid_from/valid_to; ausente = aberto), ortogonal
+// ao AS OF (transaction time — quando foi gravado no log).
+valid_at = { ^"VALID" ~ ^"AT" ~ int }
+// A node pattern, optionally followed by a directed relationship to a second
+// node (M9): `(a)` | `(a)-[r]->(b)` | `(a)-[r:socio_de]->(b)`.
+pattern = { node_pat ~ (rel ~ node_pat)? }
+node_pat = { "(" ~ ident ~ (":" ~ ident)? ~ ")" }
+rel = { "-[" ~ ident ~ (":" ~ ident)? ~ "]->" }
+
+where_clause = { ^"WHERE" ~ condition ~ (bool_op ~ condition)* }
+bool_op = { ^"AND" | ^"OR" }
+condition = { operand ~ cmp ~ operand }
+cmp = { "!=" | ">=" | "<=" | "=" | ">" | "<" }
+operand = { dist_fn | prop | number | string | ident }
+// Operadores de distância da Variedade Produto (padrão pgvector): a distância
+// do embedding do nó ao vetor literal, por componente ou no produto completo.
+// Ex.: WHERE DIST_HYP([0.1, 0.2]) < 0.5 · ORDER BY DIST_PRODUCT([...])
+dist_fn = { dist_kind ~ "(" ~ vector ~ ")" }
+dist_kind = { ^"DIST_PRODUCT" | ^"DIST_HYP" | ^"DIST_SPH" | ^"DIST_EUC" }
+
+as_of = { ^"AS" ~ ^"OF" ~ (as_of_lsn | as_of_ts) }
+as_of_lsn = { ^"LSN" ~ int }
+as_of_ts = { ^"TIMESTAMP" ~ int }
+
+return_clause = { ^"RETURN" ~ ret_item ~ ("," ~ ret_item)* }
+ret_item = { star | prop | ident }
+star = { "*" }
+
+order_by = { ^"ORDER" ~ ^"BY" ~ (dist_fn | prop | ident) ~ direction? }
+direction = { ^"ASC" | ^"DESC" }
+limit = { ^"LIMIT" ~ int }
+
+// ---- CREATE (-> log append) ----
+create_stmt = { ^"CREATE" ~ "(" ~ ident ~ (":" ~ ident)? ~ props? ~ ")" }
+props = { "{" ~ pair ~ ("," ~ pair)* ~ "}" }
+pair = { ident ~ ":" ~ (string | number) }
+
+// ---- Extensions ----
+recall_stmt = { ^"RECALL" ~ "(" ~ string ~ "," ~ int ~ ")" ~ as_of? }
+nearest_stmt = { ^"NEAREST" ~ "(" ~ vector ~ "," ~ int ~ ")" ~ as_of? }
+vector = { "[" ~ number ~ ("," ~ number)* ~ "]" }
+provenance_stmt = { ^"PROVENANCE" ~ "(" ~ string ~ ")" }
+// M8 graph engine: vizinhança e travessia temporal derivadas do log.
+// NEIGHBORS("node" [, "edge_type"]) [AS OF ...]
+neighbors_stmt = { ^"NEIGHBORS" ~ "(" ~ string ~ ("," ~ string)? ~ ")" ~ as_of? }
+// TRAVERSE("start", depth) [AS OF ...]
+traverse_stmt = { ^"TRAVERSE" ~ "(" ~ string ~ "," ~ int ~ ")" ~ as_of? }
+// M10 hybrid fusion: FUSE("text", [vector], "anchor_node", k) [AS OF ...]
+fuse_stmt = { ^"FUSE" ~ "(" ~ string ~ "," ~ vector ~ "," ~ string ~ "," ~ int ~ ")" ~ as_of? }
+// M11 entity resolution: RESOLVE("key") | CLUSTER("entity_id"), both [AS OF ...]
+resolve_stmt = { ^"RESOLVE" ~ "(" ~ string ~ ")" ~ as_of? }
+cluster_stmt = { ^"CLUSTER" ~ "(" ~ string ~ ")" ~ as_of? }
+// M12 hypothesis graph: HYPOTHESES("from", "to", "edge_type") [AS OF ...]
+hypotheses_stmt = { ^"HYPOTHESES" ~ "(" ~ string ~ "," ~ string ~ "," ~ string ~ ")" ~ as_of? }
+// M13 causal query: WHY("event_id" [, max_depth]) [UNTIL "cause_id"] [AS OF ...]
+// SPEC-014: the optional UNTIL clause returns the MINIMAL causal chain from the
+// target down to the named cause (shortest path in the parent DAG).
+why_stmt = { ^"WHY" ~ "(" ~ string ~ ("," ~ int)? ~ ")" ~ (^"UNTIL" ~ string)? ~ as_of? }
+// M14 graph analytics: COMMUNITY("node" [, LEIDEN]) | METRICS("node"), both [AS OF ...]
+// LEIDEN (V2.4) troca as componentes conexas pela partição de modularidade.
+community_stmt = { ^"COMMUNITY" ~ "(" ~ string ~ ("," ~ leiden_kw)? ~ ")" ~ as_of? }
+leiden_kw = { ^"LEIDEN" }
+metrics_stmt = { ^"METRICS" ~ "(" ~ string ~ ")" ~ as_of? }
+// M15 decision layer: DECIDE() evaluates rules and emits Action events [AS OF ...]
+decide_stmt = { ^"DECIDE" ~ "(" ~ ")" ~ as_of? }
+// M16 counterfactual engine: SIMULATE ADD/REMOVE EDGE ("from", "to", "etype") THEN <stmt>
+simulate_stmt = { ^"SIMULATE" ~ simulate_op ~ ^"EDGE" ~ "(" ~ string ~ "," ~ string ~ "," ~ string ~ ")" ~ ^"THEN" ~ stmt }
+simulate_op = { ^"ADD" | ^"REMOVE" }
+// M17 adaptive rules: ADAPT() learns the decision threshold from feedback [AS OF ...]
+adapt_stmt = { ^"ADAPT" ~ "(" ~ ")" ~ as_of? }
+
+// ---- terminals ----
+ident = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+prop = ${ ident ~ "." ~ ident }
+int = @{ ASCII_DIGIT+ }
+number = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }
+string = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }

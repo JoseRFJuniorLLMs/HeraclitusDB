@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "heraclitusdb-embedded"
+description = "Embedded HeraclitusDB — the full event-sourced engine in-process, no gRPC"
+requires-python = ">=3.8"
+license = { text = "BSL-1.1" }
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+dynamic = ["version"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
