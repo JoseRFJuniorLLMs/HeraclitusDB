@@ -1,0 +1,40 @@
+[package]
+name = "heraclitus-raft"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Replication: log shipping v0 (RFC-003); openraft consensus behind `replication` feature (TCP + gRPC transports)"
+
+[features]
+# SPEC-015/021 — the openraft consensus upgrade: leader election + quorum
+# commit + automatic failover, proven by the in-process cluster tests in
+# src/consensus.rs. Off by default: the lean v0 log-shipping path stays the
+# default until the network transport + durable raft-log milestones land.
+replication = [
+    "dep:openraft",
+    "dep:tokio",
+    "dep:bincode",
+    "dep:serde",
+    "dep:tonic",
+    "dep:tokio-stream",
+    "dep:heraclitus-proto",
+]
+
+[dependencies]
+heraclitus-core = { workspace = true }
+heraclitus-log = { workspace = true }
+heraclitus-proto = { workspace = true, optional = true }
+openraft = { version = "0.9", features = ["serde", "storage-v2"], optional = true }
+tokio = { workspace = true, optional = true }
+tokio-stream = { workspace = true, features = ["net"], optional = true }
+tonic = { workspace = true, optional = true }
+bincode = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# Proves the core invariant end-to-end: only the log ships over the wire, yet
+# each node's derived graph view hydrates to a bit-identical state_hash.
+heraclitus-index-graph = { workspace = true }
+heraclitus-views = { workspace = true }

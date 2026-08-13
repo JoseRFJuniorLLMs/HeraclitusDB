@@ -1,0 +1,18 @@
+[package]
+name = "heraclitus-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rust SDK: thin async client over the gRPC surface"
+
+[dependencies]
+heraclitus-proto = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+heraclitus-server = { path = "../heraclitus-server" }
+heraclitus-core = { workspace = true }
+tempfile = { workspace = true }

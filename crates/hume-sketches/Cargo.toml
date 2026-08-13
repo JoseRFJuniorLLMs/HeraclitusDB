@@ -1,0 +1,14 @@
+[package]
+name = "hume-sketches"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Data Sketches Engine (SPEC-0039 §7) — estruturas probabilísticas de tamanho
+# fixo para o catálogo estatístico: cardinalidade (HyperLogLog) e frequência
+# (Count-Min). std-only. Primitivas de referência, não ligadas ao CBO vivo.
+[dependencies]
+
+[dev-dependencies]

@@ -1,0 +1,29 @@
+[package]
+name = "heraclitus-compliance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Camada de conformidade para governo: carimbo de tempo RFC 3161 (ICP-Brasil), ancoragem da raiz de Merkle e recibos jurídicos."
+
+[dependencies]
+heraclitus-core = { workspace = true }
+heraclitus-log = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+rand = { workspace = true }
+# pure-Rust crypto/ASN.1 (sem dependências em C: o build gnu no Windows continua limpo)
+der = { workspace = true }
+const-oid = { workspace = true }
+sha2 = { workspace = true }
+p256 = { workspace = true }
+# async daemon (carimbagem por linha d'água)
+tokio = { workspace = true }
+tracing = { workspace = true }
+fips204 = "0.4.6"
+
+[dev-dependencies]
+tempfile = { workspace = true }

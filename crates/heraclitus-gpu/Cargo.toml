@@ -1,0 +1,20 @@
+[package]
+name = "heraclitus-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Heterogeneous (GPU) batch distance + quantized Top-M for RECALL/FUSE"
+
+[dependencies]
+heraclitus-core = { workspace = true }
+wgpu = { version = "24", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", optional = true }
+
+[features]
+# Default build is pure CPU (no GPU deps pulled). `gpu` enables the real wgpu
+# runtime dispatch (M20.3.1); it always keeps the CPU reference as fallback and
+# self-validates against it (`gpu_matches_cpu_on_hardware`).
+default = []
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]

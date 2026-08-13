@@ -1,0 +1,21 @@
+[package]
+name = "heraclitusdb-embedded"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/JoseRFJuniorLLMs/HeraclitusDB"
+description = "Embedded HeraclitusDB for Python (PyO3) — the full engine in-process, no gRPC"
+
+[lib]
+name = "heraclitusdb_embedded"
+crate-type = ["cdylib", "rlib"]
+
+# Excluded from the workspace (needs a Python interpreter at build time).
+# Path deps into the workspace crates; built via maturin.
+[dependencies]
+heraclitus-server = { path = "../../crates/heraclitus-server" }
+heraclitus-core = { path = "../../crates/heraclitus-core" }
+serde_json = "1"
+# abi3-py38: build one wheel that works on CPython 3.8+ (stable ABI) — no need
+# to match the exact interpreter version at build time.
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py38"] }

@@ -38,11 +38,11 @@ sdk/python-embedded/*.pyd
 #sdk/python-embedded/
 
 # qualquer fonte Rust, onde quer que esteja
-*.rs
+#*.rs
 
 # manifestos do workspace Rust
-Cargo.toml
-Cargo.lock
-**/Cargo.toml
-**/Cargo.lock
-rust-toolchain.toml
+#Cargo.toml
+#Cargo.lock
+#**/Cargo.toml
+#**/Cargo.lock
+#rust-toolchain.toml

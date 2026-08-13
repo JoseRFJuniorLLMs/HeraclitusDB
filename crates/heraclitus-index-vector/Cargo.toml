@@ -1,0 +1,32 @@
+[package]
+name = "heraclitus-index-vector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-crate HNSW with pluggable product-manifold metric and bitmap filter push-down"
+
+[dependencies]
+heraclitus-core = { workspace = true }
+heraclitus-manifold = { workspace = true }
+heraclitus-views = { workspace = true }
+heraclitus-gpu = { workspace = true }
+roaring = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+rand = { workspace = true }
+
+[features]
+# GPU-accelerated exact RECALL (`search_exact_gpu`). Forwards to heraclitus-gpu's
+# wgpu dispatch; without this feature (or without a GPU) it falls back to the CPU
+# brute-force. The approximate HNSW `search()` is never affected either way.
+gpu = ["heraclitus-gpu/gpu"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+ulid = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "hnsw_search"
+harness = false

@@ -1,0 +1,84 @@
+[package]
+name = "heraclitus-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "gRPC (tonic) + minimal REST (axum) server composing the engine"
+
+[[bin]]
+name = "heraclitus-server"
+path = "src/main.rs"
+
+# Windows service wrapper: same engine, driven by the Service Control Manager.
+[[bin]]
+name = "heraclitus-service"
+path = "src/bin/service.rs"
+
+[dependencies]
+heraclitus-core = { workspace = true }
+heraclitus-btree = { workspace = true }
+heraclitus-compliance = { workspace = true }
+heraclitus-crypto = { workspace = true }
+heraclitus-log = { workspace = true }
+heraclitus-manifold = { workspace = true }
+heraclitus-memtable = { workspace = true }
+heraclitus-views = { workspace = true }
+heraclitus-index-vector = { workspace = true }
+heraclitus-index-graph = { workspace = true }
+heraclitus-index-text = { workspace = true }
+heraclitus-index-attr = { workspace = true }
+heraclitus-activation = { workspace = true }
+heraclitus-retrieval = { workspace = true }
+heraclitus-query = { workspace = true }
+heraclitus-proto = { workspace = true }
+heraclitus-raft = { workspace = true, optional = true }
+heraclitus-analytics = { workspace = true, optional = true }
+heraclitus-tier = { workspace = true, optional = true }
+heraclitus-distill = { workspace = true, optional = true }
+arrow-flight = { version = "58", optional = true }
+tonic-flight = { package = "tonic", version = "0.14", optional = true }
+futures = { version = "0.3", optional = true }
+tonic = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[features]
+# Real wgpu dispatch for exact RECALL (M20.3.1): forwards down the chain
+# server -> index-vector -> heraclitus-gpu. Validated on hardware by the
+# self-checks `gpu_matches_cpu_on_hardware` / `product_gpu_matches_cpu_on_hardware`
+# (the CPU f64 rescore always has the final say, so results stay exact).
+gpu = ["heraclitus-index-vector/gpu"]
+# SQL analytics over the log (DataFusion). Off by default — DataFusion is a
+# heavy dependency and the default server/service stays lean. Enables
+# `Embedded::analytics()` and the REST `POST /sql` route.
+analytics = ["dep:heraclitus-analytics", "dep:arrow-flight", "dep:futures", "dep:tonic-flight"]
+# Cold tier (§3.10): demote de segmentos selados para object store (Parquet +
+# recibo Merkle). Off por default — puxa parquet/arrow/object_store (pesado),
+# como o analytics. Liga a superficie REST `/tier/*`.
+tier = ["dep:heraclitus-tier"]
+# Cold tier na NUVEM: forwardam os backends GCS/S3 do tier. Ligam `tier`.
+# Credenciais vêm do ambiente (GOOGLE_APPLICATION_CREDENTIALS / AWS_*).
+tier-gcp = ["tier", "heraclitus-tier/gcp"]
+tier-aws = ["tier", "heraclitus-tier/aws"]
+# Consolidação §3.9 (distill): task periódica que agrupa embeddings episódicos
+# na variedade e emite Facts (FactDerived) com proveniência no log, via
+# Engine::append (indexados ao vivo + consenso). Off por default (opt-in por
+# distill_interval_secs). Puxa heraclitus-distill (manifold clustering).
+distill = ["dep:heraclitus-distill"]
+# SPEC-015/021 — replicação por consenso Raft (openraft). Off por default: o
+# servidor de nó único é o caminho normal; ligar forma um cluster e faz as
+# escritas passarem pelo líder. Puxa heraclitus-raft com a sua feature própria.
+replication = ["dep:heraclitus-raft", "heraclitus-raft/replication"]
+
+# Only the service binary needs these, and only on Windows.
+[target.'cfg(windows)'.dependencies]
+windows-service = { workspace = true }
+tracing-appender = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

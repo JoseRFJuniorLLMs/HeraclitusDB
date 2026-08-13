@@ -1,0 +1,36 @@
+[package]
+name = "heraclitus-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+heraclitus-log = { path = "../crates/heraclitus-log" }
+heraclitus-manifold = { path = "../crates/heraclitus-manifold" }
+heraclitus-core = { path = "../crates/heraclitus-core" }
+heraclitus-query = { path = "../crates/heraclitus-query" }
+
+[[bin]]
+name = "log_decode"
+path = "fuzz_targets/log_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifold_ops"
+path = "fuzz_targets/manifold_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "query_parser"
+path = "fuzz_targets/query_parser.rs"
+test = false
+doc = false
+bench = false

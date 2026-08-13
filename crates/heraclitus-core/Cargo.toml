@@ -1,0 +1,14 @@
+[package]
+name = "heraclitus-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared types, IDs, errors and config for HeraclitusDB"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+ulid = { workspace = true }
+toml = { workspace = true }

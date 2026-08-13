@@ -1,0 +1,18 @@
+[package]
+name = "heraclitus-index-attr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Índice secundário automático: qualquer atributo (CPF/CNPJ/nome/campo) -> [LSN]. View materializada, persistida e reconstruível por replay."
+
+[dependencies]
+heraclitus-core = { workspace = true }
+heraclitus-views = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+heraclitus-log = { workspace = true }

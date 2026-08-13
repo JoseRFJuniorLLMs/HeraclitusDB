@@ -1,0 +1,16 @@
+[package]
+name = "hume-kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# HUME (SPEC-0040.1 §4) — camada primitiva de baixo nível: manipulação direta de
+# memória alinhada e do SelectionVector adaptativo. Sem dependências externas
+# (só `std`) por design: é a fundação sobre a qual o DataChunk ABI assenta e tem
+# de compilar em segundos para os microbenchmarks. NÃO toca no caminho vivo de
+# query (DataFusion/Arrow continua a ser o motor SQL — invariante I4).
+[dependencies]
+
+[dev-dependencies]

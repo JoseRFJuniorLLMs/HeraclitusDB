@@ -1,0 +1,18 @@
+[package]
+name = "heraclitus-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic simulation tests: turmoil partition suite (M6)"
+
+[dependencies]
+heraclitus-core = { workspace = true }
+
+[dev-dependencies]
+heraclitus-log = { workspace = true }
+heraclitus-raft = { path = "../../crates/heraclitus-raft" }
+tempfile = { workspace = true }
+turmoil = { workspace = true }
+tokio = { workspace = true }
+bincode = { workspace = true }

@@ -1,0 +1,22 @@
+[package]
+name = "heraclitus-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cypher/GQL-subset parser + temporal AS OF, rule-based planner with EXPLAIN"
+
+[dependencies]
+heraclitus-core = { workspace = true }
+heraclitus-log = { workspace = true }
+heraclitus-index-graph = { workspace = true }
+heraclitus-manifold = { workspace = true }
+arc-swap = { workspace = true }
+blake3 = { workspace = true }
+pest = { workspace = true }
+pest_derive = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = { workspace = true }

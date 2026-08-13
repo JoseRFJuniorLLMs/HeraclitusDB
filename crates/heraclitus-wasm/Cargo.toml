@@ -1,0 +1,16 @@
+[package]
+name = "heraclitus-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SPEC-025/035: sandbox WASM (wasmtime) para plugins/UDFs — fuel-limited e crash-isolado"
+
+[dependencies]
+heraclitus-core = { workspace = true }
+# Runtime WASM de referência. Crate SEPARADO de propósito: quem não usa
+# plugins não paga esta dependência (e a tese "inteligência no agente" fica
+# preservada — isto é opt-in por construção).
+wasmtime = "31"
+
+[dev-dependencies]

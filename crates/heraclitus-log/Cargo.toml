@@ -1,0 +1,33 @@
+[package]
+name = "heraclitus-log"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The source of truth: segmented append-only immutable log"
+
+[dependencies]
+heraclitus-core = { workspace = true }
+heraclitus-btree = { workspace = true }
+heraclitus-crypto = { workspace = true }
+bincode = { workspace = true }
+serde = { workspace = true }
+crc32fast = { workspace = true }
+blake3 = { workspace = true }
+memmap2 = { workspace = true }
+crossbeam-channel = { workspace = true }
+arc-swap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+metrics = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rand = { workspace = true }
+proptest = { workspace = true }
+criterion = { workspace = true }
+serde_json = { workspace = true }
+
+[[bench]]
+name = "append"
+harness = false

@@ -1,0 +1,20 @@
+[package]
+name = "heraclitus-manifold"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Product-manifold geometry engine: H^a x S^b x E^c with learned signature"
+
+[dependencies]
+heraclitus-core = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+rand = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "distance"
+harness = false

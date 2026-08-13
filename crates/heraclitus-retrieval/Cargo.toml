@@ -1,0 +1,25 @@
+[package]
+name = "heraclitus-retrieval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Two-stage retrieval: RRF recall fusion + pluggable reranker"
+
+[dependencies]
+heraclitus-core = { workspace = true }
+heraclitus-log = { workspace = true }
+heraclitus-manifold = { workspace = true }
+heraclitus-memtable = { workspace = true }
+heraclitus-index-vector = { workspace = true }
+heraclitus-index-text = { workspace = true }
+heraclitus-activation = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+# Optional ONNX cross-encoder reranker. Default = linear scorer, no ONNX.
+rerank-onnx = []
+
+[dev-dependencies]
+tempfile = { workspace = true }
