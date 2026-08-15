@@ -169,10 +169,27 @@ switch ($Action) {
             # Consequencia assumida: restaurar este backup NAO chega. E preciso a
             # keystore, guardada em custodia propria, e so as chaves que nao
             # tenham sido destruidas entretanto. E esse o comportamento correto.
-            $excluded = @('keys')
+            # Alem das chaves, ficam de fora os CHECKPOINTS DE VIEW.
+            #
+            # A cifra em repouso sela o log, mas o estado derivado que as views
+            # gravam em disco (views\graph.ckpt, views\attr_index.bin) guarda os
+            # VALORES dos atributos em claro -- verificado: com a cifra ligada,
+            # o graph.ckpt continha actor_id=deploy, actor_name=admin, etc. Um
+            # backup que os levasse entregaria dados pessoais sem exigir chave
+            # nenhuma, anulando na pratica a cifra do log.
+            #
+            # Excluir nao perde nada: as views sao DERIVADAS e reconstroem-se do
+            # log por replay determinista (a correcao nunca depende do
+            # checkpoint). O custo e um arranque mais lento apos o restauro.
+            $excluded = @('keys', 'views')
             Get-ChildItem -LiteralPath $sourceFull -Force | ForEach-Object {
                 if ($excluded -contains $_.Name) {
-                    Write-Host "BACKUP_SKIP $($_.Name) (material de chave; custodia separada)" -ForegroundColor Yellow
+                    $motivo = if ($_.Name -eq 'keys') {
+                        'material de chave; custodia separada'
+                    } else {
+                        'estado derivado com atributos em claro; reconstroi-se do log'
+                    }
+                    Write-Host "BACKUP_SKIP $($_.Name) ($motivo)" -ForegroundColor Yellow
                 } else {
                     Copy-Item -LiteralPath $_.FullName -Destination $payload -Recurse -Force
                 }
