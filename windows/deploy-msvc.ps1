@@ -1,4 +1,4 @@
-# Deploy do HeraclitusDB como serviço — toolchain MSVC (a gnu está partida).
+﻿# Deploy do HeraclitusDB como serviço — toolchain MSVC (a gnu está partida).
 # Robusto contra o quirk do cargo no Windows (não repõe o exe canónico após um
 # link cujo destino estava bloqueado): pega o caminho REAL do exe compilado via
 # --message-format=json e copia-o à mão. Backup + rollback se algo falhar.

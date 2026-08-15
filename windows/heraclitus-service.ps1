@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Gere o HeraclitusDB como serviço do Windows (Service Control Manager).
 

@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $svc = 'HeraclitusDB'
 $log = 'D:\tmp\hera_deploy.log'
 $env:PATH = 'D:\DEV\tools\as-only;' + $env:PATH

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Atualiza uma instalação local para o perfil seguro de homologação.
 
