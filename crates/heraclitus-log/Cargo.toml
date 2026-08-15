@@ -31,3 +31,7 @@ serde_json = { workspace = true }
 [[bench]]
 name = "append"
 harness = false
+
+[[bench]]
+name = "mmap_vs_read"
+harness = false

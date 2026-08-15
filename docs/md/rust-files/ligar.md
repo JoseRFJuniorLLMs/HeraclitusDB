@@ -1,3 +1,68 @@
+> ## Verificação de 2026-08-15 — o que mudou desde esta varredura
+>
+> Auditoria confirmada com greps na árvore inteira. **Todas as afirmações de
+> "sem chamador" verificaram-se**: cada símbolo citado (`MappedSegment`,
+> `ReplayDispatcher`, `plan_transnode_access`, `AnalyticalPlanner`,
+> `HyperLogLog`, `CpmRecord`, `search_exact_gpu`, `run_sandboxed`, `Radix`,
+> `top_k_u64`) aparece só no seu próprio ficheiro. Os crates órfãos
+> (`heraclitus-txn`, `heraclitus-wasm`, `hume-ir`, `hume-sketches`) não têm
+> dependentes. A correção sobre o `zone_map` estar ligado via `SkipScanner`
+> também se confirma.
+>
+> **Três alterações materiais:**
+>
+> 1. **`compression.rs` já não está desligado.** Foi ligado ao
+>    `heraclitus-index-attr` (PR #15). Reclassificar como *wired, com ganho
+>    empírico pequeno no workload atual*: −83% em laboratório, **−0,3% nos
+>    ficheiros reais**. O benchmark existe para impedir que algoritmos elegantes
+>    sejam promovidos a religião.
+>
+> 2. **`partition.rs` e `topk.rs` eram mais graves do que os outros órfãos** —
+>    não estavam declarados em `lib.rs`, logo não compilavam e os seus
+>    `#[test]` **nunca corriam**. Não é rigoroso dizer que "possuem testes": são
+>    funções marcadas `#[test]` sem autoridade operacional nenhuma. **Corrigido**
+>    — declarados, compilam, e os 4 testes passam (54 → 58 no crate).
+>
+> 3. **O P0 `mmap.rs` foi medido e NÃO deve ser ligado.** Ver abaixo.
+>
+> Nota metodológica: o SHA `b0699275` não existe neste repositório — os merges
+> com `--rebase` reescrevem hashes. Esta verificação foi feita em `cbe656c`.
+>
+> ### `mmap.rs` — medido, e o resultado inverte a recomendação
+>
+> Novo benchmark `crates/heraclitus-log/benches/mmap_vs_read.rs`. Compara os dois
+> caminhos ao **mesmo nível** (extração do payload cru, tocando nos bytes dos
+> dois lados) e mede o mmap em duas variantes: mapeando a cada varredura, e com
+> o mapa **reutilizado** (o uso realista de um segmento selado, que é imutável).
+>
+> ```text
+> registos pequenos  200000x   64B | read  18.4ms | mmap+open 0.66x | reutilizado 0.87x
+> registos medios     50000x 1024B | read  19.7ms | mmap+open 0.20x | reutilizado 0.24x
+> registos grandes     5000x16384B | read  33.3ms | mmap+open 0.20x | reutilizado 0.26x
+> segmento pequeno     1000x  256B | read 132.1us | mmap+open 0.30x | reutilizado 0.37x
+> ```
+>
+> **O mmap perde em todas as configurações**, mesmo com o mapa reutilizado — e
+> perde mais quanto maiores os registos, porque há mais páginas a faltar. O
+> `BufReader` beneficia do read-ahead sequencial do kernel; o mmap paga uma falta
+> suave por página.
+>
+> **Recomendação: não ligar.** Nesta plataforma seria uma regressão.
+>
+> Ressalvas honestas, porque o resultado é específico:
+> - **É Windows.** No Linux o custo de falta de página é menor e existem os
+>   `madvise` (`MADV_SEQUENTIAL`, `MADV_HUGEPAGE`) que o próprio `mmap.rs`
+>   documenta como deliberadamente **não implementados**. O módulo está a correr
+>   sem a afinação que a sua própria spec prevê.
+> - **Cache quente apenas.** Esvaziar o page cache de forma fiável exige
+>   privilégios do SO.
+> - Isto mede varredura **sequencial completa**. O mmap pode ganhar em acesso
+>   **parcial/aleatório** a um segmento grande — que não é o padrão do scan atual.
+>
+> O `mmap.rs` continua correto e testado; o que a medição diz é que **não ataca
+> um custo que apareça no perfil atual**. Fica como referência, com o benchmark
+> ao lado para quem quiser refazer a pergunta noutra plataforma.
+
 Sim. Fiz uma auditoria de **wiring**, não apenas uma busca por `TODO`. Varri a árvore Rust do `main` no commit `b0699275...`, procurei declarações explícitas de “reference/not wired/caminho vivo” e, principalmente, confrontei isso com **call sites reais**. Isso é importante porque alguns comentários já estão velhos. `zone_map.rs`, por exemplo, parece dizer “falta ligar”, mas hoje já está efetivamente ligado por `SkipScanner` ao backend. Humanos deixam comentários arqueológicos; o compilador, felizmente, é menos sentimental.
 
 ## Resultado geral
