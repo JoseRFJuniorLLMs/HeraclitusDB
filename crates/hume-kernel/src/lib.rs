@@ -26,7 +26,17 @@ pub mod chunk;
 pub mod compression;
 pub mod memory;
 pub mod morsel;
+/// Radix partitioning para hash joins cache-aware.
+///
+/// Estava no disco mas **fora da árvore de módulos** — não compilava como parte
+/// do crate e os seus `#[test]` nunca corriam. Um ficheiro nessa situação não é
+/// "implementado com testes": é texto que ninguém verifica, e que pode ter
+/// deixado de compilar sem nada acusar.
+pub mod partition;
 pub mod selection;
+/// Top-K por heap parcial. Mesma situação do [`partition`]: existia sem estar
+/// declarado.
+pub mod topk;
 pub mod validity;
 pub mod vector;
 
