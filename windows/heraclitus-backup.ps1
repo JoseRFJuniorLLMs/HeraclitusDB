@@ -154,12 +154,37 @@ switch ($Action) {
         Invoke-WithServiceStopped {
             New-Item -ItemType Directory -Path $backup | Out-Null
             $payload = Join-Path $backup 'data'
-            Copy-Item -LiteralPath $sourceFull -Destination $payload -Recurse
+            New-Item -ItemType Directory -Path $payload | Out-Null
+
+            # A keystore da cifra em repouso NAO entra no backup.
+            #
+            # O apagamento LGPD deste banco e crypto-shred: destroi-se a chave do
+            # titular e o conteudo dele fica ilegivel para sempre, sem nunca mutar
+            # o log imutavel. Se o backup levasse data\keys junto, bastava
+            # restaurar para a chave "destruida" voltar -- e o apagamento passava
+            # a ser reversivel, ou seja, deixava de ser apagamento. Nao se pode
+            # responder a um titular que os dados foram eliminados enquanto uma
+            # copia consegue desfaze-lo.
+            #
+            # Consequencia assumida: restaurar este backup NAO chega. E preciso a
+            # keystore, guardada em custodia propria, e so as chaves que nao
+            # tenham sido destruidas entretanto. E esse o comportamento correto.
+            $excluded = @('keys')
+            Get-ChildItem -LiteralPath $sourceFull -Force | ForEach-Object {
+                if ($excluded -contains $_.Name) {
+                    Write-Host "BACKUP_SKIP $($_.Name) (material de chave; custodia separada)" -ForegroundColor Yellow
+                } else {
+                    Copy-Item -LiteralPath $_.FullName -Destination $payload -Recurse -Force
+                }
+            }
+
             $files = Get-Manifest $payload
             $manifest = [ordered]@{
-                format = 'heraclitus-backup/1'
+                format = 'heraclitus-backup/2'
                 created_utc = (Get-Date).ToUniversalTime().ToString('o')
                 source = $sourceFull
+                excluded = $excluded
+                keystore_included = $false
                 files = $files
             }
             $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $backup 'manifest.json') -Encoding utf8
@@ -188,5 +213,13 @@ switch ($Action) {
             Copy-Item -LiteralPath $payload -Destination $destinationFull -Recurse
         }
         Write-Host "RESTORE_CREATED $destinationFull" -ForegroundColor Green
+        if (-not (Test-Path -LiteralPath (Join-Path $destinationFull 'keys'))) {
+            Write-Host (
+                "RESTORE_INCOMPLETE sem 'keys': se o banco de origem usava cifra em " +
+                "repouso, o conteudo fica ilegivel ate repor a keystore a partir da " +
+                "sua custodia propria. As chaves de titulares apagados (crypto-shred) " +
+                "nao devem ser repostas -- o apagamento tem de sobreviver ao restauro."
+            ) -ForegroundColor Yellow
+        }
     }
 }
