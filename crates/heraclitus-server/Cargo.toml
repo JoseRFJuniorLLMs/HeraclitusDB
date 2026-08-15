@@ -36,7 +36,7 @@ heraclitus-raft = { workspace = true, optional = true }
 heraclitus-analytics = { workspace = true, optional = true }
 heraclitus-tier = { workspace = true, optional = true }
 heraclitus-distill = { workspace = true, optional = true }
-arrow-flight = { version = "58", optional = true }
+arrow-flight = { version = "59", optional = true }
 futures = { version = "0.3", optional = true }
 tonic = { workspace = true }
 axum = { workspace = true }
