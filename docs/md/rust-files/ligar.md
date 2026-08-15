@@ -68,6 +68,65 @@
 > **Ganho hoje: zero.** Não há nada a ganhar em substituir uma dependência que
 > não está compilada. O ganho exige as três condições em simultâneo.
 >
+> ### CPM / CRF v2 — medido, e a conclusão não é a esperada
+>
+> Primeiro, a correção: o **CRC-32C do CPM-200 já fez cutover** — está no v5 do
+> `format.rs:175`. O que falta é só o *layout* do registo, não "um novo formato
+> de storage inteiro". O comentário do próprio `cpm.rs` ("keeps writing
+> FORMAT_VERSION 4") está desatualizado.
+>
+> Custo medido (`benches/crf_v2_overhead.rs`):
+>
+> ```text
+> cabecalho v5 atual : 24 B      LOG REAL: 190 registos, media 2791 B/registo
+> prefixo fixo CRF v2: 64 B      inchaco: 1.4%   (5.44 GB a 136M eventos)
+> ```
+>
+> **O custo é modesto** — 1,4%, porque os registos reais são grandes (os
+> embeddings pesam). A minha suposição inicial de que +40 B seria proibitivo
+> estava errada.
+>
+> O problema é o outro lado. Dos campos que o CRF v2 acrescenta ao prefixo fixo:
+>
+> | Campo | Neste modelo de dados |
+> | --- | --- |
+> | `event_id[16]` | hoje no payload bincode — **ganho real** |
+> | `lsn`, `hlc` | **já** no cabeçalho v5 — ganho zero |
+> | `knowledge_ver` | conceito do Fato Operacional do Forge — **sem fonte** |
+> | `ontology_ver` | idem — **sem fonte** |
+> | `confidence_raw` | idem — **sem fonte** |
+> | `flags`, TLV | extensibilidade futura — por usar |
+>
+> O CRF v2 foi desenhado para o **Fato Operacional do Forge**, não para o
+> `Episode` do HeraclitusDB. Três dos campos fixos ficariam permanentemente a
+> zero.
+>
+> ### O achado que esta investigação produziu
+>
+> Ao procurar quem beneficiaria do `event_id` em offset fixo, encontrei isto:
+>
+> ```rust
+> // heraclitus-query/src/backend.rs:1422
+> fn provenance(&self, id: &str) -> Result<Vec<String>, HeraclitusError> {
+>     let mut chunk_iter = LogChunkIterator::new(self.log.clone(), 0, head);
+>     while let Some((_, e)) = chunk_iter.next_item()? {
+>         if e.id.to_string() == id { ... }
+> ```
+>
+> **O `provenance()` varre o log inteiro desde o LSN 0**, desserializando cada
+> `Episode` (com attrs, embedding, parents) e formatando o id como `String` para
+> comparar. É O(N) com decode completo e uma alocação por registo, a cada
+> chamada — numa das consultas centrais de um sistema de auditoria (o `WHY`).
+>
+> E o `heraclitus-index-graph` **já tem** `out: DashMap<EventId, Vec<EventId>>` —
+> exatamente as arestas de proveniência, indexadas por `EventId`.
+>
+> **Recomendação: não fazer o cutover; corrigir o `provenance` com o índice que
+> já existe.** É o caminho barato para o mesmo benefício, sem migrar um formato
+> persistente. Se um dia o Forge e o HeraclitusDB convergirem num único formato
+> de registo — que o trabalho da ponte torna plausível — o CRF v2 é exatamente
+> esse formato, e aí o cutover passa a ter razão. **Hoje não tem.**
+
 > Nota metodológica: o SHA `b0699275` não existe neste repositório — os merges
 > com `--rebase` reescrevem hashes. Esta verificação foi feita em `cbe656c`.
 >

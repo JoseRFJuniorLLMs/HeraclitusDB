@@ -35,3 +35,7 @@ harness = false
 [[bench]]
 name = "mmap_vs_read"
 harness = false
+
+[[bench]]
+name = "crf_v2_overhead"
+harness = false
