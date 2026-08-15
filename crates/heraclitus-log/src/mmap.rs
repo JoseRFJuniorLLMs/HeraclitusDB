@@ -12,6 +12,33 @@
 //! `File`/`seek`/`read_exact` loop — records are yielded as slices straight out
 //! of the page cache, with no per-record allocation or copy.
 //!
+//! # NÃO LIGAR AO SCAN SEM MEDIR PRIMEIRO
+//!
+//! Zero-copy **não é** automaticamente mais rápido, e neste caso não é. Medido
+//! em 2026-08-15 com `benches/mmap_vs_read.rs` — mesmo nível de trabalho dos
+//! dois lados, mapa reutilizado (o uso realista de um segmento selado):
+//!
+//! ```text
+//! registos pequenos  200000x   64B | read  18.4ms | mmap 0.87x
+//! registos medios     50000x 1024B | read  19.7ms | mmap 0.24x
+//! registos grandes     5000x16384B | read  33.3ms | mmap 0.26x
+//! ```
+//!
+//! **Perde em todas as configurações**, e mais quanto maiores os registos — a
+//! assinatura de faltas de página a dominar. O `BufReader` beneficia do
+//! read-ahead sequencial do kernel; o `mmap` paga uma falta suave por página.
+//!
+//! O módulo fica porque a medição é **estreita**, não porque o código esteja
+//! errado. Não foi medido: Linux (falta de página mais barata), os `madvise`
+//! abaixo (que **não estão implementados** — o módulo corre sem a afinação que a
+//! sua própria spec prevê), cache frio, e sobretudo **acesso parcial** a um
+//! segmento grande, que é onde o zero-copy tem hipóteses reais e onde o
+//! `SkipScanner` naturalmente vai a seguir.
+//!
+//! Antes de promover isto ao caminho vivo, **volte a correr o benchmark na
+//! plataforma de destino e com o padrão de acesso real.** Ligá-lo hoje, aqui,
+//! para varredura sequencial, seria uma regressão medida.
+//!
 //! ## Kernel hints (CPM-600 "Granularidade" / "NUMA")
 //! `madvise` hints — `MADV_SEQUENTIAL`/`MADV_WILLNEED` for cache residency and
 //! the spec's **Huge Pages** (`MADV_HUGEPAGE`, 2 MB/1 GB) — plus **NUMA**

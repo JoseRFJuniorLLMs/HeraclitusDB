@@ -3479,15 +3479,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "heraclitus-txn"
-version = "1.0.5"
-dependencies = [
- "heraclitus-core",
- "heraclitus-log",
- "tempfile",
-]
-
-[[package]]
 name = "heraclitus-views"
 version = "1.0.5"
 dependencies = [

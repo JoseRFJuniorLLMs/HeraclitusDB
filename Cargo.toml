@@ -18,7 +18,6 @@ members = [
     "crates/heraclitus-retrieval",
     "crates/heraclitus-distill",
     "crates/heraclitus-tier",
-    "crates/heraclitus-txn",
     "crates/heraclitus-query",
     "crates/heraclitus-raft",
     "crates/heraclitus-proto",
@@ -64,7 +63,6 @@ heraclitus-gpu = { path = "crates/heraclitus-gpu" }
 heraclitus-retrieval = { path = "crates/heraclitus-retrieval" }
 heraclitus-distill = { path = "crates/heraclitus-distill" }
 heraclitus-tier = { path = "crates/heraclitus-tier" }
-heraclitus-txn = { path = "crates/heraclitus-txn" }
 heraclitus-query = { path = "crates/heraclitus-query" }
 heraclitus-proto = { path = "crates/heraclitus-proto" }
 heraclitus-client = { path = "crates/heraclitus-client" }
