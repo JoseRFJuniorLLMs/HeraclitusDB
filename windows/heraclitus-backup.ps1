@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Backup, verificação e restore não destrutivo do data-dir do HeraclitusDB.
 
@@ -54,12 +54,25 @@ function Test-IsWithin([string]$Child, [string]$Parent) {
     $childFull.StartsWith($parentFull, [StringComparison]::OrdinalIgnoreCase)
 }
 
+function Get-RelativePathSafe([string]$Base, [string]$Child) {
+    # Windows PowerShell 5.1 runs on .NET Framework, where
+    # System.IO.Path.GetRelativePath does not exist. Backup payloads only need
+    # descendant paths, so a checked prefix removal is both compatible and
+    # stricter than URI-based relative path helpers.
+    $basePrefix = (Get-AbsolutePath $Base).TrimEnd('\') + '\'
+    $childFull = Get-AbsolutePath $Child
+    if (-not $childFull.StartsWith($basePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "arquivo fora do payload de backup: $childFull"
+    }
+    $childFull.Substring($basePrefix.Length)
+}
+
 function Get-Manifest([string]$Payload) {
     $payloadFull = Get-AbsolutePath $Payload
     @(
         Get-ChildItem -LiteralPath $payloadFull -Recurse -File | Sort-Object FullName | ForEach-Object {
             [pscustomobject]@{
-                path = [IO.Path]::GetRelativePath($payloadFull, $_.FullName).Replace('\', '/')
+                path = (Get-RelativePathSafe $payloadFull $_.FullName).Replace('\', '/')
                 length = $_.Length
                 sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
             }

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Aplica o perfil seguro do serviço Windows sem colocar segredos no Git.
 
