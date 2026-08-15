@@ -76,11 +76,17 @@ mod tests {
     fn i64_roundtrip_and_order() {
         let mut xs = [i64::MIN, -1_000_000, -1, 0, 1, 42, 1_000_000, i64::MAX];
         for &x in &xs {
-            assert_eq!(CanonicalKeyCodec::decode_i64(CanonicalKeyCodec::encode_i64(x)), x);
+            assert_eq!(
+                CanonicalKeyCodec::decode_i64(CanonicalKeyCodec::encode_i64(x)),
+                x
+            );
         }
         // Encoded keys must be monotonic in the source order.
         xs.sort();
-        let keys: Vec<u64> = xs.iter().map(|&x| CanonicalKeyCodec::encode_i64(x)).collect();
+        let keys: Vec<u64> = xs
+            .iter()
+            .map(|&x| CanonicalKeyCodec::encode_i64(x))
+            .collect();
         let mut sorted = keys.clone();
         sorted.sort();
         assert_eq!(keys, sorted, "encoded i64 keys must preserve order");
@@ -121,7 +127,10 @@ mod tests {
             f64::INFINITY,
         ];
         xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let keys: Vec<u64> = xs.iter().map(|&x| CanonicalKeyCodec::encode_f64(x)).collect();
+        let keys: Vec<u64> = xs
+            .iter()
+            .map(|&x| CanonicalKeyCodec::encode_f64(x))
+            .collect();
         let mut sorted = keys.clone();
         sorted.sort();
         assert_eq!(keys, sorted, "encoded f64 keys must preserve numeric order");

@@ -45,7 +45,11 @@ impl WasmPlugin {
         cfg.consume_fuel(true); // SPEC-035: orçamento de instruções obrigatório
         let engine = Engine::new(&cfg).map_err(|e| format!("engine: {e}"))?;
         let module = Module::new(&engine, wat_or_wasm).map_err(|e| format!("module: {e}"))?;
-        Ok(Self { engine, module, name: name.into() })
+        Ok(Self {
+            engine,
+            module,
+            name: name.into(),
+        })
     }
 
     /// Executa `func(i64, i64) -> i64` exportada, com `fuel` como teto de
@@ -132,7 +136,10 @@ mod tests {
         // esgota o fuel, vira Err, e o host continua a executar chamadas.
         let p = WasmPlugin::load("evil", SPIN.as_bytes()).unwrap();
         let err = p.call2_i64("spin", 0, 0, 10_000).unwrap_err();
-        assert!(err.contains("fuel") || err.contains("faulted"), "got: {err}");
+        assert!(
+            err.contains("fuel") || err.contains("faulted"),
+            "got: {err}"
+        );
 
         // O host está vivo: uma chamada legítima a seguir funciona.
         let ok = WasmPlugin::load("adder", ADD.as_bytes()).unwrap();

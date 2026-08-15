@@ -13,20 +13,55 @@ use std::sync::Arc;
 fn ts_monotonico_por_lsn_sob_concorrencia() {
     for tentativa in 0..5 {
         let dir = tempfile::tempdir().unwrap();
-        let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::GroupCommit { interval_ms: 5 }).unwrap());
-        let hs: Vec<_> = (0..8usize).map(|k| { let l = log.clone(); std::thread::spawn(move || {
-            for i in 0..150 { l.append(Episode::new("a", EventKind::Observation,
-                format!("t{k}i{i}").into_bytes())).unwrap(); }})}).collect();
-        for h in hs { h.join().unwrap(); }
+        let log = Arc::new(
+            Log::open(
+                dir.path(),
+                1 << 20,
+                FsyncPolicy::GroupCommit { interval_ms: 5 },
+            )
+            .unwrap(),
+        );
+        let hs: Vec<_> = (0..8usize)
+            .map(|k| {
+                let l = log.clone();
+                std::thread::spawn(move || {
+                    for i in 0..150 {
+                        l.append(Episode::new(
+                            "a",
+                            EventKind::Observation,
+                            format!("t{k}i{i}").into_bytes(),
+                        ))
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
         let head = log.head();
         let all = log.scan(0, head).unwrap();
         let mut inversoes = 0;
         let mut prev = 0u64;
         for (lsn, e) in &all {
-            if e.ts_hlc < prev { inversoes += 1; if inversoes <= 3 { eprintln!("  inversao no LSN {lsn}: ts {} < anterior {}", e.ts_hlc, prev); } }
+            if e.ts_hlc < prev {
+                inversoes += 1;
+                if inversoes <= 3 {
+                    eprintln!(
+                        "  inversao no LSN {lsn}: ts {} < anterior {}",
+                        e.ts_hlc, prev
+                    );
+                }
+            }
             prev = e.ts_hlc;
         }
-        eprintln!("tentativa {tentativa}: {} registos, {inversoes} inversoes de ts por LSN", all.len());
-        assert_eq!(inversoes, 0, "ts NAO e monotonico por LSN — a busca binaria do AS OF TIMESTAMP e invalida");
+        eprintln!(
+            "tentativa {tentativa}: {} registos, {inversoes} inversoes de ts por LSN",
+            all.len()
+        );
+        assert_eq!(
+            inversoes, 0,
+            "ts NAO e monotonico por LSN — a busca binaria do AS OF TIMESTAMP e invalida"
+        );
     }
 }

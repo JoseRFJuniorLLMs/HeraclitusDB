@@ -1,0 +1,5 @@
+# Precise historical false positives from the vendored minified vis-network
+# bundle. `key` is an internal JavaScript property; these fingerprints do not
+# suppress future findings or any other file/commit.
+33852d7322c09ed2e4e58ebaa56a10f48dea7dd3:console/vendor/vis-network.min.js:generic-api-key:33
+46086ac03942e9b6db38779d556bc56d3dd79e0d:console/vendor/vis-network.min.js:generic-api-key:33

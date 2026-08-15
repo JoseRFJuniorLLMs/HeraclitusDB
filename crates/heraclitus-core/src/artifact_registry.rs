@@ -140,7 +140,10 @@ mod tests {
     use super::*;
 
     fn fp(n: u8) -> QueryFingerprint {
-        QueryFingerprint { logical_intent_hash: [n; 32], applicable_snapshot: n as u64 }
+        QueryFingerprint {
+            logical_intent_hash: [n; 32],
+            applicable_snapshot: n as u64,
+        }
     }
 
     #[test]

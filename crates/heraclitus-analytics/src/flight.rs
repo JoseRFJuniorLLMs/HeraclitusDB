@@ -29,8 +29,10 @@ pub fn batch_to_ipc(batch: &RecordBatch) -> Result<Vec<u8>, AnalyticsError> {
     {
         let mut w = StreamWriter::try_new(&mut buf, batch.schema().as_ref())
             .map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
-        w.write(batch).map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
-        w.finish().map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
+        w.write(batch)
+            .map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
+        w.finish()
+            .map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
     }
     Ok(buf)
 }
@@ -64,9 +66,11 @@ pub fn events_as_single_ipc(log: &Log, as_of: Option<u64>) -> Result<Vec<u8>, An
         let mut w = StreamWriter::try_new(&mut buf, schema.as_ref())
             .map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
         for b in &batches {
-            w.write(b).map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
+            w.write(b)
+                .map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
         }
-        w.finish().map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
+        w.finish()
+            .map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
     }
     Ok(buf)
 }
@@ -104,7 +108,9 @@ impl IpcFlightService {
             return Ok(None);
         }
         if let Some(rest) = s.strip_prefix("events?as_of=") {
-            let n: u64 = rest.parse().map_err(|_| format!("as_of inválido: {rest}"))?;
+            let n: u64 = rest
+                .parse()
+                .map_err(|_| format!("as_of inválido: {rest}"))?;
             return Ok(Some(n));
         }
         Err(format!("ticket desconhecido: {s}"))
@@ -131,7 +137,10 @@ impl FlightService for IpcFlightService {
         let mut appended = 0usize;
         for bytes in &batches {
             for batch in ipc_to_batches(bytes).map_err(|e| e.to_string())? {
-                let agent_ix = batch.schema().index_of("agent_id").map_err(|e| e.to_string())?;
+                let agent_ix = batch
+                    .schema()
+                    .index_of("agent_id")
+                    .map_err(|e| e.to_string())?;
                 let kind_ix = batch.schema().index_of("kind").map_err(|e| e.to_string())?;
                 let agents = batch
                     .column(agent_ix)
@@ -218,7 +227,11 @@ mod tests {
     fn single_ipc_stream_carries_all_batches() {
         let (_d, log) = seeded_log(2500);
         let body = events_as_single_ipc(&log, None).unwrap();
-        let rows: usize = ipc_to_batches(&body).unwrap().iter().map(|b| b.num_rows()).sum();
+        let rows: usize = ipc_to_batches(&body)
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
         assert_eq!(rows, 2500, "um só stream HTTP com o log inteiro");
     }
 

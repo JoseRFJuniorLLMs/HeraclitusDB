@@ -78,7 +78,10 @@ pub struct Tlv {
 
 impl Tlv {
     pub fn new(tag: u16, value: impl Into<Vec<u8>>) -> Self {
-        Self { tag, value: value.into() }
+        Self {
+            tag,
+            value: value.into(),
+        }
     }
 }
 
@@ -131,7 +134,7 @@ impl CpmRecord {
         buf[8..16].copy_from_slice(&self.lsn.to_le_bytes());
         buf[16..24].copy_from_slice(&self.hlc.to_le_bytes());
         buf[24..26].copy_from_slice(&(FIXED_PREFIX_LEN as u16).to_le_bytes()); // header_len
-        // [26..28] reserved = 0
+                                                                               // [26..28] reserved = 0
         buf[28..32].copy_from_slice(&self.flags.to_le_bytes());
         // Fixed Metadata
         buf[32..36].copy_from_slice(&(var.len() as u32).to_le_bytes()); // var_metadata_len
@@ -226,7 +229,10 @@ fn parse_tlvs(mut buf: &[u8]) -> Option<Vec<Tlv>> {
         if buf.len() < end {
             return None; // value truncated
         }
-        out.push(Tlv { tag, value: buf[6..end].to_vec() });
+        out.push(Tlv {
+            tag,
+            value: buf[6..end].to_vec(),
+        });
         buf = &buf[end..];
     }
     Some(out)
@@ -243,7 +249,11 @@ const CRC32C_TABLE: [u32; 256] = {
         let mut crc = i as u32;
         let mut j = 0;
         while j < 8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0x82F6_3B78 } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0x82F6_3B78
+            } else {
+                crc >> 1
+            };
             j += 1;
         }
         table[i] = crc;
@@ -359,7 +369,10 @@ mod tests {
         let rec = sample();
         let bytes = rec.encode();
         // header_len field stamped to the true fixed prefix (64), not the spec typo.
-        assert_eq!(u16::from_le_bytes(bytes[24..26].try_into().unwrap()) as usize, FIXED_PREFIX_LEN);
+        assert_eq!(
+            u16::from_le_bytes(bytes[24..26].try_into().unwrap()) as usize,
+            FIXED_PREFIX_LEN
+        );
         match decode_record(&bytes) {
             CpmDecoded::Record(got, consumed) => {
                 assert_eq!(consumed, bytes.len());
@@ -373,11 +386,15 @@ mod tests {
     #[test]
     fn unknown_tlv_tag_is_preserved_not_rejected() {
         let mut rec = sample();
-        rec.tlvs.push(Tlv::new(0xBEEF, b"future dimension".to_vec()));
+        rec.tlvs
+            .push(Tlv::new(0xBEEF, b"future dimension".to_vec()));
         let bytes = rec.encode();
         match decode_record(&bytes) {
             CpmDecoded::Record(got, _) => {
-                assert!(got.tlvs.iter().any(|t| t.tag == 0xBEEF && t.value == b"future dimension"));
+                assert!(got
+                    .tlvs
+                    .iter()
+                    .any(|t| t.tag == 0xBEEF && t.value == b"future dimension"));
                 // pristine payload still readable past the unknown tag
                 assert_eq!(got.payload, rec.payload);
             }
@@ -405,18 +422,28 @@ mod tests {
         let leaf0 = record_leaf(&bytes);
         let mut t = bytes.clone();
         t[40] ^= 0x01; // flip a byte of event_id
-        // recompute crc so it passes the physical lane, proving the *crypto* lane still catches it
+                       // recompute crc so it passes the physical lane, proving the *crypto* lane still catches it
         let size = u32::from_le_bytes(t[4..8].try_into().unwrap()) as usize;
         let crc = crc32c(&t[4..size]);
         t[..4].copy_from_slice(&crc.to_le_bytes());
-        assert_ne!(leaf0, record_leaf(&t), "Merkle leaf must change when a field is altered");
+        assert_ne!(
+            leaf0,
+            record_leaf(&t),
+            "Merkle leaf must change when a field is altered"
+        );
     }
 
     #[test]
     fn truncated_and_length_mismatch_are_torn() {
         let bytes = sample().encode();
-        assert!(matches!(decode_record(&bytes[..FIXED_PREFIX_LEN - 1]), CpmDecoded::Torn));
-        assert!(matches!(decode_record(&bytes[..bytes.len() - 1]), CpmDecoded::Torn));
+        assert!(matches!(
+            decode_record(&bytes[..FIXED_PREFIX_LEN - 1]),
+            CpmDecoded::Torn
+        ));
+        assert!(matches!(
+            decode_record(&bytes[..bytes.len() - 1]),
+            CpmDecoded::Torn
+        ));
         // corrupt payload_len so the three length fields disagree
         let mut t = bytes.clone();
         t[36] ^= 0xFF;

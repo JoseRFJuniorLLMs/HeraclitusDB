@@ -27,7 +27,7 @@ async fn flight_client_does_doget_over_real_grpc() {
     let (addr, _handle) = serve_flight(log, "127.0.0.1:0").await.unwrap();
 
     // Cliente Flight OFICIAL (arrow-flight) sobre um canal tonic real.
-    let channel = tonic_flight::transport::Endpoint::from_shared(format!("http://{addr}"))
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
         .unwrap()
         .connect()
         .await
@@ -42,7 +42,10 @@ async fn flight_client_does_doget_over_real_grpc() {
     let batches: Vec<_> = stream.try_collect().await.expect("stream decodifica");
     let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
     assert_eq!(rows, 2500, "todas as linhas atravessam o protocolo");
-    assert!(batches.iter().all(|b| b.num_rows() <= 1024), "lotes de ≤1024");
+    assert!(
+        batches.iter().all(|b| b.num_rows() <= 1024),
+        "lotes de ≤1024"
+    );
     assert_eq!(batches[0].schema().field(1).name(), "agent_id");
 
     // AS OF respeitado pelo protocolo.

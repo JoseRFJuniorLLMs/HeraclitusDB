@@ -1204,7 +1204,7 @@ impl BEpsilonTree {
         // Fechar para permitir o rename em Windows
         drop(t);
         std::fs::rename(&tmp_path, path)?;
-        
+
         // Sync do diretório pai: sem isto o `rename` pode não sobreviver a uma
         // falha de energia e o checkpoint volta a apontar para o ficheiro antigo
         // (ou para nenhum). O erro é PROPAGADO — engoli-lo com `let _ =` fazia a
@@ -2230,7 +2230,11 @@ impl BEpsilonTree {
             }
 
             if let Some(versions) = node.buffer.get(key) {
-                if let Some(msg) = versions.iter().rev().find(|m| m.lsn() <= snapshot_generation) {
+                if let Some(msg) = versions
+                    .iter()
+                    .rev()
+                    .find(|m| m.lsn() <= snapshot_generation)
+                {
                     break Ok(match msg {
                         Msg::Upsert(v, _) => Some(v.clone()),
                         Msg::Delete(_) => None,

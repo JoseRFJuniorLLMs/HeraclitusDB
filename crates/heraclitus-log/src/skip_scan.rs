@@ -57,7 +57,10 @@ impl SkipScanner {
     /// scan vs. loaded from the persisted sidecar. On a warm data dir a fresh
     /// scanner should load everything and build nothing.
     pub fn build_stats(&self) -> (usize, usize) {
-        (self.built.load(Ordering::Relaxed), self.loaded.load(Ordering::Relaxed))
+        (
+            self.built.load(Ordering::Relaxed),
+            self.loaded.load(Ordering::Relaxed),
+        )
     }
 
     /// Drop one segment's zone map from the in-RAM cache (SPEC-031 eviction
@@ -88,7 +91,9 @@ impl SkipScanner {
         // Try the persisted sidecar first (avoids the full-segment warm read).
         let path = self.sidecar_path(meta.id);
         if let Ok(bytes) = std::fs::read(&path) {
-            if let Ok((zm, _)) = bincode::serde::decode_from_slice::<ZoneMap, _>(&bytes, BINCODE_CFG) {
+            if let Ok((zm, _)) =
+                bincode::serde::decode_from_slice::<ZoneMap, _>(&bytes, BINCODE_CFG)
+            {
                 let zm = Arc::new(zm);
                 self.cache.lock().unwrap().insert(meta.id, zm.clone());
                 self.loaded.fetch_add(1, Ordering::Relaxed);
@@ -220,7 +225,10 @@ mod tests {
             .filter(|(_, e)| e.agent_id == "bob")
             .map(|(l, _)| *l)
             .collect();
-        assert_eq!(bobs_full, bobs_res, "pruning must never drop a matching event");
+        assert_eq!(
+            bobs_full, bobs_res,
+            "pruning must never drop a matching event"
+        );
         assert_eq!(bobs_full.len(), 80);
     }
 
@@ -229,7 +237,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = std::sync::Arc::new(Log::open(dir.path(), 2048, FsyncPolicy::Always).unwrap());
         for i in 0..120 {
-            log.append(ep(if i % 2 == 0 { "alice" } else { "bob" }, i)).unwrap();
+            log.append(ep(if i % 2 == 0 { "alice" } else { "bob" }, i))
+                .unwrap();
         }
         let n_sealed = log.sealed_segments().len();
         assert!(n_sealed >= 2);

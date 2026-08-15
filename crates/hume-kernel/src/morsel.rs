@@ -27,7 +27,10 @@ impl MorselSizer {
     /// Novo seletor para um cache-alvo em bytes (ex.: 256 KiB de L2), começando
     /// no piso da escada.
     pub fn new(target_cache_bytes: usize) -> Self {
-        Self { target_cache_bytes, idx: 0 }
+        Self {
+            target_cache_bytes,
+            idx: 0,
+        }
     }
 
     /// Tamanho de morsel atual (topo da adaptação dinâmica).

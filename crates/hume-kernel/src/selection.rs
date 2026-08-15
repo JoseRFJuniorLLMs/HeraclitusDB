@@ -125,7 +125,11 @@ impl SelectionVector {
     pub fn from_bitmap(len: usize, mut words: Vec<u64>) -> Self {
         words.resize(words_for(len), 0);
         clear_tail(&mut words, len);
-        Self { len, rep: Rep::Bitmap(words) }.optimized()
+        Self {
+            len,
+            rep: Rep::Bitmap(words),
+        }
+        .optimized()
     }
 
     /// Número de linhas ativas (RowIDs selecionados).
@@ -186,11 +190,18 @@ impl SelectionVector {
     pub fn optimized(self) -> Self {
         let len = self.len;
         let selected = self.selected();
-        let density = if len == 0 { 0.0 } else { selected as f64 / len as f64 };
+        let density = if len == 0 {
+            0.0
+        } else {
+            selected as f64 / len as f64
+        };
 
         // Alta densidade → Bitmap.
         if density >= BITMAP_DENSITY_THRESHOLD {
-            return Self { len, rep: Rep::Bitmap(self.to_bitmap()) };
+            return Self {
+                len,
+                rep: Rep::Bitmap(self.to_bitmap()),
+            };
         }
         // Baixa densidade → índices compactos.
         let indices = self.to_indices();
@@ -217,7 +228,11 @@ impl SelectionVector {
             sorted.last().is_none_or(|&x| (x as usize) < len),
             "índice fora do domínio {len}"
         );
-        let density = if len == 0 { 0.0 } else { sorted.len() as f64 / len as f64 };
+        let density = if len == 0 {
+            0.0
+        } else {
+            sorted.len() as f64 / len as f64
+        };
         let rep = if density >= BITMAP_DENSITY_THRESHOLD {
             let mut words = vec![0u64; words_for(len)];
             for &i in &sorted {
@@ -281,7 +296,11 @@ impl SelectionVector {
             *w = !*w;
         }
         clear_tail(&mut words, self.len);
-        Self { len: self.len, rep: Rep::Bitmap(words) }.optimized()
+        Self {
+            len: self.len,
+            rep: Rep::Bitmap(words),
+        }
+        .optimized()
     }
 
     fn zip_words(&self, other: &Self, op: impl Fn(u64, u64) -> u64) -> Self {
@@ -293,7 +312,11 @@ impl SelectionVector {
             out[i] = op(a[i], b[i]);
         }
         clear_tail(&mut out, self.len);
-        Self { len: self.len, rep: Rep::Bitmap(out) }.optimized()
+        Self {
+            len: self.len,
+            rep: Rep::Bitmap(out),
+        }
+        .optimized()
     }
 }
 
@@ -383,11 +406,8 @@ mod tests {
         let b = SelectionVector::from_indices(len, &ib);
         let (ba, bb) = (brute(len, &ia), brute(len, &ib));
 
-        let and_ref: Vec<u32> = from_bools(
-            &(0..len).map(|i| ba[i] && bb[i]).collect::<Vec<_>>(),
-        );
-        let or_ref: Vec<u32> =
-            from_bools(&(0..len).map(|i| ba[i] || bb[i]).collect::<Vec<_>>());
+        let and_ref: Vec<u32> = from_bools(&(0..len).map(|i| ba[i] && bb[i]).collect::<Vec<_>>());
+        let or_ref: Vec<u32> = from_bools(&(0..len).map(|i| ba[i] || bb[i]).collect::<Vec<_>>());
         let not_a_ref: Vec<u32> = from_bools(&ba.iter().map(|x| !x).collect::<Vec<_>>());
 
         assert_eq!(a.and(&b).to_indices(), and_ref);

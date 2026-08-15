@@ -5,56 +5,133 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
 
 jobs:
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@dcedce43c6f43de0b836d1fe38946645c9c638dc # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   lint-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable action
         with:
+          toolchain: 1.96.0
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: fmt
         run: cargo fmt --all --check
-      - name: clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: tests (incl. proptest suites)
-        run: cargo test --workspace
-      - name: tests — analytics feature (DataFusion SQL over the log)
-        run: cargo test -p heraclitus-server --features analytics
+      - name: clippy — workspace, targets e features (deny warnings)
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: tests — workspace e todas as features
+        run: cargo test --workspace --all-features --locked
       - name: build check — gpu feature (wgpu dispatch; CI has no GPU, build only)
-        run: cargo build -p heraclitus-server --features gpu
+        run: cargo build -p heraclitus-server --features gpu --locked
       - name: crash-injection gate (M0)
-        run: cargo test -p heraclitus-log --test crash_injection -- --nocapture
+        run: cargo test -p heraclitus-log --test crash_injection --locked -- --nocapture
         env:
           CRASH_ITERS: "1000"
       - name: format compat gate (v2/v3/v4 read-path)
-        run: cargo test -p heraclitus-log --test v2_compat
+        run: cargo test -p heraclitus-log --test v2_compat --locked
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable action
+        with:
+          toolchain: 1.96.0
+      - name: install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: prove rkyv advisory is not in the resolved build graph
+        shell: bash
+        run: |
+          if cargo tree --workspace --all-features -i rkyv 2>/dev/null | grep -q rkyv; then
+            echo "rkyv entrou no grafo compilado; a exceção RustSec não é mais válida"
+            exit 1
+          fi
+      - name: RustSec — deny every finding except documented risk acceptances
+        run: >-
+          cargo audit --deny warnings
+          --ignore RUSTSEC-2026-0235
+          --ignore RUSTSEC-2025-0141
+          --ignore RUSTSEC-2024-0436
+
+  python-sdk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: sdk/python/pyproject.toml
+      - name: install SDK and quality gates
+        run: python -m pip install --upgrade pip ruff pip-audit && python -m pip install -e './sdk/python[dev]'
+      - name: protobuf generated-code drift
+        run: |
+          python sdk/python/generate_proto.py
+          git diff --exit-code -- sdk/python/heraclitusdb/heraclitus_pb2.py sdk/python/heraclitusdb/heraclitus_pb2_grpc.py
+      - name: lint and format
+        working-directory: sdk/python
+        run: ruff check . && ruff format --check .
+      - name: tests
+        working-directory: sdk/python
+        run: pytest -q
+      - name: dependency audit
+        run: pip-audit --strict ./sdk/python
 
   fuzz:
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     continue-on-error: false
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly action
+        with:
+          toolchain: nightly-2026-02-17
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: install cargo-fuzz
-        run: cargo install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
       - name: fuzz log decode (10 min budget)
-        run: cargo +nightly fuzz run log_decode -- -max_total_time=600
+        run: cargo +nightly-2026-02-17 fuzz run log_decode -- -max_total_time=600
         working-directory: .
       - name: fuzz query parser (10 min budget, M4 gate)
-        run: cargo +nightly fuzz run query_parser -- -max_total_time=600
+        run: cargo +nightly-2026-02-17 fuzz run query_parser -- -max_total_time=600
+        working-directory: .
+      - name: fuzz manifold operations (10 min budget)
+        run: cargo +nightly-2026-02-17 fuzz run manifold_ops -- -max_total_time=600
         working-directory: .
 
   bench-check:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable action
+        with:
+          toolchain: 1.96.0
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: criterion compile check (no run)
         run: cargo bench --workspace --no-run

@@ -13,11 +13,13 @@ use serde_json::{json, Value as Json};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Plan {
     ScanFilter {
+        var: String,
         label: Option<String>,
         conditions: Vec<(BoolOp, Condition)>,
         valid_at: Option<u64>,
         as_of: Option<AsOf>,
         order_by: Option<(OrderKey, bool)>,
+        returns: Vec<RetItem>,
         limit: Option<u32>,
     },
     Recall {
@@ -137,11 +139,13 @@ pub fn plan(stmt: &Stmt) -> Plan {
             }
         }
         Stmt::Match(m) => Plan::ScanFilter {
+            var: m.var.clone(),
             label: m.label.clone(),
             conditions: m.conditions.clone(),
             valid_at: m.valid_at,
             as_of: m.as_of,
             order_by: m.order_by.clone(),
+            returns: m.returns.clone(),
             limit: m.limit,
         },
         Stmt::Recall { text, k, as_of } => Plan::Recall {
@@ -251,14 +255,17 @@ pub fn plan(stmt: &Stmt) -> Plan {
 pub fn render(plan: &Plan) -> String {
     match plan {
         Plan::ScanFilter {
+            var,
             label,
             conditions,
             valid_at,
             as_of,
             order_by,
+            returns,
             limit,
         } => {
             let mut s = String::from("ScanFilter\n");
+            s += &format!("  var = {var}\n");
             if let Some(l) = label {
                 s += &format!("  label = {l}\n");
             }
@@ -281,6 +288,9 @@ pub fn render(plan: &Plan) -> String {
             }
             if let Some(l) = limit {
                 s += &format!("  Limit({l})\n");
+            }
+            if !returns.is_empty() {
+                s += &format!("  Project({returns:?})\n");
             }
             s
         }
@@ -380,7 +390,7 @@ fn episode_to_json(lsn: Lsn, e: &Episode) -> Json {
         "id": e.id.to_string(),
         "agent_id": e.agent_id,
         "session_id": e.session_id,
-        "kind": format!("{:?}", e.kind),
+        "kind": kind_label(&e.kind),
         "content": String::from_utf8_lossy(&e.content),
         "attrs": e.attrs,
         "ts_hlc": e.ts_hlc,
@@ -872,14 +882,49 @@ fn project_edge(
     Json::Object(obj)
 }
 
+fn project_node(lsn: Lsn, e: &Episode, returns: &[RetItem], var: &str) -> Json {
+    if returns.is_empty() || returns.iter().any(|i| matches!(i, RetItem::Star)) {
+        return episode_to_json(lsn, e);
+    }
+    if returns.len() == 1 && matches!(&returns[0], RetItem::Ident(v) if v == var) {
+        return episode_to_json(lsn, e);
+    }
+
+    let mut obj = serde_json::Map::new();
+    for item in returns {
+        match item {
+            RetItem::Star => {}
+            RetItem::Ident(v) => {
+                let value = if v == var {
+                    episode_to_json(lsn, e)
+                } else {
+                    Json::Null
+                };
+                obj.insert(v.clone(), value);
+            }
+            RetItem::Prop(v, field) => {
+                let value = if v == var {
+                    field_of(lsn, e, field).unwrap_or(Json::Null)
+                } else {
+                    Json::Null
+                };
+                obj.insert(format!("{v}.{field}"), value);
+            }
+        }
+    }
+    Json::Object(obj)
+}
+
 pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusError> {
     match plan {
         Plan::ScanFilter {
+            var,
             label,
             conditions,
             valid_at,
             as_of,
             order_by,
+            returns,
             limit,
         } => {
             let bound = resolve_as_of(as_of, be)?;
@@ -952,7 +997,9 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                 rows.truncate(*l as usize);
             }
             Ok(Json::Array(
-                rows.iter().map(|(l, e)| episode_to_json(*l, e)).collect(),
+                rows.iter()
+                    .map(|(l, e)| project_node(*l, e, returns, var))
+                    .collect(),
             ))
         }
         Plan::Recall { text, k, as_of } => {

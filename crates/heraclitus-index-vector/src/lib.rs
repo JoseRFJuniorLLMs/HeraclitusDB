@@ -456,7 +456,10 @@ impl VectorIndex {
                 .nodes
                 .iter()
                 .all(|n| n.neighbors.len() == n.level + 1 && !n.neighbors.is_empty())
-            && snap.entry.map(|e| (e as usize) < snap.nodes.len()).unwrap_or(true);
+            && snap
+                .entry
+                .map(|e| (e as usize) < snap.nodes.len())
+                .unwrap_or(true);
         if !coherent {
             return Ok(false);
         }

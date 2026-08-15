@@ -21,7 +21,7 @@ use futures::{StreamExt, TryStreamExt};
 use heraclitus_analytics::vectorized::{episodes_to_batches_sized, BATCH_ROWS};
 use heraclitus_log::Log;
 use std::sync::Arc;
-use tonic_flight::{Request, Response, Status, Streaming};
+use tonic::{Request, Response, Status, Streaming};
 
 pub struct HeraclitusFlight {
     log: Arc<Log>,
@@ -50,7 +50,7 @@ impl HeraclitusFlight {
 
 type S<T> = BoxStream<'static, Result<T, Status>>;
 
-#[tonic_flight::async_trait]
+#[tonic::async_trait]
 impl FlightService for HeraclitusFlight {
     type HandshakeStream = S<HandshakeResponse>;
     type ListFlightsStream = S<FlightInfo>;
@@ -125,7 +125,9 @@ impl FlightService for HeraclitusFlight {
         &self,
         _req: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
-        Err(Status::unimplemented("do_put (usar o data plane IPC do analytics)"))
+        Err(Status::unimplemented(
+            "do_put (usar o data plane IPC do analytics)",
+        ))
     }
     async fn do_action(
         &self,
@@ -158,8 +160,8 @@ pub async fn serve_flight(
     let local = listener.local_addr().map_err(|e| e.to_string())?;
     let svc = FlightServiceServer::new(HeraclitusFlight::new(log));
     let handle = tokio::spawn(async move {
-        let incoming = tonic_flight::transport::server::TcpIncoming::from(listener);
-        let _ = tonic_flight::transport::Server::builder()
+        let incoming = tonic::transport::server::TcpIncoming::from(listener);
+        let _ = tonic::transport::Server::builder()
             .add_service(svc)
             .serve_with_incoming(incoming)
             .await;

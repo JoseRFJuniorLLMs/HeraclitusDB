@@ -92,7 +92,11 @@ impl AnalyticalPlanner {
                 let (col, is_str) = self.col(&p.word()?)?;
                 let op = p.op()?;
                 let value = p.literal(is_str)?;
-                predicates.push(Predicate { column: col, op, value });
+                predicates.push(Predicate {
+                    column: col,
+                    op,
+                    value,
+                });
                 if !p.eat_word("AND") {
                     break;
                 }
@@ -157,9 +161,11 @@ pub fn run_analytical(
     let (plan, predicates) = AnalyticalPlanner::new()
         .compile(query)
         .map_err(AnalyticsError::Arrow)?;
-    let dag = SelectivityOptimizer { selectivities: selectivities.clone() }
-        .optimize(plan)
-        .map_err(AnalyticsError::Arrow)?;
+    let dag = SelectivityOptimizer {
+        selectivities: selectivities.clone(),
+    }
+    .optimize(plan)
+    .map_err(AnalyticsError::Arrow)?;
     let batches = episodes_to_batches(events)?;
     // As mesmas estimativas alimentam a decisão adaptativa de fusão do executor.
     let mut exec = VecExecutor::new(batches, predicates);
@@ -331,7 +337,10 @@ impl Cursor<'_> {
         if self.i == self.toks.len() {
             Ok(())
         } else {
-            Err(format!("tokens a mais a partir de {:?}", &self.toks[self.i..]))
+            Err(format!(
+                "tokens a mais a partir de {:?}",
+                &self.toks[self.i..]
+            ))
         }
     }
 }
@@ -347,7 +356,11 @@ mod tests {
             .map(|i| {
                 let mut e = Episode::new(
                     if i % 2 == 0 { "alice" } else { "bob" },
-                    if i % 3 == 0 { EventKind::Action } else { EventKind::Observation },
+                    if i % 3 == 0 {
+                        EventKind::Action
+                    } else {
+                        EventKind::Observation
+                    },
                     vec![0u8; i % 7],
                 );
                 e.ts_hlc = i as u64;
@@ -360,16 +373,25 @@ mod tests {
     fn parses_where_group_and_sum_into_logical_plan() {
         let planner = AnalyticalPlanner::new();
         let (plan, preds) = planner
-            .compile("SELECT WHERE agent_id = \"alice\" AND lsn < 100 GROUP BY kind SUM content_len")
+            .compile(
+                "SELECT WHERE agent_id = \"alice\" AND lsn < 100 GROUP BY kind SUM content_len",
+            )
             .unwrap();
         // Dois predicados registados na ordem de aparição.
         assert_eq!(preds.len(), 2);
         assert_eq!(preds[0].column, 1); // agent_id
         assert!(matches!(preds[0].value, Literal::Str(ref s) if s == "alice"));
         assert_eq!(preds[1].column, 0); // lsn
-        assert!(matches!((preds[1].op, &preds[1].value), (CmpOp::Lt, Literal::U64(100))));
+        assert!(matches!(
+            (preds[1].op, &preds[1].value),
+            (CmpOp::Lt, Literal::U64(100))
+        ));
         match plan {
-            LogicalPlan::Select { relations, predicates, aggregate } => {
+            LogicalPlan::Select {
+                relations,
+                predicates,
+                aggregate,
+            } => {
                 assert_eq!(relations, vec!["events".to_string()]);
                 assert_eq!(predicates, vec![0, 1]); // ids posicionais
                 assert_eq!(aggregate, Some((vec![2], vec![4]))); // group by kind, sum content_len

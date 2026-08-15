@@ -27,7 +27,11 @@ pub enum Compatibility {
 
 impl StorageFormatVersion {
     pub fn new(major: u16, minor: u16, feature_flags: u64) -> Self {
-        Self { major, minor, feature_flags }
+        Self {
+            major,
+            minor,
+            feature_flags,
+        }
     }
 
     /// Negotiate an on-disk version against what this binary supports.
@@ -82,7 +86,10 @@ mod tests {
     fn newer_major_is_rejected() {
         let running = StorageFormatVersion::new(5, 0, 0);
         let disk = StorageFormatVersion::new(6, 0, 0);
-        assert!(matches!(disk.negotiate(running, 0), Compatibility::Reject(_)));
+        assert!(matches!(
+            disk.negotiate(running, 0),
+            Compatibility::Reject(_)
+        ));
     }
 
     #[test]

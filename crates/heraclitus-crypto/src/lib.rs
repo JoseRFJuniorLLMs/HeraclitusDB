@@ -1,8 +1,9 @@
 //! heraclitus-crypto — encryption at rest with per-agent keys + crypto-shredding (§3.10).
 //!
 //! Each `agent_id` owns a 32-byte key, persisted as a file **outside the
-//! immutable log**. Episode content is sealed at rest with ChaCha20-Poly1305
-//! (AEAD), the `agent_id` bound in as associated data. "Erasure" (LGPD/GDPR)
+//! immutable log**. Episode content plus the sensitive attribute/embedding
+//! envelope are sealed at rest with ChaCha20-Poly1305 (AEAD), with `agent_id`
+//! bound as associated data. "Erasure" (LGPD/GDPR)
 //! is **crypto-shredding**: destroy the key file and that agent's ciphertext
 //! becomes permanently unreadable — the append-only log is never mutated.
 //!
@@ -271,7 +272,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ks = KeyStore::open(dir.path()).unwrap();
         ks.get_or_create("eva").unwrap();
-        let kmode = std::fs::metadata(ks.key_path("eva")).unwrap().permissions().mode();
+        let kmode = std::fs::metadata(ks.key_path("eva"))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(kmode & 0o777, 0o600, "ficheiro .key deve ser 0600");
         let dmode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
         assert_eq!(dmode & 0o777, 0o700, "dir de chaves deve ser 0700");

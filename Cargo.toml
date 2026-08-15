@@ -36,12 +36,12 @@ members = [
 # O binding PyO3 fica FORA do workspace: precisa de um interpretador Python no
 # build (pyo3-build-config), que os runners do CI e `cargo build --workspace`
 # não têm de garantir. Constrói-se sozinho via maturin em sdk/python-embedded.
-exclude = ["sdk/python-embedded"]
+exclude = ["sdk/python-embedded", "fuzz"]
 
 [workspace.package]
 version = "1.0.5"
 edition = "2021"
-license = "Apache-2.0"
+license = "BUSL-1.1"
 repository = "https://github.com/JoseRFJuniorLLMs/HeraclitusDB"
 authors = ["José R. F. Junior", "Claude (Anthropic)"]
 
@@ -79,10 +79,11 @@ hume-ir = { path = "crates/hume-ir" }
 # external
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "io-util"] }
 tokio-stream = "0.1"
-tonic = "0.12"
-prost = "0.13"
-tonic-build = "0.12"
-protox = "0.7"
+tonic = { version = "0.14.6", features = ["tls-ring"] }
+tonic-prost = "0.14.6"
+prost = "0.14.4"
+tonic-prost-build = "0.14.6"
+protox = "0.9.1"
 axum = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -90,7 +91,7 @@ bincode = { version = "2", features = ["serde"] }
 thiserror = "2"
 crc32fast = "1"
 blake3 = "1"
-memmap2 = "0.9"
+memmap2 = "0.9.11"
 crossbeam-channel = "0.5"
 arc-swap = "1"
 dashmap = "6"
@@ -109,7 +110,7 @@ rand = "0.8"
 proptest = "1"
 criterion = "0.5"
 clap = { version = "4", features = ["derive"] }
-object_store = "0.11"
+object_store = "0.14.1"
 turmoil = "0.6"
 arrayvec = { version = "0.7", features = ["serde"] }
 tempfile = "3"
@@ -118,7 +119,7 @@ der = { version = "0.7", features = ["derive", "oid", "alloc"] }
 const-oid = "0.9"
 sha2 = "0.10"
 p256 = { version = "0.13", features = ["ecdsa"] }
-anyhow = "1"
+anyhow = "1.0.103"
 csv = "1"
 encoding_rs = "0.8"
 

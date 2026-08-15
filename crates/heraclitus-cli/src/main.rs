@@ -14,6 +14,19 @@ enum Cmd {
     LogInspect { dir: PathBuf },
     /// Full integrity scan: every crc + sealed-segment merkle roots.
     Verify { dir: PathBuf },
+    /// Reescreve um data-dir inteiro num destino NOVO com cifra por agent_id.
+    /// Preserva LSN, EventId e HLC; nunca altera nem apaga a origem.
+    MigrateEncrypt {
+        /// Data-dir de origem (contém `log/` e, opcionalmente, `keys/`).
+        source: PathBuf,
+        /// Data-dir novo; deve não existir.
+        destination: PathBuf,
+    },
+    /// Gera credenciais RBAC bootstrap sem imprimir tokens no terminal.
+    InitCredentials {
+        /// Diretório novo que receberá credentials.json e tokens separados.
+        output: PathBuf,
+    },
     /// QPS x recall@10 harness on a synthetic hierarchical dataset (M7).
     Bench {
         #[arg(long, default_value_t = 20_000)]
@@ -62,6 +75,13 @@ fn main() {
     let result: Result<String, String> = match cli.cmd {
         Cmd::LogInspect { dir } => heraclitus_cli::log_inspect(&dir).map_err(|e| e.to_string()),
         Cmd::Verify { dir } => heraclitus_cli::verify(&dir).map_err(|e| e.to_string()),
+        Cmd::MigrateEncrypt {
+            source,
+            destination,
+        } => heraclitus_cli::migrate_encrypt(&source, &destination).map_err(|e| e.to_string()),
+        Cmd::InitCredentials { output } => {
+            heraclitus_cli::init_credentials(&output).map_err(|e| e.to_string())
+        }
         Cmd::Bench { n, dim, queries } => {
             Ok(heraclitus_cli::bench_recall(n, dim, queries).to_markdown())
         }

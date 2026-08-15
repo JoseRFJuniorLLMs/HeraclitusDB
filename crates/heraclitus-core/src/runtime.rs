@@ -44,7 +44,9 @@ pub struct DatabaseManifest {
 impl DatabaseManifest {
     /// Segments visible under a read snapshot pinned at `target_lsn`.
     pub fn visible_segments(&self, target_lsn: Lsn) -> impl Iterator<Item = &SegmentDescriptor> {
-        self.segments.iter().filter(move |s| s.first_lsn <= target_lsn)
+        self.segments
+            .iter()
+            .filter(move |s| s.first_lsn <= target_lsn)
     }
 }
 
@@ -97,7 +99,10 @@ pub struct MemoryBudget {
 
 impl MemoryBudget {
     pub fn new(allowed_bytes: usize) -> Self {
-        Self { allowed_bytes, used_bytes: 0 }
+        Self {
+            allowed_bytes,
+            used_bytes: 0,
+        }
     }
 
     /// Reserve `bytes`, or `Err` if it would blow the cap (caller then falls
@@ -153,7 +158,9 @@ impl ExecutionContext {
         Self {
             snapshot_lsn,
             memory_budget: std::sync::Mutex::new(MemoryBudget::new(mem_cap)),
-            cpu_budget: CpuBudget { max_microseconds: cpu_micros },
+            cpu_budget: CpuBudget {
+                max_microseconds: cpu_micros,
+            },
             cancellation: std::sync::Arc::new(CancellationToken::default()),
         }
     }
@@ -187,7 +194,10 @@ mod tests {
     fn memory_budget_guards_oom() {
         let mut b = MemoryBudget::new(1000);
         assert!(b.try_reserve(600).is_ok());
-        assert!(b.try_reserve(600).is_err(), "must reject over-cap reservation");
+        assert!(
+            b.try_reserve(600).is_err(),
+            "must reject over-cap reservation"
+        );
         assert_eq!(b.used_bytes, 600);
         b.release(600);
         assert!(b.try_reserve(1000).is_ok());

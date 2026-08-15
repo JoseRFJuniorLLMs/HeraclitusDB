@@ -54,7 +54,10 @@ impl EmaCalibrator {
     /// `alpha` ∈ (0,1]: higher = react faster to recent measurements.
     pub fn new(alpha: f64) -> Self {
         assert!(alpha > 0.0 && alpha <= 1.0, "alpha must be in (0,1]");
-        Self { alpha, smoothed_ns: HashMap::new() }
+        Self {
+            alpha,
+            smoothed_ns: HashMap::new(),
+        }
     }
 
     /// Fold a measured latency for `fingerprint`; returns the new smoothed value.
@@ -75,7 +78,11 @@ mod tests {
 
     #[test]
     fn weighted_score_combines_dimensions() {
-        let c = CostEstimate { cpu_cycles: 100, io_pages: 10, ..CostEstimate::zero() };
+        let c = CostEstimate {
+            cpu_cycles: 100,
+            io_pages: 10,
+            ..CostEstimate::zero()
+        };
         assert_eq!(c.weighted_score(2.0, 0.5), 10.0 * 2.0 + 100.0 * 0.5);
     }
 
@@ -90,7 +97,10 @@ mod tests {
         for _ in 0..20 {
             last = cal.observe(fp, 200.0);
         }
-        assert!(last > 199.0 && last <= 200.0, "EMA should converge, got {last}");
+        assert!(
+            last > 199.0 && last <= 200.0,
+            "EMA should converge, got {last}"
+        );
         assert_eq!(cal.predicted(&fp), Some(last));
         assert_eq!(cal.predicted(&[0u8; 32]), None);
     }

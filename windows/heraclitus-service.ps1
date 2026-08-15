@@ -50,8 +50,8 @@ function Invoke-Elevated([string]$act) {
 
 if (-not $Bin) {
     Write-Error "Binário não encontrado. Compile primeiro:`n" +
-                "  `$env:PATH = 'D:\DEV\tools\as-only;`$env:PATH'`n" +
-                "  cargo +stable-x86_64-pc-windows-gnu build --release -p heraclitus-server --bin heraclitus-service"
+                "  cargo +stable-x86_64-pc-windows-msvc build --release --locked " +
+                "-p heraclitus-server --bin heraclitus-service"
     exit 1
 }
 

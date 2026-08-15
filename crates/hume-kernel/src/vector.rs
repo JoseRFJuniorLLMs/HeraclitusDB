@@ -61,7 +61,12 @@ impl Vector {
                 write(dst, i, v);
             }
         }
-        Self { dtype, len, buf, validity: ValidityMask::all_valid(len) }
+        Self {
+            dtype,
+            len,
+            buf,
+            validity: ValidityMask::all_valid(len),
+        }
     }
 
     /// Constrói uma coluna `Int32`.

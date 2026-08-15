@@ -30,6 +30,13 @@ pub enum HeraclitusError {
 
     #[error("compare-and-append failed: expected lsn {expected}, head is {head}")]
     CasConflict { expected: u64, head: u64 },
+
+    /// The same external idempotency key was reused for a different payload.
+    /// Silently accepting this would turn a source-side identity collision into
+    /// evidence loss, so it is a first-class conflict rather than a generic
+    /// query/storage failure.
+    #[error("idempotency conflict for key {key}")]
+    IdempotencyConflict { key: String },
 }
 
 pub type Result<T> = std::result::Result<T, HeraclitusError>;

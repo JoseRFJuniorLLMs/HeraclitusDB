@@ -1,14 +1,15 @@
 //! heraclitus-server — gRPC (tonic) + minimal REST (axum), §3.14.
 //! The server composes; the storage knows nothing about HTTP or LLMs.
 
+mod auth;
 pub mod boot;
 #[cfg(feature = "replication")]
 pub mod cluster; // SPEC-015/021: wiring do consenso Raft (nó de cluster sobre o log)
 pub mod embedded;
 pub mod engine;
-pub mod grpc;
 #[cfg(feature = "analytics")]
 pub mod flight_grpc; // SPEC-016: protocolo Arrow Flight real (gRPC, tonic 0.14)
+pub mod grpc;
 pub mod rest;
 
 pub use embedded::Embedded;
@@ -18,7 +19,6 @@ use crate::boot::{group, Boot};
 use heraclitus_core::{FsyncPolicy, HeraclitusConfig, HeraclitusError};
 use heraclitus_proto::v1::heraclitus_server::HeraclitusServer;
 use std::sync::Arc;
-use tonic::{Request, Status};
 
 /// Serve gRPC on `config.grpc_addr` and REST on `config.rest_addr` until
 /// the provided shutdown future resolves.
@@ -42,6 +42,9 @@ pub async fn serve_with(
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     boot: Boot,
 ) -> Result<(), HeraclitusError> {
+    // `HeraclitusConfig` também pode ser construído diretamente por embedding
+    // (sem `load`); os gates de segurança precisam valer nos dois caminhos.
+    config.validate_security()?;
     boot.banner(env!("CARGO_PKG_VERSION"));
     let fsync = match &config.fsync {
         FsyncPolicy::Always => "fsync sempre (durabilidade máxima)".to_string(),
@@ -93,12 +96,17 @@ pub async fn serve_with(
         .parse()
         .map_err(|e| HeraclitusError::Config(format!("rest_addr: {e}")))?;
 
-    // Authentication (§access control): when `auth_token` is set, every gRPC
-    // call must carry `authorization: Bearer <token>`. When unset, the
-    // interceptor is a no-op (default — backward compatible, localhost bind).
-    let expected_auth = config.auth_token.clone().map(|t| format!("Bearer {t}"));
-    if expected_auth.is_some() {
-        boot.warn_line("Auth gRPC", "Bearer token EXIGIDO em cada chamada");
+    // Autenticação multi-principal: tokens nunca ficam armazenados em claro;
+    // cada request é associado a um Principal que os handlers autorizam por papel.
+    let authenticator = auth::Authenticator::from_config(&config)?;
+    if authenticator.is_required() {
+        boot.warn_line(
+            "Auth gRPC",
+            &format!(
+                "Bearer + RBAC EXIGIDO · {} principal(is)",
+                config.access_credentials.len() + usize::from(config.auth_token.is_some())
+            ),
+        );
     } else if !grpc_addr.ip().is_loopback() {
         // Mesma política da superfície REST: o gRPC inclui ESCRITAS duráveis
         // (append) e admin destrutivo (shred, rebuild). Sem auth_token, o
@@ -108,25 +116,7 @@ pub async fn serve_with(
              append/shred/rebuild ficariam abertos. Defina auth_token ou use 127.0.0.1."
         )));
     }
-    let auth = move |req: Request<()>| -> Result<Request<()>, Status> {
-        match &expected_auth {
-            None => Ok(req),
-            Some(exp) => {
-                // R17: comparação constant-time (sem side-channel de timing).
-                let ok = req
-                    .metadata()
-                    .get("authorization")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|v| rest::ct_eq(v.as_bytes(), exp.as_bytes()))
-                    .unwrap_or(false);
-                if ok {
-                    Ok(req)
-                } else {
-                    Err(Status::unauthenticated("missing or invalid bearer token"))
-                }
-            }
-        }
-    };
+    let auth = move |req| authenticator.authenticate(req);
     let svc = HeraclitusServer::with_interceptor(grpc::Service::new(engine.clone()), auth);
     if config.rest_basic_auth.is_some() {
         boot.warn_line("Auth REST", "HTTP Basic EXIGIDO em cada chamada");
@@ -138,7 +128,10 @@ pub async fn serve_with(
              as rotas de escrita ficariam abertas. Defina rest_basic_auth ou use 127.0.0.1."
         )));
     } else {
-        boot.warn_line("Auth REST", "sem auth (loopback) — escritas locais /hvm//tier/sql abertas");
+        boot.warn_line(
+            "Auth REST",
+            "sem auth (loopback) — escritas locais /hvm//tier/sql abertas",
+        );
     }
     let rest = rest::router(engine.clone(), config.rest_basic_auth.clone());
 
@@ -352,9 +345,44 @@ pub async fn serve_with(
         None
     };
 
-    boot.ok_line("Servidor gRPC (tonic)", &grpc_addr.to_string());
+    let mut grpc_server = tonic::transport::Server::builder();
+    if let (Some(cert_path), Some(key_path)) = (&config.tls_cert_path, &config.tls_key_path) {
+        let cert = std::fs::read(cert_path).map_err(|e| {
+            HeraclitusError::Config(format!("TLS cert {}: {e}", cert_path.display()))
+        })?;
+        let key = std::fs::read(key_path)
+            .map_err(|e| HeraclitusError::Config(format!("TLS key {}: {e}", key_path.display())))?;
+        let mut tls = tonic::transport::ServerTlsConfig::new()
+            .identity(tonic::transport::Identity::from_pem(cert, key));
+        if let Some(ca_path) = &config.tls_client_ca_path {
+            let ca = std::fs::read(ca_path).map_err(|e| {
+                HeraclitusError::Config(format!("TLS client CA {}: {e}", ca_path.display()))
+            })?;
+            tls = tls.client_ca_root(tonic::transport::Certificate::from_pem(ca));
+            boot.warn_line("TLS gRPC", "mTLS obrigatório (CA de clientes configurada)");
+        } else {
+            boot.warn_line(
+                "TLS gRPC",
+                "TLS servidor ativo; certificado cliente não exigido",
+            );
+        }
+        grpc_server = grpc_server
+            .tls_config(tls)
+            .map_err(|e| HeraclitusError::Config(format!("TLS gRPC: {e}")))?;
+    }
+    boot.ok_line(
+        "Servidor gRPC (tonic)",
+        &format!(
+            "{}://{grpc_addr}",
+            if config.tls_cert_path.is_some() {
+                "https"
+            } else {
+                "http"
+            }
+        ),
+    );
     boot.ready(&grpc_addr.to_string(), &rest_addr.to_string());
-    tonic::transport::Server::builder()
+    grpc_server
         .add_service(svc)
         .serve_with_shutdown(grpc_addr, shutdown)
         .await

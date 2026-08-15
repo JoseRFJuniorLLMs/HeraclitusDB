@@ -37,7 +37,9 @@ fn bench(c: &mut Criterion) {
     g.bench_function("interpret_cold", |bn| {
         bn.iter(|| black_box(interpret_mask(&f, &cols, N).unwrap().len()))
     });
-    g.bench_function("jit_hot", |bn| bn.iter(|| black_box(jit.run(&cols, N).len())));
+    g.bench_function("jit_hot", |bn| {
+        bn.iter(|| black_box(jit.run(&cols, N).len()))
+    });
     g.finish();
 }
 

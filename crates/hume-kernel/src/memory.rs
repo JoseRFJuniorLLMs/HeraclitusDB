@@ -116,7 +116,11 @@ mod tests {
         for len in [1usize, 7, 63, 64, 65, 1024, 100_000] {
             let b = AlignedBuffer::new(len);
             assert_eq!(b.len(), len);
-            assert_eq!(b.as_ptr() as usize % CACHE_LINE, 0, "len={len} não alinhado");
+            assert_eq!(
+                b.as_ptr() as usize % CACHE_LINE,
+                0,
+                "len={len} não alinhado"
+            );
         }
     }
 

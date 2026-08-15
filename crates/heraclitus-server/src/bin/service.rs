@@ -19,6 +19,7 @@
 
 const SERVICE_NAME: &str = "HeraclitusDB";
 const SERVICE_DISPLAY: &str = "HeraclitusDB Event-Sourced Memory";
+const SERVICE_ACCOUNT: &str = r"NT SERVICE\HeraclitusDB";
 
 #[cfg(windows)]
 fn base_dir() -> std::path::PathBuf {
@@ -50,6 +51,15 @@ fn apply_path_defaults() {
     if std::env::var_os("HERACLITUS_PLAIN_BOOT").is_none() {
         std::env::set_var("HERACLITUS_PLAIN_BOOT", "1");
     }
+}
+
+#[cfg(windows)]
+fn config_path(explicit: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    explicit.or_else(|| {
+        std::env::var_os("HERACLITUS_CONFIG")
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+    })
 }
 
 #[cfg(windows)]
@@ -116,6 +126,7 @@ mod console {
         tracing::info!(service = super::SERVICE_NAME, mode = "console", "starting");
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async move {
+            let config_path = super::config_path(config_path);
             let config = HeraclitusConfig::load(config_path.as_deref())?;
             heraclitus_server::serve(config, async {
                 let _ = tokio::signal::ctrl_c().await;
@@ -204,7 +215,8 @@ mod service_runner {
 
         let rt = tokio::runtime::Runtime::new()?;
         let result = rt.block_on(async move {
-            let config = HeraclitusConfig::load(None)?;
+            let config_path = super::config_path(None);
+            let config = HeraclitusConfig::load(config_path.as_deref())?;
             // Bridge the blocking stop channel into an async shutdown future.
             let (async_tx, async_rx) = tokio::sync::oneshot::channel::<()>();
             std::thread::spawn(move || {
@@ -251,17 +263,13 @@ mod service_ctl {
             ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
         )?;
         let exe = std::env::current_exe()?;
-        // If a config path is given, pass it so SCM launches `exe console <cfg>`?
-        // No — SCM must launch the dispatcher (no args). A config file is honored
-        // via the HERACLITUS_* env vars or the default; absolute config support
-        // would need the service to read it, so we keep launch args empty and
-        // document env-based config.
+        // O dispatcher do SCM precisa arrancar sem subcomando. Um TOML opcional
+        // é selecionado pela env de máquina HERACLITUS_CONFIG.
         let launch_arguments: Vec<OsString> = Vec::new();
         if let Some(c) = &config {
             eprintln!(
-                "Nota: a config '{}' não é passada ao SCM. Configure via variáveis \
-                 HERACLITUS_DATA_DIR / HERACLITUS_GRPC_ADDR / HERACLITUS_REST_ADDR \
-                 (System environment) ou aceite os padrões em %ProgramData%\\HeraclitusDB.",
+                "Nota: defina HERACLITUS_CONFIG='{}' como variável de ambiente \
+                 de máquina antes de iniciar o serviço.",
                 c.display()
             );
         }
@@ -274,13 +282,15 @@ mod service_ctl {
             executable_path: exe,
             launch_arguments,
             dependencies: vec![],
-            account_name: None, // LocalSystem
+            // Conta virtual isolada, sem os privilégios de LocalSystem. O
+            // instalador operacional concede ACL só a data/log/config.
+            account_name: Some(OsString::from(super::SERVICE_ACCOUNT)),
             account_password: None,
         };
         let service = manager.create_service(&info, ServiceAccess::CHANGE_CONFIG)?;
         service.set_description(
             "HeraclitusDB — substrato de memória event-sourced (log imutável append-only). \
-             gRPC :7474, REST :7475. Logs em %ProgramData%\\HeraclitusDB\\logs.",
+             gRPC :7474, REST :7475. Conta virtual NT SERVICE\\HeraclitusDB.",
         )?;
         println!(
             "Serviço '{}' instalado (auto-start).\n\

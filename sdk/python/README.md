@@ -16,23 +16,24 @@ pip install ./sdk/python
 
 ```python
 import heraclitusdb
+
 db = heraclitusdb.connect("127.0.0.1:7474")
 
 # escrever no log (o rio); parents = arestas de proveniência (ULIDs)
 lsn = db.append("Observation", "empresa X trocou de socio", attrs={"caso": "1"})
 
 # consultar (GQL/Cypher subset)
-rows = db.query('MATCH (n) RETURN n LIMIT 100')
-df   = db.query_df('MATCH (n) RETURN n LIMIT 1000')     # -> pandas.DataFrame
+rows = db.query("MATCH (n) RETURN n LIMIT 100")
+df = db.query_df("MATCH (n) RETURN n LIMIT 1000")  # -> pandas.DataFrame
 
 # viagem no tempo: estado do banco num LSN do passado
-passado = db.query('MATCH (n) RETURN n', as_of=1000)
+passado = db.query("MATCH (n) RETURN n", as_of=1000)
 
 # recall semântico (ANN no manifold de produto)
 db.recall("empresa de fachada que venceu licitacao", k=10)
 
 # integridade criptográfica (Árvore de Merkle)
-db.verify()        # {'ok': True, 'message': '{"merkle_ok":0,...}'}
+db.verify()  # {'ok': True, 'message': '{"merkle_ok":0,...}'}
 
 # stream do rio
 for ev in db.subscribe(from_lsn=db.head()):

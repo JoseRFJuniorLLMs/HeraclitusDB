@@ -20,6 +20,31 @@ pub struct GqlParser;
 use ast::*;
 use heraclitus_core::HeraclitusError;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryAccess {
+    Read,
+    Write,
+}
+
+/// Classifica a query antes da execução para o RBAC do servidor. `CREATE` e
+/// `DECIDE` persistem eventos; um `SIMULATE ... THEN` herda a classe do plano
+/// interno. Todo o restante é leitura.
+pub fn required_access(input: &str) -> Result<QueryAccess, HeraclitusError> {
+    fn mutates(stmt: &Stmt) -> bool {
+        match stmt {
+            Stmt::Create(_) | Stmt::Decide { .. } => true,
+            Stmt::Simulate { then, .. } => mutates(then),
+            _ => false,
+        }
+    }
+    let query = parse(input)?;
+    Ok(if mutates(&query.stmt) {
+        QueryAccess::Write
+    } else {
+        QueryAccess::Read
+    })
+}
+
 /// Parse a query string into the AST. Never panics on any input — fuzz gate.
 pub fn parse(input: &str) -> Result<Query, HeraclitusError> {
     let mut pairs =
@@ -109,6 +134,54 @@ mod tests {
     }
 
     #[test]
+    fn rbac_query_classification_is_fail_closed_for_mutations() {
+        assert_eq!(
+            required_access("MATCH (n) RETURN n").unwrap(),
+            QueryAccess::Read
+        );
+        assert_eq!(
+            required_access("CREATE (n:Observation {content: \"x\"})").unwrap(),
+            QueryAccess::Write
+        );
+        assert_eq!(required_access("DECIDE ()").unwrap(), QueryAccess::Write);
+        assert!(required_access("isto não é GQL").is_err());
+    }
+
+    #[test]
+    fn node_return_projection_and_custom_kind_are_canonical() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        let mut e = Episode::new(
+            "agent",
+            EventKind::Custom("OperationalFact".into()),
+            b"login failure".to_vec(),
+        );
+        e.attrs.insert("risk_level".into(), "High".into());
+        log.append(e).unwrap();
+        let be = LogBackend::new(log);
+
+        let full = execute("MATCH (n:OperationalFact) RETURN n", &be).unwrap();
+        let row = &full.as_array().unwrap()[0];
+        assert_eq!(row["kind"], "OperationalFact");
+        assert_eq!(row["attrs"]["risk_level"], "High");
+        let full_lsn = row["lsn"].clone();
+
+        let projected = execute(
+            "MATCH (n:OperationalFact) RETURN n.kind, n.risk_level, n.lsn",
+            &be,
+        )
+        .unwrap();
+        let row = &projected.as_array().unwrap()[0];
+        assert_eq!(row["n.kind"], "OperationalFact");
+        assert_eq!(row["n.risk_level"], "High");
+        assert_eq!(row["n.lsn"], full_lsn);
+        assert!(
+            row.get("content").is_none(),
+            "projeção não deve vazar colunas extras"
+        );
+    }
+
+    #[test]
     fn match_agent_id_pushes_down_to_zone_map_skip() {
         // SPEC-010 pushdown at the query layer: `WHERE agent_id = "alice"` routes
         // through `scan_agent`, which prunes bob-only sealed segments (skip-I/O)
@@ -141,7 +214,11 @@ mod tests {
         let be = LogBackend::new(log);
         let v = execute("MATCH (n) WHERE n.agent_id = \"alice\" RETURN n", &be).unwrap();
         let rows = v.as_array().unwrap();
-        assert_eq!(rows.len(), 60, "exactly alice's 60 events, none dropped, no bob");
+        assert_eq!(
+            rows.len(),
+            60,
+            "exactly alice's 60 events, none dropped, no bob"
+        );
         assert!(
             rows.iter().all(|r| r["agent_id"].as_str() == Some("alice")),
             "pruning + post-filter must yield only alice"
@@ -176,9 +253,7 @@ mod tests {
         let v = execute("MATCH (n) WHERE n.session_id = \"s-A\" RETURN n", &be).unwrap();
         let rows = v.as_array().unwrap();
         assert_eq!(rows.len(), 60, "exactly session s-A, none dropped, no s-B");
-        assert!(rows
-            .iter()
-            .all(|r| r["session_id"].as_str() == Some("s-A")));
+        assert!(rows.iter().all(|r| r["session_id"].as_str() == Some("s-A")));
     }
 
     #[test]
@@ -291,7 +366,10 @@ mod tests {
 
         // WHY(e3) UNTIL e1 → must go through e2: [e3, e2, e1].
         let v = execute(&format!("WHY(\"{id3}\") UNTIL \"{id1}\""), &be).unwrap();
-        assert_eq!(chain_of(&v), vec![id3.to_string(), id2.to_string(), id1.to_string()]);
+        assert_eq!(
+            chain_of(&v),
+            vec![id3.to_string(), id2.to_string(), id1.to_string()]
+        );
 
         // A cause that is not an ancestor → not linked, empty chain.
         let stranger = mk(b"s", &[]);

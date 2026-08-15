@@ -223,7 +223,12 @@ impl FileRaftLog {
     fn replay(
         wal_path: &Path,
     ) -> Result<
-        (BTreeMap<u64, Entry<TypeConfig>>, Option<LogId<NodeId>>, u64, bool),
+        (
+            BTreeMap<u64, Entry<TypeConfig>>,
+            Option<LogId<NodeId>>,
+            u64,
+            bool,
+        ),
         StorageError<NodeId>,
     > {
         let mut entries: BTreeMap<u64, Entry<TypeConfig>> = BTreeMap::new();
@@ -406,7 +411,7 @@ impl RaftLogStorage<TypeConfig> for FileRaftLog {
         I: IntoIterator<Item = Entry<TypeConfig>> + Send,
     {
         self.append_sync(entries)?; // fsync por registo lá dentro
-        // O fsync já aconteceu ⇒ o ack de quórum é respaldado por durabilidade.
+                                    // O fsync já aconteceu ⇒ o ack de quórum é respaldado por durabilidade.
         callback.log_io_completed(Ok(()));
         Ok(())
     }
@@ -491,8 +496,16 @@ mod tests {
         // Reabre a partir do disco — nada em memória sobrevive.
         let mut log = FileRaftLog::open(dir.path()).unwrap();
         let st = log.get_log_state().await.unwrap();
-        assert_eq!(st.last_log_id.unwrap().index, 3, "entradas recuperadas do WAL");
-        assert_eq!(log.read_vote().await.unwrap(), Some(Vote::new(7, 2)), "voto durável");
+        assert_eq!(
+            st.last_log_id.unwrap().index,
+            3,
+            "entradas recuperadas do WAL"
+        );
+        assert_eq!(
+            log.read_vote().await.unwrap(),
+            Some(Vote::new(7, 2)),
+            "voto durável"
+        );
         assert_eq!(log.read_committed().await.unwrap().unwrap().index, 2);
         let got = log.try_get_log_entries(1..4).await.unwrap();
         assert_eq!(got.len(), 3);
@@ -503,11 +516,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         {
             let mut log = FileRaftLog::open(dir.path()).unwrap();
-            append(
-                &mut log,
-                (1..=6).map(|i| entry(i, 1, "x")).collect(),
-            )
-            .await;
+            append(&mut log, (1..=6).map(|i| entry(i, 1, "x")).collect()).await;
             // Trunca de 5 para cima (conflito de líder) e purga até 2 (snapshot).
             log.truncate(LogId::new(CommittedLeaderId::new(1, 0), 5))
                 .await
@@ -546,11 +555,27 @@ mod tests {
         }
         // O open descarta a cauda torn e recupera exatamente os 2 registos bons.
         let mut log = FileRaftLog::open(dir.path()).unwrap();
-        assert_eq!(log.get_log_state().await.unwrap().last_log_id.unwrap().index, 2);
+        assert_eq!(
+            log.get_log_state()
+                .await
+                .unwrap()
+                .last_log_id
+                .unwrap()
+                .index,
+            2
+        );
         // E o WAL foi truncado, por isso um novo append continua limpo.
         append(&mut log, vec![entry(3, 1, "c")]).await;
         let mut log2 = FileRaftLog::open(dir.path()).unwrap();
-        assert_eq!(log2.get_log_state().await.unwrap().last_log_id.unwrap().index, 3);
+        assert_eq!(
+            log2.get_log_state()
+                .await
+                .unwrap()
+                .last_log_id
+                .unwrap()
+                .index,
+            3
+        );
     }
 
     #[tokio::test]
@@ -575,7 +600,11 @@ mod tests {
         // decode falha garantidamente (variante inválida) — e os registos 2 e 3,
         // comprometidos, ficam depois do ponto corrupto.
         {
-            let mut f = OpenOptions::new().read(true).write(true).open(&wal_path).unwrap();
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&wal_path)
+                .unwrap();
             f.seek(SeekFrom::Start(4)).unwrap();
             f.write_all(&[0xFF]).unwrap();
             f.sync_all().unwrap();

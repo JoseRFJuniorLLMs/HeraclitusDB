@@ -175,8 +175,14 @@ mod tests {
     #[test]
     fn bitpack_roundtrip_various_widths() {
         for bits in [1u32, 3, 7, 13, 32, 63, 64] {
-            let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
-            let values: Vec<u64> = (0..500u64).map(|i| (i.wrapping_mul(2654435761)) & mask).collect();
+            let mask = if bits == 64 {
+                u64::MAX
+            } else {
+                (1u64 << bits) - 1
+            };
+            let values: Vec<u64> = (0..500u64)
+                .map(|i| (i.wrapping_mul(2654435761)) & mask)
+                .collect();
             let packed = bitpack::pack(&values, bits);
             let got = bitpack::unpack(&packed, bits, values.len());
             assert_eq!(got, values, "roundtrip falhou em bits={bits}");

@@ -47,7 +47,10 @@ impl View for PersistView {
 }
 
 fn view_with(state: &Arc<Mutex<Vec<Lsn>>>) -> Box<PersistView> {
-    Box::new(PersistView { seen: state.clone(), wm: 0 })
+    Box::new(PersistView {
+        seen: state.clone(),
+        wm: 0,
+    })
 }
 
 /// PERDA DE DADOS SILENCIOSA (corrigida): arrancar com `HERACLITUS_SKIP_VIEW_REPLAY`
@@ -81,7 +84,11 @@ fn skip_replay_then_checkpoint_does_not_orphan_events() {
         r.register(view_with(&st));
         r.catch_up(&log).unwrap();
         r.checkpoint().unwrap();
-        assert_eq!(st.lock().unwrap().len() as u64, head, "setup: a view devia ver tudo");
+        assert_eq!(
+            st.lock().unwrap().len() as u64,
+            head,
+            "setup: a view devia ver tudo"
+        );
     }
 
     // 2) Arranque com o replay SALTADO, seguido de um checkpoint (o periódico

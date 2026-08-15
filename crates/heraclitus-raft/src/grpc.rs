@@ -68,10 +68,7 @@ impl RaftTransport for RaftTransportSvc {
         Ok(Response::new(RaftEnvelope { payload }))
     }
 
-    async fn vote(
-        &self,
-        request: Request<RaftEnvelope>,
-    ) -> Result<Response<RaftEnvelope>, Status> {
+    async fn vote(&self, request: Request<RaftEnvelope>) -> Result<Response<RaftEnvelope>, Status> {
         let req: VoteRequest<NodeId> = decode(&request.into_inner().payload)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let resp = self.raft.vote(req).await;
@@ -94,8 +91,34 @@ impl RaftTransport for RaftTransportSvc {
 // ── cliente (RaftNetwork) ────────────────────────────────────────────────────
 
 /// Factory de rede gRPC: descobre o destino pelo `addr` da membership.
+#[derive(Clone)]
+pub struct GrpcTlsConfig {
+    pub certificate: Arc<Vec<u8>>,
+    pub private_key: Arc<Vec<u8>>,
+    pub ca_certificate: Arc<Vec<u8>>,
+    pub server_name: Option<String>,
+}
+
+impl GrpcTlsConfig {
+    pub fn new(
+        certificate: Vec<u8>,
+        private_key: Vec<u8>,
+        ca_certificate: Vec<u8>,
+        server_name: Option<String>,
+    ) -> Self {
+        Self {
+            certificate: Arc::new(certificate),
+            private_key: Arc::new(private_key),
+            ca_certificate: Arc::new(ca_certificate),
+            server_name,
+        }
+    }
+}
+
 #[derive(Clone, Default)]
-pub struct GrpcNetworkFactory;
+pub struct GrpcNetworkFactory {
+    tls: Option<GrpcTlsConfig>,
+}
 
 impl RaftNetworkFactory<TypeConfig> for GrpcNetworkFactory {
     type Network = GrpcConnection;
@@ -104,6 +127,7 @@ impl RaftNetworkFactory<TypeConfig> for GrpcNetworkFactory {
         GrpcConnection {
             target,
             addr: node.addr.clone(),
+            tls: self.tls.clone(),
         }
     }
 }
@@ -112,6 +136,7 @@ impl RaftNetworkFactory<TypeConfig> for GrpcNetworkFactory {
 pub struct GrpcConnection {
     target: NodeId,
     addr: String,
+    tls: Option<GrpcTlsConfig>,
 }
 
 /// Snapshots/lotes de raft podem exceder o default de 4MB do tonic; o transporte
@@ -121,9 +146,31 @@ const MAX_RAFT_MSG: usize = 256 * 1024 * 1024;
 
 impl GrpcConnection {
     async fn client(&self) -> Result<RaftTransportClient<tonic::transport::Channel>, Unreachable> {
-        let c = RaftTransportClient::connect(format!("http://{}", self.addr))
-            .await
-            .map_err(|e| Unreachable::new(&e))?;
+        let scheme = if self.tls.is_some() { "https" } else { "http" };
+        let mut endpoint =
+            tonic::transport::Endpoint::from_shared(format!("{scheme}://{}", self.addr))
+                .map_err(|e| Unreachable::new(&e))?;
+        if let Some(tls) = &self.tls {
+            let host = self
+                .addr
+                .rsplit_once(':')
+                .map(|(host, _)| host.trim_matches(['[', ']']).to_string())
+                .unwrap_or_else(|| self.addr.clone());
+            let config = tonic::transport::ClientTlsConfig::new()
+                .ca_certificate(tonic::transport::Certificate::from_pem(
+                    tls.ca_certificate.as_ref().clone(),
+                ))
+                .identity(tonic::transport::Identity::from_pem(
+                    tls.certificate.as_ref().clone(),
+                    tls.private_key.as_ref().clone(),
+                ))
+                .domain_name(tls.server_name.clone().unwrap_or(host));
+            endpoint = endpoint
+                .tls_config(config)
+                .map_err(|e| Unreachable::new(&e))?;
+        }
+        let channel = endpoint.connect().await.map_err(|e| Unreachable::new(&e))?;
+        let c = RaftTransportClient::new(channel);
         Ok(c.max_decoding_message_size(MAX_RAFT_MSG)
             .max_encoding_message_size(MAX_RAFT_MSG))
     }
@@ -209,9 +256,33 @@ pub async fn spawn_node_grpc_on<LS>(
 where
     LS: openraft::storage::RaftLogStorage<TypeConfig>,
 {
+    spawn_node_grpc_on_tls(id, log, config, bind_addr, store, sm, None).await
+}
+
+/// Variante de produção com mTLS. A mesma identidade é usada pelo servidor e
+/// pelo cliente Raft; a CA deve ser exclusiva do cluster.
+pub async fn spawn_node_grpc_on_tls<LS>(
+    id: NodeId,
+    log: Arc<Log>,
+    config: Arc<openraft::Config>,
+    bind_addr: &str,
+    store: LS,
+    sm: EpisodeStateMachine,
+    tls: Option<GrpcTlsConfig>,
+) -> Result<GrpcNode, Box<dyn std::error::Error>>
+where
+    LS: openraft::storage::RaftLogStorage<TypeConfig>,
+{
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     let addr = listener.local_addr()?.to_string();
-    let raft = HeraclitusRaft::new(id, config, GrpcNetworkFactory, store, sm).await?;
+    let raft = HeraclitusRaft::new(
+        id,
+        config,
+        GrpcNetworkFactory { tls: tls.clone() },
+        store,
+        sm,
+    )
+    .await?;
     let svc = RaftTransportSvc { raft: raft.clone() };
     // Um erro de `accept()` (ex.: EMFILE por exaustão de FDs sob carga) NÃO deve
     // terminar o serve — senão o nó cairia do cluster até restart, sem sinal. O
@@ -219,8 +290,20 @@ where
     use tokio_stream::StreamExt as _;
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener)
         .filter_map(|r| r.ok().map(Ok::<_, std::io::Error>));
+    let mut builder = tonic::transport::Server::builder();
+    if let Some(tls) = tls {
+        let server_tls = tonic::transport::ServerTlsConfig::new()
+            .identity(tonic::transport::Identity::from_pem(
+                tls.certificate.as_ref().clone(),
+                tls.private_key.as_ref().clone(),
+            ))
+            .client_ca_root(tonic::transport::Certificate::from_pem(
+                tls.ca_certificate.as_ref().clone(),
+            ));
+        builder = builder.tls_config(server_tls)?;
+    }
     let server = tokio::spawn(async move {
-        let _ = tonic::transport::Server::builder()
+        let _ = builder
             .add_service(
                 RaftTransportServer::new(svc)
                     .max_decoding_message_size(MAX_RAFT_MSG)
@@ -270,7 +353,11 @@ mod tests {
     }
 
     fn ep(i: u64) -> Episode {
-        Episode::new("grpc", EventKind::Observation, format!("grpc-{i}").into_bytes())
+        Episode::new(
+            "grpc",
+            EventKind::Observation,
+            format!("grpc-{i}").into_bytes(),
+        )
     }
 
     /// O consenso sobre **gRPC/tonic real**: 3 nós em portas efémeras elegem um
@@ -284,7 +371,11 @@ mod tests {
         for id in 0..3u64 {
             let dir = tempfile::tempdir().unwrap();
             let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
-            nodes.push(spawn_node_grpc(id, log, config.clone(), "127.0.0.1:0").await.unwrap());
+            nodes.push(
+                spawn_node_grpc(id, log, config.clone(), "127.0.0.1:0")
+                    .await
+                    .unwrap(),
+            );
             dirs.push(dir);
         }
 
@@ -326,7 +417,12 @@ mod tests {
         }
 
         for n in &nodes {
-            assert_eq!(n.node.log.head(), 20, "nó {} replicou os 20 episódios", n.node.id);
+            assert_eq!(
+                n.node.log.head(),
+                20,
+                "nó {} replicou os 20 episódios",
+                n.node.id
+            );
         }
         assert!(logs_equivalent(&nodes[0].node.log, &nodes[1].node.log).unwrap());
         assert!(logs_equivalent(&nodes[1].node.log, &nodes[2].node.log).unwrap());

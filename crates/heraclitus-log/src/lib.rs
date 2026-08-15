@@ -38,6 +38,53 @@ use std::time::Instant;
 use tokio::sync::broadcast;
 
 const BINCODE_CFG: bincode::config::Configuration = bincode::config::standard();
+const ENCRYPTED_FIELDS_ATTR: &str = "__heraclitus_encrypted_fields_v1";
+const SHREDDED_ATTR: &str = "__heraclitus_shredded";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SensitiveFields {
+    attrs: std::collections::BTreeMap<String, String>,
+    embedding: Option<ProductPoint>,
+}
+
+fn is_public_technical_attr(name: &str) -> bool {
+    matches!(
+        name,
+        "__heraclitus_idempotency_key" | "__heraclitus_idempotency_hash"
+    )
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    let nibble = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    text.as_bytes()
+        .chunks_exact(2)
+        .map(|p| Some((nibble(p[0])? << 4) | nibble(p[1])?))
+        .collect()
+}
+
+fn fields_aad(agent_id: &str) -> Vec<u8> {
+    let mut aad = agent_id.as_bytes().to_vec();
+    aad.extend_from_slice(b"\0fields-v1");
+    aad
+}
 
 fn segment_path(dir: &Path, id: SegmentId) -> PathBuf {
     dir.join(format!("{id:020}.hrkl"))
@@ -642,26 +689,73 @@ impl Log {
                                     }
                                 }
 
-                                let content_payload = match &worker_keystore {
-                                    Some(ks) => match ks.get_or_create(&episode.agent_id) {
-                                        Ok(key) => {
-                                            crypto_scratch.clear();
-                                            crypto_scratch = heraclitus_crypto::seal(
-                                                &key,
-                                                &episode.content,
-                                                episode.agent_id.as_bytes(),
-                                            );
-                                            &crypto_scratch
-                                        }
-                                        Err(e) => {
-                                            let _ = resp_tx.send(Err(HeraclitusError::Crypto(
-                                                format!("Keystore Isolation Fault: {e:?}"),
-                                            )));
-                                            continue;
-                                        }
-                                    },
-                                    None => &episode.content,
-                                };
+                                let (stored_content, stored_attrs, stored_embedding) =
+                                    match &worker_keystore {
+                                        Some(ks) => match ks.get_or_create(&episode.agent_id) {
+                                            Ok(key) => {
+                                                crypto_scratch.clear();
+                                                crypto_scratch = heraclitus_crypto::seal(
+                                                    &key,
+                                                    &episode.content,
+                                                    episode.agent_id.as_bytes(),
+                                                );
+
+                                                let public_attrs = episode
+                                                    .attrs
+                                                    .iter()
+                                                    .filter(|(k, _)| is_public_technical_attr(k))
+                                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                                    .collect::<std::collections::BTreeMap<_, _>>();
+                                                let sensitive = SensitiveFields {
+                                                    attrs: episode
+                                                        .attrs
+                                                        .iter()
+                                                        .filter(|(k, _)| {
+                                                            !is_public_technical_attr(k)
+                                                        })
+                                                        .map(|(k, v)| (k.clone(), v.clone()))
+                                                        .collect(),
+                                                    embedding: episode.embedding.clone(),
+                                                };
+                                                let encoded = match bincode::serde::encode_to_vec(
+                                                    &sensitive,
+                                                    BINCODE_CFG,
+                                                ) {
+                                                    Ok(v) => v,
+                                                    Err(e) => {
+                                                        let _ = resp_tx.send(Err(
+                                                            HeraclitusError::Serialization(
+                                                                e.to_string(),
+                                                            ),
+                                                        ));
+                                                        continue;
+                                                    }
+                                                };
+                                                let sealed_fields = heraclitus_crypto::seal(
+                                                    &key,
+                                                    &encoded,
+                                                    &fields_aad(&episode.agent_id),
+                                                );
+                                                let mut attrs = public_attrs;
+                                                attrs.insert(
+                                                    ENCRYPTED_FIELDS_ATTR.into(),
+                                                    hex_encode(&sealed_fields),
+                                                );
+                                                (crypto_scratch.clone(), attrs, None)
+                                            }
+                                            Err(e) => {
+                                                let _ = resp_tx.send(Err(HeraclitusError::Crypto(
+                                                    format!("Keystore Isolation Fault: {e:?}"),
+                                                )));
+                                                continue;
+                                            }
+                                        },
+                                        None => (
+                                            episode.content.clone(),
+                                            episode.attrs.clone(),
+                                            episode.embedding.clone(),
+                                        ),
+                                    };
 
                                 let storage_payload = StoragePayload {
                                     opaque_meta: *opaque_meta,
@@ -670,9 +764,9 @@ impl Log {
                                     session_id: episode.session_id.clone(),
                                     ts_hlc: episode.ts_hlc,
                                     kind: episode.kind.clone(),
-                                    content: content_payload.to_vec(),
-                                    embedding: episode.embedding.clone(),
-                                    attrs: episode.attrs.clone(),
+                                    content: stored_content,
+                                    embedding: stored_embedding,
+                                    attrs: stored_attrs,
                                     parents: episode.parents.clone(),
                                     valid_from: episode.valid_from,
                                     valid_to: episode.valid_to,
@@ -711,9 +805,10 @@ impl Log {
                                     // roll.
                                     if pending_index_start < stashed_updates.len() {
                                         let cat = worker_catalog.load();
-                                        let mut entries =
-                                            Vec::with_capacity(cat.active.index.entries.len()
-                                                + (stashed_updates.len() - pending_index_start));
+                                        let mut entries = Vec::with_capacity(
+                                            cat.active.index.entries.len()
+                                                + (stashed_updates.len() - pending_index_start),
+                                        );
                                         entries.extend_from_slice(&cat.active.index.entries);
                                         for u in &stashed_updates[pending_index_start..] {
                                             entries.push(LsnEntry {
@@ -1054,7 +1149,11 @@ impl Log {
                         return self.read_at(container.meta.id, entry.offset);
                     }
                 }
-                if let Ok(j) = container.index.entries.binary_search_by_key(&lsn, |e| e.lsn) {
+                if let Ok(j) = container
+                    .index
+                    .entries
+                    .binary_search_by_key(&lsn, |e| e.lsn)
+                {
                     let entry = &container.index.entries[j];
                     return self.read_at(container.meta.id, entry.offset);
                 }
@@ -1602,31 +1701,57 @@ impl heraclitus_core::contracts::SegmentCatalog for Log {
 
 #[allow(clippy::needless_lifetimes)]
 impl Log {
-
     fn decrypt_in_place(&self, ep: &mut Episode) -> Result<(), HeraclitusError> {
         let Some(ks) = &self.keystore else {
             return Ok(());
         };
-        if !heraclitus_crypto::is_encrypted(&ep.content) {
+        let encrypted_content = heraclitus_crypto::is_encrypted(&ep.content);
+        let encrypted_fields = ep.attrs.remove(ENCRYPTED_FIELDS_ATTR);
+        if !encrypted_content && encrypted_fields.is_none() {
             return Ok(());
         }
 
-        let key = ks.get(&ep.agent_id).ok_or_else(|| {
-            HeraclitusError::Crypto(format!(
-                "Chave criptográfica ausente para o agente: {}",
-                ep.agent_id
-            ))
-        })?;
+        let Some(key) = ks.get(&ep.agent_id) else {
+            // Ausência é a semântica normal do crypto-shred, não corrupção. Não
+            // podemos abortar scan/replay no primeiro titular eliminado.
+            ep.content = heraclitus_crypto::SHREDDED.to_vec();
+            ep.embedding = None;
+            ep.attrs.retain(|k, _| is_public_technical_attr(k));
+            ep.attrs.insert(SHREDDED_ATTR.into(), "true".into());
+            return Ok(());
+        };
 
-        let opened = heraclitus_crypto::open(&key, &ep.content, ep.agent_id.as_bytes())
-            .ok_or_else(|| {
+        if encrypted_content {
+            let opened = heraclitus_crypto::open(&key, &ep.content, ep.agent_id.as_bytes())
+                .ok_or_else(|| {
+                    HeraclitusError::Crypto(format!(
+                        "Assinatura inválida detectada na cifra do agente: {}",
+                        ep.agent_id
+                    ))
+                })?;
+            ep.content = opened;
+        }
+
+        if let Some(encoded_hex) = encrypted_fields {
+            let sealed = hex_decode(&encoded_hex).ok_or_else(|| {
                 HeraclitusError::Crypto(format!(
-                    "Assinatura inválida detectada na cifra do agente: {}",
+                    "Envelope de atributos ilegível para o agente: {}",
                     ep.agent_id
                 ))
             })?;
-
-        ep.content = opened;
+            let opened = heraclitus_crypto::open(&key, &sealed, &fields_aad(&ep.agent_id))
+                .ok_or_else(|| {
+                    HeraclitusError::Crypto(format!(
+                        "Assinatura inválida no envelope de atributos do agente: {}",
+                        ep.agent_id
+                    ))
+                })?;
+            let (sensitive, _): (SensitiveFields, usize) =
+                bincode::serde::decode_from_slice(&opened, BINCODE_CFG)
+                    .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+            ep.attrs.extend(sensitive.attrs);
+            ep.embedding = sensitive.embedding;
+        }
         Ok(())
     }
 }

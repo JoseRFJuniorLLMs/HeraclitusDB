@@ -137,5 +137,4 @@ mod tests {
         assert_ne!(t, 0, "nunca dá wrap para zero");
         assert!(hlc.now() >= t, "continua não-decrescente");
     }
-
 }

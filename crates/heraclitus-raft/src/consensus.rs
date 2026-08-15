@@ -40,9 +40,8 @@ use openraft::raft::{
 };
 use openraft::storage::{LogFlushed, LogState, RaftLogStorage, RaftStateMachine, Snapshot};
 use openraft::{
-    StorageIOError,
     BasicNode, Entry, EntryPayload, LogId, RaftLogReader, RaftNetwork, RaftNetworkFactory,
-    RaftSnapshotBuilder, SnapshotMeta, StorageError, StoredMembership, Vote,
+    RaftSnapshotBuilder, SnapshotMeta, StorageError, StorageIOError, StoredMembership, Vote,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
@@ -259,11 +258,13 @@ impl EpisodeStateMachine {
         // episódios em falta nunca eram re-aplicados (divergência SILENCIOSA).
         // Falhar ALTO (como o caminho de meta-corrompido) é a postura segura.
         if head < meta.normals {
-            return Err(StorageError::from(StorageIOError::read(Self::io_err(format!(
+            return Err(StorageError::from(StorageIOError::read(Self::io_err(
+                format!(
                 "state-machine à frente do log (normals={} > head={}): crash na janela de fsync. \
                  Recupere de um snapshot, ou use FsyncPolicy::Always sob replicação.",
                 meta.normals, head
-            )))));
+            ),
+            ))));
         }
         let skip_normals = head - meta.normals;
         Ok(Self {
@@ -300,7 +301,9 @@ impl EpisodeStateMachine {
     /// Persiste o meta da máquina de forma atómica (tmp+rename+fsync). Chamado
     /// no fim de cada batch de apply, DEPOIS de os episódios estarem em disco.
     fn persist_sm_meta(&self, st: &SmState) -> Result<(), StorageError<NodeId>> {
-        let Some(dir) = &self.sm_dir else { return Ok(()) };
+        let Some(dir) = &self.sm_dir else {
+            return Ok(());
+        };
         let meta = SmMeta {
             applied: st.applied,
             membership: st.membership.clone(),
@@ -363,9 +366,8 @@ impl RaftSnapshotBuilder<TypeConfig> for EpisodeStateMachine {
             };
             for (_, ep) in &batch {
                 payload.push(
-                    bincode::serde::encode_to_vec(ep, BINCODE_CFG).map_err(|e| {
-                        StorageError::from(StorageIOError::read(Self::io_err(e)))
-                    })?,
+                    bincode::serde::encode_to_vec(ep, BINCODE_CFG)
+                        .map_err(|e| StorageError::from(StorageIOError::read(Self::io_err(e))))?,
                 );
             }
             cur = last + 1;
@@ -430,19 +432,28 @@ impl RaftStateMachine<TypeConfig> for EpisodeStateMachine {
                     } else {
                         let (ep, _): (Episode, usize) =
                             bincode::serde::decode_from_slice(bytes, BINCODE_CFG).map_err(|e| {
-                                StorageError::from(StorageIOError::apply(entry.log_id, Self::io_err(e)))
+                                StorageError::from(StorageIOError::apply(
+                                    entry.log_id,
+                                    Self::io_err(e),
+                                ))
                             })?;
                         let lsn = self.log.head();
                         // Só clonamos quando há hook (o host quer indexar). O
                         // hook corre síncrono com o apply ⇒ read-your-writes.
                         if let Some(hook) = &self.on_apply {
                             self.log.append_replicated(lsn, ep.clone()).map_err(|e| {
-                                StorageError::from(StorageIOError::apply(entry.log_id, Self::io_err(e)))
+                                StorageError::from(StorageIOError::apply(
+                                    entry.log_id,
+                                    Self::io_err(e),
+                                ))
                             })?;
                             hook(lsn, &ep);
                         } else {
                             self.log.append_replicated(lsn, ep).map_err(|e| {
-                                StorageError::from(StorageIOError::apply(entry.log_id, Self::io_err(e)))
+                                StorageError::from(StorageIOError::apply(
+                                    entry.log_id,
+                                    Self::io_err(e),
+                                ))
                             })?;
                         }
                         lsn
@@ -587,13 +598,9 @@ impl Router {
                 "link {from}->{to} particionado"
             ))));
         }
-        inner
-            .targets
-            .get(&to)
-            .cloned()
-            .ok_or_else(|| {
-                Unreachable::new(&std::io::Error::other(format!("nó {to} não registado")))
-            })
+        inner.targets.get(&to).cloned().ok_or_else(|| {
+            Unreachable::new(&std::io::Error::other(format!("nó {to} não registado")))
+        })
     }
 }
 
@@ -626,9 +633,11 @@ impl RaftNetwork<TypeConfig> for RouterConnection {
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>>
-    {
-        let raft = self.router.conn(self.from, self.target).map_err(RPCError::Unreachable)?;
+    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
+        let raft = self
+            .router
+            .conn(self.from, self.target)
+            .map_err(RPCError::Unreachable)?;
         raft.append_entries(rpc)
             .await
             .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
@@ -642,7 +651,10 @@ impl RaftNetwork<TypeConfig> for RouterConnection {
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
     > {
-        let raft = self.router.conn(self.from, self.target).map_err(RPCError::Unreachable)?;
+        let raft = self
+            .router
+            .conn(self.from, self.target)
+            .map_err(RPCError::Unreachable)?;
         raft.install_snapshot(rpc)
             .await
             .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
@@ -653,7 +665,10 @@ impl RaftNetwork<TypeConfig> for RouterConnection {
         rpc: VoteRequest<NodeId>,
         _option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        let raft = self.router.conn(self.from, self.target).map_err(RPCError::Unreachable)?;
+        let raft = self
+            .router
+            .conn(self.from, self.target)
+            .map_err(RPCError::Unreachable)?;
         raft.vote(rpc)
             .await
             .map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
@@ -817,7 +832,11 @@ mod tests {
     }
 
     fn ep(i: u64) -> Episode {
-        Episode::new("cluster", EventKind::Observation, format!("acked-{i}").into_bytes())
+        Episode::new(
+            "cluster",
+            EventKind::Observation,
+            format!("acked-{i}").into_bytes(),
+        )
     }
 
     async fn three_nodes() -> (Vec<ConsensusNode>, Router, Vec<tempfile::TempDir>) {
@@ -836,8 +855,9 @@ mod tests {
             nodes.push(spawn_node(id, log, &router, cfg.clone()).await.unwrap());
             dirs.push(dir);
         }
-        let members: BTreeMap<NodeId, BasicNode> =
-            (0..3).map(|i| (i, BasicNode::new(format!("node-{i}")))).collect();
+        let members: BTreeMap<NodeId, BasicNode> = (0..3)
+            .map(|i| (i, BasicNode::new(format!("node-{i}"))))
+            .collect();
         nodes[0].raft.initialize(members).await.unwrap();
         (nodes, router, dirs)
     }
@@ -949,7 +969,11 @@ mod tests {
             }
             g.state_hash()
         };
-        let (h0, h1, h2) = (hash_of(&nodes[0].log), hash_of(&nodes[1].log), hash_of(&nodes[2].log));
+        let (h0, h1, h2) = (
+            hash_of(&nodes[0].log),
+            hash_of(&nodes[1].log),
+            hash_of(&nodes[2].log),
+        );
         assert_eq!(h0, h1, "view derivada do nó 1 ≡ nó 0, bit a bit");
         assert_eq!(h1, h2, "view derivada do nó 2 ≡ nó 1, bit a bit");
     }
@@ -1119,7 +1143,12 @@ mod tests {
         wait_all_applied(&nodes, i2).await;
 
         for n in &nodes {
-            assert_eq!(n.log.head(), 3, "nó {}: 3 writes através de 2 failovers", n.id);
+            assert_eq!(
+                n.log.head(),
+                3,
+                "nó {}: 3 writes através de 2 failovers",
+                n.id
+            );
         }
         assert!(logs_equivalent(&nodes[0].log, &nodes[1].log).unwrap());
         assert!(logs_equivalent(&nodes[1].log, &nodes[2].log).unwrap());
@@ -1149,8 +1178,17 @@ mod tests {
         let mut src = EpisodeStateMachine::new(src_log.clone());
         src.apply(mk_entries(10)).await.unwrap();
         assert_eq!(src_log.head(), 10);
-        let snap = src.get_snapshot_builder().await.build_snapshot().await.unwrap();
-        assert_eq!(snap.meta.last_log_id.unwrap().index, 10, "meta consistente com o applied");
+        let snap = src
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        assert_eq!(
+            snap.meta.last_log_id.unwrap().index,
+            10,
+            "meta consistente com o applied"
+        );
 
         // Nó destino vazio COM hook: o install_snapshot tem de disparar o hook
         // para cada episódio entregue — senão o nó apanharia o log mas não
@@ -1160,21 +1198,39 @@ mod tests {
         let hc = hook_fires.clone();
         let dst_dir = tempfile::tempdir().unwrap();
         let dst_log = Arc::new(Log::open(dst_dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
-        let mut dst = EpisodeStateMachine::new(dst_log.clone())
-            .with_apply_hook(Arc::new(move |_lsn, _ep| {
+        let mut dst = EpisodeStateMachine::new(dst_log.clone()).with_apply_hook(Arc::new(
+            move |_lsn, _ep| {
                 hc.fetch_add(1, Ordering::SeqCst);
-            }));
-        dst.install_snapshot(&snap.meta, snap.snapshot).await.unwrap();
+            },
+        ));
+        dst.install_snapshot(&snap.meta, snap.snapshot)
+            .await
+            .unwrap();
         assert_eq!(dst_log.head(), 10, "install reconstrói os 10 episódios");
-        assert_eq!(hook_fires.load(Ordering::SeqCst), 10, "o hook indexa os 10 do snapshot");
+        assert_eq!(
+            hook_fires.load(Ordering::SeqCst),
+            10,
+            "o hook indexa os 10 do snapshot"
+        );
         assert!(logs_equivalent(&src_log, &dst_log).unwrap());
 
         // Reinstalar é idempotente — o skip de prefixo não duplica NEM re-dispara
         // o hook para o prefixo já presente.
-        let snap2 = src.get_snapshot_builder().await.build_snapshot().await.unwrap();
-        dst.install_snapshot(&snap2.meta, snap2.snapshot).await.unwrap();
+        let snap2 = src
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        dst.install_snapshot(&snap2.meta, snap2.snapshot)
+            .await
+            .unwrap();
         assert_eq!(dst_log.head(), 10, "reinstalar não duplica episódios");
-        assert_eq!(hook_fires.load(Ordering::SeqCst), 10, "prefixo já presente não re-indexa");
+        assert_eq!(
+            hook_fires.load(Ordering::SeqCst),
+            10,
+            "prefixo já presente não re-indexa"
+        );
         assert!(logs_equivalent(&src_log, &dst_log).unwrap());
     }
 
@@ -1195,10 +1251,9 @@ mod tests {
         let last_index = {
             let router = Router::new();
             let log = Arc::new(Log::open(&log_dir, 1 << 20, FsyncPolicy::Always).unwrap());
-            let node =
-                spawn_node_durable(0, log.clone(), &router, cfg.clone(), &raft_dir, &sm_dir)
-                    .await
-                    .unwrap();
+            let node = spawn_node_durable(0, log.clone(), &router, cfg.clone(), &raft_dir, &sm_dir)
+                .await
+                .unwrap();
             node.raft
                 .initialize(BTreeMap::from([(0u64, BasicNode::new("n0"))]))
                 .await
@@ -1244,7 +1299,10 @@ mod tests {
         // Continua a servir: um novo write comita e a sequência de LSN densos
         // continua exatamente onde estava (5) — sem buraco, sem repetição.
         let r = node.raft.client_write(episode_bytes(&ep(5))).await.unwrap();
-        assert!(r.log_id.index > last_index, "o raft-log avançou do ponto durável");
+        assert!(
+            r.log_id.index > last_index,
+            "o raft-log avançou do ponto durável"
+        );
         assert_eq!(r.data, 5, "LSN denso continua a sequência (0..5)");
         assert_eq!(log.head(), 6, "5 recuperados + 1 novo");
     }
@@ -1282,8 +1340,9 @@ mod tests {
             );
             dirs.push(dir);
         }
-        let members: BTreeMap<NodeId, BasicNode> =
-            (0..3).map(|i| (i, BasicNode::new(format!("n{i}")))).collect();
+        let members: BTreeMap<NodeId, BasicNode> = (0..3)
+            .map(|i| (i, BasicNode::new(format!("n{i}"))))
+            .collect();
         nodes[0].raft.initialize(members).await.unwrap();
         let leader = wait_leader(&nodes).await;
 
@@ -1337,7 +1396,12 @@ mod tests {
 
         // Força um snapshot no líder e purga o raft-log até esse ponto: as
         // entradas que o seguidor atrasado precisa DEIXAM de existir como log.
-        nodes[leader_id as usize].raft.trigger().snapshot().await.unwrap();
+        nodes[leader_id as usize]
+            .raft
+            .trigger()
+            .snapshot()
+            .await
+            .unwrap();
         nodes[leader_id as usize]
             .raft
             .wait(Some(Duration::from_secs(10)))
@@ -1347,7 +1411,12 @@ mod tests {
             )
             .await
             .unwrap();
-        nodes[leader_id as usize].raft.trigger().purge_log(last).await.unwrap();
+        nodes[leader_id as usize]
+            .raft
+            .trigger()
+            .purge_log(last)
+            .await
+            .unwrap();
 
         // Cura o link: o seguidor está a ~0, mas o log do líder já não tem as
         // entradas antigas ⇒ o openraft manda-lhe um snapshot.

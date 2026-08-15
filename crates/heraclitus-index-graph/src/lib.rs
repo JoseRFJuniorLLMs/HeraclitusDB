@@ -116,7 +116,7 @@ impl GraphIndex {
         for (i, ev) in self.dense.events().iter().enumerate() {
             h.update(&(i as u32).to_be_bytes());
             h.update(&ev.0.to_bytes()); // 16-byte ULID identity
-            // Children (out-edges) resolved to dense internal ids, then sorted.
+                                        // Children (out-edges) resolved to dense internal ids, then sorted.
             let mut outs: Vec<u32> = self
                 .out
                 .get(ev)

@@ -20,7 +20,9 @@ pub struct Versioned<T> {
 
 impl<T> Versioned<T> {
     pub fn new(value: T) -> Self {
-        Self { inner: RwLock::new(Arc::new(value)) }
+        Self {
+            inner: RwLock::new(Arc::new(value)),
+        }
     }
 
     /// Reader: take a snapshot handle to the current version. Holding it keeps
@@ -50,7 +52,7 @@ mod tests {
         let v = Versioned::new(vec![1, 2, 3]);
         let old = v.load(); // reader pins version 1
         v.store(vec![9, 9]); // writer publishes version 2
-        // The old handle is unchanged — no torn read, no use-after-free.
+                             // The old handle is unchanged — no torn read, no use-after-free.
         assert_eq!(*old, vec![1, 2, 3]);
         // A fresh load sees the new version.
         assert_eq!(*v.load(), vec![9, 9]);

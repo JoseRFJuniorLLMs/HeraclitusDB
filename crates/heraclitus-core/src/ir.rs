@@ -21,17 +21,31 @@ pub enum LogicalPlan {
         /// always produced per group.
         aggregate: Option<(Vec<u32>, Vec<u32>)>,
     },
-    GraphMatch { pattern_id: u32 },
-    TraceProvenance { target: EventId },
+    GraphMatch {
+        pattern_id: u32,
+    },
+    TraceProvenance {
+        target: EventId,
+    },
 }
 
 /// Low-level operator interpreted by the vectorized runtime.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PhysicalIr {
-    ColumnScan { projection: Vec<u32> },
-    VectorFilter { predicate_id: u32 },
-    HashJoin { left_key: u32, right_key: u32 },
-    VectorAggregate { keys: Vec<u32>, aggregations: Vec<u32> },
+    ColumnScan {
+        projection: Vec<u32>,
+    },
+    VectorFilter {
+        predicate_id: u32,
+    },
+    HashJoin {
+        left_key: u32,
+        right_key: u32,
+    },
+    VectorAggregate {
+        keys: Vec<u32>,
+        aggregations: Vec<u32>,
+    },
 }
 
 /// Sparse dependency lowering for the provenance/explain engine (Compiler 2).
@@ -52,7 +66,11 @@ pub struct ExecutionNode {
 
 impl ExecutionNode {
     pub fn new(node_id: u64, operation: PhysicalIr, dependencies: Vec<u64>) -> Self {
-        Self { node_id, operation, dependencies }
+        Self {
+            node_id,
+            operation,
+            dependencies,
+        }
     }
 }
 
@@ -89,14 +107,35 @@ mod tests {
     #[test]
     fn well_formed_dag_accepted_cycle_rejected() {
         let mut p = PhysicalPlan::default();
-        p.push(ExecutionNode::new(0, PhysicalIr::ColumnScan { projection: vec![0, 1] }, vec![]));
-        p.push(ExecutionNode::new(1, PhysicalIr::VectorFilter { predicate_id: 7 }, vec![0]));
-        p.push(ExecutionNode::new(2, PhysicalIr::VectorAggregate { keys: vec![0], aggregations: vec![1] }, vec![1]));
+        p.push(ExecutionNode::new(
+            0,
+            PhysicalIr::ColumnScan {
+                projection: vec![0, 1],
+            },
+            vec![],
+        ));
+        p.push(ExecutionNode::new(
+            1,
+            PhysicalIr::VectorFilter { predicate_id: 7 },
+            vec![0],
+        ));
+        p.push(ExecutionNode::new(
+            2,
+            PhysicalIr::VectorAggregate {
+                keys: vec![0],
+                aggregations: vec![1],
+            },
+            vec![1],
+        ));
         assert!(p.is_well_formed());
 
         // Forward reference (node 0 depends on not-yet-defined node 9) → invalid.
         let mut bad = PhysicalPlan::default();
-        bad.push(ExecutionNode::new(0, PhysicalIr::ColumnScan { projection: vec![] }, vec![9]));
+        bad.push(ExecutionNode::new(
+            0,
+            PhysicalIr::ColumnScan { projection: vec![] },
+            vec![9],
+        ));
         assert!(!bad.is_well_formed());
     }
 }

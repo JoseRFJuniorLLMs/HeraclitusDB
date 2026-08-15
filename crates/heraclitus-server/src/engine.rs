@@ -28,6 +28,12 @@ use heraclitus_views::{View, ViewRegistry};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// Reserved technical attributes used to make external delivery exactly-once.
+/// They remain outside the encrypted attribute envelope so retries can still be
+/// identified after a subject has been crypto-shredded.
+pub const IDEMPOTENCY_KEY_ATTR: &str = "__heraclitus_idempotency_key";
+pub const IDEMPOTENCY_HASH_ATTR: &str = "__heraclitus_idempotency_hash";
+
 pub struct Engine {
     pub log: Arc<Log>,
     pub memtable: Arc<Memtable>,
@@ -69,6 +75,10 @@ pub struct Engine {
     /// R16: serializa o par (ler head → append) das escritas H-VM, para que
     /// dois upserts concorrentes nunca carimbem o mesmo lsn na VmInstruction.
     hvm_lock: Mutex<()>,
+    /// Serializa check+append de uma chave externa. O índice de atributos é
+    /// persistente/reconstruível pelo log, portanto isto fecha tanto corridas
+    /// concorrentes quanto retries depois de crash/restart.
+    idempotency_lock: Mutex<()>,
 }
 
 /// Contrato de encaminhamento de escritas pelo consenso. Implementado pelo
@@ -149,6 +159,11 @@ impl Engine {
         // Bulk-ingest: appends gravam só no log. Implica pular o replay no boot.
         let log_only = truthy("HERACLITUS_LOG_ONLY");
         let skip_replay = log_only || truthy("HERACLITUS_SKIP_VIEW_REPLAY");
+        let privacy_rebuild_marker = config
+            .data_dir
+            .join("views")
+            .join("privacy-rebuild-required");
+        let privacy_rebuild = privacy_rebuild_marker.exists();
 
         // Encryption at rest (§3.10): when enabled, the log seals episode
         // content with a per-agent key kept under `<data_dir>/keys`.
@@ -160,6 +175,11 @@ impl Engine {
         } else {
             None
         };
+        if privacy_rebuild && keystore.is_none() {
+            return Err(HeraclitusError::Config(
+                "privacy-rebuild-required existe, mas encryption_at_rest está desligado".into(),
+            ));
+        }
 
         let log = {
             let p = boot.phase("Log append-only (a fonte da verdade)");
@@ -244,7 +264,11 @@ impl Engine {
             registry.register(Box::new(Shared(tgraph.clone())));
             registry.register(Box::new(Shared(entity.clone())));
             registry.register(Box::new(Shared(activation.clone())));
-            if skip_replay {
+            if privacy_rebuild {
+                registry.rebuild(&log, None)?;
+                registry.checkpoint()?;
+                p.ok("rebuild integral obrigatório pós-shred concluído");
+            } else if skip_replay {
                 // As views ficam VAZIAS — os watermarks carregados do disco
                 // deixam de as descrever. Mantê-los fazia um checkpoint
                 // posterior (periódico ou de shutdown) gravar snapshots vazios
@@ -275,7 +299,11 @@ impl Engine {
         let attr_dir = config.data_dir.join("views");
         let attr = {
             let p = boot.phase("Índice de atributos (campo → LSN)");
-            let attr = Arc::new(Mutex::new(AttrIndex::open(&attr_dir)));
+            let attr = Arc::new(Mutex::new(if privacy_rebuild {
+                AttrIndex::new()
+            } else {
+                AttrIndex::open(&attr_dir)
+            }));
             let keys = {
                 let mut idx = attr.lock().unwrap();
                 if !skip_replay {
@@ -327,7 +355,7 @@ impl Engine {
                 .unwrap_or(0),
         );
 
-        Ok(Self {
+        let engine = Self {
             log,
             memtable: Arc::new(Memtable::new(config.memtable_cap)),
             views: Mutex::new(registry),
@@ -345,11 +373,17 @@ impl Engine {
             audit_queries: config.audit_queries,
             replication: std::sync::OnceLock::new(),
             hvm_lock: Mutex::new(()),
+            idempotency_lock: Mutex::new(()),
             #[cfg(feature = "tier")]
             cold_tier_path: config.cold_tier_path.clone(),
             #[cfg(feature = "distill")]
             distill_cursor,
-        })
+        };
+        if privacy_rebuild {
+            engine.attr.lock().unwrap().save(&engine.attr_dir)?;
+            std::fs::remove_file(&privacy_rebuild_marker)?;
+        }
+        Ok(engine)
     }
 
     /// Ativa a replicação: a partir daqui `append` encaminha pelo consenso.
@@ -379,7 +413,7 @@ impl Engine {
     /// Meta-auditoria: regista a execução de uma query como EVENTO no log
     /// (best-effort — auditar nunca pode falhar a query auditada). O texto é
     /// truncado para não inchar o log com queries gigantes.
-    pub fn audit_query(&self, gql: &str, ok: bool) {
+    pub fn audit_query(&self, gql: &str, ok: bool, principal: &str) {
         if !self.audit_queries {
             return;
         }
@@ -393,6 +427,25 @@ impl Engine {
             text.into_bytes(),
         );
         e.attrs.insert("audit".into(), "query".into());
+        e.attrs.insert("principal".into(), principal.into());
+        e.attrs
+            .insert("ok".into(), if ok { "true".into() } else { "false".into() });
+        let _ = self.append(e);
+    }
+
+    /// Registra toda tentativa de operação administrativa, inclusive falhas.
+    pub fn audit_admin(&self, operation: &str, ok: bool, principal: &str) {
+        if !self.audit_queries {
+            return;
+        }
+        let mut e = Episode::new(
+            "heraclitus-audit",
+            EventKind::Custom("AuditAdmin".into()),
+            operation.as_bytes().to_vec(),
+        );
+        e.attrs.insert("audit".into(), "admin".into());
+        e.attrs.insert("principal".into(), principal.into());
+        e.attrs.insert("operation".into(), operation.into());
         e.attrs
             .insert("ok".into(), if ok { "true".into() } else { "false".into() });
         let _ = self.append(e);
@@ -539,7 +592,11 @@ impl Engine {
 
     /// Ids dos segmentos selados — candidatos a demote para o cold tier.
     pub fn sealed_segment_ids(&self) -> Vec<SegmentId> {
-        self.log.sealed_segments().into_iter().map(|s| s.id).collect()
+        self.log
+            .sealed_segments()
+            .into_iter()
+            .map(|s| s.id)
+            .collect()
     }
 
     /// Demote um segmento selado para o cold tier (object store local em
@@ -651,7 +708,9 @@ impl Engine {
     /// num Vec — a mesma classe do R9/R10; op de manutenção não é desculpa
     /// para um alloc proporcional ao log).
     #[cfg(feature = "tier")]
-    pub fn demotion_receipts(&self) -> Result<Vec<heraclitus_tier::DemotionReceipt>, HeraclitusError> {
+    pub fn demotion_receipts(
+        &self,
+    ) -> Result<Vec<heraclitus_tier::DemotionReceipt>, HeraclitusError> {
         let head = self.log.head();
         let mut out = Vec::new();
         let mut cur = 0u64;
@@ -717,20 +776,14 @@ impl Engine {
         if from >= head {
             return Ok(Vec::new());
         }
-        let episodes = self.log.scan_capped(
-            from,
-            head,
-            heraclitus_query::backend::QUERY_SCAN_CAP,
-        )?;
+        let episodes =
+            self.log
+                .scan_capped(from, head, heraclitus_query::backend::QUERY_SCAN_CAP)?;
         // Fronteira coberta: o próximo tick continua daqui (não do head, para o
         // caso de o cap ter truncado a janela).
-        let next_cursor = episodes
-            .last()
-            .map(|(l, _)| l + 1)
-            .unwrap_or(head);
+        let next_cursor = episodes.last().map(|(l, _)| l + 1).unwrap_or(head);
 
-        let distiller =
-            heraclitus_distill::Distiller::new(self.metric.clone(), cfg.clone());
+        let distiller = heraclitus_distill::Distiller::new(self.metric.clone(), cfg.clone());
         let facts = distiller.distill_episodes(&episodes, head)?;
         let mut out = Vec::with_capacity(facts.len());
         for ev in facts {
@@ -752,12 +805,66 @@ impl Engine {
     /// sealed content becomes permanently unreadable. The log is never mutated.
     /// Errors if encryption at rest is disabled.
     pub fn shred(&self, agent_id: &str) -> Result<bool, HeraclitusError> {
-        match &self.keystore {
-            Some(ks) => Ok(ks.shred(agent_id)?),
-            None => Err(HeraclitusError::Config(
-                "encryption at rest is disabled; nothing to shred".into(),
-            )),
+        let ks = self.keystore.as_ref().ok_or_else(|| {
+            HeraclitusError::Config("encryption at rest is disabled; nothing to shred".into())
+        })?;
+        std::fs::create_dir_all(&self.attr_dir)?;
+        let marker = self.attr_dir.join("privacy-rebuild-required");
+        let recovery_pending = marker.exists();
+        if !recovery_pending {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&marker)?;
+            f.write_all(b"rebuild all derived state before serving\n")?;
+            f.sync_all()?;
         }
+
+        let destroyed = ks.shred(agent_id)?;
+        if !destroyed && !recovery_pending {
+            // Sem chave e sem operação interrompida: idempotência normal.
+            let _ = std::fs::remove_file(&marker);
+            return Ok(false);
+        }
+
+        self.memtable.clear();
+        {
+            let mut views = self.views.lock().unwrap();
+            views.rebuild(&self.log, None)?;
+            views.checkpoint()?;
+        }
+
+        let mut rebuilt = AttrIndex::new();
+        let head = self.log.head();
+        let mut cur = 0u64;
+        while cur <= head {
+            let batch = self.log.scan_capped(cur, head.saturating_add(1), 100_000)?;
+            let Some(&(last, _)) = batch.last() else {
+                break;
+            };
+            for (lsn, ep) in &batch {
+                if !vm_bridge::is_hvm(ep) {
+                    rebuilt.apply(*lsn, ep);
+                }
+            }
+            cur = last.saturating_add(1);
+        }
+        rebuilt.save(&self.attr_dir)?;
+        *self.attr.lock().unwrap() = rebuilt;
+
+        let subject_hash = blake3::hash(agent_id.as_bytes()).to_hex().to_string();
+        let mut receipt = Episode::new(
+            "heraclitus-privacy",
+            EventKind::Custom("PrivacyErasureReceipt".into()),
+            b"derived state rebuilt after crypto-shred".to_vec(),
+        );
+        receipt
+            .attrs
+            .insert("subject_key_hash".into(), subject_hash);
+        receipt
+            .attrs
+            .insert("operation".into(), "crypto-shred".into());
+        self.append(receipt)?;
+        std::fs::remove_file(marker)?;
+        Ok(destroyed || recovery_pending)
     }
 
     /// Append + synchronously index into memtable AND views.
@@ -776,7 +883,127 @@ impl Engine {
                 vm_bridge::HVM_KIND
             )));
         }
+        if episode.attrs.contains_key(IDEMPOTENCY_KEY_ATTR)
+            || episode.attrs.contains_key(IDEMPOTENCY_HASH_ATTR)
+        {
+            return Err(HeraclitusError::Query(
+                "atributos de idempotência são reservados; use AppendRequest.idempotency_key"
+                    .into(),
+            ));
+        }
         self.append_internal(episode)
+    }
+
+    /// Exactly-once lógico para produtores externos.
+    ///
+    /// O primeiro request grava a chave e um hash canónico do payload no mesmo
+    /// episódio. Um retry byte-equivalente recebe o LSN original; a mesma chave
+    /// com dados diferentes é recusada explicitamente. O lock cobre a janela
+    /// check→append no líder. Depois de restart o índice é reconstruído do log.
+    pub fn append_idempotent(
+        &self,
+        mut episode: Episode,
+        key: &str,
+    ) -> Result<(Lsn, bool, String), HeraclitusError> {
+        if key.is_empty() {
+            let lsn = self.append(episode)?;
+            let id = self
+                .log
+                .read(lsn)?
+                .ok_or_else(|| HeraclitusError::Corruption {
+                    context: "append response".into(),
+                    detail: format!("LSN {lsn} não pôde ser relido"),
+                })?
+                .1
+                .id
+                .to_string();
+            return Ok((lsn, false, id));
+        }
+        if self.log_only {
+            return Err(HeraclitusError::Config(
+                "Append idempotente não é permitido em HERACLITUS_LOG_ONLY".into(),
+            ));
+        }
+        if key.len() > 80
+            || !key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.'))
+        {
+            return Err(HeraclitusError::Query(
+                "idempotency_key deve ter 1..80 caracteres ASCII [A-Za-z0-9._:-]".into(),
+            ));
+        }
+        if vm_bridge::is_hvm(&episode) {
+            return Err(HeraclitusError::Query(format!(
+                "o kind '{}' é reservado ao ledger H-VM",
+                vm_bridge::HVM_KIND
+            )));
+        }
+        if episode.attrs.contains_key(IDEMPOTENCY_KEY_ATTR)
+            || episode.attrs.contains_key(IDEMPOTENCY_HASH_ATTR)
+        {
+            return Err(HeraclitusError::Query(
+                "atributos de idempotência são reservados".into(),
+            ));
+        }
+
+        // EventId/ts_hlc são gerados pelo destino e não participam do hash: um
+        // retry legítimo cria um Episode novo antes de chegar aqui.
+        let canonical = serde_json::to_vec(&(
+            &episode.agent_id,
+            &episode.session_id,
+            &episode.kind,
+            &episode.content,
+            &episode.embedding,
+            &episode.attrs,
+            &episode.valid_from,
+            &episode.valid_to,
+        ))
+        .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+        let payload_hash = blake3::hash(&canonical).to_hex().to_string();
+
+        let _guard = self.idempotency_lock.lock().unwrap();
+        let previous = self
+            .attr
+            .lock()
+            .unwrap()
+            .lookup(IDEMPOTENCY_KEY_ATTR, key)
+            .last()
+            .copied();
+        if let Some(lsn) = previous {
+            let (_, existing) = self
+                .log
+                .read(lsn)?
+                .ok_or_else(|| HeraclitusError::Corruption {
+                    context: "idempotency index".into(),
+                    detail: format!("LSN {lsn} ausente para a chave {key}"),
+                })?;
+            if existing.attrs.get(IDEMPOTENCY_HASH_ATTR) == Some(&payload_hash) {
+                return Ok((lsn, true, existing.id.to_string()));
+            }
+            return Err(HeraclitusError::IdempotencyConflict {
+                key: key.to_string(),
+            });
+        }
+
+        episode
+            .attrs
+            .insert(IDEMPOTENCY_KEY_ATTR.into(), key.to_string());
+        episode
+            .attrs
+            .insert(IDEMPOTENCY_HASH_ATTR.into(), payload_hash);
+        let lsn = self.append_internal(episode)?;
+        let id = self
+            .log
+            .read(lsn)?
+            .ok_or_else(|| HeraclitusError::Corruption {
+                context: "append response".into(),
+                detail: format!("LSN {lsn} não pôde ser relido"),
+            })?
+            .1
+            .id
+            .to_string();
+        Ok((lsn, false, id))
     }
 
     /// Append sem a validação de kind reservado — só para o caminho INTERNO do
@@ -1354,6 +1581,97 @@ mod tests {
         Engine::open(&cfg).unwrap()
     }
 
+    #[test]
+    fn idempotent_append_retries_return_original_lsn_and_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = "forge:0123456789abcdef";
+        let make = || {
+            let mut e = Episode::new(
+                "subject:abc",
+                EventKind::Custom("OperationalFact".into()),
+                b"same".to_vec(),
+            );
+            e.attrs.insert("fact_id".into(), "fact-1".into());
+            e
+        };
+
+        let original = {
+            let engine = engine_in(dir.path());
+            let (lsn, deduplicated, event_id) = engine.append_idempotent(make(), key).unwrap();
+            assert!(!deduplicated);
+            let head = engine.snapshot();
+            let retry = engine.append_idempotent(make(), key).unwrap();
+            assert_eq!(retry.0, lsn);
+            assert!(retry.1);
+            assert_eq!(retry.2, event_id);
+            assert_eq!(engine.snapshot(), head, "retry não pode avançar o log");
+
+            let mut conflicting = make();
+            conflicting.content = b"different".to_vec();
+            assert!(matches!(
+                engine.append_idempotent(conflicting, key),
+                Err(HeraclitusError::IdempotencyConflict { .. })
+            ));
+            lsn
+        };
+
+        let reopened = engine_in(dir.path());
+        let retry = reopened.append_idempotent(make(), key).unwrap();
+        assert_eq!(
+            (retry.0, retry.1),
+            (original, true),
+            "o índice reconstruído do log tem de deduplicar depois de restart"
+        );
+    }
+
+    #[test]
+    fn shred_rebuilds_all_derived_state_and_queries_keep_working() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            encryption_at_rest: true,
+            ..Default::default()
+        };
+        let engine = Engine::open(&cfg).unwrap();
+        let mut event = Episode::new(
+            "titular:hmac-sha256:subject-a",
+            EventKind::Custom("OperationalFact".into()),
+            b"Carlos entrou".to_vec(),
+        );
+        event
+            .attrs
+            .insert("actor_name".into(), "Carlos Silva".into());
+        let lsn = engine.append(event).unwrap();
+        let before = heraclitus_query::execute(
+            "MATCH (n) WHERE n.actor_name = \"Carlos Silva\" RETURN n",
+            &engine,
+        )
+        .unwrap();
+        assert_eq!(before.as_array().unwrap().len(), 1);
+
+        assert!(engine.shred("titular:hmac-sha256:subject-a").unwrap());
+        let after = heraclitus_query::execute(
+            "MATCH (n) WHERE n.actor_name = \"Carlos Silva\" RETURN n",
+            &engine,
+        )
+        .unwrap();
+        assert!(after.as_array().unwrap().is_empty());
+        let (_, shredded) = engine.log.read(lsn).unwrap().unwrap();
+        assert_eq!(shredded.content, heraclitus_crypto::SHREDDED);
+        assert!(!engine.attr_dir.join("privacy-rebuild-required").exists());
+        drop(engine);
+
+        let reopened = Engine::open(&cfg).unwrap();
+        let after_restart = heraclitus_query::execute(
+            "MATCH (n) WHERE n.actor_name = \"Carlos Silva\" RETURN n",
+            &reopened,
+        )
+        .unwrap();
+        assert!(after_restart.as_array().unwrap().is_empty());
+        assert!(reopened.log.read(lsn).unwrap().is_some());
+    }
+
     /// §3.9/§2.6 — a task de distill consolida clusters em Facts pelo caminho
     /// unificado (Engine::append): os Facts ficam indexados AO VIVO (state_hash
     /// do grafo idêntico vivo vs reopen), o cursor evita re-emissão, e episódios
@@ -1370,7 +1688,11 @@ mod tests {
         };
         let obs = |text: &str, x: f32| {
             let mut e = Episode::new("agent", EventKind::Observation, text.as_bytes().to_vec());
-            e.embedding = Some(ProductPoint { hyp: vec![x, 0.0], sph: vec![], euc: vec![] });
+            e.embedding = Some(ProductPoint {
+                hyp: vec![x, 0.0],
+                sph: vec![],
+                euc: vec![],
+            });
             e
         };
 
@@ -1379,7 +1701,9 @@ mod tests {
             let engine = Engine::open(&cfg).unwrap();
             // Cluster apertado de "gato" + um outlier longe.
             for i in 0..4 {
-                engine.append(obs(&format!("gato {i}"), 0.60 + i as f32 * 0.01)).unwrap();
+                engine
+                    .append(obs(&format!("gato {i}"), 0.60 + i as f32 * 0.01))
+                    .unwrap();
             }
             engine.append(obs("galaxia distante", -0.7)).unwrap();
 
@@ -1387,16 +1711,29 @@ mod tests {
             assert_eq!(facts.len(), 1, "exatamente um cluster estável vira Fact");
             let (_, ev) = engine.log.read(facts[0]).unwrap().unwrap();
             assert_eq!(ev.kind, EventKind::FactDerived);
-            assert_eq!(ev.parents.len(), 4, "proveniência = os 4 episódios do cluster");
+            assert_eq!(
+                ev.parents.len(),
+                4,
+                "proveniência = os 4 episódios do cluster"
+            );
 
             // Cursor: sem episódios novos, o 2º tick não re-emite nada.
-            assert!(engine.distill_tick(&dcfg).unwrap().is_empty(), "cursor evita re-emissão");
+            assert!(
+                engine.distill_tick(&dcfg).unwrap().is_empty(),
+                "cursor evita re-emissão"
+            );
 
             // Episódios novos ⇒ o 3º tick consolida um Fact novo.
             for i in 0..3 {
-                engine.append(obs(&format!("chuva {i}"), -0.2 + i as f32 * 0.01)).unwrap();
+                engine
+                    .append(obs(&format!("chuva {i}"), -0.2 + i as f32 * 0.01))
+                    .unwrap();
             }
-            assert_eq!(engine.distill_tick(&dcfg).unwrap().len(), 1, "cluster novo vira Fact");
+            assert_eq!(
+                engine.distill_tick(&dcfg).unwrap().len(),
+                1,
+                "cluster novo vira Fact"
+            );
 
             engine.graph_state_hash()
         };
@@ -1410,7 +1747,10 @@ mod tests {
             "Facts do distill indexados ao vivo ≡ boot-replay"
         );
         // E o cursor persistiu: reabrir e um tick sem episódios novos é no-op.
-        assert!(engine2.distill_tick(&dcfg).unwrap().is_empty(), "cursor sobrevive ao restart");
+        assert!(
+            engine2.distill_tick(&dcfg).unwrap().is_empty(),
+            "cursor sobrevive ao restart"
+        );
     }
 
     #[test]
@@ -1488,7 +1828,10 @@ mod tests {
         engine.hvm_upsert(b"k".to_vec(), b"v".to_vec()).unwrap();
         let path = engine.hvm_checkpoint_default().unwrap();
         assert!(path.ends_with("hvm.hbt"));
-        assert!(path.starts_with(dir.path()), "checkpoint sob o data_dir: {path:?}");
+        assert!(
+            path.starts_with(dir.path()),
+            "checkpoint sob o data_dir: {path:?}"
+        );
         let tree = heraclitus_btree::BEpsilonTree::load(&path).unwrap();
         assert_eq!(tree.get(b"k"), Some(b"v".to_vec()));
     }
@@ -1526,7 +1869,11 @@ mod tests {
             live_hash, reopened_hash,
             "escritas H-VM não devem divergir o state_hash do grafo (vivo vs replay)"
         );
-        assert_eq!(engine2.hvm_state().unwrap().memory_layers.len(), 2, "ledger intacto");
+        assert_eq!(
+            engine2.hvm_state().unwrap().memory_layers.len(),
+            2,
+            "ledger intacto"
+        );
     }
 
     #[test]

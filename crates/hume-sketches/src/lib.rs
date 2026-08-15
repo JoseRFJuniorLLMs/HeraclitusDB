@@ -46,7 +46,10 @@ impl HyperLogLog {
     /// Se `p` estiver fora de `4..=16`.
     pub fn new(p: u32) -> Self {
         assert!((4..=16).contains(&p), "p tem de estar em 4..=16");
-        Self { p, registers: vec![0u8; 1usize << p] }
+        Self {
+            p,
+            registers: vec![0u8; 1usize << p],
+        }
     }
 
     /// Regista um hash de 64 bits já calculado.
@@ -127,7 +130,12 @@ impl CountMin {
     pub fn new(d: usize, w: usize) -> Self {
         assert!(d > 0 && w > 0, "d e w têm de ser > 0");
         let seeds = (0..d as u64).map(|i| splitmix64(0x1234_5678 ^ i)).collect();
-        Self { d, w, counts: vec![0u32; d * w], seeds }
+        Self {
+            d,
+            w,
+            counts: vec![0u32; d * w],
+            seeds,
+        }
     }
 
     #[inline]
@@ -151,7 +159,10 @@ impl CountMin {
 
     /// Estima a frequência de um hash (mínimo sobre as linhas).
     pub fn estimate_hash(&self, hash: u64) -> u32 {
-        (0..self.d).map(|row| self.counts[self.slot(row, hash)]).min().unwrap_or(0)
+        (0..self.d)
+            .map(|row| self.counts[self.slot(row, hash)])
+            .min()
+            .unwrap_or(0)
     }
 
     /// Estima a frequência de um inteiro.

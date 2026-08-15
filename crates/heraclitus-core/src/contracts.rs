@@ -61,7 +61,9 @@ mod tests {
 
     #[test]
     fn catalog_and_scheduler_contracts_work() {
-        let cat = DummyCatalog { segs: vec![(0, 0), (1, 10), (2, 20)] };
+        let cat = DummyCatalog {
+            segs: vec![(0, 0), (1, 10), (2, 20)],
+        };
         assert_eq!(cat.resolve_visible(15), vec![0, 1]);
 
         let sched = DummySched;

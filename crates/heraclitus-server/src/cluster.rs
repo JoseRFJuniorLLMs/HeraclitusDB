@@ -19,14 +19,17 @@ use heraclitus_raft::consensus::{
     self, episode_bytes, ApplyHook, EpisodeStateMachine, HeraclitusRaft, NodeId, SubmitOutcome,
 };
 use heraclitus_raft::durable::FileRaftLog;
-use heraclitus_raft::grpc::spawn_node_grpc_on;
+use heraclitus_raft::grpc::{spawn_node_grpc_on_tls, GrpcTlsConfig};
 use heraclitus_raft::net::spawn_node_tcp_on;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 /// Escrita a submeter: episódio + canal (std) de resposta, para o `append`
 /// síncrono do `Engine` bloquear até o consenso confirmar ou rejeitar.
-type Submit = (Episode, std::sync::mpsc::Sender<Result<Lsn, HeraclitusError>>);
+type Submit = (
+    Episode,
+    std::sync::mpsc::Sender<Result<Lsn, HeraclitusError>>,
+);
 
 /// Handle de replicação instalado no `Engine` via `set_replication`.
 pub struct ReplicationHandle {
@@ -109,20 +112,45 @@ pub async fn spawn(
                 sm,
             )
             .await
-            .map_err(|e| HeraclitusError::Config(format!("nó raft TCP em {}: {e}", cfg.raft_addr)))?;
+            .map_err(|e| {
+                HeraclitusError::Config(format!("nó raft TCP em {}: {e}", cfg.raft_addr))
+            })?;
             (t.node, t.server)
         }
         RaftTransport::Grpc => {
-            let g = spawn_node_grpc_on(
+            let tls = match (&cfg.tls_cert_path, &cfg.tls_key_path, &cfg.tls_ca_path) {
+                (Some(cert), Some(key), Some(ca)) => Some(GrpcTlsConfig::new(
+                    std::fs::read(cert).map_err(|e| {
+                        HeraclitusError::Config(format!("raft TLS cert {}: {e}", cert.display()))
+                    })?,
+                    std::fs::read(key).map_err(|e| {
+                        HeraclitusError::Config(format!("raft TLS key {}: {e}", key.display()))
+                    })?,
+                    std::fs::read(ca).map_err(|e| {
+                        HeraclitusError::Config(format!("raft TLS CA {}: {e}", ca.display()))
+                    })?,
+                    (!cfg.tls_server_name.is_empty()).then(|| cfg.tls_server_name.clone()),
+                )),
+                (None, None, None) => None,
+                _ => {
+                    return Err(HeraclitusError::Config(
+                        "raft TLS exige cert, key e CA juntos".into(),
+                    ))
+                }
+            };
+            let g = spawn_node_grpc_on_tls(
                 cfg.node_id,
                 engine.log.clone(),
                 consensus::production_config(),
                 &cfg.raft_addr,
                 store,
                 sm,
+                tls,
             )
             .await
-            .map_err(|e| HeraclitusError::Config(format!("nó raft gRPC em {}: {e}", cfg.raft_addr)))?;
+            .map_err(|e| {
+                HeraclitusError::Config(format!("nó raft gRPC em {}: {e}", cfg.raft_addr))
+            })?;
             (g.node, g.server)
         }
     };
@@ -214,7 +242,10 @@ mod tests {
         for _ in 0..80 {
             for e in engines {
                 let (e, ep) = (e.clone(), ep.clone());
-                if let Ok(lsn) = tokio::task::spawn_blocking(move || e.append(ep)).await.unwrap() {
+                if let Ok(lsn) = tokio::task::spawn_blocking(move || e.append(ep))
+                    .await
+                    .unwrap()
+                {
                     return lsn;
                 }
             }
@@ -229,7 +260,11 @@ mod tests {
         for _ in 0..80 {
             for e in engines {
                 let (e, k, v) = (e.clone(), key.clone(), val.clone());
-                if tokio::task::spawn_blocking(move || e.hvm_upsert(k, v)).await.unwrap().is_ok() {
+                if tokio::task::spawn_blocking(move || e.hvm_upsert(k, v))
+                    .await
+                    .unwrap()
+                    .is_ok()
+                {
                     return;
                 }
             }
@@ -245,8 +280,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn three_server_cluster_replicates_hvm_writes() {
         let addrs: Vec<String> = (0..3).map(|_| free_addr()).collect();
-        let peers: BTreeMap<u64, String> =
-            (0..3).map(|i| (i as u64, addrs[i].clone())).collect();
+        let peers: BTreeMap<u64, String> = (0..3).map(|i| (i as u64, addrs[i].clone())).collect();
 
         let mut engines: Vec<Arc<Engine>> = Vec::new();
         let mut tasks: Vec<ClusterTasks> = Vec::new();
@@ -264,6 +298,7 @@ mod tests {
                     raft_dir: dir.path().join("raft"),
                     sm_dir: dir.path().join("raft-sm"),
                     transport: RaftTransport::Tcp,
+                    ..Default::default()
                 }),
                 ..Default::default()
             };
@@ -280,8 +315,12 @@ mod tests {
         // 1 escrita normal (vai para o grafo) + 5 upserts H-VM (ficam fora do grafo).
         write_via_cluster(&engines, obs("alice", "facto")).await;
         for i in 0..5 {
-            hvm_write_via_cluster(&engines, format!("k{i}").into_bytes(), format!("v{i}").into_bytes())
-                .await;
+            hvm_write_via_cluster(
+                &engines,
+                format!("k{i}").into_bytes(),
+                format!("v{i}").into_bytes(),
+            )
+            .await;
         }
 
         // Convergência: log head = 6 e ledger H-VM = 5 em TODOS os nós.
@@ -306,7 +345,11 @@ mod tests {
         // hvm_isa excluídos consistentemente ⇒ só o episódio normal conta.
         let h0 = engines[0].graph_state_hash();
         for (i, e) in engines.iter().enumerate() {
-            assert_eq!(e.graph_state_hash(), h0, "nó {i}: state_hash do grafo diverge");
+            assert_eq!(
+                e.graph_state_hash(),
+                h0,
+                "nó {i}: state_hash do grafo diverge"
+            );
         }
 
         for t in tasks {
@@ -321,8 +364,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn three_server_cluster_replicates_writes_and_indexes() {
         let addrs: Vec<String> = (0..3).map(|_| free_addr()).collect();
-        let peers: BTreeMap<u64, String> =
-            (0..3).map(|i| (i as u64, addrs[i].clone())).collect();
+        let peers: BTreeMap<u64, String> = (0..3).map(|i| (i as u64, addrs[i].clone())).collect();
 
         let mut engines: Vec<Arc<Engine>> = Vec::new();
         let mut tasks: Vec<ClusterTasks> = Vec::new();
@@ -340,6 +382,7 @@ mod tests {
                     raft_dir: dir.path().join("raft"),
                     sm_dir: dir.path().join("raft-sm"),
                     transport: RaftTransport::Tcp,
+                    ..Default::default()
                 }),
                 ..Default::default()
             };
@@ -370,12 +413,23 @@ mod tests {
             // Indexação (read-your-writes): a query GQL — que usa as views/memtable
             // derivadas — devolve os 8 em CADA nó, prova de que o hook indexou.
             let v = heraclitus_query::execute("MATCH (n) RETURN n", e.as_ref()).unwrap();
-            assert_eq!(v.as_array().unwrap().len(), 8, "nó {i} indexou (query devolve 8)");
+            assert_eq!(
+                v.as_array().unwrap().len(),
+                8,
+                "nó {i} indexou (query devolve 8)"
+            );
             // Observabilidade: state() expõe o estado do cluster (papel/líder).
             let st = e.state();
             let rep = &st["replication"];
-            assert_eq!(rep["node_id"].as_u64(), Some(i as u64), "state() traz o node_id");
-            assert!(rep["leader"].is_number(), "state() traz o líder atual do cluster");
+            assert_eq!(
+                rep["node_id"].as_u64(),
+                Some(i as u64),
+                "state() traz o node_id"
+            );
+            assert!(
+                rep["leader"].is_number(),
+                "state() traz o líder atual do cluster"
+            );
         }
 
         // Um não-líder recusa a escrita com um erro claro (não corrompe nada).
@@ -396,7 +450,13 @@ mod tests {
             }
             idx
         };
-        let follower = engines.iter().enumerate().find(|(i, _)| *i != leader_idx).unwrap().1.clone();
+        let follower = engines
+            .iter()
+            .enumerate()
+            .find(|(i, _)| *i != leader_idx)
+            .unwrap()
+            .1
+            .clone();
         let err = tokio::task::spawn_blocking(move || follower.append(obs("bob", "no")))
             .await
             .unwrap()
@@ -418,8 +478,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn three_server_cluster_over_grpc_replicates_and_indexes() {
         let addrs: Vec<String> = (0..3).map(|_| free_addr()).collect();
-        let peers: BTreeMap<u64, String> =
-            (0..3).map(|i| (i as u64, addrs[i].clone())).collect();
+        let peers: BTreeMap<u64, String> = (0..3).map(|i| (i as u64, addrs[i].clone())).collect();
 
         let mut engines: Vec<Arc<Engine>> = Vec::new();
         let mut tasks: Vec<ClusterTasks> = Vec::new();
@@ -437,6 +496,7 @@ mod tests {
                     raft_dir: dir.path().join("raft"),
                     sm_dir: dir.path().join("raft-sm"),
                     transport: RaftTransport::Grpc,
+                    ..Default::default()
                 }),
                 ..Default::default()
             };

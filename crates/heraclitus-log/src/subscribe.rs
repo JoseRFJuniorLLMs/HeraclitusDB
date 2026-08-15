@@ -16,10 +16,7 @@ use tokio::sync::broadcast::error::RecvError;
 
 /// Liga `sub` ao tail do log. Devolve o handle da thread; ela termina sozinha
 /// quando o log é dropado (canal fechado).
-pub fn attach_subscriber(
-    log: &Log,
-    sub: Arc<dyn StreamSubscriber>,
-) -> std::thread::JoinHandle<()> {
+pub fn attach_subscriber(log: &Log, sub: Arc<dyn StreamSubscriber>) -> std::thread::JoinHandle<()> {
     let mut rx = log.tail_subscribe();
     std::thread::spawn(move || {
         // R15: `Option` em vez de `0` — um overflow ANTES do primeiro evento
@@ -90,7 +87,11 @@ mod tests {
         while sub.seen.load(Ordering::SeqCst) < 10 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(sub.seen.load(Ordering::SeqCst), 10, "todos os appends notificados");
+        assert_eq!(
+            sub.seen.load(Ordering::SeqCst),
+            10,
+            "todos os appends notificados"
+        );
         assert_eq!(sub.last_lsn.load(Ordering::SeqCst), 9, "último LSN correto");
         assert_eq!(sub.overflows.load(Ordering::SeqCst), 0);
     }

@@ -99,7 +99,10 @@ pub fn episodes_to_batches_sized(
     let mut out = Vec::with_capacity(events.len().div_ceil(rows_per_batch));
     for chunk in events.chunks(rows_per_batch) {
         let lsn: UInt64Array = chunk.iter().map(|(l, _)| *l).collect();
-        let agent: StringArray = chunk.iter().map(|(_, e)| Some(e.agent_id.as_str())).collect();
+        let agent: StringArray = chunk
+            .iter()
+            .map(|(_, e)| Some(e.agent_id.as_str()))
+            .collect();
         let kind: StringArray = chunk
             .iter()
             .map(|(_, e)| Some(crate::kind_label(&e.kind)))
@@ -232,7 +235,11 @@ pub struct SelectivityOptimizer {
 impl Optimizer for SelectivityOptimizer {
     fn optimize(&self, plan: LogicalPlan) -> Result<Vec<ExecutionNode>, String> {
         match plan {
-            LogicalPlan::Select { predicates, aggregate, .. } => {
+            LogicalPlan::Select {
+                predicates,
+                aggregate,
+                ..
+            } => {
                 let mut ordered = predicates;
                 ordered.sort_by(|a, b| {
                     let sa = self.selectivities.get(a).copied().unwrap_or(0.5);
@@ -258,13 +265,18 @@ impl Optimizer for SelectivityOptimizer {
                     let id = nodes.len() as u64;
                     nodes.push(ExecutionNode::new(
                         id,
-                        PhysicalIr::VectorAggregate { keys, aggregations: aggs },
+                        PhysicalIr::VectorAggregate {
+                            keys,
+                            aggregations: aggs,
+                        },
                         vec![prev],
                     ));
                 }
                 Ok(nodes)
             }
-            other => Err(format!("SelectivityOptimizer: plano não suportado: {other:?}")),
+            other => Err(format!(
+                "SelectivityOptimizer: plano não suportado: {other:?}"
+            )),
         }
     }
 }
@@ -412,15 +424,14 @@ impl VecExecutor {
         input: &[RecordBatch],
         pids: &[u32],
     ) -> Result<Vec<RecordBatch>, AnalyticsError> {
-        let preds: Vec<Predicate> = pids
-            .iter()
-            .map(|p| {
-                self.predicates
-                    .get(*p as usize)
-                    .cloned()
-                    .ok_or_else(|| AnalyticsError::Arrow(format!("predicate {p} não registado")))
-            })
-            .collect::<Result<_, _>>()?;
+        let preds: Vec<Predicate> =
+            pids.iter()
+                .map(|p| {
+                    self.predicates.get(*p as usize).cloned().ok_or_else(|| {
+                        AnalyticsError::Arrow(format!("predicate {p} não registado"))
+                    })
+                })
+                .collect::<Result<_, _>>()?;
         let cpus = self.capabilities.logical_cpus.max(1);
         if cpus > 1 && input.len() >= 4 {
             let chunk = input.len().div_ceil(cpus);
@@ -477,7 +488,10 @@ impl VecExecutor {
     ///   sobre a lista esparsa que encolhe, sem tocar nas linhas já cortadas nem
     ///   materializar bitmaps densos.
     /// - **Materialização única:** um só `take()` no fim, das linhas finais.
-    fn fused_filter_one(b: &RecordBatch, preds: &[Predicate]) -> Result<RecordBatch, AnalyticsError> {
+    fn fused_filter_one(
+        b: &RecordBatch,
+        preds: &[Predicate],
+    ) -> Result<RecordBatch, AnalyticsError> {
         let n = b.num_rows();
         let mut survivors: Vec<u32> = if let Some((p0, rest)) = preds.split_first() {
             let m0 = predicate_matcher(b, p0)?;
@@ -512,14 +526,19 @@ impl VecExecutor {
         aggs: &[u32],
     ) -> Result<Vec<RecordBatch>, AnalyticsError> {
         // Pipeline breaker: consome tudo, emite um batch (chaves, count, somas).
-        let mut groups: HashMap<Vec<String>, (u64, Vec<u64>)> = HashMap::new();
+        type GroupKey = Vec<String>;
+        type GroupState = (u64, Vec<u64>);
+        type GroupRow = (GroupKey, GroupState);
+        let mut groups: HashMap<GroupKey, GroupState> = HashMap::new();
         for b in input {
             for row in 0..b.num_rows() {
                 let key: Vec<String> = keys
                     .iter()
                     .map(|k| array_cell_string(b.column(*k as usize), row))
                     .collect();
-                let entry = groups.entry(key).or_insert_with(|| (0, vec![0; aggs.len()]));
+                let entry = groups
+                    .entry(key)
+                    .or_insert_with(|| (0, vec![0; aggs.len()]));
                 entry.0 += 1;
                 for (i, a) in aggs.iter().enumerate() {
                     let col = b.column(*a as usize);
@@ -530,7 +549,7 @@ impl VecExecutor {
             }
         }
         // Saída determinística: ordena por chave.
-        let mut rows: Vec<(Vec<String>, (u64, Vec<u64>))> = groups.into_iter().collect();
+        let mut rows: Vec<GroupRow> = groups.into_iter().collect();
         rows.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut fields: Vec<Field> = keys
@@ -549,14 +568,16 @@ impl VecExecutor {
             let a: StringArray = rows.iter().map(|(k, _)| Some(k[i].as_str())).collect();
             cols.push(Arc::new(a));
         }
-        cols.push(Arc::new(rows.iter().map(|(_, (c, _))| *c).collect::<UInt64Array>()));
+        cols.push(Arc::new(
+            rows.iter().map(|(_, (c, _))| *c).collect::<UInt64Array>(),
+        ));
         for i in 0..aggs.len() {
             cols.push(Arc::new(
                 rows.iter().map(|(_, (_, s))| s[i]).collect::<UInt64Array>(),
             ));
         }
-        let batch = RecordBatch::try_new(schema, cols)
-            .map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
+        let batch =
+            RecordBatch::try_new(schema, cols).map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
         Ok(vec![batch])
     }
 
@@ -572,7 +593,8 @@ impl VecExecutor {
         }
         // BUILD: hash do lado esquerdo inteiro (chave → índices de linha).
         let lschema = left[0].schema();
-        let lall = concat_batches(&lschema, left).map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
+        let lall =
+            concat_batches(&lschema, left).map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
         let mut table: HashMap<String, Vec<usize>> = HashMap::new();
         for row in 0..lall.num_rows() {
             table
@@ -582,7 +604,8 @@ impl VecExecutor {
         }
         // PROBE: lado direito em streaming; emite (esq ++ dir) por par casado.
         let rschema = right[0].schema();
-        let rall = concat_batches(&rschema, right).map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
+        let rall =
+            concat_batches(&rschema, right).map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
         let (mut lrows, mut rrows): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
         for rrow in 0..rall.num_rows() {
             if let Some(ls) = table.get(&array_cell_string(rall.column(rk as usize), rrow)) {
@@ -606,7 +629,11 @@ impl VecExecutor {
         };
         let mut cols = take(&lall, &lidx)?;
         cols.extend(take(&rall, &ridx)?);
-        let mut fields: Vec<Field> = lschema.fields().iter().map(|f| f.as_ref().clone()).collect();
+        let mut fields: Vec<Field> = lschema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
         fields.extend(
             rschema
                 .fields()
@@ -687,10 +714,13 @@ impl TaskScheduler for VecExecutor {
                         .map(|p| self.selectivities.get(p).copied().unwrap_or(0.5))
                         .product();
                     let out = {
-                        let input = results.get(&node.dependencies[0]).ok_or("filter sem input")?;
+                        let input = results
+                            .get(&node.dependencies[0])
+                            .ok_or("filter sem input")?;
                         if pids.len() >= 2 && est < ADAPTIVE_FUSE_THRESHOLD {
                             // Muito seletivo → materialização tardia (fundido).
-                            self.run_fused_filters(input, &pids).map_err(|e| e.to_string())?
+                            self.run_fused_filters(input, &pids)
+                                .map_err(|e| e.to_string())?
                         } else {
                             // Eager: um filtro por passo (materializa entre eles).
                             let mut cur =
@@ -705,17 +735,25 @@ impl TaskScheduler for VecExecutor {
                 }
                 PhysicalIr::VectorAggregate { keys, aggregations } => {
                     let out = {
-                        let input =
-                            results.get(&node.dependencies[0]).ok_or("aggregate sem input")?;
+                        let input = results
+                            .get(&node.dependencies[0])
+                            .ok_or("aggregate sem input")?;
                         self.run_aggregate(input, keys, aggregations)
                             .map_err(|e| e.to_string())?
                     };
                     (out, node.node_id, i + 1)
                 }
-                PhysicalIr::HashJoin { left_key, right_key } => {
+                PhysicalIr::HashJoin {
+                    left_key,
+                    right_key,
+                } => {
                     let out = {
-                        let l = results.get(&node.dependencies[0]).ok_or("join sem lado esq")?;
-                        let r = results.get(&node.dependencies[1]).ok_or("join sem lado dir")?;
+                        let l = results
+                            .get(&node.dependencies[0])
+                            .ok_or("join sem lado esq")?;
+                        let r = results
+                            .get(&node.dependencies[1])
+                            .ok_or("join sem lado dir")?;
                         self.run_hash_join(l, r, *left_key, *right_key)
                             .map_err(|e| e.to_string())?
                     };
@@ -741,7 +779,11 @@ mod tests {
             .map(|i| {
                 let mut e = Episode::new(
                     if i % 2 == 0 { "alice" } else { "bob" },
-                    if i % 3 == 0 { EventKind::Action } else { EventKind::Observation },
+                    if i % 3 == 0 {
+                        EventKind::Action
+                    } else {
+                        EventKind::Observation
+                    },
                     vec![0u8; i % 7],
                 );
                 e.ts_hlc = i as u64;
@@ -766,7 +808,11 @@ mod tests {
         // fatiar em lotes de 1024 — o contrato SPEC-013, agora explícito.
         let b = episodes_to_batches_sized(&eps(3000), BATCH_ROWS).unwrap();
         let sizes: Vec<usize> = b.iter().map(|x| x.num_rows()).collect();
-        assert_eq!(sizes, vec![1024, 1024, 952], "SPEC-013: lotes fixos de 1024");
+        assert_eq!(
+            sizes,
+            vec![1024, 1024, 952],
+            "SPEC-013: lotes fixos de 1024"
+        );
     }
 
     #[test]
@@ -776,29 +822,45 @@ mod tests {
         // do resultado. Mesmo DAG, fontes fatiadas de forma diferente (1024 fixo
         // vs. adaptativo default) → saída bit-idêntica.
         let events = eps(3000);
-        let fixed =
-            VecExecutor::new(episodes_to_batches_sized(&events, BATCH_ROWS).unwrap(), preds());
+        let fixed = VecExecutor::new(
+            episodes_to_batches_sized(&events, BATCH_ROWS).unwrap(),
+            preds(),
+        );
         let adaptive = VecExecutor::new(episodes_to_batches(&events).unwrap(), preds());
         let dag = || {
-            SelectivityOptimizer { selectivities: HashMap::new() }
-                .optimize(LogicalPlan::Select {
-                    relations: vec![],
-                    predicates: vec![0, 1],
-                    aggregate: Some((vec![2], vec![4])), // group by kind; sum content_len
-                })
-                .unwrap()
+            SelectivityOptimizer {
+                selectivities: HashMap::new(),
+            }
+            .optimize(LogicalPlan::Select {
+                relations: vec![],
+                predicates: vec![0, 1],
+                aggregate: Some((vec![2], vec![4])), // group by kind; sum content_len
+            })
+            .unwrap()
         };
         let a = fixed.execute(dag()).unwrap();
         let b = adaptive.execute(dag()).unwrap();
-        assert_eq!(format!("{a:?}"), format!("{b:?}"), "morsel-size ≡ resultado bit a bit");
+        assert_eq!(
+            format!("{a:?}"),
+            format!("{b:?}"),
+            "morsel-size ≡ resultado bit a bit"
+        );
     }
 
     fn preds() -> Vec<Predicate> {
         vec![
             // p0: agent_id == "alice"  (sobrevive ~50%)
-            Predicate { column: 1, op: CmpOp::Eq, value: Literal::Str("alice".into()) },
+            Predicate {
+                column: 1,
+                op: CmpOp::Eq,
+                value: Literal::Str("alice".into()),
+            },
             // p1: lsn < 100            (sobrevive ~3%)
-            Predicate { column: 0, op: CmpOp::Lt, value: Literal::U64(100) },
+            Predicate {
+                column: 0,
+                op: CmpOp::Lt,
+                value: Literal::U64(100),
+            },
         ]
     }
 
@@ -828,7 +890,11 @@ mod tests {
         let f = concat_batches(&sch, &fused).unwrap();
         let r = concat_batches(&sch, &refb).unwrap();
         assert!(f.num_rows() > 0, "há sobreviventes (alice ∩ lsn<100)");
-        assert_eq!(format!("{f:?}"), format!("{r:?}"), "fundido ≡ sequencial, bit a bit");
+        assert_eq!(
+            format!("{f:?}"),
+            format!("{r:?}"),
+            "fundido ≡ sequencial, bit a bit"
+        );
     }
 
     #[test]
@@ -853,7 +919,11 @@ mod tests {
         let a = fused_route.execute(dag()).unwrap();
         let b = eager_route.execute(dag()).unwrap();
         assert!(!a.is_empty(), "há sobreviventes");
-        assert_eq!(format!("{a:?}"), format!("{b:?}"), "adaptativo (fundido) ≡ eager, bit a bit");
+        assert_eq!(
+            format!("{a:?}"),
+            format!("{b:?}"),
+            "adaptativo (fundido) ≡ eager, bit a bit"
+        );
     }
 
     #[test]
@@ -866,7 +936,11 @@ mod tests {
         parallel.capabilities.logical_cpus = 8;
         let a = serial.run_fused_filters(&batches, &[0, 1]).unwrap();
         let b = parallel.run_fused_filters(&batches, &[0, 1]).unwrap();
-        assert_eq!(format!("{a:?}"), format!("{b:?}"), "fundido paralelo ≡ serial");
+        assert_eq!(
+            format!("{a:?}"),
+            format!("{b:?}"),
+            "fundido paralelo ≡ serial"
+        );
     }
 
     #[test]
@@ -898,7 +972,9 @@ mod tests {
         let events = eps(3000);
         let batches = episodes_to_batches(&events).unwrap();
         let exec = VecExecutor::new(batches, preds());
-        let opt = SelectivityOptimizer { selectivities: HashMap::new() };
+        let opt = SelectivityOptimizer {
+            selectivities: HashMap::new(),
+        };
         // WHERE agent=alice AND lsn<100 GROUP BY kind → count por kind.
         let dag = opt
             .optimize(LogicalPlan::Select {
@@ -976,7 +1052,11 @@ mod tests {
         };
         let a = serial.execute(dag()).unwrap();
         let b = parallel.execute(dag()).unwrap();
-        assert_eq!(format!("{a:?}"), format!("{b:?}"), "paralelo ≡ serial, bit a bit");
+        assert_eq!(
+            format!("{a:?}"),
+            format!("{b:?}"),
+            "paralelo ≡ serial, bit a bit"
+        );
         assert!(!a.is_empty());
     }
 
@@ -1022,15 +1102,30 @@ mod tests {
         let dag = vec![
             ExecutionNode::new(0, PhysicalIr::ColumnScan { projection: vec![] }, vec![]),
             ExecutionNode::new(1, PhysicalIr::ColumnScan { projection: vec![] }, vec![]),
-            ExecutionNode::new(2, PhysicalIr::HashJoin { left_key: 1, right_key: 1 }, vec![0, 1]),
+            ExecutionNode::new(
+                2,
+                PhysicalIr::HashJoin {
+                    left_key: 1,
+                    right_key: 1,
+                },
+                vec![0, 1],
+            ),
         ];
         let out = exec.execute(dag).unwrap();
         // 5 alice × 2 alice + 5 bob × 2 bob = 20 pares.
         assert_eq!(out[0].num_rows(), 20);
         // Chave igual dos dois lados em todas as linhas.
-        let l = out[0].column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let l = out[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         let ridx = out[0].schema().index_of("agent_id_r").unwrap();
-        let r = out[0].column(ridx).as_any().downcast_ref::<StringArray>().unwrap();
+        let r = out[0]
+            .column(ridx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         for i in 0..out[0].num_rows() {
             assert_eq!(l.value(i), r.value(i));
         }

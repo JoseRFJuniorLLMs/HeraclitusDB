@@ -155,7 +155,11 @@ impl Builder {
 
     /// Fecha a função. `n_columns` = colunas de entrada; `ret` = valor devolvido.
     pub fn finish(self, n_columns: usize, ret: ValueId) -> Function {
-        Function { n_columns, insts: self.insts, ret }
+        Function {
+            n_columns,
+            insts: self.insts,
+            ret,
+        }
     }
 }
 
@@ -169,7 +173,11 @@ pub enum IrError {
     /// Tipos incompatíveis para a operação.
     TypeMismatch { at: ValueId, detail: &'static str },
     /// `Op::Column` refere uma coluna fora do intervalo.
-    ColumnOob { at: ValueId, idx: usize, n_columns: usize },
+    ColumnOob {
+        at: ValueId,
+        idx: usize,
+        n_columns: usize,
+    },
     /// O valor de retorno não existe.
     RetOob { ret: ValueId, n_values: usize },
 }
@@ -186,7 +194,10 @@ pub fn verify(f: &Function) -> Result<Vec<Ty>, IrError> {
     for (i, inst) in f.insts.iter().enumerate() {
         let i = i as ValueId;
         if inst.result != i {
-            return Err(IrError::BadNumbering { index: i as usize, result: inst.result });
+            return Err(IrError::BadNumbering {
+                index: i as usize,
+                result: inst.result,
+            });
         }
         // Operando tem de estar definido antes (id < i).
         let operand_ty = |v: ValueId| -> Result<Ty, IrError> {
@@ -200,34 +211,50 @@ pub fn verify(f: &Function) -> Result<Vec<Ty>, IrError> {
             Op::Const(c) => c.ty(),
             Op::Column(idx, ty) => {
                 if *idx >= f.n_columns {
-                    return Err(IrError::ColumnOob { at: i, idx: *idx, n_columns: f.n_columns });
+                    return Err(IrError::ColumnOob {
+                        at: i,
+                        idx: *idx,
+                        n_columns: f.n_columns,
+                    });
                 }
                 *ty
             }
             Op::Add(a, b) | Op::Sub(a, b) | Op::Mul(a, b) => {
                 let (ta, tb) = (operand_ty(*a)?, operand_ty(*b)?);
                 if ta != tb || ta == Ty::Bool {
-                    return Err(IrError::TypeMismatch { at: i, detail: "aritmética exige numéricos do mesmo tipo" });
+                    return Err(IrError::TypeMismatch {
+                        at: i,
+                        detail: "aritmética exige numéricos do mesmo tipo",
+                    });
                 }
                 ta
             }
             Op::CmpGt(a, b) | Op::CmpLt(a, b) | Op::CmpEq(a, b) => {
                 let (ta, tb) = (operand_ty(*a)?, operand_ty(*b)?);
                 if ta != tb || ta == Ty::Bool {
-                    return Err(IrError::TypeMismatch { at: i, detail: "comparação exige numéricos do mesmo tipo" });
+                    return Err(IrError::TypeMismatch {
+                        at: i,
+                        detail: "comparação exige numéricos do mesmo tipo",
+                    });
                 }
                 Ty::Bool
             }
             Op::And(a, b) | Op::Or(a, b) => {
                 let (ta, tb) = (operand_ty(*a)?, operand_ty(*b)?);
                 if ta != Ty::Bool || tb != Ty::Bool {
-                    return Err(IrError::TypeMismatch { at: i, detail: "lógica exige Bool" });
+                    return Err(IrError::TypeMismatch {
+                        at: i,
+                        detail: "lógica exige Bool",
+                    });
                 }
                 Ty::Bool
             }
             Op::Not(a) => {
                 if operand_ty(*a)? != Ty::Bool {
-                    return Err(IrError::TypeMismatch { at: i, detail: "Not exige Bool" });
+                    return Err(IrError::TypeMismatch {
+                        at: i,
+                        detail: "Not exige Bool",
+                    });
                 }
                 Ty::Bool
             }
@@ -235,7 +262,10 @@ pub fn verify(f: &Function) -> Result<Vec<Ty>, IrError> {
         types.push(ty);
     }
     if (f.ret as usize) >= types.len() {
-        return Err(IrError::RetOob { ret: f.ret, n_values: types.len() });
+        return Err(IrError::RetOob {
+            ret: f.ret,
+            n_values: types.len(),
+        });
     }
     Ok(types)
 }
@@ -279,7 +309,12 @@ fn arith(a: Val, b: Val, fi: impl Fn(i64, i64) -> i64, ff: impl Fn(f64, f64) -> 
     }
 }
 
-fn compare(a: Val, b: Val, fi: impl Fn(&i64, &i64) -> bool, ff: impl Fn(&f64, &f64) -> bool) -> Val {
+fn compare(
+    a: Val,
+    b: Val,
+    fi: impl Fn(&i64, &i64) -> bool,
+    ff: impl Fn(&f64, &f64) -> bool,
+) -> Val {
     match (a, b) {
         (Val::I64(x), Val::I64(y)) => Val::Bool(fi(&x, &y)),
         (Val::F64(x), Val::F64(y)) => Val::Bool(ff(&x, &y)),
@@ -302,13 +337,45 @@ pub fn interpret(f: &Function, cols: &[ColumnData], n: usize) -> Result<Vec<Val>
             let v = match &inst.op {
                 Op::Const(c) => c.to_val(),
                 Op::Column(idx, _) => cols[*idx].get(row),
-                Op::Add(a, b) => arith(env[*a as usize], env[*b as usize], |x, y| x + y, |x, y| x + y),
-                Op::Sub(a, b) => arith(env[*a as usize], env[*b as usize], |x, y| x - y, |x, y| x - y),
-                Op::Mul(a, b) => arith(env[*a as usize], env[*b as usize], |x, y| x * y, |x, y| x * y),
-                Op::CmpGt(a, b) => compare(env[*a as usize], env[*b as usize], |x, y| x > y, |x, y| x > y),
-                Op::CmpLt(a, b) => compare(env[*a as usize], env[*b as usize], |x, y| x < y, |x, y| x < y),
-                Op::CmpEq(a, b) => compare(env[*a as usize], env[*b as usize], |x, y| x == y, |x, y| x == y),
-                Op::And(a, b) => Val::Bool(env[*a as usize].as_bool() && env[*b as usize].as_bool()),
+                Op::Add(a, b) => arith(
+                    env[*a as usize],
+                    env[*b as usize],
+                    |x, y| x + y,
+                    |x, y| x + y,
+                ),
+                Op::Sub(a, b) => arith(
+                    env[*a as usize],
+                    env[*b as usize],
+                    |x, y| x - y,
+                    |x, y| x - y,
+                ),
+                Op::Mul(a, b) => arith(
+                    env[*a as usize],
+                    env[*b as usize],
+                    |x, y| x * y,
+                    |x, y| x * y,
+                ),
+                Op::CmpGt(a, b) => compare(
+                    env[*a as usize],
+                    env[*b as usize],
+                    |x, y| x > y,
+                    |x, y| x > y,
+                ),
+                Op::CmpLt(a, b) => compare(
+                    env[*a as usize],
+                    env[*b as usize],
+                    |x, y| x < y,
+                    |x, y| x < y,
+                ),
+                Op::CmpEq(a, b) => compare(
+                    env[*a as usize],
+                    env[*b as usize],
+                    |x, y| x == y,
+                    |x, y| x == y,
+                ),
+                Op::And(a, b) => {
+                    Val::Bool(env[*a as usize].as_bool() && env[*b as usize].as_bool())
+                }
                 Op::Or(a, b) => Val::Bool(env[*a as usize].as_bool() || env[*b as usize].as_bool()),
                 Op::Not(a) => Val::Bool(!env[*a as usize].as_bool()),
             };
@@ -365,7 +432,15 @@ mod tests {
         let cols = [ColumnData::I64(&col0), ColumnData::I64(&col1)];
         let out = interpret(&f, &cols, 4).unwrap();
         // 901>900&5==5=T ; 5>900=F ; 950>900&3==5=F ; 1000>900&5==5=T
-        assert_eq!(out, vec![Val::Bool(true), Val::Bool(false), Val::Bool(false), Val::Bool(true)]);
+        assert_eq!(
+            out,
+            vec![
+                Val::Bool(true),
+                Val::Bool(false),
+                Val::Bool(false),
+                Val::Bool(true)
+            ]
+        );
         assert_eq!(interpret_mask(&f, &cols, 4).unwrap(), vec![0, 3]);
     }
 
@@ -382,7 +457,10 @@ mod tests {
         let col0 = [1.0f64, 4.0, 6.0];
         let out = interpret(&f, &[ColumnData::F64(&col0)], 3).unwrap();
         // 2<10=T ; 8<10=T ; 12<10=F
-        assert_eq!(out, vec![Val::Bool(true), Val::Bool(true), Val::Bool(false)]);
+        assert_eq!(
+            out,
+            vec![Val::Bool(true), Val::Bool(true), Val::Bool(false)]
+        );
     }
 
     #[test]
@@ -390,7 +468,10 @@ mod tests {
         // Instrução 0 usa o valor 1 (ainda não definido).
         let f = Function {
             n_columns: 1,
-            insts: vec![Inst { result: 0, op: Op::Not(1) }],
+            insts: vec![Inst {
+                result: 0,
+                op: Op::Not(1),
+            }],
             ret: 0,
         };
         assert_eq!(verify(&f), Err(IrError::UseBeforeDef { at: 0, used: 1 }));
@@ -400,10 +481,19 @@ mod tests {
     fn rejects_bad_numbering() {
         let f = Function {
             n_columns: 0,
-            insts: vec![Inst { result: 5, op: Op::Const(Const::Bool(true)) }],
+            insts: vec![Inst {
+                result: 5,
+                op: Op::Const(Const::Bool(true)),
+            }],
             ret: 5,
         };
-        assert_eq!(verify(&f), Err(IrError::BadNumbering { index: 0, result: 5 }));
+        assert_eq!(
+            verify(&f),
+            Err(IrError::BadNumbering {
+                index: 0,
+                result: 5
+            })
+        );
     }
 
     #[test]

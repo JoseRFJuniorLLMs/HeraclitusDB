@@ -8,8 +8,9 @@ description = "Protobuf definitions and generated gRPC types"
 
 [dependencies]
 tonic = { workspace = true }
-prost = "0.13"
+tonic-prost = { workspace = true }
+prost = { workspace = true }
 
 [build-dependencies]
-tonic-build = { workspace = true }
+tonic-prost-build = { workspace = true }
 protox = { workspace = true }

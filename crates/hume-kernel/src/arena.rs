@@ -41,7 +41,10 @@ pub struct ScratchAllocator {
 impl ScratchAllocator {
     /// Nova arena com `capacity` bytes.
     pub fn new(capacity: usize) -> Self {
-        Self { buf: AlignedBuffer::new(capacity), offset: Cell::new(0) }
+        Self {
+            buf: AlignedBuffer::new(capacity),
+            offset: Cell::new(0),
+        }
     }
 
     /// Capacidade total em bytes.
@@ -66,7 +69,10 @@ impl ScratchAllocator {
     // cada região devolvida é disjunta, o borrow atado a `&self` impede `reset`.
     #[allow(clippy::mut_from_ref)]
     pub fn alloc_bytes(&self, n: usize, align: usize) -> Option<&mut [u8]> {
-        assert!(align.is_power_of_two(), "alinhamento tem de ser potência de dois");
+        assert!(
+            align.is_power_of_two(),
+            "alinhamento tem de ser potência de dois"
+        );
         let cur = self.offset.get();
         let start = (cur + align - 1) & !(align - 1);
         let end = start.checked_add(n)?;

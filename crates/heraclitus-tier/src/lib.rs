@@ -11,7 +11,7 @@ use arrow_schema::{DataType, Field, Schema};
 use heraclitus_core::{Episode, EventKind, HeraclitusError, Lsn, SegmentId};
 use heraclitus_log::format::{Decoded, SegmentHeader, HEADER_LEN};
 use heraclitus_log::{decode_episode_payload, merkle_root, Log};
-use object_store::{local::LocalFileSystem, path::Path as ObjPath, ObjectStore};
+use object_store::{local::LocalFileSystem, path::Path as ObjPath, ObjectStore, ObjectStoreExt};
 use parquet::arrow::ArrowWriter;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -86,7 +86,9 @@ impl ColdTier {
         std::fs::create_dir_all(root.as_ref())?;
         let store = LocalFileSystem::new_with_prefix(root.as_ref())
             .map_err(|e| HeraclitusError::Storage(std::io::Error::other(e)))?;
-        Ok(Self { store: Arc::new(store) })
+        Ok(Self {
+            store: Arc::new(store),
+        })
     }
 
     /// Abre o backend a partir de um `location`: um URL de nuvem
@@ -109,7 +111,9 @@ impl ColdTier {
                     .with_url(location)
                     .build()
                     .map_err(|e| HeraclitusError::Storage(std::io::Error::other(e)))?;
-                return Ok(Self { store: Arc::new(store) });
+                return Ok(Self {
+                    store: Arc::new(store),
+                });
             }
             #[cfg(not(feature = "gcp"))]
             return Err(HeraclitusError::Config(
@@ -123,7 +127,9 @@ impl ColdTier {
                     .with_url(location)
                     .build()
                     .map_err(|e| HeraclitusError::Storage(std::io::Error::other(e)))?;
-                return Ok(Self { store: Arc::new(store) });
+                return Ok(Self {
+                    store: Arc::new(store),
+                });
             }
             #[cfg(not(feature = "aws"))]
             return Err(HeraclitusError::Config(
@@ -478,7 +484,9 @@ fn segment_to_parquet(bytes: &[u8]) -> Result<Vec<u8>, HeraclitusError> {
                 rows.iter().map(|(_, e)| e.valid_to).collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(
-                rows.iter().map(|(_, e)| embedding_json(e)).collect::<Vec<_>>(),
+                rows.iter()
+                    .map(|(_, e)| embedding_json(e))
+                    .collect::<Vec<_>>(),
             )),
         ],
     )
@@ -669,9 +677,8 @@ mod tests {
         use arrow_array::{Array, StringArray, UInt64Array};
         let dir = tempfile::tempdir().unwrap();
         // Segmentos minúsculos forçam um selado; primeiro episódio enriquecido.
-        let log = Log::open(&dir.path().join("log"), 2048, FsyncPolicy::Always).unwrap();
-        let mut enriched =
-            Episode::new("tier", EventKind::Observation, b"enriquecido".to_vec());
+        let log = Log::open(dir.path().join("log"), 2048, FsyncPolicy::Always).unwrap();
+        let mut enriched = Episode::new("tier", EventKind::Observation, b"enriquecido".to_vec());
         enriched.valid_from = Some(100);
         enriched.valid_to = Some(200);
         enriched.embedding = Some(heraclitus_core::ProductPoint {
@@ -693,7 +700,10 @@ mod tests {
         let tier = ColdTier::open_local(dir.path().join("cold")).unwrap();
         let seg = log.sealed_segments()[0].clone();
         let (receipt, _) = tier.demote(&log, seg.id).await.unwrap();
-        let ppath = receipt.parquet_path.clone().expect("recibo aponta o parquet");
+        let ppath = receipt
+            .parquet_path
+            .clone()
+            .expect("recibo aponta o parquet");
         let obj = tier.store.get(&ObjPath::from(ppath)).await.unwrap();
         let bytes = obj.bytes().await.unwrap();
 
@@ -733,7 +743,10 @@ mod tests {
         assert_eq!(vf.value(0), 100);
         assert_eq!(vt.value(0), 200);
         assert!(!emb.is_null(0), "embedding presente na linha enriquecida");
-        assert!(emb.value(0).contains("hyp"), "embedding serializado em JSON");
+        assert!(
+            emb.value(0).contains("hyp"),
+            "embedding serializado em JSON"
+        );
 
         // Linhas simples ⇒ NULL (aberto/ausente), NÃO 0 — a distinção que faltava.
         assert!(vf.is_null(1), "sem valid_from → NULL, não 0");

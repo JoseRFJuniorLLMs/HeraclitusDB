@@ -52,7 +52,11 @@ impl DataChunk {
     pub fn new(columns: Vec<Vector>) -> Self {
         let len = columns.first().map(|c| c.len()).unwrap_or(0);
         for c in &columns {
-            assert_eq!(c.len(), len, "todas as colunas do DataChunk têm o mesmo comprimento");
+            assert_eq!(
+                c.len(),
+                len,
+                "todas as colunas do DataChunk têm o mesmo comprimento"
+            );
         }
         Self {
             columns,
@@ -163,8 +167,14 @@ mod tests {
     #[test]
     fn refine_is_composable() {
         let mut c = sample();
-        c.refine(&SelectionVector::from_indices(1000, &(0..500).collect::<Vec<_>>()));
-        c.refine(&SelectionVector::from_indices(1000, &(400..600).collect::<Vec<_>>()));
+        c.refine(&SelectionVector::from_indices(
+            1000,
+            &(0..500).collect::<Vec<_>>(),
+        ));
+        c.refine(&SelectionVector::from_indices(
+            1000,
+            &(400..600).collect::<Vec<_>>(),
+        ));
         // interseção [0,500) ∩ [400,600) = [400,500) = 100 linhas
         assert_eq!(c.cardinality(), 100);
     }
@@ -182,7 +192,11 @@ mod tests {
         let c = sample().with_device(Device::Gpu);
         assert_eq!(c.device(), Device::Gpu);
         let mut c = c;
-        c.set_row_ids(vec![PhysicalRowId { segment_id: 1, page_id: 2, offset: 3 }]);
+        c.set_row_ids(vec![PhysicalRowId {
+            segment_id: 1,
+            page_id: 2,
+            offset: 3,
+        }]);
         assert_eq!(c.row_ids().len(), 1);
         assert_eq!(c.row_ids()[0].offset, 3);
     }

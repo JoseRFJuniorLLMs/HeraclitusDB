@@ -1,10 +1,89 @@
 //! heraclitus-cli — admin & inspection (§3.14) + the M7 QPS×recall harness.
 
 use heraclitus_core::{EventId, FsyncPolicy, ProductPoint};
+use heraclitus_crypto::KeyStore;
 use heraclitus_index_vector::VectorIndex;
 use heraclitus_log::Log;
 use heraclitus_manifold::{dist_hyp, project_to_ball, ProductMetric};
 use std::time::Instant;
+
+/// Cria duas identidades de bootstrap com tokens CSPRNG. Os tokens só são
+/// escritos em arquivos `create_new`; stdout contém caminhos, nunca segredos.
+/// Em produção, mova `admin.token` para cofre/offline e aplique ACL do SO.
+pub fn init_credentials(
+    output: &std::path::Path,
+) -> Result<String, heraclitus_core::HeraclitusError> {
+    use heraclitus_core::HeraclitusError;
+    use rand::RngCore;
+    use std::io::Write;
+
+    if output.exists() {
+        return Err(HeraclitusError::Config(format!(
+            "diretório de credenciais já existe: {}",
+            output.display()
+        )));
+    }
+    let name = output.file_name().ok_or_else(|| {
+        HeraclitusError::Config("diretório de credenciais não pode ser raiz de volume".into())
+    })?;
+    let parent = output.parent().ok_or_else(|| {
+        HeraclitusError::Config("diretório de credenciais precisa de pai explícito".into())
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let output = std::fs::canonicalize(parent)?.join(name);
+    std::fs::create_dir(&output)?;
+
+    fn make_token(path: &std::path::Path) -> Result<String, std::io::Error> {
+        let mut bytes = [0u8; 48];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(token.as_bytes())?;
+        file.sync_all()?;
+        Ok(token)
+    }
+
+    let writer_path = output.join("writer.token");
+    let admin_path = output.join("admin.token");
+    let writer = make_token(&writer_path)?;
+    let admin = make_token(&admin_path)?;
+    let credentials = serde_json::json!([
+        {
+            "principal": "forge-writer",
+            "token_blake3": blake3::hash(writer.as_bytes()).to_hex().to_string(),
+            "roles": ["writer"]
+        },
+        {
+            "principal": "security-admin",
+            "token_blake3": blake3::hash(admin.as_bytes()).to_hex().to_string(),
+            "roles": ["admin", "auditor"]
+        }
+    ]);
+    let credentials_path = output.join("credentials.json");
+    let mut credentials_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&credentials_path)?;
+    let encoded = serde_json::to_vec_pretty(&credentials)
+        .map_err(|error| HeraclitusError::Serialization(error.to_string()))?;
+    credentials_file.write_all(&encoded)?;
+    credentials_file.sync_all()?;
+
+    Ok(format!(
+        "credenciais criadas sem exibir tokens: credentials={}; writer={}; admin={}",
+        credentials_path.display(),
+        writer_path.display(),
+        admin_path.display()
+    ))
+}
 
 pub fn log_inspect(dir: &std::path::Path) -> Result<String, heraclitus_core::HeraclitusError> {
     let log = Log::open(dir, 256 * 1024 * 1024, FsyncPolicy::Always)?;
@@ -36,6 +115,115 @@ pub fn verify(dir: &std::path::Path) -> Result<String, heraclitus_core::Heraclit
     Ok(format!(
         "segments: {}  records: {}  merkle ok: {}\nall crc checks passed",
         r.segments, r.records, r.merkle_ok
+    ))
+}
+
+/// Migração offline e não destrutiva para encryption-at-rest.
+///
+/// A origem e o destino são *data dirs* (cada um contém `log/`). O destino tem
+/// de não existir: isto impede sobreposição, mistura de épocas e overwrite
+/// acidental. A migração fixa o `head`, verifica a origem, lê em páginas e usa
+/// `append_replicated`, preservando LSN/EventId/HLC enquanto a serialização do
+/// log cifra content, attrs e embedding com uma chave por `agent_id`.
+pub fn migrate_encrypt(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<String, heraclitus_core::HeraclitusError> {
+    use heraclitus_core::HeraclitusError;
+
+    let source = std::fs::canonicalize(source)?;
+    let source_log = source.join("log");
+    if !source_log.is_dir() {
+        return Err(HeraclitusError::Config(format!(
+            "origem não contém diretório de log: {}",
+            source_log.display()
+        )));
+    }
+    if destination.exists() {
+        return Err(HeraclitusError::Config(format!(
+            "destino já existe; use um diretório novo: {}",
+            destination.display()
+        )));
+    }
+    let name = destination
+        .file_name()
+        .ok_or_else(|| HeraclitusError::Config("destino não pode ser raiz de volume".into()))?;
+    let parent = destination.parent().ok_or_else(|| {
+        HeraclitusError::Config("destino deve ter um diretório pai explícito".into())
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let destination = std::fs::canonicalize(parent)?.join(name);
+    if destination.starts_with(&source) || source.starts_with(&destination) {
+        return Err(HeraclitusError::Config(
+            "origem e destino não podem conter um ao outro".into(),
+        ));
+    }
+
+    let source_keys = source.join("keys");
+    let source_keystore = source_keys
+        .is_dir()
+        .then(|| KeyStore::open(&source_keys))
+        .transpose()?;
+    let source_log = Log::open_with_keystore(
+        &source_log,
+        256 * 1024 * 1024,
+        FsyncPolicy::Always,
+        source_keystore,
+    )?;
+    let source_report = source_log.verify()?;
+    let head = source_log.head();
+
+    std::fs::create_dir(&destination)?;
+    let destination_keystore = KeyStore::open(destination.join("keys"))?;
+    let destination_log = Log::open_with_keystore(
+        destination.join("log"),
+        256 * 1024 * 1024,
+        FsyncPolicy::Always,
+        Some(destination_keystore),
+    )?;
+
+    let mut cursor = 0u64;
+    let mut copied = 0u64;
+    while cursor < head {
+        let page = source_log.scan_capped(cursor, head, 4096)?;
+        if page.is_empty() {
+            return Err(HeraclitusError::Corruption {
+                context: format!("migração no LSN {cursor}"),
+                detail: "origem terminou antes do head fixado".into(),
+            });
+        }
+        for (lsn, episode) in page {
+            if lsn != cursor {
+                return Err(HeraclitusError::Corruption {
+                    context: format!("migração no LSN {cursor}"),
+                    detail: format!("histórico não contíguo; próximo LSN é {lsn}"),
+                });
+            }
+            destination_log.append_replicated(lsn, episode)?;
+            cursor = cursor.saturating_add(1);
+            copied = copied.saturating_add(1);
+        }
+    }
+    destination_log.flush()?;
+    let destination_report = destination_log.verify()?;
+    if destination_log.head() != head || copied != head {
+        return Err(HeraclitusError::Corruption {
+            context: "migração cifrada".into(),
+            detail: format!(
+                "contagem divergente: origem head={head}; destino head={}; copiados={copied}",
+                destination_log.head()
+            ),
+        });
+    }
+
+    Ok(format!(
+        "migração cifrada concluída: {copied} evento(s); origem {} segmento(s)/{} registro(s); destino {} segmento(s)/{} registro(s); origem preservada em {}; destino {}",
+        source_report.segments,
+        source_report.records,
+        destination_report.segments,
+        destination_report.records,
+        source.display(),
+        destination.display()
     ))
 }
 
@@ -274,5 +462,89 @@ mod tests {
         let hi = r.curves.last().unwrap().2;
         assert!(hi >= lo, "recall must not degrade with ef ({lo} -> {hi})");
         assert!(hi > 0.8, "recall@10 at ef=256 too low: {hi}");
+    }
+
+    #[test]
+    fn migrate_encrypt_preserves_identity_and_hides_plaintext() {
+        use heraclitus_core::{Episode, EventKind};
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("encrypted");
+        let source_log = Log::open(source.join("log"), 1024 * 1024, FsyncPolicy::Always).unwrap();
+        let mut episode = Episode::new(
+            "titular:hmac-sha256:abc",
+            EventKind::Observation,
+            b"PII-MIGRATION-UNIQUE-4471".to_vec(),
+        );
+        episode.session_id = "sessao".into();
+        episode
+            .attrs
+            .insert("matricula".into(), "SERVIDOR-99881".into());
+        let (lsn, stamped) = source_log.append_stamped(episode).unwrap();
+        source_log.flush().unwrap();
+        drop(source_log);
+
+        let report = migrate_encrypt(&source, &destination).unwrap();
+        assert!(report.contains("1 evento(s)"));
+
+        let raw: Vec<u8> = std::fs::read_dir(destination.join("log"))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().is_some_and(|x| x == "hrkl"))
+            .flat_map(|entry| std::fs::read(entry.path()).unwrap())
+            .collect();
+        assert!(!raw.windows(25).any(|w| w == b"PII-MIGRATION-UNIQUE-4471"));
+        assert!(!raw.windows(14).any(|w| w == b"SERVIDOR-99881"));
+
+        let keys = KeyStore::open(destination.join("keys")).unwrap();
+        let encrypted = Log::open_with_keystore(
+            destination.join("log"),
+            1024 * 1024,
+            FsyncPolicy::Always,
+            Some(keys),
+        )
+        .unwrap();
+        let (_, restored) = encrypted.read(lsn).unwrap().unwrap();
+        assert_eq!(restored.id, stamped.id);
+        assert_eq!(restored.ts_hlc, stamped.ts_hlc);
+        assert_eq!(restored.content, b"PII-MIGRATION-UNIQUE-4471");
+        assert_eq!(restored.attrs["matricula"], "SERVIDOR-99881");
+        assert!(encrypted.verify().is_ok());
+    }
+
+    #[test]
+    fn migrate_encrypt_refuses_existing_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir_all(source.join("log")).unwrap();
+        let destination = root.path().join("existing");
+        std::fs::create_dir(&destination).unwrap();
+        let error = migrate_encrypt(&source, &destination).unwrap_err();
+        assert!(error.to_string().contains("destino já existe"));
+    }
+
+    #[test]
+    fn init_credentials_hashes_match_tokens_and_refuses_overwrite() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("secrets");
+        let message = init_credentials(&output).unwrap();
+        let writer = std::fs::read_to_string(output.join("writer.token")).unwrap();
+        assert!(!message.contains(&writer));
+        let credentials: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(output.join("credentials.json")).unwrap())
+                .unwrap();
+        for (index, name) in [(0, "writer.token"), (1, "admin.token")] {
+            let token = std::fs::read_to_string(output.join(name)).unwrap();
+            assert_eq!(token.len(), 96);
+            assert_eq!(
+                credentials[index]["token_blake3"].as_str().unwrap(),
+                blake3::hash(token.as_bytes()).to_hex().as_str()
+            );
+        }
+        assert!(init_credentials(&output)
+            .unwrap_err()
+            .to_string()
+            .contains("já existe"));
     }
 }

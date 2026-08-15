@@ -28,9 +28,16 @@ fn manifest_reflects_segments_and_watermark() {
     assert_eq!(m.format_identifier, *b"HRKL");
     assert_eq!(m.cumulative_watermark, log.head());
     // Selados vêm Frozen com Merkle root; o ativo (se tem eventos) vem Active.
-    let frozen: Vec<_> = m.segments.iter().filter(|s| s.state == SegmentState::Frozen).collect();
+    let frozen: Vec<_> = m
+        .segments
+        .iter()
+        .filter(|s| s.state == SegmentState::Frozen)
+        .collect();
     assert_eq!(frozen.len(), sealed.len());
-    assert!(frozen.iter().all(|s| s.payload_hash != [0; 32]), "Merkle nos selados");
+    assert!(
+        frozen.iter().all(|s| s.payload_hash != [0; 32]),
+        "Merkle nos selados"
+    );
     // Cobertura contígua: soma de event_count = head.
     let total: u64 = m.segments.iter().map(|s| s.event_count).sum();
     assert_eq!(total, log.head());

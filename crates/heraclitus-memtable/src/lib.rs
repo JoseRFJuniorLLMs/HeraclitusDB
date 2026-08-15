@@ -87,6 +87,13 @@ impl Memtable {
         self.len() == 0
     }
 
+    /// Remove toda a cauda materializada. Usado por operações de privacidade
+    /// antes de reconstruir as views a partir do log já crypto-shredded.
+    pub fn clear(&self) {
+        self.entries.write().unwrap().clear();
+        self.adjacency.clear();
+    }
+
     /// Exact brute-force KNN over the tail (≤ cap points — fine, §3.4).
     pub fn knn(&self, metric: &ProductMetric, query: &ProductPoint, k: usize) -> Vec<ScoredHit> {
         let entries = self.entries.read().unwrap();

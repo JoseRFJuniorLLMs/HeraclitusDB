@@ -498,7 +498,7 @@ pub fn topm_gpu(
     m: usize,
     scale: f32,
 ) -> Option<Vec<Candidate>> {
-    if dim == 0 || query.len() != dim || vectors.is_empty() || vectors.len() % dim != 0 {
+    if dim == 0 || query.len() != dim || vectors.is_empty() || !vectors.len().is_multiple_of(dim) {
         return None;
     }
     let n = vectors.len() / dim;
@@ -527,7 +527,7 @@ pub fn topm_product_gpu(
     scale: f32,
 ) -> Option<Vec<Candidate>> {
     let dim = sig.a + sig.b + sig.c;
-    if dim == 0 || query.len() != dim || vectors.is_empty() || vectors.len() % dim != 0 {
+    if dim == 0 || query.len() != dim || vectors.is_empty() || !vectors.len().is_multiple_of(dim) {
         return None;
     }
     let n = vectors.len() / dim;

@@ -17,7 +17,10 @@ pub struct SystemMetric {
 
 impl SystemMetric {
     pub fn new(name: impl Into<String>, value: f64) -> Self {
-        Self { name: name.into(), value }
+        Self {
+            name: name.into(),
+            value,
+        }
     }
 
     /// Materialize this metric as a log episode. The metric name/value ride in
@@ -40,7 +43,10 @@ mod tests {
         let m = SystemMetric::new("freeze_duration_ms", 12.5);
         let ep = m.to_episode("engine");
         assert_eq!(ep.kind, EventKind::SystemMetric);
-        assert_eq!(ep.attrs.get("metric").map(String::as_str), Some("freeze_duration_ms"));
+        assert_eq!(
+            ep.attrs.get("metric").map(String::as_str),
+            Some("freeze_duration_ms")
+        );
         assert_eq!(ep.attrs.get("value").map(String::as_str), Some("12.5"));
     }
 }

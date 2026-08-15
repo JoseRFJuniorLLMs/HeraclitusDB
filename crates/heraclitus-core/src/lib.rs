@@ -30,14 +30,16 @@ pub mod vm;
 
 pub use canonical::CanonicalKeyCodec;
 pub use capability::CapabilityCatalog;
-pub use config::{FsyncPolicy, HeraclitusConfig, RaftTransport, ReplicationConfig};
+pub use config::{
+    AccessCredential, AccessRole, FsyncPolicy, HeraclitusConfig, RaftTransport, ReplicationConfig,
+};
 pub use consistency::IsolationLevel;
+pub use error::HeraclitusError;
+pub use event::{Episode, EventKind, Fact, ProductPoint};
+pub use hlc::Hlc;
+pub use id::{EventId, FactId, Lsn, SegmentId};
 pub use runtime::{
     ArtifactType, DatabaseManifest, DerivedExecutionArtifact, ExecutionContext, QueryFingerprint,
     SegmentState, StorageEngine,
 };
 pub use streaming::{NotificationEvent, StreamSubscriber};
-pub use error::HeraclitusError;
-pub use event::{Episode, EventKind, Fact, ProductPoint};
-pub use hlc::Hlc;
-pub use id::{EventId, FactId, Lsn, SegmentId};

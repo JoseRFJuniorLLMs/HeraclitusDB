@@ -24,7 +24,8 @@ fn probe_big_value_after_tree_grows() {
     let big = vec![0xABu8; 6144];
     t.upsert(b"zzz-grande".to_vec(), big.clone())
         .expect("upsert de valor grande apos split nao pode falhar");
-    t.commit().expect("commit apos valor grande nao pode falhar");
+    t.commit()
+        .expect("commit apos valor grande nao pode falhar");
 
     assert_eq!(
         t.get(b"zzz-grande"),

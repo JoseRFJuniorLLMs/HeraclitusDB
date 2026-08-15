@@ -50,7 +50,10 @@ mod tests {
     fn put_then_get_roundtrips_batches() {
         let f = MemFlight::default();
         assert_eq!(f.do_put(vec![vec![1, 2], vec![3, 4]]).unwrap(), 2);
-        assert_eq!(f.do_get(&Ticket(b"t1".to_vec())).unwrap(), vec![vec![1, 2], vec![3, 4]]);
+        assert_eq!(
+            f.do_get(&Ticket(b"t1".to_vec())).unwrap(),
+            vec![vec![1, 2], vec![3, 4]]
+        );
         assert!(f.do_get(&Ticket(b"nope".to_vec())).is_err());
     }
 }

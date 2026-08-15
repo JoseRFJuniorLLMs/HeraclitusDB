@@ -68,8 +68,14 @@ mod tests {
 
     #[test]
     fn strategy_by_size_and_locality() {
-        assert_eq!(plan_transnode_access(0, 0, 10_000, 1024), TransnodeStrategy::Local);
-        assert_eq!(plan_transnode_access(0, 1, 512, 1024), TransnodeStrategy::Replicate);
+        assert_eq!(
+            plan_transnode_access(0, 0, 10_000, 1024),
+            TransnodeStrategy::Local
+        );
+        assert_eq!(
+            plan_transnode_access(0, 1, 512, 1024),
+            TransnodeStrategy::Replicate
+        );
         assert_eq!(
             plan_transnode_access(0, 1, 1 << 30, 1024),
             TransnodeStrategy::RecompileLocal

@@ -151,10 +151,7 @@ async fn flight_events(
 /// Caveat: `LogAnalytics::from_log` materializa o log até ao head (ou `as_of`)
 /// por chamada — usar `as_of` e `LIMIT`/`WHERE` para consultas grandes.
 #[cfg(feature = "analytics")]
-async fn sql(
-    State(engine): State<Arc<Engine>>,
-    Json(body): Json<serde_json::Value>,
-) -> Response {
+async fn sql(State(engine): State<Arc<Engine>>, Json(body): Json<serde_json::Value>) -> Response {
     use axum::response::IntoResponse;
     let Some(query) = body.get("sql").and_then(|v| v.as_str()).map(str::to_owned) else {
         return (StatusCode::BAD_REQUEST, "corpo requer o campo string `sql`").into_response();
@@ -214,11 +211,19 @@ async fn run_sql(
     // largado é mesmo cancelado (ao contrário do `spawn_blocking` acima).
     let rows = tokio::time::timeout(std::time::Duration::from_secs(30), analytics.sql(&query))
         .await
-        .map_err(|_| (StatusCode::REQUEST_TIMEOUT, "timeout executando SQL".to_string()))?
+        .map_err(|_| {
+            (
+                StatusCode::REQUEST_TIMEOUT,
+                "timeout executando SQL".to_string(),
+            )
+        })?
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("sql: {e}")))?;
 
     if rows.len() > 10_000 {
-        return Err((StatusCode::PAYLOAD_TOO_LARGE, "Conjunto de resultados muito grande (> 10.000 linhas). Utilize LIMIT.".to_string()));
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Conjunto de resultados muito grande (> 10.000 linhas). Utilize LIMIT.".to_string(),
+        ));
     }
 
     Ok(rows)
@@ -258,12 +263,7 @@ fn hvm_state_json(engine: &Engine) -> Result<serde_json::Value, String> {
     let entries: serde_json::Map<String, serde_json::Value> = state
         .memory_layers
         .iter()
-        .map(|(k, v)| {
-            (
-                bytes_str(k),
-                serde_json::Value::String(bytes_str(v)),
-            )
-        })
+        .map(|(k, v)| (bytes_str(k), serde_json::Value::String(bytes_str(v))))
         .collect();
     Ok(serde_json::json!({
         "current_lsn": state.current_lsn,
@@ -286,13 +286,20 @@ async fn hvm_state(State(engine): State<Arc<Engine>>) -> Response {
 /// `POST /hvm/upsert` — corpo `{"key":"…","val":"…"}` (UTF-8) → `{"lsn":n}`.
 /// Escrita no ledger via `Engine::append` — logo pelo **consenso** quando a
 /// replicação está ativa (num não-líder devolve erro com o hint do líder).
-async fn hvm_upsert(State(engine): State<Arc<Engine>>, Json(body): Json<serde_json::Value>) -> Response {
+async fn hvm_upsert(
+    State(engine): State<Arc<Engine>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
     use axum::response::IntoResponse;
     let (Some(key), Some(val)) = (
         body.get("key").and_then(|v| v.as_str()),
         body.get("val").and_then(|v| v.as_str()),
     ) else {
-        return (StatusCode::BAD_REQUEST, "corpo requer os campos string `key` e `val`").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "corpo requer os campos string `key` e `val`",
+        )
+            .into_response();
     };
     let (key, val) = (key.as_bytes().to_vec(), val.as_bytes().to_vec());
     match tokio::task::spawn_blocking(move || engine.hvm_upsert(key, val)).await {
@@ -303,7 +310,10 @@ async fn hvm_upsert(State(engine): State<Arc<Engine>>, Json(body): Json<serde_js
 }
 
 /// `POST /hvm/delete` — corpo `{"key":"…"}` → `{"lsn":n}`.
-async fn hvm_delete(State(engine): State<Arc<Engine>>, Json(body): Json<serde_json::Value>) -> Response {
+async fn hvm_delete(
+    State(engine): State<Arc<Engine>>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
     use axum::response::IntoResponse;
     let Some(key) = body.get("key").and_then(|v| v.as_str()) else {
         return (StatusCode::BAD_REQUEST, "corpo requer o campo string `key`").into_response();
@@ -355,10 +365,18 @@ async fn tier_demote(
     // seguidores teriam o recibo sem o objeto. O guard cai quando o store for
     // partilhado (nuvem via config).
     if engine.is_replicated() {
-        return (StatusCode::CONFLICT, "demote requer object store partilhado sob replicacao").into_response();
+        return (
+            StatusCode::CONFLICT,
+            "demote requer object store partilhado sob replicacao",
+        )
+            .into_response();
     }
     let Some(seg) = body.get("segment").and_then(|v| v.as_u64()) else {
-        return (StatusCode::BAD_REQUEST, "corpo requer o campo inteiro `segment`").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "corpo requer o campo inteiro `segment`",
+        )
+            .into_response();
     };
     // demote faz fs::read + blake3 + encode Parquet + fsync — fora do reactor.
     let res = tokio::task::spawn_blocking(move || {
@@ -412,10 +430,7 @@ async fn tier_receipts(State(engine): State<Arc<Engine>>) -> Response {
 /// devolve os episódios (lsn/agent/kind/content). NÃO reinsere nos índices
 /// quentes (recall-on-demand puro; a re-hidratação é follow-up).
 #[cfg(feature = "tier")]
-async fn tier_fetch(
-    State(engine): State<Arc<Engine>>,
-    Path(segment): Path<u64>,
-) -> Response {
+async fn tier_fetch(State(engine): State<Arc<Engine>>, Path(segment): Path<u64>) -> Response {
     use axum::response::IntoResponse;
     // fetch_cold_segment faz scan do log + decode do objeto — fora do reactor.
     let res = tokio::task::spawn_blocking(move || {
@@ -528,9 +543,13 @@ mod sql_tests {
         assert_eq!(rows, reference, "a via ligada difere da referência");
 
         // Snapshot AS OF: só lsn < 6.
-        let as_of = run_sql(&engine, "SELECT COUNT(*) AS n FROM events".to_owned(), Some(6))
-            .await
-            .unwrap();
+        let as_of = run_sql(
+            &engine,
+            "SELECT COUNT(*) AS n FROM events".to_owned(),
+            Some(6),
+        )
+        .await
+        .unwrap();
         assert_eq!(as_of[0]["n"], 6);
 
         // SQL inválido = 400, nunca pânico.
@@ -559,13 +578,20 @@ mod hvm_tests {
     fn hvm_state_json_reflects_the_ledger() {
         let dir = tempfile::tempdir().unwrap();
         let engine = engine_in(dir.path());
-        engine.hvm_upsert(b"user:1".to_vec(), b"alice".to_vec()).unwrap();
-        engine.hvm_upsert(b"user:2".to_vec(), b"bob".to_vec()).unwrap();
+        engine
+            .hvm_upsert(b"user:1".to_vec(), b"alice".to_vec())
+            .unwrap();
+        engine
+            .hvm_upsert(b"user:2".to_vec(), b"bob".to_vec())
+            .unwrap();
         engine.hvm_delete(b"user:1".to_vec()).unwrap();
 
         let v = hvm_state_json(&engine).unwrap();
         assert_eq!(v["entries"]["user:2"], "bob");
-        assert!(v["entries"].get("user:1").is_none(), "chave apagada não aparece");
+        assert!(
+            v["entries"].get("user:1").is_none(),
+            "chave apagada não aparece"
+        );
         // 3 instruções escritas (upsert/upsert/delete), LSNs 0-indexados ⇒ 2.
         assert!(v["max_lsn_applied"].as_u64().unwrap() >= 2);
     }
@@ -583,7 +609,9 @@ mod hvm_tests {
         engine.hvm_upsert(vec![0xff], b"um".to_vec()).unwrap();
         engine.hvm_upsert(vec![0xfe], b"dois".to_vec()).unwrap();
         // Valor binário também: deve sair como hex, não corrompido em silêncio.
-        engine.hvm_upsert(b"bin".to_vec(), vec![0x00, 0xff]).unwrap();
+        engine
+            .hvm_upsert(b"bin".to_vec(), vec![0x00, 0xff])
+            .unwrap();
 
         let v = hvm_state_json(&engine).unwrap();
         let entries = v["entries"].as_object().unwrap();
@@ -603,7 +631,9 @@ mod hvm_tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = engine_in(dir.path());
         // Chave literal "hex:ff" (texto) vs. chave binária 0xff (→ "hex:ff").
-        engine.hvm_upsert(b"hex:ff".to_vec(), b"literal".to_vec()).unwrap();
+        engine
+            .hvm_upsert(b"hex:ff".to_vec(), b"literal".to_vec())
+            .unwrap();
         engine.hvm_upsert(vec![0xff], b"binario".to_vec()).unwrap();
 
         let v = hvm_state_json(&engine).unwrap();
@@ -653,14 +683,24 @@ mod tier_tests {
         assert!(receipt.parquet_path.is_some(), "espelho Parquet criado");
 
         // O recibo verifica: re-computa o Merkle do objeto cold e confere.
-        assert!(engine.verify_demotion(&receipt).await.unwrap(), "recibo verifica");
+        assert!(
+            engine.verify_demotion(&receipt).await.unwrap(),
+            "recibo verifica"
+        );
 
         // Recall round-trip: o recibo está listado e o segmento busca-se de volta
         // do cold tier (object store) com todos os episódios.
         let receipts = engine.demotion_receipts().unwrap();
-        assert!(receipts.iter().any(|r| r.segment_id == seg), "recibo listado");
+        assert!(
+            receipts.iter().any(|r| r.segment_id == seg),
+            "recibo listado"
+        );
         let back = engine.fetch_cold_segment(seg).await.unwrap();
-        assert_eq!(back.len() as u64, receipt.record_count, "recall devolve todos os episódios");
+        assert_eq!(
+            back.len() as u64,
+            receipt.record_count,
+            "recall devolve todos os episódios"
+        );
 
         // GUARDA R21 (padrão §2.6, o mesmo do H-VM): o episódio DemotionReceipt
         // — agora appendado pelo Engine::append (caminho unificado) — tem de
@@ -722,13 +762,19 @@ mod tier_tests {
         };
         let new = engine.tier_compaction_tick(&policy).await.unwrap();
         assert_eq!(new.len(), 1, "um segmento compactado");
-        assert_eq!(new[0].dropped, tombstoned, "removeu exatamente os tombstonados");
+        assert_eq!(
+            new[0].dropped, tombstoned,
+            "removeu exatamente os tombstonados"
+        );
         assert_eq!(
             new[0].record_count + new[0].dropped,
             receipt.record_count,
             "kept + dropped == original"
         );
-        assert!(engine.verify_demotion(&new[0]).await.unwrap(), "recibo novo verifica");
+        assert!(
+            engine.verify_demotion(&new[0]).await.unwrap(),
+            "recibo novo verifica"
+        );
 
         // O recall do segmento passa a devolver só os sobreviventes.
         let survivors = engine.fetch_cold_segment(seg).await.unwrap();
@@ -736,6 +782,9 @@ mod tier_tests {
 
         // Idempotência: os tombstonados já foram removidos ⇒ 2º tick é no-op.
         let again = engine.tier_compaction_tick(&policy).await.unwrap();
-        assert!(again.is_empty(), "sem lixo novo, nada a compactar: {again:?}");
+        assert!(
+            again.is_empty(),
+            "sem lixo novo, nada a compactar: {again:?}"
+        );
     }
 }

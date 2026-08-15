@@ -890,12 +890,18 @@ impl LogBackend {
     /// (`"skip"` ou `"window"`). Público para o executor — e para testes.
     pub fn observe_access_path(&self, path: &str, nanos: f64) {
         let fp = Self::access_fingerprint(path, 0);
-        self.calibrator.lock().unwrap().observe(fp.logical_intent_hash, nanos);
+        self.calibrator
+            .lock()
+            .unwrap()
+            .observe(fp.logical_intent_hash, nanos);
     }
 
     fn predicted_access_path(&self, path: &str) -> Option<f64> {
         let fp = Self::access_fingerprint(path, 0);
-        self.calibrator.lock().unwrap().predicted(&fp.logical_intent_hash)
+        self.calibrator
+            .lock()
+            .unwrap()
+            .predicted(&fp.logical_intent_hash)
     }
 
     /// SPEC-028/031: cataloga os zone maps tocados; sob pressão (mais entradas
@@ -917,7 +923,9 @@ impl LogBackend {
             }
         }
         while self.scanner.cached() > cap {
-            let Some(evicted) = reg.evict_lru() else { break };
+            let Some(evicted) = reg.evict_lru() else {
+                break;
+            };
             let mut dropped = false;
             for id in evicted {
                 if let Some(seg) = seg_of.remove(&id) {

@@ -87,7 +87,11 @@ fn probe_graph_match_applies_non_pushdown_where() {
     // b != "Maria" deve excluir a aresta para Maria.
     let v = execute("MATCH (a)-[r]->(b) WHERE b != \"Maria\" RETURN *", &be).unwrap();
     let rows = v.as_array().unwrap();
-    assert_eq!(rows.len(), 1, "WHERE b != \"Maria\" tem de filtrar: {rows:?}");
+    assert_eq!(
+        rows.len(),
+        1,
+        "WHERE b != \"Maria\" tem de filtrar: {rows:?}"
+    );
     assert_eq!(rows[0]["to"].as_str().unwrap(), "Beto");
 }
 

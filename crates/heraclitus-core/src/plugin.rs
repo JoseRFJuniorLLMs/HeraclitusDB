@@ -45,7 +45,10 @@ pub struct PluginHost {
 
 impl PluginHost {
     pub fn new(host_major: u32) -> Self {
-        Self { host_major, catalog: RegistryCatalog::default() }
+        Self {
+            host_major,
+            catalog: RegistryCatalog::default(),
+        }
     }
 
     pub fn load(&mut self, mut plugin: Box<dyn HeraclitusPlugin>) -> Result<(), String> {
@@ -71,7 +74,10 @@ mod tests {
     struct ZstdPlugin;
     impl HeraclitusPlugin for ZstdPlugin {
         fn capabilities(&self) -> ExtensionCapabilities {
-            ExtensionCapabilities { provides_compression: Some("zstd-adaptive".into()), ..Default::default() }
+            ExtensionCapabilities {
+                provides_compression: Some("zstd-adaptive".into()),
+                ..Default::default()
+            }
         }
         fn register(&mut self, catalog: &mut RegistryCatalog) -> Result<(), String> {
             catalog.compressors.push("zstd-adaptive".into());
@@ -86,7 +92,10 @@ mod tests {
     fn compatible_plugin_registers_capability() {
         let mut host = PluginHost::new(1);
         host.load(Box::new(ZstdPlugin)).unwrap();
-        assert_eq!(host.catalog().compressors, vec!["zstd-adaptive".to_string()]);
+        assert_eq!(
+            host.catalog().compressors,
+            vec!["zstd-adaptive".to_string()]
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! The gRPC service over the engine.
 
 use crate::engine::Engine;
-use heraclitus_core::{Episode, EventKind, ProductPoint};
+use heraclitus_core::{AccessRole, Episode, EventKind, ProductPoint};
 use heraclitus_proto::v1 as pb;
 use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -22,11 +22,15 @@ fn internal(e: impl std::fmt::Display) -> Status {
 }
 
 fn episode_json(lsn: u64, e: &Episode) -> String {
+    let kind = match &e.kind {
+        EventKind::Custom(value) => value.clone(),
+        other => format!("{other:?}"),
+    };
     serde_json::json!({
         "lsn": lsn,
         "id": e.id.to_string(),
         "agent_id": e.agent_id,
-        "kind": format!("{:?}", e.kind),
+        "kind": kind,
         "content": crate::rest::bytes_str(&e.content),
         "attrs": e.attrs,
         "ts_hlc": e.ts_hlc,
@@ -40,7 +44,9 @@ impl pb::heraclitus_server::Heraclitus for Service {
         &self,
         req: Request<pb::AppendRequest>,
     ) -> Result<Response<pb::AppendResponse>, Status> {
+        let principal = crate::auth::require(&req, AccessRole::Writer)?;
         let r = req.into_inner();
+        let idempotency_key = r.idempotency_key.clone();
         let kind = match r.kind.as_str() {
             "" | "Observation" => EventKind::Observation,
             "Action" => EventKind::Action,
@@ -59,7 +65,16 @@ impl pb::heraclitus_server::Heraclitus for Service {
                 euc: r.euc,
             });
         }
+        if r.attrs.keys().any(|key| key.starts_with("__heraclitus_")) {
+            return Err(Status::invalid_argument(
+                "atributos com prefixo __heraclitus_ são reservados",
+            ));
+        }
         e.attrs = r.attrs.into_iter().collect();
+        e.attrs.insert(
+            "__heraclitus_authenticated_principal".into(),
+            principal.name,
+        );
         for p in r.parents {
             e.parents.push(
                 p.parse()
@@ -71,17 +86,37 @@ impl pb::heraclitus_server::Heraclitus for Service {
         // escrita concorrente — daí `spawn_blocking`, o padrão correto para uma
         // operação bloqueante dentro de um handler async.
         let engine = self.engine.clone();
-        let lsn = tokio::task::spawn_blocking(move || engine.append(e))
-            .await
-            .map_err(internal)?
-            .map_err(internal)?;
-        Ok(Response::new(pb::AppendResponse { lsn }))
+        let result =
+            tokio::task::spawn_blocking(move || engine.append_idempotent(e, &idempotency_key))
+                .await
+                .map_err(internal)?
+                .map_err(|e| match e {
+                    heraclitus_core::HeraclitusError::IdempotencyConflict { .. } => {
+                        Status::already_exists(e.to_string())
+                    }
+                    heraclitus_core::HeraclitusError::Query(_) => {
+                        Status::invalid_argument(e.to_string())
+                    }
+                    _ => internal(e),
+                })?;
+        Ok(Response::new(pb::AppendResponse {
+            lsn: result.0,
+            deduplicated: result.1,
+            event_id: result.2,
+        }))
     }
 
     async fn query(
         &self,
         req: Request<pb::QueryRequest>,
     ) -> Result<Response<pb::QueryResponse>, Status> {
+        let required = match heraclitus_query::required_access(&req.get_ref().gql)
+            .map_err(|e| Status::invalid_argument(e.to_string()))?
+        {
+            heraclitus_query::QueryAccess::Read => AccessRole::Reader,
+            heraclitus_query::QueryAccess::Write => AccessRole::Writer,
+        };
+        let principal = crate::auth::require(&req, required)?;
         let gql = req.into_inner().gql;
         // GQL pode ESCREVER (`CREATE` → append; `DECIDE` → append por ação) e a
         // meta-auditoria também appenda — todos bloqueiam no quórum quando a
@@ -92,7 +127,7 @@ impl pb::heraclitus_server::Heraclitus for Service {
             let result = heraclitus_query::execute(&gql, engine.as_ref());
             // Meta-auditoria (quando ligada por config): a execução — com sucesso
             // OU falha — vira um evento AuditQuery no log, antes de responder.
-            engine.audit_query(&gql, result.is_ok());
+            engine.audit_query(&gql, result.is_ok(), &principal.name);
             result
         })
         .await
@@ -107,6 +142,7 @@ impl pb::heraclitus_server::Heraclitus for Service {
         &self,
         req: Request<pb::RecallRequest>,
     ) -> Result<Response<pb::QueryResponse>, Status> {
+        crate::auth::require(&req, AccessRole::Reader)?;
         let r = req.into_inner();
         // R11: hidratação lê do disco (log.read por hit) — fora do reactor.
         let engine = self.engine.clone();
@@ -125,6 +161,7 @@ impl pb::heraclitus_server::Heraclitus for Service {
         &self,
         req: Request<pb::SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
+        crate::auth::require(&req, AccessRole::Reader)?;
         let from = req.into_inner().from_lsn;
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let engine = self.engine.clone();
@@ -205,8 +242,9 @@ impl pb::heraclitus_server::Heraclitus for Service {
 
     async fn snapshot(
         &self,
-        _req: Request<pb::SnapshotRequest>,
+        req: Request<pb::SnapshotRequest>,
     ) -> Result<Response<pb::SnapshotResponse>, Status> {
+        crate::auth::require(&req, AccessRole::Reader)?;
         Ok(Response::new(pb::SnapshotResponse {
             lsn: self.engine.snapshot(),
         }))
@@ -216,13 +254,20 @@ impl pb::heraclitus_server::Heraclitus for Service {
         &self,
         req: Request<pb::AdminRequest>,
     ) -> Result<Response<pb::AdminResponse>, Status> {
+        let required = match req.get_ref().op.as_str() {
+            "stats" | "verify" => AccessRole::Auditor,
+            _ => AccessRole::Admin,
+        };
+        let principal = crate::auth::require(&req, required)?;
         let r = req.into_inner();
         // R11: `verify` re-varre o log inteiro e `rebuild` replaya-o — minutos
         // em logs grandes. Correr isso no worker async estagnava o reactor do
         // tokio (o mesmo padrão já corrigido no `append`/`query`).
         let engine = self.engine.clone();
+        let operation = r.op.clone();
+        let audit_principal = principal.name.clone();
         let (ok, message) = tokio::task::spawn_blocking(move || {
-            match r.op.as_str() {
+            let result = match r.op.as_str() {
                 "stats" => (true, engine.stats().to_string()),
                 "verify" => match engine.verify() {
                     Ok(v) => (true, v.to_string()),
@@ -251,7 +296,9 @@ impl pb::heraclitus_server::Heraclitus for Service {
                     }
                 }
                 other => (false, format!("unknown admin op: {other}")),
-            }
+            };
+            engine.audit_admin(&operation, result.0, &audit_principal);
+            result
         })
         .await
         .map_err(internal)?;

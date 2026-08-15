@@ -81,7 +81,10 @@ impl DenseEntityMap {
             .enumerate()
             .map(|(i, id)| (*id, i as u32))
             .collect();
-        Self { forward, backward: events }
+        Self {
+            forward,
+            backward: events,
+        }
     }
 
     /// Phase 2+3 (Optimize → Freeze): publish an immutable, shareable view.

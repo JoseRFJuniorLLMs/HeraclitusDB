@@ -18,8 +18,17 @@ fn idx_com_valor() -> AttrIndex {
 #[test]
 fn intervalo_invertido_devolve_vazio_em_vez_de_panicar() {
     let idx = idx_com_valor();
-    assert!(idx.lookup_range("valor", Bound::Excluded(100.0), Bound::Excluded(10.0)).is_empty());
-    assert!(idx.lookup_range("valor", Bound::Included(100.0), Bound::Included(10.0)).is_empty());
-    assert!(idx.lookup_range("valor", Bound::Excluded(50.0), Bound::Excluded(50.0)).is_empty());
-    assert_eq!(idx.lookup_range("valor", Bound::Included(0.0), Bound::Included(100.0)), vec![1]);
+    assert!(idx
+        .lookup_range("valor", Bound::Excluded(100.0), Bound::Excluded(10.0))
+        .is_empty());
+    assert!(idx
+        .lookup_range("valor", Bound::Included(100.0), Bound::Included(10.0))
+        .is_empty());
+    assert!(idx
+        .lookup_range("valor", Bound::Excluded(50.0), Bound::Excluded(50.0))
+        .is_empty());
+    assert_eq!(
+        idx.lookup_range("valor", Bound::Included(0.0), Bound::Included(100.0)),
+        vec![1]
+    );
 }

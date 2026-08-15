@@ -15,7 +15,12 @@ use std::io::{Read, Seek, SeekFrom, Write};
 #[test]
 fn scan_e_read_concordam_perante_crc_violado() {
     let dir = tempfile::tempdir().unwrap();
-    let log = Log::open(dir.path().join("log"), 256 * 1024 * 1024, FsyncPolicy::Always).unwrap();
+    let log = Log::open(
+        dir.path().join("log"),
+        256 * 1024 * 1024,
+        FsyncPolicy::Always,
+    )
+    .unwrap();
     for i in 0..5 {
         log.append(Episode::new(
             "a",
@@ -36,7 +41,11 @@ fn scan_e_read_concordam_perante_crc_violado() {
         .find(|p| p.extension().map(|x| x == "hrkl").unwrap_or(false))
         .unwrap();
     {
-        let mut f = std::fs::OpenOptions::new().read(true).write(true).open(&seg).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&seg)
+            .unwrap();
         let mut buf = Vec::new();
         f.read_to_end(&mut buf).unwrap();
         let off = (buf.len() / 2) as u64;
@@ -47,13 +56,13 @@ fn scan_e_read_concordam_perante_crc_violado() {
     }
 
     // O scan NAO pode devolver Ok com um LSN em falta: ou devolve tudo, ou falha.
-    match log.scan(0, head) {
-        Ok(v) => assert_eq!(
+    // `Err` é a outra resposta correta: corrupção detectada e propagada.
+    if let Ok(v) = log.scan(0, head) {
+        assert_eq!(
             v.len() as u64,
             head,
             "scan devolveu Ok com {} de {head} registos — buraco silencioso",
             v.len()
-        ),
-        Err(_) => {} // falhar alto e o comportamento correto
+        );
     }
 }

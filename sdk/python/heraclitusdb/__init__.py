@@ -4,10 +4,11 @@
 
 """heraclitusdb — cliente Python para o HeraclitusDB.
 
-    import heraclitusdb
-    db = heraclitusdb.connect("127.0.0.1:7474")
+import heraclitusdb
+db = heraclitusdb.connect("127.0.0.1:7474")
 """
-from .client import Client, connect, HeraclitusError
 
-__version__ = "0.1.0"
-__all__ = ["Client", "connect", "HeraclitusError", "__version__"]
+from .client import Client, HeraclitusError, connect
+
+__version__ = "1.0.5"
+__all__ = ["Client", "HeraclitusError", "__version__", "connect"]

@@ -60,7 +60,9 @@ enum RaftRpc {
 enum RaftRpcResp {
     AppendEntries(Result<AppendEntriesResponse<NodeId>, RaftError<NodeId>>),
     Vote(Result<VoteResponse<NodeId>, RaftError<NodeId>>),
-    InstallSnapshot(Result<InstallSnapshotResponse<NodeId>, RaftError<NodeId, InstallSnapshotError>>),
+    InstallSnapshot(
+        Result<InstallSnapshotResponse<NodeId>, RaftError<NodeId, InstallSnapshotError>>,
+    ),
 }
 
 // ── enquadramento ───────────────────────────────────────────────────────────
@@ -191,7 +193,11 @@ impl RaftNetwork<TypeConfig> for TcpConnection {
         rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        match self.call(RaftRpc::AppendEntries(rpc)).await.map_err(RPCError::Unreachable)? {
+        match self
+            .call(RaftRpc::AppendEntries(rpc))
+            .await
+            .map_err(RPCError::Unreachable)?
+        {
             RaftRpcResp::AppendEntries(Ok(r)) => Ok(r),
             RaftRpcResp::AppendEntries(Err(e)) => {
                 Err(RPCError::RemoteError(RemoteError::new(self.target, e)))
@@ -207,9 +213,15 @@ impl RaftNetwork<TypeConfig> for TcpConnection {
         rpc: VoteRequest<NodeId>,
         _option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        match self.call(RaftRpc::Vote(rpc)).await.map_err(RPCError::Unreachable)? {
+        match self
+            .call(RaftRpc::Vote(rpc))
+            .await
+            .map_err(RPCError::Unreachable)?
+        {
             RaftRpcResp::Vote(Ok(r)) => Ok(r),
-            RaftRpcResp::Vote(Err(e)) => Err(RPCError::RemoteError(RemoteError::new(self.target, e))),
+            RaftRpcResp::Vote(Err(e)) => {
+                Err(RPCError::RemoteError(RemoteError::new(self.target, e)))
+            }
             _ => Err(RPCError::Unreachable(Unreachable::new(&io_err(
                 "resposta de tipo trocado",
             )))),
@@ -224,7 +236,11 @@ impl RaftNetwork<TypeConfig> for TcpConnection {
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
     > {
-        match self.call(RaftRpc::InstallSnapshot(rpc)).await.map_err(RPCError::Unreachable)? {
+        match self
+            .call(RaftRpc::InstallSnapshot(rpc))
+            .await
+            .map_err(RPCError::Unreachable)?
+        {
             RaftRpcResp::InstallSnapshot(Ok(r)) => Ok(r),
             RaftRpcResp::InstallSnapshot(Err(e)) => {
                 Err(RPCError::RemoteError(RemoteError::new(self.target, e)))
@@ -306,7 +322,11 @@ mod tests {
     }
 
     fn ep(i: u64) -> Episode {
-        Episode::new("tcp", EventKind::Observation, format!("net-{i}").into_bytes())
+        Episode::new(
+            "tcp",
+            EventKind::Observation,
+            format!("net-{i}").into_bytes(),
+        )
     }
 
     /// O teto de frame protege contra um comprimento gigante vindo do fio: em vez
@@ -319,7 +339,11 @@ mod tests {
         a.write_all(&u32::MAX.to_le_bytes()).await.unwrap();
         a.flush().await.unwrap();
         let err = read_frame(&mut b).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "recusa, não aloca");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "recusa, não aloca"
+        );
 
         // Um frame legítimo faz round-trip.
         let (mut a, mut b) = tokio::io::duplex(1024);
@@ -384,7 +408,12 @@ mod tests {
         }
 
         for t in &tcp {
-            assert_eq!(t.node.log.head(), 20, "nó {} replicou os 20 episódios", t.node.id);
+            assert_eq!(
+                t.node.log.head(),
+                20,
+                "nó {} replicou os 20 episódios",
+                t.node.id
+            );
         }
         assert!(logs_equivalent(&tcp[0].node.log, &tcp[1].node.log).unwrap());
         assert!(logs_equivalent(&tcp[1].node.log, &tcp[2].node.log).unwrap());
@@ -425,7 +454,12 @@ mod tests {
             .unwrap();
 
         for i in 0..5 {
-            tcp[leader as usize].node.raft.client_write(episode_bytes(&ep(i))).await.unwrap();
+            tcp[leader as usize]
+                .node
+                .raft
+                .client_write(episode_bytes(&ep(i)))
+                .await
+                .unwrap();
         }
 
         // Morte real do líder: encerra o seu Raft.
@@ -467,7 +501,12 @@ mod tests {
                 .applied_index_at_least(Some(last), "sobrevivente converge")
                 .await
                 .unwrap();
-            assert_eq!(t.node.log.head(), 10, "nó {} tem os 10 episódios", t.node.id);
+            assert_eq!(
+                t.node.log.head(),
+                10,
+                "nó {} tem os 10 episódios",
+                t.node.id
+            );
         }
         let survivors: Vec<&TcpNode> = tcp.iter().filter(|t| t.node.id != leader).collect();
         assert!(logs_equivalent(&survivors[0].node.log, &survivors[1].node.log).unwrap());

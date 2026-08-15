@@ -1,87 +1,124 @@
-# HeraclitusDB como serviço do Windows
+# HeraclitusDB como serviço Windows
 
-O binário **`heraclitus-service.exe`** corre o mesmo motor do `heraclitus-server`,
-mas conduzido pelo **Service Control Manager (SCM)** do Windows. Resultado: aparece
-no **Gerenciador de Tarefas → aba Serviços** (e em `services.msc`), arranca sozinho
-no boot, sobrevive ao logoff e responde a *start/stop* do Windows. Como um serviço
-não tem consola, o **log de execução** é escrito num ficheiro rotativo diário em
-`%ProgramData%\HeraclitusDB\logs`.
+`heraclitus-service.exe` executa o mesmo motor do servidor no Service Control
+Manager, com auto-start, parada graciosa e log diário. Instalações novas usam a
+conta virtual de menor privilégio `NT SERVICE\HeraclitusDB`, nunca LocalSystem.
 
-## 1. Compilar
+## Build
 
 ```powershell
-$env:PATH = "D:\DEV\tools\as-only;$env:PATH"
-cargo +stable-x86_64-pc-windows-gnu build --release -p heraclitus-server --bin heraclitus-service
+cargo +stable-x86_64-pc-windows-msvc build --release `
+  -p heraclitus-server --bin heraclitus-service --locked
+cargo +stable-x86_64-pc-windows-msvc build --release `
+  -p heraclitus-cli --bin heraclitus --locked
 ```
 
-Binário: `target\release\heraclitus-service.exe`.
+## Instalar e operar
 
-## 2. Instalar e arrancar (pede UAC uma vez)
+Em PowerShell elevado:
 
 ```powershell
-cd D:\DEV\HeraclitusDB\windows
-.\heraclitus-service.ps1 install
+.\windows\heraclitus-service.ps1 install
+.\windows\heraclitus-service.ps1 status
+.\windows\heraclitus-service.ps1 logs
 ```
 
-O script auto-eleva, regista o serviço (auto-start) e arranca-o.
+O perfil padrão continua de desenvolvimento em loopback. Para homologação,
+prepare primeiro um data-dir cifrado e credenciais novas.
 
-## 3. Ver o log de execução em tempo real
+## Migração de um diretório antigo em plaintext
+
+Nunca apenas ligue `HERACLITUS_ENCRYPTION=true` sobre segmentos antigos: isso
+cifra os appends novos, mas não reescreve o passado. Com o serviço parado:
 
 ```powershell
-.\heraclitus-service.ps1 logs        # segue o log (Ctrl+C para sair)
-.\heraclitus-service.ps1 status      # estado + PID
+target\release\heraclitus migrate-encrypt `
+  D:\HeraclitusDB\data `
+  D:\HeraclitusDB\data-encrypted-v1
 ```
 
-## 4. Parar / remover
+A origem é verificada e preservada. O destino precisa não existir e recebe
+novos segmentos cifrados + keystore; LSN, EventId e HLC são preservados. Views
+não são copiadas e serão reconstruídas no primeiro boot.
+
+## Credenciais sem segredo no terminal
 
 ```powershell
-.\heraclitus-service.ps1 stop
-.\heraclitus-service.ps1 uninstall
+target\release\heraclitus init-credentials D:\HeraclitusDB\secrets-v1
 ```
 
-## Comandos nativos do Windows (equivalentes)
+O comando cria `credentials.json` com hashes BLAKE3 e tokens separados. Não
+imprime nenhum token. Mova `admin.token` para cofre/offline depois do bootstrap.
+
+## Aplicar perfil seguro
 
 ```powershell
-Start-Service HeraclitusDB
-Stop-Service  HeraclitusDB
-Get-Service   HeraclitusDB
-sc.exe query  HeraclitusDB
+.\windows\heraclitus-production.ps1 apply `
+  -Profile homologation `
+  -DataDir D:\HeraclitusDB\data-encrypted-v1 `
+  -SecretsDir D:\HeraclitusDB\secrets-v1
 ```
 
-Ou diretamente pelo binário (PowerShell **como Administrador**):
+O script aplica ACLs, conta virtual, `fsync=always`, RBAC, meta-auditoria,
+encryption-at-rest e configura `HERACLITUS_TOKEN_FILE` no perfil do usuário.
+Abra um terminal novo depois da aplicação.
+
+`-Profile production` também liga o gate fail-closed e exige uma TSA HTTPS real
+e `-RestAuthFile` dentro de `SecretsDir`. O serviço recebe apenas o caminho em
+`HERACLITUS_REST_AUTH_FILE`; a senha não é copiada para variável de ambiente ou
+para o repositório. Isso não deve ser usado com TSA de laboratório.
+
+## Backup e restore
 
 ```powershell
-.\target\release\heraclitus-service.exe install
-.\target\release\heraclitus-service.exe uninstall
-.\target\release\heraclitus-service.exe console   # primeiro plano, para debug
-.\target\release\heraclitus-service.exe status
+.\windows\heraclitus-backup.ps1 backup `
+  -BackupRoot D:\HeraclitusDB\backups `
+  -HeraclitusCli D:\DEV\HeraclitusDB\target\release\heraclitus.exe
+
+.\windows\heraclitus-backup.ps1 verify `
+  -BackupPath D:\HeraclitusDB\backups\heraclitus-backup-<UTC> `
+  -HeraclitusCli D:\DEV\HeraclitusDB\target\release\heraclitus.exe
+
+.\windows\heraclitus-backup.ps1 restore `
+  -BackupPath D:\HeraclitusDB\backups\heraclitus-backup-<UTC> `
+  -Destination D:\HeraclitusDB\restore-drill-<UTC>
 ```
 
-## Configuração
+O backup para o serviço de forma graciosa, copia e gera manifesto SHA-256. O
+restore nunca apaga nem sobrescreve: o destino precisa não existir.
+Como o backup inclui o keystore necessário ao restore, o volume de backup deve
+ter cifra de volume/cofre e acesso segregado; em produção, use também cópia
+imutável e off-site conforme o RPO/RTO do órgão.
 
-O serviço não recebe argumentos do SCM; configura-se por **variáveis de ambiente
-de sistema** (ou aceita os padrões). As variáveis são lidas no arranque:
+## Upgrade local transacional
 
-| Variável | Padrão (serviço) | Função |
-|---|---|---|
-| `HERACLITUS_DATA_DIR` | `%ProgramData%\HeraclitusDB\data` | log append-only + views |
-| `HERACLITUS_GRPC_ADDR` | `127.0.0.1:7474` | endpoint gRPC |
-| `HERACLITUS_REST_ADDR` | `127.0.0.1:7475` | endpoint REST (admin) |
-| `HERACLITUS_LOG_DIR` | `%ProgramData%\HeraclitusDB\logs` | log de execução |
-| `HERACLITUS_FSYNC` | `always` | `always` ou `group_commit:<ms>` |
-
-Para mudar uma porta de forma persistente para o serviço:
+Para atualizar uma instalação antiga que ainda usa dados em plaintext, existe
+um fluxo único e fail-safe. Ele exige PowerShell elevado e preserva origem e
+binário anterior, migra para um data-dir novo cifrado, cria credenciais, aplica
+o perfil de homologação e só conclui depois de backup, restore e restart:
 
 ```powershell
-[Environment]::SetEnvironmentVariable('HERACLITUS_GRPC_ADDR','0.0.0.0:7474','Machine')
-Restart-Service HeraclitusDB
+.\windows\deploy-local-homologation.ps1
 ```
 
-## Notas
+Todos os destinos precisam ser novos; o script nunca apaga nem sobrescreve
+data-dirs. Em falha, restaura ambiente, conta e binário anteriores e volta a
+iniciar o serviço original. Parâmetros permitem usar caminhos diferentes.
 
-- O serviço corre como **LocalSystem**. Os caminhos default vivem em
-  `%ProgramData%` justamente para o serviço nunca escrever em `System32`
-  (o diretório de trabalho que o SCM impõe).
-- A paragem é **graciosa**: o SCM envia `Stop`, que é encaminhado para um
-  *shutdown* limpo do `serve()` (fecha o gRPC, aborta o REST) — sem perda de
-  escritas confirmadas, fiel à durabilidade do log.
+## Variáveis relevantes
+
+| Variável | Uso |
+| --- | --- |
+| `HERACLITUS_DATA_DIR` | data-dir ativo |
+| `HERACLITUS_GRPC_ADDR` | gRPC; padrão `127.0.0.1:7474` |
+| `HERACLITUS_REST_ADDR` | REST administrativo; sempre loopback |
+| `HERACLITUS_FSYNC` | produção exige `always` |
+| `HERACLITUS_CREDENTIALS_FILE` | JSON com principals, roles e hashes |
+| `HERACLITUS_TOKEN_FILE` | token do cliente; nunca lido pelo servidor |
+| `HERACLITUS_ENCRYPTION` | cifra por titular |
+| `HERACLITUS_AUDIT_QUERIES` | meta-auditoria de consultas |
+| `HERACLITUS_CONFIG` | TOML opcional lido pelo serviço |
+| `HERACLITUS_PRODUCTION` | ativa gates estritos |
+
+Fora de loopback, gRPC exige autenticação e TLS. Raft entre máquinas exige gRPC
+com mTLS. O REST administrativo nunca aceita bind público.

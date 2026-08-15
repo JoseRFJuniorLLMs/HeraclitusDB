@@ -292,8 +292,14 @@ mod tests {
         f1.batch = 1; // pathological: one event per round
         let mut f2 = Follower::new(flog2.clone());
         f2.batch = 4096; // whole log in one shot
-        f1.sync_once(&mut LocalTransport { leader: leader.clone() }).unwrap();
-        f2.sync_once(&mut LocalTransport { leader: leader.clone() }).unwrap();
+        f1.sync_once(&mut LocalTransport {
+            leader: leader.clone(),
+        })
+        .unwrap();
+        f2.sync_once(&mut LocalTransport {
+            leader: leader.clone(),
+        })
+        .unwrap();
 
         assert!(logs_equivalent(&leader, &flog1).unwrap());
         assert!(logs_equivalent(&flog1, &flog2).unwrap());
@@ -335,10 +341,14 @@ mod tests {
 
         // Followers pull the raw log only — they never receive a GraphIndex.
         Follower::new(flog1.clone())
-            .sync_once(&mut LocalTransport { leader: leader.clone() })
+            .sync_once(&mut LocalTransport {
+                leader: leader.clone(),
+            })
             .unwrap();
         Follower::new(flog2.clone())
-            .sync_once(&mut LocalTransport { leader: leader.clone() })
+            .sync_once(&mut LocalTransport {
+                leader: leader.clone(),
+            })
             .unwrap();
 
         // Each node hydrates its own graph view from its own local log.

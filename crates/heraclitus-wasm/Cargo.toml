@@ -11,6 +11,6 @@ heraclitus-core = { workspace = true }
 # Runtime WASM de referência. Crate SEPARADO de propósito: quem não usa
 # plugins não paga esta dependência (e a tese "inteligência no agente" fica
 # preservada — isto é opt-in por construção).
-wasmtime = "31"
+wasmtime = { version = "=36.0.13", default-features = false, features = ["cranelift", "runtime", "wat", "std"] }
 
 [dev-dependencies]

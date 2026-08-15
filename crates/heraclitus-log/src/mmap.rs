@@ -56,7 +56,10 @@ impl MappedSegment {
         // NOTE: madvise (SEQUENTIAL/WILLNEED/HUGEPAGE) + NUMA affinity are the
         // Linux runtime tuning of CPM-600 — see the module docs; not wired here.
         let hdr = SegmentHeader::decode(&mmap[..])?;
-        Ok(Self { mmap, version: hdr.version })
+        Ok(Self {
+            mmap,
+            version: hdr.version,
+        })
     }
 
     /// The raw mapped bytes (including header/footer).
@@ -114,7 +117,11 @@ mod tests {
         let mut hashes = Vec::new();
         {
             let mut f = File::create(&path).unwrap();
-            let hdr = SegmentHeader { version: format::FORMAT_VERSION, segment_id: 7, created_hlc: 1 };
+            let hdr = SegmentHeader {
+                version: format::FORMAT_VERSION,
+                segment_id: 7,
+                created_hlc: 1,
+            };
             f.write_all(&hdr.encode()).unwrap();
             for (i, p) in payloads.iter().enumerate() {
                 let rec = encode_record(format::FORMAT_VERSION, 100 + i as u64, 500 + i as u64, p);
@@ -137,7 +144,11 @@ mod tests {
 
         let got: Vec<(Lsn, u64, Vec<u8>)> =
             seg.records().map(|(l, h, p)| (l, h, p.to_vec())).collect();
-        assert_eq!(got.len(), 3, "iteration must stop at the footer, not read it");
+        assert_eq!(
+            got.len(),
+            3,
+            "iteration must stop at the footer, not read it"
+        );
         assert_eq!(got[0], (100, 500, b"alpha".to_vec()));
         assert_eq!(got[1], (101, 501, b"bravo-payload".to_vec()));
         assert_eq!(got[2], (102, 502, b"charlie".to_vec()));
@@ -154,7 +165,11 @@ mod tests {
         let path = dir.path().join(format!("{:020}.hrkl", 0));
         {
             let mut f = File::create(&path).unwrap();
-            let hdr = SegmentHeader { version: format::FORMAT_VERSION, segment_id: 0, created_hlc: 1 };
+            let hdr = SegmentHeader {
+                version: format::FORMAT_VERSION,
+                segment_id: 0,
+                created_hlc: 1,
+            };
             f.write_all(&hdr.encode()).unwrap();
             let rec0 = encode_record(format::FORMAT_VERSION, 0, 0, b"good");
             let mut rec1 = encode_record(format::FORMAT_VERSION, 1, 0, b"tampered");

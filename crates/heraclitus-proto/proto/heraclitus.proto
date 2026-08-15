@@ -22,8 +22,16 @@ message AppendRequest {
   repeated float euc = 7;
   map<string, string> attrs = 8;
   repeated string parents = 9; // ULID strings (provenance edges)
+  // Stable key supplied by an external producer. The server atomically returns
+  // the original LSN for an identical retry and rejects reuse with a different
+  // payload. Maximum 80 ASCII characters.
+  string idempotency_key = 10;
 }
-message AppendResponse { uint64 lsn = 1; }
+message AppendResponse {
+  uint64 lsn = 1;
+  bool deduplicated = 2;
+  string event_id = 3; // ULID of the original or newly appended episode
+}
 
 message QueryRequest { string gql = 1; }    // GQL subset incl. EXPLAIN/AS OF
 message QueryResponse { string json = 1; }  // rows (or plan text) as JSON

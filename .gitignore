@@ -1,5 +1,6 @@
 /target
 **/target
+/target-deploy/
 *.log
 /data
 fuzz/corpus
@@ -26,6 +27,9 @@ sdk/python-embedded/target/
 sdk/python-embedded/*.so
 sdk/python-embedded/*.pyd
 **/__pycache__/
+sdk/python/.venv/
+sdk/python/build/
+sdk/python/*.egg-info/
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CODIGO-FONTE RUST — NUNCA COMMITAR (repositorio publico)

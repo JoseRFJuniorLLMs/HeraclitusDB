@@ -42,7 +42,10 @@ impl ReplayDispatcher {
     pub fn dispatch_record(&mut self, lsn: Lsn, payload: &[u8]) -> Result<(), String> {
         for sink in &mut self.ordered_sinks {
             sink.consume_log_record(lsn, payload).map_err(|err| {
-                format!("[SPEC-ERR] replay aborted at sink '{}': {err}", sink.sink_identifier())
+                format!(
+                    "[SPEC-ERR] replay aborted at sink '{}': {err}",
+                    sink.sink_identifier()
+                )
             })?;
         }
         Ok(())
@@ -78,8 +81,16 @@ mod tests {
         let a = Arc::new(AtomicU64::new(0));
         let b = Arc::new(AtomicU64::new(0));
         let mut d = ReplayDispatcher::new();
-        d.attach_sink(Box::new(Counting { id: "a", seen: a.clone(), fail_at: None }));
-        d.attach_sink(Box::new(Counting { id: "b", seen: b.clone(), fail_at: Some(3) }));
+        d.attach_sink(Box::new(Counting {
+            id: "a",
+            seen: a.clone(),
+            fail_at: None,
+        }));
+        d.attach_sink(Box::new(Counting {
+            id: "b",
+            seen: b.clone(),
+            fail_at: Some(3),
+        }));
         assert_eq!(d.sink_count(), 2);
 
         for lsn in 0..3 {

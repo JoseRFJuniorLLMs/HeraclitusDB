@@ -4,18 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "heraclitusdb"
-version = "0.1.0"
+version = "1.0.5"
 description = "Cliente Python para o HeraclitusDB — banco de auditoria event-sourced (log imutável, AS OF, Merkle, provenance)."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = { text = "BUSL-1.1" }
 authors = [{ name = "Jose R F Junior", email = "web2ajax@gmail.com" }]
 keywords = ["heraclitusdb", "event-sourcing", "audit", "graph", "provenance", "merkle", "grpc"]
-dependencies = ["grpcio>=1.50", "protobuf>=4.21"]
+dependencies = ["grpcio>=1.80", "protobuf>=6.31.1"]
 
 [project.optional-dependencies]
 pandas = ["pandas>=1.5"]
-dev = ["grpcio-tools>=1.50", "pytest>=7"]
+dev = ["grpcio-tools==1.80.0", "pytest>=8"]
 
 [project.urls]
 Homepage = "https://github.com/JoseRFJuniorLLMs/HeraclitusDB"
@@ -25,3 +25,14 @@ packages = ["heraclitusdb"]
 
 [tool.setuptools.package-data]
 heraclitusdb = ["*.py"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+exclude = [
+    "heraclitusdb/heraclitus_pb2.py",
+    "heraclitusdb/heraclitus_pb2_grpc.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "RUF", "UP"]

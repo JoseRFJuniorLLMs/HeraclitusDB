@@ -76,9 +76,16 @@ pub fn constant_fold(f: &Function) -> Function {
             Some(c) => Op::Const(c),
             None => inst.op.clone(),
         };
-        insts.push(Inst { result: i as ValueId, op });
+        insts.push(Inst {
+            result: i as ValueId,
+            op,
+        });
     }
-    Function { n_columns: f.n_columns, insts, ret: f.ret }
+    Function {
+        n_columns: f.n_columns,
+        insts,
+        ret: f.ret,
+    }
 }
 
 /// Dead-code elimination: remove instruções cujo resultado não alcança `ret`,
@@ -110,9 +117,16 @@ pub fn dead_code_elimination(f: &Function) -> Function {
         if !live[i] {
             continue;
         }
-        insts.push(Inst { result: remap[i], op: remap_op(&inst.op, &remap) });
+        insts.push(Inst {
+            result: remap[i],
+            op: remap_op(&inst.op, &remap),
+        });
     }
-    Function { n_columns: f.n_columns, insts, ret: remap[f.ret as usize] }
+    Function {
+        n_columns: f.n_columns,
+        insts,
+        ret: remap[f.ret as usize],
+    }
 }
 
 /// `constant_fold` ⟶ `dead_code_elimination`.
@@ -170,7 +184,10 @@ mod tests {
 
         let folded = constant_fold(&f);
         // A instrução `sum` passou a Const(5).
-        assert!(matches!(folded.insts[sum as usize].op, Op::Const(Const::I64(5))));
+        assert!(matches!(
+            folded.insts[sum as usize].op,
+            Op::Const(Const::I64(5))
+        ));
     }
 
     #[test]
@@ -209,7 +226,15 @@ mod tests {
         let after = interpret(&opt, &cols, 4).unwrap();
         assert_eq!(before, after, "otimização preserva a semântica");
         // 6<3=F ; 6<6=F ; 6<7=T ; 6<100=T
-        assert_eq!(after, vec![Val::Bool(false), Val::Bool(false), Val::Bool(true), Val::Bool(true)]);
+        assert_eq!(
+            after,
+            vec![
+                Val::Bool(false),
+                Val::Bool(false),
+                Val::Bool(true),
+                Val::Bool(true)
+            ]
+        );
         // E encolheu (dobrou constantes + limpou mortos).
         assert!(opt.insts.len() < f.insts.len());
     }

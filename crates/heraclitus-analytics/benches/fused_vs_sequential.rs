@@ -43,37 +43,62 @@ fn bench(c: &mut Criterion) {
     for &sel in &[0.9f64, 0.5, 0.1, 0.01] {
         let thr = (sel * N as f64) as u64;
         let preds = vec![
-            Predicate { column: 0, op: CmpOp::Lt, value: Literal::U64(thr) }, // p0: lsn < thr
-            Predicate { column: 1, op: CmpOp::Eq, value: Literal::Str("alice".into()) }, // p1
+            Predicate {
+                column: 0,
+                op: CmpOp::Lt,
+                value: Literal::U64(thr),
+            }, // p0: lsn < thr
+            Predicate {
+                column: 1,
+                op: CmpOp::Eq,
+                value: Literal::Str("alice".into()),
+            }, // p1
         ];
         let mut exec = VecExecutor::new(batches.clone(), preds);
         exec.capabilities.logical_cpus = 1; // serial: mede o algoritmo, não threads
 
         // Sanidade: os dois caminhos têm de dar o mesmo nº de sobreviventes.
         let mid = exec.run_filter(&batches, 0).unwrap();
-        let eager_rows: usize =
-            exec.run_filter(&mid, 1).unwrap().iter().map(|b| b.num_rows()).sum();
+        let eager_rows: usize = exec
+            .run_filter(&mid, 1)
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
         let fused_rows: usize = exec
             .run_fused_filters(&batches, &[0, 1])
             .unwrap()
             .iter()
             .map(|b| b.num_rows())
             .sum();
-        assert_eq!(eager_rows, fused_rows, "eager e fused têm de coincidir (sel={sel})");
+        assert_eq!(
+            eager_rows, fused_rows,
+            "eager e fused têm de coincidir (sel={sel})"
+        );
 
-        group.bench_with_input(BenchmarkId::new("eager_2x_materialize", sel), &sel, |b, _| {
-            b.iter(|| {
-                let mid = exec.run_filter(black_box(&batches), 0).unwrap();
-                let out = exec.run_filter(&mid, 1).unwrap();
-                black_box(out.len())
-            })
-        });
-        group.bench_with_input(BenchmarkId::new("fused_late_materialize", sel), &sel, |b, _| {
-            b.iter(|| {
-                let out = exec.run_fused_filters(black_box(&batches), &[0, 1]).unwrap();
-                black_box(out.len())
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("eager_2x_materialize", sel),
+            &sel,
+            |b, _| {
+                b.iter(|| {
+                    let mid = exec.run_filter(black_box(&batches), 0).unwrap();
+                    let out = exec.run_filter(&mid, 1).unwrap();
+                    black_box(out.len())
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("fused_late_materialize", sel),
+            &sel,
+            |b, _| {
+                b.iter(|| {
+                    let out = exec
+                        .run_fused_filters(black_box(&batches), &[0, 1])
+                        .unwrap();
+                    black_box(out.len())
+                })
+            },
+        );
     }
     group.finish();
 }

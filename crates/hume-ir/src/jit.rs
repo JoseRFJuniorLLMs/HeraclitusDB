@@ -36,8 +36,8 @@ impl JitFilter {
         flags.set("use_colocated_libcalls", "false").unwrap();
         flags.set("is_pic", "false").unwrap();
         let isa_flags = settings::Flags::new(flags);
-        let builder = JITBuilder::new(default_libcall_names())
-            .map_err(|e| format!("JITBuilder: {e}"))?;
+        let builder =
+            JITBuilder::new(default_libcall_names()).map_err(|e| format!("JITBuilder: {e}"))?;
         let _ = &isa_flags; // ISA vem do host via JITBuilder::new
         let mut module = JITModule::new(builder);
         let ptr = module.target_config().pointer_type();
@@ -107,7 +107,10 @@ impl JitFilter {
         let code = module.get_finalized_function(id);
         // SAFETY: assinatura acima corresponde exatamente a `CompiledFn`.
         let func: CompiledFn = unsafe { std::mem::transmute::<*const u8, CompiledFn>(code) };
-        Ok(Self { func, _module: module })
+        Ok(Self {
+            func,
+            _module: module,
+        })
     }
 
     /// Executa o filtro sobre `n` linhas, devolvendo os índices sobreviventes.
@@ -167,12 +170,48 @@ fn emit_expr(
                     Ty::Bool => b.ins().iconst(types::I64, 0), // colunas não são Bool
                 }
             }
-            Op::Add(x, y) => arith(b, types_of[i], vals[*x as usize], vals[*y as usize], Arith::Add),
-            Op::Sub(x, y) => arith(b, types_of[i], vals[*x as usize], vals[*y as usize], Arith::Sub),
-            Op::Mul(x, y) => arith(b, types_of[i], vals[*x as usize], vals[*y as usize], Arith::Mul),
-            Op::CmpGt(x, y) => cmp(b, types_of[*x as usize], vals[*x as usize], vals[*y as usize], Cmp::Gt),
-            Op::CmpLt(x, y) => cmp(b, types_of[*x as usize], vals[*x as usize], vals[*y as usize], Cmp::Lt),
-            Op::CmpEq(x, y) => cmp(b, types_of[*x as usize], vals[*x as usize], vals[*y as usize], Cmp::Eq),
+            Op::Add(x, y) => arith(
+                b,
+                types_of[i],
+                vals[*x as usize],
+                vals[*y as usize],
+                Arith::Add,
+            ),
+            Op::Sub(x, y) => arith(
+                b,
+                types_of[i],
+                vals[*x as usize],
+                vals[*y as usize],
+                Arith::Sub,
+            ),
+            Op::Mul(x, y) => arith(
+                b,
+                types_of[i],
+                vals[*x as usize],
+                vals[*y as usize],
+                Arith::Mul,
+            ),
+            Op::CmpGt(x, y) => cmp(
+                b,
+                types_of[*x as usize],
+                vals[*x as usize],
+                vals[*y as usize],
+                Cmp::Gt,
+            ),
+            Op::CmpLt(x, y) => cmp(
+                b,
+                types_of[*x as usize],
+                vals[*x as usize],
+                vals[*y as usize],
+                Cmp::Lt,
+            ),
+            Op::CmpEq(x, y) => cmp(
+                b,
+                types_of[*x as usize],
+                vals[*x as usize],
+                vals[*y as usize],
+                Cmp::Eq,
+            ),
             Op::And(x, y) => b.ins().band(vals[*x as usize], vals[*y as usize]),
             Op::Or(x, y) => b.ins().bor(vals[*x as usize], vals[*y as usize]),
             Op::Not(x) => {

@@ -243,11 +243,11 @@ impl View for ActivationStore {
     /// episode's own HLC timestamp, never the wall clock.
     fn apply(&mut self, lsn: Lsn, event: &Episode) {
         self.touch(event.id, event.ts_hlc >> 16); // physical millis -> stable seconds-ish unit
-        // Avanço-só: dois appends concorrentes aplicam-se fora de ordem (o
-        // `index_applied` não tranca as views atomicamente), e um insert cru
-        // regredia este watermark. Persistido no snapshot, ficava a mentir
-        // sobre o que a view cobre — e esta view NÃO é idempotente (`touch`
-        // conta cada acesso), pelo que um re-replay contaria duas vezes.
+                                                  // Avanço-só: dois appends concorrentes aplicam-se fora de ordem (o
+                                                  // `index_applied` não tranca as views atomicamente), e um insert cru
+                                                  // regredia este watermark. Persistido no snapshot, ficava a mentir
+                                                  // sobre o que a view cobre — e esta view NÃO é idempotente (`touch`
+                                                  // conta cada acesso), pelo que um re-replay contaria duas vezes.
         self.watermark = self.watermark.max(lsn);
     }
 
@@ -331,6 +331,10 @@ mod watermark_order_tests {
         s.apply(6, &e6);
         assert_eq!(s.watermark(), 6);
         s.apply(5, &e5); // chega atrasado
-        assert_eq!(s.watermark(), 6, "watermark regrediu com entrega fora de ordem");
+        assert_eq!(
+            s.watermark(),
+            6,
+            "watermark regrediu com entrega fora de ordem"
+        );
     }
 }
