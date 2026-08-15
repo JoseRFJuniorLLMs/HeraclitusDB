@@ -580,11 +580,42 @@ pub fn topm_product(
     scale: f32,
 ) -> Vec<Candidate> {
     #[cfg(feature = "gpu")]
-    if let Some(r) = topm_product_gpu(query, vectors, sig, m, scale) {
-        return r;
+    {
+        let dim = sig.a + sig.b + sig.c;
+        let n = vectors.len().checked_div(dim).unwrap_or(0);
+        // Abaixo do ponto de cruzamento a GPU PERDE: o custo de transferir os
+        // vetores e despachar o shader não é amortizado. Medido em
+        // `benches/gpu_vs_cpu.rs` (H32xS8xE8, 48 dims):
+        //
+        //     1.000 vetores  0.19x   <- GPU 5x MAIS LENTA
+        //    10.000          1.50x
+        //    50.000          1.67x
+        //   200.000          3.05x
+        //   500.000          3.46x
+        //
+        // Sem esta guarda, ligar a feature `gpu` degradava toda a instalação com
+        // coleções pequenas — que são a maioria antes de haver volume. O
+        // fallback deixava de ser rede de segurança e passava a ser a via
+        // rápida que ninguém tomava.
+        if n >= GPU_MIN_VECTORS {
+            if let Some(r) = topm_product_gpu(query, vectors, sig, m, scale) {
+                return r;
+            }
+        }
     }
     topm_product_cpu(query, vectors, sig, m, scale)
 }
+
+/// Ponto de cruzamento CPU→GPU, em número de vetores.
+///
+/// Conservador de propósito: a 10.000 a GPU já ganha 1,5x, mas o ganho só se
+/// torna material (>3x) na ordem das centenas de milhares. Escolher 8.000 põe o
+/// limiar logo acima da zona onde a GPU perde, sem prometer ganho onde ele é
+/// ruído. Reveja com `cargo bench -p heraclitus-gpu --bench gpu_vs_cpu` no
+/// hardware de destino — este número é da máquina onde foi medido, não uma
+/// constante universal.
+#[cfg(feature = "gpu")]
+pub const GPU_MIN_VECTORS: usize = 8_000;
 
 #[cfg(test)]
 mod tests {
@@ -752,4 +783,43 @@ mod gpu_tests {
             None => eprintln!("[M20.3.1b] no GPU adapter; CPU fallback (skipped)"),
         }
     }
+}
+
+#[cfg(all(test, feature = "gpu"))]
+mod limiar_tests {
+    use super::*;
+
+    /// Regressao do defeito que a medicao expos: o `topm_product` tentava a GPU
+    /// SEMPRE que a feature estava ligada, sem olhar ao tamanho. Numa colecao
+    /// pequena isso e 5x mais lento -- e colecoes pequenas sao a maioria antes
+    /// de haver volume. Abaixo do limiar tem de ficar na CPU.
+    #[test]
+    fn colecao_pequena_fica_na_cpu_e_da_o_mesmo_resultado() {
+        let sig = ProductSig::default();
+        let dim = sig.a + sig.b + sig.c;
+        let n = 200; // muito abaixo de GPU_MIN_VECTORS
+
+        let query: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.001).collect();
+        let vectors: Vec<f32> = (0..n * dim).map(|i| (i as f32) * 0.0001).collect();
+
+        let via_dispatch = topm_product(&query, &vectors, &sig, 5, 10_000.0);
+        let via_cpu = topm_product_cpu(&query, &vectors, &sig, 5, 10_000.0);
+        assert_eq!(
+            via_dispatch, via_cpu,
+            "abaixo do limiar o despacho tem de ser exatamente o caminho CPU"
+        );
+    }
+
+    /// O limiar tem de estar ACIMA da zona medida onde a GPU perde (1.000 =
+    /// 0.19x) e nao tao alto que desperdice o ganho real. Verificado em tempo de
+    /// COMPILACAO: se alguem mexer na constante para fora desta janela, o crate
+    /// nem chega a compilar -- mais forte do que um teste que pode ser saltado.
+    const _: () = assert!(
+        GPU_MIN_VECTORS > 1_000,
+        "a 1.000 vetores a GPU mede 0.19x -- o limiar nao pode incluir essa zona"
+    );
+    const _: () = assert!(
+        GPU_MIN_VECTORS <= 50_000,
+        "a 10.000 a GPU ja ganha 1.5x -- um limiar alto demais desperdica isso"
+    );
 }
