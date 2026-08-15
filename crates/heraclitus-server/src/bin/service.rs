@@ -17,8 +17,11 @@
 //! Paths default to %ProgramData%\HeraclitusDB (data, logs, cold tier) so the
 //! service never writes into C:\Windows\System32 (the SCM working directory).
 
+#[cfg(windows)]
 const SERVICE_NAME: &str = "HeraclitusDB";
+#[cfg(windows)]
 const SERVICE_DISPLAY: &str = "HeraclitusDB Event-Sourced Memory";
+#[cfg(windows)]
 const SERVICE_ACCOUNT: &str = r"NT SERVICE\HeraclitusDB";
 
 #[cfg(windows)]
