@@ -33,6 +33,109 @@ const SKIP_VALUES: &[&str] = &["", "0", "-1", "nao", "sim", "true", "false", "nu
 /// (CPF/CNPJ/códigos/razão social) ficam muito abaixo.
 const MAX_VALUE_LEN: usize = 80;
 
+/// Magic do checkpoint comprimido. Um ficheiro v1 (bincode cru) nunca começa
+/// por estes bytes, por isso a presença dele distingue os formatos sem ambiguidade.
+const MAGIC_V2: &[u8; 4] = b"HATR";
+const FORMAT_V2: u16 = 2;
+
+/// Espelho do [`Snapshot`] com os postings **comprimidos**.
+///
+/// A estrutura (chaves, mapas) continua a ir em bincode — é texto e metadados,
+/// onde os codecs de inteiros não ajudam. O que muda são as colunas de `Lsn`:
+/// postings de um índice invertido são LSNs em ordem crescente estrita, o caso
+/// exato em que delta+bitpack ganha muito. Com 4 KB por posting a 8 bytes cada,
+/// passar para ~1 bit por LSN não é um ganho marginal.
+/// Abaixo disto o cabecalho do codec nunca compensa; nem vale a pena medir.
+const MIN_PARA_MEDIR: usize = 8;
+
+/// Escolhe a forma mais curta para uma coluna de postings.
+///
+/// Devolve `Some(blob)` se o codec ganhar, `None` se o bincode cru for melhor.
+/// A escolha e MEDIDA, nao presumida: o bincode ja codifica inteiros em varint,
+/// por isso uma lista de um LSN pequeno custa-lhe 1-2 bytes, enquanto o
+/// cabecalho autodescritivo do codec custa 9 antes de qualquer dado.
+fn escolher_forma(v: &[Lsn]) -> Option<Vec<u8>> {
+    if v.len() < MIN_PARA_MEDIR {
+        return None;
+    }
+    let packed = hume_kernel::compression::column::encode(v);
+    let plain = bincode::serde::encode_to_vec(v, BINCODE_CFG)
+        .map(|b| b.len())
+        .unwrap_or(usize::MAX);
+    (packed.len() < plain).then_some(packed)
+}
+
+#[derive(Serialize, Deserialize)]
+struct CompressedSnapshot {
+    watermark: Lsn,
+    applied: bool,
+    /// Colunas onde o bincode varint ja e melhor -- a maioria, num indice com
+    /// muitos valores quase unicos.
+    exact_plain: HashMap<String, Vec<Lsn>>,
+    /// Colunas onde o codec ganha. Uma chave vive num mapa OU no outro.
+    ///
+    /// Sao dois mapas e nao um enum por coluna porque o discriminante custa um
+    /// byte POR COLUNA: com 50.000 colunas minusculas isso sozinho fazia o
+    /// ficheiro crescer 5,6%. Num ficheiro dominado por metadados, a
+    /// autodescricao paga-se em bytes.
+    exact_packed: HashMap<String, Vec<u8>>,
+    numeric_plain: HashMap<String, BTreeMap<u64, Vec<Lsn>>>,
+    numeric_packed: HashMap<String, BTreeMap<u64, Vec<u8>>>,
+}
+
+impl From<&Snapshot> for CompressedSnapshot {
+    fn from(s: &Snapshot) -> Self {
+        let mut exact_plain = HashMap::new();
+        let mut exact_packed = HashMap::new();
+        for (k, v) in &s.exact {
+            match escolher_forma(v) {
+                Some(blob) => { exact_packed.insert(k.clone(), blob); }
+                None => { exact_plain.insert(k.clone(), v.clone()); }
+            }
+        }
+        let mut numeric_plain: HashMap<String, BTreeMap<u64, Vec<Lsn>>> = HashMap::new();
+        let mut numeric_packed: HashMap<String, BTreeMap<u64, Vec<u8>>> = HashMap::new();
+        for (campo, por_valor) in &s.numeric {
+            for (chave, v) in por_valor {
+                match escolher_forma(v) {
+                    Some(blob) => {
+                        numeric_packed.entry(campo.clone()).or_default().insert(*chave, blob);
+                    }
+                    None => {
+                        numeric_plain.entry(campo.clone()).or_default().insert(*chave, v.clone());
+                    }
+                }
+            }
+        }
+        Self { watermark: s.watermark, applied: s.applied, exact_plain, exact_packed, numeric_plain, numeric_packed }
+    }
+}
+
+impl CompressedSnapshot {
+    /// `None` se alguma coluna não descodificar — o chamador degrada para
+    /// rebuild por replay, que é sempre correto por construção.
+    fn expand(self) -> Option<Snapshot> {
+        use hume_kernel::compression::column;
+        let mut exact = self.exact_plain;
+        for (k, blob) in self.exact_packed {
+            exact.insert(k, column::decode(&blob)?);
+        }
+        let mut numeric = self.numeric_plain;
+        for (campo, por_valor) in self.numeric_packed {
+            let m = numeric.entry(campo).or_default();
+            for (chave, blob) in por_valor {
+                m.insert(chave, column::decode(&blob)?);
+            }
+        }
+        Some(Snapshot {
+            watermark: self.watermark,
+            applied: self.applied,
+            exact,
+            numeric,
+        })
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct Snapshot {
     watermark: Lsn,
@@ -77,9 +180,31 @@ impl AttrIndex {
         let path = dir.as_ref().join(SNAPSHOT_FILE);
         match std::fs::read(&path) {
             Ok(bytes) => {
-                match bincode::serde::decode_from_slice::<Snapshot, _>(&bytes, BINCODE_CFG) {
-                    Ok((snap, _)) => AttrIndex { inner: snap },
-                    Err(_) => AttrIndex::new(), // checkpoint corrompido -> rebuild por replay
+                // v2 (comprimido) traz magic; v1 (bincode cru) não. Ler os dois
+                // não é cortesia: sem isto, o primeiro arranque depois desta
+                // mudança deitava fora um checkpoint válido e reconstruía o
+                // índice inteiro por replay — correto, mas caro e silencioso.
+                let snap = if bytes.starts_with(MAGIC_V2) {
+                    bytes
+                        .get(4..6)
+                        .map(|v| u16::from_le_bytes([v[0], v[1]]))
+                        .filter(|v| *v == FORMAT_V2)
+                        .and_then(|_| {
+                            bincode::serde::decode_from_slice::<CompressedSnapshot, _>(
+                                &bytes[6..],
+                                BINCODE_CFG,
+                            )
+                            .ok()
+                        })
+                        .and_then(|(c, _)| c.expand())
+                } else {
+                    bincode::serde::decode_from_slice::<Snapshot, _>(&bytes, BINCODE_CFG)
+                        .ok()
+                        .map(|(s, _)| s)
+                };
+                match snap {
+                    Some(inner) => AttrIndex { inner },
+                    None => AttrIndex::new(), // corrompido -> rebuild por replay
                 }
             }
             Err(_) => AttrIndex::new(),
@@ -146,8 +271,14 @@ impl AttrIndex {
     /// Grava o checkpoint em `dir` (escrita atómica tmp+rename).
     pub fn save(&self, dir: impl AsRef<Path>) -> Result<(), HeraclitusError> {
         std::fs::create_dir_all(dir.as_ref())?;
-        let bytes = bincode::serde::encode_to_vec(&self.inner, BINCODE_CFG)
+        // v2: magic + versão + bincode do snapshot com as colunas comprimidas.
+        let comprimido = CompressedSnapshot::from(&self.inner);
+        let corpo = bincode::serde::encode_to_vec(&comprimido, BINCODE_CFG)
             .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+        let mut bytes = Vec::with_capacity(corpo.len() + 6);
+        bytes.extend_from_slice(MAGIC_V2);
+        bytes.extend_from_slice(&FORMAT_V2.to_le_bytes());
+        bytes.extend_from_slice(&corpo);
         let dst = dir.as_ref().join(SNAPSHOT_FILE);
         let tmp = dir.as_ref().join(format!("{SNAPSHOT_FILE}.tmp"));
         {
@@ -407,5 +538,111 @@ mod tests {
             a.lookup("cnpj", "cnpj0"),
             &[0, 3, 6, 9, 12, 15, 18, 21, 24, 27]
         );
+    }
+}
+
+#[cfg(test)]
+mod compressao_tests {
+    use super::*;
+
+    fn indice_com(n: u64) -> AttrIndex {
+        let mut ix = AttrIndex::new();
+        for lsn in 0..n {
+            let mut ep = Episode::new("a", heraclitus_core::EventKind::Custom("T".into()), b"x".to_vec());
+            ep.attrs.insert("campo".into(), "valor".into());
+            ep.attrs.insert("seq".into(), lsn.to_string());
+            ix.apply(lsn, &ep);
+        }
+        ix
+    }
+
+    #[test]
+    fn checkpoint_v2_faz_roundtrip_exato() {
+        let dir = tempfile::tempdir().unwrap();
+        let antes = indice_com(5_000);
+        antes.save(dir.path()).unwrap();
+        let depois = AttrIndex::open(dir.path());
+        assert_eq!(depois.lookup("campo", "valor"), antes.lookup("campo", "valor"));
+        assert_eq!(depois.lookup("campo", "valor").len(), 5_000);
+    }
+
+    #[test]
+    fn o_ficheiro_gravado_e_v2() {
+        let dir = tempfile::tempdir().unwrap();
+        indice_com(10).save(dir.path()).unwrap();
+        let bytes = std::fs::read(dir.path().join(SNAPSHOT_FILE)).unwrap();
+        assert!(bytes.starts_with(MAGIC_V2), "checkpoint tem de trazer o magic v2");
+    }
+
+    /// Sem isto, o primeiro arranque depois desta mudanca deitava fora um
+    /// checkpoint valido e reconstruia o indice inteiro por replay -- correto,
+    /// mas caro e silencioso.
+    #[test]
+    fn checkpoint_v1_legado_continua_a_ser_lido() {
+        let dir = tempfile::tempdir().unwrap();
+        let ix = indice_com(200);
+        // Grava no formato ANTIGO: bincode cru, sem magic.
+        let cru = bincode::serde::encode_to_vec(&ix.inner, BINCODE_CFG).unwrap();
+        std::fs::write(dir.path().join(SNAPSHOT_FILE), &cru).unwrap();
+
+        let lido = AttrIndex::open(dir.path());
+        assert_eq!(lido.lookup("campo", "valor").len(), 200, "v1 tem de continuar legivel");
+    }
+
+    #[test]
+    fn checkpoint_corrompido_degrada_para_rebuild_em_vez_de_panicar() {
+        let dir = tempfile::tempdir().unwrap();
+        indice_com(100).save(dir.path()).unwrap();
+        let p = dir.path().join(SNAPSHOT_FILE);
+        let mut bytes = std::fs::read(&p).unwrap();
+        // Estraga o meio do corpo comprimido, mantendo o magic.
+        let meio = bytes.len() / 2;
+        bytes[meio] ^= 0xFF;
+        bytes.truncate(bytes.len() - 3);
+        std::fs::write(&p, &bytes).unwrap();
+
+        let lido = AttrIndex::open(dir.path()); // nao pode entrar em panico
+        assert!(lido.is_empty() || !lido.lookup("campo", "valor").is_empty());
+    }
+
+    /// Indice onde os POSTINGS dominam: poucos valores distintos, muitos
+    /// eventos cada. E o caso que a compressao existe para atacar -- na pratica
+    /// campos como risk_level, action_class, agent_id.
+    fn indice_postings_longos(n: u64, valores: u64) -> AttrIndex {
+        let mut ix = AttrIndex::new();
+        for lsn in 0..n {
+            let mut ep = Episode::new("a", heraclitus_core::EventKind::Custom("T".into()), b"x".to_vec());
+            ep.attrs.insert("classe".into(), format!("c{}", lsn % valores));
+            ix.apply(lsn, &ep);
+        }
+        ix
+    }
+
+    fn tamanhos(ix: &AttrIndex) -> (u64, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        ix.save(dir.path()).unwrap();
+        let v2 = std::fs::metadata(dir.path().join(SNAPSHOT_FILE)).unwrap().len();
+        let v1 = bincode::serde::encode_to_vec(&ix.inner, BINCODE_CFG).unwrap().len() as u64;
+        (v1, v2)
+    }
+
+    /// O ponto de tudo isto. Quando os postings sao longos e ordenados -- o caso
+    /// que a compressao ataca -- o ganho tem de ser grande, nao marginal.
+    #[test]
+    fn postings_longos_encolhem_muito() {
+        let (v1, v2) = tamanhos(&indice_postings_longos(50_000, 10));
+        assert!(v2 * 5 < v1, "esperado >5x menor; v1={v1} v2={v2}");
+    }
+
+    /// E o contrapeso: num indice dominado por valores quase unicos, os postings
+    /// sao curtos e o bincode varint ja e bom. Comprimir NAO pode piorar.
+    ///
+    /// A primeira versao comprimia tudo e este caso CRESCEU de 587 KB para
+    /// 1.09 MB -- o cabecalho de 9 bytes por coluna aplicado a 20.000 listas de
+    /// um elemento. Foi por isso que a escolha passou a ser medida por coluna.
+    #[test]
+    fn postings_curtos_nunca_pioram() {
+        let (v1, v2) = tamanhos(&indice_com(20_000));
+        assert!(v2 <= v1, "regressao: v2={v2} > v1={v1}");
     }
 }
