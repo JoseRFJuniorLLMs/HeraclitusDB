@@ -3238,6 +3238,7 @@ dependencies = [
  "heraclitus-core",
  "heraclitus-log",
  "heraclitus-views",
+ "hume-kernel",
  "serde",
  "tempfile",
 ]

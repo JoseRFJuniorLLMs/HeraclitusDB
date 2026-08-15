@@ -12,6 +12,8 @@ heraclitus-core = { workspace = true }
 heraclitus-views = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
+# Compressao das colunas de postings no checkpoint (SPEC-0039 §5).
+hume-kernel = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
