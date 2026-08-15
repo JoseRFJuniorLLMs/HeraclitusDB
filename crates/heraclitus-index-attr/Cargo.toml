@@ -18,3 +18,7 @@ hume-kernel = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 heraclitus-log = { workspace = true }
+
+[[bench]]
+name = "compression_gain"
+harness = false

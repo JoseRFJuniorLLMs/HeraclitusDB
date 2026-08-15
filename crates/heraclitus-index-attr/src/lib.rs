@@ -268,6 +268,19 @@ impl AttrIndex {
         self.inner.exact.is_empty()
     }
 
+    /// Tamanho que o checkpoint teria **sem** compressão de postings — o
+    /// baseline v1 (bincode cru do snapshot).
+    ///
+    /// Existe para o `benches/compression_gain.rs` poder comparar contra a
+    /// alternativa real em vez de contra um número citado de memória. O ganho
+    /// da compressão varia entre −83% e zero consoante o perfil do índice;
+    /// um valor fixo em documentação seria verdade num caso e mentira noutro.
+    pub fn snapshot_bincode_len(&self) -> usize {
+        bincode::serde::encode_to_vec(&self.inner, BINCODE_CFG)
+            .map(|b| b.len())
+            .unwrap_or(0)
+    }
+
     /// Grava o checkpoint em `dir` (escrita atómica tmp+rename).
     pub fn save(&self, dir: impl AsRef<Path>) -> Result<(), HeraclitusError> {
         std::fs::create_dir_all(dir.as_ref())?;
