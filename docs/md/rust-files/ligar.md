@@ -25,6 +25,49 @@
 >
 > 3. **O P0 `mmap.rs` foi medido e NÃO deve ser ligado.** Ver abaixo.
 >
+> 4. **O "segundo motor analítico" está mal classificado.** Não é P3/integração
+>    arquitetural — está **bloqueado à espera de uma decisão de produto**. Ver
+>    abaixo.
+>
+> ### O `VecExecutor` não substitui o DataFusion — porque o DataFusion não está lá
+>
+> O relatório diz *"a produção usa DataFusion"*. **Não usa.** Verificado:
+>
+> - a feature `analytics` está **desligada por omissão** (`heraclitus-server/Cargo.toml`);
+> - o deploy compila sem features → `grep datafusion` no binário implantado
+>   devolve **0**;
+> - o caminho vivo de GQL é o `heraclitus-query`, que **não importa DataFusion
+>   em lado nenhum**.
+>
+> O DataFusion só existe atrás do `POST /sql` opcional. Custo medido da
+> dependência: **609 → 1.418 nós** (+133%) — mas **zero quando desligada**, que é
+> o estado atual.
+>
+> Logo a decisão não é "ligar o HUME para substituir o DataFusion". É:
+>
+> > **É preciso o endpoint SQL de todo?**
+>
+> | | |
+> | --- | --- |
+> | **Se o diferencial é GQL + proveniência + `AS OF` + integridade** | Então *ambos* — o caminho DataFusion **e** o `VecExecutor` — são peso morto. O `heraclitus-analytics` inteiro é candidato a remoção, e o repositório fica mais honesto sobre o que é. |
+> | **Se um cliente pede `SELECT`** | Manter o DataFusion. Está desligado por omissão, custa zero quando não é usado, e escrever um dialeto SQL correto (coerção de tipos, semântica de `NULL`, window functions, joins correlacionados) é o pior investimento possível para uma equipa pequena. |
+> | **Se um contrato proíbe dependência estrangeira E exige SQL** | Aí sim, construir o motor próprio. Deixa de ser otimização e passa a ser **requisito** — e as 1.605 linhas de `planner.rs` + `vectorized.rs` passam de dívida a ativo. |
+>
+> Dois argumentos a favor do motor próprio que o relatório original não regista,
+> e que só valem no terceiro cenário:
+>
+> - **Soberania.** 809 crates de terceiros no caminho de consulta é superfície de
+>   cadeia de suprimentos que alguém terá de justificar num órgão público — e o
+>   README já vende uma "Sovereignty Layer".
+> - **Determinismo, que é a tese do produto.** Um otimizador de terceiros escolhe
+>   planos diferentes entre versões: a mesma consulta, o mesmo dado, plano
+>   diferente depois de um `cargo update`. Num sistema que vende *replay
+>   determinístico*, "a mesma pergunta produz a mesma execução, sempre" é
+>   propriedade vendável — e o DataFusion não a garante.
+>
+> **Ganho hoje: zero.** Não há nada a ganhar em substituir uma dependência que
+> não está compilada. O ganho exige as três condições em simultâneo.
+>
 > Nota metodológica: o SHA `b0699275` não existe neste repositório — os merges
 > com `--rebase` reescrevem hashes. Esta verificação foi feita em `cbe656c`.
 >
@@ -50,6 +93,7 @@
 > **Recomendação: não ligar.** Nesta plataforma seria uma regressão.
 >
 > Ressalvas honestas, porque o resultado é específico:
+>
 > - **É Windows.** No Linux o custo de falta de página é menor e existem os
 >   `madvise` (`MADV_SEQUENTIAL`, `MADV_HUGEPAGE`) que o próprio `mmap.rs`
 >   documenta como deliberadamente **não implementados**. O módulo está a correr
@@ -101,9 +145,9 @@ Frame of Reference
 BitPacking
 ```
 
-inclusive com roundtrip e testes. O próprio módulo diz que essas primitivas **não estão ligadas ao storage vivo**. 
+inclusive com roundtrip e testes. O próprio módulo diz que essas primitivas **não estão ligadas ao storage vivo**.
 
-E o teste de FOR + BitPacking demonstra compressão de aproximadamente **64 bits → 6 bits por valor**, chegando a mais de 10× menos palavras armazenadas naquele cenário. 
+E o teste de FOR + BitPacking demonstra compressão de aproximadamente **64 bits → 6 bits por valor**, chegando a mais de 10× menos palavras armazenadas naquele cenário.
 
 Hoje:
 
@@ -969,3 +1013,21 @@ E há uma distinção especialmente importante:
 Já **DataChunk + SelectionVector + Morsel + HUME-IR + JIT + VecExecutor** formam praticamente **um segundo motor físico de execução**. Ligá-los não é uma pequena otimização. É começar a fazer o HUME assumir trabalho que hoje está delegado ao DataFusion/Arrow.
 
 Esse é o verdadeiro quadro arquitetural que a varredura revela.
+
+Porque parei aqui
+
+O que sobra divide-se em três categorias, e nenhuma se resolve com mais uma tarde:
+
+1. Não é otimização, é arquitetura. DataChunk + SelectionVector + Morsel + hume-ir + JIT + VecExecutor são, como o próprio documento diz, um segundo motor físico de execução. Ligá-los é começar a substituir o DataFusion. Isso é uma decisão tua sobre o produto, não um wiring.
+
+2. Muda formato persistente. O cpm.rs implementa um CRF v2 completo para o log. É outra categoria de risco — precisa de migração e cutover, como a cifra precisou.
+
+3. Baratos mas provavelmente inúteis. O ReplayDispatcher e o numa.rs ligam-se em pouco tempo. Mas o NUMA devolve nodes: 1 nesta máquina e o dispatcher governa um replay que já funciona. Ligá-los daria trabalho sem número para mostrar — exatamente o padrão que os três filtros de hoje existiram para evitar.
+
+O hume-sketches já expliquei: alimentaria um otimizador de custos que hoje é do DataFusion, e o único nosso (predicted_access_path) já é adaptativo por medição real. Trocar medição por estimativa não me parece ganho.
+
+O que eu faria a seguir
+
+Nada disto, ainda. Os três filtros de hoje custaram poucas horas e devolveram: um ganho pequeno, uma recusa fundamentada e um defeito latente corrigido. Isso é um bom retorno — mas todos mediram cargas sintéticas.
+
+O compression deu 83% em laboratório e 0,3% real. Antes de ligar mais alguma coisa, vale mais saber qual é o perfil de custo verdadeiro — e isso só vem do piloto.
