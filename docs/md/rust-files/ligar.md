@@ -101,31 +101,44 @@
 > `Episode` do HeraclitusDB. Três dos campos fixos ficariam permanentemente a
 > zero.
 >
-> ### O achado que esta investigação produziu
+> ### RETRATAÇÃO — o "achado" do `provenance` não se sustenta
 >
-> Ao procurar quem beneficiaria do `event_id` em offset fixo, encontrei isto:
+> Publiquei aqui que o `provenance()` varria o log inteiro em produção. **Estava
+> errado**, e a verificação seguinte desmontou-o.
+>
+> O varrimento existe, em `heraclitus-query/src/backend.rs:1422` — mas o
+> `LogBackend` é a **implementação de REFERÊNCIA**, usada só em testes (os
+> próprios comentários do engine lhe chamam isso: *"capado como o LogBackend de
+> referência"*). O único `use ... LogBackend` fora do crate está dentro de um
+> `mod tests`.
+>
+> **O caminho vivo já usa o índice.** O `Engine::provenance`
+> (`heraclitus-server/src/engine.rs:1372`) resolve por
+> `GraphIndex::parents(&eid)` — um lookup de hash:
 >
 > ```rust
-> // heraclitus-query/src/backend.rs:1422
-> fn provenance(&self, id: &str) -> Result<Vec<String>, HeraclitusError> {
->     let mut chunk_iter = LogChunkIterator::new(self.log.clone(), 0, head);
->     while let Some((_, e)) = chunk_iter.next_item()? {
->         if e.id.to_string() == id { ... }
+> Ok(eid) => Ok(self.graph.lock().unwrap().parents(&eid)
+>     .into_iter().map(|p| p.to_string()).collect()),
 > ```
 >
-> **O `provenance()` varre o log inteiro desde o LSN 0**, desserializando cada
-> `Episode` (com attrs, embedding, parents) e formatando o id como `String` para
-> comparar. É O(N) com decode completo e uma alocação por registo, a cada
-> chamada — numa das consultas centrais de um sistema de auditoria (o `WHY`).
+> Não há O(N) em produção, e otimizar a referência tornaria-a menos óbvia sem
+> acelerar nada. Ficou uma nota no próprio método a dizer isto, para o próximo
+> leitor não repetir o erro.
 >
-> E o `heraclitus-index-graph` **já tem** `out: DashMap<EventId, Vec<EventId>>` —
-> exatamente as arestas de proveniência, indexadas por `EventId`.
+> **O que isto ensina sobre auditar por grep:** encontrar um padrão mau num
+> ficheiro não prova que ele corra. Foi o mesmo erro do relatório original ao
+> dizer que "a produção usa DataFusion" — o símbolo existia, o caminho não. A
+> pergunta que faltava nos dois casos é a mesma: *quem chama isto em produção?*
 >
-> **Recomendação: não fazer o cutover; corrigir o `provenance` com o índice que
-> já existe.** É o caminho barato para o mesmo benefício, sem migrar um formato
-> persistente. Se um dia o Forge e o HeraclitusDB convergirem num único formato
-> de registo — que o trabalho da ponte torna plausível — o CRF v2 é exatamente
-> esse formato, e aí o cutover passa a ter razão. **Hoje não tem.**
+> ### Conclusão sobre o CPM / CRF v2
+>
+> Sem o "achado" do `provenance`, o único ganho real que restava ao cutover
+> (`event_id` em offset fixo) fica **sem consumidor conhecido**. O custo medido é
+> modesto — 1,4% — mas continua a não haver razão para o pagar.
+>
+> **Recomendação: não fazer o cutover.** O que mudaria a resposta: se o Forge e o
+> HeraclitusDB convergirem num único formato de registo — que o trabalho da ponte
+> torna plausível — o CRF v2 é exatamente esse formato. Hoje não há razão.
 
 > Nota metodológica: o SHA `b0699275` não existe neste repositório — os merges
 > com `--rebase` reescrevem hashes. Esta verificação foi feita em `cbe656c`.

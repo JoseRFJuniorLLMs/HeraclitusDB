@@ -1419,6 +1419,18 @@ impl QueryBackend for LogBackend {
         Ok(final_hydrated_hits)
     }
 
+    /// Varredura completa do log, de propósito.
+    ///
+    /// O `LogBackend` é a **implementação de REFERÊNCIA** contra a qual o
+    /// `heraclitus-server::Engine` é validado (ver os testes que comparam os
+    /// dois). Aqui a clareza vale mais do que a velocidade: um scan que
+    /// desserializa tudo e compara é trivialmente correto, e é isso que o torna
+    /// útil como referência.
+    ///
+    /// O caminho VIVO não faz isto — o `Engine::provenance` resolve pelo
+    /// `GraphIndex::parents`, um lookup de hash. Se estiveres a ler isto a
+    /// pensar "há aqui um O(N) em produção": não há. Otimizar este método
+    /// tornaria a referência menos óbvia sem acelerar nada que corra a sério.
     fn provenance(&self, id: &str) -> Result<Vec<String>, HeraclitusError> {
         let head = self.log.head();
         let mut chunk_iter = LogChunkIterator::new(self.log.clone(), 0, head);
