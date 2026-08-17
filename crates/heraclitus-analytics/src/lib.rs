@@ -80,6 +80,22 @@ pub struct LogAnalytics {
 }
 
 impl LogAnalytics {
+    /// A sessão DataFusion por baixo, **só para leitura**.
+    ///
+    /// Existe porque [`Self::sql`] funde parse + planeamento + execução numa só
+    /// medição, e a SPEC-0042 §17.2 exige separá-las: no desenho aprovado o
+    /// DataFusion continua a ser o front-end semântico, logo o custo de parse
+    /// é pago de qualquer forma e **não** é ganho atribuível ao HUME. Quem
+    /// mede precisa de `ctx().sql(..)` (plano) e `.collect()` (execução) em
+    /// separado.
+    ///
+    /// Não contorna as `SQLOptions` de [`Self::sql`]: quem usa este acessor
+    /// perde a proibição de DDL/DML, portanto **não** o use na superfície
+    /// pública — só em benchmarks e diagnóstico.
+    pub fn ctx(&self) -> &SessionContext {
+        &self.ctx
+    }
+
     /// Materializa `events` a partir do log com o orçamento por omissão
     /// ([`DEFAULT_MAX_ROWS`] / [`DEFAULT_MAX_BYTES`]). Ver [`Self::from_log_capped`].
     pub fn from_log(log: &Log, as_of: Option<Lsn>) -> Result<Self, AnalyticsError> {
