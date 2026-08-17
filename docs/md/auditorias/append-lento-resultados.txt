@@ -1,0 +1,52 @@
+Auditoria: o append do log abranda com o crescimento do segmento
+200000 registos de 64 B por configuracao.
+
+── 1. A curva (1 escritor sincrono) ──────────────────────────────
+  Se o custo por append fosse constante, a linha seria plana.
+
+  segmento 1 GiB (nunca sela — quadratico corre ate ao fim)
+    janela:       25k       50k       75k      100k      125k      150k      175k      200k
+    app/s :      8968      1790      1228       964       769       631       568       506
+    degradacao da 1a para a ultima janela: 17.7x mais lento
+
+  segmento 4 MiB (sela varias vezes — indice reinicia)
+    janela:       25k       50k       75k      100k      125k      150k      175k      200k
+    app/s :     12067     11764     10703     10490     10635     11101     10139     10752
+    degradacao da 1a para a ultima janela: 1.1x mais lento
+
+  segmento 256 KiB (~100 seals — testa o quadratico DOS SEGMENTOS)
+    janela:       25k       50k       75k      100k      125k      150k      175k      200k
+    app/s :     14800     15091     15344     14826     15133     14360     16307     16757
+    degradacao da 1a para a ultima janela: 0.9x mais lento
+
+── 2. Efeito das duas mitigacoes (debito total) ──────────────────
+
+  1 escritor  · segmento   1 GiB:       875 app/s  (pior caso)
+  1 escritor  · segmento   4 MiB:     10923 app/s
+  1 escritor  · segmento 256 KiB:     15292 app/s
+  8 escritores · segmento 1 GiB:      5661 app/s  (35.3s para 200000 registos)
+  8 escritores · segmento 4 MiB:     35563 app/s  (5.6s para 200000 registos)
+
+── 3. Veredicto ─────────────────────────────────────────────────
+
+  ganho so por segmento menor      : 12.5x
+  ganho so por escrita concorrente : 6.5x
+  ganho pelas duas juntas          : 40.7x
+
+  CONFIRMADO: com segmento grande e escritor sincrono, o debito cai
+  17.7x ao longo de apenas 200000 registos. A curva e o custo da copia
+  COW do indice (lib.rs:938) a crescer com as entradas acumuladas.
+
+  Contraprova OK: a curva de 256 KiB fica plana (0.9x) mesmo com
+  ~100 seals. Encolher o segmento resolve de facto; nao ha um segundo
+  quadratico escondido no numero de segmentos a esta escala.
+
+  Notas para ler os numeros:
+   - o quadratico e por SEGMENTO, nao pelo log todo: selar reinicia o indice;
+   - o default de producao e segment_max_bytes = 256 MiB, MAIOR que os 4 MiB
+     testados aqui, logo o efeito em producao e PIOR que a linha do 4 MiB;
+   - o batching do worker vai ate 128 comandos: quem escreve de forma
+     sincrona (um append, esperar o ACK, repetir) paga o pior caso sozinho.
+
+
+[exited with code 0]
