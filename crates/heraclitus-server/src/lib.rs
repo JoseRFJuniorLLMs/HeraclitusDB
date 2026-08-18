@@ -133,7 +133,11 @@ pub async fn serve_with(
             "sem auth (loopback) — escritas locais /hvm//tier/sql abertas",
         );
     }
-    let rest = rest::router(engine.clone(), config.rest_basic_auth.clone());
+    let rest = rest::router(
+        engine.clone(),
+        config.rest_basic_auth.clone(),
+        config.rest_cors_origins.clone(),
+    );
 
     let rest_listener = tokio::net::TcpListener::bind(rest_addr).await?;
     boot.ok_line("Servidor REST (axum)", &format!("http://{rest_addr}"));

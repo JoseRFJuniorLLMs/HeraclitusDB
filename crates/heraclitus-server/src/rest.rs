@@ -57,13 +57,20 @@ fn b64(input: &[u8]) -> String {
 /// Constrói o router; com `basic_auth = Some("user:pass")` TODAS as rotas
 /// exigem `Authorization: Basic ...` (comparação de string constante contra o
 /// valor esperado — nunca se descodifica input do cliente).
-pub fn router(engine: Arc<Engine>, basic_auth: Option<String>) -> Router {
+pub fn router(
+    engine: Arc<Engine>,
+    basic_auth: Option<String>,
+    cors_origins: Vec<String>,
+) -> Router {
     let routes = Router::new()
         .route("/healthz", get(healthz))
         .route("/stats", get(stats))
         .route("/state", get(state))
         .route("/verify", get(verify))
         .route("/verify/:segment", get(verify_segment))
+        // Fluxo ao vivo de appends (SSE). O log já emitia cada append
+        // confirmado num broadcast interno; faltava só quem o expusesse.
+        .route("/live/events", get(live_events))
         // M20 — H-VM sovereignty ledger (SPEC-025-adjacente). KV durável no log.
         .route("/hvm/state", get(hvm_state))
         .route("/hvm/upsert", axum::routing::post(hvm_upsert))
@@ -84,6 +91,14 @@ pub fn router(engine: Arc<Engine>, basic_auth: Option<String>) -> Router {
         .route("/tier/fetch/:segment", get(tier_fetch));
     let routes = routes.with_state(engine);
 
+    let protegido = aplicar_auth(routes, basic_auth);
+    // O CORS fica por FORA da autenticação: o browser envia o preflight
+    // `OPTIONS` sem credenciais nenhumas, portanto se a auth o apanhasse
+    // primeiro devolveria 401 e o pedido real nem chegava a ser feito.
+    aplicar_cors(protegido, cors_origins)
+}
+
+fn aplicar_auth(routes: Router, basic_auth: Option<String>) -> Router {
     match basic_auth {
         None => routes,
         Some(creds) => {
@@ -109,6 +124,132 @@ pub fn router(engine: Arc<Engine>, basic_auth: Option<String>) -> Router {
                 }
             }))
         }
+    }
+}
+
+/// CORS por lista explícita de origens. Vazio ⇒ nenhum cabeçalho, que é o
+/// comportamento histórico.
+///
+/// Escrito à mão em vez de puxar o `tower-http`: são 30 linhas, e a política
+/// aqui é restritiva de um modo que a camada genérica tornaria fácil de
+/// afrouxar por acidente. **Nunca emite `*`** — este REST tem rotas que
+/// escrevem e liga-se a `127.0.0.1`; um wildcard deixaria qualquer página que
+/// o operador visitasse falar com a base de dados dele através do browser.
+fn aplicar_cors(routes: Router, origens: Vec<String>) -> Router {
+    if origens.is_empty() {
+        return routes;
+    }
+    let permitidas = Arc::new(origens);
+    routes.layer(middleware::from_fn(move |req: Request, next: Next| {
+        let permitidas = permitidas.clone();
+        async move {
+            let autorizada = req
+                .headers()
+                .get(header::ORIGIN)
+                .and_then(|v| v.to_str().ok())
+                .filter(|o| permitidas.iter().any(|p| p == o))
+                .map(|o| o.to_string());
+
+            // Preflight: responder aqui, sem tocar no handler.
+            if req.method() == axum::http::Method::OPTIONS {
+                let mut b = Response::builder().status(StatusCode::NO_CONTENT);
+                if let Some(o) = &autorizada {
+                    b = b
+                        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, o.as_str())
+                        .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS")
+                        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "authorization, content-type")
+                        .header(header::ACCESS_CONTROL_ALLOW_CREDENTIALS, "true")
+                        .header(header::ACCESS_CONTROL_MAX_AGE, "600")
+                        // Sem `Vary: Origin` um intermediário podia servir a
+                        // resposta de uma origem autorizada a outra qualquer.
+                        .header(header::VARY, "Origin");
+                }
+                return b.body("".into()).unwrap();
+            }
+
+            let mut resp = next.run(req).await;
+            if let Some(o) = autorizada {
+                let h = resp.headers_mut();
+                if let Ok(v) = o.parse() {
+                    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+                }
+                h.insert(header::ACCESS_CONTROL_ALLOW_CREDENTIALS, "true".parse().unwrap());
+                h.insert(header::VARY, "Origin".parse().unwrap());
+            }
+            resp
+        }
+    }))
+}
+
+/// `GET /live/events` → SSE com **metadados** de cada append confirmado.
+///
+/// O log já emitia isto: `Log::tail_subscribe` devolve um broadcast alimentado
+/// pelo worker a cada registo commitado. Não havia era quem o expusesse.
+///
+/// ## O que NÃO vai no fluxo, e porquê
+///
+/// Nem `content` nem os valores dos `attrs`. O broadcast do log transporta o
+/// episódio **antes de ser cifrado** — a cifra é aplicada ao payload que vai
+/// para o disco, não à cópia que segue para o canal. Ou seja, com
+/// `encryption_at_rest` ligado, o que está guardado vai cifrado mas o que passa
+/// aqui iria em claro. Reencaminhar isso para um browser desfazia exatamente o
+/// que a cifra em repouso e o crypto-shred existem para proteger.
+///
+/// ## O que vai, e a ressalva que fica
+///
+/// `lsn`, `agent_id`, `kind`, `bytes` e o instante. É quanto basta para ver
+/// ritmo, origem e mistura de tipos.
+///
+/// **Ressalva séria:** no modelo do Forge o `agent_id` é o **titular** dos
+/// dados (`titular:<id>`), não o produtor — é a chave por que o
+/// crypto-shred apaga. Está pseudonimizado por HMAC na ponte, portanto não é
+/// diretamente identificante, mas é um pseudónimo estável por pessoa. Este
+/// endpoint fica atrás da autenticação de administração, o que é proporcional
+/// para quem já podia consultar tudo por `/sql` — **mas um painel destes num
+/// ecrã de parede tem outra exposição**. Quem o puser à vista deve pensar nisso.
+async fn live_events(
+    State(engine): State<Arc<Engine>>,
+) -> axum::response::Sse<impl tokio_stream::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>>
+{
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use tokio_stream::StreamExt;
+
+    let rx = engine.log.tail_subscribe();
+    let fluxo = tokio_stream::wrappers::BroadcastStream::new(rx).map(|item| {
+        let dado = match item {
+            Ok((lsn, ep)) => serde_json::json!({
+                "lsn": lsn,
+                "agent_id": ep.agent_id,
+                "kind": rotulo_kind(&ep.kind),
+                "bytes": ep.content.len(),
+                "attrs": ep.attrs.len(),
+                "ts_hlc": ep.ts_hlc,
+                // O HLC é `(milissegundos << 16) | contador` (core/src/hlc.rs).
+                // Enviar já em milissegundos evita que o cliente tenha de
+                // deslocar 64 bits — em JavaScript o `>>` é de 32 e truncava.
+                "t_ms": ep.ts_hlc >> 16,
+            }),
+            // O canal tem 4096 de folga. Um cliente mais lento que a ingestão
+            // fica para trás e o broadcast descarta — que é o correto numa
+            // vista AO VIVO (quer-se o agora, não a fila). Mas tem de ser dito:
+            // um painel que silenciosamente salta 200 mil eventos mente sobre
+            // o que mostra.
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                serde_json::json!({ "saltados": n })
+            }
+        };
+        Ok(Event::default().data(dado.to_string()))
+    });
+
+    Sse::new(fluxo).keep_alive(KeepAlive::default())
+}
+
+/// Rótulo estável para o tipo de evento. `Custom` já traz o nome; os restantes
+/// usam o `Debug` da variante.
+fn rotulo_kind(k: &heraclitus_core::EventKind) -> String {
+    match k {
+        heraclitus_core::EventKind::Custom(s) => s.clone(),
+        outro => format!("{outro:?}"),
     }
 }
 

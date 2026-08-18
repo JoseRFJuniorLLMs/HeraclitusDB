@@ -41,7 +41,7 @@ futures = { version = "0.3", optional = true }
 tonic = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
-tokio-stream = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
 serde_json = { workspace = true }
 blake3 = { workspace = true }
 tracing = { workspace = true }

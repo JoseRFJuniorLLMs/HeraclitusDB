@@ -122,6 +122,20 @@ pub struct HeraclitusConfig {
     /// bind). Prefer `HERACLITUS_REST_AUTH_FILE`; the legacy inline
     /// `HERACLITUS_REST_AUTH` remains available outside production.
     pub rest_basic_auth: Option<String>,
+    /// Origens autorizadas a chamar o REST a partir de um browser (CORS).
+    /// Vazio (default) = **nenhum** cabeçalho CORS, que é o comportamento
+    /// histórico e o mais seguro.
+    ///
+    /// **Nunca aceita `*`, e é deliberado.** Este REST tem rotas que ESCREVEM
+    /// (`/hvm/upsert`, `/hvm/delete`, `/tier/demote`) e liga-se tipicamente a
+    /// `127.0.0.1`. Um `Access-Control-Allow-Origin: *` faria com que qualquer
+    /// página que o operador visitasse pudesse falar com a base de dados local
+    /// através do browser dele. A lista é explícita por isso.
+    ///
+    /// Exemplo: `rest_cors_origins = ["http://localhost:9337"]` para o painel
+    /// forense em desenvolvimento. Em produção, o melhor continua a ser servir
+    /// painel e API na **mesma origem** (nginx) e deixar isto vazio.
+    pub rest_cors_origins: Vec<String>,
     /// Periodic view-checkpoint interval in seconds (fast boot): bounds the
     /// tail a crash-boot has to replay. `0` = checkpoint only at boot and on
     /// graceful shutdown. Default 300.
@@ -257,6 +271,7 @@ impl Default for HeraclitusConfig {
             tls_client_ca_path: None,
             production_mode: false,
             rest_basic_auth: None,
+            rest_cors_origins: Vec::new(),
             checkpoint_interval_secs: 300,
             audit_queries: false,
             encryption_at_rest: false,
