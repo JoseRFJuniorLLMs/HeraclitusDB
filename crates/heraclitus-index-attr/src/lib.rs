@@ -36,7 +36,19 @@ const MAX_VALUE_LEN: usize = 80;
 /// Magic do checkpoint comprimido. Um ficheiro v1 (bincode cru) nunca começa
 /// por estes bytes, por isso a presença dele distingue os formatos sem ambiguidade.
 const MAGIC_V2: &[u8; 4] = b"HATR";
-const FORMAT_V2: u16 = 2;
+/// **v3**: o `agent_id` passou a ser indexado sob `_agent`.
+///
+/// A subida de versao NAO e cosmetica — e o mecanismo de correcao. Um
+/// checkpoint v2 foi escrito sem `_agent`; ao carrega-lo, o indice ficava a
+/// conhecer o campo apenas para os eventos que chegassem DEPOIS, e a pegada de
+/// um titular respondia "1 evento" sobre um log com 200. Dizer isso a um
+/// titular de dados e uma declaracao falsa, e a guarda `indexado` nao a
+/// apanhava: o campo existia, so estava incompleto.
+///
+/// Com a versao a subir, o `open` rejeita o checkpoint antigo e reconstroi por
+/// replay a partir do LSN 0 — backfill completo, sem ninguem ter de se lembrar
+/// de correr nada. Custa um replay no primeiro arranque apos a atualizacao.
+const FORMAT_V2: u16 = 3;
 
 /// Espelho do [`Snapshot`] com os postings **comprimidos**.
 ///
