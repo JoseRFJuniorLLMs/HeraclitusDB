@@ -256,7 +256,13 @@ async fn live_events(
                 "kind": rotulo_kind(&ep.kind),
                 "bytes": ep.content.len(),
                 "attrs": ep.attrs.len(),
-                "ts_hlc": ep.ts_hlc,
+                // Como STRING, nao como numero. Um HLC ronda 1,17e17, e o
+                // `Number` do JavaScript so e exato ate 2^53 (9,0e15): ao
+                // desserializar, os 16 bits do contador logico eram
+                // silenciosamente arredondados. Quem comparasse dois `ts_hlc`
+                // vindos do painel podia ve-los iguais sendo diferentes — num
+                // sistema cuja premissa e a ordem total dos eventos.
+                "ts_hlc": ep.ts_hlc.to_string(),
                 // O HLC é `(milissegundos << 16) | contador` (core/src/hlc.rs).
                 // Enviar já em milissegundos evita que o cliente tenha de
                 // deslocar 64 bits — em JavaScript o `>>` é de 32 e truncava.
