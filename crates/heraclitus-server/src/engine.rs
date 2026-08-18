@@ -1056,7 +1056,19 @@ impl Engine {
     pub fn verify(&self) -> Result<serde_json::Value, HeraclitusError> {
         let r = self.log.verify_durable()?;
         Ok(serde_json::json!({
-            "segments": r.segments, "records": r.records, "merkle_ok": r.merkle_ok
+            "segments": r.segments,
+            "sealed": r.sealed,
+            "records": r.records,
+            "merkle_ok": r.merkle_ok,
+            // Verdadeiro sempre que existe relatório: `Log::verify` devolve
+            // `Err` assim que uma raiz Merkle não bate. Explicitar isto poupa
+            // ao cliente ter de o inferir da AUSÊNCIA de um campo de erro —
+            // inferência que já levou um painel a escrever "íntegro" em cima
+            // de uma corrupção detectada.
+            "ok": true,
+            // Selados sem raiz gravada no rodapé: não são falha, são
+            // não-verificáveis. Sem este número, "3 de 5" não se explica.
+            "sem_raiz": r.sealed.saturating_sub(r.merkle_ok)
         }))
     }
 

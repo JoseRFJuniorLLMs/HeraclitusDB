@@ -136,10 +136,34 @@ fn aplicar_auth(routes: Router, basic_auth: Option<String>) -> Router {
 /// escrevem e liga-se a `127.0.0.1`; um wildcard deixaria qualquer página que
 /// o operador visitasse falar com a base de dados dele através do browser.
 fn aplicar_cors(routes: Router, origens: Vec<String>) -> Router {
-    if origens.is_empty() {
+    // Validar à entrada em vez de confiar. Uma origem malformada nunca vai
+    // casar com o `Origin` que o browser envia, e o sintoma seria o painel a
+    // dizer "bloqueado por CORS" com a configuração aparentemente correta —
+    // horas a depurar o lado errado. Um `*` aqui seria pior: o operador
+    // pensaria tê-lo autorizado e o código ignorá-lo-ia em silêncio.
+    let (validas, rejeitadas): (Vec<String>, Vec<String>) = origens.into_iter().partition(|o| {
+        // Forma de "serialized origin" (RFC 6454): esquema://host[:porta], sem
+        // barra final, sem caminho, sem wildcard.
+        (o.starts_with("http://") || o.starts_with("https://"))
+            && !o.contains('*')
+            && !o.ends_with('/')
+            && o.matches('/').count() == 2
+    });
+    for r in &rejeitadas {
+        tracing::warn!(
+            origem = %r,
+            "rest_cors_origins: entrada IGNORADA — tem de ser esquema://host[:porta], \
+             sem barra final e sem `*` (o wildcard nunca é aceite nesta superfície)"
+        );
+    }
+    if validas.is_empty() {
+        if !rejeitadas.is_empty() {
+            tracing::warn!("rest_cors_origins: nenhuma origem válida — CORS fica DESLIGADO");
+        }
         return routes;
     }
-    let permitidas = Arc::new(origens);
+    tracing::info!(origens = ?validas, "CORS ativo para estas origens");
+    let permitidas = Arc::new(validas);
     routes.layer(middleware::from_fn(move |req: Request, next: Next| {
         let permitidas = permitidas.clone();
         async move {
@@ -158,7 +182,15 @@ fn aplicar_cors(routes: Router, origens: Vec<String>) -> Router {
                         .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, o.as_str())
                         .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS")
                         .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "authorization, content-type")
-                        .header(header::ACCESS_CONTROL_ALLOW_CREDENTIALS, "true")
+                        // SEM `Allow-Credentials`, deliberadamente. O painel
+                        // envia `Authorization` explicitamente, portanto não
+                        // precisa dele. COM ele, bastava o operador ter feito
+                        // login uma vez neste servidor no browser: qualquer
+                        // página servida na origem autorizada podia então fazer
+                        // `fetch(..., {credentials:'include'})`, o browser
+                        // anexava sozinho a credencial guardada, e o cabeçalho
+                        // tornava a resposta LEGÍVEL — leitura do log inteiro e
+                        // escrita por /hvm/*, sem nunca saber a password.
                         .header(header::ACCESS_CONTROL_MAX_AGE, "600")
                         // Sem `Vary: Origin` um intermediário podia servir a
                         // resposta de uma origem autorizada a outra qualquer.
@@ -173,8 +205,9 @@ fn aplicar_cors(routes: Router, origens: Vec<String>) -> Router {
                 if let Ok(v) = o.parse() {
                     h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
                 }
-                h.insert(header::ACCESS_CONTROL_ALLOW_CREDENTIALS, "true".parse().unwrap());
-                h.insert(header::VARY, "Origin".parse().unwrap());
+                // `append` e nao `insert`: um handler pode ja ter posto o seu
+                // proprio `Vary`, e substitui-lo estragaria a chave de cache dele.
+                h.append(header::VARY, "Origin".parse().unwrap());
             }
             resp
         }
@@ -614,13 +647,23 @@ async fn state(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
 
 /// Verificação Merkle do log inteiro. `Log::verify` re-lê+re-hasha todos os
 /// segmentos → `spawn_blocking` (nunca bloquear o reactor / os probes de saúde).
-async fn verify(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
-    let out = match tokio::task::spawn_blocking(move || engine.verify()).await {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => serde_json::json!({ "error": e.to_string() }),
-        Err(e) => serde_json::json!({ "error": format!("join: {e}") }),
-    };
-    Json(out)
+async fn verify(State(engine): State<Arc<Engine>>) -> (StatusCode, Json<serde_json::Value>) {
+    // Uma falha de integridade saía com HTTP **200** e um `{"error": ...}` no
+    // corpo. Um cliente que só olhasse ao estado — ou que procurasse campos que
+    // ali não vinham — lia isso como sucesso: um painel chegou a escrever
+    // "íntegro" por cima de uma corrupção detectada. A deteção de adulteração é
+    // a razão de existir deste produto; não pode viajar como 200.
+    match tokio::task::spawn_blocking(move || engine.verify()).await {
+        Ok(Ok(v)) => (StatusCode::OK, Json(v)),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("join: {e}") })),
+        ),
+    }
 }
 
 /// Verificação Merkle pontual de um segmento (idem: em `spawn_blocking`).

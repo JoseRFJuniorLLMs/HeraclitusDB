@@ -1486,6 +1486,7 @@ impl Log {
             report.segments += 1;
             report.records += scan.record_hashes.len() as u64;
             if scan.sealed {
+                report.sealed += 1;
                 let root = merkle_root(&scan.record_hashes);
                 match scan.blake3_root {
                     Some(stored) if stored == root => report.merkle_ok += 1,
@@ -2447,8 +2448,19 @@ pub fn merkle_root(hashes: &[[u8; 32]]) -> [u8; 32] {
 
 #[derive(Default)]
 pub struct VerifyReport {
+    /// Total de segmentos varridos, **incluindo o ativo**.
     pub segments: u64,
+    /// Quantos desses estavam SELADOS. O ativo nunca está, portanto
+    /// `sealed == segments - 1` no caso normal.
+    ///
+    /// Existe porque sem ele o relatório não conseguia exprimir "íntegro":
+    /// quem comparasse `merkle_ok == segments` nunca obtinha verdadeiro num log
+    /// saudável, e um painel chegou a declarar FALHA DE INTEGRIDADE em bases
+    /// perfeitamente sãs por causa disso.
+    pub sealed: u64,
     pub records: u64,
+    /// Selados cuja raiz gravada no rodapé bate com a recomputada. Um selado
+    /// sem raiz gravada não conta aqui **e não é falha** — é não-verificável.
     pub merkle_ok: u64,
 }
 
