@@ -1,11 +1,22 @@
 //! heraclitus-cli — admin & inspection (§3.14) + the M7 QPS×recall harness.
 
-use heraclitus_core::{EventId, FsyncPolicy, ProductPoint};
+use heraclitus_core::{EventId, FsyncPolicy, HeraclitusConfig, ProductPoint};
 use heraclitus_crypto::KeyStore;
 use heraclitus_index_vector::VectorIndex;
 use heraclitus_log::Log;
 use heraclitus_manifold::{dist_hyp, project_to_ball, ProductMetric};
 use std::time::Instant;
+
+/// Tamanho de segmento para os `Log::open` do CLI.
+///
+/// Vem do default da config em vez de estar cravado: o valor governa o debito
+/// de escrita (o indice do segmento ativo e copiado por lote — ver a doc de
+/// `HeraclitusConfig::segment_max_bytes`), e o `migrate-encrypt` reescreve o
+/// log INTEIRO por esta via. Deixar 256 MiB cravado aqui anulava a mudanca de
+/// configuracao precisamente no caminho que mais escreve.
+fn segmento() -> u64 {
+    HeraclitusConfig::default().segment_max_bytes
+}
 
 /// Cria duas identidades de bootstrap com tokens CSPRNG. Os tokens só são
 /// escritos em arquivos `create_new`; stdout contém caminhos, nunca segredos.
@@ -86,7 +97,7 @@ pub fn init_credentials(
 }
 
 pub fn log_inspect(dir: &std::path::Path) -> Result<String, heraclitus_core::HeraclitusError> {
-    let log = Log::open(dir, 256 * 1024 * 1024, FsyncPolicy::Always)?;
+    let log = Log::open(dir, segmento(), FsyncPolicy::Always)?;
     let sealed = log.sealed_segments();
     let mut out = format!(
         "head lsn: {}\nsealed segments: {}\n",
@@ -108,7 +119,7 @@ pub fn log_inspect(dir: &std::path::Path) -> Result<String, heraclitus_core::Her
 }
 
 pub fn verify(dir: &std::path::Path) -> Result<String, heraclitus_core::HeraclitusError> {
-    let log = Log::open(dir, 256 * 1024 * 1024, FsyncPolicy::Always)?;
+    let log = Log::open(dir, segmento(), FsyncPolicy::Always)?;
     // `log.verify()` já devolve `Err(Corruption)` numa raiz Merkle divergente
     // (o `?` propaga) — e `main` agora sai com código 1 em qualquer `Err`.
     let r = log.verify()?;
@@ -166,7 +177,7 @@ pub fn migrate_encrypt(
         .transpose()?;
     let source_log = Log::open_with_keystore(
         &source_log,
-        256 * 1024 * 1024,
+        segmento(),
         FsyncPolicy::Always,
         source_keystore,
     )?;
@@ -177,7 +188,7 @@ pub fn migrate_encrypt(
     let destination_keystore = KeyStore::open(destination.join("keys"))?;
     let destination_log = Log::open_with_keystore(
         destination.join("log"),
-        256 * 1024 * 1024,
+        segmento(),
         FsyncPolicy::Always,
         Some(destination_keystore),
     )?;
@@ -238,7 +249,7 @@ pub fn anchor(
 ) -> Result<String, String> {
     use heraclitus_compliance::{anchor, current_watermark, HttpTsa, LocalTsa, TsaClient};
     let log =
-        Log::open(log_dir, 256 * 1024 * 1024, FsyncPolicy::Always).map_err(|e| e.to_string())?;
+        Log::open(log_dir, segmento(), FsyncPolicy::Always).map_err(|e| e.to_string())?;
     if current_watermark(&log) == 0 {
         return Ok(
             "nada selado para ancorar (sem segmentos selados); apenda mais eventos primeiro".into(),
@@ -269,7 +280,7 @@ pub fn verify_receipts(
 ) -> Result<String, String> {
     use heraclitus_compliance::{load_manifest, verify_receipt};
     let log =
-        Log::open(log_dir, 256 * 1024 * 1024, FsyncPolicy::Always).map_err(|e| e.to_string())?;
+        Log::open(log_dir, segmento(), FsyncPolicy::Always).map_err(|e| e.to_string())?;
     let receipts = load_manifest(receipts_dir).map_err(|e| e.to_string())?;
     if receipts.is_empty() {
         return Ok("nenhum recibo encontrado (manifest.jsonl vazio ou ausente)".into());

@@ -56,7 +56,28 @@ impl Default for FsyncPolicy {
 #[serde(default)]
 pub struct HeraclitusConfig {
     pub data_dir: PathBuf,
-    /// Segments roll at this size (default 256 MB).
+    /// Tamanho a que o segmento rola e sela (default 8 MiB).
+    ///
+    /// **Isto não é só uma escolha de tamanho de ficheiro — governa o débito de
+    /// escrita.** O índice do segmento ativo é publicado por copy-on-write a
+    /// cada lote (`heraclitus-log/src/lib.rs:938`), portanto o custo por append
+    /// cresce com as entradas JÁ acumuladas nesse segmento; selar reinicia-o.
+    /// Um segmento maior deixa esse quadrático correr durante mais tempo.
+    ///
+    /// Medido a 1M de registos realistas (~487 B cada):
+    ///
+    /// | segmento | appends/s | 1M registos |
+    /// |---|---|---|
+    /// | 8 MiB | 12 798 (curva plana) | 78 s |
+    /// | 256 MiB (o default antigo) | 399 (degrada 7,4×) | 42 min |
+    ///
+    /// **Ressalva:** segmentos pequenos não são grátis — cada selagem custa
+    /// fsync, criação de ficheiro e sync do diretório-pai. Abaixo de ~50k
+    /// registos por segmento o default antigo era mais rápido (a 20k: 18 393
+    /// vs 10 109 app/s). Para bases pequenas e de escrita rara, subir este
+    /// valor é legítimo.
+    ///
+    /// Ver `docs/md/auditorias/append-lento-com-o-crescimento.md`.
     pub segment_max_bytes: u64,
     pub fsync: FsyncPolicy,
     /// Memtable holds at most this many events above the view watermark.
@@ -218,7 +239,8 @@ impl Default for HeraclitusConfig {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("./data"),
-            segment_max_bytes: 256 * 1024 * 1024,
+            // 8 MiB: ver a doc do campo. Medido 32x mais rapido a 1M de registos.
+            segment_max_bytes: 8 * 1024 * 1024,
             fsync: FsyncPolicy::default(),
             memtable_cap: 100_000,
             compaction_max_cores: 1,

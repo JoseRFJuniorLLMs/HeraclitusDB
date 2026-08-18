@@ -13,7 +13,7 @@
 //!     se degradar com escrita concorrente, a troca não está a compensar;
 //!  5. **arranque a frio** — reabrir o log de 1M reconstrói o índice. É o tempo
 //!     de indisponibilidade num restart, um número operacional real;
-//!  6. **escrita com o default de 256 MiB** — a comparação que valida (ou não) a
+//!  6. **escrita com 256 MiB (o default ANTIGO)** — a comparação que valida (ou não) a
 //!     recomendação da auditoria no volume alvo, em vez de por extrapolação.
 //!
 //! ```bash
@@ -31,7 +31,8 @@ use std::time::{Duration, Instant};
 
 /// A recomendação da auditoria `docs/md/auditorias/append-lento-com-o-crescimento.md`.
 const SEG_RECOMENDADO: u64 = 8 << 20;
-/// O default de `HeraclitusConfig::segment_max_bytes`.
+/// O default ANTIGO de `HeraclitusConfig::segment_max_bytes`, mantido aqui
+/// como termo de comparacao depois de o default passar a 8 MiB.
 const SEG_DEFAULT: u64 = 256 << 20;
 
 /// Gerador determinístico (xorshift64*). Reprodutível de propósito: um
@@ -149,7 +150,9 @@ fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1_000_000);
-    let janela = (n / 10).max(1);
+    // 40 janelas: com 10M e selagens a cada ~550k, e o suficiente para o
+    // dente-de-serra das selagens aparecer em vez de ficar aliased.
+    let janela = (n / 40).clamp(1_000, 250_000).min(n.max(1));
 
     println!("\n=== Carga realista: {n} registos, escrita + leitura ===\n");
     println!("Eventos com forma de log de servidor: 8 servicos, 5 niveis, 6 rotas,");
