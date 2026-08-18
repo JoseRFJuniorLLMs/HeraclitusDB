@@ -136,6 +136,18 @@ pub struct HeraclitusConfig {
     /// forense em desenvolvimento. Em produção, o melhor continua a ser servir
     /// painel e API na **mesma origem** (nginx) e deixar isto vazio.
     pub rest_cors_origins: Vec<String>,
+    /// Permite `POST /titular/:id/eliminar` (crypto-shred) pelo REST.
+    /// **`false` por omissao, e deliberadamente.**
+    ///
+    /// A eliminacao e IRREVERSIVEL: destroi a chave do titular e o conteudo
+    /// dele fica ilegivel para sempre. O REST so tem Basic auth, que e tudo-ou-
+    /// nada — nao distingue papeis como o RBAC do gRPC. Expor uma operacao
+    /// destrutiva atras disso, por omissao, seria pos a decisao mais grave do
+    /// sistema atras da protecao mais fraca dele.
+    ///
+    /// Com `false`, o endpoint responde 403 e devolve o comando gRPC
+    /// equivalente, que passa pelo RBAC. Ligue-se so onde isso for aceitavel.
+    pub rest_allow_erasure: bool,
     /// Periodic view-checkpoint interval in seconds (fast boot): bounds the
     /// tail a crash-boot has to replay. `0` = checkpoint only at boot and on
     /// graceful shutdown. Default 300.
@@ -272,6 +284,7 @@ impl Default for HeraclitusConfig {
             production_mode: false,
             rest_basic_auth: None,
             rest_cors_origins: Vec::new(),
+            rest_allow_erasure: false,
             checkpoint_interval_secs: 300,
             audit_queries: false,
             encryption_at_rest: false,
@@ -389,6 +402,10 @@ impl HeraclitusConfig {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_REST_ALLOW_ERASURE") {
+            self.rest_allow_erasure =
+                matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes");
         }
         if let Ok(v) = std::env::var("HERACLITUS_CHECKPOINT_INTERVAL") {
             if let Ok(s) = v.parse() {

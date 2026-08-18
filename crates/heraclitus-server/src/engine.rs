@@ -801,6 +801,130 @@ impl Engine {
         Ok(out)
     }
 
+    /// Pegada de um titular no log: quantos eventos, de que tipos, desde
+    /// quando, e se a chave dele ainda existe.
+    ///
+    /// Responde ao que a LGPD art. 18 (I e II) obriga a conseguir responder —
+    /// confirmação da existência do tratamento e acesso aos dados — e é a
+    /// base do ecrã do titular no painel.
+    ///
+    /// Usa o índice `_agent` do `AttrIndex`. Um índice construído antes de
+    /// esse campo existir não o tem: `indexado: false` diz isso em vez de
+    /// devolver zero eventos e deixar alguém concluir que não há dados
+    /// nenhuns sobre a pessoa. Nesse caso, `rebuild` resolve.
+    pub fn titular(&self, agent_id: &str, limite: usize) -> serde_json::Value {
+        let lsns: Vec<Lsn> = {
+            let attr = self.attr.lock().unwrap();
+            attr.lookup("_agent", agent_id).to_vec()
+        };
+        // O índice conhece o campo `_agent`? Se não conhecer, foi construído
+        // antes desta funcionalidade — e aí "0 eventos" NÃO é uma resposta, é
+        // uma ausência de índice. Dizer a um titular "não temos nada sobre si"
+        // por causa de um índice desatualizado é uma declaração falsa.
+        //
+        // Nota: os frames H-VM (`hvm_isa`) são excluídos dos índices por
+        // desenho (`index_applied`) — vivem no replay da VM. Um log só com
+        // esses frames dá `agentes_indexados: 0` legitimamente.
+        let agentes_indexados = self.attr.lock().unwrap().field_entries("_agent");
+
+        let mut tipos: std::collections::BTreeMap<String, u64> = Default::default();
+        let mut amostra = Vec::new();
+        let (mut primeiro_ms, mut ultimo_ms) = (u64::MAX, 0u64);
+        for &lsn in &lsns {
+            if let Ok(Some((_, ep))) = self.log.read(lsn) {
+                let kind = match &ep.kind {
+                    heraclitus_core::EventKind::Custom(s) => s.clone(),
+                    outro => format!("{outro:?}"),
+                };
+                *tipos.entry(kind.clone()).or_insert(0) += 1;
+                let ms = ep.ts_hlc >> 16;
+                primeiro_ms = primeiro_ms.min(ms);
+                ultimo_ms = ultimo_ms.max(ms);
+                if amostra.len() < limite {
+                    // METADADOS apenas. O conteúdo não sai por aqui: este
+                    // endpoint existe para provar tratamento, não para o expor.
+                    amostra.push(serde_json::json!({
+                        "lsn": lsn,
+                        "kind": kind,
+                        "bytes": ep.content.len(),
+                        "t_ms": ms,
+                        "atributos": ep.attrs.len(),
+                    }));
+                }
+            }
+        }
+
+        serde_json::json!({
+            "titular": agent_id,
+            "eventos": lsns.len(),
+            "tipos": tipos,
+            "primeiro_ms": if primeiro_ms == u64::MAX { serde_json::Value::Null } else { primeiro_ms.into() },
+            "ultimo_ms": if ultimo_ms == 0 { serde_json::Value::Null } else { ultimo_ms.into() },
+            "cifrado": self.keystore.is_some(),
+            // `false` com `cifrado: true` = a chave foi destruída: os dados
+            // deste titular já foram eliminados por crypto-shred.
+            "chave_presente": self
+                .keystore
+                .as_ref()
+                // `get` devolve `None` quando a chave nao existe — que e
+                // exatamente o estado pos-shred. Nao se usa a chave para nada:
+                // so se pergunta se ainda la esta.
+                .map(|ks| ks.get(agent_id).is_some())
+                .unwrap_or(false),
+            // `false` = este índice não conhece o campo do titular; a contagem
+            // acima não é de confiança e um `rebuild` resolve.
+            "indexado": agentes_indexados > 0,
+            "agentes_indexados": agentes_indexados,
+            "amostra": amostra,
+        })
+    }
+
+    /// Eventos de auditoria que mencionam este titular.
+    ///
+    /// O `audit_queries` transforma cada consulta GQL num evento do log — quem
+    /// consultou o quê é, ele próprio, prova. Aqui procuram-se os que citam
+    /// este identificador, mais os `shred:<id>` do `AuditAdmin`.
+    ///
+    /// **Ressalva:** é uma procura por menção no texto registado, não um
+    /// índice de "acessos a este titular". Uma consulta que devolva dados dele
+    /// sem o nomear não aparece. É o que a informação atual permite afirmar.
+    pub fn titular_acessos(&self, agent_id: &str, limite: usize) -> serde_json::Value {
+        let head = self.log.head();
+        let mut achados = Vec::new();
+        let mut cur = 0u64;
+        while cur < head && achados.len() < limite {
+            let lote = match self.log.scan_capped(cur, head, 20_000) {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            let Some(&(ultimo, _)) = lote.last() else { break };
+            for (lsn, ep) in &lote {
+                let e_auditoria = ep.attrs.contains_key("audit");
+                if !e_auditoria {
+                    continue;
+                }
+                let texto = String::from_utf8_lossy(&ep.content);
+                let operacao = ep.attrs.get("operation").cloned().unwrap_or_default();
+                if !texto.contains(agent_id) && !operacao.contains(agent_id) {
+                    continue;
+                }
+                achados.push(serde_json::json!({
+                    "lsn": lsn,
+                    "t_ms": ep.ts_hlc >> 16,
+                    "tipo": ep.attrs.get("audit").cloned().unwrap_or_default(),
+                    "principal": ep.attrs.get("principal").cloned().unwrap_or_default(),
+                    "operacao": operacao,
+                    "ok": ep.attrs.get("ok").cloned().unwrap_or_default(),
+                }));
+                if achados.len() >= limite {
+                    break;
+                }
+            }
+            cur = ultimo + 1;
+        }
+        serde_json::json!({ "titular": agent_id, "acessos": achados })
+    }
+
     /// Crypto-shred (§3.10): destroy an agent's encryption key so all of its
     /// sealed content becomes permanently unreadable. The log is never mutated.
     /// Errors if encryption at rest is disabled.

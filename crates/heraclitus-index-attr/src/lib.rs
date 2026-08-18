@@ -264,6 +264,22 @@ impl AttrIndex {
         self.inner.exact.len()
     }
 
+    /// Quantos valores distintos existem indexados sob `field`.
+    ///
+    /// Serve para distinguir "nao ha dados" de "este indice nao conhece este
+    /// campo" — que e a diferenca entre responder a um titular "nao temos nada
+    /// sobre si" e "o nosso indice e anterior a esta funcionalidade". A
+    /// primeira resposta, dada por engano, e uma declaracao falsa a um titular
+    /// de dados.
+    pub fn field_entries(&self, field: &str) -> usize {
+        let prefixo = ikey(field, "");
+        self.inner
+            .exact
+            .keys()
+            .filter(|k| k.starts_with(&prefixo))
+            .count()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.inner.exact.is_empty()
     }
@@ -322,6 +338,26 @@ impl View for AttrIndex {
                 v.insert(i, lsn);
             }
         }
+        // `agent_id` entra como pseudo-atributo, sob a chave reservada
+        // `_agent`.
+        //
+        // Porquê: o `agent_id` é a chave por que a cifra em repouso deriva as
+        // chaves e por que o crypto-shred apaga — no modelo do Forge é o
+        // **titular** dos dados. Sem estar indexado, responder "que dados têm
+        // sobre mim?" (LGPD art. 18, I e II) obrigava a varrer o log inteiro:
+        // 51 segundos a 10 milhões de registos, medido. Um banco que assenta a
+        // conformidade neste campo tem de conseguir procurá-lo.
+        //
+        // O prefixo `_` evita colisão com um atributo de utilizador chamado
+        // "agent": as chaves de utilizador vêm de `event.attrs`, que nunca
+        // produz `_agent`.
+        {
+            let a = event.agent_id.trim();
+            if !a.is_empty() && a.len() <= MAX_VALUE_LEN {
+                insert_sorted(self.inner.exact.entry(ikey("_agent", a)).or_default(), lsn);
+            }
+        }
+
         for (field, value) in &event.attrs {
             let v = value.trim();
             if v.len() > MAX_VALUE_LEN || SKIP_VALUES.contains(&v.to_ascii_lowercase().as_str()) {

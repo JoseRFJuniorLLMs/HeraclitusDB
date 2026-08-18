@@ -137,6 +137,7 @@ pub async fn serve_with(
         engine.clone(),
         config.rest_basic_auth.clone(),
         config.rest_cors_origins.clone(),
+        config.rest_allow_erasure,
     );
 
     let rest_listener = tokio::net::TcpListener::bind(rest_addr).await?;

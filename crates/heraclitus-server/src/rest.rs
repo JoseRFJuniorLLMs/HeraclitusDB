@@ -11,6 +11,10 @@ use axum::{
 };
 use std::sync::Arc;
 
+/// Se `POST /titular/:id/eliminar` esta autorizado. Vem da config
+/// (`rest_allow_erasure`), `false` por omissao.
+static ERASURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Comparação em tempo constante (R17): o tempo não depende do prefixo
 /// coincidente, fechando o side-channel de timing do `==` de strings. O
 /// comprimento continua observável — inevitável e inócuo (o segredo não é o
@@ -61,7 +65,9 @@ pub fn router(
     engine: Arc<Engine>,
     basic_auth: Option<String>,
     cors_origins: Vec<String>,
+    allow_erasure: bool,
 ) -> Router {
+    ERASURE.store(allow_erasure, std::sync::atomic::Ordering::Relaxed);
     let routes = Router::new()
         .route("/healthz", get(healthz))
         .route("/stats", get(stats))
@@ -71,6 +77,10 @@ pub fn router(
         // Fluxo ao vivo de appends (SSE). O log já emitia cada append
         // confirmado num broadcast interno; faltava só quem o expusesse.
         .route("/live/events", get(live_events))
+        // LGPD art. 18: pegada do titular, acessos aos dados dele, e eliminacao.
+        .route("/titular/:id", get(titular))
+        .route("/titular/:id/acessos", get(titular_acessos))
+        .route("/titular/:id/eliminar", axum::routing::post(titular_eliminar))
         // M20 — H-VM sovereignty ledger (SPEC-025-adjacente). KV durável no log.
         .route("/hvm/state", get(hvm_state))
         .route("/hvm/upsert", axum::routing::post(hvm_upsert))
@@ -289,6 +299,83 @@ fn rotulo_kind(k: &heraclitus_core::EventKind) -> String {
     match k {
         heraclitus_core::EventKind::Custom(s) => s.clone(),
         outro => format!("{outro:?}"),
+    }
+}
+
+/// `GET /titular/:id` — pegada de um titular (LGPD art. 18, I e II).
+/// Devolve METADADOS: quantos eventos, de que tipos, desde quando, e se a
+/// chave dele ainda existe. Nunca devolve conteudo.
+async fn titular(State(engine): State<Arc<Engine>>, Path(id): Path<String>) -> Json<serde_json::Value> {
+    Json(engine.titular(&id, 50))
+}
+
+/// `GET /titular/:id/acessos` — eventos de auditoria que mencionam este titular.
+async fn titular_acessos(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let out = tokio::task::spawn_blocking(move || engine.titular_acessos(&id, 100))
+        .await
+        .unwrap_or_else(|e| serde_json::json!({ "error": format!("join: {e}") }));
+    Json(out)
+}
+
+/// `POST /titular/:id/eliminar` — crypto-shred (LGPD art. 18, VI).
+///
+/// DESLIGADO por omissao. Ver `HeraclitusConfig::rest_allow_erasure`: a
+/// operacao e irreversivel e o REST so tem Basic auth, que nao distingue
+/// papeis. Com o interruptor a `false` responde 403 **e diz qual o comando
+/// gRPC equivalente**, que passa pelo RBAC — recusar sem indicar o caminho
+/// certo so leva a que alguem procure um atalho pior.
+///
+/// Exige `{"confirmar": "<id>"}` no corpo: um POST acidental nao apaga nada.
+async fn titular_eliminar(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+    Json(corpo): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !ERASURE.load(std::sync::atomic::Ordering::Relaxed) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "eliminacao pelo REST desligada (rest_allow_erasure = false)",
+                "alternativa": format!("Admin RPC com op = \"shred:{id}\", que passa pelo RBAC do gRPC"),
+            })),
+        );
+    }
+    if corpo.get("confirmar").and_then(|v| v.as_str()) != Some(id.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "confirmacao em falta: o corpo tem de trazer {\"confirmar\": \"<id>\"}",
+            })),
+        );
+    }
+    let alvo = id.clone();
+    let r = tokio::task::spawn_blocking(move || engine.shred(&alvo)).await;
+    match r {
+        Ok(Ok(destruida)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "chave_destruida": destruida,
+                "nota": if destruida {
+                    "Chave destruida. O log NAO foi alterado: a cadeia Merkle continua a verificar."
+                } else {
+                    "Nao havia chave para este titular (ja eliminado, ou nunca escreveu)."
+                },
+            })),
+        ),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("join: {e}") })),
+        ),
     }
 }
 
