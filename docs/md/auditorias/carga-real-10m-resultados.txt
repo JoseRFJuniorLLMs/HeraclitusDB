@@ -1,0 +1,46 @@
+=== Carga realista: 10000000 registos, escrita + leitura ===
+
+Eventos com forma de log de servidor: 8 servicos, 5 niveis, 6 rotas,
+mensagem de 120-400 B e 3 atributos por registo (bincode real).
+
+-- 1. ESCRITA · segmento 8 MiB (recomendacao da auditoria) ------
+    debito por janela de 250000: 13967 13963 13965 20860 20999 22128 21955 21428 21630 21205 20552 20804 20268 20448 20670 20850 20292 20065 20864 21963 23380 23307 22175 20616 20058 20463 23728 24037 21328 20508 17537 17007 20613 20278 17693 30252 38710 39650 37419 37818
+    8 MiB: 21164 app/s no total (472.5s); 1a janela 13967 -> ultima 37818 = 0.4x
+    log em disco: 4873.7 MB em 582 ficheiros, media 487 B/registo
+
+-- 2. LEITURA PONTUAL · read(lsn) aleatorio ---------------------
+    20000 leituras aleatorias, 20000 encontradas (100.0%)
+    p50   19.90µs · p95   31.90µs · p99   71.90µs · max   14.39ms · 41769 leituras/s
+
+-- 3. VARRIMENTO · scan / scan_capped --------------------------
+    scan de   10000 registos (pedidos   10000):   33.78ms  =  296019 registos/s
+    scan de  100000 registos (pedidos  100000):  389.55ms  =  256703 registos/s
+    scan_capped do log INTEIRO (10000000 registos): 51.05s  =  195888 registos/s
+
+-- 4. LEITURA SOB ESCRITA · 4 leitores + 4 escritores -----------
+    O indice e copiado na escrita para os leitores nunca bloquearem.
+    Se a latencia de leitura nao piorar, a troca esta a compensar.
+    em 10s: 25008 escritas (2501/s) e 481102 leituras (48110/s)
+    leitura SOB escrita: p50 27.20µs · p95 76.30µs · p99 1.08ms · max 134.45ms
+    vs leitura sem escrita (p50 19.90µs)  =>  1.37x
+
+-- 5. ARRANQUE A FRIO · reabrir o log ---------------------------
+    Log::open sobre 10025008 registos: 24.53s  (head recuperado = 10025008)
+    E o tempo de indisponibilidade num restart do servico.
+    primeira leitura depois de reabrir: 62.70µs
+
+-- 6. ESCRITA · segmento 256 MiB (o DEFAULT de producao) --------
+    Lenta por desenho: e o problema a ser demonstrado no volume
+    alvo, em vez de extrapolado da curva de 200k.
+    debito por janela de 250000: 695 265 560 417 428 458 327 517 372 736 334 1054 376 747 312 385 357 304 411 256 486 231 600 277 520 298 388 317 304 365 201 363 197 674 215 390 264 298 263 270
+    256 MiB: 351 app/s no total (28494.7s); 1a janela 695 -> ultima 270 = 2.6x
+
+=== VEREDICTO ===
+
+  escrita · segmento   8 MiB (recomendado):     21164 app/s
+  escrita · segmento 256 MiB (default)    :       351 app/s
+  ganho da recomendacao no volume alvo    : 60.3x
+
+  leitura pontual sem escrita : p50 19.90µs
+  leitura pontual sob escrita : p50 27.20µs · p99 1.08ms
+

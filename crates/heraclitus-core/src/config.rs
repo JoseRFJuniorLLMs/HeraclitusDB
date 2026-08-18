@@ -377,6 +377,19 @@ impl HeraclitusConfig {
         } else if let Some(value) = inline_rest_auth {
             self.rest_basic_auth = Some(value);
         }
+        // Origens CORS por variável de ambiente, no mesmo estilo do resto.
+        // Lista separada por vírgulas; vazio desliga (o default). A validação
+        // do formato é feita onde a camada é montada (`rest.rs::aplicar_cors`),
+        // que rejeita `*` e origens malformadas com aviso nomeando a entrada —
+        // aqui só se separa, para uma entrada inválida ser reportada uma vez
+        // e no sítio onde se percebe o efeito.
+        if let Ok(v) = std::env::var("HERACLITUS_REST_CORS_ORIGINS") {
+            self.rest_cors_origins = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
         if let Ok(v) = std::env::var("HERACLITUS_CHECKPOINT_INTERVAL") {
             if let Ok(s) = v.parse() {
                 self.checkpoint_interval_secs = s;
