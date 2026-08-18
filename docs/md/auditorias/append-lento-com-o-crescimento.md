@@ -4,8 +4,11 @@
 **Veredicto:** **armadilha de afinação, não teto arquitetural.** O default de
 produção (`segment_max_bytes = 256 MiB`) é o valor errado para carga de escrita.
 **Não é preciso mexer em código para o resolver** — mas é preciso mexer na
-configuração, e o ganho medido é de **12,5× a 40,7×**.
-**Benchmark:** `crates/heraclitus-log/benches/append_scaling.rs`
+configuração. Ganho medido: **12,5× a 40,7×** a 200 mil registos e **32,0×** a
+1 milhão com carga realista (ver a ADENDA no fim, que também delimita o ponto de
+cruzamento abaixo do qual a recomendação **piora**).
+**Benchmarks:** `crates/heraclitus-log/benches/append_scaling.rs` (o mecanismo) e
+`benches/carga_real_1m.rs` (validação a 1M, escrita + leitura)
 **Origem:** apareceu de lado, ao instrumentar a geração de dados do benchmark da
 SPEC-0042. Não era o que se procurava.
 
@@ -176,3 +179,118 @@ quadrático, reduz-lhe a constante por três ordens de grandeza.
 2. Validar a curva no **volume real alvo** — esta auditoria mediu 200 mil
    registos e ~100 segmentos.
 3. Decidir se `resolve_lsn_from_consensus_index` merece medição própria.
+
+---
+
+# ADENDA — validação a 1 000 000 de registos, com carga realista
+
+**Data:** 2026-08-16
+**Benchmark:** `crates/heraclitus-log/benches/carga_real_1m.rs`
+**Resultados brutos:** `carga-real-1m-resultados.txt`
+
+A auditoria acima mediu 200 mil registos com payload artificial e recomendou
+4–16 MiB **por extrapolação**. A secção 8 deixou isso explícito como trabalho
+por fazer. Está feito: 1 milhão de registos, eventos com forma de log de
+servidor (8 serviços, 5 níveis, 6 rotas, mensagem de 120–400 B, 3 atributos
+por registo em `BTreeMap` serializado por bincode). Média real: **487 B/registo,
+486,5 MB em 59 ficheiros**.
+
+## A recomendação confirma-se — e por uma margem maior
+
+| Configuração | appends/s | Curva ao longo de 1M |
+|---|---|---|
+| segmento **8 MiB** (recomendado) | **12 798** | **plana** (0,8× — acaba mais rápida) |
+| segmento **256 MiB** (default) | **399** | degrada **7,4×** |
+
+**Ganho de 32,0× no volume alvo.** 1M registos levam **78 segundos** com 8 MiB e
+**42 minutos** com o default.
+
+## A prova causal está visível na curva
+
+Débito da configuração default, por janela de 100 000:
+
+```
+1908  675  408  304  226 │ 384  944 │ 489  305  258
+                          └── o segmento sela aqui ──┘
+```
+
+A 487 B/registo, um segmento de 256 MiB enche-se a ~551 000 registos. O débito
+cai monotonamente até à janela dos 400–500k (226 app/s), **sobe para 944** nas
+janelas seguintes, e recomeça a cair. Isso é o índice ativo a ser reiniciado
+pela selagem, exatamente como a secção 2 previa.
+
+Não é inferência a partir da forma da curva: é o mecanismo a ser observado a
+acontecer, no sítio onde a aritmética diz que tem de acontecer.
+
+## Existe um ponto de cruzamento, e agora está delimitado
+
+A mesma bateria com **20 000** registos dá o resultado **inverso**:
+
+| Volume | 8 MiB | 256 MiB | Vencedor |
+|---|---|---|---|
+| 20 000 registos | 10 109 app/s | 18 393 app/s | **default**, 1,8× |
+| 1 000 000 registos | 12 798 app/s | 399 app/s | **8 MiB**, 32× |
+
+Segmentos pequenos **não são grátis**: cada selagem custa fsync, criação de
+ficheiro e sync do diretório-pai — um custo fixo pago desde o primeiro registo,
+enquanto o quadrático só começa a doer por volta dos 50k. Abaixo do cruzamento,
+encolher o segmento **piora**.
+
+A recomendação de 4–16 MiB continua correta para o caso de uso alvo (ingestão
+contínua de logs, que passa o cruzamento em minutos), mas a razão tem de ser
+dita: não é que segmentos menores sejam sempre melhores; é que este volume está
+muito acima do ponto onde passam a ser.
+
+## Leitura: o desenho aguenta-se
+
+| Métrica | Valor |
+|---|---|
+| `read(lsn)` aleatório, p50 | 68,5 µs |
+| p95 / p99 / max | 114,7 µs / 270,5 µs / 14,0 ms |
+| débito, um leitor | 12 477 leituras/s |
+| `scan` de 100k registos | 1,12 s = 89 639 registos/s |
+| `scan_capped` do log inteiro (1M) | 12,22 s = 81 818 registos/s |
+
+### Leitura sob escrita — o teste que valida a troca
+
+O índice é copiado na escrita precisamente para os leitores nunca bloquearem.
+Com **4 leitores + 4 escritores** durante 10 s sobre o log de 1M:
+
+| | p50 | p95 | p99 | max |
+|---|---|---|---|---|
+| leitura **sem** escrita | 68,5 µs | 114,7 µs | 270,5 µs | 14,0 ms |
+| leitura **sob** escrita | **73,2 µs** | 156,2 µs | 451,7 µs | 121,4 ms |
+
+**Degradação de p50: 1,07×.** A troca compensa: 414 643 leituras (41 464/s)
+concorrentes com escrita, e a latência mediana sobe 7%. **O custo pago na
+escrita está a comprar o que prometia.**
+
+Duas ressalvas honestas:
+- a **cauda** piora bastante (p99 de 270 µs para 452 µs; máximo de 14 ms para
+  121 ms). Quem tiver SLO de cauda tem de medir isto na sua carga;
+- a **escrita** é que sofre: 6 170 escritas/s neste teste misto, contra 12 798
+  em escrita pura. Sob carga de leitura pesada, o débito de escrita cai ~2×.
+  Os leitores ganham a contenção de I/O.
+
+A 20 000 registos a degradação de leitura era 2,87×, não 1,07×. Não se
+extrapole a partir de logs pequenos: o efeito **desaparece** à escala real.
+
+## Arranque a frio
+
+```
+Log::open sobre 1 061 696 registos: 5,36 s
+primeira leitura depois de reabrir:  202,8 µs
+```
+
+**5,36 s é o tempo de indisponibilidade num restart do serviço**, e escala com
+o nº de registos. Não estava medido em lado nenhum. Merece entrar no plano de
+operação antes de alguém reiniciar em produção.
+
+## O que muda na secção 8 (trabalho por fazer)
+
+- ~~Validar a curva no volume real alvo~~ — **feito**: 32× a favor da
+  recomendação a 1M, com a causa observada diretamente.
+- Continua por fazer: escolher e aplicar o `segment_max_bytes` de produção;
+  medir `resolve_lsn_from_consensus_index`.
+- **Novo:** a cauda de leitura sob escrita (p99, max) e a queda de ~2× no débito
+  de escrita sob carga de leitura merecem medição na carga real, não sintética.

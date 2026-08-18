@@ -1,0 +1,46 @@
+=== Carga realista: 1000000 registos, escrita + leitura ===
+
+Eventos com forma de log de servidor: 8 servicos, 5 niveis, 6 rotas,
+mensagem de 120-400 B e 3 atributos por registo (bincode real).
+
+-- 1. ESCRITA · segmento 8 MiB (recomendacao da auditoria) ------
+    debito por janela de 100000: 12131 14124 13353 11484 11759 11373 13523 13086 13538 14506
+    8 MiB: 12798 app/s no total (78.1s); 1a janela 12131 -> ultima 14506 = 0.8x
+    log em disco: 486.5 MB em 59 ficheiros, media 487 B/registo
+
+-- 2. LEITURA PONTUAL · read(lsn) aleatorio ---------------------
+    20000 leituras aleatorias, 20000 encontradas (100.0%)
+    p50   68.50µs · p95  114.70µs · p99  270.50µs · max   14.00ms · 12477 leituras/s
+
+-- 3. VARRIMENTO · scan / scan_capped --------------------------
+    scan de   10000 registos (pedidos   10000):  108.54ms  =  92130 registos/s
+    scan de  100000 registos (pedidos  100000):     1.12s  =  89639 registos/s
+    scan_capped do log INTEIRO (1000000 registos): 12.22s  =  81818 registos/s
+
+-- 4. LEITURA SOB ESCRITA · 4 leitores + 4 escritores -----------
+    O indice e copiado na escrita para os leitores nunca bloquearem.
+    Se a latencia de leitura nao piorar, a troca esta a compensar.
+    em 10s: 61696 escritas (6170/s) e 414643 leituras (41464/s)
+    leitura SOB escrita: p50 73.20µs · p95 156.20µs · p99 451.70µs · max 121.42ms
+    vs leitura sem escrita (p50 68.50µs)  =>  1.07x
+
+-- 5. ARRANQUE A FRIO · reabrir o log ---------------------------
+    Log::open sobre 1061696 registos: 5.36s  (head recuperado = 1061696)
+    E o tempo de indisponibilidade num restart do servico.
+    primeira leitura depois de reabrir: 202.80µs
+
+-- 6. ESCRITA · segmento 256 MiB (o DEFAULT de producao) --------
+    Lenta por desenho: e o problema a ser demonstrado no volume
+    alvo, em vez de extrapolado da curva de 200k.
+    debito por janela de 100000: 1908 675 408 304 226 384 944 489 305 258
+    256 MiB: 399 app/s no total (2504.1s); 1a janela 1908 -> ultima 258 = 7.4x
+
+=== VEREDICTO ===
+
+  escrita · segmento   8 MiB (recomendado):     12798 app/s
+  escrita · segmento 256 MiB (default)    :       399 app/s
+  ganho da recomendacao no volume alvo    : 32.0x
+
+  leitura pontual sem escrita : p50 68.50µs
+  leitura pontual sob escrita : p50 73.20µs · p99 451.70µs
+
