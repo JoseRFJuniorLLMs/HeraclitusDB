@@ -1,4 +1,4 @@
-# Aplica ao servico HeraclitusDB o binario novo (/live/events + CORS) e a
+﻿# Aplica ao servico HeraclitusDB o binario novo (/live/events + CORS) e a
 # variavel de ambiente que autoriza o painel forense.
 #
 # PRECISA DE ELEVACAO: escrever variaveis de maquina e parar/arrancar um
@@ -86,8 +86,23 @@ if ($null -ne $verify.sealed) {
   Write-Host '  /verify ainda sem o campo `sealed` — binario antigo?' -ForegroundColor Yellow
 }
 
-$live = (Invoke-WebRequest 'http://127.0.0.1:7475/live/events' -TimeoutSec 5 -UseBasicParsing).StatusCode
-"  /live/events: HTTP $live  (200 = ativo)"
+# Um fluxo SSE NUNCA termina, por desenho. O `Invoke-WebRequest` espera pelo
+# corpo completo e ficava pendurado para sempre — o script parecia falhar
+# quando na verdade ja tinha feito tudo. Le-se so o cabecalho da resposta e
+# aborta-se de imediato: o que interessa aqui e o codigo de estado.
+try {
+  $req = [Net.HttpWebRequest]::Create('http://127.0.0.1:7475/live/events')
+  $req.Timeout = 5000
+  $resp = $req.GetResponse()
+  "  /live/events: HTTP $([int]$resp.StatusCode)  (200 = ativo)"
+  $resp.Close()   # fecha sem drenar o fluxo
+} catch [Net.WebException] {
+  if ($_.Exception.Response) {
+    "  /live/events: HTTP $([int]$_.Exception.Response.StatusCode)  (404 = binario antigo)"
+  } else {
+    Write-Host "  /live/events: sem resposta — $($_.Exception.Message)" -ForegroundColor Yellow
+  }
+}
 
 $cors = (Invoke-WebRequest 'http://127.0.0.1:7475/stats' -Headers @{Origin='http://localhost:9337'} -TimeoutSec 8 -UseBasicParsing).Headers['Access-Control-Allow-Origin']
 if ($cors) { "  CORS: $cors" } else { Write-Host '  CORS ausente — a variavel so e lida no ARRANQUE do servico; reiniciar de novo.' -ForegroundColor Yellow }
