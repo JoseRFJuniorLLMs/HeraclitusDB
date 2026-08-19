@@ -852,6 +852,72 @@ impl Engine {
         })
     }
 
+    /// Caracteristicas de UMA fonte: que tipos de evento produz, que campos
+    /// preenche, e sob que principal autenticado escreve.
+    ///
+    /// Num SOC a pergunta nao e so "quem escreve" — e "o que e que esta fonte
+    /// mete no log". Um agente que sempre mandou `Observation` e comeca a
+    /// mandar outra coisa, ou que passa a preencher um campo novo, mudou de
+    /// comportamento; e isso e a materia-prima de uma deteccao.
+    ///
+    /// Le eventos, portanto tem tecto (`amostra_max`). Com o tecto atingido, o
+    /// resultado diz `amostrado: true` — uma distribuicao calculada sobre parte
+    /// dos dados nao pode ser apresentada como se fosse sobre todos.
+    pub fn fonte_detalhe(&self, agente: &str, amostra_max: usize) -> serde_json::Value {
+        let lsns: Vec<Lsn> = self.attr.lock().unwrap().lookup("_agent", agente).to_vec();
+        let total = lsns.len();
+        // Amostra pelas pontas: os mais RECENTES importam mais para saber o que
+        // a fonte faz agora, mas os primeiros mostram como comecou.
+        let lidos: Vec<Lsn> = if total <= amostra_max {
+            lsns.clone()
+        } else {
+            let metade = amostra_max / 2;
+            lsns.iter().take(metade).chain(lsns.iter().rev().take(amostra_max - metade)).copied().collect()
+        };
+
+        let mut tipos: std::collections::BTreeMap<String, u64> = Default::default();
+        let mut campos: std::collections::BTreeMap<String, u64> = Default::default();
+        let mut principais: std::collections::BTreeMap<String, u64> = Default::default();
+        let mut sessoes: std::collections::BTreeSet<String> = Default::default();
+        let (mut bytes, mut n) = (0u64, 0u64);
+
+        for lsn in lidos {
+            if let Ok(Some((_, ep))) = self.log.read(lsn) {
+                n += 1;
+                bytes += ep.content.len() as u64;
+                let k = match &ep.kind {
+                    heraclitus_core::EventKind::Custom(s) => s.clone(),
+                    outro => format!("{outro:?}"),
+                };
+                *tipos.entry(k).or_insert(0) += 1;
+                for campo in ep.attrs.keys() {
+                    *campos.entry(campo.clone()).or_insert(0) += 1;
+                }
+                if let Some(p) = ep.attrs.get("__heraclitus_authenticated_principal") {
+                    *principais.entry(p.clone()).or_insert(0) += 1;
+                }
+                if !ep.session_id.is_empty() {
+                    sessoes.insert(ep.session_id.clone());
+                }
+            }
+        }
+
+        serde_json::json!({
+            "agente": agente,
+            "eventos": total,
+            "amostrado": total > amostra_max,
+            "amostra": n,
+            "tipos": tipos,
+            "campos": campos,
+            // Quem escreveu, do ponto de vista da AUTENTICACAO — distinto do
+            // `agent_id`, que e a quem os dados dizem respeito. Uma fonte que
+            // muda de principal e uma mudanca de quem tem a credencial.
+            "principais": principais,
+            "sessoes": sessoes.len(),
+            "bytes_medios": if n > 0 { bytes / n } else { 0 },
+        })
+    }
+
     /// Campos indexados e a cardinalidade de cada um.
     ///
     /// Responde "que categorias de dados estao a ser tratadas?" a partir do que

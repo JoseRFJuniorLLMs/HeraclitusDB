@@ -79,6 +79,7 @@ pub fn router(
         .route("/live/events", get(live_events))
         // LGPD art. 18: pegada do titular, acessos aos dados dele, e eliminacao.
         .route("/fontes", get(fontes))
+        .route("/fontes/:id", get(fonte_detalhe))
         .route("/atributos", get(atributos))
         .route("/titular/:id", get(titular))
         .route("/titular/:id/acessos", get(titular_acessos))
@@ -307,6 +308,17 @@ fn rotulo_kind(k: &heraclitus_core::EventKind) -> String {
 /// `GET /fontes` — quem escreve neste log, quanto, e desde/ate quando.
 async fn fontes(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
     Json(engine.fontes())
+}
+
+/// `GET /fontes/:id` — características de uma fonte: tipos, campos, principais.
+async fn fonte_detalhe(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let out = tokio::task::spawn_blocking(move || engine.fonte_detalhe(&id, 2_000))
+        .await
+        .unwrap_or_else(|e| serde_json::json!({ "error": format!("join: {e}") }));
+    Json(out)
 }
 
 /// `GET /atributos` — campos indexados e cardinalidade (matéria-prima do ROPA).
