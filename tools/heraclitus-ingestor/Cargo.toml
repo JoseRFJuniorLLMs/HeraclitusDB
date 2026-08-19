@@ -14,6 +14,10 @@ path = "src/main.rs"
 name = "edge-builder"
 path = "src/bin/edge_builder.rs"
 
+[[bin]]
+name = "carga_real_10k"
+path = "src/bin/carga_real_10k.rs"
+
 [dependencies]
 heraclitus-client  = { workspace = true }
 tokio              = { workspace = true }
@@ -24,3 +28,7 @@ tracing-subscriber = { workspace = true }
 anyhow             = { workspace = true }
 csv                = { workspace = true }
 encoding_rs        = { workspace = true }
+
+[[bin]]
+name = "probe_grpc"
+path = "src/bin/probe_grpc.rs"

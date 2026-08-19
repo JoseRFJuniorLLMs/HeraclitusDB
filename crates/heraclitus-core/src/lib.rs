@@ -21,7 +21,6 @@ pub mod hlc;
 pub mod id;
 pub mod ir;
 pub mod numa;
-pub mod plugin;
 pub mod runtime;
 pub mod sandbox;
 pub mod streaming;

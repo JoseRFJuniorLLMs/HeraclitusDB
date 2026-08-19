@@ -51,6 +51,49 @@ struct Cli {
     /// Apenas simula — não envia eventos
     #[arg(long)]
     dry_run: bool,
+
+    /// Bearer token RBAC. Sem isto, um servidor com `auth_token` ou
+    /// `access_credentials` configurados recusa TODOS os appends com
+    /// "missing or invalid bearer token" — e a carga morre no primeiro evento.
+    /// Aceita também o caminho de um ficheiro (`--token-file`), que é o formato
+    /// em que `heraclitus init-credentials` os grava.
+    #[arg(long)]
+    token: Option<String>,
+
+    /// Ficheiro com o token (ex.: `secrets-v1/writer.token`). Preferível a
+    /// `--token`: não deixa o segredo na linha de comandos nem no histórico.
+    #[arg(long)]
+    token_file: Option<PathBuf>,
+
+    /// RETOMA: salta as pastas que ordenam ANTES desta e começa nela.
+    ///
+    /// Uma carga de 8,87M linhas leva horas e não é atómica. Sem isto, uma
+    /// interrupção a 90% obrigava a recarregar tudo — e como o log é
+    /// append-only, "recarregar" significa **duplicar** o que já lá estava.
+    /// As pastas são processadas por ordem alfabética (`subdirs.sort()`), por
+    /// isso o nome da pasta onde parou é um ponto de retoma suficiente.
+    ///
+    /// A pasta indicada é RE-processada por inteiro: se a interrupção
+    /// aconteceu a meio dela, essa pasta — e só essa — fica com duplicados.
+    #[arg(long)]
+    desde: Option<String>,
+}
+
+/// Resolve o token a partir de `--token-file` (preferido) ou `--token`.
+fn resolver_token(
+    token: Option<String>,
+    token_file: Option<PathBuf>,
+) -> anyhow::Result<Option<String>> {
+    if let Some(p) = token_file {
+        let bruto = std::fs::read_to_string(&p)
+            .map_err(|e| anyhow::anyhow!("nao foi possivel ler {}: {e}", p.display()))?;
+        let t = bruto.trim().to_string();
+        if t.is_empty() {
+            anyhow::bail!("ficheiro de token vazio: {}", p.display());
+        }
+        return Ok(Some(t));
+    }
+    Ok(token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()))
 }
 
 #[tokio::main]
@@ -74,13 +117,21 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Conectar ao servidor
+    let token = resolver_token(cli.token.clone(), cli.token_file.clone())?;
+    if token.is_some() {
+        info!("  Auth      : bearer token fornecido");
+    }
     let mut client = if !cli.dry_run {
         info!("Conectando ao HeraclitusDB...");
-        Some(
-            heraclitus_client::Client::connect(cli.server.clone())
-                .await
-                .map_err(|e| anyhow::anyhow!("Falha ao conectar em {}: {e}", cli.server))?,
-        )
+        let c = heraclitus_client::Client::connect(cli.server.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("Falha ao conectar em {}: {e}", cli.server))?;
+        Some(match &token {
+            Some(t) => c
+                .with_bearer_token(t)
+                .map_err(|e| anyhow::anyhow!("token invalido para cabecalho HTTP: {e}"))?,
+            None => c,
+        })
     } else {
         None
     };
@@ -99,6 +150,26 @@ async fn main() -> anyhow::Result<()> {
         .map(|e| e.path())
         .collect();
     subdirs.sort();
+
+    if let Some(inicio) = &cli.desde {
+        let antes = subdirs.len();
+        subdirs.retain(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().as_ref() >= inicio.as_str())
+                .unwrap_or(false)
+        });
+        if subdirs.is_empty() {
+            anyhow::bail!(
+                "--desde '{inicio}' nao deixou nenhuma pasta para processar \
+                 (nome errado? as pastas sao processadas por ordem alfabetica)"
+            );
+        }
+        warn!(
+            "  RETOMA   : {} pastas saltadas, a comecar em '{}'",
+            antes - subdirs.len(),
+            inicio
+        );
+    }
 
     for subdir in &subdirs {
         let nome = subdir

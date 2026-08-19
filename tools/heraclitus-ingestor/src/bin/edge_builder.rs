@@ -57,6 +57,14 @@ struct Cli {
     /// Limite de eventos por kind (0 = sem limite — útil para testes)
     #[arg(long, default_value_t = 0)]
     limit: usize,
+
+    /// Bearer token RBAC (ver `--token-file`, preferível).
+    #[arg(long)]
+    token: Option<String>,
+
+    /// Ficheiro com o token (ex.: `secrets-v1/writer.token`).
+    #[arg(long)]
+    token_file: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -76,13 +84,36 @@ async fn main() -> anyhow::Result<()> {
         warn!("  MODO DRY-RUN — nenhuma aresta será gravada");
     }
 
+    // Mesmo problema do ingestor: sem bearer token, um servidor com RBAC
+    // recusa a primeira query e o edge-builder morre antes de ler um nó.
+    let token = match &cli.token_file {
+        Some(p) => {
+            let t = std::fs::read_to_string(p)
+                .map_err(|e| anyhow::anyhow!("nao foi possivel ler {}: {e}", p.display()))?
+                .trim()
+                .to_string();
+            if t.is_empty() {
+                anyhow::bail!("ficheiro de token vazio: {}", p.display());
+            }
+            Some(t)
+        }
+        None => cli
+            .token
+            .clone()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty()),
+    };
     let mut client = if !cli.dry_run {
         info!("Conectando ao HeraclitusDB...");
-        Some(
-            Client::connect(cli.server.clone())
-                .await
-                .map_err(|e| anyhow::anyhow!("Falha ao conectar: {e}"))?,
-        )
+        let c = Client::connect(cli.server.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("Falha ao conectar: {e}"))?;
+        Some(match &token {
+            Some(t) => c
+                .with_bearer_token(t)
+                .map_err(|e| anyhow::anyhow!("token invalido para cabecalho HTTP: {e}"))?,
+            None => c,
+        })
     } else {
         None
     };
@@ -144,7 +175,26 @@ async fn main() -> anyhow::Result<()> {
             kinds.len()
         );
         for k in kinds {
-            let rows = coletar_kind(c, k, head).await?;
+            let mut rows = coletar_kind(c, k, head).await?;
+            // `--limit` estava DECLARADA e nunca lida: prometia uma válvula de
+            // segurança para testes que não existia. Importa porque o cache
+            // guarda TODOS os nós de TODOS os kinds em RAM ao mesmo tempo, como
+            // `serde_json::Value` — a ~500-1000 B por nó, os 21 kinds das
+            // regras num log de 10M pedem vários GB, e sem teto o processo
+            // morre a meio em vez de dar um resultado parcial útil.
+            if cli.limit > 0 {
+                if let Some(a) = rows.as_array_mut() {
+                    if a.len() > cli.limit {
+                        warn!(
+                            "   '{k}': {} nós truncados para {} por --limit — as arestas \
+                             deste kind ficam INCOMPLETAS",
+                            a.len(),
+                            cli.limit
+                        );
+                        a.truncate(cli.limit);
+                    }
+                }
+            }
             cache.insert(k.to_string(), rows);
         }
     }
