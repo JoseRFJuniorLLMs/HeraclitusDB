@@ -104,6 +104,26 @@ try {
   }
 }
 
+# Os endpoints novos, um a um. Um 404 aqui significa exatamente uma coisa —
+# o binario que ficou em producao e mais antigo do que o codigo — e dizer QUAL
+# faltou poupa a proxima meia hora de procurar no sitio errado.
+$novos = @(
+  @{ rota = '/replay';    para = 'prova de reconstrucao determinista (Painel do Auditor)' }
+  @{ rota = '/diff';      para = 'comparar dois momentos (AS OF <-> AS OF)' }
+  @{ rota = '/fontes';    para = 'de onde vem cada log' }
+  @{ rota = '/atributos'; para = 'mapa de dados pessoais (LGPD art. 37)' }
+)
+foreach ($n in $novos) {
+  try {
+    $null = Invoke-RestMethod ('http://127.0.0.1:7475' + $n.rota) -TimeoutSec 30
+    "  {0,-11} ok   {1}" -f $n.rota, $n.para
+  } catch {
+    $codigo = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
+    $dica = if ($codigo -eq 404) { 'binario antigo' } else { "HTTP $codigo" }
+    Write-Host ("  {0,-11} FALTA ({1})  {2}" -f $n.rota, $dica, $n.para) -ForegroundColor Yellow
+  }
+}
+
 $cors = (Invoke-WebRequest 'http://127.0.0.1:7475/stats' -Headers @{Origin='http://localhost:9337'} -TimeoutSec 8 -UseBasicParsing).Headers['Access-Control-Allow-Origin']
 if ($cors) { "  CORS: $cors" } else { Write-Host '  CORS ausente — a variavel so e lida no ARRANQUE do servico; reiniciar de novo.' -ForegroundColor Yellow }
 
