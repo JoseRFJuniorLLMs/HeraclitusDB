@@ -21,6 +21,48 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::path::Path;
 
+/// Uma linha do diff, ao nivel do CAMPO. Ver [`AttrIndex::diff`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffCampo {
+    pub campo: String,
+    /// Postings deste campo dentro de `[de, ate)`.
+    pub eventos: usize,
+    /// Postings na janela ANTERIOR de igual duracao — o termo de comparacao.
+    pub eventos_anterior: usize,
+    /// Valores cujo PRIMEIRO posting cai na janela — nunca antes vistos.
+    pub valores_novos: usize,
+    /// Valores com pelo menos um posting na janela.
+    pub valores_ativos: usize,
+    /// Valores que produziram eventos na janela anterior e ZERO nesta.
+    pub valores_silenciosos: usize,
+    /// Valores distintos indexados sob este campo, sem limite temporal.
+    pub valores_total: usize,
+    /// Postings totais do campo em todo o log — junto com `valores_total` diz
+    /// se o campo e QUASE-UNICO (um valor distinto por evento, como um
+    /// timestamp ou um uuid). Num campo desses "valor novo" nao e sinal
+    /// nenhum: todos os valores sao novos por construcao. Quem apresenta
+    /// precisa de saber isto para nao somar ruido a uma manchete.
+    pub postings_total: usize,
+    pub topo: Vec<DiffValor>,
+}
+
+/// Um valor concreto dentro de um [`DiffCampo`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffValor {
+    pub valor: String,
+    /// Postings dentro da janela.
+    pub eventos: usize,
+    /// Postings na janela anterior de igual duracao — o termo de comparacao
+    /// que torna "calou-se" e "disparou" afirmacoes com significado.
+    pub anterior: usize,
+    /// Postings em TODO o passado antes de `de` — distingue "novo" de "ja ca
+    /// estava" mesmo quando a janela anterior esta vazia.
+    pub antes: usize,
+    pub novo: bool,
+    /// Estava ativo na janela anterior e emudeceu nesta.
+    pub silencioso: bool,
+}
+
 const BINCODE_CFG: bincode::config::Configuration = bincode::config::standard();
 const SNAPSHOT_FILE: &str = "attr_index.bin";
 /// Separador entre campo e valor na chave do índice (US, nunca aparece em dados).
@@ -337,6 +379,112 @@ impl AttrIndex {
             .count()
     }
 
+    /// Diff entre dois instantes do log: `[de, ate)`.
+    ///
+    /// Num log append-only nada desaparece — por isso um diff aqui NAO e "o que
+    /// foi apagado". E outra coisa, e mais util a quem investiga: **o que
+    /// apareceu que nunca antes existira**, e **o que existia e calou-se**.
+    ///
+    /// - `novo` — o primeiro posting deste valor cai dentro da janela. Um IP,
+    ///   um utilizador ou um comando que o sistema nunca tinha visto.
+    /// - `silencioso` — tinha postings ANTES de `de` e nenhum na janela. Numa
+    ///   plataforma forense isto pesa tanto como o resto: uma fonte que se cala
+    ///   pode ser o atacante a desligar o registo.
+    ///
+    /// Custo: uma passagem pelas chaves do indice e duas buscas binarias por
+    /// chave (os postings estao ordenados por invariante do `apply`). Nao le o
+    /// log — trabalha so sobre o indice.
+    pub fn diff(&self, de: Lsn, ate: Lsn, topo: usize) -> Vec<DiffCampo> {
+        // A janela ANTERIOR e o termo de comparacao. Sem ela, "calou-se" seria
+        // "nao apareceu nesta janela", que num log com historia e verdade sobre
+        // quase tudo — um numero grande, alarmante e sem informacao nenhuma.
+        // Medido: numa janela de 24 h sobre este log, 527 dos 561 valores
+        // "calaram-se" por essa definicao. Comparando com a janela anterior de
+        // igual duracao, os que de facto pararam sao os que interessam.
+        let largura = ate.saturating_sub(de);
+        let ant = de.saturating_sub(largura);
+        let mut por_campo: BTreeMap<String, DiffCampo> = BTreeMap::new();
+
+        for (k, lsns) in self.inner.exact.iter() {
+            let Some((campo, valor)) = k.split_once(SEP) else { continue };
+            // `partition_point` num vetor ordenado: quantos LSN sao < bound.
+            let ate_i = lsns.partition_point(|l| *l < ate);
+            let de_i = lsns.partition_point(|l| *l < de);
+            let ant_i = lsns.partition_point(|l| *l < ant);
+            let na_janela = ate_i.saturating_sub(de_i);
+            let na_anterior = de_i.saturating_sub(ant_i);
+
+            let e = por_campo.entry(campo.to_string()).or_insert_with(|| DiffCampo {
+                campo: campo.to_string(),
+                eventos: 0,
+                eventos_anterior: 0,
+                valores_novos: 0,
+                valores_ativos: 0,
+                valores_silenciosos: 0,
+                valores_total: 0,
+                postings_total: 0,
+                topo: Vec::new(),
+            });
+            e.valores_total += 1;
+            e.postings_total += lsns.len();
+
+            // Um valor cujo primeiro posting so aparece DEPOIS da janela ainda
+            // nao existia no instante `ate` — nao pertence a este diff.
+            if lsns.first().is_none_or(|f| *f >= ate) {
+                continue;
+            }
+
+            let novo = de_i == 0 && na_janela > 0;
+            let silencioso = na_janela == 0 && na_anterior > 0;
+            e.eventos += na_janela;
+            e.eventos_anterior += na_anterior;
+            if na_janela > 0 {
+                e.valores_ativos += 1;
+                if novo {
+                    e.valores_novos += 1;
+                }
+            }
+            if silencioso {
+                e.valores_silenciosos += 1;
+            }
+
+            // Um valor sem atividade nem numa janela nem na outra nao tem nada
+            // a dizer sobre este intervalo — nao entra no topo.
+            if na_janela > 0 || na_anterior > 0 {
+                e.topo.push(DiffValor {
+                    valor: valor.to_string(),
+                    eventos: na_janela,
+                    anterior: na_anterior,
+                    antes: de_i,
+                    novo,
+                    silencioso,
+                });
+            }
+        }
+
+        let mut out: Vec<DiffCampo> = por_campo.into_values().collect();
+        for c in out.iter_mut() {
+            // Ordem por relevancia forense: primeiro o que nunca existiu, depois
+            // o que emudeceu, e so entao o volume. Alfabetico como desempate
+            // para o resultado ser estavel entre chamadas.
+            c.topo.sort_by(|a, b| {
+                b.novo
+                    .cmp(&a.novo)
+                    .then_with(|| b.silencioso.cmp(&a.silencioso))
+                    .then_with(|| b.eventos.max(b.anterior).cmp(&a.eventos.max(a.anterior)))
+                    .then_with(|| a.valor.cmp(&b.valor))
+            });
+            c.topo.truncate(topo);
+        }
+        out.sort_by(|a, b| {
+            b.eventos
+                .max(b.eventos_anterior)
+                .cmp(&a.eventos.max(a.eventos_anterior))
+                .then_with(|| a.campo.cmp(&b.campo))
+        });
+        out
+    }
+
     pub fn is_empty(&self) -> bool {
         self.inner.exact.is_empty()
     }
@@ -467,6 +615,100 @@ mod tests {
         e.attrs.insert("cnpj".into(), cnpj.into());
         e.attrs.insert("nome".into(), nome.into());
         e
+    }
+
+    /// Um evento de UMA fonte, para as janelas do `diff` terem valores
+    /// distinguiveis sem depender do `ep()` acima (que fixa cnpj/nome).
+    fn ev(fonte: &str) -> Episode {
+        let mut e = Episode::new("etl", EventKind::Observation, b"x".to_vec());
+        e.attrs.insert("fonte".into(), fonte.into());
+        e
+    }
+
+    /// O que um diff num log append-only pode e nao pode afirmar.
+    ///
+    /// Este e o teste que impede a regressao que ja aconteceu uma vez: com
+    /// "calou-se" definido como "nao apareceu nesta janela", 527 dos 561
+    /// valores deste log apareciam como calados — um numero alarmante e sem
+    /// informacao. O criterio tem de ser contra a JANELA ANTERIOR.
+    #[test]
+    fn diff_compara_com_a_janela_anterior_nao_com_todo_o_passado() {
+        let mut idx = AttrIndex::new();
+        // Janela anterior [0,4): A tres vezes, B uma vez.
+        idx.apply(0, &ev("A"));
+        idx.apply(1, &ev("A"));
+        idx.apply(2, &ev("A"));
+        idx.apply(3, &ev("B"));
+        // Janela [4,8): A continua (mais devagar), B cala-se, C nasce.
+        idx.apply(4, &ev("A"));
+        idx.apply(5, &ev("C"));
+        idx.apply(6, &ev("C"));
+        idx.apply(7, &ev("C"));
+
+        let d = idx.diff(4, 8, 10);
+        let f = d.iter().find(|c| c.campo == "fonte").expect("campo fonte");
+
+        assert_eq!(f.eventos, 4, "quatro eventos na janela");
+        assert_eq!(f.eventos_anterior, 4, "quatro na janela anterior");
+        assert_eq!(f.valores_total, 3, "A, B, C");
+        assert_eq!(f.postings_total, 8);
+
+        let v = |n: &str| f.topo.iter().find(|x| x.valor == n).unwrap();
+
+        // C nunca existira antes: e a unica coisa NOVA.
+        assert!(v("C").novo, "C aparece pela primeira vez na janela");
+        assert_eq!(f.valores_novos, 1);
+        assert!(!v("A").novo, "A ja ca estava");
+
+        // B estava ativo e parou. A NAO parou — abrandou.
+        assert!(v("B").silencioso, "B estava ativo antes e emudeceu");
+        assert!(!v("A").silencioso, "A abrandou, nao parou");
+        assert_eq!(f.valores_silenciosos, 1);
+
+        // O termo de comparacao por valor e a janela anterior, nao o passado
+        // todo — e o que permite dizer "-67%" em vez de "existiu".
+        assert_eq!(v("A").eventos, 1);
+        assert_eq!(v("A").anterior, 3);
+    }
+
+    /// Sem janela anterior (de = 0) nada se pode ter calado: nao havia periodo
+    /// antes onde algo pudesse estar a falar. O contrario — marcar tudo o que
+    /// so aparece mais tarde como "silencioso" — seria uma afirmacao inventada.
+    #[test]
+    fn diff_desde_o_inicio_nao_inventa_silencio() {
+        let mut idx = AttrIndex::new();
+        idx.apply(0, &ev("A"));
+        idx.apply(1, &ev("B"));
+
+        let d = idx.diff(0, 2, 10);
+        let f = d.iter().find(|c| c.campo == "fonte").unwrap();
+        assert_eq!(f.eventos_anterior, 0);
+        assert_eq!(f.valores_silenciosos, 0, "sem janela anterior nao ha silencio");
+        assert_eq!(f.valores_novos, 2, "tudo e novo quando se comeca do zero");
+    }
+
+    /// Um valor que so nasce DEPOIS do fim da janela nao pertence ao diff — no
+    /// instante `ate` ele ainda nao existia. Confundir isto faria o painel
+    /// mostrar o futuro dentro de uma consulta ao passado, que e exatamente o
+    /// que um AS OF tem de impedir.
+    #[test]
+    fn diff_ignora_o_que_so_nasce_depois_da_janela() {
+        let mut idx = AttrIndex::new();
+        idx.apply(0, &ev("A"));
+        idx.apply(1, &ev("A"));
+        idx.apply(2, &ev("FUTURO"));
+
+        let d = idx.diff(0, 2, 10);
+        let f = d.iter().find(|c| c.campo == "fonte").unwrap();
+        assert!(
+            !f.topo.iter().any(|v| v.valor == "FUTURO"),
+            "um valor posterior a `ate` nao pode aparecer num AS OF anterior"
+        );
+        assert_eq!(f.valores_novos, 1, "so A");
+        // `valores_total` e deliberadamente SEM limite temporal (cardinalidade
+        // do campo hoje), por isso conta os dois — e a unica grandeza aqui que
+        // olha para alem de `ate`.
+        assert_eq!(f.valores_total, 2);
     }
 
     #[test]

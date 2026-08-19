@@ -965,7 +965,7 @@ impl Engine {
             // muda de principal e uma mudanca de quem tem a credencial.
             "principais": principais,
             "sessoes": sessoes.len(),
-            "bytes_medios": if n > 0 { bytes / n } else { 0 },
+            "bytes_medios": bytes.checked_div(n).unwrap_or(0),
         })
     }
 
@@ -989,6 +989,86 @@ impl Engine {
             })
             .collect();
         serde_json::json!({ "campos": lista })
+    }
+
+    /// O ultimo LSN escrito (exclusivo: o proximo append usa este valor).
+    pub fn head(&self) -> Lsn {
+        self.log.head()
+    }
+
+    /// O carimbo de ingestao (ms epoch) do evento em `lsn`, se legivel.
+    pub fn ts_ms(&self, lsn: Lsn) -> Option<u64> {
+        match self.log.read(lsn) {
+            Ok(Some((_, ep))) => Some(ep.ts_hlc >> 16),
+            _ => None,
+        }
+    }
+
+    /// O LSN a partir do qual os eventos foram registados em/depois de `ms`.
+    ///
+    /// O `ts_hlc` e carimbado pelo `Log::append`, e o HLC e monotono — logo a
+    /// ordem dos LSN E a ordem do tempo de INGESTAO, e uma busca binaria sobre
+    /// o log resolve isto em O(log n) leituras em vez de um varrimento.
+    ///
+    /// Atencao ao que isto significa: o tempo aqui e quando o registo ENTROU,
+    /// nao quando o facto aconteceu no mundo. Um lote importado ontem de logs
+    /// da semana passada aparece com o carimbo de ontem.
+    pub fn lsn_em(&self, ms: u64) -> Lsn {
+        let (mut lo, mut hi) = (0u64, self.log.head());
+        while lo < hi {
+            let meio = lo + (hi - lo) / 2;
+            match self.log.read(meio) {
+                Ok(Some((_, ep))) if (ep.ts_hlc >> 16) < ms => lo = meio + 1,
+                // Buraco no log (LSN sem registo legivel): trata-se como
+                // "ainda nao chegou a `ms`" para a busca continuar em vez de
+                // parar num ponto arbitrario.
+                Ok(None) | Err(_) => lo = meio + 1,
+                _ => hi = meio,
+            }
+        }
+        lo
+    }
+
+    /// Diff entre dois instantes do log: o que existe em `ate` que nao existia
+    /// em `de`, campo a campo.
+    ///
+    /// Num log append-only nada e apagado, por isso um diff **nao pode** mostrar
+    /// remocoes. Mostra as duas coisas que um investigador de facto procura:
+    ///
+    ///  - **apareceu** — um valor cujo primeiro registo cai dentro da janela.
+    ///    Um IP, um utilizador, um comando que o sistema nunca tinha visto.
+    ///  - **calou-se** — um valor que existia antes e nao produziu nada na
+    ///    janela. Numa plataforma forense isto pesa tanto como o resto: uma
+    ///    fonte que emudece pode ser o atacante a desligar o registo.
+    ///
+    /// Sai todo do indice de atributos — nao le o log, tirando as duas leituras
+    /// para carimbar as pontas da janela.
+    pub fn diff(&self, de: Lsn, ate: Lsn, topo: usize) -> serde_json::Value {
+        let head = self.log.head();
+        let ate = ate.min(head);
+        let de = de.min(ate);
+
+        let campos = self.attr.lock().unwrap().diff(de, ate, topo);
+        let ms = |lsn: Lsn| self.ts_ms(lsn);
+
+        serde_json::json!({
+            "de": de,
+            "ate": ate,
+            "head": head,
+            "eventos": ate.saturating_sub(de),
+            "de_ms": ms(de),
+            // `ate` e exclusivo: o ultimo evento DENTRO da janela e `ate - 1`.
+            "ate_ms": if ate > de { ms(ate - 1) } else { None },
+            // A janela ANTERIOR de igual duracao e o termo de comparacao de
+            // "calou-se" e de "disparou". Vai no JSON para o painel poder
+            // dizer contra o que compara, em vez de o subentender.
+            "anterior_de": de.saturating_sub(ate.saturating_sub(de)),
+            "anterior_ate": de,
+            "campos": campos,
+            "nota": "Janela [de, ate), comparada com a janela anterior de igual \
+                     duracao. O tempo e o de INGESTAO (carimbo do append), nao o \
+                     momento em que o facto ocorreu no mundo.",
+        })
     }
 
     /// Pegada de um titular no log: quantos eventos, de que tipos, desde

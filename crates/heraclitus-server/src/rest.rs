@@ -82,6 +82,7 @@ pub fn router(
         .route("/fontes", get(fontes))
         .route("/fontes/:id", get(fonte_detalhe))
         .route("/atributos", get(atributos))
+        .route("/diff", get(diff))
         .route("/titular/:id", get(titular))
         .route("/titular/:id/acessos", get(titular_acessos))
         .route("/titular/:id/eliminar", axum::routing::post(titular_eliminar))
@@ -343,6 +344,44 @@ async fn fonte_detalhe(
 /// `GET /atributos` — campos indexados e cardinalidade (matéria-prima do ROPA).
 async fn atributos(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
     Json(engine.atributos())
+}
+
+/// `GET /diff?de=&ate=` — o que mudou entre dois instantes do log.
+///
+/// As pontas aceitam-se em LSN (`de`/`ate`) ou em milissegundos epoch
+/// (`de_ms`/`ate_ms`), que sao convertidos por busca binaria sobre o log. A
+/// forma por tempo e a que uma pessoa usa; a forma por LSN e a que um auditor
+/// cita, porque nao depende de relogios.
+///
+/// Sem qualquer parametro, a janela e a ultima hora.
+async fn diff(
+    State(engine): State<Arc<Engine>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let num = |k: &str| q.get(k).and_then(|v| v.parse::<u64>().ok());
+    let (de_ms, ate_ms, de_lsn, ate_lsn) =
+        (num("de_ms"), num("ate_ms"), num("de"), num("ate"));
+    let topo = num("topo").unwrap_or(12).clamp(1, 200) as usize;
+
+    let out = tokio::task::spawn_blocking(move || {
+        let head = engine.head();
+        let ate = ate_lsn
+            .or_else(|| ate_ms.map(|m| engine.lsn_em(m)))
+            .unwrap_or(head);
+        let de = de_lsn.or_else(|| de_ms.map(|m| engine.lsn_em(m))).unwrap_or_else(|| {
+            // Sem janela pedida: a ultima hora de INGESTAO. Cair para "desde o
+            // inicio" seria pior — num log grande devolve tudo como "novo" e da
+            // a impressao de que tudo apareceu agora.
+            match engine.ts_ms(ate.saturating_sub(1)) {
+                Some(ms) => engine.lsn_em(ms.saturating_sub(3_600_000)),
+                None => 0,
+            }
+        });
+        engine.diff(de, ate, topo)
+    })
+    .await
+    .unwrap_or_else(|e| serde_json::json!({ "error": format!("join: {e}") }));
+    Json(out)
 }
 
 /// `GET /titular/:id` — pegada de um titular (LGPD art. 18, I e II).
