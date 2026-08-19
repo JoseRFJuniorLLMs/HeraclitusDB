@@ -801,6 +801,57 @@ impl Engine {
         Ok(out)
     }
 
+    /// Prova de reconstrucao determinista.
+    ///
+    /// A afirmacao mais forte deste sistema perante um auditor nao e "o painel
+    /// mostrou isto naquele dia" — e **"consigo reconstruir o estado que levou
+    /// a esta conclusao"**. O contrato ja existe e e testado (`state_hash`
+    /// identico entre replays), mas nunca esteve visivel.
+    ///
+    /// Com `executar = false` devolve so os hashes atuais: barato, nao mexe em
+    /// nada, e permite a um auditor comparar com os de outra instancia ou de
+    /// outro momento.
+    ///
+    /// Com `executar = true` reconstroi as views a partir do LSN 0 e compara os
+    /// hashes antes/depois. Se baterem, o replay e determinista **agora, sobre
+    /// este log** — que e diferente de "os testes dizem que e". E caro e mexe
+    /// nas views vivas, por isso e a pedido explicito.
+    pub fn replay_prova(&self, executar: bool) -> serde_json::Value {
+        let hex = |b: [u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let antes = hex(self.graph_state_hash());
+        let head = self.log.head();
+
+        if !executar {
+            return serde_json::json!({
+                "executado": false,
+                "head": head,
+                "graph_state_hash": antes,
+                "nota": "Hashes do estado atual. Reconstruir e comparar exige `executar=true`.",
+            });
+        }
+
+        let t0 = std::time::Instant::now();
+        if let Err(e) = self.rebuild(None) {
+            return serde_json::json!({
+                "executado": true, "ok": false, "erro": e.to_string(),
+            });
+        }
+        let depois = hex(self.graph_state_hash());
+        serde_json::json!({
+            "executado": true,
+            "ok": antes == depois,
+            "head": head,
+            "hash_antes": antes,
+            "hash_depois": depois,
+            "segundos": t0.elapsed().as_secs_f64(),
+            "nota": if antes == depois {
+                "Estado reconstruido a partir do LSN 0 e IDENTICO ao anterior."
+            } else {
+                "DIVERGENCIA: a reconstrucao nao reproduziu o estado. Isto e um incidente."
+            },
+        })
+    }
+
     /// Fontes que escrevem neste log: quem, quanto, e desde/ate quando.
     ///
     /// Numa plataforma forense, **uma fonte que se cala e um incidente** — pode

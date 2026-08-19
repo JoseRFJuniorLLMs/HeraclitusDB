@@ -78,6 +78,7 @@ pub fn router(
         // confirmado num broadcast interno; faltava só quem o expusesse.
         .route("/live/events", get(live_events))
         // LGPD art. 18: pegada do titular, acessos aos dados dele, e eliminacao.
+        .route("/replay", get(replay))
         .route("/fontes", get(fontes))
         .route("/fontes/:id", get(fonte_detalhe))
         .route("/atributos", get(atributos))
@@ -303,6 +304,24 @@ fn rotulo_kind(k: &heraclitus_core::EventKind) -> String {
         heraclitus_core::EventKind::Custom(s) => s.clone(),
         outro => format!("{outro:?}"),
     }
+}
+
+/// `GET /replay[?executar=1]` — prova de reconstrução determinista.
+///
+/// Sem `executar`, devolve só os hashes atuais: barato, não toca em nada, e
+/// serve para comparar com outra instância ou outro momento.
+///
+/// Com `executar=1`, reconstrói as views a partir do LSN 0 e compara os hashes
+/// antes/depois. É caro e mexe nas views vivas — nunca acontece por omissão.
+async fn replay(
+    State(engine): State<Arc<Engine>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let executar = matches!(q.get("executar").map(|s| s.as_str()), Some("1") | Some("true"));
+    let out = tokio::task::spawn_blocking(move || engine.replay_prova(executar))
+        .await
+        .unwrap_or_else(|e| serde_json::json!({ "erro": format!("join: {e}") }));
+    Json(out)
 }
 
 /// `GET /fontes` — quem escreve neste log, quanto, e desde/ate quando.
