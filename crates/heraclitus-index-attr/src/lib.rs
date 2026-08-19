@@ -276,6 +276,51 @@ impl AttrIndex {
         self.inner.exact.len()
     }
 
+    /// Valores distintos indexados sob `field`, com quantos LSNs cada um.
+    ///
+    /// Com `field = "_agent"` responde "que fontes escrevem neste log, e
+    /// quanto" — sem varrer o log, so lendo o indice.
+    pub fn field_values(&self, field: &str) -> Vec<(String, usize)> {
+        let prefixo = ikey(field, "");
+        let mut v: Vec<(String, usize)> = self
+            .inner
+            .exact
+            .iter()
+            .filter_map(|(k, lsns)| {
+                k.strip_prefix(&prefixo).map(|val| (val.to_string(), lsns.len()))
+            })
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v
+    }
+
+    /// Primeiro e ultimo LSN indexados para `(field, value)`.
+    ///
+    /// Os postings estao em ordem crescente por invariante do `apply`, logo sao
+    /// as pontas — sem percorrer nada.
+    pub fn field_span(&self, field: &str, value: &str) -> Option<(Lsn, Lsn)> {
+        let l = self.lookup(field, value);
+        match (l.first(), l.last()) {
+            (Some(a), Some(b)) => Some((*a, *b)),
+            _ => None,
+        }
+    }
+
+    /// Campos indexados -> quantos valores distintos cada um tem.
+    ///
+    /// E o "que dados guardamos?" ao nivel do ESQUEMA, derivado do que esta
+    /// mesmo no log em vez de uma folha de calculo mantida a mao — a
+    /// materia-prima do registo de operacoes de tratamento (LGPD art. 37).
+    pub fn fields(&self) -> BTreeMap<String, usize> {
+        let mut m: BTreeMap<String, usize> = BTreeMap::new();
+        for k in self.inner.exact.keys() {
+            if let Some((campo, _)) = k.split_once(SEP) {
+                *m.entry(campo.to_string()).or_insert(0) += 1;
+            }
+        }
+        m
+    }
+
     /// Quantos valores distintos existem indexados sob `field`.
     ///
     /// Serve para distinguir "nao ha dados" de "este indice nao conhece este

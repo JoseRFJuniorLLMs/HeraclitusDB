@@ -78,6 +78,8 @@ pub fn router(
         // confirmado num broadcast interno; faltava só quem o expusesse.
         .route("/live/events", get(live_events))
         // LGPD art. 18: pegada do titular, acessos aos dados dele, e eliminacao.
+        .route("/fontes", get(fontes))
+        .route("/atributos", get(atributos))
         .route("/titular/:id", get(titular))
         .route("/titular/:id/acessos", get(titular_acessos))
         .route("/titular/:id/eliminar", axum::routing::post(titular_eliminar))
@@ -300,6 +302,16 @@ fn rotulo_kind(k: &heraclitus_core::EventKind) -> String {
         heraclitus_core::EventKind::Custom(s) => s.clone(),
         outro => format!("{outro:?}"),
     }
+}
+
+/// `GET /fontes` — quem escreve neste log, quanto, e desde/ate quando.
+async fn fontes(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
+    Json(engine.fontes())
+}
+
+/// `GET /atributos` — campos indexados e cardinalidade (matéria-prima do ROPA).
+async fn atributos(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
+    Json(engine.atributos())
 }
 
 /// `GET /titular/:id` — pegada de um titular (LGPD art. 18, I e II).

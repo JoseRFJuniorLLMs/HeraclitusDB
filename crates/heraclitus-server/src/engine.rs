@@ -801,6 +801,79 @@ impl Engine {
         Ok(out)
     }
 
+    /// Fontes que escrevem neste log: quem, quanto, e desde/ate quando.
+    ///
+    /// Numa plataforma forense, **uma fonte que se cala e um incidente** — pode
+    /// ser o atacante a desligar o log. Este endpoint da a materia-prima para
+    /// detetar isso: com o instante do ultimo evento de cada fonte, o painel
+    /// compara com o ritmo historico dela e assinala silencio.
+    ///
+    /// Sai do indice `_agent`, nao de um varrimento: duas leituras por fonte
+    /// (o primeiro e o ultimo LSN, que sao as pontas dos postings ordenados).
+    pub fn fontes(&self) -> serde_json::Value {
+        let vals = self.attr.lock().unwrap().field_values("_agent");
+        let mut fontes = Vec::with_capacity(vals.len());
+        let (mut global_min, mut global_max) = (u64::MAX, 0u64);
+
+        for (agente, eventos) in vals {
+            let span = self.attr.lock().unwrap().field_span("_agent", &agente);
+            let (mut primeiro_ms, mut ultimo_ms) = (None, None);
+            if let Some((a, b)) = span {
+                if let Ok(Some((_, ep))) = self.log.read(a) {
+                    let ms = ep.ts_hlc >> 16;
+                    primeiro_ms = Some(ms);
+                    global_min = global_min.min(ms);
+                }
+                if let Ok(Some((_, ep))) = self.log.read(b) {
+                    let ms = ep.ts_hlc >> 16;
+                    ultimo_ms = Some(ms);
+                    global_max = global_max.max(ms);
+                }
+            }
+            fontes.push(serde_json::json!({
+                "agente": agente,
+                "eventos": eventos,
+                "primeiro_ms": primeiro_ms,
+                "ultimo_ms": ultimo_ms,
+                "primeiro_lsn": span.map(|s| s.0),
+                "ultimo_lsn": span.map(|s| s.1),
+            }));
+        }
+
+        serde_json::json!({
+            "fontes": fontes,
+            // Retencao: o evento mais antigo do log. O Marco Civil (12.965/2014)
+            // obriga a guardar registos de conexao 1 ano e de aplicacao 6 meses;
+            // a LGPD obriga a NAO guardar alem do necessario. Os dois lados
+            // precisam deste numero.
+            "mais_antigo_ms": if global_min == u64::MAX { None } else { Some(global_min) },
+            "mais_recente_ms": if global_max == 0 { None } else { Some(global_max) },
+            "head": self.log.head(),
+        })
+    }
+
+    /// Campos indexados e a cardinalidade de cada um.
+    ///
+    /// Responde "que categorias de dados estao a ser tratadas?" a partir do que
+    /// esta MESMO no log — o inverso de um registo de tratamento mantido a mao,
+    /// que descreve o que alguem se lembrou de escrever.
+    ///
+    /// So nomes de campo e contagens: nunca valores. Listar os valores de um
+    /// campo `cpf` seria despejar os CPFs todos.
+    pub fn atributos(&self) -> serde_json::Value {
+        let campos = self.attr.lock().unwrap().fields();
+        let lista: Vec<_> = campos
+            .into_iter()
+            .map(|(campo, distintos)| {
+                serde_json::json!({
+                    "campo": campo,
+                    "valores_distintos": distintos,
+                })
+            })
+            .collect();
+        serde_json::json!({ "campos": lista })
+    }
+
     /// Pegada de um titular no log: quantos eventos, de que tipos, desde
     /// quando, e se a chave dele ainda existe.
     ///
