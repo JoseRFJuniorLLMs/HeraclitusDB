@@ -37,13 +37,25 @@ name = "mmap_vs_read"
 harness = false
 
 [[bench]]
-name = "crf_v2_overhead"
-harness = false
-
-[[bench]]
 name = "append_scaling"
 harness = false
 
 [[bench]]
 name = "carga_real_1m"
+harness = false
+
+[[bench]]
+name = "carga_real_20m"
+harness = false
+
+[[bench]]
+name = "otim_leitura"
+harness = false
+
+[[bench]]
+name = "otim_crc"
+harness = false
+
+[[bench]]
+name = "otim_boot"
 harness = false

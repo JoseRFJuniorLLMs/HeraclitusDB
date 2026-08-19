@@ -1,0 +1,109 @@
+
+=== Carga realista: 20000000 registos, escrita + leitura + integridade ===
+
+Eventos com forma de log de servidor: 8 servicos, 5 niveis, 6 rotas,
+mensagem de 120-400 B e 3 atributos por registo (bincode real).
+Dados em: D:/HeraclitusDB/bench-20m
+
+-- 1. ESCRITA · 1 escritor · segmento 8 MiB ---------------------
+    debito por janela de 500000: 7879 9614 14868 13198 14087 12677 14695 14142 21426 21951 14869 12980 13634 15319 14745 12456 12574 9305 7436 10078 11828 9833 10701 10473 11634 8794 22995 23721 26808 24870 24073 3141 23171 5582 22855 25443 24011 24186 20548 19954
+    1 escritor: 12533 app/s no total (1595.8s); 1a janela 7879 -> ultima 19954 = 0.4x
+    log em disco: 9755.7 MB em 1164 ficheiros, media 488 B/registo
+
+-- 2. LEITURA PONTUAL · read(lsn) aleatorio ---------------------
+    20000 leituras aleatorias, 20000 encontradas (100.0%)
+    p50  115.50µs · p95  247.20µs · p99  409.40µs · max   12.54ms · 8081 leituras/s
+
+-- 3. VARRIMENTO · scan / scan_capped --------------------------
+    scan de    10000 registos (pedidos    10000):   52.79ms  =  189443 registos/s
+    scan de   100000 registos (pedidos   100000):  622.25ms  =  160708 registos/s
+    scan_capped do log INTEIRO (20000000 registos): 96.81s  =  206596 registos/s
+
+-- 4. CONSENSO · resolve_lsn_from_consensus_index ---------------
+    200 chamadas: p50 30.15ms · p95 40.64ms · max 82.70ms
+
+-- 5. LEITURA SOB ESCRITA · 4 leitores + 4 escritores -----------
+    em 10s: 392171 escritas (39217/s) e 621213 leituras (62121/s)
+    leitura SOB escrita: p50 37.20µs · p95 193.10µs · p99 310.20µs · max 46.78ms
+    vs leitura sem escrita (p50 115.50µs)  =>  0.32x
+
+-- 6. ARRANQUE A FRIO · reabrir o log ---------------------------
+    Log::open sobre 20392171 registos: 50.23s  (head recuperado = 20392171)
+    E o tempo de indisponibilidade num restart do servico.
+    primeira leitura depois de reabrir: 113.70µs
+
+-- 7. INTEGRIDADE · verify() do log inteiro ---------------------
+    crc de cada registo + raiz Merkle de cada segmento selado.
+    20392171 registos, 1187 segmentos, merkle_ok 1186 — 51.93s  =  392718 registos/s
+    E o custo de uma auditoria forense completa.
+
+
+-- 8. ESCRITA · 8 escritores -------------------------------------
+    NAO EXECUTADA. A fase 5 (4 leitores + 4 escritores sobre o log de
+    20M ja construido) mediu 39217 escritas/s contra 12533 do escritor
+    unico da fase 1 — o ganho da concorrencia (3.1x) ficou medido no
+    volume alvo sem pagar mais 20M de escritas (~10 GB, ~25 min).
+
+=== VEREDICTO (20 000 000 registos) ===
+
+  escrita · 1 escritor   · 8 MiB :     12533 app/s  (1595.8 s)
+  escrita · 8 escritores · 8 MiB :     39217 app/s  (fase 5)   = 3.1x
+  curva ao longo de 20M           :     7879 -> 19954 app/s = PLANA (acelera)
+
+  log em disco                    :     9755.7 MB em 1164 ficheiros (488 B/registo)
+  RAM residente do processo       :     692 MB de pico (~35 B/registo de indice)
+
+  leitura pontual sem escrita     :     p50 115.50us · 8081 leituras/s
+  leitura pontual sob escrita     :     p50  37.20us · 62121 leituras/s
+  scan_capped do log inteiro      :     96.81 s = 206596 registos/s
+
+  resolve_lsn_from_consensus_index:     p50 30.15 ms  (O(n) sobre 20M entradas)
+
+  arranque a frio (Log::open)     :     50.23 s   <- indisponibilidade no restart
+  auditoria forense (verify)      :     51.93 s = 392718 registos/s
+
+  AMBIENTE: maquina NAO ociosa (Claude Code x3, Antigravity IDE, LM Studio).
+  Os valores absolutos sao um piso; as razoes entre variantes sao robustas.
+
+=====================================================================
+ SONDAS DE OTIMIZACAO (2026-08-19) - mesmos dados, variantes lado a lado
+=====================================================================
+
+-- CRC-32C (otim_crc) ------------------------------------------------
+    corretude: identicas em 11 tamanhos + vetor 0xE3069283 OK
+    bloco 487 B (registo medio real):
+      tabela byte-a-byte (atual) :   349 MB/s
+      SSE4.2 crc32 (disponivel)  :  9544 MB/s   = 27.3x
+    20M registos, UMA passagem: 25.4 s -> 0.9 s de CPU (poupa 24.5 s)
+    Passagens no ciclo de vida: escrita + scan completo + verify()
+
+-- LEITURA (otim_leitura, segmento real 8.4 MB / 17201 registos) ------
+    PONTUAL:
+      1. como esta (open + seek + re-le cabecalho): p50 26.30us ·  22959/s
+      2. sem reler o cabecalho do segmento        : p50 20.60us ·  32250/s  1.40x
+      3. + handle reutilizado (cache de fd)       : p50  3.50us · 236244/s 10.29x
+    VARRIMENTO:
+      4. como esta (File cru, 2 read_exact/reg)   : 235941 reg/s · 109 MB/s
+      5. com BufReader de 1 MiB                   : 767419 reg/s · 356 MB/s  3.25x
+      6. por mmap (zero-copy, hoje desligado)     : 624805 reg/s · 290 MB/s  2.65x
+    => o BufReader BATE o mmap. A decisao de deixar o mmap desligado estava
+       certa, mas por comparacao contra um leitor que o codigo vivo nao tem.
+
+-- ARRANQUE A FRIO / VERIFY (otim_boot, 1187 segmentos) --------------
+    corretude: opaque_meta == payload[..16] em 500 registos reais OK
+      1. como esta (bincode completo + blake3)  190.81s ·  106872 reg/s
+      2. sem desserializar o Episode             96.54s ·  211230 reg/s  1.98x
+      3. + sem blake3 (raiz ja esta no rodape)   66.37s ·  307261 reg/s  2.88x
+      4. + em paralelo (8 threads)               13.36s · 1526451 reg/s 14.28x
+      5. so paralelizar, sem mais nada           55.03s ·  370564 reg/s  3.47x
+    => Log::open 50.23s -> ~3.5s ; verify() 51.93s -> ~3.6s
+
+-- CAMINHO gRPC (medido na carga real de D:\dados-governo) -----------
+    appends em voo | debito        | ETA 8.87M
+    ---------------+---------------+-----------
+      1 (serial)   |    86 ev/s    | 28 h
+     16            |   274 ev/s    |  9 h    (3.2x)
+     64            |   748 ev/s    |  3.3 h  (8.7x)
+    256            |  1760 ev/s    |  1.4 h  (20.5x)
+    Escalonamento quase linear => gargalo e LATENCIA (fsync por append),
+    nao saturacao: servidor com CPU ~0, fila de disco 0.0, 2 MB/s.

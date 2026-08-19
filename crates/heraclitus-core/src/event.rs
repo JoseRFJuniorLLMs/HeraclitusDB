@@ -50,6 +50,27 @@ pub enum EventKind {
     SystemMetric,
 }
 
+impl EventKind {
+    /// O rótulo CANÓNICO do kind — a forma textual usada em queries
+    /// (`WHERE n.tipo = "..."`), no índice de atributos (pseudo-atributo
+    /// `_kind`) e em qualquer saída para o utilizador.
+    ///
+    /// Existe aqui, junto ao enum, por uma razão de correção e não de estilo:
+    /// esta função estava **copiada em seis sítios** (query/plan.rs,
+    /// analytics, server/engine.rs ×2, server/rest.rs, tier). Enquanto o
+    /// rótulo só era usado para mostrar, divergir era feio; a partir do
+    /// momento em que o índice de atributos guarda `_kind = <rótulo>` e a
+    /// query procura por `<rótulo>`, **as duas cópias têm de produzir os
+    /// mesmos bytes ou a busca devolve zero linhas sobre dados que existem**.
+    /// Uma única definição torna essa classe de bug impossível.
+    pub fn label(&self) -> String {
+        match self {
+            EventKind::Custom(s) => s.clone(),
+            other => format!("{other:?}"),
+        }
+    }
+}
+
 /// The unit of truth. Episodes are appended to the log and never mutated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Episode {

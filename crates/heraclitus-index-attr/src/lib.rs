@@ -90,7 +90,19 @@ const MAGIC_V2: &[u8; 4] = b"HATR";
 /// Com a versao a subir, o `open` rejeita o checkpoint antigo e reconstroi por
 /// replay a partir do LSN 0 — backfill completo, sem ninguem ter de se lembrar
 /// de correr nada. Custa um replay no primeiro arranque apos a atualizacao.
-const FORMAT_V2: u16 = 3;
+/// **v4**: o `kind` passou a ser indexado sob `_kind`.
+///
+/// Mesma mecânica da v3, e pela mesma razão: um checkpoint v3 foi escrito sem
+/// `_kind`. Carregá-lo deixava o índice a conhecer o campo só para os eventos
+/// que chegassem DEPOIS — e uma query `MATCH (n:Contrato)` devolveria os
+/// contratos novos e escondia os antigos, em silêncio, com ar de resposta
+/// completa. Num banco de auditoria, uma resposta incompleta sem aviso é pior
+/// que um erro.
+///
+/// Subir a versão faz o `open` recusar o checkpoint antigo e reconstruir por
+/// replay desde o LSN 0. Custa um replay no primeiro arranque; num log de 10M
+/// isso são minutos, uma vez.
+const FORMAT_V2: u16 = 4;
 
 /// Espelho do [`Snapshot`] com os postings **comprimidos**.
 ///
@@ -560,6 +572,32 @@ impl View for AttrIndex {
             let a = event.agent_id.trim();
             if !a.is_empty() && a.len() <= MAX_VALUE_LEN {
                 insert_sorted(self.inner.exact.entry(ikey("_agent", a)).or_default(), lsn);
+            }
+        }
+
+        // O `kind` entra como pseudo-atributo sob a chave reservada `_kind`,
+        // pela MESMA razão que o `_agent` — e com consequências maiores.
+        //
+        // `n.tipo` / `n.kind` é o predicado mais usado de toda a camada de
+        // grafo: cada `MATCH (n:Contrato)` é isso. E era exatamente o campo
+        // que o planner classificava como "builtin", logo **incapaz de usar
+        // índice** — resolvia-se sempre por varrimento do log com pós-filtro.
+        //
+        // Medido a 2026-08-19 sobre o log real de 10 093 244 eventos: coletar
+        // os 13 891 nós de kind `Contrato` levou **7m27s** (128 queries de
+        // janela de 100k LSN), e o kind seguinte expirou. Com 21 kinds nas
+        // regras de aresta, o edge-builder re-varria o log inteiro 21 vezes —
+        // e nunca terminava. A construção do grafo, que é o diferencial do
+        // produto, parava na prática nos ~250 mil eventos.
+        //
+        // O rótulo vem de `EventKind::label()` (heraclitus-core), a definição
+        // única partilhada com o planner: se as duas divergissem, a procura
+        // devolvia zero linhas sobre dados existentes.
+        {
+            let k = event.kind.label();
+            let k = k.trim();
+            if !k.is_empty() && k.len() <= MAX_VALUE_LEN {
+                insert_sorted(self.inner.exact.entry(ikey("_kind", k)).or_default(), lsn);
             }
         }
 

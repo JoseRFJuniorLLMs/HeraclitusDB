@@ -1300,17 +1300,16 @@ impl Engine {
         key: &str,
     ) -> Result<(Lsn, bool, String), HeraclitusError> {
         if key.is_empty() {
+            // O `EventId` é gerado por `Episode::new` ANTES de chegar aqui, e
+            // `append_internal` nunca lhe toca (só o `ts_hlc` é carimbado pelo
+            // log). Ler o `id` do episódio custa zero; relê-lo do disco, como
+            // se fazia, custava uma leitura pontual COMPLETA por append —
+            // abrir o ficheiro do segmento, seek, ler o registo e descodificar
+            // o bincode — para devolver um valor que já estava em memória.
+            // Medido a 2026-08-19: era o desperdício mais caro do caminho de
+            // escrita por gRPC. Ver docs/md/auditorias/otimizacao-20m.md §3.5.
+            let id = episode.id.to_string();
             let lsn = self.append(episode)?;
-            let id = self
-                .log
-                .read(lsn)?
-                .ok_or_else(|| HeraclitusError::Corruption {
-                    context: "append response".into(),
-                    detail: format!("LSN {lsn} não pôde ser relido"),
-                })?
-                .1
-                .id
-                .to_string();
             return Ok((lsn, false, id));
         }
         if self.log_only {

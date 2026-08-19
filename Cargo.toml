@@ -24,9 +24,14 @@ members = [
     "crates/heraclitus-server",
     "crates/heraclitus-cli",
     "crates/heraclitus-client",
-    "crates/heraclitus-wasm",
     "sim/heraclitus-sim",
     "tools/heraclitus-ingestor", "crates/heraclitus-analytics",
+    # HUME: `hume-ir` e `hume-sketches` não têm consumidor HOJE, mas não são
+    # código morto — são infraestrutura para a SPEC-0043 (MATH-15 "JIT
+    # vectorization" e a camada de hash/HLL dos sketches, ambos P1 com
+    # potencial "muito alto"/"alto"). Foram apagados numa limpeza a 2026-08-19
+    # e restaurados no mesmo dia, quando a SPEC apareceu: "sem dependentes" e
+    # "morto" não são a mesma coisa.
     "crates/hume-kernel",
     "crates/hume-ir",
     "crates/hume-sketches",

@@ -15,6 +15,24 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// demorar; ajustável com [`Client::with_request_timeout`].
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Re-exporta o `tonic` com que este cliente foi construído.
+///
+/// Toda a API pública devolve `Result<_, tonic::Status>`, portanto qualquer
+/// consumidor que queira distinguir um erro transitório (`Unavailable`,
+/// `DeadlineExceeded`) de um permanente precisa do `tonic::Code` — e tem de
+/// ser a MESMA versão do crate, senão os tipos não unificam. Re-exportar aqui
+/// evita que cada consumidor declare a sua própria dependência e arrisque
+/// divergir de versão.
+pub use tonic;
+
+/// `Clone` é barato e é o que torna a ingestão concorrente possível: o
+/// `Channel` do tonic já é um handle partilhado (multiplexa HTTP/2 sobre a
+/// mesma ligação), portanto clonar o `Client` dá mais um emissor sem abrir mais
+/// uma ligação TCP. Sem isto, um carregador ETL só consegue ter UM append em
+/// voo de cada vez — e com `fsync = group_commit` cada append espera a sua
+/// própria janela de fsync, o que trava o débito em ~90 eventos/s
+/// independentemente do hardware (medido em 2026-08-19 na carga governamental).
+#[derive(Clone)]
 pub struct Client {
     inner: Grpc<Channel>,
     /// Aplicado a cada RPC unário (via cabeçalho grpc-timeout). NÃO é aplicado
