@@ -10,6 +10,52 @@ use crate::CompError;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// What this build has actually verified about a timestamp token.
+///
+/// There deliberately is no "legally validated" variant yet: validation of a
+/// RFC 3161 CMS token against an ICP-Brasil trust store is not implemented.
+/// Old manifests deserialize to [`LegacyUnverified`], so a missing field can
+/// never silently promote historical evidence.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TimestampValidationState {
+    /// A self-contained token issued and verified by the in-process dev TSA.
+    /// It proves the development flow only; it is not an ICP-Brasil timestamp.
+    DevelopmentOnly,
+    /// A token received from an external endpoint, with no CMS/X.509 trust
+    /// validation yet. Its commitment can still be recomputed locally.
+    ExternalTokenUnvalidated,
+    /// A receipt written before validation state was persisted.
+    #[default]
+    LegacyUnverified,
+}
+
+impl TimestampValidationState {
+    /// Stable, human-readable state for CLI and audit output.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::DevelopmentOnly => "somente desenvolvimento",
+            Self::ExternalTokenUnvalidated => "token externo não validado",
+            Self::LegacyUnverified => "recibo legado não validado",
+        }
+    }
+}
+
+/// Timestamp metadata known when an evidence receipt is written.
+///
+/// This intentionally separates receipt creation time from a validated
+/// authority time. The latter must remain `None` unless the token verifier
+/// extracted and verified it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimestampEvidence {
+    /// Local receipt-creation time, or the verified development token time.
+    pub recorded_unix_ms: u64,
+    /// Authority `genTime` only after successful verification.
+    pub authority_gen_unix_ms: Option<u64>,
+    /// Strength of the available verification.
+    pub validation_state: TimestampValidationState,
+}
+
 /// One notarized anchor, serialized into the manifest.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LegalReceipt {
@@ -21,8 +67,20 @@ pub struct LegalReceipt {
     pub root_hex: String,
     /// SHA-256 imprint that was timestamped (hex).
     pub imprint_hex: String,
-    /// Authority time (ms since Unix epoch).
+    /// Time recorded in this receipt (ms since Unix epoch).
+    ///
+    /// For a verified dev token this equals its embedded time. For an external
+    /// unvalidated token it is the local receipt-creation time, not a claimed
+    /// authority `genTime`. Kept under the historic field name for manifest
+    /// compatibility; consumers must inspect `validation_state`.
     pub gen_unix_ms: u64,
+    /// Time asserted by the token authority, but only when this build could
+    /// validate it. `None` never means "unknown but valid".
+    #[serde(default)]
+    pub authority_gen_unix_ms: Option<u64>,
+    /// Verification state available when this receipt was written.
+    #[serde(default)]
+    pub validation_state: TimestampValidationState,
     /// Authority/policy name.
     pub policy: String,
     /// Token file name relative to the receipts dir.
@@ -54,7 +112,7 @@ pub fn persist(
     commitment: &Commitment,
     imprint: &[u8; 32],
     policy: &str,
-    gen_unix_ms: u64,
+    timestamp: TimestampEvidence,
     token: &[u8],
 ) -> Result<LegalReceipt, CompError> {
     let dir = dir.as_ref();
@@ -68,7 +126,9 @@ pub fn persist(
         segments: commitment.segments,
         root_hex: to_hex(&commitment.root),
         imprint_hex: to_hex(imprint),
-        gen_unix_ms,
+        gen_unix_ms: timestamp.recorded_unix_ms,
+        authority_gen_unix_ms: timestamp.authority_gen_unix_ms,
+        validation_state: timestamp.validation_state,
         policy: policy.to_string(),
         token_file,
     };
@@ -127,10 +187,41 @@ mod tests {
             segments: 2,
         };
         let imprint = [4u8; 32];
-        let r = persist(dir.path(), &c, &imprint, "ACT-dev", 1700, b"token-bytes").unwrap();
+        let r = persist(
+            dir.path(),
+            &c,
+            &imprint,
+            "ACT-dev",
+            TimestampEvidence {
+                recorded_unix_ms: 1700,
+                authority_gen_unix_ms: Some(1700),
+                validation_state: TimestampValidationState::DevelopmentOnly,
+            },
+            b"token-bytes",
+        )
+        .unwrap();
         assert_eq!(r.lsn, 42);
         let all = load_manifest(dir.path()).unwrap();
         assert_eq!(all, vec![r.clone()]);
         assert_eq!(read_token(dir.path(), &r).unwrap(), b"token-bytes");
+    }
+
+    #[test]
+    fn legacy_manifest_entry_is_never_promoted() {
+        let legacy = r#"{
+            "lsn": 42,
+            "segments": 2,
+            "root_hex": "aa",
+            "imprint_hex": "bb",
+            "gen_unix_ms": 123,
+            "policy": "ACT-antiga",
+            "token_file": "00000000000000000042.tst"
+        }"#;
+        let receipt: LegalReceipt = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            receipt.validation_state,
+            TimestampValidationState::LegacyUnverified
+        );
+        assert_eq!(receipt.authority_gen_unix_ms, None);
     }
 }

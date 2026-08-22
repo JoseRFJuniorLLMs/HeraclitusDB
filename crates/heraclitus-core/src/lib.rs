@@ -41,4 +41,10 @@ pub use runtime::{
     ArtifactType, DatabaseManifest, DerivedExecutionArtifact, ExecutionContext, QueryFingerprint,
     SegmentState, StorageEngine,
 };
+// SPEC-0050 §70–§72 — vocabulário do catálogo v2. Vive em `runtime` porque é
+// contrato partilhado (manifesto, packer, tier, CLI) e não implementação.
+pub use runtime::{
+    CompressionCodec, DerivedArtifactRef, GenerationState, PhysicalGeneration, PhysicalLayout,
+    RetentionPolicy, SegmentDescriptorV2, DEFAULT_GC_GRACE_SECONDS,
+};
 pub use streaming::{NotificationEvent, StreamSubscriber};

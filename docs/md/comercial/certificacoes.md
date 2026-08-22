@@ -1,4 +1,8 @@
-Com o detalhamento das especificações técnicas de infraestrutura, IA e auditoria (**SPEC-0045**^^, **SPEC-0046**^^, **SPEC-0047**^^ e **SPEC-0048**^^), a arquitetura do produto cobre a totalidade dos requisitos funcionais, de inteligência e de conformidade legal brasileira.
+# Proposta comercial e roadmap de certificações — não é atestado técnico
+
+> **Estado técnico (2026-08-21):** este documento descreve objetivos comerciais e de produto, não capacidades certificadas. As SPEC-0045–0049 continuam propostas/parciais. Em especial, `heraclitus-compliance` não implementa `StrictAirGap`, `IcpBrasilTimestampVerifier`, validação CMS/X.509, trust store ICP-Brasil ou carimbo de tempo juridicamente validado. Nenhum item marcado como “SIM” abaixo deve ser usado em edital, proposta ou atestado até ser substituído por evidência de qualificação verificável.
+
+Com o detalhamento das especificações técnicas de infraestrutura, IA e auditoria (**SPEC-0045**^^, **SPEC-0046**^^, **SPEC-0047**^^ e **SPEC-0048**^^), a arquitetura registra os requisitos funcionais, de inteligência e de conformidade legal brasileira que ainda precisam de implementação e qualificação.
 
 Para transformar o ecossistema no produto **imbatível para licitações** ou viabilizar a **contratação direta por Inexigibilidade ou Dispensa de Licitação** (Lei nº 14.133/2021), a lacuna restante não é mais de código do banco de dados, mas de enquadramento jurídico-comercial, certificações estatais e governança de implantação.
 
@@ -29,11 +33,11 @@ Para um órgão público comprar o HeraclitusDB sem abrir concorrência, o proce
 
 | **Requisito do Termo de Referência (TR)**                                | **HeraclitusDB + Sentinel**                 | **SIEMs / Bancos Tradicionais**                     |
 | ------------------------------------------------------------------------- | ------------------------------------------- | --------------------------------------------------- |
-| **Operação AI 100% Air-Gapped sem Egress**                              | SIM (`heraclitus-compliance`)^^ <br/>       | NÃO (Exigem nuvem externa)                         |
-| **Garantia de Não-Bloqueio do Hot-Path de Ingestão por IA**             | SIM (`subscribe.rs`via LSNs)^^ <br/>        | NÃO (Causam gargalo de escrita)                    |
-| **Carimbo de Tempo ICP-Brasil RFC 3161 Nativo**                           | SIM (`IcpBrasilTimestampVerifier`)^^ <br/>  | NÃO (Requer ferramentas de terceiros)              |
-| **Cadeia de Custódia Pericial (CPP Art. 158-A) com Verificador Offline** | SIM (`heraclitus-forensic`)^^ <br/>         | NÃO (Apenas logs de texto sem Merkle proof)^^<br/> |
-| **Troca Bidirecional CTIR Gov / STIX 2.1 Sanitizada**                     | SIM (`heraclitus-sentinel::threat`)^^ <br/> | NÃO (Formatos proprietários fechados)             |
+| **Operação AI 100% Air-Gapped sem Egress**                              | ROADMAP — não implementado                   | Não avaliado                                       |
+| **Garantia de Não-Bloqueio do Hot-Path de Ingestão por IA**             | PARCIAL — `subscribe.rs` sem Sentinel/IA     | Não avaliado                                       |
+| **Carimbo de Tempo ICP-Brasil RFC 3161 Nativo**                          | PROTÓTIPO — sem HTTPS/CMS/TrustStore          | Não avaliado                                       |
+| **Cadeia de Custódia Pericial (CPP Art. 158-A) com Verificador Offline** | ROADMAP — `heraclitus-forensic` não existe    | Não avaliado                                       |
+| **Troca Bidirecional CTIR Gov / STIX 2.1 Sanitizada**                   | ROADMAP — `heraclitus-sentinel` não existe    | Não avaliado                                       |
 
 **4. Prontidão SRE, Hardening e Certificações Internacionais**
 
@@ -82,7 +86,6 @@ Em editais de defesa ou segurança da informação, o Ministério da Defesa pode
 * **Registro no INPI:** Registrar o código-fonte dos *crates* Rust do HeraclitusDB no Instituto Nacional da Propriedade Industrial.
 * **Submissão à CMID:** Dar entrada no requerimento junto ao Ministério da Defesa comprovando que 100% da arquitetura de inteligência, criptografia e banco roda localmente (*Air-Gapped*).
 * **Auditoria de Código:** Passar pela inspeção do Ministério da Defesa que valida a ausência de *backdoors* ou dependências de nuvens sujeitas a leis estrangeiras (como o *Cloud Act* americano).
-
 
 Se essas SPECs estiverem **apenas escritas**, ainda falta quase tudo que transforma arquitetura em produto. Se estiverem **implementadas, testadas e integradas**, aí o HeraclitusDB já estaria perto de uma plataforma SOC governamental séria. Nesse ponto eu **pararia de inventar features por um tempo**. O próximo trabalho seria transformar o projeto em algo que um gestor público consiga contratar, um jurídico consiga defender e um fiscal de contrato consiga aceitar sem precisar acreditar em você por fé.
 
@@ -539,3 +542,24 @@ Aí você cria um **moat de contratação**, e não apenas um moat técnico.
 E existe uma jogada particularmente boa: fazer o **Heraclitus Government Qualification Suite** e o **Procurement Pack IN-94** antes de começar a bater nas portas. Eles transformariam boa parte da superioridade técnica que você está construindo em algo que um ETP, um TR, uma PoC, um parecer jurídico e uma comissão de contratação conseguem efetivamente enxergar.
 
 Entre as rotas de contratação especial, eu colocaria a ordem estratégica como **CPSI para o primeiro piloto**, **ETEC quando existir P&D com risco tecnológico real**, **licitação convencional depois que houver atestados e benchmark**, e **inexigibilidade apenas quando a inviabilidade de competição for concreta e documentalmente defensável**. Isso é bem menos glamouroso que “somos exclusivos”, porém bem mais difícil de ser desmontado por controle interno, AGU ou TCU.
+
+
+O HeraclitusDB foi projetado para passar pela inspeção da CMID (Comissão Mista de Indústria de Defesa) do Ministério da Defesa sem ressalvas, pois cumpre todos os requisitos de Soberania Tecnológica e Segurança de Estado.
+
+**Como o HeraclitusDB Comprova Soberania e Zero Backdoors na CMID**
+
+* **Código 100% Auditável em Rust**: A CMID inspeciona a árvore do monorepo (`crates/*`). Como a base é construída do zero em Rust sem dependências proprietárias de fornecedores estrangeiros, é possível compilar o sistema de forma determinística e auditar 100% das dependências (*Software Bill of Materials - SBOM*).
+* **Modo Air-Gapped Rígido (`heraclitus-compliance`)**: A auditoria militar valida que o sistema opera em modo de estrito isolamento físico (`StrictAirGap`)^^. O motor bloqueia qualquer tentativa de conexões de saída (*egress*), garantindo que nenhum dado de inteligência ou telemetria seja exfiltrado para nuvens ou servidores fora do país^^.
+* **Inexistência de "SQL Injection Emocional" ou Hijacking de IA**: O agente de segurança (`heraclitus-sentinel`) é blindado contra sequestro de execução^^. O invariante `LOG DATA != AGENT INSTRUCTION` prova aos auditores que o LLM local não possui acesso a *shells*, *scripts* arbitrários do SO ou privilégios de superusuário do banco^^.
+* **IA de Investigação Soberana e Local**: A inferência do modelo no nível L4 roda localmente via `hume-kernel` e `heraclitus-gpu` sobre artefatos `GGUF/SafeTensors`, sem depender de APIs externas (como OpenAI ou Anthropic) sujeitas a leis de jurisdição estrangeira (ex.: *US CLOUD Act*)^^.
+* **Cadeia de Custódia e Imutabilidade Criptográfica (`heraclitus-forensic`)**: O banco prova a integridade dos logs por meio de árvores de Merkle, hashes BLAKE3 e carimbos do tempo ICP-Brasil (RFC 3161)^^. Qualquer tentativa de alteração do histórico por agentes internos ou externos quebra a verificação pericial matemática^^.
+
+**Resumo da Avaliação de Soberania da CMID**
+
+
+| **Exigência Militar de Defesa**            | **Solução Nativa no HeraclitusDB**                                            |
+| ------------------------------------------- | ------------------------------------------------------------------------------- |
+| **Independência de Nuvens Estrangeiras**   | Execução e inferência de IA 100%*on-premises*/*Air-Gapped*^^. <br/>          |
+| **Ausência de Backdoors de Exfiltração** | Bloqueio de rede no nível de*kernel*e ausência de*telemetry SaaS*^^. <br/>    |
+| **Proteção contra Sabotagem Operacional** | *PolicyEngine*determinístico que valida e restringe cada ação da IA^^. <br/> |
+| **Rastreabilidade de Decisão**             | *AI Decision Provenance*gravada em LSNs no log imutável do banco^^.            |

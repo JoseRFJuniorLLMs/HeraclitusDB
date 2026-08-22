@@ -52,28 +52,28 @@ O "esquecimento" aqui é uma **propriedade do índice, não destruição física
 
 ---
 
-## 🏛️ Conformidade Governamental: Timestamping Legal (RFC 3161 / ICP-Brasil)
+## 🏛️ Evidência de conformidade: protótipo RFC 3161
 
-A integridade matemática (log imutável + raiz Merkle blake3) prova que o estado é **internamente** consistente. Para um tribunal, esse estado precisa ser ancorado à **hora oficial legal do país**. O crate [`heraclitus-compliance`](crates/heraclitus-compliance) constrói essa ponte — sem tocar no core, em Rust puro (sem OpenSSL/C):
+A integridade matemática (log imutável + raiz Merkle blake3) prova que o estado é **internamente** consistente. O crate [`heraclitus-compliance`](crates/heraclitus-compliance) implementa o commitment, a ancoragem assíncrona e o recibo auditável; **não implementa ainda validação jurídica/ICP-Brasil de um token externo**. Em particular, esta versão não possui transporte HTTPS para ACT, validação CMS/X.509, trust store ICP-Brasil, revogação ou `genTime` externo verificado.
 
 - **Compromisso reproduzível.** Consolida as raízes dos segmentos selados em um único *commitment* até um watermark de LSN; deriva um imprint **SHA-256** (TSAs não aceitam blake3 — apenas OIDs registrados).
 - **Timestamping assíncrono por watermark.** Um daemon ancora o estado consolidado a cada marco (N LSNs ou T minutos) — **nunca** no caminho crítico de escrita. A chamada à TSA roda em thread blocante, sem degradar QPS.
-- **TSA plugável.** `LocalTsa` (em processo, prova o fluxo sem credenciais) e `HttpTsa` (requisição RFC 3161 real para TSA credenciada, e.g. SERPRO sincronizado com o Observatório Nacional).
+- **TSA com estado explícito.** `LocalTsa` (em processo, prova o fluxo sem credenciais e nunca é ICP-Brasil) e `HttpTsa` (ingestão HTTP de token externo ainda não validado).
 - **Assinatura Institucional.** Trait `InstitutionalSigner` com `SoftKeySigner` (dev) e `Pkcs11Signer` (produção — chave em **HSM/PKCS#11**; certificado A1 em arquivo é rejeitado pela segurança das agências).
 - **Assinaturas pós-quânticas (FIPS 204).** `MlDsaSigner` (ML-DSA-44) + `HybridSigner` (ECDSA P-256 **e** ML-DSA — quebrar qualquer um invalida o par).
-- **Recibo Legal.** Token `<lsn>.tst` + `manifest.jsonl` append-only, com o commitment recomputável a partir do log imutável.
+- **Recibo de evidência.** Token `<lsn>.tst` + `manifest.jsonl` append-only, com estado de validação e commitment recomputável a partir do log imutável.
 
 ```bash
-# Ancorar o estado selado (dev TSA local; usar --tsa-url para TSA real)
+# Ancorar o estado selado (ACT local de desenvolvimento)
 cargo run -p heraclitus-cli -- anchor ./data/log --receipts ./data/receipts
 
 # Verificação forense: revalida integridade do log + todos os recibos
 cargo run -p heraclitus-cli -- verify-receipts ./data/log --receipts ./data/receipts
 ```
 
-O que isso prova juridicamente: *que aquele estado existia **antes** do instante oficial T* — combinado com a ordem causal interna (log + HLC), fecha a prova forense. Adulteração de um registro já carimbado altera o commitment e a verificação **falha** — fraude retroativa torna-se detectável.
+O que isso prova hoje: um commitment pode ser recomputado e divergências retroativas no log são detectáveis. Para token externo, a CLI reporta **INCONCLUSIVO** até que haja validação da cadeia de confiança; isso não é prova de fraude nem validação legal.
 
-> **Roadmap de acreditação.** Implementado e testado: commitment, requisição RFC 3161, TSA dev/HTTP, verificador, daemon, CLI, ML-DSA híbrido. Próximos passos (requerem âncoras de confiança do órgão): validação do `.tst` (CMS) real contra raízes ICP-Brasil; provedor concreto PKCS#11/HSM; meta-auditoria de acesso, mascaramento LGPD dinâmico, ABAC por partição, conectores SIAFI/SIAPE.
+> **Roadmap de acreditação.** Faltam: transporte HTTPS autenticado para ACT, validação do `.tst` (CMS) contra raízes ICP-Brasil, política/revogação, provedor concreto PKCS#11/HSM, meta-auditoria de acesso, mascaramento LGPD dinâmico, ABAC por partição e conectores SIAFI/SIAPE. A configuração de produção falha fechada enquanto esses requisitos de timestamp externo não existirem.
 
 ---
 
@@ -127,8 +127,8 @@ heraclitus-btree         ← Bᵋ-tree (Fractal Tree) comercial: CoW shadow pagi
 heraclitus-gpu           ← aceleração heterogênea (M20.3): batch distance GPU (wgpu, Intel Arc),
                             kernel WGSL produto manifold; OP_QUANTIZE na fronteira (invariância ordinal);
                             fallback CPU obrigatório; feature flag `gpu`
-heraclitus-compliance    ← timestamping legal RFC 3161 / ICP-Brasil; ML-DSA-44 + ECDSA híbrido;
-                            PKCS#11/HSM; daemon assíncrono; recibo juridicamente vinculante
+heraclitus-compliance    ← commitment e recibos de evidência RFC 3161; token dev verificável;
+                            ingestão HTTP externa não validada; daemon assíncrono
 heraclitus-query         ← parser pest (Cypher/GQL subset) fuzzado; planner rule-based;
                             EXPLAIN; AS OF LSN/TIMESTAMP; VALID AT; DIST_HYP/DIST_PRODUCT;
                             REQUIRE LSN; backend lock-free ArcSwap (M30)

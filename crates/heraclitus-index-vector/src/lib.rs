@@ -5,6 +5,8 @@
 //! push-down. The index is derived state: losing it means replay, not data
 //! loss.
 
+pub mod gate;
+
 use heraclitus_core::{Episode, EventId, HeraclitusError, Lsn, ProductPoint};
 use heraclitus_manifold::{ProductMetric, Signature};
 use heraclitus_views::View;
