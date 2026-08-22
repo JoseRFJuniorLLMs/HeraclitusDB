@@ -92,6 +92,7 @@ pub mod error;
 pub mod footer;
 pub mod gc;
 pub mod header;
+pub mod hrki;
 pub mod manifest;
 pub mod merkle;
 pub mod packed;
