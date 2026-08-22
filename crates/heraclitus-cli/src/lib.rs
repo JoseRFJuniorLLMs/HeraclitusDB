@@ -3,6 +3,10 @@
 use heraclitus_core::{EventId, FsyncPolicy, HeraclitusConfig, ProductPoint};
 use heraclitus_crypto::KeyStore;
 use heraclitus_index_vector::VectorIndex;
+use heraclitus_log::v6::error::HARD_MAX_BLOCK_BYTES;
+use heraclitus_log::v6::verify::{
+    hex32, inspect as inspect_v6_segment, prove_lsn, verify_segment, IntegrityLevel,
+};
 use heraclitus_log::Log;
 use heraclitus_manifold::{dist_hyp, project_to_ball, ProductMetric};
 use std::time::Instant;
@@ -129,6 +133,148 @@ pub fn verify(dir: &std::path::Path) -> Result<String, heraclitus_core::Heraclit
     ))
 }
 
+/// Inspeciona um segmento HRKL v6 sem abrir o directório do banco.
+///
+/// Este comando é deliberadamente de leitura: não repara a cauda nem altera o
+/// manifesto. Para um segmento RAW ainda activo, o relatório deixa explícito
+/// que não há footer selado e, portanto, não há garantia forense completa.
+pub fn inspect_v6(segment: &std::path::Path) -> Result<String, heraclitus_core::HeraclitusError> {
+    inspect_v6_segment(segment, HARD_MAX_BLOCK_BYTES)
+}
+
+/// Mantém `heraclitus verify <log-dir>` retrocompatível e acrescenta o caminho
+/// físico, somente-leitura, para um único segmento HRKL v6.
+pub fn verify_target(target: &std::path::Path) -> Result<String, heraclitus_core::HeraclitusError> {
+    verify_target_with_level(target, false)
+}
+
+/// Variante de [`verify_target`] que habilita a recomputação da raiz canónica
+/// para um segmento v6 com `StoragePayload` actual. Um directório legado
+/// continua a usar o verificador v1--v5; `--logical` não muda em silêncio a
+/// semântica desse caminho.
+pub fn verify_target_with_level(
+    target: &std::path::Path,
+    logical: bool,
+) -> Result<String, heraclitus_core::HeraclitusError> {
+    if target.is_dir() {
+        if logical {
+            return Err(heraclitus_core::HeraclitusError::Config(
+                "--logical só é suportado para um arquivo HRKL v6; para um diretório legado use `verify <dir>`".into(),
+            ));
+        }
+        return verify(target);
+    }
+    if target.is_file() {
+        return verify_v6(target, logical);
+    }
+    Err(heraclitus_core::HeraclitusError::Config(format!(
+        "alvo de verify não existe ou não é ficheiro/directório: {}",
+        target.display()
+    )))
+}
+
+/// Verifica a integridade física ou lógica de um HRKL v6. O modo lógico usa a
+/// mesma ponte `StoragePayload -> (opaque_meta, Episode)` do writer e packer;
+/// assim não há um hash de CLI diferente do que foi selado no footer.
+fn verify_v6(
+    segment: &std::path::Path,
+    logical: bool,
+) -> Result<String, heraclitus_core::HeraclitusError> {
+    let level = if logical {
+        IntegrityLevel::Logical
+    } else {
+        IntegrityLevel::Physical
+    };
+    let report = verify_segment(
+        segment,
+        level,
+        HARD_MAX_BLOCK_BYTES,
+        logical.then_some(&heraclitus_log::canonical_hash_storage_payload_v6),
+    )?;
+    if !report.is_ok() {
+        let detail = if report.notes.is_empty() {
+            "falha física sem detalhe adicional".to_owned()
+        } else {
+            report.notes.join("; ")
+        };
+        return Err(heraclitus_core::HeraclitusError::Corruption {
+            context: format!("verificação HRKL v6: {}", segment.display()),
+            detail,
+        });
+    }
+
+    let scope = if logical { "logical + physical" } else { "physical" };
+    let mut out = format!(
+        "HRKL v6 {scope} verification passed\nsegment: {}\nlayout: {}\nrecords: {}\nlsn: {}..{}\nblocks: {}\nlogical root (declared): {}\n",
+        segment.display(),
+        report.layout.as_str(),
+        report.record_count,
+        report.min_lsn,
+        report.max_lsn,
+        report.block_count,
+        hex32(&report.declared_root),
+    );
+    if logical {
+        out.push_str(&format!(
+            "logical root (recomputed): {}\n",
+            report.recomputed_root.as_ref().map(hex32).unwrap_or_default()
+        ));
+    }
+    if report.notes.is_empty() {
+        out.push_str(&format!("sealed: yes\nscope: {scope} checks"));
+    } else {
+        out.push_str(&format!("sealed: incomplete\nscope: {scope} checks\nnotes:\n"));
+        for note in report.notes {
+            out.push_str(&format!("  - {note}\n"));
+        }
+    }
+    Ok(out)
+}
+
+/// Emite uma prova de inclusão canónica para um LSN de um arquivo HRKL v6.
+/// A operação é intencionalmente explícita: exige segmento selado e verifica a
+/// decodificação do payload antes de construir a prova.
+pub fn prove_v6_lsn(
+    segment: &std::path::Path,
+    lsn: u64,
+) -> Result<String, heraclitus_core::HeraclitusError> {
+    let proof = prove_lsn(
+        segment,
+        lsn,
+        HARD_MAX_BLOCK_BYTES,
+        &heraclitus_log::canonical_hash_storage_payload_v6,
+    )?
+    .ok_or_else(|| {
+        heraclitus_core::HeraclitusError::Config(format!(
+            "LSN {lsn} não existe no segmento HRKL v6: {}",
+            segment.display()
+        ))
+    })?;
+    if !proof.verify() {
+        return Err(heraclitus_core::HeraclitusError::Corruption {
+            context: format!("prova HRKL v6: {}", segment.display()),
+            detail: "a prova construída não fecha contra a raiz declarada".into(),
+        });
+    }
+
+    let mut out = format!(
+        "HRKL v6 inclusion proof\nsegment: {}\nlsn: {}\ncanonical record hash: {}\nlogical root: {}\nleaf: {}/{}\nattestation imprint: {}\npath:\n",
+        segment.display(),
+        proof.lsn,
+        hex32(&proof.canonical_record_hash),
+        hex32(&proof.logical_root),
+        proof.proof.leaf_index,
+        proof.proof.leaf_count,
+        hex32(&proof.envelope.imprint()),
+    );
+    for (index, step) in proof.proof.path.iter().enumerate() {
+        let side = if step.sibling_is_left { "left" } else { "right" };
+        out.push_str(&format!("  {index}: sibling {side} {}\n", hex32(&step.sibling)));
+    }
+    out.push_str("proof verifies: true");
+    Ok(out)
+}
+
 /// Migração offline e não destrutiva para encryption-at-rest.
 ///
 /// A origem e o destino são *data dirs* (cada um contém `log/`). O destino tem
@@ -238,9 +384,12 @@ pub fn migrate_encrypt(
     ))
 }
 
-/// Anchor the current sealed state with a legal timestamp (RFC 3161). With no
-/// `--tsa-url`, an in-process dev ACT is used (proves the flow without
-/// credentials); with one, a real homologated ACT (e.g. SERPRO) is called.
+/// Anchor the current sealed state as development evidence.
+///
+/// With no `--tsa-url`, an in-process dev ACT proves the end-to-end flow but
+/// has no ICP-Brasil or legal validity. With one, the current client only stores
+/// a raw external token over HTTP; HTTPS, CMS/X.509 and ICP-Brasil validation
+/// are deliberately not claimed by this build.
 pub fn anchor(
     log_dir: &std::path::Path,
     receipts_dir: &std::path::Path,
@@ -255,30 +404,41 @@ pub fn anchor(
             "nada selado para ancorar (sem segmentos selados); apenda mais eventos primeiro".into(),
         );
     }
+    let external_tsa = tsa_url.is_some();
     let tsa: Box<dyn TsaClient> = match tsa_url {
         Some(u) => Box::new(HttpTsa::new(u, policy)),
         None => Box::new(LocalTsa::generate(policy)),
     };
     let r = anchor(&log, tsa.as_ref(), receipts_dir, None).map_err(|e| e.to_string())?;
+    let timestamp_note = if external_tsa {
+        "token externo armazenado; cadeia CMS/X.509/ICP-Brasil NÃO validada; hora gravada é local"
+    } else {
+        "token de desenvolvimento verificado localmente; não é carimbo ICP-Brasil"
+    };
     Ok(format!(
-        "ancorado: LSN {} · {} segmentos · root {}…\n  imprint SHA-256 {}…\n  carimbo {} (ms epoch) · ACT '{}'\n  recibo: {}",
+        "ancorado: LSN {} · {} segmentos · root {}…\n  imprint SHA-256 {}…\n  registro {} (ms epoch) · origem '{}' · {}\n  recibo: {}",
         r.lsn,
         r.segments,
         &r.root_hex[..r.root_hex.len().min(16)],
         &r.imprint_hex[..r.imprint_hex.len().min(16)],
         r.gen_unix_ms,
         r.policy,
+        timestamp_note,
         r.token_file
     ))
 }
 
 /// Re-verify every persisted receipt against the live log — the forensic check.
-/// A FALHA means the log was altered retroactively below that watermark.
+/// A FALHA means the log was altered retroactively below that watermark. An
+/// INCONCLUSIVO result means the commitment matches but the timestamp token
+/// still has no external trust-chain verifier.
 pub fn verify_receipts(
     log_dir: &std::path::Path,
     receipts_dir: &std::path::Path,
 ) -> Result<String, String> {
-    use heraclitus_compliance::{load_manifest, verify_receipt};
+    use heraclitus_compliance::{
+        load_manifest, verify_receipt, ReceiptVerification, TimestampValidationState,
+    };
     let log =
         Log::open(log_dir, segmento(), FsyncPolicy::Always).map_err(|e| e.to_string())?;
     let receipts = load_manifest(receipts_dir).map_err(|e| e.to_string())?;
@@ -302,27 +462,49 @@ pub fn verify_receipts(
         }
     };
     out += &format!("{} recibo(s) a verificar:\n", receipts.len());
-    let mut all_ok = true;
+    let mut integrity_ok = true;
+    let mut timestamp_unvalidated = false;
     for r in &receipts {
         match verify_receipt(&log, receipts_dir, r) {
-            Ok(v) => {
+            Ok(ReceiptVerification::DevelopmentOnly(v)) => {
                 out += &format!(
-                    "  OK    LSN {:>12}  {} seg  carimbo {} ms  ACT '{}'\n",
+                    "  DEV   LSN {:>12}  {} seg  registro {} ms  origem '{}' (não ICP-Brasil)\n",
                     r.lsn, r.segments, v.gen_unix_ms, r.policy
                 );
             }
+            Ok(ReceiptVerification::CommitmentOnly(state)) => {
+                timestamp_unvalidated = true;
+                let detail = match state {
+                    TimestampValidationState::ExternalTokenUnvalidated => {
+                        "token externo sem validação CMS/X.509/ICP-Brasil"
+                    }
+                    TimestampValidationState::LegacyUnverified => {
+                        "manifesto legado sem estado de validação"
+                    }
+                    TimestampValidationState::DevelopmentOnly => unreachable!(
+                        "a verificação de desenvolvimento retorna DevelopmentOnly"
+                    ),
+                };
+                out += &format!(
+                    "  INCONCLUSIVO LSN {:>12}  commitment CONFERE · {}\n",
+                    r.lsn, detail
+                );
+            }
             Err(e) => {
-                all_ok = false;
+                integrity_ok = false;
                 out += &format!("  FALHA LSN {:>12}  {}\n", r.lsn, e);
             }
         }
     }
-    if all_ok {
-        out += "\nTODOS os recibos conferem — log íntegro e não adulterado retroativamente.";
-        Ok(out)
-    } else {
+    if !integrity_ok {
         out += "\n*** ATENÇÃO: pelo menos um recibo NÃO confere — possível adulteração retroativa do log. ***";
         Err(out)
+    } else if timestamp_unvalidated {
+        out += "\nINCONCLUSIVO: os commitments conferem; esta build não valida a cadeia de confiança dos tokens externos. Isto NÃO é uma deteção de fraude e NÃO é validação legal/ICP-Brasil.";
+        Err(out)
+    } else {
+        out += "\nTodos os commitments e tokens de desenvolvimento conferem — nenhuma validação legal/ICP-Brasil foi executada.";
+        Ok(out)
     }
 }
 
@@ -464,6 +646,160 @@ pub fn bench_recall(n: usize, dim: usize, queries: usize) -> BenchReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ExternalTsa;
+
+    impl heraclitus_compliance::TsaClient for ExternalTsa {
+        fn policy_name(&self) -> &str {
+            "ACT-externa-de-teste"
+        }
+
+        fn validation_state(&self) -> heraclitus_compliance::TimestampValidationState {
+            heraclitus_compliance::TimestampValidationState::ExternalTokenUnvalidated
+        }
+
+        fn stamp(
+            &self,
+            _imprint: &[u8; 32],
+        ) -> Result<Vec<u8>, heraclitus_compliance::CompError> {
+            Ok(vec![0x30, 0x00])
+        }
+    }
+
+    fn v6_hasher(lsn: u64, hlc: u64, payload: &[u8]) -> heraclitus_log::v6::V6Result<[u8; 32]> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"HERACLITUS:CLI:V6:TEST\\0");
+        hasher.update(&lsn.to_le_bytes());
+        hasher.update(&hlc.to_le_bytes());
+        hasher.update(payload);
+        Ok(*hasher.finalize().as_bytes())
+    }
+
+    fn write_v6_raw(path: &std::path::Path, records: u64) {
+        use heraclitus_log::v6::raw::{RawSegmentWriter, SegmentInit};
+
+        let mut writer = RawSegmentWriter::create(
+            path,
+            SegmentInit {
+                segment_id: 17,
+                created_hlc: 10,
+                first_lsn: 100,
+                writer_epoch: 1,
+                storage_namespace_id: [0xA5; 16],
+            },
+        )
+        .unwrap();
+        for i in 0..records {
+            let payload = format!("cli v6 record {i}").into_bytes();
+            let lsn = 100 + i;
+            let hlc = 1_000 + i;
+            writer
+                .append(lsn, hlc, &payload, &v6_hasher(lsn, hlc, &payload).unwrap())
+                .unwrap();
+        }
+        writer.seal().unwrap();
+    }
+
+    #[test]
+    fn cli_marks_unvalidated_external_token_inconclusive_not_tampered() {
+        use heraclitus_compliance::anchor as anchor_receipt;
+        use heraclitus_core::{Episode, EventKind};
+
+        let root = tempfile::tempdir().unwrap();
+        let log_dir = root.path().join("log");
+        let receipts = root.path().join("receipts");
+        let log = Log::open(&log_dir, 256, FsyncPolicy::Always).unwrap();
+        for i in 0..120 {
+            log.append(Episode::new(
+                "auditor",
+                EventKind::Observation,
+                format!("evento {i}").into_bytes(),
+            ))
+            .unwrap();
+        }
+        anchor_receipt(&log, &ExternalTsa, &receipts, None).unwrap();
+        drop(log);
+
+        let report = verify_receipts(&log_dir, &receipts).unwrap_err();
+        assert!(report.contains("INCONCLUSIVO"));
+        assert!(report.contains("NÃO é uma deteção de fraude"));
+        assert!(!report.contains("possível adulteração retroativa"));
+    }
+
+    #[test]
+    fn cli_inspect_and_verify_v6_raw_and_packed_segments() {
+        use heraclitus_log::v6::packed::PackOptions;
+        use heraclitus_log::v6::packer::pack_segment;
+
+        let root = tempfile::tempdir().unwrap();
+        let raw = root.path().join("000017.hrkl");
+        let packed = root.path().join("000017.g1.hrkl");
+        write_v6_raw(&raw, 128);
+        pack_segment(&raw, &packed, PackOptions::default(), 0, 1, &v6_hasher).unwrap();
+
+        let raw_inspect = inspect_v6(&raw).unwrap();
+        assert!(raw_inspect.contains("Physical Layout      RAW"));
+        assert!(verify_target(&raw)
+            .unwrap()
+            .contains("physical verification passed"));
+
+        let packed_inspect = inspect_v6(&packed).unwrap();
+        assert!(packed_inspect.contains("Physical Layout      PACKED"));
+        assert!(verify_target(&packed)
+            .unwrap()
+            .contains("physical verification passed"));
+    }
+
+    #[test]
+    fn cli_verify_v6_returns_error_for_a_corrupted_packed_block() {
+        use heraclitus_log::v6::block::BLOCK_HEADER_LEN;
+        use heraclitus_log::v6::header::FILE_HEADER_LEN;
+        use heraclitus_log::v6::packed::PackOptions;
+        use heraclitus_log::v6::packer::pack_segment;
+
+        let root = tempfile::tempdir().unwrap();
+        let raw = root.path().join("000017.hrkl");
+        let packed = root.path().join("000017.g1.hrkl");
+        write_v6_raw(&raw, 128);
+        pack_segment(&raw, &packed, PackOptions::default(), 0, 1, &v6_hasher).unwrap();
+
+        let mut bytes = std::fs::read(&packed).unwrap();
+        bytes[FILE_HEADER_LEN + BLOCK_HEADER_LEN + 3] ^= 0xFF;
+        std::fs::write(&packed, bytes).unwrap();
+
+        let error = verify_target(&packed).unwrap_err();
+        assert!(error.to_string().contains("verificação HRKL v6"));
+    }
+
+    #[test]
+    fn cli_logical_verify_and_prove_use_the_official_storage_payload_hasher() {
+        use heraclitus_core::{Episode, EventKind};
+        use heraclitus_log::v6::V6Log;
+
+        let root = tempfile::tempdir().unwrap();
+        let v6_root = root.path().join("v6");
+        let log = V6Log::open(&v6_root, 1 << 20, FsyncPolicy::Always).unwrap();
+        for i in 0..5 {
+            log.append(Episode::new(
+                "cli-proof",
+                EventKind::Observation,
+                format!("record-{i}").into_bytes(),
+            ))
+            .unwrap();
+        }
+        log.seal_active().unwrap();
+        let segment = v6_root
+            .join("segments")
+            .join("00000000000000000000.g0000.raw.hrkl");
+
+        let verification = verify_target_with_level(&segment, true).unwrap();
+        assert!(verification.contains("logical + physical verification passed"));
+        assert!(verification.contains("logical root (recomputed)"));
+
+        let proof = prove_v6_lsn(&segment, 3).unwrap();
+        assert!(proof.contains("lsn: 3"));
+        assert!(proof.contains("proof verifies: true"));
+    }
 
     #[test]
     fn bench_harness_recall_sane() {

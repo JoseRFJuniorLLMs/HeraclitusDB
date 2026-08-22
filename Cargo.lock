@@ -3093,6 +3093,7 @@ name = "heraclitus-index-vector"
 version = "1.0.5"
 dependencies = [
  "bincode",
+ "blake3",
  "criterion",
  "heraclitus-core",
  "heraclitus-gpu",
@@ -3101,6 +3102,7 @@ dependencies = [
  "rand 0.8.7",
  "roaring",
  "serde",
+ "serde_json",
  "tempfile",
  "ulid",
 ]
@@ -3133,6 +3135,7 @@ dependencies = [
  "heraclitus-btree",
  "heraclitus-core",
  "heraclitus-crypto",
+ "lz4_flex 0.11.6",
  "memmap2",
  "metrics",
  "proptest",
@@ -3142,6 +3145,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "ulid",
+ "zstd",
 ]
 
 [[package]]
@@ -4032,6 +4037,12 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+
+[[package]]
+name = "lz4_flex"
+version = "0.11.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
 
 [[package]]
 name = "lz4_flex"

@@ -93,6 +93,10 @@ serde_json = "1"
 bincode = { version = "2", features = ["serde"] }
 thiserror = "2"
 crc32fast = "1"
+# SPEC-0050 §32/§33 — codecs de bloco do HRKL v6 PACKED. Zstd é o default
+# (perfil "balanced", nível 3); LZ4 serve o perfil "fast" do tier warm.
+zstd = "0.13"
+lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 blake3 = "1"
 memmap2 = "0.9.11"
 crossbeam-channel = "0.5"

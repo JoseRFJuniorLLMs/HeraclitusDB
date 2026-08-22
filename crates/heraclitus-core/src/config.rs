@@ -169,8 +169,9 @@ pub struct HeraclitusConfig {
     pub compliance_interval_secs: u64,
     /// Minimum LSN advance between anchors.
     pub compliance_min_lsn_step: u64,
-    /// `"local"` (in-process dev ACT) or `"http"` (real RFC 3161 ACT at
-    /// `compliance_tsa_url`).
+    /// `"local"` (in-process dev ACT) or `"http"` (external RFC 3161 token
+    /// intake at `compliance_tsa_url`). The HTTP backend is not valid for a
+    /// production compliance boundary: it has no TLS or trust-chain verifier.
     pub compliance_tsa_mode: String,
     /// ACT endpoint when `compliance_tsa_mode = "http"`.
     pub compliance_tsa_url: String,
@@ -616,9 +617,26 @@ impl HeraclitusConfig {
                 || self.compliance_tsa_url.is_empty()
             {
                 return Err(invalid(
-                    "produção exige compliance RFC3161 por TSA HTTP configurada".into(),
+                    "produção exige uma TSA externa configurada; LocalTsa não é evidência legal"
+                        .into(),
                 ));
             }
+            if self.compliance_tsa_url.starts_with("http://") {
+                return Err(invalid(
+                    "produção proíbe TSA em HTTP puro; esta build não implementa transporte HTTPS seguro"
+                        .into(),
+                ));
+            }
+            if self.compliance_tsa_url.starts_with("https://") {
+                return Err(invalid(
+                    "produção com TSA HTTPS está bloqueada: esta build ainda não implementa HTTPS nem validação CMS/X.509/ICP-Brasil"
+                        .into(),
+                ));
+            }
+            return Err(invalid(
+                "produção exige URL HTTPS para TSA externa, mas suporte HTTPS e validação de confiança ainda não estão implementados"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -700,7 +718,18 @@ mod tests {
             token_blake3: "b".repeat(64),
             roles: vec![AccessRole::Writer],
         });
-        assert!(cfg.validate_security().is_ok());
+        let err = cfg.validate_security().unwrap_err().to_string();
+        assert!(
+            err.contains("HTTPS") && err.contains("bloqueada"),
+            "configuração não pode alegar compliance de produção sem transporte e trust chain: {err}"
+        );
+
+        cfg.compliance_tsa_url = "http://tsa.example.invalid".into();
+        assert!(cfg
+            .validate_security()
+            .unwrap_err()
+            .to_string()
+            .contains("HTTP puro"));
 
         cfg.rest_basic_auth = Some("admin:short".into());
         assert!(cfg.validate_security().is_err());

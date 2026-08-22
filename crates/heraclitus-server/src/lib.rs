@@ -332,11 +332,16 @@ pub async fn serve_with(
             config.compliance_min_lsn_step,
             config.data_dir.join("receipts"),
         );
+        let evidence_status = if config.compliance_tsa_mode.eq_ignore_ascii_case("http") {
+            "token externo sem validação CMS/X.509/ICP-Brasil"
+        } else {
+            "token de desenvolvimento; não é ICP-Brasil"
+        };
         boot.warn_line(
-            "Compliance RFC 3161",
+            "Compliance evidence",
             &format!(
-                "carimbo de tempo ATIVO · modo {}",
-                config.compliance_tsa_mode
+                "ancoragem ATIVA · modo {} · {}",
+                config.compliance_tsa_mode, evidence_status
             ),
         );
         let log = engine.log.clone();

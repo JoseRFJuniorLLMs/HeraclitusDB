@@ -6,12 +6,12 @@
 //!   [`DevToken`] (a P-256 signed `DevTstInfo`) so the whole anchor → stamp →
 //!   verify loop is exercised end-to-end **without any government credential**.
 //!   It is NOT RFC 3161 / ICP-Brasil valid; it exists to prove the architecture.
-//! * [`HttpTsa`] — POSTs a real RFC 3161 `TimeStampReq` to a homologated ACT
-//!   (SERPRO etc.) and returns the raw `.tst` (a CMS `TimeStampToken`). Use this
-//!   in production; the token carries legal weight, validated by the production
-//!   verifier against ICP-Brasil roots.
+//! * [`HttpTsa`] — POSTs a RFC 3161 `TimeStampReq` to an external endpoint and
+//!   returns its raw `.tst`. This is an evidence-ingestion scaffold only: this
+//!   build does not support HTTPS transport or validate CMS/X.509/ICP-Brasil.
 
 use crate::rfc3161::{MessageImprint, TimeStampReq};
+use crate::receipt::TimestampValidationState;
 use crate::{now_unix_ms, CompError};
 use der::asn1::OctetString;
 use der::{Encode, Sequence};
@@ -25,6 +25,12 @@ use std::time::Duration;
 pub trait TsaClient {
     /// Human-readable policy/authority name recorded in the receipt.
     fn policy_name(&self) -> &str;
+    /// Provenance that can be established by this client implementation.
+    ///
+    /// Implementations must never return a state stronger than they can prove.
+    /// In particular, an external token remains unvalidated until a CMS/X.509
+    /// verifier and an explicit trust store are available.
+    fn validation_state(&self) -> TimestampValidationState;
     /// Stamp `imprint`, returning DER token bytes to persist verbatim.
     fn stamp(&self, imprint: &[u8; 32]) -> Result<Vec<u8>, CompError>;
 }
@@ -84,6 +90,10 @@ impl TsaClient for LocalTsa {
         &self.name
     }
 
+    fn validation_state(&self) -> TimestampValidationState {
+        TimestampValidationState::DevelopmentOnly
+    }
+
     fn stamp(&self, imprint: &[u8; 32]) -> Result<Vec<u8>, CompError> {
         let info = DevTstInfo {
             version: 1,
@@ -101,9 +111,12 @@ impl TsaClient for LocalTsa {
     }
 }
 
-/// Production ACT over RFC 3161 HTTP. Plain `http://` only — for `https://`
-/// terminate TLS at a reverse proxy in the órgão's network, or extend this with
-/// a vetted TLS stack. Returns the raw CMS `TimeStampToken` bytes.
+/// External RFC 3161 endpoint over plain HTTP.
+///
+/// This client is deliberately unavailable to a production configuration:
+/// plain `http://` is not an acceptable trust boundary and `https://` is not
+/// implemented here. It returns raw bytes only; CMS/X.509 validation is a
+/// separate, still-missing capability.
 pub struct HttpTsa {
     url: String,
     policy: String,
@@ -125,6 +138,10 @@ impl TsaClient for HttpTsa {
         &self.policy
     }
 
+    fn validation_state(&self) -> TimestampValidationState {
+        TimestampValidationState::ExternalTokenUnvalidated
+    }
+
     fn stamp(&self, imprint: &[u8; 32]) -> Result<Vec<u8>, CompError> {
         let mut nonce = [0u8; 8];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
@@ -140,8 +157,9 @@ impl TsaClient for HttpTsa {
 }
 
 /// Minimal HTTP/1.1 POST of a binary body, returning the response body bytes.
-/// Honest scope: `http://` + `Content-Length` responses (what RFC 3161 ACTs
-/// return). No TLS, no chunked transfer — production hardening is a follow-up.
+/// Honest scope: `http://` + `Content-Length` responses. No TLS, no chunked
+/// transfer, response parsing, or trust validation — never use this transport
+/// as a production compliance boundary.
 fn http_post_der(
     url: &str,
     content_type: &str,
@@ -150,7 +168,7 @@ fn http_post_der(
 ) -> Result<Vec<u8>, CompError> {
     let rest = url.strip_prefix("http://").ok_or_else(|| {
         CompError::Unsupported(
-            "HttpTsa só suporta http:// nesta versão (use proxy TLS para https)".into(),
+            "HttpTsa só suporta http:// nesta versão; HTTPS e validação de confiança ainda não estão implementados".into(),
         )
     })?;
     let (authority, path) = match rest.find('/') {

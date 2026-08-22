@@ -20,6 +20,7 @@ pub mod format;
 pub mod mmap;
 pub mod skip_scan; // SPEC-010: segment-level skip-I/O scan wired on zone maps
 pub mod subscribe; // SPEC-022: StreamSubscriber ligado ao tail do log
+pub mod v6; // SPEC-0050: HRKL v6 — canónico, PACKED, sidecars e lakehouse
 pub mod vm_bridge;
 pub mod zone_map; // SPEC-010: per-segment min/max skip-I/O primitive
 
@@ -280,22 +281,206 @@ impl StoragePayloadV3 {
 /// Consumidores: read/scan internos e o tier (recall-on-demand). O `content`
 /// volta como foi persistido (cifrado se havia keystore).
 pub fn decode_episode_payload(version: u16, payload: &[u8]) -> Result<Episode, HeraclitusError> {
+    Ok(decode_episode_payload_with_meta(version, payload)?.episode)
+}
+
+/// Resultado da descodificação do payload persistido.
+///
+/// O `Episode` público não carrega `opaque_meta`, mas esse campo faz parte da
+/// identidade canónica do HRKL v6. Expor os dois juntos evita a armadilha de
+/// reconstruir uma raiz lógica a partir de `Episode` e, sem querer, apagar os
+/// 16 bytes de metadados de consenso da prova.
+#[derive(Debug, Clone)]
+pub struct DecodedStoragePayload {
+    pub opaque_meta: [u8; 16],
+    pub episode: Episode,
+}
+
+/// Descodifica um payload de armazenamento preservando o `opaque_meta`.
+///
+/// Esta é a ponte oficial entre o formato legado de payload (v1--v5) e o
+/// codec canónico v6. O formato físico do segmento v6 mantém inicialmente o
+/// `StoragePayload` v4/v5 (§42); portanto [`canonical_hash_storage_payload_v6`]
+/// usa esta função para que writer, packer, `verify --logical` e `prove` tenham
+/// exactamente a mesma regra.
+pub fn decode_episode_payload_with_meta(
+    version: u16,
+    payload: &[u8],
+) -> Result<DecodedStoragePayload, HeraclitusError> {
     if version >= 4 {
         let (sp, _): (StoragePayload, usize) =
             bincode::serde::decode_from_slice(payload, BINCODE_CFG)
                 .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
-        Ok(sp.into_episode())
+        Ok(DecodedStoragePayload {
+            opaque_meta: sp.opaque_meta,
+            episode: sp.into_episode(),
+        })
     } else if version == 3 {
         let (sp, _): (StoragePayloadV3, usize) =
             bincode::serde::decode_from_slice(payload, BINCODE_CFG)
                 .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
-        Ok(sp.into_episode())
+        Ok(DecodedStoragePayload {
+            opaque_meta: sp.opaque_meta,
+            episode: sp.into_episode(),
+        })
     } else {
         let (ep, _): (EpisodeV2, usize) =
             bincode::serde::decode_from_slice(payload, BINCODE_CFG)
                 .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
-        Ok(ep.into_episode())
+        // v1/v2 não persistiam opaque_meta. Zero é a única representação
+        // honesta para uma migração canónica desses formatos; a raiz legada
+        // nunca é reinterpretada como raiz v6 (§131).
+        Ok(DecodedStoragePayload {
+            opaque_meta: [0; 16],
+            episode: ep.into_episode(),
+        })
     }
+}
+
+/// Calcula o hash canónico oficial de um payload `StoragePayload` que será
+/// escrito num segmento v6 RAW/PACKED.
+///
+/// A função é intencionalmente pública: o packer e as ferramentas forenses
+/// recebem apenas `(lsn, hlc, payload)` do formato físico. Centralizar aqui a
+/// conversão impede que cada chamador invente uma interpretação de bincode ou
+/// esqueça `opaque_meta`.
+pub fn canonical_hash_storage_payload_v6(
+    lsn: Lsn,
+    record_hlc: u64,
+    payload: &[u8],
+) -> Result<[u8; 32], HeraclitusError> {
+    let stored = decode_episode_payload_with_meta(format::FORMAT_VERSION, payload)?;
+    Ok(v6::hash_episode_record(
+        lsn,
+        record_hlc,
+        stored.opaque_meta,
+        &stored.episode,
+    ))
+}
+
+/// Codifica o payload que a primeira geração v6 mantém compatível com o
+/// `StoragePayload` actual (§42). A cifra, quando configurada, é aplicada
+/// **antes** do hash canónico: o leitor/packer vê exactamente os bytes que
+/// ficaram persistidos e nunca plaintext acidentalmente.
+pub(crate) fn encode_storage_payload_v6(
+    opaque_meta: [u8; 16],
+    episode: &Episode,
+    keystore: Option<&KeyStore>,
+) -> Result<Vec<u8>, HeraclitusError> {
+    let (stored_content, stored_attrs, stored_embedding) = match keystore {
+        Some(ks) => {
+            let key = ks.get_or_create(&episode.agent_id).map_err(|e| {
+                HeraclitusError::Crypto(format!("Keystore Isolation Fault: {e:?}"))
+            })?;
+            let stored_content = heraclitus_crypto::seal(
+                &key,
+                &episode.content,
+                episode.agent_id.as_bytes(),
+            );
+            let public_attrs = episode
+                .attrs
+                .iter()
+                .filter(|(k, _)| is_public_technical_attr(k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let sensitive = SensitiveFields {
+                attrs: episode
+                    .attrs
+                    .iter()
+                    .filter(|(k, _)| !is_public_technical_attr(k))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                embedding: episode.embedding.clone(),
+            };
+            let encoded = bincode::serde::encode_to_vec(&sensitive, BINCODE_CFG)
+                .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+            let sealed_fields = heraclitus_crypto::seal(&key, &encoded, &fields_aad(&episode.agent_id));
+            let mut attrs = public_attrs;
+            attrs.insert(ENCRYPTED_FIELDS_ATTR.into(), hex_encode(&sealed_fields));
+            (stored_content, attrs, None)
+        }
+        None => (
+            episode.content.clone(),
+            episode.attrs.clone(),
+            episode.embedding.clone(),
+        ),
+    };
+
+    let storage_payload = StoragePayload {
+        opaque_meta,
+        id: episode.id,
+        agent_id: episode.agent_id.clone(),
+        session_id: episode.session_id.clone(),
+        ts_hlc: episode.ts_hlc,
+        kind: episode.kind.clone(),
+        content: stored_content,
+        embedding: stored_embedding,
+        attrs: stored_attrs,
+        parents: episode.parents.clone(),
+        valid_from: episode.valid_from,
+        valid_to: episode.valid_to,
+    };
+    bincode::serde::encode_to_vec(&storage_payload, BINCODE_CFG)
+        .map_err(|e| HeraclitusError::Serialization(e.to_string()))
+}
+
+/// Reverte a cifra de um `Episode` já reconstruído do payload persistido.
+/// Mantida fora de [`Log`] para que o reader v6 siga exactamente a mesma
+/// semântica de crypto-shredding do reader legado.
+pub(crate) fn decrypt_storage_episode_in_place(
+    ep: &mut Episode,
+    keystore: Option<&KeyStore>,
+) -> Result<(), HeraclitusError> {
+    let Some(ks) = keystore else {
+        return Ok(());
+    };
+    let encrypted_content = heraclitus_crypto::is_encrypted(&ep.content);
+    let encrypted_fields = ep.attrs.remove(ENCRYPTED_FIELDS_ATTR);
+    if !encrypted_content && encrypted_fields.is_none() {
+        return Ok(());
+    }
+
+    let Some(key) = ks.get(&ep.agent_id) else {
+        // Ausência é a semântica normal de crypto-shredding, não corrupção.
+        ep.content = heraclitus_crypto::SHREDDED.to_vec();
+        ep.embedding = None;
+        ep.attrs.retain(|k, _| is_public_technical_attr(k));
+        ep.attrs.insert(SHREDDED_ATTR.into(), "true".into());
+        return Ok(());
+    };
+
+    if encrypted_content {
+        let opened = heraclitus_crypto::open(&key, &ep.content, ep.agent_id.as_bytes())
+            .ok_or_else(|| {
+                HeraclitusError::Crypto(format!(
+                    "Assinatura inválida detectada na cifra do agente: {}",
+                    ep.agent_id
+                ))
+            })?;
+        ep.content = opened;
+    }
+
+    if let Some(encoded_hex) = encrypted_fields {
+        let sealed = hex_decode(&encoded_hex).ok_or_else(|| {
+            HeraclitusError::Crypto(format!(
+                "Envelope de atributos ilegível para o agente: {}",
+                ep.agent_id
+            ))
+        })?;
+        let opened = heraclitus_crypto::open(&key, &sealed, &fields_aad(&ep.agent_id))
+            .ok_or_else(|| {
+                HeraclitusError::Crypto(format!(
+                    "Assinatura inválida no envelope de atributos do agente: {}",
+                    ep.agent_id
+                ))
+            })?;
+        let (sensitive, _): (SensitiveFields, usize) =
+            bincode::serde::decode_from_slice(&opened, BINCODE_CFG)
+                .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+        ep.attrs.extend(sensitive.attrs);
+        ep.embedding = sensitive.embedding;
+    }
+    Ok(())
 }
 
 impl StoragePayload {
@@ -401,6 +586,30 @@ impl Log {
         fsync: FsyncPolicy,
     ) -> Result<Self, HeraclitusError> {
         Self::open_with_keystore(dir, segment_max_bytes, fsync, None)
+    }
+
+    /// Abre o motor HRKL v6 explícito, isolado do layout legado v1--v5.
+    ///
+    /// O retorno é [`v6::V6Log`], não `Log`: trocar o backend por baixo de
+    /// uma base existente seria uma migração implícita e insegura. Chamadores
+    /// novos podem adoptar este caminho; bases legadas continuam em `open` até
+    /// uma migração v1--v5→v6 auditável ser executada.
+    pub fn open_v6(
+        dir: impl Into<PathBuf>,
+        segment_max_bytes: u64,
+        fsync: FsyncPolicy,
+    ) -> Result<v6::V6Log, HeraclitusError> {
+        v6::V6Log::open(dir, segment_max_bytes, fsync)
+    }
+
+    /// Variante v6 com a mesma cifra por `agent_id` do caminho legado.
+    pub fn open_v6_with_keystore(
+        dir: impl Into<PathBuf>,
+        segment_max_bytes: u64,
+        fsync: FsyncPolicy,
+        keystore: Option<Arc<KeyStore>>,
+    ) -> Result<v6::V6Log, HeraclitusError> {
+        v6::V6Log::open_with_keystore(dir, segment_max_bytes, fsync, keystore)
     }
 
     pub fn open_with_keystore(
@@ -1769,6 +1978,12 @@ impl Log {
             segments,
             cumulative_watermark: head,
             statistics_root_hash: [0; 32],
+            // SPEC-0050 §70: o catálogo v2 é povoado pelo `.hrkm`
+            // (`v6::manifest::ManifestStore`), não por esta vista derivada do
+            // catálogo em memória. Deixá-lo vazio aqui é deliberado — o v1 é
+            // uma projecção barata do estado do writer, o v2 é o catálogo
+            // persistido com gerações físicas.
+            ..Default::default()
         }
     }
 
@@ -1792,57 +2007,7 @@ impl heraclitus_core::contracts::SegmentCatalog for Log {
 #[allow(clippy::needless_lifetimes)]
 impl Log {
     fn decrypt_in_place(&self, ep: &mut Episode) -> Result<(), HeraclitusError> {
-        let Some(ks) = &self.keystore else {
-            return Ok(());
-        };
-        let encrypted_content = heraclitus_crypto::is_encrypted(&ep.content);
-        let encrypted_fields = ep.attrs.remove(ENCRYPTED_FIELDS_ATTR);
-        if !encrypted_content && encrypted_fields.is_none() {
-            return Ok(());
-        }
-
-        let Some(key) = ks.get(&ep.agent_id) else {
-            // Ausência é a semântica normal do crypto-shred, não corrupção. Não
-            // podemos abortar scan/replay no primeiro titular eliminado.
-            ep.content = heraclitus_crypto::SHREDDED.to_vec();
-            ep.embedding = None;
-            ep.attrs.retain(|k, _| is_public_technical_attr(k));
-            ep.attrs.insert(SHREDDED_ATTR.into(), "true".into());
-            return Ok(());
-        };
-
-        if encrypted_content {
-            let opened = heraclitus_crypto::open(&key, &ep.content, ep.agent_id.as_bytes())
-                .ok_or_else(|| {
-                    HeraclitusError::Crypto(format!(
-                        "Assinatura inválida detectada na cifra do agente: {}",
-                        ep.agent_id
-                    ))
-                })?;
-            ep.content = opened;
-        }
-
-        if let Some(encoded_hex) = encrypted_fields {
-            let sealed = hex_decode(&encoded_hex).ok_or_else(|| {
-                HeraclitusError::Crypto(format!(
-                    "Envelope de atributos ilegível para o agente: {}",
-                    ep.agent_id
-                ))
-            })?;
-            let opened = heraclitus_crypto::open(&key, &sealed, &fields_aad(&ep.agent_id))
-                .ok_or_else(|| {
-                    HeraclitusError::Crypto(format!(
-                        "Assinatura inválida no envelope de atributos do agente: {}",
-                        ep.agent_id
-                    ))
-                })?;
-            let (sensitive, _): (SensitiveFields, usize) =
-                bincode::serde::decode_from_slice(&opened, BINCODE_CFG)
-                    .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
-            ep.attrs.extend(sensitive.attrs);
-            ep.embedding = sensitive.embedding;
-        }
-        Ok(())
+        decrypt_storage_episode_in_place(ep, self.keystore.as_deref())
     }
 }
 

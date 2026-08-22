@@ -1,15 +1,17 @@
 //! heraclitus-compliance — a camada jurídica para cenário de governo.
 //!
 //! O motor garante a **integridade matemática** (log imutável + raiz de Merkle
-//! blake3). Este crate acrescenta a **validade jurídica** sem tocar nesse core:
+//! blake3). Este crate acrescenta uma camada de **evidência de desenvolvimento**
+//! sem tocar nesse core. Validade jurídica para um token RFC 3161 externo ainda
+//! depende de verificador CMS/X.509, trust store e política, que não existem
+//! nesta versão:
 //!
 //! 1. [`commit`] — funde os roots dos segmentos selados num único commitment
 //!    reproduzível até uma watermark LSN, e deriva o imprint SHA-256.
-//! 2. [`rfc3161`] — o pedido RFC 3161 que vai para uma ACT homologada (SERPRO /
-//!    Observatório Nacional).
+//! 2. [`rfc3161`] — o pedido RFC 3161 que pode ser enviado a uma ACT externa.
 //! 3. [`tsa`] — a ACT: [`tsa::LocalTsa`] (dev, ponta-a-ponta sem credencial) e
-//!    [`tsa::HttpTsa`] (produção).
-//! 4. [`verify`] — confere imprint + assinatura + extrai a hora.
+//!    [`tsa::HttpTsa`] (ingestão HTTP de token externo, não produção).
+//! 4. [`verify`] — confere o token de desenvolvimento e extrai a sua hora.
 //! 5. [`signer`] — assinatura institucional (CAdES) soft (dev) / HSM (produção).
 //! 6. [`receipt`] — o recibo jurídico persistido (token + manifesto auditável).
 //!
@@ -19,9 +21,10 @@
 //! mataria o QPS). Em vez disso, um worker assíncrono ancora o **estado
 //! consolidado** a cada marco (N LSNs / T minutos): captura a raiz de Merkle
 //! daquele instante, carimba o imprint SHA-256, e persiste o recibo. O que isto
-//! prova juridicamente é preciso: *aquele estado existia ANTES do instante
-//! oficial T* — combinado com a ordem causal interna (log + HLC), fecha a prova
-//! forense.
+//! prova localmente é preciso: o commitment é reproduzível até aquele watermark.
+//! A afirmação de que existia antes de um instante oficial exige validar o token
+//! externo contra uma cadeia de confiança, e não pode ser feita por este crate
+//! ainda.
 
 pub mod commit;
 pub mod receipt;
@@ -32,7 +35,7 @@ pub mod verify;
 pub mod worker;
 
 pub use commit::{commit_at, commit_now, current_watermark, Commitment};
-pub use receipt::{load_manifest, read_token, LegalReceipt};
+pub use receipt::{load_manifest, read_token, LegalReceipt, TimestampValidationState};
 pub use signer::{InstitutionalSignature, InstitutionalSigner, Pkcs11Signer, SoftKeySigner};
 pub use tsa::{HttpTsa, LocalTsa, TsaClient};
 pub use verify::{is_dev_token, verify_dev_token, VerifiedTime};
@@ -95,9 +98,22 @@ pub enum CompError {
     Unsupported(String),
 }
 
+/// What a receipt verification established.
+///
+/// `CommitmentOnly` is intentionally not an error: the log can be intact even
+/// while the timestamp token lacks a verifier. It must not be presented as an
+/// ICP-Brasil or other legal timestamp validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptVerification {
+    /// A development token was internally verified. It is not legal evidence.
+    DevelopmentOnly(VerifiedTime),
+    /// The commitment matches, but no authority-token trust validation exists.
+    CommitmentOnly(TimestampValidationState),
+}
+
 /// Anchor the log at `watermark` (or the current watermark when `None`):
 /// compute the commitment, timestamp its SHA-256 imprint via `tsa`, and persist
-/// a legal receipt under `receipts_dir`. Returns the receipt.
+/// an evidence receipt under `receipts_dir`. Returns the receipt.
 ///
 /// This is the per-marco operation a background worker calls — it never blocks
 /// or touches the append path.
@@ -111,25 +127,38 @@ pub fn anchor(
     let commitment = commit_at(log, wm);
     let imprint = commitment.message_imprint_sha256();
     let token = tsa.stamp(&imprint)?;
-    // Prefer the authority's own time when we can read it offline (dev token);
-    // otherwise record our wall clock (real RFC token time is validated by the
-    // production verifier against ICP-Brasil roots).
-    let gen_ms = verify_dev_token(&token, &imprint)
-        .map(|v| v.gen_unix_ms)
-        .unwrap_or_else(|_| now_unix_ms());
+    // A caller cannot elevate its own output by naming a policy or URL. Only
+    // LocalTsa's self-contained development token is decodable here; any other
+    // backend records local creation time and persists an explicit unvalidated
+    // state until a real external-token verifier exists.
+    let validation_state = tsa.validation_state();
+    let authority_gen_unix_ms = if validation_state == TimestampValidationState::DevelopmentOnly {
+        Some(
+            verify_dev_token(&token, &imprint)
+                .map_err(|e| CompError::Verify(format!("token de desenvolvimento inválido: {e}")))?
+                .gen_unix_ms,
+        )
+    } else {
+        None
+    };
+    let gen_ms = authority_gen_unix_ms.unwrap_or_else(now_unix_ms);
     receipt::persist(
         receipts_dir,
         &commitment,
         &imprint,
         tsa.policy_name(),
-        gen_ms,
+        receipt::TimestampEvidence {
+            recorded_unix_ms: gen_ms,
+            authority_gen_unix_ms,
+            validation_state,
+        },
         &token,
     )
 }
 
 /// Re-verify a previously issued receipt against the live log: recompute the
 /// commitment at the receipt's watermark, confirm the imprint matches what was
-/// timestamped, and (for dev tokens) verify the authority signature.
+/// timestamped, and (only for dev tokens) verify the authority signature.
 ///
 /// A mismatch means the log was altered retroactively below `receipt.lsn` — the
 /// exact fraud this layer is built to expose.
@@ -137,7 +166,7 @@ pub fn verify_receipt(
     log: &Log,
     receipts_dir: impl AsRef<Path>,
     receipt: &LegalReceipt,
-) -> Result<VerifiedTime, CompError> {
+) -> Result<ReceiptVerification, CompError> {
     let commitment = commit_at(log, receipt.lsn);
     let imprint = commitment.message_imprint_sha256();
     if receipt::to_hex(&imprint) != receipt.imprint_hex {
@@ -147,21 +176,18 @@ pub fn verify_receipt(
         )));
     }
     let token = receipt::read_token(receipts_dir, receipt)?;
-    // Distinguir "não consigo validar" de "fraude". `verify_dev_token` só sabe
-    // ler o token da autoridade de DESENVOLVIMENTO; um `.tst` RFC 3161 real
-    // (modo HttpTsa, produção) nunca descodifica como DevToken, e antes isso
-    // devolvia o mesmo erro de uma assinatura adulterada — ou seja, TODOS os
-    // recibos legítimos de produção eram reportados como fraude. O commitment
-    // (que é o que prova que o log não mudou) JÁ foi verificado acima.
-    match verify_dev_token(&token, &imprint) {
-        Ok(v) => Ok(v),
-        Err(e) if !verify::is_dev_token(&token) => Err(CompError::Verify(format!(
-            "commitment CONFERE (o log não foi alterado no LSN {}), mas o token é um \
-             RFC 3161 real e a validação da cadeia de confiança (ICP-Brasil) ainda não \
-             está implementada — isto NÃO é uma deteção de fraude. Detalhe: {e}",
-            receipt.lsn
-        ))),
-        Err(e) => Err(e),
+    match receipt.validation_state {
+        TimestampValidationState::DevelopmentOnly => {
+            verify_dev_token(&token, &imprint).map(ReceiptVerification::DevelopmentOnly)
+        }
+        TimestampValidationState::ExternalTokenUnvalidated
+        | TimestampValidationState::LegacyUnverified => {
+            // The commitment is already confirmed above. Do not conflate an
+            // absent authority-token verifier with evidence of fraud.
+            Ok(ReceiptVerification::CommitmentOnly(
+                receipt.validation_state,
+            ))
+        }
     }
 }
 
@@ -197,8 +223,17 @@ mod tests {
         assert_eq!(receipt.lsn, wm);
         assert!(receipt.segments >= 1);
 
-        // a fresh verification of an untouched log passes
-        verify_receipt(&log, receipts.path(), &receipt).unwrap();
+        // A fresh development receipt is explicitly not promoted to legal
+        // evidence, even though its self-contained token verifies.
+        assert!(matches!(
+            verify_receipt(&log, receipts.path(), &receipt).unwrap(),
+            ReceiptVerification::DevelopmentOnly(_)
+        ));
+        assert_eq!(
+            receipt.validation_state,
+            TimestampValidationState::DevelopmentOnly
+        );
+        assert_eq!(receipt.authority_gen_unix_ms, Some(receipt.gen_unix_ms));
 
         // the commitment is reproducible: same watermark → same imprint
         let again = commit_at(&log, wm).message_imprint_sha256();
@@ -221,5 +256,45 @@ mod tests {
         // forge the recorded imprint → verification must fail
         receipt.imprint_hex = receipt::to_hex(&[0u8; 32]);
         assert!(verify_receipt(&log, receipts.path(), &receipt).is_err());
+    }
+
+    struct ExternalTsa;
+
+    impl TsaClient for ExternalTsa {
+        fn policy_name(&self) -> &str {
+            "ACT-externa-de-teste"
+        }
+
+        fn validation_state(&self) -> TimestampValidationState {
+            TimestampValidationState::ExternalTokenUnvalidated
+        }
+
+        fn stamp(&self, _imprint: &[u8; 32]) -> Result<Vec<u8>, CompError> {
+            // Deliberately not a DevToken: the current build cannot validate
+            // an external RFC 3161/CMS token and must report that honestly.
+            Ok(vec![0x30, 0x00])
+        }
+    }
+
+    #[test]
+    fn external_token_is_commitment_only_not_fraud_or_legal_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let receipts = tempfile::tempdir().unwrap();
+        let log = Log::open(dir.path(), 256, FsyncPolicy::Always).unwrap();
+        append_n(&log, 120);
+
+        let receipt = anchor(&log, &ExternalTsa, receipts.path(), None).unwrap();
+        assert_eq!(
+            receipt.validation_state,
+            TimestampValidationState::ExternalTokenUnvalidated
+        );
+        assert_eq!(receipt.authority_gen_unix_ms, None);
+
+        assert_eq!(
+            verify_receipt(&log, receipts.path(), &receipt).unwrap(),
+            ReceiptVerification::CommitmentOnly(
+                TimestampValidationState::ExternalTokenUnvalidated
+            )
+        );
     }
 }
