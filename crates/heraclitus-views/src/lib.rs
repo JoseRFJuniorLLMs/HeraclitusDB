@@ -10,7 +10,7 @@
 //! recovery story is *always* "rebuild from LSN 0".
 
 use heraclitus_core::{Episode, HeraclitusError, Lsn};
-use heraclitus_log::Log;
+use heraclitus_log::EpisodeLog;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -170,7 +170,10 @@ impl ViewRegistry {
     }
 
     /// On startup: replay `(watermark, head]` for each view.
-    pub fn catch_up(&mut self, log: &Log) -> Result<u64, HeraclitusError> {
+    pub fn catch_up<L: EpisodeLog + ?Sized>(
+        &mut self,
+        log: &L,
+    ) -> Result<u64, HeraclitusError> {
         // Correção de correção (não só perf): um watermark persistido só é válido
         // se o ESTADO da view também tiver sido restaurado. Views que nascem vazias
         // (restore()==false, o default) têm o watermark forçado a 0 aqui, senão o
@@ -224,7 +227,11 @@ impl ViewRegistry {
     }
 
     /// `heraclitus-cli view rebuild --view X` — must always work from LSN 0.
-    pub fn rebuild(&mut self, log: &Log, view_name: Option<&str>) -> Result<(), HeraclitusError> {
+    pub fn rebuild<L: EpisodeLog + ?Sized>(
+        &mut self,
+        log: &L,
+        view_name: Option<&str>,
+    ) -> Result<(), HeraclitusError> {
         for v in self.views.iter_mut() {
             if view_name.map(|n| n == v.name()).unwrap_or(true) {
                 v.reset();
@@ -331,7 +338,8 @@ mod tests {
     fn wipe_and_replay_is_deterministic() {
         // M2 acceptance gate: rebuild from LSN 0 yields bit-identical state.
         let dir = tempfile::tempdir().unwrap();
-        let log = Log::open(dir.path().join("log"), 1 << 20, FsyncPolicy::Always).unwrap();
+        let log =
+            heraclitus_log::Log::open(dir.path().join("log"), 1 << 20, FsyncPolicy::Always).unwrap();
         for i in 0..50 {
             log.append(Episode::new(
                 "a",
@@ -363,7 +371,8 @@ mod tests {
         // nasce vazia (restore()==false) e catch_up confiasse no watermark, ela
         // ficaria sem `(0, watermark]` no restart. O fix força replay desde 0.
         let dir = tempfile::tempdir().unwrap();
-        let log = Log::open(dir.path().join("log"), 1 << 20, FsyncPolicy::Always).unwrap();
+        let log =
+            heraclitus_log::Log::open(dir.path().join("log"), 1 << 20, FsyncPolicy::Always).unwrap();
         for i in 0..50 {
             log.append(Episode::new(
                 "a",

@@ -7,7 +7,7 @@
 //!    from the log itself.
 
 use heraclitus_core::{Episode, EventId, EventKind, HeraclitusError, Lsn};
-use heraclitus_log::Log;
+use heraclitus_log::EpisodeLog;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -96,8 +96,8 @@ pub struct RetrievalFeedback {
 }
 
 /// Append a feedback event to the log so rerankers can be retrained offline.
-pub fn log_feedback(
-    log: &Log,
+pub fn log_feedback<L: EpisodeLog + ?Sized>(
+    log: &L,
     agent_id: &str,
     fb: &RetrievalFeedback,
 ) -> Result<Lsn, HeraclitusError> {
@@ -204,7 +204,8 @@ mod tests {
     #[test]
     fn feedback_is_a_log_event() {
         let dir = tempfile::tempdir().unwrap();
-        let log = Log::open(dir.path(), 1 << 20, heraclitus_core::FsyncPolicy::Always).unwrap();
+        let log = heraclitus_log::Log::open(dir.path(), 1 << 20, heraclitus_core::FsyncPolicy::Always)
+            .unwrap();
         let fb = RetrievalFeedback {
             query_id: "q1".into(),
             chosen: EventId::new(),
