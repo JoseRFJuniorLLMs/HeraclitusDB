@@ -42,7 +42,6 @@ pub use verify::{is_dev_token, verify_dev_token, VerifiedTime};
 pub use worker::{run_worker, tick};
 
 use heraclitus_core::Lsn;
-use heraclitus_log::Log;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -117,8 +116,8 @@ pub enum ReceiptVerification {
 ///
 /// This is the per-marco operation a background worker calls — it never blocks
 /// or touches the append path.
-pub fn anchor(
-    log: &Log,
+pub fn anchor<L: heraclitus_log::EpisodeLog + ?Sized>(
+    log: &L,
     tsa: &dyn TsaClient,
     receipts_dir: impl AsRef<Path>,
     watermark: Option<Lsn>,
@@ -162,8 +161,8 @@ pub fn anchor(
 ///
 /// A mismatch means the log was altered retroactively below `receipt.lsn` — the
 /// exact fraud this layer is built to expose.
-pub fn verify_receipt(
-    log: &Log,
+pub fn verify_receipt<L: heraclitus_log::EpisodeLog + ?Sized>(
+    log: &L,
     receipts_dir: impl AsRef<Path>,
     receipt: &LegalReceipt,
 ) -> Result<ReceiptVerification, CompError> {
@@ -194,6 +193,7 @@ pub fn verify_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use heraclitus_log::Log;
     use heraclitus_core::{Episode, EventKind, FsyncPolicy};
 
     fn append_n(log: &Log, n: usize) {

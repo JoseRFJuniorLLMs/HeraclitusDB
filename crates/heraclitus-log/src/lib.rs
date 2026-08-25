@@ -19,10 +19,13 @@ pub mod cpm;
 pub mod format;
 pub mod mmap;
 pub mod skip_scan; // SPEC-010: segment-level skip-I/O scan wired on zone maps
+pub mod store; // SPEC-0050: fachada explícita e neutra entre HRKL legado/v6
 pub mod subscribe; // SPEC-022: StreamSubscriber ligado ao tail do log
 pub mod v6; // SPEC-0050: HRKL v6 — canónico, PACKED, sidecars e lakehouse
 pub mod vm_bridge;
 pub mod zone_map; // SPEC-010: per-segment min/max skip-I/O primitive
+
+pub use store::{AnyLog, EpisodeLog, PrunedScanStats};
 
 use arc_swap::ArcSwap;
 use format::{Decoded, SegmentFooter, SegmentHeader, HEADER_LEN};
@@ -89,6 +92,21 @@ fn fields_aad(agent_id: &str) -> Vec<u8> {
 
 fn segment_path(dir: &Path, id: SegmentId) -> PathBuf {
     dir.join(format!("{id:020}.hrkl"))
+}
+
+/// Recusa uma raiz que já foi inicializada pelo motor v6. A verificação é
+/// executada antes de `create_dir_all` e antes de qualquer recovery legado:
+/// seleccionar o backend errado não pode criar um segmento v1--v5 ao lado de
+/// `segments/`/`manifests/` nem alterar bytes existentes.
+fn reject_v6_root(dir: &Path) -> Result<(), HeraclitusError> {
+    if dir.join("segments").is_dir() || dir.join("manifests").is_dir() {
+        return Err(HeraclitusError::Corruption {
+            context: "hrkl legacy open".into(),
+            detail: "HRKL v6 layout found; select storage_format=v6 or run an explicit migration"
+                .into(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -169,7 +187,8 @@ impl Drop for WorkerDropGuard {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct StoragePayload {
+#[doc(hidden)]
+pub struct StoragePayload {
     pub opaque_meta: [u8; 16],
     pub id: EventId,
     pub agent_id: String,
@@ -424,6 +443,87 @@ pub(crate) fn encode_storage_payload_v6(
         .map_err(|e| HeraclitusError::Serialization(e.to_string()))
 }
 
+/// Codifica o payload de um `Episode` **exactamente** como a geração de
+/// formato `version` o teria persistido.
+///
+/// Existe por duas razões, e nenhuma delas é conveniência de teste:
+///
+/// 1. **A matriz de compatibilidade v1–v5** (SPEC-0050 §206, "v1-v5 permanecem
+///    legíveis") precisa de fabricar segmentos de cada geração. Sem isto, cada
+///    teste replicaria o layout à mão e provaria a sua própria cópia em vez do
+///    formato real — foi assim que `v2_compat.rs` acabou a cobrir só o v2.
+/// 2. **O migrador legado→v6** (§132) precisa de reler payloads antigos e
+///    voltar a codificá-los sem inventar uma interpretação por geração.
+///
+/// A regra por versão espelha [`decode_episode_payload_with_meta`]: v1/v2
+/// persistiam o `Episode` directo (sem `opaque_meta`), v3 o `StoragePayloadV3`,
+/// v4+ o `StoragePayload` com valid time. Se as duas divergirem, o teste
+/// `roundtrip_por_versao` falha.
+///
+/// **Sem cifra**: esta função escreve o payload em claro. O caminho cifrado é
+/// [`encode_storage_payload_v6`], que aplica a cifra ANTES do hash canónico.
+#[doc(hidden)]
+pub fn encode_storage_payload_for_version(
+    version: u16,
+    opaque_meta: [u8; 16],
+    episode: &Episode,
+) -> Result<Vec<u8>, HeraclitusError> {
+    let ser = |v: Result<Vec<u8>, _>| v.map_err(|e: bincode::error::EncodeError| {
+        HeraclitusError::Serialization(e.to_string())
+    });
+    match version {
+        0 => Err(HeraclitusError::Config(
+            "format_version 0 não existe".into(),
+        )),
+        1 | 2 => {
+            // v1/v2 não persistiam `opaque_meta`: o payload era o `Episode`
+            // serializado directo. Serializar o `Episode` público dá
+            // exactamente o layout do `EpisodeV2` (mesma ordem de campos) —
+            // o teste `prefixo_v2_bate_com_episode` prova-o.
+            ser(bincode::serde::encode_to_vec(episode, BINCODE_CFG))
+        }
+        3 => ser(bincode::serde::encode_to_vec(
+            &StoragePayloadV3 {
+                opaque_meta,
+                id: episode.id,
+                agent_id: episode.agent_id.clone(),
+                session_id: episode.session_id.clone(),
+                ts_hlc: episode.ts_hlc,
+                kind: episode.kind.clone(),
+                content: episode.content.clone(),
+                embedding: episode.embedding.clone(),
+                attrs: episode.attrs.clone(),
+                parents: episode.parents.clone(),
+            },
+            BINCODE_CFG,
+        )),
+        // v4 e v5 partilham o layout do payload; o que muda entre elas é o
+        // algoritmo de CRC do registo, que vive em `format::encode_record`.
+        4 | 5 => ser(bincode::serde::encode_to_vec(
+            &StoragePayload {
+                opaque_meta,
+                id: episode.id,
+                agent_id: episode.agent_id.clone(),
+                session_id: episode.session_id.clone(),
+                ts_hlc: episode.ts_hlc,
+                kind: episode.kind.clone(),
+                content: episode.content.clone(),
+                embedding: episode.embedding.clone(),
+                attrs: episode.attrs.clone(),
+                parents: episode.parents.clone(),
+                valid_from: episode.valid_from,
+                valid_to: episode.valid_to,
+            },
+            BINCODE_CFG,
+        )),
+        other => Err(HeraclitusError::Config(format!(
+            "esta build não sabe codificar o payload da format_version {other} \
+             (a mais recente que conhece é {})",
+            format::FORMAT_VERSION
+        ))),
+    }
+}
+
 /// Reverte a cifra de um `Episode` já reconstruído do payload persistido.
 /// Mantida fora de [`Log`] para que o reader v6 siga exactamente a mesma
 /// semântica de crypto-shredding do reader legado.
@@ -619,6 +719,9 @@ impl Log {
         keystore: Option<Arc<KeyStore>>,
     ) -> Result<Self, HeraclitusError> {
         let dir = dir.into();
+        if dir.exists() {
+            reject_v6_root(&dir)?;
+        }
         std::fs::create_dir_all(&dir)?;
 
         check_and_recover_truncate_intent(&dir)?;

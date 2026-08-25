@@ -5,6 +5,33 @@
 //! proof. **Nothing is ever deleted.** Recall-on-demand fetches and
 //! re-scans cold segments. GDPR-style erasure is crypto-shredding
 //! (docs/CONSISTENCY.md) — planned, not yet implemented here.
+//!
+//! ## Dois tiers frios, deliberadamente
+//!
+//! | | v1 (este ficheiro) | v6 / SPEC-0050 Fase 5 |
+//! |---|---|---|
+//! | chave | `cold/{segment_id}.hrkl` | `canonical/…/generation-N.hrkl` (§82) |
+//! | republicar | `PUT` por cima | geração nova (§83) |
+//! | recall | descarrega o segmento todo | range GET só dos blocos (§85) |
+//! | recibo | raiz Merkle física | raiz lógica + digest físico + geração (§86) |
+//! | autoridade | — | `physical_digest`/`logical_root`, nunca o `ETag` (§84) |
+//!
+//! O v1 **não** foi migrado nem depreciado: os recibos já escritos no log
+//! apontam para `cold/…` e o log é imutável. Os dois prefixos coexistem no
+//! mesmo bucket sem se cruzarem, e [`receipts_v2::decode_receipt_payload`] lê
+//! qualquer um dos dois. O caminho novo é [`demotion::ColdTierV6`].
+
+pub mod demotion;
+pub mod lakehouse;
+pub mod generation;
+pub mod object_source;
+pub mod receipts_v2;
+
+pub use demotion::{ColdTierV6, ColdVerifyReport};
+pub use generation::GenerationKey;
+pub use object_source::{ColdReadStats, ColdSegmentReader, SparseSource};
+pub use receipts_v2::{AnyDemotionReceipt, DemotionReceiptV2};
+pub use lakehouse::worker::{ExportOutcome, LakehouseWorker};
 
 use arrow_array::{ArrayRef, BinaryArray, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
@@ -103,6 +130,15 @@ impl ColdTier {
     /// consenso via `Engine::append`. Um object store de nuvem é o que
     /// desbloqueia o demote em cluster (o objeto deixa de ser local ao nó).
     pub fn open_location(location: &str) -> Result<Self, HeraclitusError> {
+        Ok(Self {
+            store: Self::store_for(location)?,
+        })
+    }
+
+    /// O backend por trás de [`Self::open_location`], sem o invólucro do tier
+    /// v1 — é o que o [`crate::demotion::ColdTierV6`] usa para não haver duas
+    /// interpretações de um `location` no mesmo processo.
+    pub fn store_for(location: &str) -> Result<Arc<dyn ObjectStore>, HeraclitusError> {
         let lower = location.to_ascii_lowercase();
         if lower.starts_with("gs://") {
             #[cfg(feature = "gcp")]
@@ -111,9 +147,7 @@ impl ColdTier {
                     .with_url(location)
                     .build()
                     .map_err(|e| HeraclitusError::Storage(std::io::Error::other(e)))?;
-                return Ok(Self {
-                    store: Arc::new(store),
-                });
+                return Ok(Arc::new(store));
             }
             #[cfg(not(feature = "gcp"))]
             return Err(HeraclitusError::Config(
@@ -127,9 +161,7 @@ impl ColdTier {
                     .with_url(location)
                     .build()
                     .map_err(|e| HeraclitusError::Storage(std::io::Error::other(e)))?;
-                return Ok(Self {
-                    store: Arc::new(store),
-                });
+                return Ok(Arc::new(store));
             }
             #[cfg(not(feature = "aws"))]
             return Err(HeraclitusError::Config(
@@ -137,7 +169,10 @@ impl ColdTier {
             ));
         }
         // Sem scheme de nuvem ⇒ caminho local (o default).
-        Self::open_local(location)
+        std::fs::create_dir_all(location)?;
+        let store = LocalFileSystem::new_with_prefix(location)
+            .map_err(|e| HeraclitusError::Storage(std::io::Error::other(e)))?;
+        Ok(Arc::new(store))
     }
 
     /// O episódio-recibo canónico (kind = `DemotionReceipt`, payload JSON).
@@ -382,7 +417,7 @@ fn hex(bytes: &[u8; 32]) -> String {
 }
 
 /// Rótulo limpo do kind para a coluna Parquet (Custom(s) → s).
-fn kind_label(k: &EventKind) -> String {
+pub(crate) fn kind_label(k: &EventKind) -> String {
     match k {
         EventKind::Custom(s) => s.clone(),
         other => format!("{other:?}"),

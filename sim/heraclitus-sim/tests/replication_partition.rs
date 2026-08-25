@@ -6,8 +6,8 @@
 //! partition, the v0 guarantee. Leader-election failover is the openraft
 //! upgrade and is not claimed here.
 
-use heraclitus_core::{Episode, EventKind, FsyncPolicy};
-use heraclitus_log::Log;
+use heraclitus_core::{Episode, EventKind, FsyncPolicy, StorageFormat};
+use heraclitus_log::AnyLog;
 use heraclitus_raft::logs_equivalent;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,9 +19,14 @@ const BINCODE_CFG: bincode::config::Configuration = bincode::config::standard();
 fn partition_heals_with_zero_acked_loss() {
     let leader_dir = tempfile::tempdir().unwrap();
     let follower_dir = tempfile::tempdir().unwrap();
-    let leader_log = Arc::new(Log::open(leader_dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+    let leader_log = Arc::new(
+        AnyLog::open(StorageFormat::V6, leader_dir.path(), 1 << 20, FsyncPolicy::Always).unwrap(),
+    );
     let follower_log =
-        Arc::new(Log::open(follower_dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        Arc::new(
+            AnyLog::open(StorageFormat::V6, follower_dir.path(), 1 << 20, FsyncPolicy::Always)
+                .unwrap(),
+        );
 
     let mut sim = turmoil::Builder::new()
         .simulation_duration(std::time::Duration::from_secs(300))
@@ -117,7 +122,7 @@ fn partition_heals_with_zero_acked_loss() {
     );
 }
 
-async fn fetch_once(flog: &Log, from: u64) -> turmoil::Result {
+async fn fetch_once(flog: &AnyLog, from: u64) -> turmoil::Result {
     let mut sock = turmoil::net::TcpStream::connect("leader:9000").await?;
     sock.write_all(&from.to_le_bytes()).await?;
     let mut cnt = [0u8; 4];

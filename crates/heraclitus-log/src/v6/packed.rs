@@ -201,12 +201,22 @@ impl PackedSegmentWriter {
     }
 
     /// Fecha o segmento: bloco pendente, directório, footer, `fsync`.
-    pub fn finish(mut self) -> V6Result<(FooterV6, PackStats)> {
+    pub fn finish(self) -> V6Result<(FooterV6, PackStats)> {
+        self.finish_observed(&mut |_| Ok(()))
+    }
+
+    #[doc(hidden)]
+    pub fn finish_observed(
+        mut self,
+        observer: &mut dyn FnMut(PackingStage) -> V6Result<()>,
+    ) -> V6Result<(FooterV6, PackStats)> {
         self.flush_block()?;
+        observer(PackingStage::BlocksWritten)?;
         let dir_offset = self.offset;
         let dir_bytes = self.directory.encode();
         self.file.write_all(&dir_bytes)?;
         self.offset += dir_bytes.len() as u64;
+        observer(PackingStage::DirectoryWritten)?;
 
         let mut flags = 0u32;
         if self.contiguous && self.record_count > 0 {
@@ -244,7 +254,9 @@ impl PackedSegmentWriter {
             logical_root: self.acc.finalize(),
         };
         self.file.write_all(&footer.encode())?;
+        observer(PackingStage::FooterWritten)?;
         self.file.sync_all()?;
+        observer(PackingStage::PackedSynced)?;
 
         let mut stats = self.stats;
         stats.record_count = self.record_count;
@@ -329,8 +341,69 @@ pub struct ScanCounters {
     pub blocks_candidate: u64,
     pub blocks_pruned: u64,
     pub blocks_read: u64,
+    pub bytes_candidate: u64,
+    pub bytes_pruned: u64,
     pub bytes_physical_read: u64,
     pub bytes_decompressed: u64,
+}
+
+/// Fronteiras duráveis da transação de packing usadas por crash injection e
+/// tracing operacional. Os nomes seguem a ordem normativa da SPEC-0050 §88.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackingStage {
+    TempCreated,
+    SourceStreamed,
+    BlocksWritten,
+    DirectoryWritten,
+    FooterWritten,
+    PackedSynced,
+    LogicalVerified,
+    Published,
+    ParentSynced,
+    ReceiptPersisted,
+    ManifestCommitted,
+    GcManifestCommitted,
+    GcObjectsUnlinked,
+}
+
+impl PackingStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TempCreated => "temp_created",
+            Self::SourceStreamed => "source_streamed",
+            Self::BlocksWritten => "blocks_written",
+            Self::DirectoryWritten => "directory_written",
+            Self::FooterWritten => "footer_written",
+            Self::PackedSynced => "packed_synced",
+            Self::LogicalVerified => "logical_verified",
+            Self::Published => "published",
+            Self::ParentSynced => "parent_synced",
+            Self::ReceiptPersisted => "receipt_persisted",
+            Self::ManifestCommitted => "manifest_committed",
+            Self::GcManifestCommitted => "gc_manifest_committed",
+            Self::GcObjectsUnlinked => "gc_objects_unlinked",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        [
+            Self::TempCreated,
+            Self::SourceStreamed,
+            Self::BlocksWritten,
+            Self::DirectoryWritten,
+            Self::FooterWritten,
+            Self::PackedSynced,
+            Self::LogicalVerified,
+            Self::Published,
+            Self::ParentSynced,
+            Self::ReceiptPersisted,
+            Self::ManifestCommitted,
+            Self::GcManifestCommitted,
+            Self::GcObjectsUnlinked,
+        ]
+        .into_iter()
+        .find(|stage| stage.as_str() == value)
+    }
 }
 
 /// Leitor de um segmento PACKED.
@@ -410,6 +483,20 @@ impl<S: BlockSource> PackedSegmentReader<S> {
         self.footer.logical_root
     }
 
+    fn block_physical_bytes(&self, index: usize) -> u64 {
+        self.directory
+            .entries
+            .get(index)
+            .map(|entry| BLOCK_HEADER_LEN as u64 + entry.stored_len as u64)
+            .unwrap_or(0)
+    }
+
+    fn all_block_physical_bytes(&self) -> u64 {
+        (0..self.directory.len())
+            .map(|index| self.block_physical_bytes(index))
+            .sum()
+    }
+
     /// Lê e descomprime um bloco. Uma leitura física por bloco.
     pub fn read_block(
         &self,
@@ -453,11 +540,16 @@ impl<S: BlockSource> PackedSegmentReader<S> {
     /// bloco. O `ScanCounters` devolvido prova-o.
     pub fn get(&self, lsn: Lsn, counters: &mut ScanCounters) -> V6Result<Option<(u64, Vec<u8>)>> {
         counters.blocks_candidate += self.directory.len() as u64;
+        counters.bytes_candidate += self.all_block_physical_bytes();
         let Some(index) = self.directory.find_block_for_lsn(lsn) else {
             counters.blocks_pruned += self.directory.len() as u64;
+            counters.bytes_pruned += self.all_block_physical_bytes();
             return Ok(None);
         };
         counters.blocks_pruned += self.directory.len() as u64 - 1;
+        counters.bytes_pruned += self
+            .all_block_physical_bytes()
+            .saturating_sub(self.block_physical_bytes(index));
         let (header, body) = self.read_block(index, counters)?;
         Ok(find_record_in_block(&header, &body, lsn)?.map(|r| (r.hlc, r.payload.to_vec())))
     }
@@ -472,6 +564,14 @@ impl<S: BlockSource> PackedSegmentReader<S> {
         let candidates = self.directory.blocks_for_lsn_range(lo, hi);
         counters.blocks_candidate += self.directory.len() as u64;
         counters.blocks_pruned += self.directory.len() as u64 - candidates.len() as u64;
+        counters.bytes_candidate += self.all_block_physical_bytes();
+        let candidate_bytes: u64 = candidates
+            .iter()
+            .map(|index| self.block_physical_bytes(*index))
+            .sum();
+        counters.bytes_pruned += self
+            .all_block_physical_bytes()
+            .saturating_sub(candidate_bytes);
         let mut out = Vec::new();
         for i in candidates {
             let (header, body) = self.read_block(i, counters)?;
@@ -486,6 +586,8 @@ impl<S: BlockSource> PackedSegmentReader<S> {
 
     /// Varre o segmento inteiro por ordem de LSN.
     pub fn scan_all(&self, counters: &mut ScanCounters) -> V6Result<Vec<(Lsn, u64, Vec<u8>)>> {
+        counters.blocks_candidate += self.directory.len() as u64;
+        counters.bytes_candidate += self.all_block_physical_bytes();
         let mut out = Vec::with_capacity(self.footer.record_count as usize);
         for i in 0..self.directory.len() {
             let (header, body) = self.read_block(i, counters)?;
@@ -502,6 +604,8 @@ impl<S: BlockSource> PackedSegmentReader<S> {
     where
         F: FnMut(&BlockRecord<'_>) -> V6Result<()>,
     {
+        counters.blocks_candidate += self.directory.len() as u64;
+        counters.bytes_candidate += self.all_block_physical_bytes();
         for i in 0..self.directory.len() {
             let (header, body) = self.read_block(i, counters)?;
             for r in decode_block_records(&header, &body)? {

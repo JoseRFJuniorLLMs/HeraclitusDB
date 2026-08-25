@@ -27,6 +27,68 @@ enum Cmd {
         #[arg(long)]
         lsn: u64,
     },
+    /// Rebuild HRKI sidecars and publish their references in the v6 HRKM.
+    RebuildIndex {
+        /// HRKL v6 storage root (the directory containing manifests/segments).
+        target: PathBuf,
+        #[arg(long, default_value_t = 0.01)]
+        fpr: f64,
+        /// Do not persist an equality filter for agent_id.
+        #[arg(long)]
+        no_agent_id: bool,
+        /// Do not persist an equality filter for session_id.
+        #[arg(long)]
+        no_session_id: bool,
+    },
+    /// Storage diagnostics that never repair or mutate the inspected database.
+    Storage {
+        #[command(subcommand)]
+        command: StorageCmd,
+    },
+    /// Inspect the HRKL v6 internal manifest (HRKM): segments, generations,
+    /// background queues and export watermark. Read-only.
+    Manifest {
+        #[command(subcommand)]
+        command: ManifestCmd,
+    },
+    /// SPEC-0050 §129-§133 — migrate a v1-v5 log directory to a NEW HRKL v6
+    /// storage root.
+    ///
+    /// Never destructive: the source is left byte-for-byte intact, the
+    /// destination must not already exist, and every segment leaves a
+    /// verifiable receipt pairing the legacy root with the v6 logical root.
+    /// Delete the legacy data yourself, after checking the receipts.
+    MigrateV6 {
+        /// Legacy log directory (the one holding the `.hrkl` files).
+        source: PathBuf,
+        /// New HRKL v6 storage root; must not exist or must be empty.
+        destination: PathBuf,
+        /// Skip the per-segment record-by-record equivalence check.
+        ///
+        /// Faster, and a worse trade than it looks: migration recomputes the
+        /// canonical identity from scratch, so a codec bug would produce a
+        /// plausible-but-wrong v6 segment that only surfaces when someone
+        /// tries to prove an LSN months later.
+        #[arg(long)]
+        no_verify: bool,
+    },
+    /// SPEC-0050 Fase 6 — publish the lakehouse projection (Parquet + Iceberg
+    /// + Delta) for every sealed segment the HRKM has not exported yet.
+    ///
+    /// Writes: it materialises objects at the destination and commits a new
+    /// HRKM generation. Running it twice is a no-op — the queue lives in the
+    /// manifest, so idempotency does not depend on this process remembering
+    /// anything.
+    Export {
+        /// HRKL v6 storage root (the directory containing manifests/segments).
+        target: PathBuf,
+        /// Destination: a local directory or an object store URL.
+        #[arg(long)]
+        to: String,
+        /// Table name published in the Iceberg/Delta catalogues.
+        #[arg(long, default_value = "episodios")]
+        table: String,
+    },
     /// Reescreve um data-dir inteiro num destino NOVO com cifra por agent_id.
     /// Preserva LSN, EventId e HLC; nunca altera nem apaga a origem.
     MigrateEncrypt {
@@ -73,6 +135,18 @@ enum Cmd {
     },
 }
 
+#[derive(Subcommand)]
+enum StorageCmd {
+    /// Compare HRKM, physical generations and HRKI sidecars read-only.
+    Doctor { dir: PathBuf },
+}
+
+#[derive(Subcommand)]
+enum ManifestCmd {
+    /// Render the current HRKM: segments, generations, queues, watermarks.
+    Show { dir: PathBuf },
+}
+
 fn receipts_dir_for(dir: &std::path::Path, receipts: Option<PathBuf>) -> PathBuf {
     receipts.unwrap_or_else(|| {
         dir.parent()
@@ -94,6 +168,35 @@ fn main() {
         Cmd::Prove { segment, lsn } => {
             heraclitus_cli::prove_v6_lsn(&segment, lsn).map_err(|e| e.to_string())
         }
+        Cmd::Manifest { command } => match command {
+            ManifestCmd::Show { dir } => {
+                heraclitus_cli::manifest_show_v6(&dir).map_err(|e| e.to_string())
+            }
+        },
+        Cmd::MigrateV6 {
+            source,
+            destination,
+            no_verify,
+        } => heraclitus_cli::migrate_v6(&source, &destination, !no_verify)
+            .map_err(|e| e.to_string()),
+        Cmd::Export { target, to, table } => {
+            heraclitus_cli::export_lakehouse_v6(&target, &to, &table).map_err(|e| e.to_string())
+        }
+        Cmd::RebuildIndex {
+            target,
+            fpr,
+            no_agent_id,
+            no_session_id,
+        } => heraclitus_cli::rebuild_index_v6(
+            &target,
+            fpr,
+            !no_agent_id,
+            !no_session_id,
+        )
+        .map_err(|e| e.to_string()),
+        Cmd::Storage {
+            command: StorageCmd::Doctor { dir },
+        } => heraclitus_cli::storage_doctor_v6(&dir).map_err(|e| e.to_string()),
         Cmd::MigrateEncrypt {
             source,
             destination,

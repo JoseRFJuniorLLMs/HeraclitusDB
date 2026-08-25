@@ -275,6 +275,344 @@ pub fn prove_v6_lsn(
     Ok(out)
 }
 
+/// Reconstrói sidecars HRKI pelo caminho vivo do v6 e commita as referências
+/// no HRKM. A operação deve ser executada com o writer parado: abrir dois
+/// writers sobre a mesma raiz não é uma forma de coordenação entre processos.
+pub fn rebuild_index_v6(
+    root: &std::path::Path,
+    fpr: f64,
+    index_agent_id: bool,
+    index_session_id: bool,
+) -> Result<String, heraclitus_core::HeraclitusError> {
+    use heraclitus_log::v6::hrki::{IndexPolicy, IndexPolicySet};
+    use heraclitus_log::v6::V6Log;
+
+    if !fpr.is_finite() || !(1e-6..=0.5).contains(&fpr) {
+        return Err(heraclitus_core::HeraclitusError::Config(format!(
+            "HRKI fpr deve estar em [0.000001, 0.5]; recebido {fpr}"
+        )));
+    }
+    if !root.join("manifests").is_dir() || !root.join("segments").is_dir() {
+        return Err(heraclitus_core::HeraclitusError::Config(format!(
+            "rebuild-index exige a raiz HRKL v6 com manifests/ e segments/: {}",
+            root.display()
+        )));
+    }
+    let mut policy = IndexPolicySet::new();
+    if index_agent_id {
+        policy = policy.com("agent_id", IndexPolicy::PublicTechnical);
+    }
+    if index_session_id {
+        policy = policy.com("session_id", IndexPolicy::PublicTechnical);
+    }
+    let log = V6Log::open(root, segmento(), FsyncPolicy::Always)?;
+    let outcomes = log.build_pending_hrki(&policy, None, fpr)?;
+    let manifest = log.manifest();
+    let valid = manifest
+        .segments_v2
+        .iter()
+        .filter(|segment| segment.hrki.is_some())
+        .count();
+    Ok(format!(
+        "HRKI rebuild concluído: {} reconstruído(s); {} sidecar(s) válido(s); manifest generation {}",
+        outcomes.len(), valid, manifest.manifest_generation
+    ))
+}
+
+/// Diagnóstico forense somente-leitura. Findings são devolvidos no texto; uma
+/// divergência crítica também resulta em erro/código de saída 1 no binário.
+pub fn storage_doctor_v6(
+    root: &std::path::Path,
+) -> Result<String, heraclitus_core::HeraclitusError> {
+    let report = heraclitus_log::v6::doctor_storage(root)?;
+    let rendered = report.render();
+    if report.has_critical() {
+        return Err(heraclitus_core::HeraclitusError::Corruption {
+            context: "HRKL v6 storage doctor".into(),
+            detail: rendered,
+        });
+    }
+    Ok(rendered)
+}
+
+/// SPEC-0050 §120 — `heraclitus manifest show`.
+///
+/// Rende o HRKM tal como está em disco, incluindo as três filas de trabalho de
+/// fundo (§144--§146) e os dois watermarks. É a forma de responder à pergunta
+/// operacional que nenhum outro comando responde: *o trabalho derivado está a
+/// acompanhar o log, ou está a ficar para trás?*
+///
+/// Read-only como o resto do grupo de diagnóstico: abre o `ManifestStore` em
+/// modo de leitura e nunca o `V6Log`, porque o boot vivo repara a cauda e
+/// reconcilia órfãos — diagnosticar alterando o objecto do diagnóstico não é
+/// diagnosticar.
+pub fn manifest_show_v6(
+    root: &std::path::Path,
+) -> Result<String, heraclitus_core::HeraclitusError> {
+    use heraclitus_log::v6::manifest::ManifestStore;
+
+    let store = ManifestStore::open_read_only(root.join("manifests"))?;
+    let loaded = store
+        .load()?
+        .ok_or_else(|| heraclitus_core::HeraclitusError::Corruption {
+            context: "HRKL v6 manifest show".into(),
+            detail: format!("nenhuma geração HRKM válida em {}", root.display()),
+        })?;
+    let m = &loaded.manifest;
+    let (canonicos, derivados) = m.storage_bytes();
+
+    let mut out = format!(
+        "HRKL v6 manifest
+root: {}
+namespace: {}
+manifest generation: {}
+recovered by scan: {}
+segments: {}
+committed lsn (cumulative watermark): {}
+exported through lsn: {}
+export lag: {}
+canonical bytes: {}
+derived bytes: {}
+packing queue: {:?}
+sidecar queue: {:?}
+lakehouse queue: {:?}
+
+",
+        root.display(),
+        m.storage_namespace_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+        loaded.generation,
+        loaded.recovered_by_scan,
+        m.segments_v2.len(),
+        m.cumulative_watermark,
+        m.exported_through_lsn,
+        m.cumulative_watermark
+            .saturating_sub(m.exported_through_lsn),
+        canonicos,
+        derivados,
+        m.packing_queue(),
+        m.sidecar_queue(),
+        m.lakehouse_queue(),
+    );
+    for s in &m.segments_v2 {
+        let activa = s
+            .active()
+            .map(|g| format!("g{:04} {:?} {:?}", g.generation, g.layout, g.state))
+            .unwrap_or_else(|| "SEM GERAÇÃO ACTIVA".to_string());
+        out.push_str(&format!(
+            "segment {:>6}  lsn [{}, {}]  records {:>8}  active {}  generations {}  hrki {}  parquet {}
+",
+            s.segment_id,
+            s.first_lsn,
+            s.last_lsn,
+            s.record_count,
+            activa,
+            s.generations.len(),
+            marca(s.hrki.as_ref().map(|a| a.logical_root), s.logical_root),
+            marca(s.parquet.as_ref().map(|a| a.logical_root), s.logical_root),
+        ));
+    }
+    Ok(out)
+}
+
+/// SPEC-0050 §129--§133 — `heraclitus migrate-v6`.
+///
+/// Migra um diretório de log v1--v5 para uma raiz HRKL v6 nova. É a peça que
+/// faltava para o v6 ser adoptável: sem ela, tudo o que as Fases 0--6
+/// construíram estava inalcançável para quem já tem dados.
+///
+/// **Não destrói nada.** A origem fica byte a byte intacta (§133), o destino
+/// tem de não existir (§83), e cada segmento deixa um recibo verificável em
+/// `<destino>/receipts/` com a raiz legada e a raiz lógica v6 lado a lado
+/// (§132) — sem as confundir, que é o erro que §131 existe para impedir.
+///
+/// Depois de correr, o operador aponta a configuração ao destino com
+/// `storage_format = "v6"`. A origem só deve ser apagada depois de os recibos
+/// terem sido verificados — e essa decisão é dele, nunca deste comando.
+pub fn migrate_v6(
+    legacy_dir: &std::path::Path,
+    destination: &std::path::Path,
+    verify: bool,
+) -> Result<String, heraclitus_core::HeraclitusError> {
+    use heraclitus_log::v6::{migrate_database, MigrateDatabaseOptions};
+
+    let relatorio = migrate_database(
+        legacy_dir,
+        destination,
+        MigrateDatabaseOptions {
+            verify,
+            created_hlc: 0,
+            storage_namespace_id: None,
+        },
+    )?;
+
+    let mut out = format!(
+        "HRKL v6 migrate
+origem:  {}
+destino: {}
+namespace: {}
+segmentos: {}
+registos: {}
+lsn: [{}, {}]
+manifest generation: {}
+cauda activa legada selada: {}
+equivalencia verificada: {}
+
+",
+        legacy_dir.display(),
+        destination.display(),
+        relatorio
+            .storage_namespace_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+        relatorio.segments.len(),
+        relatorio.records,
+        relatorio.first_lsn,
+        relatorio.last_lsn,
+        relatorio.manifest_generation,
+        if relatorio.legacy_tail_sealed { "sim" } else { "nao havia" },
+        if verify { "sim" } else { "NAO (--no-verify)" },
+    );
+    for s in &relatorio.segments {
+        out.push_str(&format!(
+            "segment {:>6}  v{}  lsn [{}, {}]  registos {:>8}  raiz legada {}  recibo {}
+",
+            s.segment_id,
+            s.legacy_format,
+            s.first_lsn,
+            s.last_lsn,
+            s.records,
+            match s.legacy_root_ok {
+                Some(true) => "confere",
+                Some(false) => "DIVERGE",
+                None => "cauda (sem rodape)",
+            },
+            s.receipt_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        ));
+    }
+    if !relatorio.is_clean() {
+        return Err(heraclitus_core::HeraclitusError::Corruption {
+            context: "HRKL v6 migrate".into(),
+            detail: out,
+        });
+    }
+    out.push_str(
+        "
+A origem NAO foi alterada. Aponte a configuracao ao destino com
+         storage_format = \"v6\" e so apague o legado depois de verificar os recibos.
+",
+    );
+    Ok(out)
+}
+
+/// SPEC-0050 §120/§203 — `heraclitus export`.
+///
+/// Corre uma passagem completa da projecção lakehouse sobre um storage root
+/// v6: fila do HRKM -> Parquet -> Iceberg -> Delta -> watermark -> HRKM.
+///
+/// É o mesmo trabalhador que o servidor corre em background, e não uma segunda
+/// implementação. Duas implementações do mesmo export divergiriam, e a que
+/// divergisse seria a do caminho menos exercitado — a mesma razão pela qual a
+/// verificação do tier frio partilha o `verify_packed_reader` do log.
+///
+/// Ao contrário do resto do grupo de diagnóstico, este comando **escreve**:
+/// materializa objectos no destino e comita uma geração nova do HRKM. Por isso
+/// abre o `V6Log` a sério, e não o `ManifestStore` em leitura.
+pub fn export_lakehouse_v6(
+    root: &std::path::Path,
+    destino: &str,
+    tabela: &str,
+) -> Result<String, heraclitus_core::HeraclitusError> {
+    use heraclitus_log::v6::V6Log;
+    use std::sync::Arc;
+
+    if !destino.contains("://") {
+        std::fs::create_dir_all(destino)?;
+    }
+    let log = Arc::new(V6Log::open(root, segmento(), FsyncPolicy::Always)?);
+    let worker = heraclitus_tier::LakehouseWorker::open_location(
+        destino,
+        tabela.to_string(),
+        log.manifest().storage_namespace_id,
+    )?;
+
+    // Runtime de uma só thread: o CLI é um processo de uma tarefa, e o
+    // `object_store` precisa de um executor. Um runtime multi-thread aqui
+    // custaria threads para nada.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            heraclitus_core::HeraclitusError::StorageEngine(format!("runtime do export: {e}"))
+        })?;
+    let saidas = rt.block_on(worker.export_pending(&log))?;
+
+    if saidas.is_empty() {
+        return Ok(format!(
+            "HRKL v6 export
+tabela: {tabela}
+destino: {destino}
+nada por exportar; a projecção está em dia (exported_through_lsn = {})
+",
+            log.manifest().exported_through_lsn
+        ));
+    }
+    let mut out = format!(
+        "HRKL v6 export
+tabela: {tabela}
+destino: {destino}
+segmentos exportados: {}
+",
+        saidas.len()
+    );
+    for s in &saidas {
+        out.push_str(&format!(
+            "segment {:>6} g{:04}  lsn [{}, {}]  rows {:>8}  bytes {:>10}  delta v{}  {}  {}
+",
+            s.segment_id,
+            s.generation,
+            s.first_lsn,
+            s.last_lsn,
+            s.rows,
+            s.size,
+            s.delta_version
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into()),
+            if s.attached {
+                "ligado ao HRKM"
+            } else {
+                "ÓRFÃO (a geração mudou durante o export; reexportável)"
+            },
+            s.path,
+        ));
+    }
+    let m = log.manifest();
+    out.push_str(&format!(
+        "exported through lsn: {}
+export lag: {}
+",
+        m.exported_through_lsn,
+        m.cumulative_watermark
+            .saturating_sub(m.exported_through_lsn)
+    ));
+    Ok(out)
+}
+
+/// `-` = ausente, `ok` = em dia, `obsoleto` = existe mas descreve outra raiz.
+fn marca(artefacto: Option<[u8; 32]>, raiz: [u8; 32]) -> &'static str {
+    match artefacto {
+        None => "-",
+        Some(r) if r == raiz => "ok",
+        Some(_) => "obsoleto",
+    }
+}
+
 /// Migração offline e não destrutiva para encryption-at-rest.
 ///
 /// A origem e o destino são *data dirs* (cada um contém `log/`). O destino tem
@@ -647,6 +985,141 @@ pub fn bench_recall(n: usize, dim: usize, queries: usize) -> BenchReport {
 mod tests {
     use super::*;
 
+    /// SPEC-0050 §129--§133 — o ciclo do operador, do princípio ao fim.
+    ///
+    /// O que se prova aqui é a **sequência que uma instalação real vive**, e
+    /// não a migração em si (essa tem o seu teste de integração no
+    /// heraclitus-log): migrar -> inspeccionar o manifesto -> diagnosticar ->
+    /// abrir e usar. Se qualquer um destes passos falhasse depois de a
+    /// migração dizer "sucesso", o comando estaria a mentir.
+    #[test]
+    fn migrate_v6_produz_um_banco_que_o_resto_das_ferramentas_aceita() {
+        use heraclitus_core::{Episode, EventKind};
+        use heraclitus_log::v6::V6Log;
+        use heraclitus_log::Log;
+
+        let dir = tempfile::tempdir().unwrap();
+        let legado = dir.path().join("legacy");
+        let destino = dir.path().join("v6");
+
+        let esperado = {
+            let log = Log::open(&legado, 8 * 1024, FsyncPolicy::Always).unwrap();
+            for i in 0..150 {
+                log.append(Episode::new(
+                    "operador",
+                    EventKind::Observation,
+                    format!("evento-{i}-{}", "k".repeat(48)).into_bytes(),
+                ))
+                .unwrap();
+            }
+            log.flush().unwrap();
+            log.scan(0, log.head()).unwrap()
+        };
+
+        let saida = migrate_v6(&legado, &destino, true).unwrap();
+        assert!(saida.contains("equivalencia verificada: sim"), "{saida}");
+        assert!(saida.contains("cauda activa legada selada: sim"), "{saida}");
+        assert!(saida.contains("NAO foi alterada"), "{saida}");
+
+        // O manifesto do banco novo descreve o que foi migrado.
+        let manifesto = manifest_show_v6(&destino).unwrap();
+        assert!(manifesto.contains("HRKL v6 manifest"), "{manifesto}");
+        // Nota: em v6 o `cumulative_watermark` do HRKM é o ÚLTIMO LSN, ao
+        // passo que o manifesto legado guarda o `head` (último + 1). A
+        // diferença é pré-existente e não é desta migração; aqui usa-se a
+        // semântica do formato que estamos a inspeccionar.
+        assert!(
+            manifesto.contains(&format!(
+                "committed lsn (cumulative watermark): {}",
+                esperado.last().unwrap().0
+            )),
+            "{manifesto}"
+        );
+
+        // O diagnóstico aceita-o sem queixas.
+        let doctor = storage_doctor_v6(&destino).unwrap();
+        assert!(doctor.contains("status: CLEAN"), "{doctor}");
+
+        // E o motor v6 abre-o e devolve a história intacta.
+        let novo = V6Log::open(&destino, 1 << 20, FsyncPolicy::Always).unwrap();
+        let lido = novo.scan(0, novo.head()).unwrap();
+        assert_eq!(lido.len(), esperado.len());
+        assert_eq!(lido.first().unwrap().1.id, esperado.first().unwrap().1.id);
+        assert_eq!(lido.last().unwrap().1.content, esperado.last().unwrap().1.content);
+
+        // Migrar duas vezes para o mesmo destino e um destino inexistente
+        // comportam-se como devem.
+        assert!(migrate_v6(&legado, &destino, true).is_err());
+        assert!(migrate_v6(&dir.path().join("nao-existe"), &dir.path().join("x"), true).is_err());
+    }
+
+    /// SPEC-0050 §120/§210 — os dois comandos operacionais da Fase 6 sobre um
+    /// banco v6 real.
+    ///
+    /// O que se prova aqui não é o formato dos ficheiros (isso tem testes
+    /// próprios no tier), mas a **sequência que um operador vive**: antes de
+    /// exportar, `manifest show` mostra a fila cheia e um atraso positivo;
+    /// depois, a fila está vazia, o atraso é zero e cada segmento aparece com
+    /// a projecção `ok`. Se o `export` corresse e o `manifest show` não
+    /// mudasse, um dos dois estaria a mentir.
+    #[test]
+    fn export_e_manifest_show_percorrem_o_ciclo_da_fase_6() {
+        use heraclitus_core::{Episode, EventKind};
+        use heraclitus_log::v6::{PackingProfile, V6Log};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("v6");
+        {
+            let log = V6Log::open(&root, 4_096, FsyncPolicy::Always).unwrap();
+            for i in 0..120 {
+                log.append(Episode::new(
+                    "cli",
+                    EventKind::Observation,
+                    format!("evento-{i}-{}", "z".repeat(64)).into_bytes(),
+                ))
+                .unwrap();
+            }
+            log.seal_active().unwrap();
+            log.pack_pending(PackingProfile::Balanced).unwrap();
+        }
+
+        let antes = manifest_show_v6(&root).unwrap();
+        assert!(antes.contains("exported through lsn: 0"), "{antes}");
+        assert!(
+            !antes.contains("lakehouse queue: []"),
+            "a fila do lakehouse devia ter segmentos:
+{antes}"
+        );
+        assert!(antes.contains("parquet -"), "{antes}");
+
+        let destino = dir.path().join("lakehouse");
+        let saida =
+            export_lakehouse_v6(&root, &destino.to_string_lossy(), "episodios").unwrap();
+        assert!(saida.contains("ligado ao HRKM"), "{saida}");
+        assert!(saida.contains("export lag: 0"), "{saida}");
+
+        let depois = manifest_show_v6(&root).unwrap();
+        assert!(depois.contains("lakehouse queue: []"), "{depois}");
+        assert!(depois.contains("parquet ok"), "{depois}");
+        assert!(
+            !depois.contains("exported through lsn: 0"),
+            "o watermark não avançou:
+{depois}"
+        );
+
+        // Correr de novo é um no-op: a fila vive no manifesto, portanto a
+        // idempotência não depende de este processo se lembrar de nada.
+        let repetido =
+            export_lakehouse_v6(&root, &destino.to_string_lossy(), "episodios").unwrap();
+        assert!(repetido.contains("nada por exportar"), "{repetido}");
+        assert_eq!(manifest_show_v6(&root).unwrap(), depois);
+
+        // E o diagnóstico continua limpo depois de tudo.
+        let doctor = storage_doctor_v6(&root).unwrap();
+        assert!(doctor.contains("status: CLEAN"), "{doctor}");
+        assert!(doctor.contains("projections: "), "{doctor}");
+    }
+
     struct ExternalTsa;
 
     impl heraclitus_compliance::TsaClient for ExternalTsa {
@@ -799,6 +1272,54 @@ mod tests {
         let proof = prove_v6_lsn(&segment, 3).unwrap();
         assert!(proof.contains("lsn: 3"));
         assert!(proof.contains("proof verifies: true"));
+    }
+
+    #[test]
+    fn cli_storage_doctor_and_rebuild_index_are_operational_and_idempotent() {
+        use heraclitus_core::{Episode, EventKind};
+        use heraclitus_log::v6::hrki::{caminho_sidecar, IndexPolicy, IndexPolicySet};
+        use heraclitus_log::v6::{PackingProfile, V6Log};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("v6");
+        let log = V6Log::open(&root, 2_048, FsyncPolicy::Always).unwrap();
+        for i in 0..20 {
+            let mut episode = Episode::new(
+                if i < 10 { "alice" } else { "bob" },
+                EventKind::Observation,
+                vec![b'x'; 256],
+            );
+            episode.session_id = format!("session-{i}");
+            log.append(episode).unwrap();
+        }
+        log.seal_active().unwrap();
+        log.pack_pending(PackingProfile::Balanced).unwrap();
+        log.build_pending_hrki(
+            &IndexPolicySet::new()
+                .com("agent_id", IndexPolicy::PublicTechnical)
+                .com("session_id", IndexPolicy::PublicTechnical),
+            None,
+            0.01,
+        )
+        .unwrap();
+        let packed = root.join(
+            &log.manifest().segments_v2[0]
+                .active()
+                .unwrap()
+                .location,
+        );
+        drop(log);
+
+        assert!(storage_doctor_v6(&root).unwrap().contains("status: CLEAN"));
+        std::fs::write(caminho_sidecar(&packed), b"bad hrki").unwrap();
+        let warning = storage_doctor_v6(&root).unwrap();
+        assert!(warning.contains("INVALID_HRKI"), "{warning}");
+
+        let rebuilt = rebuild_index_v6(&root, 0.01, true, true).unwrap();
+        assert!(rebuilt.contains("1 reconstruído(s)"), "{rebuilt}");
+        assert!(storage_doctor_v6(&root).unwrap().contains("status: CLEAN"));
+        let retry = rebuild_index_v6(&root, 0.01, true, true).unwrap();
+        assert!(retry.contains("0 reconstruído(s)"), "{retry}");
     }
 
     #[test]

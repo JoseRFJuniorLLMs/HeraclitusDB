@@ -45,9 +45,13 @@ use super::error::{corrupt, V6Result};
 use super::footer::FooterV6;
 use super::header::PhysicalLayout;
 use super::manifest::{record_pack, ManifestStore};
-use super::packed::{open_packed, PackOptions, PackStats, PackedSegmentWriter, ScanCounters};
+use super::packed::{
+    open_packed, PackOptions, PackStats, PackedSegmentWriter, PackingStage, ScanCounters,
+};
 use super::raw::{scan_raw_segment, SegmentInit};
-use super::receipts::{physical_digest_of_file, PackReceipt, PACKER_VERSION};
+use super::receipts::{
+    persist_pack_receipt, physical_digest_of_file, PackReceipt, PACKER_VERSION,
+};
 
 /// Calcula o `canonical_record_hash` de um registo a partir do que está
 /// persistido.
@@ -77,6 +81,30 @@ pub fn pack_segment(
     source_generation: u32,
     target_generation: u32,
     hasher: CanonicalHasher<'_>,
+) -> V6Result<PackOutcome> {
+    pack_segment_with_observer(
+        source,
+        target,
+        opts,
+        source_generation,
+        target_generation,
+        hasher,
+        &mut |_| Ok(()),
+    )
+}
+
+/// Variante instrumentada para crash injection determinística. O observer é
+/// chamado somente depois de cada fronteira ter sido alcançada no disco.
+#[allow(clippy::too_many_arguments)]
+#[doc(hidden)]
+pub fn pack_segment_with_observer(
+    source: &Path,
+    target: &Path,
+    opts: PackOptions,
+    source_generation: u32,
+    target_generation: u32,
+    hasher: CanonicalHasher<'_>,
+    observer: &mut dyn FnMut(PackingStage) -> V6Result<()>,
 ) -> V6Result<PackOutcome> {
     const CTX: &str = "hrkl v6 packer";
 
@@ -133,15 +161,17 @@ pub fn pack_segment(
         storage_namespace_id: scan.header.storage_namespace_id,
     };
     let mut writer = PackedSegmentWriter::create(&tmp, init, opts)?;
+    observer(PackingStage::TempCreated)?;
 
     // 3./4./5./6. stream + canonical verification + blocks + directory
     for r in &scan.records {
         let h = hasher(r.lsn, r.hlc, &r.payload)?;
         writer.push(r.lsn, r.hlc, r.payload.clone(), &h)?;
     }
+    observer(PackingStage::SourceStreamed)?;
 
     // 7./8. footer + fsync do temporário
-    let (target_footer, stats) = writer.finish()?;
+    let (target_footer, stats) = writer.finish_observed(observer)?;
 
     // 9. verify packed logical_root — o passo que autoriza tudo o resto.
     //    §134/invariante 3: para o mesmo conjunto de CanonicalRecords v6,
@@ -182,10 +212,13 @@ pub fn pack_segment(
             ));
         }
     }
+    observer(PackingStage::LogicalVerified)?;
 
     // 10./11. publicar a geração imutável
     std::fs::rename(&tmp, target)?;
+    observer(PackingStage::Published)?;
     sync_parent_dir(target)?;
+    observer(PackingStage::ParentSynced)?;
 
     // 12. PackReceipt
     let receipt = PackReceipt {
@@ -250,20 +283,60 @@ pub fn pack_and_commit(
     now_hlc: u64,
     hasher: CanonicalHasher<'_>,
 ) -> V6Result<PackOutcome> {
-    let outcome = pack_segment(
+    pack_and_commit_with_observer(
+        store,
+        manifest,
+        source,
+        target,
+        opts,
+        source_generation,
+        target_generation,
+        now_hlc,
+        hasher,
+        &mut |_| Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[doc(hidden)]
+pub fn pack_and_commit_with_observer(
+    store: &ManifestStore,
+    manifest: &mut DatabaseManifest,
+    source: &Path,
+    target: &Path,
+    opts: PackOptions,
+    source_generation: u32,
+    target_generation: u32,
+    now_hlc: u64,
+    hasher: CanonicalHasher<'_>,
+    observer: &mut dyn FnMut(PackingStage) -> V6Result<()>,
+) -> V6Result<PackOutcome> {
+    let outcome = pack_segment_with_observer(
         source,
         target,
         opts,
         source_generation,
         target_generation,
         hasher,
+        observer,
     )?;
-    let location = target.to_string_lossy().to_string();
-    // 13. commit do novo HRKM. Se `record_pack` recusar (raiz divergente,
-    //     geração repetida), o ficheiro publicado fica órfão e o manifesto
-    //     antigo continua correcto — que é o resultado seguro.
-    record_pack(manifest, &outcome.receipt, &location, now_hlc)?;
-    store.commit(manifest)?;
+    let receipt_dir = store
+        .dir()
+        .parent()
+        .unwrap_or_else(|| store.dir())
+        .join("receipts");
+    persist_pack_receipt(&receipt_dir, &outcome.receipt)?;
+    observer(PackingStage::ReceiptPersisted)?;
+
+    let location = manifest_location(store, target)?;
+    // 13. commit do novo HRKM por copy-on-success. Se `record_pack` ou o
+    // commit recusarem, o manifesto entregue pelo chamador continua igual;
+    // PACKED/recibo publicados ficam órfãos seguros para o doctor/GC.
+    let mut next = manifest.clone();
+    record_pack(&mut next, &outcome.receipt, &location, now_hlc)?;
+    store.commit(&mut next)?;
+    *manifest = next;
+    observer(PackingStage::ManifestCommitted)?;
     Ok(outcome)
 }
 
@@ -271,6 +344,24 @@ fn temp_path(target: &Path) -> PathBuf {
     let mut s = target.as_os_str().to_os_string();
     s.push(".tmp");
     PathBuf::from(s)
+}
+
+fn manifest_location(store: &ManifestStore, target: &Path) -> V6Result<String> {
+    let storage_root = store.dir().parent().ok_or_else(|| {
+        corrupt(
+            "hrkl v6 packer",
+            "manifest directory has no storage root parent",
+        )
+    })?;
+    let root = std::fs::canonicalize(storage_root)?;
+    let target = std::fs::canonicalize(target)?;
+    let relative = target.strip_prefix(&root).map_err(|_| {
+        corrupt(
+            "hrkl v6 packer",
+            "published generation is outside the storage root",
+        )
+    })?;
+    Ok(relative.to_string_lossy().replace('\\', "/"))
 }
 
 fn sync_parent_dir(path: &Path) -> V6Result<()> {

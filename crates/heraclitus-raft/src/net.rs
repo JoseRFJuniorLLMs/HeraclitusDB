@@ -23,7 +23,7 @@
 use crate::consensus::{
     ConsensusNode, EpisodeStateMachine, HeraclitusRaft, MemRaftLog, NodeId, TypeConfig,
 };
-use heraclitus_log::Log;
+use heraclitus_log::AnyLog;
 use openraft::error::{InstallSnapshotError, RPCError, RaftError, RemoteError, Unreachable};
 use openraft::network::RPCOption;
 use openraft::raft::{
@@ -268,7 +268,7 @@ pub struct TcpNode {
 /// `EpisodeStateMachine::open_durable().with_apply_hook(..)`).
 pub async fn spawn_node_tcp_on<LS>(
     id: NodeId,
-    log: Arc<Log>,
+    log: Arc<AnyLog>,
     config: Arc<openraft::Config>,
     bind_addr: &str,
     store: LS,
@@ -292,7 +292,7 @@ where
 /// caminho de referência para testes de transporte.
 pub async fn spawn_node_tcp(
     id: NodeId,
-    log: Arc<Log>,
+    log: Arc<AnyLog>,
     config: Arc<openraft::Config>,
 ) -> Result<TcpNode, Box<dyn std::error::Error>> {
     let sm = EpisodeStateMachine::new(log.clone());
@@ -361,7 +361,7 @@ mod tests {
         let mut dirs = Vec::new();
         for id in 0..3u64 {
             let dir = tempfile::tempdir().unwrap();
-            let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+            let log = Arc::new(AnyLog::open(crate::formato_de_teste(), dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
             tcp.push(spawn_node_tcp(id, log, config.clone()).await.unwrap());
             dirs.push(dir);
         }
@@ -434,7 +434,7 @@ mod tests {
         let mut dirs = Vec::new();
         for id in 0..3u64 {
             let dir = tempfile::tempdir().unwrap();
-            let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+            let log = Arc::new(AnyLog::open(crate::formato_de_teste(), dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
             tcp.push(spawn_node_tcp(id, log, config.clone()).await.unwrap());
             dirs.push(dir);
         }

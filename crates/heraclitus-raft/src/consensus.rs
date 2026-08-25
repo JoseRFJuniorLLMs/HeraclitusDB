@@ -31,7 +31,7 @@
 //!   um seguidor atrasado apanha via `install_snapshot`).
 
 use heraclitus_core::Episode;
-use heraclitus_log::Log;
+use heraclitus_log::{AnyLog, EpisodeLog};
 use openraft::error::{InstallSnapshotError, RPCError, RaftError, RemoteError, Unreachable};
 use openraft::network::RPCOption;
 use openraft::raft::{
@@ -214,7 +214,7 @@ pub type ApplyHook = Arc<dyn Fn(heraclitus_core::Lsn, &Episode) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct EpisodeStateMachine {
-    log: Arc<Log>,
+    log: Arc<AnyLog>,
     state: Arc<Mutex<SmState>>,
     sm_dir: Option<std::path::PathBuf>,
     on_apply: Option<ApplyHook>,
@@ -222,7 +222,7 @@ pub struct EpisodeStateMachine {
 
 impl EpisodeStateMachine {
     /// Máquina em memória (sem durabilidade do `applied`/membership).
-    pub fn new(log: Arc<Log>) -> Self {
+    pub fn new(log: Arc<AnyLog>) -> Self {
         Self {
             log,
             state: Arc::new(Mutex::new(SmState::default())),
@@ -241,7 +241,7 @@ impl EpisodeStateMachine {
     /// `sm_dir` e calcula `skip_normals = head_de_episódios − normals` (os
     /// episódios que ficaram em disco num crash antes de o meta ser gravado).
     pub fn open_durable(
-        log: Arc<Log>,
+        log: Arc<AnyLog>,
         sm_dir: impl AsRef<std::path::Path>,
     ) -> Result<Self, StorageError<NodeId>> {
         let sm_dir = sm_dir.as_ref().to_path_buf();
@@ -683,7 +683,7 @@ impl RaftNetwork<TypeConfig> for RouterConnection {
 pub struct ConsensusNode {
     pub id: NodeId,
     pub raft: HeraclitusRaft,
-    pub log: Arc<Log>,
+    pub log: Arc<AnyLog>,
 }
 
 /// Cria um nó de consenso a partir de um raft-log e uma máquina de estados já
@@ -691,7 +691,7 @@ pub struct ConsensusNode {
 /// tanto o modo em-memória como o durável.
 pub async fn spawn_node_with<LS>(
     id: NodeId,
-    log: Arc<Log>,
+    log: Arc<AnyLog>,
     router: &Router,
     config: Arc<openraft::Config>,
     store: LS,
@@ -719,7 +719,7 @@ where
 /// consenso. Config de eleição curta para determinismo.
 pub async fn spawn_node(
     id: NodeId,
-    log: Arc<Log>,
+    log: Arc<AnyLog>,
     router: &Router,
     config: Arc<openraft::Config>,
 ) -> Result<ConsensusNode, Box<dyn std::error::Error>> {
@@ -732,7 +732,7 @@ pub async fn spawn_node(
 /// restart sem re-aplicar (duplicar) nem perder — ver o teste `restart_*`.
 pub async fn spawn_node_durable(
     id: NodeId,
-    log: Arc<Log>,
+    log: Arc<AnyLog>,
     router: &Router,
     config: Arc<openraft::Config>,
     raft_dir: impl AsRef<std::path::Path>,
@@ -851,7 +851,7 @@ mod tests {
         let mut dirs = Vec::new();
         for id in 0..3u64 {
             let dir = tempfile::tempdir().unwrap();
-            let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+            let log = Arc::new(AnyLog::open(crate::formato_de_teste(), dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
             nodes.push(spawn_node(id, log, &router, cfg.clone()).await.unwrap());
             dirs.push(dir);
         }
@@ -962,7 +962,7 @@ mod tests {
         // SEU log local; os três `state_hash` têm de ser bit-idênticos.
         use heraclitus_index_graph::GraphIndex;
         use heraclitus_views::View;
-        let hash_of = |log: &Log| {
+        let hash_of = |log: &AnyLog| {
             let mut g = GraphIndex::new();
             for (lsn, e) in log.scan(0, u64::MAX).unwrap() {
                 g.apply(lsn, &e);
@@ -1174,7 +1174,7 @@ mod tests {
 
         // Nó fonte: aplica 10 episódios e constrói um snapshot.
         let src_dir = tempfile::tempdir().unwrap();
-        let src_log = Arc::new(Log::open(src_dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        let src_log = Arc::new(AnyLog::open(crate::formato_de_teste(), src_dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
         let mut src = EpisodeStateMachine::new(src_log.clone());
         src.apply(mk_entries(10)).await.unwrap();
         assert_eq!(src_log.head(), 10);
@@ -1197,7 +1197,7 @@ mod tests {
         let hook_fires = Arc::new(AtomicU64::new(0));
         let hc = hook_fires.clone();
         let dst_dir = tempfile::tempdir().unwrap();
-        let dst_log = Arc::new(Log::open(dst_dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        let dst_log = Arc::new(AnyLog::open(crate::formato_de_teste(), dst_dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
         let mut dst = EpisodeStateMachine::new(dst_log.clone()).with_apply_hook(Arc::new(
             move |_lsn, _ep| {
                 hc.fetch_add(1, Ordering::SeqCst);
@@ -1250,7 +1250,7 @@ mod tests {
         // ── Vida 1: arranca, inicializa (cluster de 1), escreve 5 episódios. ──
         let last_index = {
             let router = Router::new();
-            let log = Arc::new(Log::open(&log_dir, 1 << 20, FsyncPolicy::Always).unwrap());
+            let log = Arc::new(AnyLog::open(crate::formato_de_teste(), &log_dir, 1 << 20, FsyncPolicy::Always).unwrap());
             let node = spawn_node_durable(0, log.clone(), &router, cfg.clone(), &raft_dir, &sm_dir)
                 .await
                 .unwrap();
@@ -1281,7 +1281,7 @@ mod tests {
 
         // ── Vida 2: reabre do disco. Nada em memória sobreviveu. ──
         let router = Router::new();
-        let log = Arc::new(Log::open(&log_dir, 1 << 20, FsyncPolicy::Always).unwrap());
+        let log = Arc::new(AnyLog::open(crate::formato_de_teste(), &log_dir, 1 << 20, FsyncPolicy::Always).unwrap());
         assert_eq!(log.head(), 5, "os 5 episódios estavam duráveis no log");
         let node = spawn_node_durable(0, log.clone(), &router, cfg.clone(), &raft_dir, &sm_dir)
             .await
@@ -1322,7 +1322,7 @@ mod tests {
         let mut dirs = Vec::new();
         for id in 0..3u64 {
             let dir = tempfile::tempdir().unwrap();
-            let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+            let log = Arc::new(AnyLog::open(crate::formato_de_teste(), dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
             // Cada nó tem o seu hook; contamos os do nó 0.
             let (seen_c, last_c) = (seen.clone(), last_lsn.clone());
             let sm = if id == 0 {

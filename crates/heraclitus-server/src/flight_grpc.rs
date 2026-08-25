@@ -19,16 +19,16 @@ use arrow_flight::{
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use heraclitus_analytics::vectorized::{episodes_to_batches_sized, BATCH_ROWS};
-use heraclitus_log::Log;
+use heraclitus_log::EpisodeLog;
 use std::sync::Arc;
 use tonic::{Request, Response, Status, Streaming};
 
 pub struct HeraclitusFlight {
-    log: Arc<Log>,
+    log: Arc<dyn EpisodeLog>,
 }
 
 impl HeraclitusFlight {
-    pub fn new(log: Arc<Log>) -> Self {
+    pub fn new<L: EpisodeLog + 'static>(log: Arc<L>) -> Self {
         Self { log }
     }
 
@@ -150,8 +150,8 @@ impl FlightService for HeraclitusFlight {
 }
 
 /// Arranca o servidor Flight num listener próprio. Devolve a porta real.
-pub async fn serve_flight(
-    log: Arc<Log>,
+pub async fn serve_flight<L: EpisodeLog + 'static>(
+    log: Arc<L>,
     addr: &str,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), String> {
     let listener = tokio::net::TcpListener::bind(addr)

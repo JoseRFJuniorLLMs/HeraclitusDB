@@ -24,7 +24,7 @@
 //! `ReplicationConfig.transport`. Default build stays on v0.
 
 use heraclitus_core::HeraclitusError;
-use heraclitus_log::Log;
+use heraclitus_log::AnyLog;
 
 /// SPEC-015/021 — o upgrade openraft: eleição + quórum + failover (opt-in).
 #[cfg(feature = "replication")]
@@ -46,7 +46,28 @@ pub mod grpc;
 // ─────────────────────────────────────────────────────────────────────────
 /// Compare two logs for byte-level payload equivalence over `[0, head)`.
 /// Used by the sim suite to prove zero acked-event loss after healing.
-pub fn logs_equivalent(a: &Log, b: &Log) -> Result<bool, HeraclitusError> {
+/// O formato de armazenamento sobre o qual a suíte de consenso corre.
+///
+/// O consenso não sabe — nem deve saber — que formato físico está por baixo:
+/// só usa `append_replicated`, `head` e `scan`, que ambos os backends
+/// publicam. Esta função existe para que a suíte inteira possa ser corrida
+/// contra os dois e provar isso, em vez de o afirmar:
+///
+/// ```text
+/// cargo test -p heraclitus-raft --features replication                        # v6
+/// HERACLITUS_RAFT_TEST_FORMAT=legacy cargo test -p heraclitus-raft --features replication
+/// ```
+///
+/// O default é **v6**, porque é o formato por omissão do banco.
+#[cfg(test)]
+pub(crate) fn formato_de_teste() -> heraclitus_core::StorageFormat {
+    match std::env::var("HERACLITUS_RAFT_TEST_FORMAT").as_deref() {
+        Ok("legacy") => heraclitus_core::StorageFormat::Legacy,
+        _ => heraclitus_core::StorageFormat::V6,
+    }
+}
+
+pub fn logs_equivalent(a: &AnyLog, b: &AnyLog) -> Result<bool, HeraclitusError> {
     let (ea, eb) = (a.scan(0, u64::MAX)?, b.scan(0, u64::MAX)?);
     if ea.len() != eb.len() {
         return Ok(false);

@@ -34,3 +34,10 @@ path = "fuzz_targets/query_parser.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "v6_decode"
+path = "fuzz_targets/v6_decode.rs"
+test = false
+doc = false
+bench = false

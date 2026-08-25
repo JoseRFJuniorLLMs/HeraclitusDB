@@ -1,6 +1,7 @@
 //! # HRKL v6 — armazenamento canónico, segmentos empacotados e ciclo de vida
 //!
-//! Implementação da **SPEC-0050**, Fases 0 a 3 do roadmap de §197–§200.
+//! Implementação da **SPEC-0050**, Fases 0 a 4 do roadmap de §197–§201 (a
+//! Fase 5 vive em `heraclitus-tier` — ver "O que ainda não está aqui").
 //!
 //! ## A decisão que organiza tudo
 //!
@@ -57,16 +58,23 @@
 //! | [`gc`] | §90–§97, §182 | política de coleta, pins, LegalHold |
 //! | [`receipts`] | §19, §86–§87 | envelopes e recibos |
 //! | [`verify`] | §119–§124, §161 | níveis de integridade, `prove`, `inspect` |
+//! | [`hrki`] | §54–§67 | sidecar de pruning: zone maps, Bloom, bitmap de kind |
 //!
 //! ## O que ainda não está aqui
 //!
-//! Fases 4 a 8 da SPEC: o sidecar `.hrki`, object storage com range reads, os
-//! exportadores do lakehouse, `PackedEpisodeV1` e a indexação avançada. Os
-//! contratos de que essas fases dependem já existem e estão povoados pelo
-//! manifesto: [`heraclitus_core::runtime::DerivedArtifactRef`] para os
-//! sidecars e a projecção Parquet, `location` em
-//! [`heraclitus_core::runtime::PhysicalGeneration`] para object storage, e as
-//! filas de §144–§146 em [`heraclitus_core::DatabaseManifest`].
+//! Fases 6 a 8 da SPEC: os exportadores do lakehouse (Parquet v2/Iceberg/Delta),
+//! `PackedEpisodeV1` e a indexação avançada. Os contratos de que dependem já
+//! existem e estão povoados pelo manifesto:
+//! [`heraclitus_core::runtime::DerivedArtifactRef`] para os sidecars e a
+//! projecção Parquet, e as filas de §144–§146 em
+//! [`heraclitus_core::DatabaseManifest`].
+//!
+//! A **Fase 5** (object storage: chaves de geração imutáveis, range reads,
+//! recibo v2) não vive aqui de propósito — vive em `heraclitus-tier`. Este
+//! crate não conhece `object_store` nem `async`; o que expõe é a fronteira
+//! [`packed::BlockSource`], e o tier implementa-a por cima de range GETs. A
+//! verificação do tier frio corre pelo mesmo [`verify::verify_packed_reader`]
+//! que a verificação local — não por uma segunda implementação.
 //!
 //! ## Invariantes que este código faz cumprir mecanicamente
 //!
@@ -87,6 +95,7 @@ pub mod block;
 pub mod block_directory;
 pub mod canonical;
 pub mod compress;
+pub mod doctor;
 pub mod engine;
 pub mod error;
 pub mod footer;
@@ -95,6 +104,7 @@ pub mod header;
 pub mod hrki;
 pub mod manifest;
 pub mod merkle;
+pub mod migrate;
 pub mod packed;
 pub mod packer;
 pub mod raw;
@@ -107,12 +117,18 @@ pub use canonical::{
     CANONICAL_CODEC_V1,
 };
 pub use compress::{CompressionCodec, PackingProfile};
+pub use doctor::{
+    doctor_storage, DoctorFinding, DoctorSeverity, StorageDoctorReport,
+};
 pub use error::V6Result;
-pub use engine::V6Log;
+pub use engine::{
+    persisted_record_hash, HrkiBuildOutcome, LakehousePending, PackedGenerationSource, V6Log,
+    V6MetricsSnapshot,
+};
 pub use footer::FooterV6;
 pub use gc::{
-    apply_gc, assert_gc_invariant, classify_compaction, plan_gc, GcBlockReason, GcOptions, GcPlan,
-    PinRegistry,
+    apply_gc, assert_gc_invariant, classify_compaction, commit_gc, commit_gc_with_observer,
+    plan_gc, GcBlockReason, GcExecution, GcOptions, GcPlan, PinRegistry,
 };
 pub use header::{FileHeaderV6, PhysicalLayout, FORMAT_VERSION_V6};
 pub use heraclitus_core::runtime::{DatabaseManifest, GenerationState, PhysicalGeneration};
@@ -121,11 +137,29 @@ pub use manifest::{
     LoadedManifest, ManifestStore,
 };
 pub use merkle::{InclusionProof, MerkleAccumulatorV1};
-pub use packed::{open_packed, PackOptions, PackStats, PackedSegmentReader, ScanCounters};
-pub use packer::{pack_and_commit, pack_segment, repack_segment, sweep_orphan_temps, PackOutcome};
+pub use migrate::{
+    migrate_database, migrate_legacy_segment, verify_migration_equivalence,
+    DatabaseMigrationReport, MigrateDatabaseOptions, MigrateOptions, MigrationEquivalence,
+    MigrationOutcome, SegmentMigration,
+};
+pub use packed::{
+    open_packed, BlockSource, FileSource, MemorySource, PackOptions, PackStats,
+    PackedSegmentReader, PackingStage, ScanCounters,
+};
+pub use packer::{
+    pack_and_commit, pack_and_commit_with_observer, pack_segment, pack_segment_with_observer,
+    repack_segment, sweep_orphan_temps, PackOutcome,
+};
 pub use raw::{RawSegmentWriter, SegmentInit};
-pub use receipts::{AttestationEnvelopeV1, PackReceipt};
-pub use verify::{inspect, prove_lsn, verify_segment, IntegrityLevel, VerifyReport};
+pub use receipts::{
+    persist_migration_receipt, persist_pack_receipt, physical_digest, physical_digest_of_file,
+    read_migration_receipt, read_pack_receipt, AttestationEnvelopeV1, LegacyMigrationReceipt,
+    PackReceipt, PACKER_VERSION,
+};
+pub use verify::{
+    inspect, prove_lsn, verify_packed_reader, verify_segment, IntegrityLevel, LsnProof,
+    VerifyReport,
+};
 
 /// CRC-32C partilhado com o resto do crate — a mesma via acelerada por
 /// hardware que o v5 usa (CPM-200 §2). Uma única implementação, para que um

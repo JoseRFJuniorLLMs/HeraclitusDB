@@ -200,13 +200,192 @@ pub async fn serve_with(
         None
     };
 
+    // SPEC-0050 Fase 2 — packing RAW→PACKED em background. A implementação
+    // desloca compressão/fsync para `spawn_blocking` e só toma o mutex do
+    // writer durante o publish curto do HRKM; append nunca espera por Zstd.
+    let v6_packing_task = if config.storage_format == heraclitus_core::StorageFormat::V6
+        && config.v6_packing_interval_secs > 0
+    {
+        let log = engine.log.v6_arc().ok_or_else(|| {
+            HeraclitusError::StorageEngine(
+                "configuração v6 abriu um backend que não é V6Log".into(),
+            )
+        })?;
+        let every = std::time::Duration::from_secs(config.v6_packing_interval_secs);
+        boot.ok_line(
+            "Packer HRKL v6",
+            &format!("background a cada {}s", config.v6_packing_interval_secs),
+        );
+        Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                match log
+                    .clone()
+                    .pack_pending_async(heraclitus_log::v6::PackingProfile::Balanced)
+                    .await
+                {
+                    Ok(outcomes) => {
+                        for outcome in outcomes {
+                            tracing::info!(
+                                segment = outcome.receipt.segment_id,
+                                records = outcome.stats.record_count,
+                                blocks = outcome.stats.block_count,
+                                physical_bytes = outcome.stats.physical_size,
+                                compression_ratio = outcome.stats.compression_ratio(),
+                                "packing HRKL v6 publicado"
+                            );
+                        }
+                    }
+                    Err(err) => tracing::warn!(error = %err, "packing HRKL v6 falhou"),
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    // SPEC-0050 Fase 4 — a fila nasce do HRKM e sobrevive a restart. Sidecar
+    // ausente/corrompido só custa pruning; o worker reconstrói-o depois do
+    // packing e nunca bloqueia append.
+    let v6_hrki_task = if config.storage_format == heraclitus_core::StorageFormat::V6
+        && config.v6_hrki_interval_secs > 0
+    {
+        let log = engine.log.v6_arc().ok_or_else(|| {
+            HeraclitusError::StorageEngine(
+                "configuração v6 abriu um backend que não é V6Log".into(),
+            )
+        })?;
+        let mut policy = heraclitus_log::v6::hrki::IndexPolicySet::new();
+        if config.v6_hrki_index_agent_id {
+            policy = policy.com(
+                "agent_id",
+                heraclitus_log::v6::hrki::IndexPolicy::PublicTechnical,
+            );
+        }
+        if config.v6_hrki_index_session_id {
+            policy = policy.com(
+                "session_id",
+                heraclitus_log::v6::hrki::IndexPolicy::PublicTechnical,
+            );
+        }
+        let fpr = config.v6_hrki_bloom_fpr;
+        let every = std::time::Duration::from_secs(config.v6_hrki_interval_secs);
+        boot.ok_line(
+            "HRKI v6",
+            &format!(
+                "background a cada {}s; Bloom FPR {}",
+                config.v6_hrki_interval_secs, fpr
+            ),
+        );
+        Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                match log
+                    .clone()
+                    .build_pending_hrki_async(policy.clone(), None, fpr)
+                    .await
+                {
+                    Ok(outcomes) => {
+                        for outcome in outcomes {
+                            tracing::info!(
+                                segment = outcome.segment_id,
+                                generation = outcome.generation,
+                                bytes = outcome.size,
+                                path = %outcome.path.display(),
+                                "sidecar HRKI publicado"
+                            );
+                        }
+                    }
+                    Err(err) => tracing::warn!(error = %err, "reconstrução HRKI falhou"),
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    // SPEC-0050 Fase 6 — projecção lakehouse em background.
+    //
+    // É a prioridade mais baixa do trabalho de fundo (§147): a fila nasce do
+    // HRKM, um segmento só entra nela depois de selado E empacotado, e falhar
+    // aqui nunca toca no caminho de escrita — §209 exige exactamente isso.
+    // Fica atrás da feature `tier` porque é lá que Parquet/Iceberg/Delta e o
+    // `object_store` vivem; o log continua a não os conhecer.
+    #[cfg(feature = "tier")]
+    let v6_lakehouse_task = if config.storage_format == heraclitus_core::StorageFormat::V6
+        && config.v6_lakehouse_interval_secs > 0
+    {
+        let log = engine.log.v6_arc().ok_or_else(|| {
+            HeraclitusError::StorageEngine(
+                "configuração v6 abriu um backend que não é V6Log".into(),
+            )
+        })?;
+        // O destino tem de estar utilizável ANTES de o servidor declarar a
+        // task viva. Descobrir no primeiro tick que o caminho não existe daria
+        // um servidor que anuncia exportação e nunca exporta.
+        let destino = config.v6_lakehouse_path.clone();
+        if let Some(pai) = std::path::Path::new(&destino).parent() {
+            if !destino.contains("://") && !pai.as_os_str().is_empty() {
+                std::fs::create_dir_all(&destino)?;
+            }
+        }
+        let worker = heraclitus_tier::LakehouseWorker::open_location(
+            &destino,
+            config.v6_lakehouse_table.clone(),
+            log.manifest().storage_namespace_id,
+        )?;
+        let every = std::time::Duration::from_secs(config.v6_lakehouse_interval_secs);
+        boot.ok_line(
+            "Lakehouse v6",
+            &format!(
+                "background a cada {}s; tabela `{}` em {}",
+                config.v6_lakehouse_interval_secs, config.v6_lakehouse_table, destino
+            ),
+        );
+        Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                match worker.export_pending(&log).await {
+                    Ok(saidas) => {
+                        for saida in saidas {
+                            tracing::info!(
+                                segment = saida.segment_id,
+                                generation = saida.generation,
+                                rows = saida.rows,
+                                bytes = saida.size,
+                                delta_version = ?saida.delta_version,
+                                attached = saida.attached,
+                                path = %saida.path,
+                                "projecção lakehouse publicada"
+                            );
+                        }
+                    }
+                    Err(err) => tracing::warn!(error = %err, "exportação lakehouse falhou"),
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     // C2.6 — task de compaction do cold tier (feature `tier`, opt-in via
     // tier_compaction_interval_secs > 0). A cada tick, segmentos demotados com
     // fração de tombstones acima da CompactionPolicy são reescritos sem eles.
     // Nunca sob replicação (o object store é local ao nó) e nunca no caminho
     // de escrita do cliente.
     #[cfg(feature = "tier")]
-    let tier_compaction_task = if config.tier_compaction_interval_secs > 0 {
+    let tier_compaction_task = if config.tier_compaction_interval_secs > 0
+        && config.storage_format != heraclitus_core::StorageFormat::V6
+    {
         let engine_tc = engine.clone();
         let every = std::time::Duration::from_secs(config.tier_compaction_interval_secs);
         boot.warn_line(
@@ -344,6 +523,12 @@ pub async fn serve_with(
                 config.compliance_tsa_mode, evidence_status
             ),
         );
+        // SPEC-0050 §7.2 — o worker corre sobre `AnyLog`, não sobre o `Log`
+        // legado. O compromisso é calculado a partir do `DatabaseManifest`,
+        // que ambos os backends publicam: o legado dá raízes Merkle físicas,
+        // o HRKL v6 dá raízes lógicas canónicas, e os dois domínios são
+        // separados no imprint para que um verificador não possa aplicar o
+        // errado e reportar fraude onde não há.
         let log = engine.log.clone();
         Some(tokio::spawn(run_worker(
             log,
@@ -405,6 +590,16 @@ pub async fn serve_with(
         t.abort();
     }
     if let Some(t) = telemetry_task {
+        t.abort();
+    }
+    if let Some(t) = v6_packing_task {
+        t.abort();
+    }
+    if let Some(t) = v6_hrki_task {
+        t.abort();
+    }
+    #[cfg(feature = "tier")]
+    if let Some(t) = v6_lakehouse_task {
         t.abort();
     }
     #[cfg(feature = "analytics")]

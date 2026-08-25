@@ -2967,9 +2967,11 @@ dependencies = [
  "heraclitus-index-vector",
  "heraclitus-log",
  "heraclitus-manifold",
+ "heraclitus-tier",
  "rand 0.8.7",
  "serde_json",
  "tempfile",
+ "tokio",
  "ulid",
 ]
 
@@ -3293,6 +3295,8 @@ dependencies = [
  "arrow-schema 59.2.0",
  "bincode",
  "blake3",
+ "bytes",
+ "futures",
  "heraclitus-core",
  "heraclitus-log",
  "object_store 0.14.1",

@@ -11,6 +11,278 @@ excluído (é cache, dá falsos positivos).
 > cada afirmação falsa/enganosa com a evidência. O estado real da plataforma e o
 > roteiro estão em [../PLANO-SPECS.md](../PLANO-SPECS.md).
 
+## ATUALIZAÇÃO 2026-08-24 (4) — HRKL v6 é o banco. Nenhuma capability recusa arrancar.
+
+`storage_format` passou a ter **`v6` por omissão**. E, mais importante do que a
+troca do default: as três capabilities que falhavam fechadas em v6 deixaram de
+falhar.
+
+### Raft em v6 — a afirmação de que estava acoplado ao layout legado era falsa
+
+Este documento (e o meu próprio resumo da sessão anterior) dizia que "a state
+machine, os snapshots e o `install_snapshot` do openraft assentam no modelo
+físico legado". **Não assentam.** Verificado por grep sobre o crate inteiro: em
+`consensus.rs`, `grpc.rs`, `net.rs` e `lib.rs`, os únicos métodos do log usados
+são `append_replicated`, `head` e `scan` — os três já no `EpisodeLog`. O
+acoplamento era uma assinatura de tipo (`Arc<Log>`), não uma dependência real.
+
+Trocado por `Arc<AnyLog>`. A suíte de consenso passou a correr contra os dois
+formatos, escolhidos por ambiente:
+
+```bash
+cargo test -p heraclitus-raft --features replication                            # v6 (default)
+HERACLITUS_RAFT_TEST_FORMAT=legacy cargo test -p heraclitus-raft --features replication
+```
+
+**18 testes passam nos dois.** Eleição, quórum, failover, transferência de
+snapshot, raft-log durável com restart de processo, transporte TCP e gRPC — tudo
+sobre HRKL v6.
+
+### Compliance em v6 — já tinha saído na actualização (2)
+
+### Cold tier v1 em v6 — recusa substituída por aviso
+
+A compaction v1 percorre recibos de demote **v1**; num banco v6 todos os
+recibos são v2, portanto a task nunca encontra o que compactar. Recusar o
+arranque do servidor inteiro por causa de uma task de fundo opcional era
+desproporcionado; deixá-la a girar em silêncio seria pior, porque o operador
+ligou-a à espera de que algo acontecesse. Agora o servidor arranca, a task **não
+é iniciada**, e o boot diz porquê:
+
+```
+Compaction do cold tier  INERTE em v6: percorre recibos v1 e o v6 emite v2; a task não é iniciada
+```
+
+### O que um operador vê ao actualizar sem migrar
+
+Os dois layouts continuam isolados nos dois sentidos — o v6 nunca converte dados
+implicitamente. Mas o erro deixou de ser um beco:
+
+```
+esta pasta contém um log v1--v5 (00000000000000000000.hrkl), e o HRKL v6 nunca
+converte dados implicitamente.
+
+Duas saídas:
+  1. migrar (a origem NÃO é alterada):
+       heraclitus migrate-v6 <origem> <destino-novo>
+     e depois apontar `data_dir` ao destino;
+  2. continuar no formato antigo:
+       storage_format = "legacy"   (ou HERACLITUS_STORAGE_FORMAT=legacy)
+```
+
+### A prova de que as peças funcionam juntas
+
+`cluster_v6_replica_empacota_e_ancora_ao_mesmo_tempo`: três nós na configuração
+**por omissão** (v6 + Raft por TCP), 60 escritas pelo consenso, replicação e
+indexação nos três, ancoragem de compliance, packing dos segmentos, e o recibo
+**continua a verificar depois do packing** — a propriedade que a raiz lógica dá
+e a raiz física legada não dava. O cluster continua a aceitar escritas no fim.
+
+O teste tem um `assert` explícito de que o default é v6: se alguém o reverter,
+o teste passa a exercitar o legado, e falha em vez de o fazer em silêncio.
+
+### O que ficou de fora, e é honesto dizer
+
+- **Compaction do cold tier para recibos v2** não existe. A v1 é inerte em v6, e
+  o aviso di-lo. Implementá-la é trabalho a sério, não um adaptador.
+- **Projecção lakehouse continua opt-in** (`v6_lakehouse_interval_secs = 0`).
+  Packing e HRKI são compressão e índices — poupam espaço, e por isso estão
+  ligados por omissão. O lakehouse é uma **cópia** dos dados noutro formato;
+  ligá-la por omissão duplicaria o disco de toda a gente sem pedir licença.
+- Os dois testes do demote/compaction **v1** passaram a fixar
+  `storage_format = Legacy` explicitamente. Herdar o default novo faria testes
+  do caminho legado a exercitar o v6 — passariam a testar outra coisa.
+
+### Validação
+
+- `cargo test --offline --workspace` — **742 testes, 0 falhas**, agora com v6
+  como formato por omissão de toda a suíte.
+- `heraclitus-server` com `tier,analytics,distill,replication` — 46 testes.
+- `heraclitus-raft --features replication` — 18 testes em v6 **e** 18 em legado.
+- Clippy `-D warnings` limpo em core, log, raft, tier, cli, compliance, sim e
+  server com todas as features.
+
+## ATUALIZAÇÃO 2026-08-24 (3) — migração v1–v5 → v6: o v6 passa a ser adoptável
+
+Terceira ocorrência do mesmo padrão nesta spec, e a mais consequente: o
+`v6::migrate` tinha 9 testes a passar, tratava cada versão do formato, o
+`opaque_meta` e a cauda rasgada — e **zero chamadores**. Não havia driver de
+base completa nem comando. Tudo o que as Fases 0–6 construíram estava
+inalcançável para qualquer instalação que já tivesse dados.
+
+Agora existe `migrate_database()` e `heraclitus migrate-v6 <origem> <destino>`.
+Garantias mecânicas: a origem fica byte a byte intacta (§133), o destino tem de
+não existir (§83), a identidade v6 é recomputada e nunca herdada (§131), a
+contiguidade de LSN é verificada e um buraco é erro duro (§5), e a cauda activa
+sai selada (§130). Cada segmento deixa um `LegacyMigrationReceipt` **persistido**
+— até agora o tipo existia mas só em memória, e uma ponte auditável que não
+sobrevive ao processo não é auditável.
+
+Uma cauda rasgada **recusa** migrar em vez de migrar metade: §130 manda
+"recover according to legacy rules", mas essa recuperação trunca o registo
+parcial e violaria a promessa de não tocar na origem.
+
+**Inconsistência pré-existente encontrada e sinalizada, não corrigida:** o
+backend legado grava `cumulative_watermark = head` (último LSN + 1) e o v6 grava
+`= max_lsn`. Não causa bug hoje, mas o `EpisodeLog::manifest()` é agora genérico
+sobre os dois. Corrigir mexe no significado de bytes já no header do `.hrkm`,
+portanto fica registado em vez de alterado às escondidas.
+
+Validação: 742 testes no workspace, 0 falhas; 6 de integração da migração (sobre
+uma base escrita pelo `Log` de produção, não bytes fabricados) e 1 no CLI a
+percorrer o ciclo do operador; Clippy `-D warnings` limpo. Mutações deliberadas
+derrubam os testes respectivos.
+
+**O v6 continua a NÃO ser o default.** `storage_format` é `legacy` por omissão, e
+virar isso é decisão de produto: uma instalação que actualize o binário sem
+migrar veria o motor recusar abrir a sua base — as raízes são isoladas nos dois
+sentidos, de propósito. O caminho existe; a decisão não foi tomada.
+
+## ATUALIZAÇÃO 2026-08-24 (2) — SPEC-0050 Fase 6 fechada; compliance sai do v6
+
+A Fase 6 (lakehouse) estava numa situação particular que vale a pena nomear,
+porque é um modo de falha que se repete em projetos grandes: **as duas pontas
+existiam e estavam testadas, e não havia corda entre elas.**
+
+- o `heraclitus-log` sabia registar uma projecção Parquet no HRKM
+  (`attach_parquet`) e recalcular o watermark contíguo de §104 — com testes;
+- o `heraclitus-tier` sabia materializar Parquet v2, metadata Iceberg v2 real
+  e commits Delta — com 34 testes unitários;
+- **nada chamava o segundo a partir do primeiro.**
+
+A consequência mensurável: `parquet_export_lag_lsn` era exposto em `/metrics` e
+crescia para sempre, porque media um pipeline que nunca corria. Um número que
+parecia saúde e era ficção.
+
+### O que foi feito
+
+| peça | onde |
+|---|---|
+| fronteira no log: `V6Log::lakehouse_pending()` + `attach_parquet_projection()` | `log/src/v6/engine.rs` |
+| trabalhador que atravessa a fronteira | `tier/src/lakehouse/worker.rs` |
+| task de background no servidor + config (`v6_lakehouse_*`) | `server/src/lib.rs`, `core/src/config.rs` |
+| `heraclitus export` e `heraclitus manifest show` (§120) | `cli/` |
+| doctor vê projecções obsoletas (`STALE_PARQUET_PROJECTION`) | `log/src/v6/doctor.rs` |
+
+O trabalhador vive no `heraclitus-tier` pela mesma razão da Fase 5: o
+`heraclitus-log` não conhece `object_store` nem `async`, e não passou a
+conhecer. O log expõe a fronteira; o tier atravessa-a. O CLI e o servidor
+conduzem **o mesmo** trabalhador — duas implementações do mesmo export
+divergiriam, e a que divergisse seria a do caminho menos exercitado.
+
+### Um bug latente que a Fase 6 teria activado
+
+§176 diz que "Parquet superseded pode ser coletado **segundo regras do
+lakehouse**". O `commit_gc` não fazia essa distinção: resolvia o `location` de
+qualquer artefacto derivado como caminho local e chamava `remove_file`. Com um
+Parquet num object store isso ou **falhava** a canonicalizar a URI (bloqueando
+o GC inteiro), ou não encontrava nada e reportava `removed` para um objecto que
+continuava vivo no bucket. Enquanto ninguém chamava `attach_parquet`, era
+inofensivo; ligar a Fase 6 tornava-o real.
+
+Corrigido: o `.hrki` é local e o GC apaga-o; o Parquet é desligado do manifesto
+e reportado em `GcExecution::lakehouse_detached` como dívida da outra camada.
+Reportar a dívida é honesto; fingir a remoção não é. Teste:
+`parquet_obsoleto_e_desligado_do_hrkm_mas_nao_apagado_pelo_gc` — falha com o
+código antigo.
+
+### Compliance deixou de ser recusado em v6 — e ficou melhor
+
+O servidor recusava arrancar com `storage_format = "v6"` e ancoragem ligada.
+A recusa era honesta mas desnecessária: o compromisso é uma Merkle sobre as
+raízes dos segmentos selados, e **ambos** os backends as publicam no
+`DatabaseManifest`. O `commit_at` passou a ler do manifesto em vez do `Log`
+concreto — sem adaptador que fabrique `SegmentMeta` legado a partir de v6, que
+é exactamente o que §69 proíbe.
+
+O que muda não é cosmético:
+
+| | raiz do segmento | sobrevive a repack? |
+|---|---|---|
+| v1–v5 | Merkle **física** dos bytes do ficheiro | **não** |
+| HRKL v6 | raiz **lógica** canónica (§7.2) | **sim** |
+
+Sob o esquema legado, empacotar um segmento invalida um recibo já notarizado:
+os bytes mudam, a raiz muda, e a reverificação acusa "log alterado
+retroativamente" sobre uma história intacta. Sob v6 isso não acontece — provado
+por `um_repack_nao_invalida_um_recibo_ja_emitido`. Os dois domínios têm
+separadores distintos no imprint (`COMMIT_DOMAIN` vs `COMMIT_DOMAIN_V6`) para
+que um verificador não possa aplicar o errado e reportar fraude onde não há; o
+recibo passou a gravar qual usou, com um default **nomeado** para que um recibo
+anterior ao v6 se releia como `legacy-physical` — um `#[serde(default)]` simples
+daria a string vazia e obrigaria o verificador a adivinhar o que "" significa
+(`um_recibo_sem_dominio_le_se_como_legado`).
+
+### O que continua por fazer, e porquê
+
+- **Fase 7 (`PackedEpisodeV1`)** — §204 condiciona-a: *"Somente após benchmarks
+  demonstrarem benefício além de Zstd."* A pré-condição é uma medição, e a
+  medição foi feita: o Zstd `Balanced` deixa **21.95%** dos bytes RAW num corpus
+  operacional real (comprime 4.56×), com §153 e §155 também a passar. **O gate
+  não abre** — um codec estruturado com dicionários disputaria essa quinta parte
+  ao preço de um encoding físico novo em disco, de um ciclo de vida de
+  dicionários (§45) e da sua colisão com a cifra por `agent_id` (§47). Números,
+  ressalvas e o que reabriria a decisão em
+  [`resultados/SPEC-0050-fase7-GATE.md`](resultados/SPEC-0050-fase7-GATE.md).
+- **Fase 8 (indexação avançada)** — §205 declara-a **"Opcional"**.
+- **Raft em v6** — continua recusado no boot. Ao contrário do compliance, não
+  é um problema de leitura do manifesto: a state machine, os snapshots e o
+  `install_snapshot` do openraft assentam no modelo físico legado. §184 coloca
+  explicitamente a política de durabilidade de réplicas "na camada de
+  replication/storage durability", fora desta spec. Fica como dívida declarada
+  e falha fechada, não como suporte parcial silencioso.
+
+### Validação
+
+- `cargo test --offline --workspace` — **742 testes, 0 falhas**.
+- Gates de performance de §207 medidos, não assumidos: §153 PASS (v6 não
+  regride; mediana de 5 corridas A/B alternadas), §154 PASS (`packed/raw` =
+  21.95%, limite 50%), §155 PASS (fallback RAW, expansão 0).
+- `heraclitus-server` com a feature `tier` — 39 testes, 0 falhas.
+- Clippy `-D warnings` limpo em `heraclitus-log` (**incluindo `--all-targets`**,
+  fechando os avisos dos benchmarks `carga_real_1m`/`carga_real_20m` que o
+  SPEC-RESUMO listava como pendentes), `heraclitus-tier`, `heraclitus-core`,
+  `heraclitus-compliance`, `heraclitus-cli`, `heraclitus-views`,
+  `heraclitus-retrieval` e `heraclitus-server`.
+- Os testes novos foram verificados por **mutação deliberada**: tornar
+  `attach_parquet_projection` um no-op derruba 3 dos 7 testes da Fase 6; fazer
+  o exportador perder 1 em cada 7 linhas derruba 6 dos 7; remover o filtro do
+  GC derruba o teste de §176. Um teste que passa na presença do bug que diz
+  cobrir não é cobertura.
+- Corrigidos de passagem dois testes que **não compilavam** em
+  `heraclitus-retrieval` e `heraclitus-views` (referências a `Log` deixadas
+  para trás na migração para `EpisodeLog`/`AnyLog`). O workspace não passava
+  `cargo check --all-targets` antes desta sessão.
+
+## ATUALIZAÇÃO 2026-08-24 — SPEC-0050 ligada ao data plane do servidor
+
+> **Nota de 2026-08-24 (2):** a Fase 6 foi fechada depois de esta secção ser
+> escrita; ver a actualização no topo. O texto abaixo fica como está para
+> preservar o registo do que se sabia nesse momento.
+
+A SPEC-0050 continua **parcial** (Fases 6–8 permanecem abertas), mas deixou de
+ser apenas uma biblioteca isolada. O caminho vivo agora seleciona o formato de
+forma explícita:
+
+- `storage_format = "v6"` no TOML ou `HERACLITUS_STORAGE_FORMAT=v6` abre
+  `V6Log`; o default continua `legacy`.
+- `EpisodeLog` + `AnyLog` desacoplam Engine, views, H-VM, query, retrieval e
+  analytics do tipo concreto `Log`.
+- Append, leitura, scan, tail, consulta GQL, verificação operacional e restart
+  foram testados através do `Engine` em v6.
+- Layout legado e v6 recusam abrir a raiz um do outro antes de qualquer escrita;
+  não existe detecção permissiva nem migração implícita.
+- Skip-scan continua disponível no legado; v6 usa scan conservador até a HRKI
+  entrar no planner, sem risco de falsos negativos.
+- Compliance, Raft e cold-tier v1 ainda dependem do modelo físico legado e são
+  recusados em v6. Isso é uma lacuna declarada, não suporte parcial silencioso.
+  **(Desactualizado em 2026-08-24: o compliance passou a correr em v6 — ver a
+  actualização no topo deste ficheiro. Raft e cold-tier v1 continuam recusados.)**
+
+Validação desta integração: 31 testes do servidor, 181 testes unitários mais
+suítes de integração/crash do log, 53 testes do query e Clippy `-D warnings`
+nos crates alterados.
+
 ## ATUALIZAÇÃO 2026-07-09 — SPEC-009-035 implementados (módulos reais)
 
 A pedido, os SPEC-009 a 035 foram **implementados como módulos Rust reais, que

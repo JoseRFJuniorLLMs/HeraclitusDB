@@ -40,10 +40,22 @@ const MAX_BYTES: u64 = 48 * 1024;
 
 fn crash_writer_v6_bin() -> PathBuf {
     let mut p = std::env::current_exe().unwrap();
+    p.pop(); // nome do teste
     p.pop(); // deps/
-    p.pop(); // debug/ | release/
     p.push("examples");
     p.push(format!("crash_writer_v6{}", std::env::consts::EXE_SUFFIX));
+    p
+}
+
+/// Mantém o exemplo no mesmo target dir da integração que o vai executar.
+/// Isso evita depender de um `D:\\cargo-target` global (que pode estar ocupado
+/// ou inacessível no CI) e garante que `crash_writer_v6_bin` aponta para a
+/// build que este teste acabou de produzir.
+fn test_target_dir() -> PathBuf {
+    let mut p = std::env::current_exe().expect("caminho do binário de teste");
+    p.pop(); // nome do teste
+    p.pop(); // deps/
+    p.pop(); // debug/ | release/
     p
 }
 
@@ -127,6 +139,8 @@ fn sobrevive_a_kills_repetidos_a_meio_do_append() {
             "-p",
             "heraclitus-log",
         ])
+        .arg("--target-dir")
+        .arg(test_target_dir())
         .status()
         .expect("cargo build crash_writer_v6");
     assert!(status.success(), "build do harness falhou");

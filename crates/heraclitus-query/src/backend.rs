@@ -12,7 +12,8 @@ use heraclitus_index_graph::decision::{self, DecisionPolicy};
 use heraclitus_index_graph::entity::EntityResolver;
 use heraclitus_index_graph::temporal::{Edge, EdgeType, EdgeVersion, TemporalGraph};
 use heraclitus_log::skip_scan::SkipScanner;
-use heraclitus_log::Log;
+use heraclitus_log::{EpisodeLog, Log, PrunedScanStats};
+use std::any::Any;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -543,7 +544,7 @@ pub trait QueryBackend {
         _field: &str,
         _value: &str,
         _as_of: Option<Lsn>,
-    ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
+    ) -> Result<Option<PrunedScanResult>, HeraclitusError> {
         Ok(None)
     }
     fn recall(
@@ -824,6 +825,28 @@ pub trait QueryBackend {
     }
 }
 
+/// Resultado de um hint de scan com os contadores da própria chamada.
+///
+/// Transportar os contadores junto das linhas evita que duas queries
+/// concorrentes troquem estatísticas através de um slot global de "último
+/// scan". O campo `stats` é `None` apenas para capabilities antigas que ainda
+/// não conseguem medir bytes/blocos.
+#[derive(Debug, Clone)]
+pub struct PrunedScanResult {
+    pub rows: Vec<(Lsn, Episode)>,
+    pub stats: Option<PrunedScanStats>,
+}
+
+impl PrunedScanResult {
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
 // =========================================================================
 // M29: SNAPSHOT BUNDLE UTILIZANDO COw PARCIAL (ELIMINA CLONE $O(N+E)$ SPICES)
 // =========================================================================
@@ -838,13 +861,13 @@ struct SnapshotBundle {
 }
 
 pub struct LogBackend {
-    log: Arc<Log>,
+    log: Arc<dyn EpisodeLog>,
     bundle: ArcSwap<SnapshotBundle>,
     sync_mutex: Mutex<()>,
     /// SPEC-028 wired: um SkipScanner vivo entre queries — o cache de zone maps
     /// em RAM paga-se a cada hit, e o ArtifactRegistry cataloga cada zone map
     /// (fingerprint por segmento) para reuso/evicção LRU sob pressão.
-    scanner: SkipScanner,
+    scanner: Option<SkipScanner>,
     artifacts: Mutex<heraclitus_core::artifact_registry::ArtifactRegistry>,
     /// artifact_id → segment (para a evicção em cascata executar no scanner).
     artifact_segments: Mutex<std::collections::HashMap<u64, heraclitus_core::SegmentId>>,
@@ -852,10 +875,28 @@ pub struct LogBackend {
     /// o skip-scan se provar mais lento que o window-scan, o planner cai de
     /// volta (adaptativo, sem redes neuronais — pura estatística).
     calibrator: Mutex<heraclitus_core::cost::EmaCalibrator>,
+    /// Último conjunto de contadores físicos produzido por um caminho de
+    /// pruning. O executor/EXPLAIN pode lê-lo sem conhecer HRKI ou `.zmap`.
+    last_pruned_scan: Mutex<Option<PrunedScanStats>>,
 }
 
 impl LogBackend {
-    pub fn new(log: Arc<Log>) -> Self {
+    pub fn new<L>(log: Arc<L>) -> Self
+    where
+        L: EpisodeLog + 'static,
+    {
+        // `SkipScanner` still owns an `Arc<Log>` because zone maps are a
+        // capability of the legacy segmented format.  Prefer an Arc exposed
+        // by a neutral facade (AnyLog::Legacy); retain the downcast for callers
+        // that pass Arc<Log> directly.  A V6 backend deliberately has no
+        // scanner and the planner falls back to its exact window scan.
+        let legacy_log = log.legacy_arc().or_else(|| {
+            log.as_legacy()?;
+            let erased: Arc<dyn Any + Send + Sync> = log.clone();
+            Arc::downcast::<Log>(erased).ok()
+        });
+        let scanner = legacy_log.map(SkipScanner::new);
+        let log: Arc<dyn EpisodeLog> = log;
         let initial_bundle = SnapshotBundle {
             lsn: 0,
             graph: Arc::new(TemporalGraph::new()),
@@ -865,14 +906,19 @@ impl LogBackend {
             vector_index: Arc::new(HnswIndex::default()),
         };
         Self {
-            scanner: SkipScanner::new(log.clone()),
+            scanner,
             log,
             bundle: ArcSwap::from_pointee(initial_bundle),
             sync_mutex: Mutex::new(()),
             artifacts: Mutex::new(Default::default()),
             artifact_segments: Mutex::new(std::collections::HashMap::new()),
             calibrator: Mutex::new(heraclitus_core::cost::EmaCalibrator::new(0.3)),
+            last_pruned_scan: Mutex::new(None),
         }
+    }
+
+    pub fn last_pruned_scan_stats(&self) -> Option<PrunedScanStats> {
+        *self.last_pruned_scan.lock().unwrap()
     }
 
     /// Fingerprint de intenção para um caminho de acesso (SPEC-011/028).
@@ -907,7 +953,10 @@ impl LogBackend {
     /// SPEC-028/031: cataloga os zone maps tocados; sob pressão (mais entradas
     /// em RAM que `cap`), evicta o LRU do registry E do cache do scanner.
     fn register_zone_maps(&self, cap: usize) {
-        let sealed = self.log.sealed_segments();
+        let (Some(log), Some(scanner)) = (self.log.as_legacy(), self.scanner.as_ref()) else {
+            return;
+        };
+        let sealed = log.sealed_segments();
         let mut reg = self.artifacts.lock().unwrap();
         let mut seg_of = self.artifact_segments.lock().unwrap();
         for meta in &sealed {
@@ -922,14 +971,14 @@ impl LogBackend {
                 seg_of.insert(id, meta.id);
             }
         }
-        while self.scanner.cached() > cap {
+        while scanner.cached() > cap {
             let Some(evicted) = reg.evict_lru() else {
                 break;
             };
             let mut dropped = false;
             for id in evicted {
                 if let Some(seg) = seg_of.remove(&id) {
-                    dropped |= self.scanner.evict(seg);
+                    dropped |= scanner.evict(seg);
                 }
             }
             if !dropped {
@@ -940,7 +989,10 @@ impl LogBackend {
 
     /// Estatísticas do registry (testes/introspecção): `(artefactos, zone maps em RAM)`.
     pub fn artifact_stats(&self) -> (usize, usize) {
-        (self.artifacts.lock().unwrap().len(), self.scanner.cached())
+        (
+            self.artifacts.lock().unwrap().len(),
+            self.scanner.as_ref().map_or(0, SkipScanner::cached),
+        )
     }
 
     fn sync_bundle(&self) -> Result<Arc<SnapshotBundle>, HeraclitusError> {
@@ -1147,7 +1199,7 @@ impl QueryBackend for LogBackend {
         field: &str,
         value: &str,
         as_of: Option<Lsn>,
-    ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
+    ) -> Result<Option<PrunedScanResult>, HeraclitusError> {
         let bound = self.resolve_as_of_bound(as_of)?;
         // SPEC-032 (adaptativo): se o histórico EMA diz que o skip-scan tem sido
         // >20% mais lento que o window-scan, devolve None — o planner cai no
@@ -1160,16 +1212,47 @@ impl QueryBackend for LogBackend {
                 return Ok(None);
             }
         }
+        let t0 = std::time::Instant::now();
+        if let Some((mut hits, stats)) = self.log.scan_builtin_eq_capped(
+            field,
+            value,
+            0,
+            bound,
+            QUERY_SCAN_CAP,
+        )? {
+            self.observe_access_path("skip", t0.elapsed().as_nanos() as f64);
+            *self.last_pruned_scan.lock().unwrap() = Some(stats);
+            hits.retain(|(l, _)| *l < bound);
+            return Ok(Some(PrunedScanResult {
+                rows: hits,
+                stats: Some(stats),
+            }));
+        }
         // Skip-I/O over sealed segments (SPEC-010) com o scanner PERSISTENTE
         // (SPEC-028: o cache de zone maps sobrevive entre queries; sidecars
         // .zmap cobrem o cold boot).
+        let Some(scanner) = self.scanner.as_ref() else {
+            // V6 não tem segmentos legados nem zone maps compatíveis. `None`
+            // é o contrato de fallback conservador: o planner executa o scan
+            // normal e reaplica o predicado, portanto nunca há falso negativo.
+            return Ok(None);
+        };
         let t0 = std::time::Instant::now();
-        let (mut hits, _stats) = match field {
-            "agent_id" => self.scanner.scan_pruned(|z| z.may_contain_agent(value))?,
-            "session_id" => self.scanner.scan_pruned(|z| z.may_contain_session(value))?,
+        let (mut hits, legacy_stats) = match field {
+            "agent_id" => scanner.scan_pruned(|z| z.may_contain_agent(value))?,
+            "session_id" => scanner.scan_pruned(|z| z.may_contain_session(value))?,
             _ => return Ok(None), // field not summarized by the zone map
         };
         self.observe_access_path("skip", t0.elapsed().as_nanos() as f64);
+        let stats = PrunedScanStats {
+            segments_total: legacy_stats.segments_considered as u64,
+            segments_candidate: legacy_stats.segments_considered as u64,
+            segments_pruned: legacy_stats.segments_skipped as u64,
+            segments_read: (legacy_stats.segments_considered
+                - legacy_stats.segments_skipped) as u64,
+            ..Default::default()
+        };
+        *self.last_pruned_scan.lock().unwrap() = Some(stats);
         // SPEC-028/031: cataloga os zone maps tocados e aplica a política de
         // evicção (cap de zone maps em RAM; o registry escolhe o LRU).
         self.register_zone_maps(1024);
@@ -1180,7 +1263,10 @@ impl QueryBackend for LogBackend {
         if hits.len() > QUERY_SCAN_CAP {
             hits.truncate(QUERY_SCAN_CAP);
         }
-        Ok(Some(hits))
+        Ok(Some(PrunedScanResult {
+            rows: hits,
+            stats: Some(stats),
+        }))
     }
 
     /// CORRIGIDO: WAND determinístico sem reorder global $O(k \log k)$ e com garantia de avanço monotônico livre de skips.
@@ -1606,14 +1692,14 @@ impl QueryBackend for LogBackend {
 // =========================================================================
 
 struct LogChunkIterator {
-    log: Arc<Log>,
+    log: Arc<dyn EpisodeLog>,
     current_lsn: Lsn,
     to_lsn: Lsn,
     current_batch: std::vec::IntoIter<(Lsn, Episode)>,
 }
 
 impl LogChunkIterator {
-    fn new(log: Arc<Log>, from_lsn: Lsn, to_lsn: Lsn) -> Self {
+    fn new(log: Arc<dyn EpisodeLog>, from_lsn: Lsn, to_lsn: Lsn) -> Self {
         Self {
             log,
             current_lsn: from_lsn,
@@ -1917,7 +2003,10 @@ pub fn community_leiden_of(
 /// partir do log inteiro, em janelas para limitar RAM. O backend de referência
 /// e as verificações de consistência das views (server) partilham isto — a
 /// regra de derivação tem uma única fonte de verdade.
-pub fn replay_graph(log: &Log) -> Result<TemporalGraph, HeraclitusError> {
+pub fn replay_graph<L>(log: &L) -> Result<TemporalGraph, HeraclitusError>
+where
+    L: EpisodeLog + ?Sized,
+{
     let mut g = TemporalGraph::new();
     let head = log.head();
     let mut cur: Lsn = 0;
@@ -1935,7 +2024,10 @@ pub fn replay_graph(log: &Log) -> Result<TemporalGraph, HeraclitusError> {
 }
 
 /// Reconstrói o resolver de entidades a partir do log inteiro (referência M11).
-pub fn replay_resolver(log: &Log) -> Result<EntityResolver, HeraclitusError> {
+pub fn replay_resolver<L>(log: &L) -> Result<EntityResolver, HeraclitusError>
+where
+    L: EpisodeLog + ?Sized,
+{
     let mut r = EntityResolver::new();
     let head = log.head();
     let mut cur: Lsn = 0;

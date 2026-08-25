@@ -194,7 +194,7 @@ impl RawSegmentWriter {
     /// catálogo/nome do motor identifica como activo.
     pub fn resume(
         path: &Path,
-        canonical_hasher: &dyn Fn(Lsn, u64, &[u8]) -> V6Result<[u8; 32]>,
+        canonical_hasher: super::packer::CanonicalHasher<'_>,
     ) -> V6Result<Self> {
         const CTX: &str = "hrkl v6 raw resume";
         let scan = scan_raw_segment(path)?;

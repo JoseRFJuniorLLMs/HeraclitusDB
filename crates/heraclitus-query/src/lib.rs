@@ -71,7 +71,9 @@ pub fn execute(
     let q = parse(input)?;
     let p = plan::plan(&q.stmt);
     if q.explain {
-        return Ok(serde_json::Value::String(plan::render(&p)));
+        return Ok(serde_json::Value::String(plan::explain_with_backend(
+            &p, be,
+        )?));
     }
     // M18: the consistency contract is enforced before any rows are produced —
     // a query that demands more freshness than the backend can serve fails
@@ -91,8 +93,8 @@ pub fn execute(
 mod tests {
     use super::*;
     use backend::LogBackend;
-    use heraclitus_core::{Episode, EventKind, FsyncPolicy};
-    use heraclitus_log::Log;
+    use heraclitus_core::{Episode, EventKind, FsyncPolicy, StorageFormat};
+    use heraclitus_log::{AnyLog, Log};
     use proptest::prelude::*;
     use std::sync::Arc;
 
@@ -322,6 +324,98 @@ mod tests {
         }
         let hint = be.scan_builtin_eq("agent_id", "alice", None).unwrap();
         assert!(hint.is_some(), "skip volta a ser o caminho preferido");
+    }
+
+    #[test]
+    fn v6_builtin_filter_uses_exact_capability_without_false_negatives() {
+        use backend::QueryBackend as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(StorageFormat::V6, dir.path(), 1 << 20, FsyncPolicy::Always).unwrap(),
+        );
+        for agent in ["alice", "bob", "alice"] {
+            log.append(Episode::new(
+                agent,
+                EventKind::Observation,
+                agent.as_bytes().to_vec(),
+            ))
+            .unwrap();
+        }
+        let be = LogBackend::new(log);
+
+        let hint = be
+            .scan_builtin_eq("agent_id", "alice", None)
+            .unwrap()
+            .expect("V6 expõe o scan exacto mesmo sem sidecar");
+        assert_eq!(hint.len(), 2);
+        let stats = be.last_pruned_scan_stats().unwrap();
+        assert_eq!(stats.hrki_used, 0);
+        assert!(stats.segments_read > 0);
+        let rows = execute("MATCH (n) WHERE n.agent_id = \"alice\" RETURN n", &be).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 2);
+        assert_eq!(be.artifact_stats(), (0, 0));
+    }
+
+    #[test]
+    fn v6_query_path_consumes_hrki_and_reports_physical_pruning() {
+        use backend::QueryBackend as _;
+        use heraclitus_log::v6::hrki::{IndexPolicy, IndexPolicySet};
+        use heraclitus_log::v6::PackingProfile;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(StorageFormat::V6, dir.path(), 420, FsyncPolicy::Always).unwrap(),
+        );
+        for (agent, range) in [("alice", 0..30), ("bob", 30..60)] {
+            for i in range {
+                log.append(Episode::new(
+                    agent,
+                    EventKind::Observation,
+                    format!("evento-{i}").into_bytes(),
+                ))
+                .unwrap();
+            }
+        }
+        let v6 = log.v6_arc().unwrap();
+        v6.seal_active().unwrap();
+        v6.pack_pending(PackingProfile::Balanced).unwrap();
+        v6.build_pending_hrki(
+            &IndexPolicySet::new().com("agent_id", IndexPolicy::PublicTechnical),
+            None,
+            0.01,
+        )
+        .unwrap();
+
+        let be = LogBackend::new(log);
+        let hint = be
+            .scan_builtin_eq("agent_id", "alice", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(hint.len(), 30);
+        let stats = be.last_pruned_scan_stats().unwrap();
+        assert!(stats.hrki_used > 0);
+        assert!(stats.segments_pruned > 0);
+        assert!(stats.blocks_pruned > 0);
+
+        let explained = execute(
+            "EXPLAIN MATCH (n) WHERE n.agent_id = \"alice\" RETURN n",
+            &be,
+        )
+        .unwrap();
+        let explained = explained.as_str().unwrap();
+        assert!(explained.contains("StoragePruning"), "{explained}");
+        assert!(explained.contains("HRKI pruned ="), "{explained}");
+        assert!(explained.contains("blocks pruned ="), "{explained}");
+        assert!(explained.contains("bytes pruned ="), "{explained}");
+
+        let rows = execute("MATCH (n) WHERE n.agent_id = \"alice\" RETURN n", &be).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 30);
+        assert!(rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["agent_id"] == "alice"));
     }
 
     #[test]
