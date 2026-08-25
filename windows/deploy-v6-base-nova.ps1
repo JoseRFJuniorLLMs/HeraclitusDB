@@ -1,41 +1,45 @@
 ﻿# Deploy do HeraclitusDB novo (HRKL v6) com base LIMPA.
 #
-# CORRER ELEVADO (o SCM e as env de máquina exigem Administrador).
+# CORRER ELEVADO (o SCM exige Administrador).
 #
-# O que faz, por ordem:
-#   1. pára o serviço;
-#   2. faz backup dos binários actuais;
-#   3. RENOMEIA a base legada (não apaga — ver nota abaixo);
-#   4. copia os binários novos;
-#   5. arranca o serviço, que cria uma base HRKL v6 vazia;
-#   6. verifica que subiu e que o formato é mesmo v6.
+# APAGA a base antiga. Nao a arquiva, nao a renomeia para sempre: apaga.
 #
-# ## Porque RENOMEIA em vez de apagar
+# ## A ordem das operacoes
 #
-# São 13,2 GB e a operação é irreversível. Renomear é instantâneo e deixa-te
-# desfazer se algo correr mal no arranque; apagar não deixa. O script imprime
-# no fim o comando exacto para a apagares quando estiveres satisfeito — um
-# passo teu, deliberado, e não um efeito colateral de um deploy.
+#   1. para o servico
+#   2. backup dos binarios (para rollback)
+#   3. renomeia a base antiga        <- instantaneo
+#   4. cria base vazia + copia binarios novos
+#   5. arranca e VERIFICA que subiu em v6
+#   6. APAGA a base antiga           <- so depois de o servico estar de pe
 #
-# ## As memórias do Claude
+# O passo 3 e o 6 estao separados de proposito, e nao por timidez: apagar
+# 15 GB leva perto de um minuto, e faze-lo entre o stop e o start punha esse
+# minuto todo em downtime. Renomear e instantaneo, o servico volta em segundos,
+# e a remocao corre com o banco ja a servir. O estado final e exactamente o
+# mesmo — a base antiga desaparece nesta mesma execucao, sem passo manual.
 #
-# Foram exportadas para D:\HeraclitusDB\claude_mem_backup_2026-08-25.jsonl
-# (166 memórias, 8 projetos). Depois de o serviço subir, restaura-as com:
+# O efeito util de os separar: se o passo 5 falhar, a base antiga ainda existe
+# e o script repoe-a junto com os binarios. Depois de o passo 5 passar, ja nao
+# ha nada para reverter e a base vai-se embora.
+#
+# ## As memorias do Claude
+#
+# 167 memorias (8 projectos) foram exportadas para
+# D:\HeraclitusDB\claude_mem_backup_2026-08-25.jsonl. Depois do deploy:
 #
 #   cd D:\DEV\scripts\hera_mem
 #   python restore_memories.py D:\HeraclitusDB\claude_mem_backup_2026-08-25.jsonl
-#
-# Se falhar o arranque, o script faz rollback dos binários sozinho; a base
-# antiga fica no diretório renomeado e volta com um Rename-Item.
 
 $ErrorActionPreference = 'Stop'
-$svc    = 'HeraclitusDB'
-$bin    = 'D:\HeraclitusDB\bin'
-$src    = 'D:\cargo-target\release'
-$data   = 'D:\HeraclitusDB\data'
-$stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
-$dataOld = "$data.legacy-$stamp"
-$log    = "D:\tmp\hera_deploy_v6_$stamp.log"
+$svc     = 'HeraclitusDB'
+$bin     = 'D:\HeraclitusDB\bin'
+$src     = 'D:\cargo-target\release'
+$data    = 'D:\HeraclitusDB\data'
+$stamp   = Get-Date -Format 'yyyyMMdd-HHmmss'
+$dataOld = "$data.apagar-$stamp"
+$log     = "D:\tmp\hera_deploy_v6_$stamp.log"
+$exes    = @('heraclitus-service.exe', 'heraclitus-server.exe', 'heraclitus.exe')
 
 function Log($m) {
     $linha = "[$(Get-Date -Format HH:mm:ss)] $m"
@@ -43,42 +47,38 @@ function Log($m) {
     $linha | Out-File $log -Append -Encoding utf8
 }
 
-# Guarda-costas: sem os binários novos não se mexe em nada.
-foreach ($exe in 'heraclitus-service.exe', 'heraclitus-server.exe', 'heraclitus.exe') {
+# Guarda-costas: sem os binarios novos nao se mexe em nada.
+foreach ($exe in $exes) {
     if (-not (Test-Path (Join-Path $src $exe))) {
-        throw "binário em falta: $src\$exe — corre primeiro: cargo build --release -p heraclitus-server -p heraclitus-cli"
+        throw "binario em falta: $src\$exe -- corre primeiro: cargo build --release -p heraclitus-server -p heraclitus-cli"
     }
 }
 
 Log "=== deploy HRKL v6, base nova ==="
-Log "binários de: $src"
+$gb = [math]::Round(((Get-ChildItem $data -Recurse -File -ErrorAction SilentlyContinue |
+                      Measure-Object -Property Length -Sum).Sum / 1GB), 2)
+Log "base antiga: $gb GB (vai ser APAGADA)"
 
 try {
     Log "a parar $svc"
     Stop-Service $svc -Force
     (Get-Service $svc).WaitForStatus('Stopped', '00:01:00')
 
-    # --- backup dos binários (rollback) ---
-    foreach ($exe in 'heraclitus-service.exe', 'heraclitus-server.exe', 'heraclitus.exe') {
+    foreach ($exe in $exes) {
         $alvo = Join-Path $bin $exe
         if (Test-Path $alvo) {
             Copy-Item $alvo "$alvo.bak-$stamp" -Force
-            Log "backup: $exe -> $exe.bak-$stamp"
+            Log "backup: $exe"
         }
     }
 
-    # --- base legada de lado ---
     if (Test-Path $data) {
-        $gb = [math]::Round(((Get-ChildItem $data -Recurse -File -ErrorAction SilentlyContinue |
-                              Measure-Object -Property Length -Sum).Sum / 1GB), 2)
         Rename-Item $data $dataOld
-        Log "base legada ($gb GB) renomeada -> $dataOld"
+        Log "base antiga de lado: $dataOld"
     }
     New-Item -ItemType Directory -Path $data -Force | Out-Null
-    Log "base nova vazia: $data"
 
-    # --- binários novos ---
-    foreach ($exe in 'heraclitus-service.exe', 'heraclitus-server.exe', 'heraclitus.exe') {
+    foreach ($exe in $exes) {
         Copy-Item (Join-Path $src $exe) (Join-Path $bin $exe) -Force
         Log "copiado: $exe ($((Get-Item (Join-Path $bin $exe)).Length) bytes)"
     }
@@ -87,48 +87,48 @@ try {
     Start-Service $svc
     (Get-Service $svc).WaitForStatus('Running', '00:01:00')
 
-    # --- verificação: subiu E está em v6 ---
+    # Verificar o FORMATO, nao so o estado do SCM. Um deploy que confirma que o
+    # servico subiu mas nao em que formato passaria por bom um arranque errado.
     Start-Sleep -Seconds 5
     $porta = $env:HERACLITUS_REST_ADDR
     if (-not $porta) { $porta = '127.0.0.1:7475' }
     $stats = Invoke-RestMethod "http://$porta/stats" -TimeoutSec 15
     Log "head=$($stats.head)  storage_format=$($stats.storage_format)"
     if ($stats.storage_format -ne 'v6') {
-        throw "o serviço subiu em '$($stats.storage_format)' e não em v6"
-    }
-    if ($stats.head -ne 0) {
-        Log "AVISO: head=$($stats.head) numa base que devia estar vazia"
+        throw "o servico subiu em '$($stats.storage_format)' e nao em v6"
     }
 
-    Log "DEPLOY OK — HRKL v6, base vazia, serviço a correr"
+    # --- ponto sem retorno: o servico esta de pe, a base antiga e lixo ---
+    Log "a apagar a base antiga ($gb GB); pode demorar"
+    Remove-Item $dataOld -Recurse -Force
+    Log "base antiga APAGADA"
+
+    $livre = [math]::Round((Get-PSDrive D).Free / 1GB, 1)
+    Log "DEPLOY OK -- HRKL v6, base vazia, servico a correr. Livre em D: $livre GB"
     Write-Output ""
-    Write-Output "Proximos dois passos, por esta ordem:"
-    Write-Output ""
-    Write-Output "  1. restaurar as 166 memorias:"
-    Write-Output "       cd D:\DEV\scripts\hera_mem"
-    Write-Output "       python restore_memories.py D:\HeraclitusDB\claude_mem_backup_2026-08-25.jsonl"
-    Write-Output ""
-    Write-Output "  2. quando estiveres satisfeito, apagar a base antiga (IRREVERSIVEL):"
-    Write-Output "       Remove-Item -Recurse -Force '$dataOld'"
+    Write-Output "Falta so restaurar as memorias:"
+    Write-Output "  cd D:\DEV\scripts\hera_mem"
+    Write-Output "  python restore_memories.py D:\HeraclitusDB\claude_mem_backup_2026-08-25.jsonl"
     Write-Output ""
     exit 0
 
 } catch {
     Log ("ERRO: " + $_.Exception.Message)
-    Log "ROLLBACK dos binarios"
-    foreach ($exe in 'heraclitus-service.exe', 'heraclitus-server.exe', 'heraclitus.exe') {
+    Log "ROLLBACK"
+    foreach ($exe in $exes) {
         $bak = Join-Path $bin "$exe.bak-$stamp"
         if (Test-Path $bak) { Copy-Item $bak (Join-Path $bin $exe) -Force }
     }
-    # A base antiga volta ao sítio, para o binário antigo a encontrar.
+    # A base antiga so e apagada DEPOIS do arranque verificado, portanto se
+    # chegamos aqui ela ainda existe e volta ao sitio.
     if ((Test-Path $dataOld) -and (Test-Path $data)) {
         $vazia = -not (Get-ChildItem $data -Recurse -File -ErrorAction SilentlyContinue)
         if ($vazia) {
             Remove-Item $data -Recurse -Force
             Rename-Item $dataOld $data
-            Log "base legada reposta em $data"
+            Log "base antiga reposta"
         } else {
-            Log "AVISO: $data nao esta vazia; a base antiga fica em $dataOld"
+            Log "AVISO: $data nao esta vazia; a base antiga ficou em $dataOld"
         }
     }
     try {
@@ -136,7 +136,7 @@ try {
         (Get-Service $svc).WaitForStatus('Running', '00:01:00')
         Log ("ROLLBACK concluido, status=" + (Get-Service $svc).Status)
     } catch {
-        Log "NAO CONSEGUIU REARRANCAR — ver $log"
+        Log "NAO CONSEGUIU REARRANCAR -- ver $log"
     }
     exit 1
 }
