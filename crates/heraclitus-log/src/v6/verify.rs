@@ -19,7 +19,7 @@ use super::error::{corrupt, V6Result};
 use super::footer::FooterV6;
 use super::header::PhysicalLayout;
 use super::merkle::{build_inclusion_proof, InclusionProof, MerkleAccumulatorV1};
-use super::packed::{open_packed, ScanCounters};
+use super::packed::{open_packed, BlockSource, PackedSegmentReader, ScanCounters};
 use super::packer::CanonicalHasher;
 use super::raw::{scan_raw_segment, RawScan};
 use super::receipts::{attestation_for, AttestationEnvelopeV1};
@@ -167,6 +167,28 @@ fn verify_packed(
     // §124: um PACKED válido exige header, footer, directório e ranges
     // coerentes — tudo verificado já no `open`.
     let reader = open_packed(path, max_block_bytes)?;
+    verify_packed_reader(&reader, level, hasher)
+}
+
+/// Verifica um segmento PACKED ja aberto, seja qual for a origem dos bytes.
+///
+/// E a mesma verificacao de [`verify_segment`] sem o pressuposto de que o
+/// segmento vive num caminho local: um [`PackedSegmentReader`] sobre object
+/// storage (SPEC-0050 §85) passa por este mesmo codigo, e e isso que impede
+/// que a autoridade de §84 — `logical_root`/`physical_digest` calculados pelo
+/// Heraclitus, nunca o `ETag` — degenere numa segunda implementacao so para o
+/// tier frio.
+pub fn verify_packed_reader<S: BlockSource>(
+    reader: &PackedSegmentReader<S>,
+    level: IntegrityLevel,
+    hasher: Option<CanonicalHasher<'_>>,
+) -> V6Result<VerifyReport> {
+    if level >= IntegrityLevel::Logical && hasher.is_none() {
+        return Err(corrupt(
+            "hrkl v6 verify",
+            "LOGICAL verification requires a canonical hasher",
+        ));
+    }
     let mut counters = ScanCounters::default();
     let mut notes = Vec::new();
     let mut logical_ok = None;

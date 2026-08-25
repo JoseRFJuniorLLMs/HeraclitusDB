@@ -18,7 +18,7 @@ use heraclitus_core::Lsn;
 use heraclitus_log::v6::canonical::DOMAIN_CANONICAL_RECORD;
 use heraclitus_log::v6::error::V6Result;
 use heraclitus_log::v6::gc::{
-    apply_gc, assert_gc_invariant, plan_gc, GcBlockReason, GcOptions, PinRegistry,
+    assert_gc_invariant, commit_gc, plan_gc, GcBlockReason, GcOptions, PinRegistry,
 };
 use heraclitus_log::v6::manifest::{
     boot_report, decode_manifest, encode_manifest, quarantine_generation, record_pack,
@@ -199,6 +199,116 @@ fn golden_vector_do_hrkm() {
 // O ciclo completo
 // ---------------------------------------------------------------------------
 
+/// SPEC-0050 §176 — "Parquet superseded pode ser coletado segundo regras do
+/// lakehouse".
+///
+/// A frase decide **quem** apaga, e essa distinção tem consequências. O `.hrki`
+/// é um ficheiro local ao lado do `.hrkl`, e o GC do HRKL apaga-o. O Parquet
+/// vive num object store, possivelmente remoto, e o GC do HRKL não o pode
+/// apagar — só desligar a referência. Antes desta correcção, `commit_gc`
+/// tratava os dois por igual: resolvia o `location` do Parquet como caminho
+/// local e ou falhava a canonicalizar uma URI, ou não encontrava nada e
+/// reportava `removed` para um objecto que continuava vivo no bucket.
+///
+/// A dívida é reportada em `lakehouse_detached` porque um operador precisa de
+/// saber que a camada lakehouse tem uma remoção por fazer. Fingir que já foi
+/// feita é o modo de falha caro.
+#[test]
+fn parquet_obsoleto_e_desligado_do_hrkm_mas_nao_apagado_pelo_gc() {
+    let d = dir_teste("gc-lakehouse");
+    let store = ManifestStore::open(d.join("manifests")).unwrap();
+    let mut m = DatabaseManifest {
+        storage_namespace_id: NAMESPACE,
+        ..Default::default()
+    };
+    let raw = sela_e_cataloga(&d, &mut m, 0, 1, 100);
+    let target = d.join("00000000000000000000.g1.hrkl");
+    pack_and_commit(
+        &store,
+        &mut m,
+        &raw,
+        &target,
+        PackOptions::default(),
+        0,
+        1,
+        hlc(100),
+        &hasher,
+    )
+    .unwrap();
+
+    // Um sidecar local obsoleto e uma projecção lakehouse obsoleta, lado a
+    // lado. A URI é a forma real: o worker da Fase 6 grava a localização
+    // absoluta do objecto, não um caminho relativo ao diretório do log.
+    let sidecar = d.join("obsoleto.hrki");
+    std::fs::write(&sidecar, b"sidecar de outra geracao").unwrap();
+    let seg = m.segment_mut(0).unwrap();
+    seg.hrki = Some(DerivedArtifactRef {
+        location: "obsoleto.hrki".into(),
+        size: 24,
+        digest: [0; 32],
+        logical_root: [0xEE; 32], // não corresponde: obsoleto
+        created_hlc: 0,
+    });
+    let uri_parquet = "file:///bucket/episodios/data/segment-0-g0.parquet".to_string();
+    seg.parquet = Some(DerivedArtifactRef {
+        location: uri_parquet.clone(),
+        size: 4_096,
+        digest: [0; 32],
+        logical_root: [0xEE; 32], // não corresponde: obsoleto
+        created_hlc: 0,
+    });
+    store.commit(&mut m).unwrap();
+
+    let plano = plan_gc(
+        &m,
+        &PinRegistry::new(),
+        &GcOptions {
+            now_hlc: hlc(100 + 86_400 + 1),
+            ..GcOptions::default()
+        },
+    );
+    assert_eq!(
+        plano.stale_artifacts.len(),
+        2,
+        "os dois derivados obsoletos deviam estar no plano"
+    );
+
+    // Com o comportamento antigo isto falhava: `resolve_gc_path` não sabe
+    // resolver `file:///bucket/...` sob a raiz do banco.
+    let executado = commit_gc(&store, &mut m, &d, &plano).unwrap();
+
+    assert_eq!(
+        executado.lakehouse_detached,
+        vec![uri_parquet],
+        "a projecção lakehouse devia ser reportada como dívida da outra camada"
+    );
+    assert!(
+        !sidecar.exists(),
+        "o `.hrki` obsoleto é local e devia ter sido apagado"
+    );
+    assert!(
+        executado.removed.iter().any(|p| p.ends_with("obsoleto.hrki")),
+        "o `.hrki` apagado devia constar em `removed`: {:?}",
+        executado.removed
+    );
+    assert!(
+        !executado
+            .removed
+            .iter()
+            .any(|p| p.to_string_lossy().contains("parquet")),
+        "o GC do HRKL não pode declarar removido um objecto do lakehouse"
+    );
+
+    // As duas referências saem do manifesto — obsoletas são obsoletas — e o
+    // segmento continua legível pela geração canónica activa.
+    let recarregado = store.load().unwrap().unwrap();
+    let seg = recarregado.manifest.segment(0).unwrap();
+    assert!(seg.hrki.is_none());
+    assert!(seg.parquet.is_none());
+    let packed = open_packed(&d.join(&seg.generation(1).unwrap().location), 1 << 26).unwrap();
+    assert_eq!(packed.footer.record_count, 100);
+}
+
 #[test]
 fn ciclo_completo_selar_catalogar_packar_coletar() {
     let d = dir_teste("ciclo");
@@ -243,7 +353,7 @@ fn ciclo_completo_selar_catalogar_packar_coletar() {
         assert_eq!(s.active_generation, 1);
         assert_eq!(s.generation(0).unwrap().state, GenerationState::Superseded);
         assert_eq!(s.generation(1).unwrap().state, GenerationState::Active);
-        let packed = open_packed(Path::new(&s.generation(1).unwrap().location), 1 << 26).unwrap();
+        let packed = open_packed(&d.join(&s.generation(1).unwrap().location), 1 << 26).unwrap();
         assert_eq!(packed.logical_root(), s.logical_root);
     }
 
@@ -276,19 +386,18 @@ fn ciclo_completo_selar_catalogar_packar_coletar() {
         .all(|c| c.layout == PhysicalLayout::Raw));
     assert_gc_invariant(&m, &plano).unwrap();
 
-    // 5. Aplicar: ficheiros primeiro, manifesto depois.
-    for c in &plano.generations {
-        std::fs::remove_file(&c.location).unwrap();
-    }
-    apply_gc(&mut m, &plano).unwrap();
-    store.commit(&mut m).unwrap();
+    // 5. Aplicar: HRKM primeiro, ficheiros depois. Um crash no meio deixa
+    // apenas órfãos; nunca deixa o manifesto a apontar para bytes apagados.
+    let executado = commit_gc(&store, &mut m, &d, &plano).unwrap();
+    assert_eq!(executado.removed.len(), 3);
+    assert!(executado.orphaned.is_empty());
 
     for i in 0..3u64 {
         let s = m.segment(i).unwrap();
         assert_eq!(s.generations.len(), 1);
         assert_eq!(s.generations[0].layout, PhysicalLayout::Packed);
         // E o segmento continua legível — que é a única coisa que importa.
-        let packed = open_packed(Path::new(&s.generations[0].location), 1 << 26).unwrap();
+        let packed = open_packed(&d.join(&s.generations[0].location), 1 << 26).unwrap();
         assert_eq!(packed.footer.record_count, 1_000);
     }
     // Nada ficou por packar nem ressuscitou na fila.
@@ -394,19 +503,19 @@ fn verifica_recuperavel(store: &ManifestStore, segment_id: u64, esperados: u64, 
     assert_eq!(s.logical_root, root, "a identidade lógica mudou");
     assert_eq!(s.record_count, esperados);
     let g = s.active().unwrap();
-    let path = Path::new(&g.location);
+    let path = store.dir().parent().unwrap().join(&g.location);
     assert!(
         path.exists(),
         "a geração activa aponta para um ficheiro que não existe"
     );
     match g.layout {
         PhysicalLayout::Raw => {
-            let scan = scan_raw_segment(path).unwrap();
+            let scan = scan_raw_segment(&path).unwrap();
             assert_eq!(scan.records.len() as u64, esperados);
             assert_eq!(scan.footer.unwrap().logical_root, root);
         }
         PhysicalLayout::Packed => {
-            let r = open_packed(path, 1 << 26).unwrap();
+            let r = open_packed(&path, 1 << 26).unwrap();
             assert_eq!(r.footer.record_count, esperados);
             assert_eq!(r.logical_root(), root);
         }
@@ -508,11 +617,7 @@ fn nenhuma_sequencia_de_operacoes_deixa_um_segmento_sem_autoridade() {
                 );
                 assert_gc_invariant(&m, &plano)
                     .unwrap_or_else(|e| panic!("passo {passo}: plano inválido: {e}"));
-                for c in &plano.generations {
-                    let _ = std::fs::remove_file(&c.location);
-                }
-                apply_gc(&mut m, &plano).unwrap();
-                store.commit(&mut m).unwrap();
+                commit_gc(&store, &mut m, &d, &plano).unwrap();
             }
         }
 
@@ -530,7 +635,7 @@ fn nenhuma_sequencia_de_operacoes_deixa_um_segmento_sem_autoridade() {
                 )
             });
             assert!(
-                Path::new(&g.location).exists(),
+                d.join(&g.location).exists(),
                 "passo {passo}: segmento {} aponta para {} que não existe",
                 s.segment_id,
                 g.location

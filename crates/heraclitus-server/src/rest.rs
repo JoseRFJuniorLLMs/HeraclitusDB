@@ -5,7 +5,7 @@ use axum::{
     extract::{Path, Request, State},
     http::{header, StatusCode},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
@@ -71,6 +71,7 @@ pub fn router(
     let routes = Router::new()
         .route("/healthz", get(healthz))
         .route("/stats", get(stats))
+        .route("/metrics", get(metrics))
         .route("/state", get(state))
         .route("/verify", get(verify))
         .route("/verify/:segment", get(verify_segment))
@@ -729,20 +730,11 @@ async fn tier_demote(
     };
     // demote faz fs::read + blake3 + encode Parquet + fsync — fora do reactor.
     let res = tokio::task::spawn_blocking(move || {
-        tokio::runtime::Handle::current().block_on(engine.demote_segment(seg))
+        tokio::runtime::Handle::current().block_on(engine.demote_segment_any(seg))
     })
     .await;
     match res {
-        Ok(Ok(r)) => Json(serde_json::json!({
-            "segment_id": r.segment_id,
-            "object_path": r.object_path,
-            "parquet_path": r.parquet_path,
-            "record_count": r.record_count,
-            "min_lsn": r.min_lsn,
-            "max_lsn": r.max_lsn,
-            "blake3_root": r.blake3_root,
-        }))
-        .into_response(),
+        Ok(Ok(r)) => Json(demotion_receipt_json(&r)).into_response(),
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("tier: {e}")).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")).into_response(),
     }
@@ -753,25 +745,44 @@ async fn tier_demote(
 async fn tier_receipts(State(engine): State<Arc<Engine>>) -> Response {
     use axum::response::IntoResponse;
     // Scan do log em spawn_blocking (nunca no reactor).
-    match tokio::task::spawn_blocking(move || engine.demotion_receipts()).await {
+    match tokio::task::spawn_blocking(move || engine.demotion_receipts_any()).await {
         Ok(Ok(rs)) => {
-            let arr: Vec<_> = rs
-                .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "segment_id": r.segment_id,
-                        "object_path": r.object_path,
-                        "parquet_path": r.parquet_path,
-                        "record_count": r.record_count,
-                        "min_lsn": r.min_lsn,
-                        "max_lsn": r.max_lsn,
-                    })
-                })
-                .collect();
+            let arr: Vec<_> = rs.iter().map(demotion_receipt_json).collect();
             Json(serde_json::json!({ "receipts": arr })).into_response()
         }
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("tier: {e}")).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")).into_response(),
+    }
+}
+
+#[cfg(feature = "tier")]
+fn demotion_receipt_json(r: &heraclitus_tier::AnyDemotionReceipt) -> serde_json::Value {
+    match r {
+        heraclitus_tier::AnyDemotionReceipt::V1(v1) => serde_json::json!({
+            "receipt_version": 1,
+            "segment_id": v1.segment_id,
+            "object_path": v1.object_path,
+            "parquet_path": v1.parquet_path,
+            "record_count": v1.record_count,
+            "min_lsn": v1.min_lsn,
+            "max_lsn": v1.max_lsn,
+            "logical_root": v1.blake3_root,
+        }),
+        heraclitus_tier::AnyDemotionReceipt::V2(v2) => serde_json::json!({
+            "receipt_version": v2.receipt_version,
+            "segment_id": v2.segment_id,
+            "generation": v2.generation,
+            "object_path": v2.object_path,
+            "hrki_path": v2.hrki_path,
+            "parquet_path": v2.parquet_path,
+            "record_count": v2.record_count,
+            "min_lsn": v2.first_lsn,
+            "max_lsn": v2.last_lsn,
+            "logical_root": v2.logical_root,
+            "physical_digest": v2.physical_digest,
+            "physical_layout": v2.physical_layout,
+            "compression_codec": v2.compression_codec,
+        }),
     }
 }
 
@@ -813,6 +824,18 @@ async fn healthz() -> &'static str {
 
 async fn stats(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
     Json(engine.stats())
+}
+
+async fn metrics(State(engine): State<Arc<Engine>>) -> Response {
+    match engine.prometheus_metrics() {
+        Ok(body) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+            body,
+        )
+            .into_response(),
+        Err(error) => (StatusCode::NOT_IMPLEMENTED, error.to_string()).into_response(),
+    }
 }
 
 /// `heraclitus_state()`: head, segmentos e watermarks — diagnóstico num GET.
@@ -1008,7 +1031,9 @@ mod hvm_tests {
 #[cfg(all(test, feature = "tier"))]
 mod tier_tests {
     use super::*;
-    use heraclitus_core::{Episode, EventKind, FsyncPolicy, HeraclitusConfig};
+    use heraclitus_core::{
+        Episode, EventKind, FsyncPolicy, HeraclitusConfig, StorageFormat,
+    };
 
     /// Demote de um segmento selado produz um recibo verificável e materializa
     /// o objeto cold (.hrkl + Parquet) — prova o wiring do `tier` ponta-a-ponta.
@@ -1072,6 +1097,168 @@ mod tier_tests {
             live_hash,
             engine2.graph_state_hash(),
             "recibo de demote indexado ao vivo ≡ boot-replay (state_hash idêntico)"
+        );
+    }
+
+    /// SPEC-0050 Fase 6 — a projecção lakehouse vista do servidor.
+    ///
+    /// O teste de integração do `heraclitus-tier` prova a exportação em si.
+    /// Este prova a canalização que o servidor usa: `Engine` em v6 ->
+    /// `log.v6_arc()` -> `LakehouseWorker` construído a partir dos campos de
+    /// configuração -> métricas do endpoint `/metrics`.
+    ///
+    /// O que se verifica aqui e em mais lado nenhum é o **atraso de
+    /// exportação**: `parquet_export_lag_lsn` é positivo enquanto a fila tem
+    /// segmentos e cai a zero quando a tabela apanha o log. Antes desta fase
+    /// essa métrica media um pipeline que nunca corria, portanto crescia para
+    /// sempre — um número que parecia saúde e era ficção.
+    #[tokio::test]
+    async fn v6_lakehouse_exporta_e_zera_o_atraso_da_metrica() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().join("v6"),
+            storage_format: StorageFormat::V6,
+            fsync: FsyncPolicy::Always,
+            segment_max_bytes: 4096,
+            cold_tier_path: dir.path().join("cold-v6"),
+            v6_packing_interval_secs: 0,
+            v6_hrki_interval_secs: 0,
+            v6_lakehouse_interval_secs: 0,
+            v6_lakehouse_path: dir.path().join("lakehouse").to_string_lossy().into_owned(),
+            v6_lakehouse_table: "episodios".into(),
+            ..Default::default()
+        };
+        cfg.validate_security().unwrap();
+        let engine = Engine::open(&cfg).unwrap();
+        for i in 0..200 {
+            engine
+                .append(Episode::new(
+                    "lakehouse",
+                    EventKind::Observation,
+                    format!("evento-fase6-{i}-{}", "p".repeat(64)).into_bytes(),
+                ))
+                .unwrap();
+        }
+        let log = engine.log.v6_arc().unwrap();
+        log.seal_active().unwrap();
+        log.pack_pending(heraclitus_log::v6::PackingProfile::Balanced)
+            .unwrap();
+
+        let atraso_antes = engine.storage_metrics()["parquet_export_lag_lsn"]
+            .as_u64()
+            .unwrap();
+        assert!(
+            atraso_antes > 0,
+            "com segmentos por exportar o atraso tem de ser positivo"
+        );
+
+        std::fs::create_dir_all(&cfg.v6_lakehouse_path).unwrap();
+        let worker = heraclitus_tier::LakehouseWorker::open_location(
+            &cfg.v6_lakehouse_path,
+            cfg.v6_lakehouse_table.clone(),
+            log.manifest().storage_namespace_id,
+        )
+        .unwrap();
+        let saidas = worker.export_pending(&log).await.unwrap();
+        assert!(!saidas.is_empty(), "nada foi exportado");
+        assert!(saidas.iter().all(|s| s.attached));
+
+        let atraso_depois = engine.storage_metrics()["parquet_export_lag_lsn"]
+            .as_u64()
+            .unwrap();
+        assert!(
+            atraso_depois < atraso_antes,
+            "o atraso não desceu: {atraso_antes} -> {atraso_depois}"
+        );
+        let manifesto = log.manifest();
+        assert_eq!(
+            manifesto.exported_through_lsn,
+            saidas.iter().map(|s| s.last_lsn).max().unwrap()
+        );
+
+        // §209 — a projecção não participa da durabilidade: o log continua a
+        // aceitar escritas e a responder a queries depois de exportar.
+        let cabeca = engine.snapshot();
+        engine
+            .append(Episode::new(
+                "lakehouse",
+                EventKind::Observation,
+                b"depois-do-export".to_vec(),
+            ))
+            .unwrap();
+        assert!(engine.snapshot() > cabeca);
+    }
+
+    /// Ligar o worker sem destino é erro de arranque, não um default calado.
+    #[test]
+    fn lakehouse_ligado_sem_destino_e_erro_de_configuracao() {
+        let cfg = HeraclitusConfig {
+            v6_lakehouse_interval_secs: 60,
+            v6_lakehouse_path: String::new(),
+            ..Default::default()
+        };
+        let err = cfg.validate_security().unwrap_err().to_string();
+        assert!(err.contains("v6_lakehouse_path"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn v6_demote_publica_geracao_receipt_v2_e_faz_recall() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().join("v6"),
+            storage_format: StorageFormat::V6,
+            fsync: FsyncPolicy::Always,
+            segment_max_bytes: 420,
+            cold_tier_path: dir.path().join("cold-v6"),
+            v6_packing_interval_secs: 0,
+            v6_hrki_interval_secs: 0,
+            ..Default::default()
+        };
+        let engine = Engine::open(&cfg).unwrap();
+        for i in 0..60 {
+            engine
+                .append(Episode::new(
+                    if i < 30 { "alice" } else { "bob" },
+                    EventKind::Observation,
+                    format!("evento-v6-{i}").into_bytes(),
+                ))
+                .unwrap();
+        }
+        engine.log.v6_arc().unwrap().seal_active().unwrap();
+        let segment = engine.sealed_segment_ids()[0];
+
+        let any = engine.demote_segment_any(segment).await.unwrap();
+        let receipt = match any {
+            heraclitus_tier::AnyDemotionReceipt::V2(v2) => v2,
+            heraclitus_tier::AnyDemotionReceipt::V1(_) => panic!("V6 gerou recibo legado"),
+        };
+        assert_eq!(receipt.receipt_version, 2);
+        assert_eq!(receipt.segment_id, segment);
+        assert_eq!(receipt.physical_layout, "PACKED");
+        assert!(receipt.object_path.starts_with("canonical/"));
+        assert!(engine.verify_demotion_v2(&receipt).await.unwrap());
+
+        let recalled = engine.fetch_cold_segment(segment).await.unwrap();
+        assert_eq!(recalled.len() as u64, receipt.record_count);
+        assert_eq!(recalled.first().unwrap().0, receipt.first_lsn);
+        assert_eq!(recalled.last().unwrap().0, receipt.last_lsn);
+        let metrics = engine.storage_metrics();
+        assert!(metrics["cold_range_reads"].as_u64().unwrap() >= 2);
+        assert!(metrics["cold_bytes_downloaded"].as_u64().unwrap() > 0);
+
+        // Retry não appenda um segundo recibo equivalente.
+        let head_after_first = engine.snapshot();
+        let retry = engine.demote_segment_any(segment).await.unwrap();
+        assert!(matches!(retry, heraclitus_tier::AnyDemotionReceipt::V2(_)));
+        assert_eq!(engine.snapshot(), head_after_first);
+        assert_eq!(
+            engine
+                .demotion_receipts_any()
+                .unwrap()
+                .into_iter()
+                .filter(|r| matches!(r, heraclitus_tier::AnyDemotionReceipt::V2(_)))
+                .count(),
+            1
         );
     }
 

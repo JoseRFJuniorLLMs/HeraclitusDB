@@ -478,6 +478,19 @@ impl ManifestStore {
         Ok(Self { dir })
     }
 
+    /// Abre um store existente sem criar diretórios nem reparar estado. É o
+    /// construtor usado por ferramentas forenses como `storage doctor`.
+    pub fn open_read_only(dir: impl AsRef<Path>) -> V6Result<Self> {
+        let dir = dir.as_ref().to_path_buf();
+        if !dir.is_dir() {
+            return Err(corrupt(
+                "hrkm read-only open",
+                format!("manifest directory does not exist: {}", dir.display()),
+            ));
+        }
+        Ok(Self { dir })
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
     }

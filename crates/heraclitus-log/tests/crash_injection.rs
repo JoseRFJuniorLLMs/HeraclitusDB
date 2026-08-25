@@ -18,6 +18,16 @@ fn crash_writer_bin() -> std::path::PathBuf {
     p
 }
 
+/// O binário do exemplo precisa ser construído no mesmo target dir do binário
+/// de teste. Assumir o target global do Cargo quebra runners que isolam o
+/// build (e pode fazer o teste matar um binário de outra build).
+fn test_target_dir() -> std::path::PathBuf {
+    let mut p = std::env::current_exe().expect("caminho do binário de teste");
+    p.pop(); // deps/
+    p.pop(); // debug/ | release/
+    p
+}
+
 #[test]
 fn survives_repeated_mid_append_kills() {
     let iters: u64 = std::env::var("CRASH_ITERS")
@@ -28,6 +38,8 @@ fn survives_repeated_mid_append_kills() {
     // Build the example binary once.
     let status = Command::new(env!("CARGO"))
         .args(["build", "--example", "crash_writer", "-p", "heraclitus-log"])
+        .arg("--target-dir")
+        .arg(test_target_dir())
         .status()
         .expect("cargo build crash_writer");
     assert!(status.success());

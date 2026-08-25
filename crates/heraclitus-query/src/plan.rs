@@ -384,6 +384,68 @@ pub fn render(plan: &Plan) -> String {
     }
 }
 
+/// Renderiza o plano e, para scans de igualdade em built-ins, pede ao backend
+/// a mesma decisão de pruning que a execução usaria. O probe é somente-leitura
+/// e os contadores viajam no próprio resultado, portanto queries concorrentes
+/// não partilham um slot global de estatísticas.
+pub fn explain_with_backend(
+    plan: &Plan,
+    be: &dyn QueryBackend,
+) -> Result<String, HeraclitusError> {
+    let mut out = render(plan);
+    let Plan::ScanFilter {
+        conditions, as_of, ..
+    } = plan
+    else {
+        return Ok(out);
+    };
+    let Some((field, value)) = builtin_skip_hint(conditions) else {
+        return Ok(out);
+    };
+    let bound = resolve_as_of(as_of, be)?;
+    let Some(probe) = be.scan_builtin_eq(&field, &value, bound)? else {
+        out.push_str("StoragePruning\n  capability = unavailable (conservative scan)\n");
+        return Ok(out);
+    };
+    let Some(stats) = probe.stats else {
+        out.push_str(&format!(
+            "StoragePruning\n  matched candidates = {}\n  counters = unavailable\n",
+            probe.rows.len()
+        ));
+        return Ok(out);
+    };
+    out.push_str(&format!(
+        concat!(
+            "StoragePruning\n",
+            "  segments total = {}\n",
+            "  manifest pruned = {}\n",
+            "  HRKI pruned = {}\n",
+            "  segments read = {}\n",
+            "  blocks candidate = {}\n",
+            "  blocks pruned = {}\n",
+            "  blocks read = {}\n",
+            "  bytes candidate = {}\n",
+            "  bytes pruned = {}\n",
+            "  bytes physical read = {}\n",
+            "  bytes decompressed = {}\n",
+            "  matched candidates = {}\n"
+        ),
+        stats.segments_total,
+        stats.manifest_pruned,
+        stats.hrki_pruned,
+        stats.segments_read,
+        stats.blocks_candidate,
+        stats.blocks_pruned,
+        stats.blocks_read,
+        stats.bytes_candidate,
+        stats.bytes_pruned,
+        stats.bytes_physical_read,
+        stats.bytes_decompressed,
+        probe.rows.len(),
+    ));
+    Ok(out)
+}
+
 fn episode_to_json(lsn: Lsn, e: &Episode) -> Json {
     json!({
         "lsn": lsn,
@@ -974,7 +1036,9 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                         // segmentos selados cujo zone map não contém o valor
                         // (scan_builtin_eq). São builtins (fora do índice de
                         // atributos); o pós-filtro `matches` revalida o exato.
-                        Some((field, value)) => be.scan_builtin_eq(&field, &value, bound)?,
+                        Some((field, value)) => be
+                            .scan_builtin_eq(&field, &value, bound)?
+                            .map(|result| result.rows),
                         None => None,
                     },
                 },

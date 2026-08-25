@@ -18,6 +18,10 @@ bincode = { workspace = true }
 parquet = "59.0.0"
 arrow-array = "59.0.0"
 arrow-schema = "59.0.0"
+# `bytes::Bytes` implementa o `ChunkReader` do parquet — e o object_store ja o
+# usa, portanto nao entra dependencia nova na arvore.
+bytes = "1"
+futures = "0.3"
 
 [features]
 # Cold tier na NUVEM (opt-in): ligam os backends GCS/S3 do object_store.

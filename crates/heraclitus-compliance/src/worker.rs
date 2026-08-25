@@ -8,7 +8,6 @@
 
 use crate::{anchor, commit::current_watermark, LegalReceipt, TsaClient};
 use crate::{CompError, WorkerConfig, WorkerState};
-use heraclitus_log::Log;
 use std::future::Future;
 use std::pin::pin;
 use std::sync::Arc;
@@ -16,8 +15,8 @@ use std::sync::Arc;
 /// One deterministic tick: anchor iff the watermark advanced enough. Returns the
 /// receipt when an anchor was made, `None` when nothing was due. Pure and
 /// synchronous so it can be unit-tested without a runtime.
-pub fn tick(
-    log: &Log,
+pub fn tick<L: heraclitus_log::EpisodeLog + ?Sized>(
+    log: &L,
     tsa: &dyn TsaClient,
     cfg: &WorkerConfig,
     state: &mut WorkerState,
@@ -33,8 +32,8 @@ pub fn tick(
 }
 
 /// Run the daemon until `shutdown` resolves. Spawn it with `tokio::spawn`.
-pub async fn run_worker(
-    log: Arc<Log>,
+pub async fn run_worker<L: heraclitus_log::EpisodeLog + ?Sized + 'static>(
+    log: Arc<L>,
     tsa: Arc<dyn TsaClient + Send + Sync>,
     cfg: WorkerConfig,
     shutdown: impl Future<Output = ()> + Send,
@@ -85,6 +84,7 @@ pub async fn run_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use heraclitus_log::Log;
     use crate::{load_manifest, verify_receipt, LocalTsa};
     use heraclitus_core::{Episode, EventKind, FsyncPolicy};
     use std::time::Duration;

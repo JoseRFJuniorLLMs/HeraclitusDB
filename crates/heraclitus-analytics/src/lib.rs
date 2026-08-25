@@ -8,7 +8,7 @@
 //! core**. Um snapshot `AS OF LSN n` limita a materialização a `lsn < n`.
 //!
 //! ```no_run
-//! # async fn demo(log: &heraclitus_log::Log) -> Result<(), heraclitus_analytics::AnalyticsError> {
+//! # async fn demo(log: &dyn heraclitus_log::EpisodeLog) -> Result<(), heraclitus_analytics::AnalyticsError> {
 //! let a = heraclitus_analytics::LogAnalytics::from_log(log, None)?;
 //! let rows = a.sql("SELECT agent_id, COUNT(*) AS n FROM events GROUP BY agent_id ORDER BY n DESC").await?;
 //! # Ok(()) }
@@ -24,7 +24,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::datasource::MemTable;
 use datafusion::prelude::SessionContext;
 use heraclitus_core::{EventKind, HeraclitusError, Lsn};
-use heraclitus_log::Log;
+use heraclitus_log::EpisodeLog;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -98,7 +98,10 @@ impl LogAnalytics {
 
     /// Materializa `events` a partir do log com o orçamento por omissão
     /// ([`DEFAULT_MAX_ROWS`] / [`DEFAULT_MAX_BYTES`]). Ver [`Self::from_log_capped`].
-    pub fn from_log(log: &Log, as_of: Option<Lsn>) -> Result<Self, AnalyticsError> {
+    pub fn from_log<L: EpisodeLog + ?Sized>(
+        log: &L,
+        as_of: Option<Lsn>,
+    ) -> Result<Self, AnalyticsError> {
         Self::from_log_capped(log, as_of, DEFAULT_MAX_ROWS, DEFAULT_MAX_BYTES)
     }
 
@@ -114,8 +117,8 @@ impl LogAnalytics {
     ///
     /// O corte é verificado POR JANELA (não só no fim): o custo máximo excedido
     /// é de uma janela de `scan_capped`, não do log todo.
-    pub fn from_log_capped(
-        log: &Log,
+    pub fn from_log_capped<L: EpisodeLog + ?Sized>(
+        log: &L,
         as_of: Option<Lsn>,
         max_rows: usize,
         max_bytes: usize,
@@ -267,6 +270,7 @@ impl LogAnalytics {
 mod tests {
     use super::*;
     use heraclitus_core::{Episode, FsyncPolicy};
+    use heraclitus_log::Log;
 
     #[tokio::test]
     async fn sql_group_by_over_the_log() {

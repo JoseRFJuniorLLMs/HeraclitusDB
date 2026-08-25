@@ -50,3 +50,6 @@ sdk/python/*.egg-info/
 #**/Cargo.toml
 #**/Cargo.lock
 #rust-toolchain.toml
+
+# targets de build de agentes/sessoes paralelas — nunca commitar
+.target-codex*/

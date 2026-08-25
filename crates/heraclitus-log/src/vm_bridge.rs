@@ -12,7 +12,7 @@
 //! [`replay_vm`] closes the loop with M20.0: the persisted bytecode, folded
 //! through the reducer, reconstructs the deterministic [`VmState`].
 
-use crate::Log;
+use crate::EpisodeLog;
 use heraclitus_core::vm::{
     decode, encode, ConsistencyVirtualMachine, VmInstruction, VmState, VmVersion,
 };
@@ -28,8 +28,8 @@ pub fn is_hvm(ep: &Episode) -> bool {
 
 /// Append one H-VM instruction to the log as a first-class event whose content
 /// is the ISA frame. Returns the LSN the log assigned.
-pub fn append_instruction(
-    log: &Log,
+pub fn append_instruction<L: EpisodeLog + ?Sized>(
+    log: &L,
     version: VmVersion,
     instr: &VmInstruction,
 ) -> Result<Lsn, HeraclitusError> {
@@ -44,8 +44,8 @@ pub fn append_instruction(
 /// Decode the H-VM instruction stored at `lsn`, or `None` if that record is not
 /// an ISA frame. A corrupt frame on a direct read surfaces as `Serialization`
 /// (never silently skipped).
-pub fn read_instruction(
-    log: &Log,
+pub fn read_instruction<L: EpisodeLog + ?Sized>(
+    log: &L,
     lsn: Lsn,
 ) -> Result<Option<(VmVersion, VmInstruction)>, HeraclitusError> {
     match log.read(lsn)? {
@@ -62,7 +62,10 @@ pub fn read_instruction(
 /// Non-H-VM records are ignored, so the bridge coexists with ordinary episodes.
 /// The scan is windowed (`scan_capped`) to bound startup RAM, matching how the
 /// engine rebuilds its attribute index.
-pub fn replay_vm(log: &Log, vm: &ConsistencyVirtualMachine) -> Result<VmState, HeraclitusError> {
+pub fn replay_vm<L: EpisodeLog + ?Sized>(
+    log: &L,
+    vm: &ConsistencyVirtualMachine,
+) -> Result<VmState, HeraclitusError> {
     let mut state = VmState::default();
     let head = log.head();
     let mut cur: Lsn = 0;
@@ -88,8 +91,8 @@ pub fn replay_vm(log: &Log, vm: &ConsistencyVirtualMachine) -> Result<VmState, H
 /// materializing the ledger state for persistence. The tree's content equals the
 /// replayed `VmState::memory_layers`; persist it with `BEpsilonTree::save` as a
 /// fast-start checkpoint — **M20.2.1** closing the loop log → reducer → tree.
-pub fn replay_vm_to_btree(
-    log: &Log,
+pub fn replay_vm_to_btree<L: EpisodeLog + ?Sized>(
+    log: &L,
     vm: &ConsistencyVirtualMachine,
     path: &std::path::Path,
 ) -> Result<heraclitus_btree::BEpsilonTree, HeraclitusError> {

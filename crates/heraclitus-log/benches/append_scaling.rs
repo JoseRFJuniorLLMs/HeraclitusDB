@@ -42,7 +42,7 @@ const CONTEUDO: usize = 64;
 fn episodio(i: u64) -> Episode {
     Episode::new(
         "bench",
-        EventKind::Custom(if i % 3 == 0 { "A" } else { "B" }.into()),
+        EventKind::Custom(if i.is_multiple_of(3) { "A" } else { "B" }.into()),
         vec![b'x'; CONTEUDO],
     )
 }

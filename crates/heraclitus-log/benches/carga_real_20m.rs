@@ -91,7 +91,7 @@ fn evento(rng: &mut Rng, i: u64) -> Episode {
     e
 }
 
-fn pct(v: &mut Vec<Duration>, p: f64) -> Duration {
+fn pct(v: &mut [Duration], p: f64) -> Duration {
     if v.is_empty() {
         return Duration::ZERO;
     }
@@ -152,7 +152,6 @@ fn escrever_serial(log: &Log, n: u64, janela: u64, rotulo: &str) -> f64 {
 /// o worker consegue absorver, e é ele que a curva tem de mostrar.
 fn escrever_concorrente(log: &Log, n: u64, janela: u64, escritores: u64, rotulo: &str) -> f64 {
     let feitos = AtomicU64::new(0);
-    let debitos;
     let t_total = Instant::now();
 
     let relatorio = std::thread::scope(|s| {
@@ -193,7 +192,7 @@ fn escrever_concorrente(log: &Log, n: u64, janela: u64, escritores: u64, rotulo:
 
         h.join().expect("relatorio")
     });
-    debitos = relatorio;
+    let debitos = relatorio;
 
     println!();
     let total = n as f64 / t_total.elapsed().as_secs_f64();

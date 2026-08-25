@@ -31,6 +31,7 @@ pub use canonical::CanonicalKeyCodec;
 pub use capability::CapabilityCatalog;
 pub use config::{
     AccessCredential, AccessRole, FsyncPolicy, HeraclitusConfig, RaftTransport, ReplicationConfig,
+    StorageFormat,
 };
 pub use consistency::IsolationLevel;
 pub use error::HeraclitusError;

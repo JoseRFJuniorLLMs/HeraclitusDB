@@ -31,7 +31,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-fn pct(v: &mut Vec<Duration>, p: f64) -> Duration {
+fn pct(v: &mut [Duration], p: f64) -> Duration {
     if v.is_empty() {
         return Duration::ZERO;
     }

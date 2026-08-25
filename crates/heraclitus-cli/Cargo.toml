@@ -20,6 +20,10 @@ heraclitus-crypto = { workspace = true }
 heraclitus-log = { workspace = true }
 heraclitus-manifold = { workspace = true }
 heraclitus-index-vector = { workspace = true }
+# SPEC-0050 Fase 6: o exportador lakehouse vive no tier, porque e la que
+# `object_store`, Parquet, Iceberg e Delta vivem. O CLI so o conduz.
+heraclitus-tier = { workspace = true }
+tokio = { workspace = true }
 clap = { workspace = true }
 blake3 = { workspace = true }
 rand = { workspace = true }

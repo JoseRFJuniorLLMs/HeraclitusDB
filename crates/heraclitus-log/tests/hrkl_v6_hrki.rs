@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 const MAX_BLOCK: usize = 1 << 20;
 
 fn evento(i: u64) -> Episode {
-    let uf = if i % 3 == 0 { "SP" } else { "RJ" };
+    let uf = if i.is_multiple_of(3) { "SP" } else { "RJ" };
     let mut e = Episode::new(
         "ag",
         EventKind::Custom(if i < 200 { "Contrato" } else { "Licitacao" }.into()),

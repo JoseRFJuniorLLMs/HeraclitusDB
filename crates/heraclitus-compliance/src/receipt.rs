@@ -81,6 +81,16 @@ pub struct LegalReceipt {
     /// Verification state available when this receipt was written.
     #[serde(default)]
     pub validation_state: TimestampValidationState,
+    /// Que família de raízes foi dobrada no compromisso (SPEC-0050 §7.2).
+    ///
+    /// O default **nomeado** faz um recibo antigo — escrito antes de o HRKL v6
+    /// existir — reler-se como `legacy-physical`, que é exactamente o que era.
+    /// Um `#[serde(default)]` simples daria a string vazia, e um verificador
+    /// teria de adivinhar o que "" significa; sem qualquer default, um recibo
+    /// válido de 2025 passaria a falhar a desserialização e a prova mais antiga
+    /// do sistema seria a primeira a partir-se.
+    #[serde(default = "dominio_legado")]
+    pub commitment_domain: String,
     /// Authority/policy name.
     pub policy: String,
     /// Token file name relative to the receipts dir.
@@ -107,6 +117,14 @@ fn token_name(lsn: u64) -> String {
 }
 
 /// Persist a token + manifest entry, returning the receipt.
+/// O domínio que um recibo sem o campo necessariamente usou: antes do HRKL v6
+/// só existiam raízes físicas.
+fn dominio_legado() -> String {
+    crate::commit::CommitmentDomain::LegacyPhysical
+        .as_str()
+        .to_string()
+}
+
 pub fn persist(
     dir: impl AsRef<Path>,
     commitment: &Commitment,
@@ -126,6 +144,7 @@ pub fn persist(
         segments: commitment.segments,
         root_hex: to_hex(&commitment.root),
         imprint_hex: to_hex(imprint),
+        commitment_domain: commitment.domain.as_str().to_string(),
         gen_unix_ms: timestamp.recorded_unix_ms,
         authority_gen_unix_ms: timestamp.authority_gen_unix_ms,
         validation_state: timestamp.validation_state,
@@ -173,6 +192,24 @@ pub fn read_token(dir: impl AsRef<Path>, receipt: &LegalReceipt) -> Result<Vec<u
 mod tests {
     use super::*;
 
+    /// Um recibo escrito antes de o HRKL v6 existir não tem o campo do
+    /// domínio. Tem de continuar a ler-se — e a ler-se como o que era.
+    #[test]
+    fn um_recibo_sem_dominio_le_se_como_legado() {
+        let json = r#"{
+            "lsn": 42,
+            "segments": 2,
+            "root_hex": "0303030303030303030303030303030303030303030303030303030303030303",
+            "imprint_hex": "0404040404040404040404040404040404040404040404040404040404040404",
+            "gen_unix_ms": 1700000000000,
+            "policy": "ACT-antiga",
+            "token_file": "0000000000000042.tsr"
+        }"#;
+        let r: LegalReceipt = serde_json::from_str(json).unwrap();
+        assert_eq!(r.commitment_domain, "legacy-physical");
+        assert_eq!(r.lsn, 42);
+    }
+
     #[test]
     fn hex_is_lowercase_and_padded() {
         assert_eq!(to_hex(&[0x00, 0x0f, 0xff]), "000fff");
@@ -185,6 +222,7 @@ mod tests {
             lsn: 42,
             root: [3u8; 32],
             segments: 2,
+            domain: crate::commit::CommitmentDomain::LegacyPhysical,
         };
         let imprint = [4u8; 32];
         let r = persist(

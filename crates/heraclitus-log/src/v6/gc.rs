@@ -27,12 +27,15 @@
 //! ninguém a registe como geração.
 
 use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 use heraclitus_core::runtime::{DatabaseManifest, GenerationState, PhysicalLayout};
 use heraclitus_core::SegmentId;
 
 use super::error::{corrupt, V6Result};
+use super::manifest::ManifestStore;
+use super::packed::PackingStage;
 
 /// O HLC deste motor é `millis << 16 | contador`. O grace period é configurado
 /// em segundos, por isso a comparação passa por aqui — e não por uma subtracção
@@ -383,9 +386,10 @@ pub fn assert_gc_invariant(m: &DatabaseManifest, plan: &GcPlan) -> V6Result<()> 
 
 /// Aplica o plano ao manifesto **em memória**, removendo as gerações coletadas.
 ///
-/// Não toca no disco: quem chama remove os ficheiros e só depois faz commit do
-/// manifesto novo. A ordem importa — se o manifesto fosse committed primeiro e
-/// a remoção falhasse, ficariam ficheiros que ninguém sabe que existem.
+/// Não toca no disco. Para executar GC físico use [`commit_gc`], que publica
+/// primeiro o HRKM sem as referências e só depois remove os bytes. Um ficheiro
+/// órfão após crash é recuperável; um manifesto committed que ainda referencia
+/// bytes já apagados não é.
 pub fn apply_gc(m: &mut DatabaseManifest, plan: &GcPlan) -> V6Result<()> {
     assert_gc_invariant(m, plan)?;
     for c in &plan.generations {
@@ -402,6 +406,144 @@ pub fn apply_gc(m: &mut DatabaseManifest, plan: &GcPlan) -> V6Result<()> {
         }
     }
     Ok(())
+}
+
+/// Resultado da execução crash-safe de um plano de GC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GcExecution {
+    /// Geração HRKM que tornou os candidatos não-autoritativos.
+    pub manifest_generation: u64,
+    /// Objetos removidos depois do commit.
+    pub removed: Vec<PathBuf>,
+    /// Objetos que permaneceram em disco. São órfãos seguros e podem ser
+    /// detectados por `storage doctor`/removidos numa passagem posterior.
+    pub orphaned: Vec<PathBuf>,
+    /// SPEC-0050 §176 — projecções lakehouse cuja referência foi desligada do
+    /// HRKM mas cujos bytes **não** são deste GC para remover.
+    ///
+    /// "Parquet superseded pode ser coletado segundo regras do lakehouse."
+    /// Um Parquet vive num object store (possivelmente remoto) e é apagado
+    /// pela camada que o publicou — o `remove` do log Delta, no
+    /// `heraclitus-tier`. Se o GC do HRKL tentasse `remove_file` aqui, ou
+    /// falhava a canonicalizar um caminho que não é local, ou não encontrava
+    /// nada e reportava `removed` para um objecto que continua vivo no bucket.
+    /// Reportar a dívida é honesto; fingir a remoção não é.
+    pub lakehouse_detached: Vec<String>,
+}
+
+/// Executa o GC na única ordem que preserva recuperação sob crash:
+///
+/// 1. validar integralmente o plano e todos os caminhos;
+/// 2. publicar um novo HRKM que já não referencia os candidatos;
+/// 3. remover os objetos físicos, tratando falha como órfão e não rollback.
+///
+/// Se o processo morrer entre 2 e 3, sobra espaço desperdiçado, mas o manifesto
+/// continua auto-consistente e a geração canónica ativa permanece legível. A
+/// ordem inversa criaria uma janela em que o HRKM aponta para um ficheiro
+/// ausente e faria o boot falhar.
+pub fn commit_gc(
+    store: &ManifestStore,
+    manifest: &mut DatabaseManifest,
+    storage_root: &Path,
+    plan: &GcPlan,
+) -> V6Result<GcExecution> {
+    commit_gc_with_observer(
+        store,
+        manifest,
+        storage_root,
+        plan,
+        &mut |_| Ok(()),
+    )
+}
+
+#[doc(hidden)]
+pub fn commit_gc_with_observer(
+    store: &ManifestStore,
+    manifest: &mut DatabaseManifest,
+    storage_root: &Path,
+    plan: &GcPlan,
+    observer: &mut dyn FnMut(PackingStage) -> V6Result<()>,
+) -> V6Result<GcExecution> {
+    assert_gc_invariant(manifest, plan)?;
+
+    // Resolver e validar TODOS os alvos antes do commit. Depois do commit não
+    // existe rollback lógico seguro: outra thread/processo pode já ter lido a
+    // nova geração do manifesto.
+    let generation_paths = plan
+        .generations
+        .iter()
+        .map(|candidate| resolve_gc_path(storage_root, &candidate.location))
+        .collect::<V6Result<Vec<_>>>()?;
+    // §176 — os derivados dividem-se por quem os pode apagar. O `.hrki` é um
+    // ficheiro local ao lado do `.hrkl` e sai daqui; o Parquet pertence ao
+    // lakehouse e só é desligado do manifesto.
+    let artifact_paths = plan
+        .stale_artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == ArtifactKind::Hrki)
+        .map(|artifact| resolve_gc_path(storage_root, &artifact.location))
+        .collect::<V6Result<Vec<_>>>()?;
+    let lakehouse_detached: Vec<String> = plan
+        .stale_artifacts
+        .iter()
+        .filter(|artifact| artifact.kind == ArtifactKind::Parquet)
+        .map(|artifact| artifact.location.clone())
+        .collect();
+
+    let mut next = manifest.clone();
+    apply_gc(&mut next, plan)?;
+    let committed = store.commit(&mut next)?;
+    *manifest = next;
+    observer(PackingStage::GcManifestCommitted)?;
+
+    let mut removed = Vec::new();
+    let mut orphaned = Vec::new();
+    for path in generation_paths.into_iter().chain(artifact_paths) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed.push(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Idempotência: já não existir é o estado final desejado.
+                removed.push(path);
+            }
+            Err(_) => orphaned.push(path),
+        }
+    }
+    observer(PackingStage::GcObjectsUnlinked)?;
+
+    Ok(GcExecution {
+        manifest_generation: committed.generation,
+        removed,
+        orphaned,
+        lakehouse_detached,
+    })
+}
+
+fn resolve_gc_path(storage_root: &Path, location: &str) -> V6Result<PathBuf> {
+    const CTX: &str = "hrkl v6 gc path";
+    let root = std::fs::canonicalize(storage_root)?;
+    let declared = Path::new(location);
+    if declared.components().any(|component| {
+        matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+    }) && !declared.is_absolute()
+    {
+        return Err(corrupt(CTX, "relative location escapes the storage root"));
+    }
+    let candidate = if declared.is_absolute() {
+        declared.to_path_buf()
+    } else {
+        root.join(declared)
+    };
+    let parent = candidate
+        .parent()
+        .ok_or_else(|| corrupt(CTX, "GC target has no parent directory"))?;
+    let canonical_parent = std::fs::canonicalize(parent)?;
+    if !canonical_parent.starts_with(&root) {
+        return Err(corrupt(CTX, "GC target is outside the storage root"));
+    }
+    let name = candidate
+        .file_name()
+        .ok_or_else(|| corrupt(CTX, "GC target has no file name"))?;
+    Ok(canonical_parent.join(name))
 }
 
 // ---------------------------------------------------------------------------

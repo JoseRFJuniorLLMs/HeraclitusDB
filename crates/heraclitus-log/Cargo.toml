@@ -64,3 +64,7 @@ harness = false
 [[bench]]
 name = "otim_boot"
 harness = false
+
+[[bench]]
+name = "hrkl_v6_ab"
+harness = false

@@ -4,6 +4,9 @@
 //! dependesse de `serde` teria a mesma fragilidade que a SPEC proíbe para a
 //! identidade lógica — recompilar mudaria os bytes assinados.
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
 use heraclitus_core::{Lsn, SegmentId};
 
 use super::canonical::{CanonicalSink, CANONICAL_CODEC_V1};
@@ -12,6 +15,9 @@ use super::header::StorageNamespaceId;
 
 pub const DOMAIN_ATTESTATION: &[u8] = b"HRKL6:ATTESTATION_ENVELOPE:V1";
 pub const DOMAIN_PACK_RECEIPT: &[u8] = b"HRKL6:PACK_RECEIPT:V1";
+pub const PACK_RECEIPT_MAGIC: [u8; 4] = *b"HRPR";
+pub const PACK_RECEIPT_FILE_VERSION: u16 = 1;
+pub const PACK_RECEIPT_BODY_LEN: usize = 186;
 
 /// SPEC-0050 §19 — o que é carimbado por RFC 3161 / ICP-Brasil.
 ///
@@ -111,6 +117,65 @@ impl PackReceipt {
         *h.finalize().as_bytes()
     }
 
+    /// Descodifica os bytes canónicos fixos do recibo. O comprimento exato
+    /// evita aceitar prefixos, sufixos ou layouts futuros como se fossem v1.
+    pub fn decode(bytes: &[u8]) -> super::error::V6Result<Self> {
+        use super::error::corrupt;
+        const CTX: &str = "hrkl v6 pack receipt";
+        if bytes.len() != PACK_RECEIPT_BODY_LEN {
+            return Err(corrupt(
+                CTX,
+                format!(
+                    "receipt body has {} bytes, expected {PACK_RECEIPT_BODY_LEN}",
+                    bytes.len()
+                ),
+            ));
+        }
+        let mut at = 0usize;
+        fn take<const N: usize>(bytes: &[u8], at: &mut usize) -> [u8; N] {
+            let out = bytes[*at..*at + N].try_into().unwrap();
+            *at += N;
+            out
+        }
+        let segment_id = u64::from_le_bytes(take(bytes, &mut at));
+        let storage_namespace_id = take(bytes, &mut at);
+        let source_generation = u32::from_le_bytes(take(bytes, &mut at));
+        let source_physical_digest = take(bytes, &mut at);
+        let target_generation = u32::from_le_bytes(take(bytes, &mut at));
+        let target_physical_digest = take(bytes, &mut at);
+        let logical_root = take(bytes, &mut at);
+        let canonical_codec = take::<1>(bytes, &mut at)[0];
+        let codec = CompressionCodec::from_u8(take::<1>(bytes, &mut at)[0])?;
+        let block_size = u32::from_le_bytes(take(bytes, &mut at));
+        let first_lsn = u64::from_le_bytes(take(bytes, &mut at));
+        let last_lsn = u64::from_le_bytes(take(bytes, &mut at));
+        let record_count = u64::from_le_bytes(take(bytes, &mut at));
+        let source_physical_size = u64::from_le_bytes(take(bytes, &mut at));
+        let target_physical_size = u64::from_le_bytes(take(bytes, &mut at));
+        let packer_version = u32::from_le_bytes(take(bytes, &mut at));
+        let created_hlc = u64::from_le_bytes(take(bytes, &mut at));
+        debug_assert_eq!(at, PACK_RECEIPT_BODY_LEN);
+        Ok(Self {
+            segment_id,
+            storage_namespace_id,
+            source_generation,
+            source_physical_digest,
+            target_generation,
+            target_physical_digest,
+            logical_root,
+            canonical_codec,
+            codec,
+            block_size,
+            first_lsn,
+            last_lsn,
+            record_count,
+            source_physical_size,
+            target_physical_size,
+            packer_version,
+            created_hlc,
+        })
+    }
+
     /// Rácio físico alcançado — a métrica que a operação lê (§180).
     pub fn compression_ratio(&self) -> f64 {
         if self.source_physical_size == 0 {
@@ -130,6 +195,105 @@ impl PackReceipt {
             logical_root: self.logical_root,
         }
     }
+}
+
+/// Persiste um `PackReceipt` como objeto imutável e sincronizado antes do
+/// commit do HRKM. Um crash pode deixar recibo/PACKED órfãos, mas nunca faz o
+/// manifesto afirmar uma transição sem a evidência auditável correspondente.
+pub fn persist_pack_receipt(dir: &Path, receipt: &PackReceipt) -> super::error::V6Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!(
+        "pack-{:020}-g{:04}-g{:04}.hrpr",
+        receipt.segment_id, receipt.source_generation, receipt.target_generation
+    ));
+    let encoded = encode_pack_receipt_file(receipt);
+    if path.exists() {
+        let existing = std::fs::read(&path)?;
+        let decoded = decode_pack_receipt_file(&existing)?;
+        if decoded != *receipt {
+            return Err(super::error::corrupt(
+                "hrkl v6 pack receipt store",
+                "immutable receipt path already contains different evidence",
+            ));
+        }
+        return Ok(path);
+    }
+
+    let tmp = path.with_extension("hrpr.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&tmp)?;
+    file.write_all(&encoded)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, &path)?;
+    sync_parent_dir(dir)?;
+    Ok(path)
+}
+
+pub fn read_pack_receipt(path: &Path) -> super::error::V6Result<PackReceipt> {
+    decode_pack_receipt_file(&std::fs::read(path)?)
+}
+
+fn encode_pack_receipt_file(receipt: &PackReceipt) -> Vec<u8> {
+    let body = receipt.encode();
+    debug_assert_eq!(body.len(), PACK_RECEIPT_BODY_LEN);
+    let mut out = Vec::with_capacity(4 + 2 + 2 + body.len() + 32 + 4);
+    out.extend_from_slice(&PACK_RECEIPT_MAGIC);
+    out.extend_from_slice(&PACK_RECEIPT_FILE_VERSION.to_le_bytes());
+    out.extend_from_slice(&(PACK_RECEIPT_BODY_LEN as u16).to_le_bytes());
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&receipt.digest());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    let crc = super::crc32c_of(&out);
+    let crc_at = out.len() - 4;
+    out[crc_at..].copy_from_slice(&crc.to_le_bytes());
+    out
+}
+
+fn decode_pack_receipt_file(bytes: &[u8]) -> super::error::V6Result<PackReceipt> {
+    use super::error::corrupt;
+    const CTX: &str = "hrkl v6 pack receipt file";
+    const PREFIX: usize = 8;
+    const SUFFIX: usize = 36;
+    if bytes.len() != PREFIX + PACK_RECEIPT_BODY_LEN + SUFFIX {
+        return Err(corrupt(CTX, "unexpected receipt file length"));
+    }
+    if bytes[..4] != PACK_RECEIPT_MAGIC {
+        return Err(corrupt(CTX, "bad magic"));
+    }
+    if u16::from_le_bytes(bytes[4..6].try_into().unwrap()) != PACK_RECEIPT_FILE_VERSION {
+        return Err(corrupt(CTX, "unsupported receipt version"));
+    }
+    if u16::from_le_bytes(bytes[6..8].try_into().unwrap()) as usize != PACK_RECEIPT_BODY_LEN {
+        return Err(corrupt(CTX, "unexpected receipt body length"));
+    }
+    let stored_crc = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap());
+    let mut checked = bytes.to_vec();
+    checked[bytes.len() - 4..].fill(0);
+    if stored_crc != super::crc32c_of(&checked) {
+        return Err(corrupt(CTX, "crc32c mismatch"));
+    }
+    let body = &bytes[PREFIX..PREFIX + PACK_RECEIPT_BODY_LEN];
+    let receipt = PackReceipt::decode(body)?;
+    let declared: [u8; 32] = bytes
+        [PREFIX + PACK_RECEIPT_BODY_LEN..PREFIX + PACK_RECEIPT_BODY_LEN + 32]
+        .try_into()
+        .unwrap();
+    if receipt.digest() != declared {
+        return Err(corrupt(CTX, "receipt digest mismatch"));
+    }
+    Ok(receipt)
+}
+
+fn sync_parent_dir(dir: &Path) -> super::error::V6Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 /// SPEC-0050 §132 — a ponte auditável entre um segmento v1–v5 e a sua
@@ -231,6 +395,28 @@ mod tests {
         }
     }
 
+    fn receipt() -> PackReceipt {
+        PackReceipt {
+            segment_id: 88,
+            storage_namespace_id: [1u8; 16],
+            source_generation: 0,
+            source_physical_digest: [0x11; 32],
+            target_generation: 1,
+            target_physical_digest: [0x22; 32],
+            logical_root: [0xAB; 32],
+            canonical_codec: CANONICAL_CODEC_V1,
+            codec: CompressionCodec::Zstd,
+            block_size: 262_144,
+            first_lsn: 100,
+            last_lsn: 199,
+            record_count: 100,
+            source_physical_size: 1000,
+            target_physical_size: 370,
+            packer_version: PACKER_VERSION,
+            created_hlc: 5,
+        }
+    }
+
     #[test]
     fn envelope_tem_tamanho_fixo_e_e_deterministico() {
         let e = env();
@@ -254,25 +440,7 @@ mod tests {
 
     #[test]
     fn recibo_de_packing_amarra_as_duas_geracoes() {
-        let r = PackReceipt {
-            segment_id: 88,
-            storage_namespace_id: [1u8; 16],
-            source_generation: 0,
-            source_physical_digest: [0x11; 32],
-            target_generation: 1,
-            target_physical_digest: [0x22; 32],
-            logical_root: [0xAB; 32],
-            canonical_codec: CANONICAL_CODEC_V1,
-            codec: CompressionCodec::Zstd,
-            block_size: 262_144,
-            first_lsn: 100,
-            last_lsn: 199,
-            record_count: 100,
-            source_physical_size: 1000,
-            target_physical_size: 370,
-            packer_version: PACKER_VERSION,
-            created_hlc: 5,
-        };
+        let r = receipt();
         assert_eq!(r.digest(), r.clone().digest());
         assert!((r.compression_ratio() - 0.37).abs() < 1e-9);
         assert_eq!(r.attestation().logical_root, r.logical_root);
@@ -280,6 +448,28 @@ mod tests {
         let mut outro = r.clone();
         outro.target_physical_digest = [0x33; 32];
         assert_ne!(r.digest(), outro.digest());
+    }
+
+    #[test]
+    fn recibo_persistido_e_imutavel_idempotente() {
+        let dir = std::env::temp_dir().join(format!(
+            "hrkl-v6-receipts-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let r = receipt();
+        let path = persist_pack_receipt(&dir, &r).unwrap();
+        assert_eq!(read_pack_receipt(&path).unwrap(), r);
+        assert_eq!(persist_pack_receipt(&dir, &r).unwrap(), path);
+
+        let mut conflicting = r.clone();
+        conflicting.target_physical_digest[0] ^= 1;
+        assert!(persist_pack_receipt(&dir, &conflicting).is_err());
+
+        let mut corrupt = std::fs::read(&path).unwrap();
+        corrupt[20] ^= 1;
+        std::fs::write(&path, corrupt).unwrap();
+        assert!(read_pack_receipt(&path).is_err());
     }
 
     #[test]

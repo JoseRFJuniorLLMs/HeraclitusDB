@@ -50,12 +50,41 @@ impl Default for FsyncPolicy {
     }
 }
 
+/// On-disk log format selected when the database is opened.
+///
+/// The legacy format remains the default so existing installations are never
+/// migrated implicitly. Selecting `V6` is an explicit operator decision via
+/// TOML (`storage_format = "v6"`) or `HERACLITUS_STORAGE_FORMAT=v6`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageFormat {
+    /// Existing segment format, kept as the backwards-compatible default.
+    #[default]
+    Legacy,
+    /// HRKL v6 generational log format.
+    V6,
+}
+
+impl StorageFormat {
+    /// Stable configuration spelling used in diagnostics and operator-facing
+    /// status output.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::V6 => "v6",
+        }
+    }
+}
+
 /// Single config struct for the whole system. Loadable from TOML with
 /// `HERACLITUS_*` environment overrides.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HeraclitusConfig {
     pub data_dir: PathBuf,
+    /// On-disk log format. Defaults to [`StorageFormat::Legacy`]; changing it
+    /// never performs an implicit migration of existing data.
+    pub storage_format: StorageFormat,
     /// Tamanho a que o segmento rola e sela (default 8 MiB).
     ///
     /// **Isto não é só uma escolha de tamanho de ficheiro — governa o débito de
@@ -98,6 +127,30 @@ pub struct HeraclitusConfig {
     /// eles, com novo recibo Merkle. `0` = desligado (default; requer a
     /// feature `tier`). Ignorada sob replicação (o object store é local ao nó).
     pub tier_compaction_interval_secs: u64,
+    /// SPEC-0050 — intervalo do worker assíncrono que transforma RAWs v6
+    /// selados em gerações PACKED. `0` desliga; ignorado no formato legado.
+    pub v6_packing_interval_secs: u64,
+    /// SPEC-0050 Fase 4 — intervalo da reconstrução de `.hrki` para PACKEDs
+    /// que ainda não têm sidecar válido. `0` desliga.
+    pub v6_hrki_interval_secs: u64,
+    /// Taxa de falso positivo alvo dos Bloom filters HRKI.
+    pub v6_hrki_bloom_fpr: f64,
+    /// Política explícita para built-ins. `attrs.*` continuam DO_NOT_INDEX.
+    pub v6_hrki_index_agent_id: bool,
+    pub v6_hrki_index_session_id: bool,
+    /// SPEC-0050 Fase 6 — intervalo do worker que projecta segmentos PACKED
+    /// em Parquet/Iceberg/Delta. `0` desliga (default).
+    ///
+    /// Fica desligado de origem por uma razão que não é timidez: a projecção
+    /// escreve para um destino **fora** do banco, e escolher esse destino é
+    /// uma decisão do operador. Um default que começasse a materializar
+    /// gigabytes numa pasta adivinhada seria pior do que não correr.
+    pub v6_lakehouse_interval_secs: u64,
+    /// Destino da tabela lakehouse (caminho local ou URL de object store).
+    /// Vazio com o intervalo ligado é erro de configuração, não um default.
+    pub v6_lakehouse_path: String,
+    /// Nome da tabela publicada nos catálogos Iceberg/Delta.
+    pub v6_lakehouse_table: String,
     /// §3.9 (distill) — intervalo (segundos) da task de consolidação: a cada
     /// tick, os episódios de Observação novos (desde o cursor) são agrupados
     /// na variedade e cada cluster estável vira um `Fact` (`FactDerived`) no
@@ -266,6 +319,7 @@ impl Default for HeraclitusConfig {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("./data"),
+            storage_format: StorageFormat::Legacy,
             // 8 MiB: ver a doc do campo. Medido 32x mais rapido a 1M de registos.
             segment_max_bytes: 8 * 1024 * 1024,
             fsync: FsyncPolicy::default(),
@@ -276,6 +330,14 @@ impl Default for HeraclitusConfig {
             rest_addr: "127.0.0.1:7475".to_string(),
             cold_tier_path: PathBuf::from("./data/cold"),
             tier_compaction_interval_secs: 0,
+            v6_lakehouse_interval_secs: 0,
+            v6_lakehouse_path: String::new(),
+            v6_lakehouse_table: "episodios".to_string(),
+            v6_packing_interval_secs: 30,
+            v6_hrki_interval_secs: 45,
+            v6_hrki_bloom_fpr: 0.01,
+            v6_hrki_index_agent_id: true,
+            v6_hrki_index_session_id: true,
             distill_interval_secs: 0,
             auth_token: None,
             access_credentials: Vec::new(),
@@ -314,6 +376,16 @@ fn read_single_line_secret(path: &str, label: &str) -> Result<String, Heraclitus
     Ok(secret.to_owned())
 }
 
+fn parse_strict_bool(name: &str, value: &str) -> Result<bool, HeraclitusError> {
+    match value {
+        "1" | "true" | "on" | "yes" => Ok(true),
+        "0" | "false" | "off" | "no" => Ok(false),
+        _ => Err(HeraclitusError::Config(format!(
+            "{name} deve ser true/false (ou 1/0; on/off; yes/no), veio `{value}`"
+        ))),
+    }
+}
+
 impl HeraclitusConfig {
     /// Load from a TOML file, then apply environment overrides.
     pub fn load(path: Option<&std::path::Path>) -> Result<Self, HeraclitusError> {
@@ -329,11 +401,23 @@ impl HeraclitusConfig {
         Ok(cfg)
     }
 
-    /// `HERACLITUS_DATA_DIR`, `HERACLITUS_GRPC_ADDR`, `HERACLITUS_REST_ADDR`,
+    /// `HERACLITUS_DATA_DIR`, `HERACLITUS_STORAGE_FORMAT=legacy|v6`,
+    /// `HERACLITUS_GRPC_ADDR`, `HERACLITUS_REST_ADDR`, and
     /// `HERACLITUS_FSYNC=always|group_commit:<ms>`.
     pub fn apply_env(&mut self) -> Result<(), HeraclitusError> {
         if let Ok(v) = std::env::var("HERACLITUS_DATA_DIR") {
             self.data_dir = PathBuf::from(v);
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_STORAGE_FORMAT") {
+            self.storage_format = match v.as_str() {
+                "legacy" => StorageFormat::Legacy,
+                "v6" => StorageFormat::V6,
+                _ => {
+                    return Err(HeraclitusError::Config(format!(
+                        "HERACLITUS_STORAGE_FORMAT deve ser legacy ou v6; recebido {v:?}"
+                    )))
+                }
+            };
         }
         if let Ok(v) = std::env::var("HERACLITUS_GRPC_ADDR") {
             self.grpc_addr = v;
@@ -448,6 +532,56 @@ impl HeraclitusConfig {
                 self.tier_compaction_interval_secs = s;
             }
         }
+        if let Ok(v) = std::env::var("HERACLITUS_V6_PACKING_INTERVAL") {
+            self.v6_packing_interval_secs = v.parse().map_err(|e| {
+                HeraclitusError::Config(format!(
+                    "HERACLITUS_V6_PACKING_INTERVAL deve ser inteiro em segundos: {e}"
+                ))
+            })?;
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_V6_HRKI_INTERVAL") {
+            self.v6_hrki_interval_secs = v.parse().map_err(|e| {
+                HeraclitusError::Config(format!(
+                    "HERACLITUS_V6_HRKI_INTERVAL deve ser inteiro em segundos: {e}"
+                ))
+            })?;
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_V6_LAKEHOUSE_INTERVAL") {
+            self.v6_lakehouse_interval_secs = v.parse().map_err(|e| {
+                HeraclitusError::Config(format!(
+                    "HERACLITUS_V6_LAKEHOUSE_INTERVAL deve ser inteiro em segundos: {e}"
+                ))
+            })?;
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_V6_LAKEHOUSE_PATH") {
+            if !v.is_empty() {
+                self.v6_lakehouse_path = v;
+            }
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_V6_LAKEHOUSE_TABLE") {
+            if !v.is_empty() {
+                self.v6_lakehouse_table = v;
+            }
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_V6_HRKI_BLOOM_FPR") {
+            self.v6_hrki_bloom_fpr = v.parse().map_err(|e| {
+                HeraclitusError::Config(format!(
+                    "HERACLITUS_V6_HRKI_BLOOM_FPR deve ser número: {e}"
+                ))
+            })?;
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_V6_HRKI_INDEX_AGENT_ID") {
+            self.v6_hrki_index_agent_id = parse_strict_bool(
+                "HERACLITUS_V6_HRKI_INDEX_AGENT_ID",
+                &v,
+            )?;
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_V6_HRKI_INDEX_SESSION_ID") {
+            self.v6_hrki_index_session_id = parse_strict_bool(
+                "HERACLITUS_V6_HRKI_INDEX_SESSION_ID",
+                &v,
+            )?;
+        }
         if let Ok(v) = std::env::var("HERACLITUS_DISTILL_INTERVAL") {
             if let Ok(s) = v.parse() {
                 self.distill_interval_secs = s;
@@ -474,6 +608,24 @@ impl HeraclitusConfig {
 
     pub fn validate_security(&self) -> Result<(), HeraclitusError> {
         let invalid = |message: String| HeraclitusError::Config(message);
+        if !(1e-6..=0.5).contains(&self.v6_hrki_bloom_fpr) {
+            return Err(invalid(format!(
+                "v6_hrki_bloom_fpr deve estar entre 0.000001 e 0.5; veio {}",
+                self.v6_hrki_bloom_fpr
+            )));
+        }
+        // SPEC-0050 Fase 6 — ligar o worker sem dizer para onde exportar é um
+        // erro de configuração, não um convite a adivinhar um destino.
+        if self.v6_lakehouse_interval_secs > 0 && self.v6_lakehouse_path.trim().is_empty() {
+            return Err(invalid(
+                "v6_lakehouse_interval_secs > 0 exige v6_lakehouse_path".into(),
+            ));
+        }
+        if self.v6_lakehouse_interval_secs > 0 && self.v6_lakehouse_table.trim().is_empty() {
+            return Err(invalid(
+                "v6_lakehouse_interval_secs > 0 exige v6_lakehouse_table".into(),
+            ));
+        }
         if self.tls_cert_path.is_some() != self.tls_key_path.is_some() {
             return Err(invalid(
                 "HERACLITUS_TLS_CERT e HERACLITUS_TLS_KEY devem ser definidos juntos".into(),
@@ -649,10 +801,37 @@ mod tests {
     #[test]
     fn default_roundtrip_toml() {
         let cfg = HeraclitusConfig::default();
+        assert_eq!(cfg.storage_format, StorageFormat::Legacy);
         let s = toml::to_string(&cfg).unwrap();
         let back: HeraclitusConfig = toml::from_str(&s).unwrap();
         assert_eq!(back.segment_max_bytes, cfg.segment_max_bytes);
         assert_eq!(back.fsync, cfg.fsync);
+        assert_eq!(back.storage_format, StorageFormat::Legacy);
+    }
+
+    #[test]
+    fn toml_selects_v6_storage_format_explicitly() {
+        let cfg: HeraclitusConfig = toml::from_str("storage_format = \"v6\"").unwrap();
+        assert_eq!(cfg.storage_format, StorageFormat::V6);
+        assert_eq!(cfg.storage_format.as_str(), "v6");
+    }
+
+    #[test]
+    fn invalid_storage_format_env_is_a_config_error() {
+        const NAME: &str = "HERACLITUS_STORAGE_FORMAT";
+        let previous = std::env::var_os(NAME);
+        std::env::set_var(NAME, "V6");
+
+        let err = HeraclitusConfig::default()
+            .apply_env()
+            .expect_err("environment selection must be strict");
+
+        match previous {
+            Some(value) => std::env::set_var(NAME, value),
+            None => std::env::remove_var(NAME),
+        }
+        assert!(matches!(err, HeraclitusError::Config(_)));
+        assert!(err.to_string().contains("legacy ou v6"));
     }
 
     #[test]

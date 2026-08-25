@@ -83,6 +83,11 @@ pub async fn spawn(
 ) -> Result<(Arc<ReplicationHandle>, ClusterTasks), HeraclitusError> {
     let raft_dir = default_dir(&cfg.raft_dir, data_dir, "raft");
     let sm_dir = default_dir(&cfg.sm_dir, data_dir, "raft-sm");
+    let log = engine.log.legacy_arc().ok_or_else(|| {
+        HeraclitusError::Config(
+            "storage_format=v6 ainda não suporta replicação Raft".into(),
+        )
+    })?;
 
     // Hook: cada episódio aplicado é indexado nas views DESTE nó. `Weak` para não
     // criar ciclo (Engine → handle → raft → sm → hook → Engine).
@@ -95,7 +100,7 @@ pub async fn spawn(
 
     let store = FileRaftLog::open(&raft_dir)
         .map_err(|e| HeraclitusError::StorageEngine(format!("raft-log durável: {e}")))?;
-    let sm = EpisodeStateMachine::open_durable(engine.log.clone(), &sm_dir)
+    let sm = EpisodeStateMachine::open_durable(log.clone(), &sm_dir)
         .map_err(|e| HeraclitusError::StorageEngine(format!("raft sm durável: {e}")))?
         .with_apply_hook(hook);
 
@@ -105,7 +110,7 @@ pub async fn spawn(
         RaftTransport::Tcp => {
             let t = spawn_node_tcp_on(
                 cfg.node_id,
-                engine.log.clone(),
+                log.clone(),
                 consensus::production_config(),
                 &cfg.raft_addr,
                 store,
@@ -140,7 +145,7 @@ pub async fn spawn(
             };
             let g = spawn_node_grpc_on_tls(
                 cfg.node_id,
-                engine.log.clone(),
+                log.clone(),
                 consensus::production_config(),
                 &cfg.raft_addr,
                 store,

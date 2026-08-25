@@ -712,7 +712,30 @@ impl Hrki {
 
     /// Grava o sidecar ao lado do `.hrkl`.
     pub fn escrever(&self, hrkl: &Path) -> V6Result<()> {
-        std::fs::write(caminho_sidecar(hrkl), self.encode())?;
+        use std::io::Write as _;
+
+        let path = caminho_sidecar(hrkl);
+        let tmp = path.with_extension("hrki.tmp");
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        file.write_all(&self.encode())?;
+        file.sync_all()?;
+        drop(file);
+        // No Windows `rename` não substitui o destino. Como o sidecar é
+        // derivado, uma queda neste intervalo deixa-o ausente (fallback para
+        // scan + reconstrução), nunca deixa o HRKL incorrecto.
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
     }
 
@@ -757,6 +780,10 @@ pub struct HrkiBuilder {
     zona_actual: Option<BlockZoneMap>,
     kinds: KindBitmap,
     campos: Vec<(String, BTreeSet<Vec<u8>>)>,
+    /// Se um único payload não pôde ser interpretado, filtros/kinds globais
+    /// deixam de ser seguros: esse registo pode conter justamente o valor que
+    /// pareceria ausente. Nesse caso conservamos apenas as zone maps físicas.
+    has_opaque: bool,
 }
 
 impl HrkiBuilder {
@@ -801,6 +828,7 @@ impl HrkiBuilder {
             zona_actual: None,
             kinds: KindBitmap::nova(64),
             campos: Vec::new(),
+            has_opaque: false,
         })
     }
 
@@ -826,6 +854,7 @@ impl HrkiBuilder {
     /// poderia produzir uma zona demasiado estreita e **excluir** um bloco que
     /// afinal interessa, que é o único erro inaceitável aqui.
     pub fn observar_opaco(&mut self, lsn: Lsn, hlc: u64) {
+        self.has_opaque = true;
         if self.zona_actual.is_none() {
             self.iniciar_bloco();
         }
@@ -849,9 +878,8 @@ impl HrkiBuilder {
             z.last_lsn = z.last_lsn.max(lsn);
             z.min_hlc = z.min_hlc.min(hlc);
             z.max_hlc = z.max_hlc.max(hlc);
-            match ep.valid_from {
-                Some(v) => z.min_valid_from = Some(z.min_valid_from.map_or(v, |m| m.min(v))),
-                None => {}
+            if let Some(v) = ep.valid_from {
+                z.min_valid_from = Some(z.min_valid_from.map_or(v, |m| m.min(v)));
             }
             match ep.valid_to {
                 Some(v) => z.max_valid_to = Some(z.max_valid_to.map_or(v, |m| m.max(v))),
@@ -861,18 +889,29 @@ impl HrkiBuilder {
 
         self.kinds.inserir(&ep.kind);
 
+        // Built-ins também obedecem à política explícita. Não entram por
+        // omissão; o worker decide, por configuração, se são técnicos em
+        // claro, hashed ou não indexáveis.
+        self.observar_valor("event_id", ep.id.to_string().as_bytes());
+        self.observar_valor("agent_id", ep.agent_id.as_bytes());
+        self.observar_valor("session_id", ep.session_id.as_bytes());
+
         // §67: `attrs.*` é DO_NOT_INDEX por omissão. Só entram os campos
         // declarados — e os sensíveis entram com chave (§66).
         for (campo, valor) in &ep.attrs {
-            match self.politica.politica_de(campo) {
-                IndexPolicy::PublicTechnical => self.registar(campo, valor.as_bytes().to_vec()),
-                IndexPolicy::HashedEquality => {
-                    let k = self.index_key.expect("validado no construtor");
-                    let d = keyed_equality_digest(&k, valor.as_bytes());
-                    self.registar(campo, d.to_vec());
-                }
-                IndexPolicy::EncryptedSidecar | IndexPolicy::DoNotIndex => {}
+            self.observar_valor(campo, valor.as_bytes());
+        }
+    }
+
+    fn observar_valor(&mut self, campo: &str, valor: &[u8]) {
+        match self.politica.politica_de(campo) {
+            IndexPolicy::PublicTechnical => self.registar(campo, valor.to_vec()),
+            IndexPolicy::HashedEquality => {
+                let k = self.index_key.expect("validado no construtor");
+                let d = keyed_equality_digest(&k, valor);
+                self.registar(campo, d.to_vec());
             }
+            IndexPolicy::EncryptedSidecar | IndexPolicy::DoNotIndex => {}
         }
     }
 
@@ -907,22 +946,25 @@ impl HrkiBuilder {
             }
         }
 
-        let filtros = self
-            .campos
-            .into_iter()
-            .map(|(campo, valores)| {
-                let mut f = BloomFilter::nova(valores.len(), fpr);
-                for v in &valores {
-                    f.inserir(v);
-                }
-                (campo, f)
-            })
-            .collect();
+        let filtros = if self.has_opaque {
+            Vec::new()
+        } else {
+            self.campos
+                .into_iter()
+                .map(|(campo, valores)| {
+                    let mut f = BloomFilter::nova(valores.len(), fpr);
+                    for v in &valores {
+                        f.inserir(v);
+                    }
+                    (campo, f)
+                })
+                .collect()
+        };
 
         Hrki {
             header: self.header,
             zonas: self.zonas,
-            kinds: Some(self.kinds),
+            kinds: (!self.has_opaque).then_some(self.kinds),
             filtros,
         }
     }
@@ -1132,6 +1174,40 @@ mod tests {
         assert!(h.filtros.is_empty(), "nenhum attr devia ter sido indexado");
         // E consultar um campo sem filtro nunca exclui.
         assert!(h.talvez_contenha("uf", b"QUALQUER"));
+    }
+
+    #[test]
+    fn builtins_so_entram_por_politica_explicita() {
+        let p = IndexPolicySet::new()
+            .com("agent_id", IndexPolicy::PublicTechnical)
+            .com("session_id", IndexPolicy::PublicTechnical);
+        let mut b = HrkiBuilder::novo(1, [0; 32], p, None).unwrap();
+        b.iniciar_bloco();
+        let mut e = ep("X", "SP");
+        e.agent_id = "agente-tecnico".into();
+        e.session_id = "sessao-tecnica".into();
+        b.observar(0, 0, &e);
+        let h = b.construir(0.01);
+        assert!(h.talvez_contenha("agent_id", b"agente-tecnico"));
+        assert!(!h.talvez_contenha("agent_id", b"outro"));
+        assert!(h.talvez_contenha("session_id", b"sessao-tecnica"));
+        assert!(!h.talvez_contenha("session_id", b"outra"));
+    }
+
+    #[test]
+    fn payload_opaco_desliga_filtros_que_poderiam_dar_falso_negativo() {
+        let p = IndexPolicySet::new().com("agent_id", IndexPolicy::PublicTechnical);
+        let mut b = HrkiBuilder::novo(1, [0; 32], p, None).unwrap();
+        b.iniciar_bloco();
+        b.observar(0, 0, &ep("X", "SP"));
+        b.observar_opaco(1, 1);
+        let h = b.construir(0.01);
+        assert!(h.kinds.is_none());
+        assert!(h.filtros.is_empty());
+        assert!(
+            h.talvez_contenha("agent_id", b"qualquer-coisa"),
+            "ausência de informação nunca pode excluir"
+        );
     }
 
     #[test]

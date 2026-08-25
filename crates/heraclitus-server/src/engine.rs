@@ -14,14 +14,14 @@ use heraclitus_index_graph::GraphIndex;
 use heraclitus_index_text::TextIndex;
 use heraclitus_index_vector::VectorIndex;
 use heraclitus_log::vm_bridge;
-use heraclitus_log::Log;
+use heraclitus_log::{AnyLog, EpisodeLog};
 use heraclitus_manifold::ProductMetric;
 use heraclitus_memtable::Memtable;
 use heraclitus_query::ast::Value as GqlValue;
 use heraclitus_query::backend::{
     cluster_of, community_of, hypotheses_of, match_edges_of, neighbors_of, node_metrics_of,
     resolve_of, traverse_of, CommunityResult, EdgeHypotheses, EdgeRow, MetricsResult, NeighborRow,
-    QueryBackend,
+    PrunedScanResult, QueryBackend,
 };
 use heraclitus_retrieval::{retrieve, LinearReranker, RecallInputs};
 use heraclitus_views::{View, ViewRegistry};
@@ -35,7 +35,9 @@ pub const IDEMPOTENCY_KEY_ATTR: &str = "__heraclitus_idempotency_key";
 pub const IDEMPOTENCY_HASH_ATTR: &str = "__heraclitus_idempotency_hash";
 
 pub struct Engine {
-    pub log: Arc<Log>,
+    /// Backend append-only selecionado explicitamente na configuração.
+    /// `legacy` continua sendo o default; `v6` nunca é inferido nem migrado.
+    pub log: Arc<AnyLog>,
     pub memtable: Arc<Memtable>,
     views: Mutex<ViewRegistry>,
     vector: Arc<Mutex<VectorIndex>>,
@@ -52,6 +54,11 @@ pub struct Engine {
     /// Raiz do cold tier (object store local); `demote` materializa segmentos aqui.
     #[cfg(feature = "tier")]
     cold_tier_path: std::path::PathBuf,
+    /// Contadores da leitura remota HRKL v6. Vivem no Engine porque cada
+    /// operação abre um `ColdTierV6` efémero; mantê-los no cliente do object
+    /// store faria os valores voltarem a zero entre requests.
+    cold_range_reads: std::sync::atomic::AtomicU64,
+    cold_bytes_downloaded: std::sync::atomic::AtomicU64,
     /// §3.9 (distill) — cursor do último LSN já consolidado (+1). Persistido em
     /// `<attr_dir>/distill.cursor`; garante que a task periódica não re-agrupa
     /// (e re-emite Facts d)os episódios já processados.
@@ -147,6 +154,23 @@ impl Engine {
     ) -> Result<Self, HeraclitusError> {
         use crate::boot::{fmt_bytes, group, sup};
 
+        // O data plane v6 já é completo, mas estes subsistemas ainda dependem
+        // de provas/segmentos físicos do layout legado. Falhar no boot evita
+        // uma base aparentemente saudável com apenas parte das garantias.
+        if config.storage_format == heraclitus_core::StorageFormat::V6 {
+            if config.replication.is_some() {
+                return Err(HeraclitusError::Config(
+                    "storage_format=v6 ainda não suporta replicação Raft".into(),
+                ));
+            }
+            #[cfg(feature = "tier")]
+            if config.tier_compaction_interval_secs > 0 {
+                return Err(HeraclitusError::Config(
+                    "storage_format=v6 ainda não suporta compaction do cold tier legado".into(),
+                ));
+            }
+        }
+
         // Modo recovery para stores grandes demais p/ a RAM: pula o replay das
         // views pesadas (que vivem 100% em RAM) e a (re)construção do índice de
         // atributos. O banco sobe servindo o log (a fonte da verdade); as views
@@ -183,7 +207,8 @@ impl Engine {
 
         let log = {
             let p = boot.phase("Log append-only (a fonte da verdade)");
-            let log = Arc::new(Log::open_with_keystore(
+            let log = Arc::new(AnyLog::open_with_keystore(
+                config.storage_format,
                 config.data_dir.join("log"),
                 config.segment_max_bytes,
                 config.fsync.clone(),
@@ -191,9 +216,10 @@ impl Engine {
             )?);
             let head = log.head();
             p.ok(format!(
-                "{} eventos · head LSN {} · segmentos de {}",
+                "{} eventos · head LSN {} · formato {} · segmentos de {}",
                 group(head),
                 group(head),
+                config.storage_format.as_str(),
                 fmt_bytes(config.segment_max_bytes)
             ));
             log
@@ -374,6 +400,8 @@ impl Engine {
             replication: std::sync::OnceLock::new(),
             hvm_lock: Mutex::new(()),
             idempotency_lock: Mutex::new(()),
+            cold_range_reads: std::sync::atomic::AtomicU64::new(0),
+            cold_bytes_downloaded: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "tier")]
             cold_tier_path: config.cold_tier_path.clone(),
             #[cfg(feature = "distill")]
@@ -473,7 +501,7 @@ impl Engine {
     pub fn emit_telemetry(&self) -> Result<u64, HeraclitusError> {
         use heraclitus_core::telemetry::SystemMetric;
         let head = self.log.head();
-        let sealed = self.log.sealed_segments().len();
+        let sealed = self.log.sealed_segment_count();
         let metrics = [
             SystemMetric::new("log_head_lsn", head as f64),
             SystemMetric::new("sealed_segments", sealed as f64),
@@ -590,13 +618,14 @@ impl Engine {
         heraclitus_tier::ColdTier::open_location(&self.cold_tier_path.to_string_lossy())
     }
 
+    #[cfg(feature = "tier")]
+    fn open_cold_tier_v6(&self) -> Result<heraclitus_tier::ColdTierV6, HeraclitusError> {
+        heraclitus_tier::ColdTierV6::open_location(&self.cold_tier_path.to_string_lossy())
+    }
+
     /// Ids dos segmentos selados — candidatos a demote para o cold tier.
     pub fn sealed_segment_ids(&self) -> Vec<SegmentId> {
-        self.log
-            .sealed_segments()
-            .into_iter()
-            .map(|s| s.id)
-            .collect()
+        self.log.sealed_segment_ids()
     }
 
     /// Demote um segmento selado para o cold tier (object store local em
@@ -610,14 +639,89 @@ impl Engine {
     /// existe no store local DESTE nó — por isso o endpoint continua a recusar
     /// demote sob replicação até o object store ser partilhado (nuvem).
     #[cfg(feature = "tier")]
-    pub async fn demote_segment(
+    async fn demote_legacy_segment(
         &self,
         segment_id: SegmentId,
     ) -> Result<heraclitus_tier::DemotionReceipt, HeraclitusError> {
         let cold = self.open_cold_tier()?;
-        let receipt = cold.demote_prepared(&self.log, segment_id).await?;
+        let legacy = self.log.legacy_arc().ok_or_else(|| {
+            HeraclitusError::Config(
+                "demote do cold tier legado ainda não suporta storage_format=v6".into(),
+            )
+        })?;
+        let receipt = cold.demote_prepared(legacy.as_ref(), segment_id).await?;
         self.append(heraclitus_tier::ColdTier::receipt_episode(&receipt)?)?;
         Ok(receipt)
+    }
+
+    /// Compatibilidade da API v1. O endpoint genérico usa
+    /// [`Self::demote_segment_any`] para também devolver recibos v2.
+    #[cfg(feature = "tier")]
+    pub async fn demote_segment(
+        &self,
+        segment_id: SegmentId,
+    ) -> Result<heraclitus_tier::DemotionReceipt, HeraclitusError> {
+        self.demote_legacy_segment(segment_id).await
+    }
+
+    /// Publica o layout correspondente ao formato aberto. Legacy mantém o
+    /// recibo v1; HRKL v6 publica a geração PACKED imutável e appenda recibo
+    /// v2 pelo mesmo `Engine::append` usado pelas demais escritas derivadas.
+    #[cfg(feature = "tier")]
+    pub async fn demote_segment_any(
+        &self,
+        segment_id: SegmentId,
+    ) -> Result<heraclitus_tier::AnyDemotionReceipt, HeraclitusError> {
+        match self.log.as_ref() {
+            AnyLog::Legacy(_) => self
+                .demote_legacy_segment(segment_id)
+                .await
+                .map(heraclitus_tier::AnyDemotionReceipt::V1),
+            AnyLog::V6(log) => {
+                let source = match log.active_packed_generation(segment_id)? {
+                    Some(source) => source,
+                    None => {
+                        // A API de demotion recebe um segmento lógico, não uma
+                        // geração. Se ele ainda está RAW, conclui a fila de
+                        // packing antes de escolher a geração publicada.
+                        log.pack_pending(heraclitus_log::v6::PackingProfile::Balanced)?;
+                        log.active_packed_generation(segment_id)?.ok_or_else(|| {
+                            HeraclitusError::Query(format!(
+                                "segmento v6 {segment_id} não existe ou não possui geração PACKED ativa"
+                            ))
+                        })?
+                    }
+                };
+                let cold = self.open_cold_tier_v6()?;
+                let receipt = cold
+                    .publish_generation(
+                        &source.path,
+                        source.generation,
+                        source.source_generation,
+                        source.created_hlc,
+                    )
+                    .await?;
+
+                // Retry depois de resposta perdida: o PUT é idempotente e o
+                // log também não ganha um segundo recibo equivalente.
+                if let Some(existing) = self.demotion_receipts_any()?.into_iter().find_map(|r| {
+                    match r {
+                        heraclitus_tier::AnyDemotionReceipt::V2(v2)
+                            if v2.segment_id == receipt.segment_id
+                                && v2.generation == receipt.generation
+                                && v2.physical_digest == receipt.physical_digest =>
+                        {
+                            Some(v2)
+                        }
+                        _ => None,
+                    }
+                }) {
+                    return Ok(heraclitus_tier::AnyDemotionReceipt::V2(existing));
+                }
+                self.append(receipt.episode()?)?;
+                Ok(heraclitus_tier::AnyDemotionReceipt::V2(Box::new(receipt)))
+            }
+        }
     }
 
     /// C2.6 — um tick de compaction do cold tier, disparado pela
@@ -703,14 +807,61 @@ impl Engine {
         cold.verify_receipt(receipt).await
     }
 
+    #[cfg(feature = "tier")]
+    pub async fn verify_demotion_v2(
+        &self,
+        receipt: &heraclitus_tier::DemotionReceiptV2,
+    ) -> Result<bool, HeraclitusError> {
+        let cold = self.open_cold_tier_v6()?;
+        let report = cold
+            .verify_generation(
+                receipt,
+                heraclitus_log::v6::IntegrityLevel::Logical,
+                Some(&heraclitus_log::v6::persisted_record_hash),
+            )
+            .await?;
+        self.cold_range_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.cold_bytes_downloaded.fetch_add(
+            report.bytes_downloaded,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(report.is_ok())
+    }
+
     /// Os recibos de demote no log (o que já foi materializado no cold tier).
     /// Scan JANELADO do log (R20: o scan sem teto materializava o log inteiro
     /// num Vec — a mesma classe do R9/R10; op de manutenção não é desculpa
     /// para um alloc proporcional ao log).
+    ///
+    /// Devolve **só** os recibos v1, que são os que o caminho `cold/…` desta
+    /// build sabe reler. Os v2 (SPEC-0050 §86) aparecem em
+    /// [`Self::demotion_receipts_any`].
     #[cfg(feature = "tier")]
     pub fn demotion_receipts(
         &self,
     ) -> Result<Vec<heraclitus_tier::DemotionReceipt>, HeraclitusError> {
+        Ok(self
+            .demotion_receipts_any()?
+            .into_iter()
+            .filter_map(|r| match r {
+                heraclitus_tier::AnyDemotionReceipt::V1(v1) => Some(v1),
+                heraclitus_tier::AnyDemotionReceipt::V2(_) => None,
+            })
+            .collect())
+    }
+
+    /// Todos os recibos de demote, de qualquer versão.
+    ///
+    /// A discriminação é feita por `receipt_version`
+    /// ([`heraclitus_tier::receipts_v2::decode_receipt_payload`]) e não por
+    /// tentativa de desserialização: um recibo v2 lido com o `serde` do v1
+    /// falha em silêncio e **desaparece** da listagem, o que faria um segmento
+    /// demotado parecer nunca ter sido demotado.
+    #[cfg(feature = "tier")]
+    pub fn demotion_receipts_any(
+        &self,
+    ) -> Result<Vec<heraclitus_tier::AnyDemotionReceipt>, HeraclitusError> {
         let head = self.log.head();
         let mut out = Vec::new();
         let mut cur = 0u64;
@@ -722,7 +873,7 @@ impl Engine {
             for (_lsn, ep) in &batch {
                 if ep.kind == EventKind::DemotionReceipt {
                     if let Ok(r) =
-                        serde_json::from_slice::<heraclitus_tier::DemotionReceipt>(&ep.content)
+                        heraclitus_tier::receipts_v2::decode_receipt_payload(&ep.content)
                     {
                         out.push(r);
                     }
@@ -742,15 +893,35 @@ impl Engine {
         segment_id: SegmentId,
     ) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
         let receipt = self
-            .demotion_receipts()?
+            .demotion_receipts_any()?
             .into_iter()
             .rev()
-            .find(|r| r.segment_id == segment_id)
+            .find(|r| match r {
+                heraclitus_tier::AnyDemotionReceipt::V1(v1) => v1.segment_id == segment_id,
+                heraclitus_tier::AnyDemotionReceipt::V2(v2) => v2.segment_id == segment_id,
+            })
             .ok_or_else(|| {
                 HeraclitusError::Query(format!("sem recibo de demote para o segmento {segment_id}"))
             })?;
-        let cold = self.open_cold_tier()?;
-        cold.fetch_cold(&receipt).await
+        match receipt {
+            heraclitus_tier::AnyDemotionReceipt::V1(v1) => {
+                let cold = self.open_cold_tier()?;
+                cold.fetch_cold(&v1).await
+            }
+            heraclitus_tier::AnyDemotionReceipt::V2(v2) => {
+                let cold = self.open_cold_tier_v6()?;
+                let (events, stats) = cold
+                    .recall_lsn_range(&v2.key()?, v2.first_lsn, v2.last_lsn)
+                    .await?;
+                self.cold_range_reads
+                    .fetch_add(stats.requests, std::sync::atomic::Ordering::Relaxed);
+                self.cold_bytes_downloaded.fetch_add(
+                    stats.bytes_fetched,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                Ok(events)
+            }
+        }
     }
 
     /// §3.9 — um tick de consolidação (distill): agrupa os episódios de
@@ -1435,6 +1606,7 @@ impl Engine {
     pub fn stats(&self) -> serde_json::Value {
         serde_json::json!({
             "head": self.log.head(),
+            "storage_format": self.log.format().as_str(),
             "memtable": self.memtable.len(),
             "vector_indexed": self.vector.lock().unwrap().len(),
             "text_indexed": self.text.lock().unwrap().len(),
@@ -1443,26 +1615,151 @@ impl Engine {
             "entity_keys": self.entity.lock().unwrap().mappings.len(),
             "activation_tracked": self.activation.lock().unwrap().len(),
             "views": self.views.lock().unwrap().view_names(),
+            "storage_metrics": self.storage_metrics(),
         })
     }
 
+    pub fn storage_metrics(&self) -> serde_json::Value {
+        let AnyLog::V6(log) = self.log.as_ref() else {
+            return serde_json::json!({
+                "available": false,
+                "reason": "HRKL v6 metrics require storage_format=v6"
+            });
+        };
+        match log.metrics_snapshot() {
+            Ok(m) => {
+                let cold_range_reads = self
+                    .cold_range_reads
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let cold_bytes_downloaded = self
+                    .cold_bytes_downloaded
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                serde_json::json!({
+                "available": true,
+                "hrkl_append_bytes_total": m.hrkl_append_bytes_total,
+                "hrkl_raw_bytes": m.hrkl_raw_bytes,
+                "hrkl_packed_bytes": m.hrkl_packed_bytes,
+                "hrkl_compression_ratio": m.hrkl_compression_ratio,
+                "hrkl_pack_queue_depth": m.hrkl_pack_queue_depth,
+                "hrkl_pack_seconds": m.hrkl_pack_seconds,
+                "hrkl_pack_throughput_bytes_sec": m.hrkl_pack_throughput_bytes_sec,
+                "hrkl_blocks_total": m.hrkl_blocks_total,
+                "hrkl_blocks_read": m.hrkl_blocks_read,
+                "hrkl_blocks_pruned": m.hrkl_blocks_pruned,
+                "hrkl_bytes_pruned": m.hrkl_bytes_pruned,
+                "hrkl_decompressed_bytes": m.hrkl_decompressed_bytes,
+                "hrki_hits": m.hrki_hits,
+                "hrki_misses": m.hrki_misses,
+                "hrki_rebuilds": m.hrki_rebuilds,
+                "cold_range_reads": cold_range_reads,
+                "cold_bytes_downloaded": cold_bytes_downloaded,
+                "parquet_export_lag_lsn": m.parquet_export_lag_lsn,
+                "canonical_verify_failures": m.canonical_verify_failures,
+                "physical_crc_failures": m.physical_crc_failures,
+                })
+            }
+            Err(error) => serde_json::json!({
+                "available": false,
+                "error": error.to_string(),
+            }),
+        }
+    }
+
+    /// Exposição Prometheus text format dos nomes normativos da §150.
+    pub fn prometheus_metrics(&self) -> Result<String, HeraclitusError> {
+        let AnyLog::V6(log) = self.log.as_ref() else {
+            return Err(HeraclitusError::Config(
+                "HRKL v6 metrics require storage_format=v6".into(),
+            ));
+        };
+        let m = log.metrics_snapshot()?;
+        let cold_range_reads = self
+            .cold_range_reads
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let cold_bytes_downloaded = self
+            .cold_bytes_downloaded
+            .load(std::sync::atomic::Ordering::Relaxed);
+        Ok(format!(
+            concat!(
+                "hrkl_append_bytes_total {}\n",
+                "hrkl_raw_bytes {}\n",
+                "hrkl_packed_bytes {}\n",
+                "hrkl_compression_ratio {}\n",
+                "hrkl_pack_queue_depth {}\n",
+                "hrkl_pack_seconds {}\n",
+                "hrkl_pack_throughput_bytes_sec {}\n",
+                "hrkl_blocks_total {}\n",
+                "hrkl_blocks_read {}\n",
+                "hrkl_blocks_pruned {}\n",
+                "hrkl_bytes_pruned {}\n",
+                "hrkl_decompressed_bytes {}\n",
+                "hrki_hits {}\n",
+                "hrki_misses {}\n",
+                "hrki_rebuilds {}\n",
+                "cold_range_reads {}\n",
+                "cold_bytes_downloaded {}\n",
+                "parquet_export_lag_lsn {}\n",
+                "canonical_verify_failures {}\n",
+                "physical_crc_failures {}\n"
+            ),
+            m.hrkl_append_bytes_total,
+            m.hrkl_raw_bytes,
+            m.hrkl_packed_bytes,
+            m.hrkl_compression_ratio,
+            m.hrkl_pack_queue_depth,
+            m.hrkl_pack_seconds,
+            m.hrkl_pack_throughput_bytes_sec,
+            m.hrkl_blocks_total,
+            m.hrkl_blocks_read,
+            m.hrkl_blocks_pruned,
+            m.hrkl_bytes_pruned,
+            m.hrkl_decompressed_bytes,
+            m.hrki_hits,
+            m.hrki_misses,
+            m.hrki_rebuilds,
+            cold_range_reads,
+            cold_bytes_downloaded,
+            m.parquet_export_lag_lsn,
+            m.canonical_verify_failures,
+            m.physical_crc_failures,
+        ))
+    }
+
     pub fn verify(&self) -> Result<serde_json::Value, HeraclitusError> {
-        let r = self.log.verify_durable()?;
-        Ok(serde_json::json!({
-            "segments": r.segments,
-            "sealed": r.sealed,
-            "records": r.records,
-            "merkle_ok": r.merkle_ok,
-            // Verdadeiro sempre que existe relatório: `Log::verify` devolve
-            // `Err` assim que uma raiz Merkle não bate. Explicitar isto poupa
-            // ao cliente ter de o inferir da AUSÊNCIA de um campo de erro —
-            // inferência que já levou um painel a escrever "íntegro" em cima
-            // de uma corrupção detectada.
-            "ok": true,
-            // Selados sem raiz gravada no rodapé: não são falha, são
-            // não-verificáveis. Sem este número, "3 de 5" não se explica.
-            "sem_raiz": r.sealed.saturating_sub(r.merkle_ok)
-        }))
+        match self.log.as_ref() {
+            AnyLog::Legacy(log) => {
+                let r = log.verify_durable()?;
+                Ok(serde_json::json!({
+                    "format": "legacy",
+                    "segments": r.segments,
+                    "sealed": r.sealed,
+                    "records": r.records,
+                    "merkle_ok": r.merkle_ok,
+                    // `verify_durable` devolve Err assim que a raiz não bate.
+                    "ok": true,
+                    "sem_raiz": r.sealed.saturating_sub(r.merkle_ok)
+                }))
+            }
+            AnyLog::V6(log) => {
+                let manifest = log.manifest();
+                let reports = log.verify_sealed(heraclitus_log::v6::IntegrityLevel::Logical)?;
+                let active_records = log.verify_active_tail()?;
+                let sealed = manifest.segments_v2.len();
+                Ok(serde_json::json!({
+                    "format": "v6",
+                    "segments": sealed,
+                    "sealed": sealed,
+                    "records": log.head(),
+                    "merkle_ok": sealed,
+                    "physical_generations_verified": reports.len(),
+                    "active_tail_records": active_records,
+                    "active_tail_crc_ok": true,
+                    "scope": "sealed logical+physical; active framing+crc+payload",
+                    "ok": true,
+                    "sem_raiz": 0
+                }))
+            }
+        }
     }
 
     /// `heraclitus_state()` — introspecção operacional num só JSON: head,
@@ -1470,23 +1767,45 @@ impl Engine {
     /// um operador precisa para diagnosticar um boot/replay sem ir a logs.
     pub fn state(&self) -> serde_json::Value {
         let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-        let sealed = self.log.sealed_segments();
-        let segments: Vec<serde_json::Value> = sealed
-            .iter()
-            .map(|m| {
-                serde_json::json!({
-                    "id": m.id,
-                    "version": m.version,
-                    "sealed": m.sealed,
-                    "base_lsn": m.base_lsn,
-                    "max_lsn": m.max_lsn,
-                    "blake3_root": m.blake3_root.as_ref().map(hex),
+        let segments: Vec<serde_json::Value> = match self.log.as_ref() {
+            AnyLog::Legacy(log) => log
+                .sealed_segments()
+                .iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "id": m.id,
+                        "version": m.version,
+                        "sealed": m.sealed,
+                        "base_lsn": m.base_lsn,
+                        "max_lsn": m.max_lsn,
+                        "blake3_root": m.blake3_root.as_ref().map(hex),
+                    })
                 })
-            })
-            .collect();
+                .collect(),
+            AnyLog::V6(log) => log
+                .manifest()
+                .segments_v2
+                .iter()
+                .map(|m| {
+                    let active = m.active();
+                    serde_json::json!({
+                        "id": m.segment_id,
+                        "version": 6,
+                        "sealed": true,
+                        "base_lsn": m.first_lsn,
+                        "max_lsn": m.last_lsn,
+                        "blake3_root": hex(&m.logical_root),
+                        "active_generation": m.active_generation,
+                        "physical_layout": active.map(|g| format!("{:?}", g.layout).to_ascii_lowercase()),
+                        "physical_generations": m.generations.len(),
+                    })
+                })
+                .collect(),
+        };
         let views = self.views.lock().unwrap();
         let mut out = serde_json::json!({
             "head_lsn": self.log.head(),
+            "storage_format": self.log.format().as_str(),
             "sealed_segments": segments,
             "views": {
                 "watermarks": views.watermarks(),
@@ -1508,20 +1827,58 @@ impl Engine {
         id: heraclitus_core::SegmentId,
     ) -> Result<serde_json::Value, HeraclitusError> {
         let hex = |b: &[u8; 32]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
-        match self.log.verify_segment(id)? {
-            None => Ok(serde_json::json!({ "found": false, "id": id })),
-            Some(r) => Ok(serde_json::json!({
-                "found": true,
-                "id": r.id,
-                "version": r.version,
-                "sealed": r.sealed,
-                "records": r.records,
-                "base_lsn": r.base_lsn,
-                "max_lsn": r.max_lsn,
-                "computed_root": hex(&r.computed_root),
-                "stored_root": r.stored_root.as_ref().map(hex),
-                "valid": r.valid,
-            })),
+        match self.log.as_ref() {
+            AnyLog::Legacy(log) => match log.verify_segment(id)? {
+                None => Ok(serde_json::json!({ "found": false, "id": id })),
+                Some(r) => Ok(serde_json::json!({
+                    "found": true,
+                    "id": r.id,
+                    "version": r.version,
+                    "sealed": r.sealed,
+                    "records": r.records,
+                    "base_lsn": r.base_lsn,
+                    "max_lsn": r.max_lsn,
+                    "computed_root": hex(&r.computed_root),
+                    "stored_root": r.stored_root.as_ref().map(hex),
+                    "valid": r.valid,
+                })),
+            },
+            AnyLog::V6(log) => {
+                let Some(reports) = log.verify_segment(
+                    id,
+                    heraclitus_log::v6::IntegrityLevel::Logical,
+                )? else {
+                    return Ok(serde_json::json!({ "found": false, "id": id }));
+                };
+                let manifest = log.manifest();
+                let desc = manifest.segment(id).ok_or_else(|| HeraclitusError::Corruption {
+                    context: "hrkl v6 verify".into(),
+                    detail: format!("segmento {id} desapareceu do manifesto durante verificação"),
+                })?;
+                let generations: Vec<_> = reports
+                    .iter()
+                    .map(|r| serde_json::json!({
+                        "layout": format!("{:?}", r.layout).to_ascii_lowercase(),
+                        "records": r.record_count,
+                        "blocks": r.block_count,
+                        "physical_ok": r.physical_ok,
+                        "logical_ok": r.logical_ok,
+                    }))
+                    .collect();
+                Ok(serde_json::json!({
+                    "found": true,
+                    "id": id,
+                    "version": 6,
+                    "sealed": true,
+                    "records": desc.record_count,
+                    "base_lsn": desc.first_lsn,
+                    "max_lsn": desc.last_lsn,
+                    "computed_root": hex(&desc.logical_root),
+                    "stored_root": hex(&desc.logical_root),
+                    "valid": reports.iter().all(|r| r.is_ok()),
+                    "generations": generations,
+                }))
+            }
         }
     }
 
@@ -1635,6 +1992,32 @@ impl QueryBackend for Engine {
         // QUERY_SCAN_CAP keeps a broad scan from exhausting memory (§query guard).
         self.log
             .scan_capped(from, to, heraclitus_query::backend::QUERY_SCAN_CAP)
+    }
+
+    fn scan_builtin_eq(
+        &self,
+        field: &str,
+        value: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<PrunedScanResult>, HeraclitusError> {
+        let bound = as_of.unwrap_or_else(|| self.log.head());
+        self.log
+            .scan_builtin_eq_capped(
+                field,
+                value,
+                0,
+                bound,
+                heraclitus_query::backend::QUERY_SCAN_CAP,
+            )
+            .map(|result| {
+                result.map(|(mut rows, stats)| {
+                    rows.retain(|(lsn, _)| *lsn < bound);
+                    PrunedScanResult {
+                        rows,
+                        stats: Some(stats),
+                    }
+                })
+            })
     }
 
     fn attr_lookup(
@@ -1984,6 +2367,127 @@ mod tests {
             ..Default::default()
         };
         Engine::open(&cfg).unwrap()
+    }
+
+    #[test]
+    fn v6_engine_append_query_and_restart_are_explicit() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            storage_format: heraclitus_core::StorageFormat::V6,
+            fsync: FsyncPolicy::Always,
+            ..Default::default()
+        };
+
+        {
+            let engine = Engine::open(&cfg).unwrap();
+            assert_eq!(engine.log.format(), heraclitus_core::StorageFormat::V6);
+            for i in 0..6 {
+                let mut event = Episode::new(
+                    "v6-test",
+                    EventKind::Observation,
+                    format!("event-{i}").into_bytes(),
+                );
+                event.attrs.insert("ordinal".into(), i.to_string());
+                assert_eq!(engine.append(event).unwrap(), i);
+            }
+            let rows = heraclitus_query::execute("MATCH (n) RETURN n", &engine).unwrap();
+            assert_eq!(rows.as_array().unwrap().len(), 6);
+            assert_eq!(engine.state()["storage_format"], "v6");
+            assert_eq!(engine.verify().unwrap()["format"], "v6");
+        }
+
+        let reopened = Engine::open(&cfg).unwrap();
+        assert_eq!(reopened.snapshot(), 6);
+        assert_eq!(reopened.log.read(5).unwrap().unwrap().1.content, b"event-5");
+        let rows = heraclitus_query::execute("MATCH (n) RETURN n", &reopened).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 6);
+        assert_eq!(reopened.append(Episode::new(
+            "v6-test",
+            EventKind::Observation,
+            b"after-restart".to_vec(),
+        )).unwrap(), 6);
+    }
+
+    #[test]
+    fn v6_engine_real_query_backend_uses_hrki_and_explain_reports_pruning() {
+        use heraclitus_log::v6::hrki::{IndexPolicy, IndexPolicySet};
+        use heraclitus_log::v6::PackingProfile;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            storage_format: heraclitus_core::StorageFormat::V6,
+            segment_max_bytes: 1_024,
+            fsync: FsyncPolicy::Always,
+            ..Default::default()
+        };
+        let engine = Engine::open(&cfg).unwrap();
+        for i in 0..40 {
+            let agent = if i < 20 { "alice" } else { "bob" };
+            engine
+                .append(Episode::new(
+                    agent,
+                    EventKind::Observation,
+                    vec![b'x'; 512],
+                ))
+                .unwrap();
+        }
+        let v6 = engine.log.v6_arc().unwrap();
+        v6.seal_active().unwrap();
+        v6.pack_pending(PackingProfile::Balanced).unwrap();
+        v6.build_pending_hrki(
+            &IndexPolicySet::new().com("agent_id", IndexPolicy::PublicTechnical),
+            None,
+            0.01,
+        )
+        .unwrap();
+
+        let probe = QueryBackend::scan_builtin_eq(&engine, "agent_id", "alice", None)
+            .unwrap()
+            .expect("Engine v6 deve expor a capability HRKI");
+        assert_eq!(probe.rows.len(), 20);
+        let stats = probe.stats.unwrap();
+        assert!(stats.hrki_used > 0);
+        assert!(stats.hrki_pruned > 0);
+        assert!(stats.bytes_pruned > 0);
+
+        let rows = heraclitus_query::execute(
+            "MATCH (n) WHERE n.agent_id = \"alice\" RETURN n",
+            &engine,
+        )
+        .unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 20);
+        let explain = heraclitus_query::execute(
+            "EXPLAIN MATCH (n) WHERE n.agent_id = \"alice\" RETURN n",
+            &engine,
+        )
+        .unwrap();
+        let explain = explain.as_str().unwrap();
+        assert!(explain.contains("StoragePruning"), "{explain}");
+        assert!(explain.contains("bytes pruned ="), "{explain}");
+
+        let metrics = engine.storage_metrics();
+        assert_eq!(metrics["available"], true);
+        assert!(metrics["hrkl_append_bytes_total"].as_u64().unwrap() > 0);
+        assert!(metrics["hrkl_packed_bytes"].as_u64().unwrap() > 0);
+        assert!(metrics["hrkl_pack_seconds"].as_f64().unwrap() > 0.0);
+        assert!(metrics["hrkl_blocks_pruned"].as_u64().unwrap() > 0);
+        assert!(metrics["hrkl_bytes_pruned"].as_u64().unwrap() > 0);
+        assert!(metrics["hrki_hits"].as_u64().unwrap() > 0);
+        assert!(metrics["hrki_rebuilds"].as_u64().unwrap() > 0);
+        let prometheus = engine.prometheus_metrics().unwrap();
+        for name in [
+            "hrkl_append_bytes_total",
+            "hrkl_pack_queue_depth",
+            "hrkl_blocks_pruned",
+            "hrki_rebuilds",
+            "parquet_export_lag_lsn",
+            "canonical_verify_failures",
+            "physical_crc_failures",
+        ] {
+            assert!(prometheus.lines().any(|line| line.starts_with(name)), "{name}");
+        }
     }
 
     #[test]

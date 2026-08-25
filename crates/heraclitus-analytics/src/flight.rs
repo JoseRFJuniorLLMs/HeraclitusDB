@@ -20,7 +20,7 @@ use datafusion::arrow::ipc::reader::StreamReader;
 use datafusion::arrow::ipc::writer::StreamWriter;
 use heraclitus_core::flight::{BatchBytes, FlightService, Ticket};
 use heraclitus_core::{Episode, EventKind};
-use heraclitus_log::Log;
+use heraclitus_log::EpisodeLog;
 use std::sync::Arc;
 
 /// Codifica um RecordBatch num stream Arrow IPC autocontido.
@@ -48,7 +48,10 @@ pub fn ipc_to_batches(bytes: &[u8]) -> Result<Vec<RecordBatch>, AnalyticsError> 
 
 /// Os episódios do log como UM único stream IPC (todos os batches) — o corpo
 /// HTTP que a rota `/flight/events` do server serve a clientes Arrow.
-pub fn events_as_single_ipc(log: &Log, as_of: Option<u64>) -> Result<Vec<u8>, AnalyticsError> {
+pub fn events_as_single_ipc<L: EpisodeLog + ?Sized>(
+    log: &L,
+    as_of: Option<u64>,
+) -> Result<Vec<u8>, AnalyticsError> {
     let to = as_of.unwrap_or(u64::MAX).min(log.head());
     // Flight faz streaming incremental: lotes fixos de BATCH_ROWS, não o morsel
     // adaptativo (que agregaria tudo num só batch grande no fio).
@@ -77,7 +80,10 @@ pub fn events_as_single_ipc(log: &Log, as_of: Option<u64>) -> Result<Vec<u8>, An
 
 /// R25: varre `[0, to)` em janelas (múltiplas de BATCH_ROWS) e converte cada
 /// janela em RecordBatches — nunca materializa o log inteiro como `Episode`s.
-fn scan_to_batches_windowed(log: &Log, to: u64) -> Result<Vec<RecordBatch>, AnalyticsError> {
+fn scan_to_batches_windowed<L: EpisodeLog + ?Sized>(
+    log: &L,
+    to: u64,
+) -> Result<Vec<RecordBatch>, AnalyticsError> {
     const WINDOW: usize = 50 * BATCH_ROWS;
     let mut batches = Vec::new();
     let mut cur = 0u64;
@@ -94,11 +100,11 @@ fn scan_to_batches_windowed(log: &Log, to: u64) -> Result<Vec<RecordBatch>, Anal
 
 /// Serviço Flight sobre o log real.
 pub struct IpcFlightService {
-    log: Arc<Log>,
+    log: Arc<dyn EpisodeLog>,
 }
 
 impl IpcFlightService {
-    pub fn new(log: Arc<Log>) -> Self {
+    pub fn new<L: EpisodeLog + 'static>(log: Arc<L>) -> Self {
         Self { log }
     }
 
@@ -124,7 +130,7 @@ impl FlightService for IpcFlightService {
         let to = as_of.unwrap_or(u64::MAX).min(self.log.head());
         // Streaming incremental: lotes fixos de BATCH_ROWS (contrato do fio).
         // R25: janelado — sem materializar o log inteiro como Episodes.
-        let batches = scan_to_batches_windowed(&self.log, to).map_err(|e| e.to_string())?;
+        let batches = scan_to_batches_windowed(self.log.as_ref(), to).map_err(|e| e.to_string())?;
         batches
             .iter()
             .map(|b| batch_to_ipc(b).map_err(|e| e.to_string()))
@@ -176,6 +182,7 @@ mod tests {
     use datafusion::arrow::array::ArrayRef;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use heraclitus_core::FsyncPolicy;
+    use heraclitus_log::Log;
 
     fn seeded_log(n: usize) -> (tempfile::TempDir, Arc<Log>) {
         let dir = tempfile::tempdir().unwrap();

@@ -97,7 +97,7 @@ fn evento(rng: &mut Rng, i: u64) -> Episode {
     e
 }
 
-fn pct(v: &mut Vec<Duration>, p: f64) -> Duration {
+fn pct(v: &mut [Duration], p: f64) -> Duration {
     if v.is_empty() {
         return Duration::ZERO;
     }
