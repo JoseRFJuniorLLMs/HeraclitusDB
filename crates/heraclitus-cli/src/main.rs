@@ -51,6 +51,27 @@ enum Cmd {
         #[command(subcommand)]
         command: ManifestCmd,
     },
+    /// SPEC-0050 §129-§133 — migrate a v1-v5 log directory to a NEW HRKL v6
+    /// storage root.
+    ///
+    /// Never destructive: the source is left byte-for-byte intact, the
+    /// destination must not already exist, and every segment leaves a
+    /// verifiable receipt pairing the legacy root with the v6 logical root.
+    /// Delete the legacy data yourself, after checking the receipts.
+    MigrateV6 {
+        /// Legacy log directory (the one holding the `.hrkl` files).
+        source: PathBuf,
+        /// New HRKL v6 storage root; must not exist or must be empty.
+        destination: PathBuf,
+        /// Skip the per-segment record-by-record equivalence check.
+        ///
+        /// Faster, and a worse trade than it looks: migration recomputes the
+        /// canonical identity from scratch, so a codec bug would produce a
+        /// plausible-but-wrong v6 segment that only surfaces when someone
+        /// tries to prove an LSN months later.
+        #[arg(long)]
+        no_verify: bool,
+    },
     /// SPEC-0050 Fase 6 — publish the lakehouse projection (Parquet + Iceberg
     /// + Delta) for every sealed segment the HRKM has not exported yet.
     ///
@@ -152,6 +173,12 @@ fn main() {
                 heraclitus_cli::manifest_show_v6(&dir).map_err(|e| e.to_string())
             }
         },
+        Cmd::MigrateV6 {
+            source,
+            destination,
+            no_verify,
+        } => heraclitus_cli::migrate_v6(&source, &destination, !no_verify)
+            .map_err(|e| e.to_string()),
         Cmd::Export { target, to, table } => {
             heraclitus_cli::export_lakehouse_v6(&target, &to, &table).map_err(|e| e.to_string())
         }

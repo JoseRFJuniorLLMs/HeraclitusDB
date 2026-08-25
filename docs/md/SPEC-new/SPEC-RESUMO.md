@@ -135,7 +135,7 @@ blocos de 8 KiB):
   crash**, e Clippy `-D warnings`; `heraclitus-query`: **53 testes** e Clippy
   `-D warnings`.
 
-- `cargo test --offline --workspace` — **735 testes, 0 falhas** (exit 0), depois
+- `cargo test --offline --workspace` — **742 testes, 0 falhas** (exit 0), depois
   de corrigir dois testes que nem sequer compilavam (`heraclitus-retrieval` e
   `heraclitus-views` tinham referências a `Log` deixadas para trás na migração
   para `EpisodeLog`/`AnyLog`; o workspace não passava `--all-targets`).
@@ -213,6 +213,72 @@ Não é dívida por falta de tempo; é o que a spec manda.
 
 Implementar qualquer uma delas sem satisfazer a condição seria contrariar a
 spec que se diz estar a cumprir.
+
+## SPEC-0050 §129–§133 — migração v1–v5 → v6 (fechada em 2026-08-24)
+
+Terceira vez que o mesmo padrão aparece nesta spec, e vale a pena nomeá-lo: o
+`v6::migrate` tinha 9 testes a passar, tratava cada versão do formato, o
+`opaque_meta`, a cauda rasgada — e **zero chamadores**. Nada migrava uma base
+inteira, não havia comando, e `storage_format` continua a ter `legacy` por
+omissão. Consequência prática: tudo o que as Fases 0–6 construíram estava
+inalcançável para quem já tem dados.
+
+| entrega | onde |
+|---|---|
+| `migrate_database()` — driver de base completa | `log/src/v6/migrate.rs` |
+| persistência do `LegacyMigrationReceipt` (§132) | `log/src/v6/receipts.rs` |
+| `heraclitus migrate-v6 <origem> <destino> [--no-verify]` | `cli/` |
+
+Garantias que o driver faz cumprir mecanicamente:
+
+1. **A origem fica byte a byte intacta** (§133) — pode haver um carimbo RFC
+   3161, uma assinatura ou uma perícia a apontar para o hash antigo. Apagar o
+   legado é decisão do operador, depois de verificar os recibos.
+2. **O destino tem de não existir** (§83) — migrar para dentro de um banco
+   povoado misturaria duas histórias.
+3. **A identidade v6 é recomputada, nunca herdada** (§131) — cada segmento deixa
+   um recibo persistido com a raiz legada e a raiz lógica v6 **lado a lado**,
+   sem as confundir.
+4. **A contiguidade de LSN é verificada, não assumida** (§5) — um buraco entre
+   segmentos é erro duro.
+5. **A cauda activa sai selada** (§130) — nunca se continua a appendar v6 num
+   ficheiro legado.
+
+Decisões e objeções registadas:
+
+- **Uma cauda rasgada recusa migrar em vez de migrar metade.** §130 manda
+  "recover according to legacy rules", mas essa recuperação é destrutiva
+  (trunca o registo parcial) e violaria a garantia 1. O caminho é o operador
+  abrir a base uma vez com o motor legado e voltar a correr.
+- **`verify` é ligado por omissão.** A migração recomputa a identidade
+  canónica do zero, portanto um erro no codec produziria um segmento v6
+  *plausível* e errado, que só se descobriria quando alguém tentasse provar um
+  LSN meses depois. `--no-verify` troca minutos de CPU por uma classe inteira de
+  falhas silenciosas.
+- **Um banco migrado é um banco novo**, com namespace próprio (§20). Reutilizar
+  o do original faria duas bases reclamarem a mesma identidade de storage. A
+  raiz lógica por segmento, essa, é idêntica entre duas migrações da mesma
+  origem — provado em `o_banco_migrado_tem_um_namespace_proprio`.
+- **Inconsistência pré-existente encontrada, não corrigida:** o backend legado
+  grava `cumulative_watermark = head` (último LSN + 1) e o v6 grava
+  `= max_lsn` (último LSN). Não causa bug hoje (os consumidores são internos a
+  cada formato, e a ancoragem de compliance lê `last_lsn` dos segmentos, não
+  este campo), mas o `EpisodeLog::manifest()` passou a ser genérico e é uma
+  armadilha à espera. Corrigir mexe no significado de bytes já em disco
+  (`cumulative_watermark` está no header do `.hrkm`), portanto fica sinalizado
+  em vez de silenciosamente alterado.
+
+Testes: 6 de integração em `log/tests/hrkl_v6_migrate_database.rs` (com uma base
+escrita pelo `Log` de produção, não bytes fabricados) e 1 no CLI que percorre o
+ciclo do operador — migrar → `manifest show` → `storage doctor` → abrir e usar.
+Validados por mutação: desligar a verificação de contiguidade ou a detecção da
+cauda activa derruba o teste respectivo.
+
+**O que continua a faltar para o v6 ser o default:** o `storage_format` continua
+`legacy` por omissão, e mudá-lo é uma decisão de produto, não de código —
+implica que uma instalação que actualize o binário sem migrar veja o motor a
+recusar abrir a sua base (as raízes são isoladas nos dois sentidos, de
+propósito). O comando existe; a decisão de virar o default não foi tomada.
 
 ## Ordem de execução atual
 

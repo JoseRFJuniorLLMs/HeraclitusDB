@@ -315,6 +315,288 @@ pub struct MigrationEquivalence {
     pub divergencia: Option<String>,
 }
 
+
+// ---------------------------------------------------------------------------
+// SPEC-0050 §129--§133 — migração de uma BASE inteira, não de um segmento
+// ---------------------------------------------------------------------------
+
+/// Parâmetros da migração de uma base completa.
+#[derive(Debug, Clone, Copy)]
+pub struct MigrateDatabaseOptions {
+    /// Corre [`verify_migration_equivalence`] em cada segmento migrado.
+    ///
+    /// Ligado por omissão, e deliberadamente: a migração recomputa a
+    /// identidade canónica do zero (§131), portanto um erro no codec produziria
+    /// um segmento v6 **plausível** e errado, que só se descobriria quando
+    /// alguém tentasse provar um LSN meses depois. Desligar isto troca minutos
+    /// de CPU por uma classe inteira de falhas silenciosas.
+    pub verify: bool,
+    /// HLC de criação carimbado nos segmentos v6 e no manifesto.
+    pub created_hlc: u64,
+    /// Namespace do banco de destino. `None` gera um novo.
+    ///
+    /// Um banco migrado é um banco **novo**: reutilizar o namespace do original
+    /// faria duas bases distintas reclamarem a mesma identidade de storage, e
+    /// §20 existe precisamente para isso não acontecer.
+    pub storage_namespace_id: Option<StorageNamespaceId>,
+}
+
+impl Default for MigrateDatabaseOptions {
+    fn default() -> Self {
+        Self {
+            verify: true,
+            created_hlc: 0,
+            storage_namespace_id: None,
+        }
+    }
+}
+
+/// O que aconteceu a um segmento.
+#[derive(Debug, Clone)]
+pub struct SegmentMigration {
+    pub legacy_path: std::path::PathBuf,
+    pub legacy_format: u16,
+    pub segment_id: SegmentId,
+    pub location: String,
+    pub first_lsn: Lsn,
+    pub last_lsn: Lsn,
+    pub records: u64,
+    pub receipt: LegacyMigrationReceipt,
+    pub receipt_path: std::path::PathBuf,
+    /// `Some(false)` = a raiz gravada no rodapé legado não bate com a
+    /// recomputada. `None` = o segmento não estava selado (cauda).
+    pub legacy_root_ok: Option<bool>,
+    /// `None` quando `verify` estava desligado.
+    pub equivalence: Option<MigrationEquivalence>,
+}
+
+/// O resultado de migrar uma base.
+#[derive(Debug, Clone)]
+pub struct DatabaseMigrationReport {
+    pub storage_namespace_id: StorageNamespaceId,
+    pub segments: Vec<SegmentMigration>,
+    pub records: u64,
+    pub first_lsn: Lsn,
+    pub last_lsn: Lsn,
+    pub manifest_generation: u64,
+    /// O último segmento legado não tinha rodapé (era a cauda activa) e foi
+    /// migrado para um segmento v6 **selado**, conforme §130.
+    pub legacy_tail_sealed: bool,
+}
+
+impl DatabaseMigrationReport {
+    /// Nenhum segmento divergiu em nada.
+    pub fn is_clean(&self) -> bool {
+        self.segments.iter().all(|s| {
+            s.legacy_root_ok != Some(false)
+                && s.equivalence.as_ref().map(|e| e.equivalente) != Some(false)
+        })
+    }
+}
+
+/// SPEC-0050 §129--§133 — migra um diretório de log v1--v5 para uma raiz v6
+/// nova, catalogada e pronta a abrir.
+///
+/// ## O que esta função garante
+///
+/// 1. **Nunca toca na origem.** Lê os `.hrkl` legados e escreve noutro sítio.
+///    §133 põe `preserve legacy original = true` por omissão justamente porque
+///    pode haver um carimbo RFC 3161, uma assinatura ou uma perícia a apontar
+///    para o hash antigo. Apagar o legado é decisão do operador, depois de
+///    verificar o recibo — nunca desta função.
+/// 2. **O destino tem de não existir.** Uma geração publicada não é
+///    sobrescrita (§83), e isso vale para a primeira geração de um banco
+///    migrado tanto como para qualquer outra.
+/// 3. **A identidade v6 é recomputada, nunca herdada** (§131). Cada segmento
+///    produz um [`LegacyMigrationReceipt`] persistido em `<v6_root>/receipts/`,
+///    com as duas raízes lado a lado.
+/// 4. **A contiguidade de LSN é verificada, não assumida** (§5). Um buraco
+///    entre segmentos legados é erro duro: em v6 a contiguidade é um
+///    invariante do formato, e migrar um buraco produziria uma base que mente
+///    sobre a sua própria história.
+/// 5. **A cauda activa é selada** (§130). O último segmento legado, se não
+///    tiver rodapé, é migrado para um segmento v6 selado; a base v6 abre depois
+///    uma cauda nova e limpa. Nunca se continua a appendar v6 num ficheiro
+///    legado.
+///
+/// ## O que esta função recusa fazer
+///
+/// Uma cauda **rasgada** (torn write no último registo) faz a migração falhar,
+/// em vez de migrar metade. §130 manda "recover according to legacy rules", e
+/// essa recuperação é destrutiva — trunca o registo parcial. Fazê-la aqui
+/// violaria a garantia 1. O caminho correcto é o operador abrir a base uma vez
+/// com o motor legado (que repara a cauda) e voltar a correr a migração.
+pub fn migrate_database(
+    legacy_dir: &Path,
+    v6_root: &Path,
+    opts: MigrateDatabaseOptions,
+) -> V6Result<DatabaseMigrationReport> {
+    const CTX: &str = "hrkl v6 migrate database";
+
+    if !legacy_dir.is_dir() {
+        return Err(corrupt(
+            CTX,
+            format!("origem não é um diretório: {}", legacy_dir.display()),
+        ));
+    }
+    if v6_root.exists() && std::fs::read_dir(v6_root)?.next().is_some() {
+        return Err(corrupt(
+            CTX,
+            format!(
+                "destino {} já existe e não está vazio; migrar para dentro de um banco existente misturaria duas histórias",
+                v6_root.display()
+            ),
+        ));
+    }
+
+    let mut ids: Vec<SegmentId> = std::fs::read_dir(legacy_dir)?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            name.strip_suffix(".hrkl")?.parse::<u64>().ok()
+        })
+        .collect();
+    ids.sort_unstable();
+    if ids.is_empty() {
+        return Err(corrupt(
+            CTX,
+            format!("nenhum segmento `.hrkl` em {}", legacy_dir.display()),
+        ));
+    }
+
+    let namespace = match opts.storage_namespace_id {
+        Some(ns) => ns,
+        None => super::engine::new_namespace(v6_root),
+    };
+
+    let segments_dir = v6_root.join("segments");
+    let receipts_dir = v6_root.join("receipts");
+    std::fs::create_dir_all(&segments_dir)?;
+    let store = super::manifest::ManifestStore::open(v6_root.join("manifests"))?;
+    let mut manifest = heraclitus_core::runtime::DatabaseManifest {
+        storage_namespace_id: namespace,
+        ..Default::default()
+    };
+
+    let mut saidas: Vec<SegmentMigration> = Vec::with_capacity(ids.len());
+    let mut esperado_proximo: Option<Lsn> = None;
+    let mut tail_sealed = false;
+    let mut total = 0u64;
+
+    for id in ids {
+        let source = legacy_dir.join(format!("{id:020}.hrkl"));
+        let location = format!("segments/{id:020}.g0000.raw.hrkl");
+        let target = v6_root.join(&location);
+
+        let legacy_format = {
+            let head = std::fs::read(&source)?;
+            format::SegmentHeader::decode(&head)?.version
+        };
+
+        let outcome = migrate_legacy_segment(
+            &source,
+            &target,
+            MigrateOptions {
+                target_segment_id: id,
+                target_generation: 0,
+                created_hlc: opts.created_hlc,
+                writer_epoch: 0,
+                storage_namespace_id: namespace,
+            },
+        )?;
+
+        if outcome.records == 0 {
+            // Um segmento vazio não representa história alguma; catalogá-lo
+            // criaria um descritor com intervalo de LSN degenerado.
+            std::fs::remove_file(&target)?;
+            continue;
+        }
+        if outcome.legacy_sealed_root.is_none() {
+            // §130 — era a cauda activa. Sai daqui SELADA.
+            tail_sealed = true;
+        }
+
+        let footer = outcome.footer;
+        if let Some(proximo) = esperado_proximo {
+            if footer.min_lsn != proximo {
+                return Err(corrupt(
+                    CTX,
+                    format!(
+                        "buraco de LSN entre segmentos: esperava {proximo}, o segmento {id} \
+                         começa em {}. A contiguidade de LSN é um invariante do formato v6 \
+                         (§5); migrar um buraco produziria uma base que mente sobre a sua \
+                         própria história.",
+                        footer.min_lsn
+                    ),
+                ));
+            }
+        }
+        esperado_proximo = Some(footer.max_lsn + 1);
+        total += outcome.records;
+
+        let receipt_path =
+            super::receipts::persist_migration_receipt(&receipts_dir, &outcome.receipt)?;
+
+        let equivalence = if opts.verify {
+            let eq = verify_migration_equivalence(&source, &target)?;
+            if !eq.equivalente {
+                return Err(corrupt(
+                    CTX,
+                    format!(
+                        "o segmento {id} migrado não é equivalente ao legado: {}",
+                        eq.divergencia.unwrap_or_else(|| "?".into())
+                    ),
+                ));
+            }
+            Some(eq)
+        } else {
+            None
+        };
+
+        let physical_size = std::fs::metadata(&target)?.len();
+        super::manifest::register_sealed_raw(
+            &mut manifest,
+            id,
+            &footer,
+            CANONICAL_CODEC_V1 as u16,
+            &location,
+            physical_size,
+            outcome.receipt.target_physical_digest,
+            opts.created_hlc,
+        )?;
+
+        saidas.push(SegmentMigration {
+            legacy_path: source,
+            legacy_format,
+            segment_id: id,
+            location,
+            first_lsn: footer.min_lsn,
+            last_lsn: footer.max_lsn,
+            records: outcome.records,
+            receipt: outcome.receipt.clone(),
+            receipt_path,
+            legacy_root_ok: outcome.legacy_root_ok(),
+            equivalence,
+        });
+    }
+
+    if saidas.is_empty() {
+        return Err(corrupt(CTX, "todos os segmentos legados estavam vazios"));
+    }
+
+    let committed = store.commit(&mut manifest)?;
+
+    Ok(DatabaseMigrationReport {
+        storage_namespace_id: namespace,
+        records: total,
+        first_lsn: saidas.first().unwrap().first_lsn,
+        last_lsn: saidas.last().unwrap().last_lsn,
+        manifest_generation: committed.generation,
+        legacy_tail_sealed: tail_sealed,
+        segments: saidas,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

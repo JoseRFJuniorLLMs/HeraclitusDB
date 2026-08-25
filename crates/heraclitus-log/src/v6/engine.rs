@@ -1999,7 +1999,12 @@ fn discover_namespace(inventory: &Inventory) -> V6Result<Option<[u8; 16]>> {
     Ok(namespace)
 }
 
-fn new_namespace(root: &Path) -> [u8; 16] {
+/// Gerador único de namespaces v6.
+///
+/// `pub(crate)` para que a migração (§129) o reutilize em vez de ter o seu
+/// próprio: dois geradores de identidade de storage acabariam por divergir, e
+/// a identidade é a última coisa que se quer ver a divergir.
+pub(crate) fn new_namespace(root: &Path) -> [u8; 16] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"HERACLITUS:HRKL:V6:NAMESPACE\0");
     hasher.update(root.to_string_lossy().as_bytes());

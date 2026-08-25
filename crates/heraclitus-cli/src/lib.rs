@@ -417,6 +417,100 @@ lakehouse queue: {:?}
     Ok(out)
 }
 
+/// SPEC-0050 §129--§133 — `heraclitus migrate-v6`.
+///
+/// Migra um diretório de log v1--v5 para uma raiz HRKL v6 nova. É a peça que
+/// faltava para o v6 ser adoptável: sem ela, tudo o que as Fases 0--6
+/// construíram estava inalcançável para quem já tem dados.
+///
+/// **Não destrói nada.** A origem fica byte a byte intacta (§133), o destino
+/// tem de não existir (§83), e cada segmento deixa um recibo verificável em
+/// `<destino>/receipts/` com a raiz legada e a raiz lógica v6 lado a lado
+/// (§132) — sem as confundir, que é o erro que §131 existe para impedir.
+///
+/// Depois de correr, o operador aponta a configuração ao destino com
+/// `storage_format = "v6"`. A origem só deve ser apagada depois de os recibos
+/// terem sido verificados — e essa decisão é dele, nunca deste comando.
+pub fn migrate_v6(
+    legacy_dir: &std::path::Path,
+    destination: &std::path::Path,
+    verify: bool,
+) -> Result<String, heraclitus_core::HeraclitusError> {
+    use heraclitus_log::v6::{migrate_database, MigrateDatabaseOptions};
+
+    let relatorio = migrate_database(
+        legacy_dir,
+        destination,
+        MigrateDatabaseOptions {
+            verify,
+            created_hlc: 0,
+            storage_namespace_id: None,
+        },
+    )?;
+
+    let mut out = format!(
+        "HRKL v6 migrate
+origem:  {}
+destino: {}
+namespace: {}
+segmentos: {}
+registos: {}
+lsn: [{}, {}]
+manifest generation: {}
+cauda activa legada selada: {}
+equivalencia verificada: {}
+
+",
+        legacy_dir.display(),
+        destination.display(),
+        relatorio
+            .storage_namespace_id
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+        relatorio.segments.len(),
+        relatorio.records,
+        relatorio.first_lsn,
+        relatorio.last_lsn,
+        relatorio.manifest_generation,
+        if relatorio.legacy_tail_sealed { "sim" } else { "nao havia" },
+        if verify { "sim" } else { "NAO (--no-verify)" },
+    );
+    for s in &relatorio.segments {
+        out.push_str(&format!(
+            "segment {:>6}  v{}  lsn [{}, {}]  registos {:>8}  raiz legada {}  recibo {}
+",
+            s.segment_id,
+            s.legacy_format,
+            s.first_lsn,
+            s.last_lsn,
+            s.records,
+            match s.legacy_root_ok {
+                Some(true) => "confere",
+                Some(false) => "DIVERGE",
+                None => "cauda (sem rodape)",
+            },
+            s.receipt_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        ));
+    }
+    if !relatorio.is_clean() {
+        return Err(heraclitus_core::HeraclitusError::Corruption {
+            context: "HRKL v6 migrate".into(),
+            detail: out,
+        });
+    }
+    out.push_str(
+        "
+A origem NAO foi alterada. Aponte a configuracao ao destino com
+         storage_format = \"v6\" e so apague o legado depois de verificar os recibos.
+",
+    );
+    Ok(out)
+}
+
 /// SPEC-0050 §120/§203 — `heraclitus export`.
 ///
 /// Corre uma passagem completa da projecção lakehouse sobre um storage root
@@ -890,6 +984,74 @@ pub fn bench_recall(n: usize, dim: usize, queries: usize) -> BenchReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SPEC-0050 §129--§133 — o ciclo do operador, do princípio ao fim.
+    ///
+    /// O que se prova aqui é a **sequência que uma instalação real vive**, e
+    /// não a migração em si (essa tem o seu teste de integração no
+    /// heraclitus-log): migrar -> inspeccionar o manifesto -> diagnosticar ->
+    /// abrir e usar. Se qualquer um destes passos falhasse depois de a
+    /// migração dizer "sucesso", o comando estaria a mentir.
+    #[test]
+    fn migrate_v6_produz_um_banco_que_o_resto_das_ferramentas_aceita() {
+        use heraclitus_core::{Episode, EventKind};
+        use heraclitus_log::v6::V6Log;
+        use heraclitus_log::Log;
+
+        let dir = tempfile::tempdir().unwrap();
+        let legado = dir.path().join("legacy");
+        let destino = dir.path().join("v6");
+
+        let esperado = {
+            let log = Log::open(&legado, 8 * 1024, FsyncPolicy::Always).unwrap();
+            for i in 0..150 {
+                log.append(Episode::new(
+                    "operador",
+                    EventKind::Observation,
+                    format!("evento-{i}-{}", "k".repeat(48)).into_bytes(),
+                ))
+                .unwrap();
+            }
+            log.flush().unwrap();
+            log.scan(0, log.head()).unwrap()
+        };
+
+        let saida = migrate_v6(&legado, &destino, true).unwrap();
+        assert!(saida.contains("equivalencia verificada: sim"), "{saida}");
+        assert!(saida.contains("cauda activa legada selada: sim"), "{saida}");
+        assert!(saida.contains("NAO foi alterada"), "{saida}");
+
+        // O manifesto do banco novo descreve o que foi migrado.
+        let manifesto = manifest_show_v6(&destino).unwrap();
+        assert!(manifesto.contains("HRKL v6 manifest"), "{manifesto}");
+        // Nota: em v6 o `cumulative_watermark` do HRKM é o ÚLTIMO LSN, ao
+        // passo que o manifesto legado guarda o `head` (último + 1). A
+        // diferença é pré-existente e não é desta migração; aqui usa-se a
+        // semântica do formato que estamos a inspeccionar.
+        assert!(
+            manifesto.contains(&format!(
+                "committed lsn (cumulative watermark): {}",
+                esperado.last().unwrap().0
+            )),
+            "{manifesto}"
+        );
+
+        // O diagnóstico aceita-o sem queixas.
+        let doctor = storage_doctor_v6(&destino).unwrap();
+        assert!(doctor.contains("status: CLEAN"), "{doctor}");
+
+        // E o motor v6 abre-o e devolve a história intacta.
+        let novo = V6Log::open(&destino, 1 << 20, FsyncPolicy::Always).unwrap();
+        let lido = novo.scan(0, novo.head()).unwrap();
+        assert_eq!(lido.len(), esperado.len());
+        assert_eq!(lido.first().unwrap().1.id, esperado.first().unwrap().1.id);
+        assert_eq!(lido.last().unwrap().1.content, esperado.last().unwrap().1.content);
+
+        // Migrar duas vezes para o mesmo destino e um destino inexistente
+        // comportam-se como devem.
+        assert!(migrate_v6(&legado, &destino, true).is_err());
+        assert!(migrate_v6(&dir.path().join("nao-existe"), &dir.path().join("x"), true).is_err());
+    }
 
     /// SPEC-0050 §120/§210 — os dois comandos operacionais da Fase 6 sobre um
     /// banco v6 real.

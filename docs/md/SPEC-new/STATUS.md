@@ -11,6 +11,42 @@ excluído (é cache, dá falsos positivos).
 > cada afirmação falsa/enganosa com a evidência. O estado real da plataforma e o
 > roteiro estão em [../PLANO-SPECS.md](../PLANO-SPECS.md).
 
+## ATUALIZAÇÃO 2026-08-24 (3) — migração v1–v5 → v6: o v6 passa a ser adoptável
+
+Terceira ocorrência do mesmo padrão nesta spec, e a mais consequente: o
+`v6::migrate` tinha 9 testes a passar, tratava cada versão do formato, o
+`opaque_meta` e a cauda rasgada — e **zero chamadores**. Não havia driver de
+base completa nem comando. Tudo o que as Fases 0–6 construíram estava
+inalcançável para qualquer instalação que já tivesse dados.
+
+Agora existe `migrate_database()` e `heraclitus migrate-v6 <origem> <destino>`.
+Garantias mecânicas: a origem fica byte a byte intacta (§133), o destino tem de
+não existir (§83), a identidade v6 é recomputada e nunca herdada (§131), a
+contiguidade de LSN é verificada e um buraco é erro duro (§5), e a cauda activa
+sai selada (§130). Cada segmento deixa um `LegacyMigrationReceipt` **persistido**
+— até agora o tipo existia mas só em memória, e uma ponte auditável que não
+sobrevive ao processo não é auditável.
+
+Uma cauda rasgada **recusa** migrar em vez de migrar metade: §130 manda
+"recover according to legacy rules", mas essa recuperação trunca o registo
+parcial e violaria a promessa de não tocar na origem.
+
+**Inconsistência pré-existente encontrada e sinalizada, não corrigida:** o
+backend legado grava `cumulative_watermark = head` (último LSN + 1) e o v6 grava
+`= max_lsn`. Não causa bug hoje, mas o `EpisodeLog::manifest()` é agora genérico
+sobre os dois. Corrigir mexe no significado de bytes já no header do `.hrkm`,
+portanto fica registado em vez de alterado às escondidas.
+
+Validação: 742 testes no workspace, 0 falhas; 6 de integração da migração (sobre
+uma base escrita pelo `Log` de produção, não bytes fabricados) e 1 no CLI a
+percorrer o ciclo do operador; Clippy `-D warnings` limpo. Mutações deliberadas
+derrubam os testes respectivos.
+
+**O v6 continua a NÃO ser o default.** `storage_format` é `legacy` por omissão, e
+virar isso é decisão de produto: uma instalação que actualize o binário sem
+migrar veria o motor recusar abrir a sua base — as raízes são isoladas nos dois
+sentidos, de propósito. O caminho existe; a decisão não foi tomada.
+
 ## ATUALIZAÇÃO 2026-08-24 (2) — SPEC-0050 Fase 6 fechada; compliance sai do v6
 
 A Fase 6 (lakehouse) estava numa situação particular que vale a pena nomear,
@@ -107,7 +143,7 @@ daria a string vazia e obrigaria o verificador a adivinhar o que "" significa
 
 ### Validação
 
-- `cargo test --offline --workspace` — **735 testes, 0 falhas**.
+- `cargo test --offline --workspace` — **742 testes, 0 falhas**.
 - Gates de performance de §207 medidos, não assumidos: §153 PASS (v6 não
   regride; mediana de 5 corridas A/B alternadas), §154 PASS (`packed/raw` =
   21.95%, limite 50%), §155 PASS (fallback RAW, expansão 0).

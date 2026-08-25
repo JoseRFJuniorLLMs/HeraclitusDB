@@ -138,8 +138,9 @@ pub use manifest::{
 };
 pub use merkle::{InclusionProof, MerkleAccumulatorV1};
 pub use migrate::{
-    migrate_legacy_segment, verify_migration_equivalence, MigrateOptions, MigrationEquivalence,
-    MigrationOutcome,
+    migrate_database, migrate_legacy_segment, verify_migration_equivalence,
+    DatabaseMigrationReport, MigrateDatabaseOptions, MigrateOptions, MigrationEquivalence,
+    MigrationOutcome, SegmentMigration,
 };
 pub use packed::{
     open_packed, BlockSource, FileSource, MemorySource, PackOptions, PackStats,
@@ -151,8 +152,9 @@ pub use packer::{
 };
 pub use raw::{RawSegmentWriter, SegmentInit};
 pub use receipts::{
-    persist_pack_receipt, physical_digest, physical_digest_of_file, read_pack_receipt,
-    AttestationEnvelopeV1, LegacyMigrationReceipt, PackReceipt, PACKER_VERSION,
+    persist_migration_receipt, persist_pack_receipt, physical_digest, physical_digest_of_file,
+    read_migration_receipt, read_pack_receipt, AttestationEnvelopeV1, LegacyMigrationReceipt,
+    PackReceipt, PACKER_VERSION,
 };
 pub use verify::{
     inspect, prove_lsn, verify_packed_reader, verify_segment, IntegrityLevel, LsnProof,
