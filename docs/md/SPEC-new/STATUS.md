@@ -11,6 +11,97 @@ excluído (é cache, dá falsos positivos).
 > cada afirmação falsa/enganosa com a evidência. O estado real da plataforma e o
 > roteiro estão em [../PLANO-SPECS.md](../PLANO-SPECS.md).
 
+## ATUALIZAÇÃO 2026-08-24 (4) — HRKL v6 é o banco. Nenhuma capability recusa arrancar.
+
+`storage_format` passou a ter **`v6` por omissão**. E, mais importante do que a
+troca do default: as três capabilities que falhavam fechadas em v6 deixaram de
+falhar.
+
+### Raft em v6 — a afirmação de que estava acoplado ao layout legado era falsa
+
+Este documento (e o meu próprio resumo da sessão anterior) dizia que "a state
+machine, os snapshots e o `install_snapshot` do openraft assentam no modelo
+físico legado". **Não assentam.** Verificado por grep sobre o crate inteiro: em
+`consensus.rs`, `grpc.rs`, `net.rs` e `lib.rs`, os únicos métodos do log usados
+são `append_replicated`, `head` e `scan` — os três já no `EpisodeLog`. O
+acoplamento era uma assinatura de tipo (`Arc<Log>`), não uma dependência real.
+
+Trocado por `Arc<AnyLog>`. A suíte de consenso passou a correr contra os dois
+formatos, escolhidos por ambiente:
+
+```bash
+cargo test -p heraclitus-raft --features replication                            # v6 (default)
+HERACLITUS_RAFT_TEST_FORMAT=legacy cargo test -p heraclitus-raft --features replication
+```
+
+**18 testes passam nos dois.** Eleição, quórum, failover, transferência de
+snapshot, raft-log durável com restart de processo, transporte TCP e gRPC — tudo
+sobre HRKL v6.
+
+### Compliance em v6 — já tinha saído na actualização (2)
+
+### Cold tier v1 em v6 — recusa substituída por aviso
+
+A compaction v1 percorre recibos de demote **v1**; num banco v6 todos os
+recibos são v2, portanto a task nunca encontra o que compactar. Recusar o
+arranque do servidor inteiro por causa de uma task de fundo opcional era
+desproporcionado; deixá-la a girar em silêncio seria pior, porque o operador
+ligou-a à espera de que algo acontecesse. Agora o servidor arranca, a task **não
+é iniciada**, e o boot diz porquê:
+
+```
+Compaction do cold tier  INERTE em v6: percorre recibos v1 e o v6 emite v2; a task não é iniciada
+```
+
+### O que um operador vê ao actualizar sem migrar
+
+Os dois layouts continuam isolados nos dois sentidos — o v6 nunca converte dados
+implicitamente. Mas o erro deixou de ser um beco:
+
+```
+esta pasta contém um log v1--v5 (00000000000000000000.hrkl), e o HRKL v6 nunca
+converte dados implicitamente.
+
+Duas saídas:
+  1. migrar (a origem NÃO é alterada):
+       heraclitus migrate-v6 <origem> <destino-novo>
+     e depois apontar `data_dir` ao destino;
+  2. continuar no formato antigo:
+       storage_format = "legacy"   (ou HERACLITUS_STORAGE_FORMAT=legacy)
+```
+
+### A prova de que as peças funcionam juntas
+
+`cluster_v6_replica_empacota_e_ancora_ao_mesmo_tempo`: três nós na configuração
+**por omissão** (v6 + Raft por TCP), 60 escritas pelo consenso, replicação e
+indexação nos três, ancoragem de compliance, packing dos segmentos, e o recibo
+**continua a verificar depois do packing** — a propriedade que a raiz lógica dá
+e a raiz física legada não dava. O cluster continua a aceitar escritas no fim.
+
+O teste tem um `assert` explícito de que o default é v6: se alguém o reverter,
+o teste passa a exercitar o legado, e falha em vez de o fazer em silêncio.
+
+### O que ficou de fora, e é honesto dizer
+
+- **Compaction do cold tier para recibos v2** não existe. A v1 é inerte em v6, e
+  o aviso di-lo. Implementá-la é trabalho a sério, não um adaptador.
+- **Projecção lakehouse continua opt-in** (`v6_lakehouse_interval_secs = 0`).
+  Packing e HRKI são compressão e índices — poupam espaço, e por isso estão
+  ligados por omissão. O lakehouse é uma **cópia** dos dados noutro formato;
+  ligá-la por omissão duplicaria o disco de toda a gente sem pedir licença.
+- Os dois testes do demote/compaction **v1** passaram a fixar
+  `storage_format = Legacy` explicitamente. Herdar o default novo faria testes
+  do caminho legado a exercitar o v6 — passariam a testar outra coisa.
+
+### Validação
+
+- `cargo test --offline --workspace` — **742 testes, 0 falhas**, agora com v6
+  como formato por omissão de toda a suíte.
+- `heraclitus-server` com `tier,analytics,distill,replication` — 46 testes.
+- `heraclitus-raft --features replication` — 18 testes em v6 **e** 18 em legado.
+- Clippy `-D warnings` limpo em core, log, raft, tier, cli, compliance, sim e
+  server com todas as features.
+
 ## ATUALIZAÇÃO 2026-08-24 (3) — migração v1–v5 → v6: o v6 passa a ser adoptável
 
 Terceira ocorrência do mesmo padrão nesta spec, e a mais consequente: o

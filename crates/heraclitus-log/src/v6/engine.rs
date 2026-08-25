@@ -2084,9 +2084,24 @@ fn reject_legacy_root(root: &Path) -> V6Result<()> {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         if name.strip_suffix(".hrkl").and_then(|id| id.parse::<u64>().ok()).is_some() {
+            // Agora que o v6 é o formato por omissão, esta é a mensagem que um
+            // operador vê ao actualizar o binário sem migrar. Tem de dizer o
+            // que fazer, e não apenas que se recusa: um erro que descreve o
+            // problema sem indicar a saída obriga a ir ler o código-fonte.
             return Err(corrupt(
                 "hrkl v6 open",
-                "legacy HRKL files found at root; use a new v6 directory or an explicit migration",
+                format!(
+                    "esta pasta contém um log v1--v5 ({}), e o HRKL v6 nunca converte dados implicitamente.
+                     
+                     Duas saídas:
+                       1. migrar (a origem NÃO é alterada):
+                            heraclitus migrate-v6 {} <destino-novo>
+                          e depois apontar `data_dir` ao destino;
+                       2. continuar no formato antigo:
+                       storage_format = \"legacy\"   (ou HERACLITUS_STORAGE_FORMAT=legacy)",
+                    name,
+                    root.display()
+                ),
             ));
         }
     }

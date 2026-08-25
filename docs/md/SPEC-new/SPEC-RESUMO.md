@@ -280,14 +280,47 @@ implica que uma instalação que actualize o binário sem migrar veja o motor a
 recusar abrir a sua base (as raízes são isoladas nos dois sentidos, de
 propósito). O comando existe; a decisão de virar o default não foi tomada.
 
+## HRKL v6 é o formato por omissão (2026-08-24)
+
+`storage_format` passou a ter `v6` por omissão, e **nenhuma capability recusa
+arrancar nele**.
+
+**Correcção a este documento:** dizia-se aqui que o Raft assentava no modelo
+físico legado. Não assenta. Em todo o crate `heraclitus-raft` os únicos métodos
+do log usados são `append_replicated`, `head` e `scan`, os três já no
+`EpisodeLog` — o acoplamento era uma assinatura de tipo (`Arc<Log>`), não uma
+dependência. Trocada por `Arc<AnyLog>`; a suíte de consenso corre agora contra os
+dois formatos (`HERACLITUS_RAFT_TEST_FORMAT=legacy` para o outro) e passa 18/18
+em ambos: eleição, quórum, failover, snapshot, restart durável, TCP e gRPC.
+
+| capability | antes em v6 | agora |
+| --- | --- | --- |
+| Raft | recusava o boot | **funciona**, 18 testes em v6 e 18 em legado |
+| Compliance | recusava o boot | **funciona**, e a raiz lógica sobrevive a repack |
+| Cold tier v1 | recusava o boot | arranca; a task **não é iniciada** e o boot avisa que é inerte (recibos v1 vs v2) |
+
+`cluster_v6_replica_empacota_e_ancora_ao_mesmo_tempo` prova as peças a
+funcionarem **juntas** na configuração por omissão: 3 nós, consenso por TCP, 60
+escritas replicadas e indexadas, ancoragem, packing, e o recibo continua a
+verificar depois de os bytes físicos mudarem.
+
+O erro que um operador vê ao actualizar sem migrar deixou de ser um beco: nomeia
+o ficheiro legado encontrado e dá as duas saídas (`heraclitus migrate-v6` ou
+`storage_format = "legacy"`).
+
+**Não ligado por omissão, deliberadamente:** a projecção lakehouse
+(`v6_lakehouse_interval_secs = 0`). Packing e HRKI são compressão e índices —
+poupam espaço. O lakehouse é uma cópia dos dados noutro formato; ligá-la por
+omissão duplicaria o disco de toda a gente sem pedir licença.
+
+**Continua a não existir:** compaction do cold tier para recibos v2. A v1 é
+inerte em v6 e o boot di-lo; implementar a v2 é trabalho a sério, não um
+adaptador.
+
 ## Ordem de execução atual
 
-1. **Raft sobre v6.** É a última capability que falha fechada no boot em
-   `storage_format = "v6"`. Ao contrário do compliance — que só precisava de ler
-   o `DatabaseManifest` em vez do `Log` concreto — a state machine, os snapshots
-   e o `install_snapshot` do openraft assentam no modelo físico legado. §184
-   coloca a política de durabilidade de réplicas fora desta spec, portanto é
-   trabalho da camada de replicação, não da 0050.
+1. **Compaction do cold tier para recibos v2** — a única funcionalidade que o
+   legado tem e o v6 não.
 2. **§175 (compactação lakehouse)** se e quando o número de ficheiros por tabela
    começar a doer; hoje é uma limitação declarada, não um defeito.
 3. Concluir a qualificação mensurável da SPEC-0049 antes de abrir plataformas

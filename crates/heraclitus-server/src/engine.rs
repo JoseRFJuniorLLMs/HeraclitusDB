@@ -154,21 +154,24 @@ impl Engine {
     ) -> Result<Self, HeraclitusError> {
         use crate::boot::{fmt_bytes, group, sup};
 
-        // O data plane v6 já é completo, mas estes subsistemas ainda dependem
-        // de provas/segmentos físicos do layout legado. Falhar no boot evita
-        // uma base aparentemente saudável com apenas parte das garantias.
-        if config.storage_format == heraclitus_core::StorageFormat::V6 {
-            if config.replication.is_some() {
-                return Err(HeraclitusError::Config(
-                    "storage_format=v6 ainda não suporta replicação Raft".into(),
-                ));
-            }
-            #[cfg(feature = "tier")]
-            if config.tier_compaction_interval_secs > 0 {
-                return Err(HeraclitusError::Config(
-                    "storage_format=v6 ainda não suporta compaction do cold tier legado".into(),
-                ));
-            }
+        // SPEC-0050 — a compaction do cold tier v1 percorre recibos de demote
+        // **v1**. Num banco v6 todos os recibos são v2, portanto a task é
+        // inerte: não corrompe nada, simplesmente nunca encontra o que
+        // compactar.
+        //
+        // Antes isto recusava o arranque. Recusar o servidor inteiro por causa
+        // de uma task de fundo opcional era desproporcionado — mas deixá-la a
+        // girar em silêncio seria pior, porque o operador ligou-a à espera de
+        // que algo acontecesse. O meio honesto é arrancar e dizer-lhe que esta
+        // peça em concreto não vai actuar.
+        #[cfg(feature = "tier")]
+        if config.storage_format == heraclitus_core::StorageFormat::V6
+            && config.tier_compaction_interval_secs > 0
+        {
+            boot.warn_line(
+                "Compaction do cold tier",
+                "INERTE em v6: percorre recibos v1 e o v6 emite v2; a task não é iniciada",
+            );
         }
 
         // Modo recovery para stores grandes demais p/ a RAM: pula o replay das

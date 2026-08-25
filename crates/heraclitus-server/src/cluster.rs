@@ -83,11 +83,10 @@ pub async fn spawn(
 ) -> Result<(Arc<ReplicationHandle>, ClusterTasks), HeraclitusError> {
     let raft_dir = default_dir(&cfg.raft_dir, data_dir, "raft");
     let sm_dir = default_dir(&cfg.sm_dir, data_dir, "raft-sm");
-    let log = engine.log.legacy_arc().ok_or_else(|| {
-        HeraclitusError::Config(
-            "storage_format=v6 ainda não suporta replicação Raft".into(),
-        )
-    })?;
+    // O consenso é agnóstico ao formato físico: só usa `append_replicated`,
+    // `head` e `scan`, que `AnyLog` publica para os dois backends. A suíte de
+    // cluster corre contra ambos (ver `heraclitus_raft::formato_de_teste`).
+    let log = engine.log.clone();
 
     // Hook: cada episódio aplicado é indexado nas views DESTE nó. `Weak` para não
     // criar ciclo (Engine → handle → raft → sm → hook → Engine).
@@ -366,6 +365,138 @@ mod tests {
     /// (transporte TCP), as escritas passam pelo `Engine::append` do líder, e os
     /// três nós **replicam o log E indexam** (uma query GQL devolve os dados em
     /// TODOS — read-your-writes preservado pelo hook de apply).
+    /// A promessa do banco novo, toda de uma vez.
+    ///
+    /// Cada uma destas peças já tem o seu teste. O que este prova é que
+    /// funcionam **juntas na configuração por omissão** — HRKL v6 com consenso
+    /// Raft, packing de segmentos e ancoragem de compliance ao mesmo tempo, no
+    /// mesmo processo. Até agora era impossível: o servidor recusava arrancar
+    /// em v6 com replicação ou com compliance ligados.
+    ///
+    /// A ancoragem em v6 usa a raiz **lógica** canónica, e é por isso que
+    /// empacotar durante a vida do cluster não invalida um recibo já emitido.
+    /// Sob o esquema legado invalidaria — os bytes físicos mudam.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cluster_v6_replica_empacota_e_ancora_ao_mesmo_tempo() {
+        use heraclitus_compliance::{anchor, verify_receipt, LocalTsa, ReceiptVerification};
+
+        let addrs: Vec<String> = (0..3).map(|_| free_addr()).collect();
+        let peers: BTreeMap<u64, String> = (0..3).map(|i| (i as u64, addrs[i].clone())).collect();
+
+        let mut engines: Vec<Arc<Engine>> = Vec::new();
+        let mut tasks: Vec<ClusterTasks> = Vec::new();
+        let mut dirs = Vec::new();
+        for id in 0..3u64 {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = HeraclitusConfig {
+                data_dir: dir.path().to_path_buf(),
+                fsync: FsyncPolicy::Always,
+                // Segmentos pequenos: queremos que role e sele durante o teste,
+                // para haver mesmo o que empacotar e o que ancorar.
+                segment_max_bytes: 4096,
+                replication: Some(ReplicationConfig {
+                    node_id: id,
+                    raft_addr: addrs[id as usize].clone(),
+                    peers: peers.clone(),
+                    bootstrap: id == 0,
+                    raft_dir: dir.path().join("raft"),
+                    sm_dir: dir.path().join("raft-sm"),
+                    transport: RaftTransport::Tcp,
+                    ..Default::default()
+                }),
+                // Sem `storage_format`: o default TEM de ser v6. Se alguém o
+                // reverter, este teste passa a exercitar o legado sem avisar —
+                // por isso o assert explícito logo a seguir.
+                ..Default::default()
+            };
+            assert_eq!(
+                cfg.storage_format,
+                heraclitus_core::StorageFormat::V6,
+                "o default do banco deixou de ser v6"
+            );
+            let engine = Arc::new(Engine::open(&cfg).unwrap());
+            let (handle, t) = spawn(&engine, cfg.replication.as_ref().unwrap(), &cfg.data_dir)
+                .await
+                .unwrap();
+            engine.set_replication(handle);
+            engines.push(engine);
+            tasks.push(t);
+            dirs.push(dir);
+        }
+
+        const ESCRITAS: u64 = 60;
+        for i in 0..ESCRITAS {
+            write_via_cluster(
+                &engines,
+                obs("alice", &format!("evento {i} {}", "z".repeat(64))),
+            )
+            .await;
+        }
+
+        for _ in 0..80 {
+            if engines.iter().all(|e| e.log.head() == ESCRITAS) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        for (i, e) in engines.iter().enumerate() {
+            assert_eq!(e.log.head(), ESCRITAS, "nó {i} não replicou tudo");
+            let v = heraclitus_query::execute("MATCH (n) RETURN n", e.as_ref()).unwrap();
+            assert_eq!(
+                v.as_array().unwrap().len() as u64,
+                ESCRITAS,
+                "nó {i} não indexou"
+            );
+        }
+
+        // Ancorar ANTES de empacotar, no nó 0.
+        let log0 = engines[0].log.clone();
+        let recibos = dirs[0].path().join("receipts");
+        let tsa = LocalTsa::generate("cluster-v6");
+        let recibo = anchor(log0.as_ref(), &tsa, &recibos, None).unwrap();
+        assert_eq!(
+            recibo.commitment_domain, "hrkl-v6-logical",
+            "num banco v6 a âncora tem de dobrar raízes lógicas"
+        );
+        assert!(recibo.segments > 0, "nada selado; o teste seria vácuo");
+
+        // Empacotar: os bytes físicos passam a ser outros.
+        let v6 = engines[0].log.v6_arc().expect("o default tem de abrir V6Log");
+        let empacotados = v6
+            .pack_pending(heraclitus_log::v6::PackingProfile::Balanced)
+            .unwrap();
+        assert!(!empacotados.is_empty(), "não havia segmentos por empacotar");
+
+        // E o recibo continua a verificar — a propriedade que o legado não tem.
+        assert!(
+            matches!(
+                verify_receipt(log0.as_ref(), &recibos, &recibo).unwrap(),
+                ReceiptVerification::DevelopmentOnly(_)
+            ),
+            "o packing invalidou uma âncora já emitida"
+        );
+
+        // O cluster continua vivo depois de tudo isto.
+        write_via_cluster(&engines, obs("alice", "depois do packing")).await;
+        for _ in 0..80 {
+            if engines.iter().all(|e| e.log.head() == ESCRITAS + 1) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        for (i, e) in engines.iter().enumerate() {
+            assert_eq!(
+                e.log.head(),
+                ESCRITAS + 1,
+                "nó {i} parou de replicar depois do packing"
+            );
+        }
+
+        for t in tasks {
+            t.abort();
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn three_server_cluster_replicates_writes_and_indexes() {
         let addrs: Vec<String> = (0..3).map(|_| free_addr()).collect();

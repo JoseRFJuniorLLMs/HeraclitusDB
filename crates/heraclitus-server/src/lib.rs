@@ -383,7 +383,9 @@ pub async fn serve_with(
     // Nunca sob replicação (o object store é local ao nó) e nunca no caminho
     // de escrita do cliente.
     #[cfg(feature = "tier")]
-    let tier_compaction_task = if config.tier_compaction_interval_secs > 0 {
+    let tier_compaction_task = if config.tier_compaction_interval_secs > 0
+        && config.storage_format != heraclitus_core::StorageFormat::V6
+    {
         let engine_tc = engine.clone();
         let every = std::time::Duration::from_secs(config.tier_compaction_interval_secs);
         boot.warn_line(

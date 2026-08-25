@@ -52,16 +52,25 @@ impl Default for FsyncPolicy {
 
 /// On-disk log format selected when the database is opened.
 ///
-/// The legacy format remains the default so existing installations are never
-/// migrated implicitly. Selecting `V6` is an explicit operator decision via
-/// TOML (`storage_format = "v6"`) or `HERACLITUS_STORAGE_FORMAT=v6`.
+/// **HRKL v6 é o formato por omissão.** É o motor completo da SPEC-0050:
+/// registos canónicos, blocos PACKED com Zstd (4.5x medido em corpus
+/// operacional), manifesto `.hrkm` com gerações e GC, sidecars `.hrki` com
+/// zone maps e Bloom, tier frio por range reads, projecção lakehouse e
+/// ancoragem de compliance pela raiz **lógica** — que, ao contrário da raiz
+/// física do legado, sobrevive a um repack sem invalidar recibos.
+///
+/// O legado (`storage_format = "legacy"`) continua legível e suportado, e
+/// **nunca** é convertido implicitamente: os dois layouts recusam abrir a raiz
+/// um do outro antes de qualquer escrita. Uma instalação com dados v1--v5
+/// converte-os com `heraclitus migrate-v6 <origem> <destino>`, que não toca na
+/// origem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageFormat {
-    /// Existing segment format, kept as the backwards-compatible default.
-    #[default]
+    /// Formato v1--v5. Continua legível; nunca é migrado implicitamente.
     Legacy,
-    /// HRKL v6 generational log format.
+    /// HRKL v6 — o formato por omissão (SPEC-0050).
+    #[default]
     V6,
 }
 
@@ -82,7 +91,7 @@ impl StorageFormat {
 #[serde(default)]
 pub struct HeraclitusConfig {
     pub data_dir: PathBuf,
-    /// On-disk log format. Defaults to [`StorageFormat::Legacy`]; changing it
+    /// On-disk log format. Defaults to [`StorageFormat::V6`]; changing it
     /// never performs an implicit migration of existing data.
     pub storage_format: StorageFormat,
     /// Tamanho a que o segmento rola e sela (default 8 MiB).
@@ -319,7 +328,7 @@ impl Default for HeraclitusConfig {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("./data"),
-            storage_format: StorageFormat::Legacy,
+            storage_format: StorageFormat::V6,
             // 8 MiB: ver a doc do campo. Medido 32x mais rapido a 1M de registos.
             segment_max_bytes: 8 * 1024 * 1024,
             fsync: FsyncPolicy::default(),
@@ -801,19 +810,27 @@ mod tests {
     #[test]
     fn default_roundtrip_toml() {
         let cfg = HeraclitusConfig::default();
-        assert_eq!(cfg.storage_format, StorageFormat::Legacy);
+        assert_eq!(cfg.storage_format, StorageFormat::V6, "v6 é o default");
         let s = toml::to_string(&cfg).unwrap();
         let back: HeraclitusConfig = toml::from_str(&s).unwrap();
         assert_eq!(back.segment_max_bytes, cfg.segment_max_bytes);
         assert_eq!(back.fsync, cfg.fsync);
-        assert_eq!(back.storage_format, StorageFormat::Legacy);
+        assert_eq!(back.storage_format, StorageFormat::V6);
     }
 
+    /// O legado continua acessível, e só por escolha explícita.
+    ///
+    /// Um default que se pudesse obter por omissão dos dois lados tornaria
+    /// impossível a um operador saber que formato tem sem ir ao disco.
     #[test]
-    fn toml_selects_v6_storage_format_explicitly() {
-        let cfg: HeraclitusConfig = toml::from_str("storage_format = \"v6\"").unwrap();
-        assert_eq!(cfg.storage_format, StorageFormat::V6);
-        assert_eq!(cfg.storage_format.as_str(), "v6");
+    fn toml_selects_each_storage_format_explicitly() {
+        let v6: HeraclitusConfig = toml::from_str("storage_format = \"v6\"").unwrap();
+        assert_eq!(v6.storage_format, StorageFormat::V6);
+        assert_eq!(v6.storage_format.as_str(), "v6");
+
+        let legado: HeraclitusConfig = toml::from_str("storage_format = \"legacy\"").unwrap();
+        assert_eq!(legado.storage_format, StorageFormat::Legacy);
+        assert_eq!(legado.storage_format.as_str(), "legacy");
     }
 
     #[test]

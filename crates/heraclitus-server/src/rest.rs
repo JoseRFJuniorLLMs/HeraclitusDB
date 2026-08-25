@@ -1045,6 +1045,12 @@ mod tier_tests {
             fsync: FsyncPolicy::Always,
             segment_max_bytes: 8192, // força sealing rápido
             cold_tier_path: dir.path().join("cold"),
+            // Este teste cobre o demote v1, que é do LAYOUT LEGADO por
+            // definição: os seus recibos são v1 e o espelho é Parquet do
+            // caminho antigo. Com o v6 como default, fixar o formato aqui é o
+            // que mantém o teste a testar o que diz testar — o equivalente v6
+            // é `v6_demote_publica_geracao_receipt_v2_e_faz_recall`.
+            storage_format: StorageFormat::Legacy,
             ..Default::default()
         };
         let engine = Engine::open(&cfg).unwrap();
@@ -1273,6 +1279,8 @@ mod tier_tests {
             fsync: FsyncPolicy::Always,
             segment_max_bytes: 8192,
             cold_tier_path: dir.path().join("cold"),
+            // Compaction v1 sobre recibos v1: legado por definição (ver acima).
+            storage_format: StorageFormat::Legacy,
             ..Default::default()
         };
         let engine = Engine::open(&cfg).unwrap();

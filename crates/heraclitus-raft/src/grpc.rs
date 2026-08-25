@@ -16,7 +16,7 @@
 use crate::consensus::{
     ConsensusNode, EpisodeStateMachine, HeraclitusRaft, MemRaftLog, NodeId, TypeConfig,
 };
-use heraclitus_log::Log;
+use heraclitus_log::AnyLog;
 use heraclitus_proto::raft_v1::{
     raft_transport_client::RaftTransportClient,
     raft_transport_server::{RaftTransport, RaftTransportServer},
@@ -247,7 +247,7 @@ pub struct GrpcNode {
 /// devolvido já está a aceitar. `bind_addr = "127.0.0.1:0"` dá porta efémera.
 pub async fn spawn_node_grpc_on<LS>(
     id: NodeId,
-    log: Arc<Log>,
+    log: Arc<AnyLog>,
     config: Arc<openraft::Config>,
     bind_addr: &str,
     store: LS,
@@ -263,7 +263,7 @@ where
 /// pelo cliente Raft; a CA deve ser exclusiva do cluster.
 pub async fn spawn_node_grpc_on_tls<LS>(
     id: NodeId,
-    log: Arc<Log>,
+    log: Arc<AnyLog>,
     config: Arc<openraft::Config>,
     bind_addr: &str,
     store: LS,
@@ -322,7 +322,7 @@ where
 /// Como [`spawn_node_grpc_on`] mas com raft-log em memória — referência p/ testes.
 pub async fn spawn_node_grpc(
     id: NodeId,
-    log: Arc<Log>,
+    log: Arc<AnyLog>,
     config: Arc<openraft::Config>,
     bind_addr: &str,
 ) -> Result<GrpcNode, Box<dyn std::error::Error>> {
@@ -370,7 +370,7 @@ mod tests {
         let mut dirs = Vec::new();
         for id in 0..3u64 {
             let dir = tempfile::tempdir().unwrap();
-            let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+            let log = Arc::new(AnyLog::open(crate::formato_de_teste(), dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
             nodes.push(
                 spawn_node_grpc(id, log, config.clone(), "127.0.0.1:0")
                     .await
