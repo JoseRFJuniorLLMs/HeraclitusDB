@@ -5,18 +5,24 @@
 # PRECISA DE ELEVACAO: parar e arrancar um servico exige administrador.
 # Correr numa consola "Executar como administrador".
 #
-# Existe porque os scripts que havia faziam ou de menos ou de mais:
+# Substituiu quatro scripts que faziam ou de menos ou de mais, apagados em
+# 2026-08-30 (recuperaveis do git, se alguma vez fizerem falta):
 #
-#   deploy.ps1            compila com a toolchain GNU (nao ha gcc nesta
-#                         maquina) e assume que o servico corre do target do
+#   deploy.ps1            compilava com a toolchain GNU (nao ha gcc nesta
+#                         maquina) e assumia que o servico corre do target do
 #                         cargo — corre de D:\HeraclitusDB\bin.
-#   deploy-msvc.ps1       copia para <repo>\target\release, que nao e o
+#   deploy-msvc.ps1       copiava para <repo>\target\release, que nao e o
 #                         destino do cargo (CARGO_TARGET_DIR=D:\cargo-target)
-#                         nem de onde o servico arranca.
-#   aplicar-live-e-cors   troca o binario CERTO, mas tambem escreve
+#                         nem de onde o servico arranca: trocava um ficheiro
+#                         que ninguem executa.
+#   aplicar-live-e-cors   trocava o binario CERTO, mas tambem escrevia
 #                         HERACLITUS_REST_CORS_ORIGINS na maquina — efeito
 #                         lateral de uma tarefa de 2026-08-18.
-#   deploy-v6-base-nova   troca o binario e APAGA A BASE.
+#   deploy-v6-base-nova   trocava o binario e APAGAVA A BASE.
+#
+# Os que ficaram tem dono e referencias: heraclitus-{service,production,
+# backup}.ps1 sao usados pelo CI, pelos runbooks e pelo bundle offline, e o
+# deploy-local-homologation.ps1 e outra coisa (homologacao, nao producao).
 #
 # E reversivel: o binario antigo fica guardado com data e hora, e o script
 # repoe-o sozinho se o servico nao subir.
@@ -54,7 +60,7 @@ Copy-Item $destino $copia -Force
 "  copia de seguranca: $copia"
 
 Stop-Service $servico -Force
-(Get-Service $servico).WaitForStatus('Stopped', '00:00:60')
+(Get-Service $servico).WaitForStatus('Stopped', '00:01:00')
 '  servico parado'
 
 Copy-Item $origem $destino -Force
@@ -63,13 +69,13 @@ Copy-Item $origem $destino -Force
 Passo '2. Arrancar e verificar'
 try {
   Start-Service $servico
-  (Get-Service $servico).WaitForStatus('Running', '00:00:60')
+  (Get-Service $servico).WaitForStatus('Running', '00:01:00')
 } catch {
   Write-Host "  NAO SUBIU: $($_.Exception.Message)" -ForegroundColor Red
   Write-Host '  a repor o binario anterior...' -ForegroundColor Yellow
   Copy-Item $copia $destino -Force
   Start-Service $servico
-  (Get-Service $servico).WaitForStatus('Running', '00:00:60')
+  (Get-Service $servico).WaitForStatus('Running', '00:01:00')
   Write-Host '  reposto; o servico esta a correr com o binario ANTIGO.' -ForegroundColor Yellow
   exit 1
 }
