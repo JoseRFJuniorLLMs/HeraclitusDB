@@ -167,6 +167,14 @@ struct RuntimeInner {
     fusion: Option<Mutex<EvidenceFusion>>,
     fusion_state: Mutex<BTreeMap<String, FusionAccumulator>>,
     signal_ids: Mutex<HashSet<String>>,
+    /// SPEC-0047 §36 — sightings ja emitidos.
+    ///
+    /// O `DirectLogSink` IGNORA a chave de idempotencia (so um host com
+    /// deduplicacao propria a honra), portanto a deduplicacao tem de viver
+    /// aqui — como ja vivia para os sinais. Sem isto, o mesmo evento visto
+    /// pelos dois caminhos (a derivacao e o derivado a voltar pelo
+    /// subscriber) produzia dois sightings da mesma observacao.
+    sighting_keys: Mutex<HashSet<String>>,
     derived_sources: Mutex<HashSet<Lsn>>,
     security_graph: Option<Mutex<TemporalSecurityGraph>>,
     incident_engine: Option<Mutex<IncidentEngine>>,
@@ -373,6 +381,7 @@ impl SentinelRuntime {
             fusion,
             fusion_state: Mutex::new(BTreeMap::new()),
             signal_ids: Mutex::new(signal_ids),
+            sighting_keys: Mutex::new(HashSet::new()),
             derived_sources: Mutex::new(derived_sources),
             security_graph,
             incident_engine,
@@ -1636,7 +1645,14 @@ fn process_until(inner: &RuntimeInner) -> Result<(), SentinelError> {
                                 .unwrap_or(lsn);
                             remember_rule_event(inner, source_lsn, &event);
                             apply_security_graph(inner, lsn, &event)?;
-                            evaluate_threat(inner, lsn, event.raw_event_id, &event)?;
+                            // `source_lsn` (o LSN do episodio BRUTO), nao `lsn`
+                            // (o do SecurityEvent). O mesmo evento chega aqui
+                            // por dois caminhos — a derivacao e, depois, o
+                            // proprio derivado a passar pelo subscriber — e
+                            // ancorar a evidencia no LSN de cada representacao
+                            // dava dois sinais e dois sightings para uma so
+                            // observacao.
+                            evaluate_threat(inner, source_lsn, event.raw_event_id, &event)?;
                             let l1_suspicious = evaluate_l1(inner)?;
                             evaluate_l2(
                                 inner,
@@ -1696,7 +1712,7 @@ fn process_until(inner: &RuntimeInner) -> Result<(), SentinelError> {
                 // portanto a evidência pode apontar para ele.
                 evaluate_threat(
                     inner,
-                    derived_lsn,
+                    normalized.source_lsn,
                     normalized.event.raw_event_id,
                     &normalized.event,
                 )?;
@@ -1805,10 +1821,22 @@ fn evaluate_threat(
         .fetch_add(hits.len() as u64, Ordering::Relaxed);
 
     for sighting in plane.sightings(&hits, derived_event_id, source_lsn, now) {
+        // A identidade e "este indicador, casado desta forma, NESTE evento" —
+        // e o `event_id` e o mesmo qualquer que seja o caminho por onde o
+        // evento chegou. Com o LSN na chave, a mesma observacao vista duas
+        // vezes produzia dois sightings.
         let key = format!(
             "t:{}:{}:{}",
-            sighting.indicator_id, sighting.match_kind, source_lsn
+            sighting.indicator_id, sighting.match_kind, sighting.event_id
         );
+        let ja_emitido = !inner
+            .sighting_keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key.clone());
+        if ja_emitido {
+            continue;
+        }
         inner.derived_sink.append(sighting.into_episode()?, &key)?;
         inner
             .metrics

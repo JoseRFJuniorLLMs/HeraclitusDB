@@ -37,7 +37,13 @@ pub mod receipt;
 pub mod rfc3161;
 pub mod signer;
 pub mod sovereignty;
+pub mod icp;
+pub mod secure_tsa;
+pub mod trust_store;
 pub mod tsa;
+
+#[cfg(test)]
+pub(crate) mod test_pki;
 pub mod verify;
 pub mod worker;
 

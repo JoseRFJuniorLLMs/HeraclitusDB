@@ -11,6 +11,149 @@ excluído (é cache, dá falsos positivos).
 > cada afirmação falsa/enganosa com a evidência. O estado real da plataforma e o
 > roteiro estão em [../PLANO-SPECS.md](../PLANO-SPECS.md).
 
+## MARCO 0 DA SPEC-0046 — 2026-08-30 (4)
+
+O Marco 0 estava **inteiramente ausente**: zero ocorrências de `TrustStore`,
+`X509`, `CMS` ou de um cliente HTTPS. Era o passo seguinte quando a sessão
+anterior ficou sem quota, e derrubava quatro itens do DoD de uma vez.
+
+### O que passou a existir
+
+| § | peça | onde |
+|---|---|---|
+| §11 | `TrustStore` configurável, sem nomes de ACT no core | `trust_store.rs` |
+| §9 | `IcpBrasilTimestampVerifier` — CMS, cadeia, EKU, imprint, nonce, política | `icp.rs` |
+| §10 | `SecureTsaClient` — HTTPS, timeouts, tectos, sem redirects, mTLS opcional | `secure_tsa.rs` |
+| §38 | PKI sintética para os testes | `test_pki.rs` (só `cfg(test)`) |
+
+### A mudança que interessa
+
+O verificador antigo tira a chave **de dentro do próprio token**
+(`verify.rs:60`, `token.tsa_key`). Isso deteta corrupção e nada mais: quem
+forjar um par de chaves produz um recibo que passa — e o doc-comment dizia-o,
+que era o que impedia o sistema de afirmar conformidade que não tinha.
+
+Agora a chave vem de um certificado que tem de encadear até uma âncora que o
+**operador** instalou. É a diferença entre *"estes bytes não foram alterados"*
+e *"uma autoridade credenciada afirmou esta hora"*.
+
+### Decisões, e as objeções que levantaram
+
+- **Usar `x509-cert` e `cms` em vez de escrever ASN.1 à mão.** São da família
+  RustCrypto, a mesma do `der`/`spki`/`const-oid`/`p256` que o crate já usava —
+  uma só versão de `der` em toda a árvore, sem duplicação de tipos. A objecção
+  é real: são dependências novas num crate com gates de supply-chain (§0049).
+  A alternativa era pior: um validador X.509 caseiro é a coisa mais perigosa
+  que se pode acrescentar a um crate de compliance, e um que *pareça* certo é
+  pior do que nenhum.
+- **RSA foi acrescentado porque sem ele isto seria teatro.** Os tokens
+  ICP-Brasil reais são `SHA256withRSA`. Um verificador que só fizesse ECDSA
+  passaria todos os testes sintéticos e recusaria todos os carimbos de
+  produção.
+- **A ordem das verificações não é arbitrária.** A cadeia é validada **antes**
+  da assinatura. Ao contrário gastava-se CPU a validar assinaturas de emissores
+  desconhecidos e — pior — convidava ao erro de reportar "assinatura válida"
+  para um token que ninguém devia aceitar.
+- **O TLS confia no mesmo trust store que o carimbo, não nas raízes do
+  sistema.** Se confiasse no sistema, qualquer CA pública do mundo podia emitir
+  um certificado para o nome da ACT e interpor-se. Consequência assumida: com o
+  trust store vazio o cliente **não liga a lado nenhum**, e nem sequer se
+  constrói.
+- **`http://` é recusado na construção, não no envio.** Um cliente que se deixa
+  construir com um endpoint inseguro é um cliente que alguém usa por engano.
+- **Redirects não se seguem, e não há como os ligar.** Seguir um redirect num
+  POST binário é reenviar o digest para um destino que o servidor escolheu —
+  exactamente o que a validação de certificado existe para impedir.
+- **Dois signatários num token são recusados.** Qual das assinaturas sustenta a
+  hora seria ambíguo, e escolher uma é pior do que recusar.
+- **A validade dos certificados é aferida no instante do CARIMBO, não no de
+  hoje.** Um carimbo emitido enquanto o certificado era válido continua a
+  provar a hora depois de ele expirar — é a razão de existir de um carimbo.
+- **Uma âncora tem de ser auto-emitida.** Aceitar um intermédio como âncora
+  faria o verificador confiar num elo cuja emissão ninguém verificou, e o
+  operador não veria a diferença ao olhar para a pasta.
+
+### O que continua por fazer, e está declarado no código
+
+- **Revogação (CRL/OCSP) não é consultada.** Um certificado revogado mas dentro
+  da validade **passa**. Está em `VerifiedTimestamp::revocation_checked`, que é
+  sempre `false` — no *resultado*, não só na documentação, para que quem
+  construa um relatório a partir disto não possa afirmar mais do que foi feito.
+- **Sem `nameConstraints` nem `policyMapping`.** A cadeia é por correspondência
+  exacta de nomes em DER com verificação de `basicConstraints`. Chega para a
+  topologia raiz → AC → ACT da ICP-Brasil; para uma malha com cross-certificados
+  não chega, e recusa em vez de adivinhar.
+- **O `SecureTsaClient` ainda não substituiu o `HttpTsa` no worker.** Trocar o
+  cliente do caminho vivo é uma mudança de configuração de produção (o endpoint
+  tem de passar a `https` e o trust store tem de estar povoado, senão o
+  servidor deixa de arrancar a ancoragem). Fica para uma decisão do operador,
+  não para um commit que a force.
+- **Interoperabilidade com uma ACT real não está provada.** Os testes usam uma
+  PKI sintética com a mesma estrutura; um `.tst` emitido por uma autoridade
+  credenciada é evidência de laboratório e entra pela SPEC-0049.
+
+### O que isto desbloqueia
+
+Com `SecureTsaClient` a falar HTTPS, o `GuardedTsaClient` da soberania passa a
+ser instalável: o `EgressEndpoint::validate()` exige `scheme == "https"` e o
+cliente antigo só falava HTTP — eram incompatíveis por construção. A
+incompatibilidade acabou; falta a decisão de trocar o cliente no worker.
+
+### Validação
+
+- `heraclitus-compliance`: **79 testes unitários** (era 43) + 4 de integração.
+  18 no verificador ICP, 8 no trust store, 9 no cliente HTTPS.
+- Cada recusa tem um teste próprio: cadeia sem âncora, assinatura de outra
+  chave, `messageDigest` que não corresponde, `signedAttrs` sem `contentType`,
+  carimbo sobre outro conteúdo, nonce trocado, nonce em falta, carimbo do
+  futuro, certificado sem `id-kp-timeStamping`, certificado fora da validade,
+  `eContentType` errado, token sem certificado, dois signatários, política
+  errada, token acima do tecto, lixo em vez de DER.
+- Validado por **mutação**: pôr `verificar_assinatura` a devolver sempre `Ok`
+  derruba `uma_assinatura_de_outra_chave_nao_passa`.
+- `cargo clippy --workspace --all-targets -- -D warnings` — limpo.
+
+
+### Dois defeitos que a suíte completa expôs, e que os testes isolados escondiam
+
+Ambos meus, ambos só visíveis com o workspace inteiro a correr.
+
+**1. O `rustls` entrava em pânico, não devolvia erro.** A árvore tem `ring`
+**e** `aws-lc-rs` (vindos de dependentes diferentes), e com os dois presentes o
+`ClientConfig::builder()` não consegue escolher um provider por omissão — e
+resolve isso com um `panic!`. Num servidor seria uma paragem no primeiro
+carimbo, não uma falha tratável. O provider passou a ser escolhido
+explicitamente. Passava em `-p heraclitus-compliance` porque a unificação de
+features aí é outra; só o `--workspace` o mostrou.
+
+**2. Um sighting duplicado por cada evento.** O mesmo `SecurityEvent` chega ao
+`evaluate_threat` por dois caminhos — a derivação, e depois o próprio derivado
+a passar pelo subscriber. Dois problemas somados:
+
+- a evidência estava ancorada no LSN de **cada representação** em vez do LSN do
+  episódio bruto, portanto os dois caminhos produziam identidades diferentes;
+- o `DirectLogSink::append` **ignora** a chave de idempotência (só um host com
+  deduplicação própria a honra), e eu confiei nela. Os sinais já tinham um
+  conjunto explícito de ids emitidos; os sightings não.
+
+Corrigido nos dois: a evidência ancora no `source_lsn` do bruto, e os sightings
+deduplicam por `(indicador, tipo de match, evento)` num conjunto próprio.
+Validado por mutação — remover a deduplicação derruba o teste.
+
+**A asserção que apanhou isto estava ela própria errada.** Era um
+`sleep(200ms)` seguido de "o head não mudou", que media a velocidade do worker
+ao mesmo tempo que a ausência de ciclo: sob carga, um derivado ainda a caminho
+contava como realimentação. Passou a esperar que o log **estabilize** e só
+então exigir que fique parado — um ciclo verdadeiro nunca estabiliza — e a
+contar cada tipo de derivado para provar que não há duplicados.
+
+### Definition of Done: de 1/20 para 5/20
+
+Passam a estar satisfeitos: **verificador RFC 3161 de produção**, **cadeia de
+confiança validada**, **TrustStore configurável**, **HTTPS para ACT**. Continua
+por satisfazer o resto, incluindo "anchors encadeados" — o `LegalReceipt` que o
+`anchor()` de produção emite não tem campo para o digest anterior.
+
 ## VERIFICAÇÃO 2026-08-30 (3) — SPEC-0046: o que foi construído, e o que dele está ligado
 
 Uma sessão paralela implementou os Marcos 1–4 da SPEC-0046 (≈5 500 linhas em

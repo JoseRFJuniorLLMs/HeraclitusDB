@@ -24,6 +24,25 @@ p256 = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 fips204 = "0.4.6"
+# SPEC-0046 Marco 0 — parsing de X.509 e de CMS/TimeStampToken.
+#
+# Da familia RustCrypto, a mesma de `der`/`spki`/`const-oid`/`p256` que este
+# crate ja usava: uma so versao de `der` em toda a arvore, sem duplicacao de
+# tipos. A alternativa era escrever ASN.1 e validacao de cadeia a mao, que num
+# crate de compliance e a coisa mais perigosa que se pode acrescentar.
+#
+# A feature `builder` do x509-cert e usada SO nos testes, para gerar uma PKI
+# sintetica: nao se embarcam certificados ICP-Brasil reais num repositorio.
+x509-cert = { version = "0.2", features = ["builder"] }
+cms = "0.2"
+rsa = "0.9"
+# A feature `ring` e explicita porque a arvore tem `ring` E `aws-lc-rs`
+# (vindos de dependentes diferentes) e, com as duas presentes, o rustls nao
+# consegue escolher um provider por omissao — o `ClientConfig::builder()`
+# ENTRA EM PANICO em vez de devolver erro. O provider e escolhido
+# explicitamente no `tls_config`; esta feature so garante que ele existe.
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pki-types = "1"
 
 [dev-dependencies]
 tempfile = { workspace = true }

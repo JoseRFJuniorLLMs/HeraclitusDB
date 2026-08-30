@@ -128,7 +128,10 @@ tempfile = "3"
 # compliance / ICP-Brasil (pure Rust)
 der = { version = "0.7", features = ["derive", "oid", "alloc"] }
 const-oid = "0.9"
-sha2 = "0.10"
+# A feature `oid` da o `AssociatedOid` que o construtor de certificados do
+# x509-cert exige para escolher o algoritmo de assinatura. Sem ela o bound
+# nao fecha e a PKI de teste nao compila.
+sha2 = { version = "0.10", features = ["oid"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
 anyhow = "1.0.103"
 csv = "1"

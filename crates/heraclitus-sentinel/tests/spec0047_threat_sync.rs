@@ -489,9 +489,45 @@ fn um_evento_com_ioc_produz_evidencia_no_log() {
     assert_eq!(sinal["labels"]["threat.max_tlp"], "TLP:AMBER");
 
     // Idempotencia: nada mais e emitido sem eventos novos.
-    let antes = log.head();
-    std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(log.head(), antes, "o derivado nao pode realimentar-se");
+    //
+    // O que isto tem de provar e a AUSENCIA de um ciclo — nao a velocidade do
+    // worker. Uma janela fixa media as duas coisas ao mesmo tempo: sob carga,
+    // um derivado que ainda estava a caminho contava como realimentacao. A
+    // forma certa e esperar que o log ESTABILIZE e so depois exigir que fique
+    // parado; um ciclo verdadeiro nunca estabiliza.
+    let mut estavel = log.head();
+    let limite = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        std::thread::sleep(Duration::from_millis(100));
+        let agora = log.head();
+        if agora == estavel {
+            break;
+        }
+        estavel = agora;
+        assert!(
+            std::time::Instant::now() < limite,
+            "o log nunca estabilizou: ha um ciclo de realimentacao"
+        );
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        log.head(),
+        estavel,
+        "o derivado realimentou-se depois de o log ter estabilizado"
+    );
+
+    // E o que ficou no log e exactamente o esperado, sem duplicados: um
+    // episodio bruto, um SecurityEvent, um SecuritySignal e um ThreatSighting.
+    let finais = log.scan(0, log.head()).unwrap();
+    let conta = |k: &str| {
+        finais
+            .iter()
+            .filter(|(_, e)| matches!(&e.kind, EventKind::Custom(x) if x == k))
+            .count()
+    };
+    assert_eq!(conta("SecurityEvent"), 1, "SecurityEvent duplicado");
+    assert_eq!(conta("ThreatSighting"), 1, "sighting duplicado");
+    assert_eq!(conta("SecuritySignal"), 1, "sinal duplicado");
 
     runtime.shutdown();
 }
