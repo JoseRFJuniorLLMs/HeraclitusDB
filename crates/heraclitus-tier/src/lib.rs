@@ -21,12 +21,14 @@
 //! mesmo bucket sem se cruzarem, e [`receipts_v2::decode_receipt_payload`] lê
 //! qualquer um dos dois. O caminho novo é [`demotion::ColdTierV6`].
 
+pub mod compaction;
 pub mod demotion;
 pub mod lakehouse;
 pub mod generation;
 pub mod object_source;
 pub mod receipts_v2;
 
+pub use compaction::{ColdCollectReport, ColdRepackOutcome};
 pub use demotion::{ColdTierV6, ColdVerifyReport};
 pub use generation::GenerationKey;
 pub use object_source::{ColdReadStats, ColdSegmentReader, SparseSource};

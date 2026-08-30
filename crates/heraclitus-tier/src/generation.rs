@@ -224,6 +224,21 @@ mod tests {
     }
 
     #[test]
+    fn o_prefixo_nao_pode_derivar_do_que_o_gc_reconhece() {
+        // O GC do log decide entre `remove_file` e "dívida do tier" por este
+        // prefixo (§82). Se um dos lados mudar sozinho, o GC volta a tentar
+        // apagar chaves de bucket com `std::fs` — e falha antes do commit,
+        // travando o GC do banco inteiro.
+        assert_eq!(
+            format!("{CANONICAL_PREFIX}/"),
+            heraclitus_core::runtime::OBJECT_STORE_GENERATION_PREFIX
+        );
+        assert!(heraclitus_core::runtime::is_object_store_location(
+            key().segment_path().as_ref()
+        ));
+    }
+
+    #[test]
     fn unhex_recusa_comprimento_errado() {
         assert!(unhex::<16>(&"ab".repeat(15)).is_none());
         assert!(unhex::<16>(&"ab".repeat(17)).is_none());

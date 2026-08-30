@@ -30,7 +30,9 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
-use heraclitus_core::runtime::{DatabaseManifest, GenerationState, PhysicalLayout};
+use heraclitus_core::runtime::{
+    is_object_store_location, DatabaseManifest, GenerationState, PhysicalLayout,
+};
 use heraclitus_core::SegmentId;
 
 use super::error::{corrupt, V6Result};
@@ -429,6 +431,25 @@ pub struct GcExecution {
     /// nada e reportava `removed` para um objecto que continua vivo no bucket.
     /// Reportar a dívida é honesto; fingir a remoção não é.
     pub lakehouse_detached: Vec<String>,
+    /// SPEC-0050 §82 — gerações canónicas que vivem num object store e cujo
+    /// HRKM deixou de as referenciar, mas cujos bytes **não** são deste GC
+    /// para remover.
+    ///
+    /// A razão é a mesma de `lakehouse_detached`, e o defeito que fecha é
+    /// concreto: `location` de uma `PhysicalGeneration` tanto pode ser
+    /// `segments/…` como `canonical/<ns>/segment-…/generation-N.hrkl` (§82).
+    /// Ao tratar as duas iguais, `resolve_gc_path` canonicalizava o pai de uma
+    /// chave de bucket contra a raiz local — que não existe — e devolvia erro
+    /// **antes** do commit. Efeito prático: bastava uma geração fria ficar
+    /// superseded para o GC do banco inteiro parar, incluindo o das gerações
+    /// locais que nada tinham a ver com o object store.
+    ///
+    /// Quem remove estes objectos é o `heraclitus-tier`, que tem o cliente do
+    /// bucket. O HRKM já não os referencia quando esta lista é devolvida, por
+    /// isso a remoção pode acontecer depois, noutro processo, ou nunca — o
+    /// pior caso é espaço pago a mais, nunca um manifesto a apontar para o
+    /// vazio.
+    pub cold_detached: Vec<String>,
 }
 
 /// Executa o GC na única ordem que preserva recuperação sob crash:
@@ -469,18 +490,27 @@ pub fn commit_gc_with_observer(
     // Resolver e validar TODOS os alvos antes do commit. Depois do commit não
     // existe rollback lógico seguro: outra thread/processo pode já ter lido a
     // nova geração do manifesto.
-    let generation_paths = plan
+    // §82 — `location` tanto pode ser um caminho local como uma chave de
+    // object storage. Só os locais passam por `resolve_gc_path`/`remove_file`;
+    // um caminho de bucket não se canonicaliza contra a raiz local (falhava
+    // aqui e travava o GC inteiro) nem se apaga com `std::fs`.
+    let (cold_generations, local_generations): (Vec<_>, Vec<_>) = plan
         .generations
+        .iter()
+        .partition(|candidate| is_object_store_location(&candidate.location));
+    let generation_paths = local_generations
         .iter()
         .map(|candidate| resolve_gc_path(storage_root, &candidate.location))
         .collect::<V6Result<Vec<_>>>()?;
-    // §176 — os derivados dividem-se por quem os pode apagar. O `.hrki` é um
-    // ficheiro local ao lado do `.hrkl` e sai daqui; o Parquet pertence ao
-    // lakehouse e só é desligado do manifesto.
+    // §176 — os derivados dividem-se por quem os pode apagar. O `.hrki` local
+    // é um ficheiro ao lado do `.hrkl` e sai daqui; o `.hrki` de uma geração
+    // fria e o Parquet pertencem a quem os publicou e só são desligados.
     let artifact_paths = plan
         .stale_artifacts
         .iter()
-        .filter(|artifact| artifact.kind == ArtifactKind::Hrki)
+        .filter(|artifact| {
+            artifact.kind == ArtifactKind::Hrki && !is_object_store_location(&artifact.location)
+        })
         .map(|artifact| resolve_gc_path(storage_root, &artifact.location))
         .collect::<V6Result<Vec<_>>>()?;
     let lakehouse_detached: Vec<String> = plan
@@ -488,6 +518,19 @@ pub fn commit_gc_with_observer(
         .iter()
         .filter(|artifact| artifact.kind == ArtifactKind::Parquet)
         .map(|artifact| artifact.location.clone())
+        .collect();
+    let cold_detached: Vec<String> = cold_generations
+        .iter()
+        .map(|candidate| candidate.location.clone())
+        .chain(
+            plan.stale_artifacts
+                .iter()
+                .filter(|artifact| {
+                    artifact.kind == ArtifactKind::Hrki
+                        && is_object_store_location(&artifact.location)
+                })
+                .map(|artifact| artifact.location.clone()),
+        )
         .collect();
 
     let mut next = manifest.clone();
@@ -515,6 +558,7 @@ pub fn commit_gc_with_observer(
         removed,
         orphaned,
         lakehouse_detached,
+        cold_detached,
     })
 }
 

@@ -48,8 +48,8 @@ use crate::receipts_v2::{DemotionReceiptV2, DEMOTION_RECEIPT_V2};
 /// continua a ser lido por quem tem recibos antigos, e os dois prefixos nunca
 /// se cruzam no mesmo bucket.
 pub struct ColdTierV6 {
-    store: Arc<dyn ObjectStore>,
-    max_block_bytes: usize,
+    pub(crate) store: Arc<dyn ObjectStore>,
+    pub(crate) max_block_bytes: usize,
 }
 
 /// O que uma verificação de geração apurou.

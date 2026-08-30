@@ -341,6 +341,26 @@ impl GenerationState {
     }
 }
 
+/// SPEC-0050 §82 — prefixo das chaves de geração em object storage.
+///
+/// Vive aqui, e não no `heraclitus-tier` que as escreve, porque quem mais
+/// precisa de o reconhecer é o GC do log: o campo `location` de uma
+/// [`PhysicalGeneration`] tanto pode ser um caminho local como uma chave de
+/// bucket, e um GC que confunda os dois ou falha a canonicalizar um caminho
+/// que não existe no disco, ou — pior — apaga o ficheiro local errado que por
+/// acaso tenha o mesmo nome relativo.
+pub const OBJECT_STORE_GENERATION_PREFIX: &str = "canonical/";
+
+/// Se `location` é uma chave de object storage (§82) em vez de um caminho
+/// local relativo à raiz de armazenamento.
+///
+/// É deliberadamente sintáctico: não vai ao disco nem à rede. Uma decisão de
+/// GC não pode depender de um `stat` — o ficheiro pode não existir por já ter
+/// sido coletado, e isso não o torna remoto.
+pub fn is_object_store_location(location: &str) -> bool {
+    location.starts_with(OBJECT_STORE_GENERATION_PREFIX)
+}
+
 /// Uma representação física de um segmento (SPEC-0050 §71).
 ///
 /// Várias gerações coexistem com a **mesma** `logical_root` do segmento e

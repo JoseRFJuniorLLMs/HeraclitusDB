@@ -759,3 +759,138 @@ fn legal_hold_impede_o_gc_ate_ser_levantado() {
     let plano = plan_gc(&m, &PinRegistry::new(), &tarde);
     assert_eq!(plano.generations.len(), 1);
 }
+
+/// SPEC-0050 §82 — uma geração canónica publicada em object storage não é
+/// apagada com `std::fs::remove_file`, e a sua presença não pode travar o GC
+/// das gerações locais.
+///
+/// O defeito era simétrico ao do Parquet (teste acima) mas pior nas
+/// consequências: `PhysicalGeneration::location` tanto pode ser
+/// `segments/…` como `canonical/<ns>/segment-…/generation-N.hrkl` (§82), e
+/// `commit_gc` mandava as duas para `resolve_gc_path`. A canonicalização do pai
+/// de uma chave de bucket contra a raiz local falha — e falha **antes** do
+/// commit, portanto o `?` abortava o GC inteiro. Bastava uma geração fria ficar
+/// superseded para nenhuma geração local voltar a ser coletada nesse banco.
+///
+/// É um bug latente enquanto ninguém cataloga gerações frias no HRKM; arma-se
+/// no momento em que alguém o fizer. Daí o teste fabricar a entrada à mão em
+/// vez de esperar pelo wiring.
+#[test]
+fn geracao_em_object_storage_e_desligada_mas_nao_apagada_pelo_gc() {
+    use heraclitus_core::runtime::{CompressionCodec, PhysicalGeneration};
+
+    let d = dir_teste("gc-cold");
+    let store = ManifestStore::open(d.join("manifests")).unwrap();
+    let mut m = DatabaseManifest {
+        storage_namespace_id: NAMESPACE,
+        ..Default::default()
+    };
+    let raw = sela_e_cataloga(&d, &mut m, 0, 1, 100);
+    let target = d.join("00000000000000000000.g1.hrkl");
+    pack_and_commit(
+        &store,
+        &mut m,
+        &raw,
+        &target,
+        PackOptions::default(),
+        0,
+        1,
+        hlc(100),
+        &hasher,
+    )
+    .unwrap();
+
+    // Uma cópia fria da mesma história, já superseded por outra geração fria
+    // mais recente. As duas são autoridades canónicas, portanto §91 não
+    // bloqueia a colecta da mais antiga.
+    let seg = m.segment_mut(0).unwrap();
+    let raiz = hex(&seg.logical_root);
+    let chave = |g: u32| {
+        format!(
+            "canonical/{}/segment-0000000000/{raiz}/generation-{g}.hrkl",
+            hex(&NAMESPACE)
+        )
+    };
+    let fria = |g: u32, superseded: u64| PhysicalGeneration {
+        generation: g,
+        layout: PhysicalLayout::Packed,
+        compression: CompressionCodec::Zstd,
+        location: chave(g),
+        physical_size: 4_096,
+        physical_digest: [g as u8; 32],
+        state: if superseded == 0 {
+            GenerationState::Verified
+        } else {
+            GenerationState::Superseded
+        },
+        created_hlc: hlc(100),
+        verified_hlc: hlc(100),
+        superseded_hlc: superseded,
+        verified_copies: 1,
+    };
+    seg.generations.push(fria(2, hlc(100)));
+    seg.generations.push(fria(3, 0));
+    // E uma geração LOCAL também coletável, para provar que a fria não a
+    // arrasta consigo: era exactamente isto que o `?` de `resolve_gc_path`
+    // impedia.
+    let local_superseded = seg
+        .generations
+        .iter()
+        .find(|g| g.generation == 0)
+        .unwrap()
+        .location
+        .clone();
+    store.commit(&mut m).unwrap();
+
+    let plano = plan_gc(
+        &m,
+        &PinRegistry::new(),
+        &GcOptions {
+            now_hlc: hlc(100 + 86_400 + 1),
+            ..GcOptions::default()
+        },
+    );
+    let coletaveis: Vec<u32> = plano.generations.iter().map(|c| c.generation).collect();
+    assert!(
+        coletaveis.contains(&0) && coletaveis.contains(&2),
+        "plano devia conter a RAW local (0) e a fria superseded (2): {coletaveis:?}"
+    );
+
+    // Com o comportamento antigo isto era `Err`: a chave `canonical/…` não
+    // canonicaliza sob a raiz local.
+    let executado = commit_gc(&store, &mut m, &d, &plano).unwrap();
+
+    assert_eq!(
+        executado.cold_detached,
+        vec![chave(2)],
+        "a geração fria devia ser reportada como dívida do tier"
+    );
+    assert!(
+        !executado
+            .removed
+            .iter()
+            .any(|p| p.to_string_lossy().contains("canonical")),
+        "o GC do HRKL não pode declarar removido um objecto de bucket: {:?}",
+        executado.removed
+    );
+    // `removed` traz caminhos canonicalizados pelo SO (em Windows, com o
+    // prefixo `\?\`), por isso a comparação é pelo nome do ficheiro.
+    let nome_local = Path::new(&local_superseded).file_name().unwrap();
+    assert!(
+        executado
+            .removed
+            .iter()
+            .any(|p| p.file_name() == Some(nome_local)),
+        "a geração local coletável devia ter sido apagada: {:?}",
+        executado.removed
+    );
+    assert!(
+        !Path::new(&local_superseded).exists(),
+        "os bytes locais deviam ter desaparecido"
+    );
+
+    // O catálogo já não referencia nenhuma das duas.
+    let seg = m.segment(0).unwrap();
+    let restantes: Vec<u32> = seg.generations.iter().map(|g| g.generation).collect();
+    assert_eq!(restantes, vec![1, 3], "sobraram {restantes:?}");
+}
