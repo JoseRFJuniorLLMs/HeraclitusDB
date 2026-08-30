@@ -25,7 +25,10 @@ members = [
     "crates/heraclitus-cli",
     "crates/heraclitus-client",
     "sim/heraclitus-sim",
-    "tools/heraclitus-ingestor", "crates/heraclitus-analytics",
+    "tools/heraclitus-ingestor",
+    "tools/heraclitus-qualifier",
+    "crates/heraclitus-sentinel",
+    "crates/heraclitus-analytics",
     # HUME: `hume-ir` e `hume-sketches` não têm consumidor HOJE, mas não são
     # código morto — são infraestrutura para a SPEC-0043 (MATH-15 "JIT
     # vectorization" e a camada de hash/HLL dos sketches, ambos P1 com
@@ -74,6 +77,7 @@ heraclitus-client = { path = "crates/heraclitus-client" }
 heraclitus-analytics = { path = "crates/heraclitus-analytics" }
 heraclitus-raft = { path = "crates/heraclitus-raft" }
 heraclitus-server = { path = "crates/heraclitus-server" }
+heraclitus-sentinel = { path = "crates/heraclitus-sentinel" }
 # HUME (SPEC-0040.1) — kernel primitivo de execução
 hume-kernel = { path = "crates/hume-kernel" }
 # HUME-IR (SPEC-000 §6) — representação intermédia SSA

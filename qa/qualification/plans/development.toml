@@ -1,0 +1,47 @@
+schema_version = 1
+suite_version = "1.0.5"
+release_version = "1.0.5-dev"
+level = "development"
+target = "local-workspace"
+build_profile = "debug"
+known_limitations = []
+
+[metadata]
+purpose = "Development qualification: correctness, lint and bounded fuzz"
+owner = "HeraclitusDB Engineering"
+
+[[trials]]
+id = "unit_tests"
+description = "Workspace unit tests with every feature"
+mode = "command"
+assurance = "development"
+program = "cargo"
+args = ["test", "--workspace", "--lib", "--all-features", "--locked"]
+timeout_seconds = 5400
+
+[[trials]]
+id = "integration_tests"
+description = "Workspace integration tests with every feature"
+mode = "command"
+assurance = "development"
+program = "cargo"
+args = ["test", "--workspace", "--tests", "--all-features", "--locked"]
+timeout_seconds = 5400
+
+[[trials]]
+id = "lint"
+description = "Clippy over workspace, targets and features with warnings denied"
+mode = "command"
+assurance = "development"
+program = "cargo"
+args = ["clippy", "--workspace", "--all-targets", "--all-features", "--locked", "--", "-D", "warnings"]
+timeout_seconds = 5400
+
+[[trials]]
+id = "basic_fuzz"
+description = "Bounded malformed log decoder fuzz campaign"
+mode = "command"
+assurance = "development"
+program = "cargo"
+args = ["+nightly-2026-02-17", "fuzz", "run", "log_decode", "--", "-max_total_time=60"]
+timeout_seconds = 180

@@ -13,6 +13,8 @@ heraclitus-log = { path = "../crates/heraclitus-log" }
 heraclitus-manifold = { path = "../crates/heraclitus-manifold" }
 heraclitus-core = { path = "../crates/heraclitus-core" }
 heraclitus-query = { path = "../crates/heraclitus-query" }
+heraclitus-compliance = { path = "../crates/heraclitus-compliance" }
+toml = "0.8"
 
 [[bin]]
 name = "log_decode"
@@ -38,6 +40,20 @@ bench = false
 [[bin]]
 name = "v6_decode"
 path = "fuzz_targets/v6_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_parse"
+path = "fuzz_targets/config_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rfc3161_decode"
+path = "fuzz_targets/rfc3161_decode.rs"
 test = false
 doc = false
 bench = false

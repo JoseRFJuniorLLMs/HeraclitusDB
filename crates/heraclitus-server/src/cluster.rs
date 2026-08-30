@@ -61,6 +61,22 @@ impl ReplRouter for ReplicationHandle {
     }
 }
 
+impl heraclitus_sentinel::LeaderOwnership for ReplicationHandle {
+    fn current_epoch(&self) -> Option<heraclitus_sentinel::SentinelEpoch> {
+        let metrics = self.raft.metrics().borrow().clone();
+        let leader = metrics.current_leader?;
+        if leader != self.node_id || metrics.current_term == 0 {
+            return None;
+        }
+        heraclitus_sentinel::SentinelEpoch::new(
+            metrics.current_term,
+            self.node_id.to_string(),
+            metrics.current_term,
+        )
+        .ok()
+    }
+}
+
 /// Tasks do cluster a abortar no shutdown (servidor TCP de raft + loop de submissão).
 pub struct ClusterTasks {
     server: tokio::task::JoinHandle<()>,

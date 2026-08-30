@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "soak-24h",
+  "description": "One full day of steady SOC ingestion and investigation. Crosses at least one compaction, packing and HRKI rebuild cycle, which a six-hour run may not.",
+  "duration_seconds": 86400,
+  "sample_interval_seconds": 120,
+  "stabilization_seconds": 3600,
+  "concurrency": 24,
+  "workload_profile": "mixed",
+  "memory_growth_budget_bytes_per_hour": 16777216,
+  "handle_growth_budget_per_hour": 2.0,
+  "thread_growth_budget_per_hour": 0.25,
+  "latency_drift_budget_ratio": 1.4,
+  "satisfies_level": "release_candidate"
+}

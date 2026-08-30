@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "description": "SPEC-0049 §126-§128 regression budgets. Every number here must come from measured history on the reference hardware, never from a guess: §127 forbids hardcoding universal thresholds without historical data. Until a release has a measured baseline on this hardware, a metric belongs out of this file, where it is reported as Undetermined instead of silently passing.",
+  "budgets": [
+    {
+      "metric": "q1_load.throughput_ops_s",
+      "direction": "higher_is_better",
+      "tolerance": 0.10
+    },
+    {
+      "metric": "q1_load.write_p99_ms",
+      "direction": "lower_is_better",
+      "tolerance": 0.15
+    },
+    {
+      "metric": "q1_load.query_p99_ms",
+      "direction": "lower_is_better",
+      "tolerance": 0.15
+    },
+    {
+      "metric": "long_soak.resident_set_growth_bytes_per_hour",
+      "direction": "lower_is_better",
+      "tolerance": 0.25
+    },
+    {
+      "metric": "long_soak.disk_amplification_ratio",
+      "direction": "lower_is_better",
+      "tolerance": 0.10
+    },
+    {
+      "metric": "q2_failure.restart_ms",
+      "direction": "lower_is_better",
+      "tolerance": 0.20
+    },
+    {
+      "metric": "q5_node_loss.election_ms",
+      "direction": "lower_is_better",
+      "tolerance": 0.20
+    },
+    {
+      "metric": "q5_node_loss.catchup_ms",
+      "direction": "lower_is_better",
+      "tolerance": 0.20
+    },
+    {
+      "metric": "q6_restore.rto_seconds",
+      "direction": "lower_is_better",
+      "tolerance": 0.20
+    }
+  ]
+}

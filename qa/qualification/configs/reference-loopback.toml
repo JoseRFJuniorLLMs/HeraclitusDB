@@ -1,0 +1,34 @@
+# Reference loopback configuration.
+#
+# This is the config the preflight plan runs `heraclitus-qualifier doctor`
+# against, so it must stay free of blocking findings. It is NOT a production
+# template: a government deployment adds TLS, mTLS, per-principal credentials
+# and encryption at rest, and none of that can be committed to a public
+# repository. Run the doctor against your own production config — see
+# `docs/runbooks/installation.md`.
+
+data_dir = "data"
+storage_format = "v6"
+
+# Inside the 4-16 MiB window measured in
+# docs/md/auditorias/append-lento-com-o-crescimento.md.
+segment_max_bytes = 8388608
+
+grpc_addr = "127.0.0.1:7474"
+rest_addr = "127.0.0.1:7475"
+
+# Loopback-only, so a bearer token is enough here. Anything reachable from
+# another host needs access_credentials with real roles instead.
+auth_token = "replace-me-before-any-shared-deployment"
+
+production_mode = false
+encryption_at_rest = false
+audit_queries = false
+telemetry_interval_secs = 0
+
+# No CORS by default: this REST surface has write routes.
+rest_cors_origins = []
+rest_allow_erasure = false
+
+[fsync]
+mode = "always"

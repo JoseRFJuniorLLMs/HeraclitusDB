@@ -9,14 +9,37 @@
 //! O trabalho corre numa thread própria (`blocking_recv` fora de runtime) para
 //! nunca bloquear o caminho de escrita — o contrato exige handlers baratos.
 
-use crate::Log;
+use crate::EpisodeLog;
 use heraclitus_core::{NotificationEvent, StreamSubscriber};
 use std::sync::Arc;
-use tokio::sync::broadcast::error::RecvError;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 /// Liga `sub` ao tail do log. Devolve o handle da thread; ela termina sozinha
 /// quando o log é dropado (canal fechado).
-pub fn attach_subscriber(log: &Log, sub: Arc<dyn StreamSubscriber>) -> std::thread::JoinHandle<()> {
+pub fn attach_subscriber<L: EpisodeLog + ?Sized>(
+    log: &L,
+    sub: Arc<dyn StreamSubscriber>,
+) -> std::thread::JoinHandle<()> {
+    attach_subscriber_inner(log, sub, None)
+}
+
+/// Variant used by background runtimes that need a prompt, explicit shutdown
+/// while the host log remains open.  The normal adapter above preserves the
+/// historical blocking behaviour for existing callers.
+pub fn attach_subscriber_with_stop<L: EpisodeLog + ?Sized>(
+    log: &L,
+    sub: Arc<dyn StreamSubscriber>,
+    stop: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    attach_subscriber_inner(log, sub, Some(stop))
+}
+
+fn attach_subscriber_inner<L: EpisodeLog + ?Sized>(
+    log: &L,
+    sub: Arc<dyn StreamSubscriber>,
+    stop: Option<Arc<AtomicBool>>,
+) -> std::thread::JoinHandle<()> {
     let mut rx = log.tail_subscribe();
     std::thread::spawn(move || {
         // R15: `Option` em vez de `0` — um overflow ANTES do primeiro evento
@@ -24,7 +47,23 @@ pub fn attach_subscriber(log: &Log, sub: Arc<dyn StreamSubscriber>) -> std::thre
         // `last_seen + 1 = 1` perdia o LSN 0 para sempre).
         let mut last_seen: Option<u64> = None;
         loop {
-            match rx.blocking_recv() {
+            if stop.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                break;
+            }
+            let received = if stop.is_some() {
+                match rx.try_recv() {
+                    Ok(value) => Ok(value),
+                    Err(TryRecvError::Empty) => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(TryRecvError::Lagged(missed)) => Err(RecvError::Lagged(missed)),
+                    Err(TryRecvError::Closed) => Err(RecvError::Closed),
+                }
+            } else {
+                rx.blocking_recv()
+            };
+            match received {
                 Ok((lsn, ep)) => {
                     last_seen = Some(lsn);
                     sub.on_append(&NotificationEvent {
@@ -47,6 +86,7 @@ pub fn attach_subscriber(log: &Log, sub: Arc<dyn StreamSubscriber>) -> std::thre
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Log;
     use heraclitus_core::{Episode, EventKind, FsyncPolicy, Lsn};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};

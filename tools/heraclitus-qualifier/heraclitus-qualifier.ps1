@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Gera evidência de desenvolvimento para a SPEC-0049.
 

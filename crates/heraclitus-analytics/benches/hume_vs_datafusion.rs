@@ -662,7 +662,7 @@ fn celula(b: &RecordBatch, col: usize, row: usize) -> Celula {
     Celula::Nulo
 }
 
-fn percentil(v: &mut Vec<Duration>, p: f64) -> Duration {
+fn percentil(v: &mut [Duration], p: f64) -> Duration {
     v.sort_unstable();
     v[(((v.len() - 1) as f64) * p).round() as usize]
 }

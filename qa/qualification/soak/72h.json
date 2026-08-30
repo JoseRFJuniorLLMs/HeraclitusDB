@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "soak-72h",
+  "description": "Three-day soak under SOC ingestion. Long enough for segment sealing, generation GC and lakehouse watermark advance to repeat many times over the same data set.",
+  "duration_seconds": 259200,
+  "sample_interval_seconds": 300,
+  "stabilization_seconds": 7200,
+  "concurrency": 24,
+  "workload_profile": "soc_ingestion",
+  "memory_growth_budget_bytes_per_hour": 8388608,
+  "handle_growth_budget_per_hour": 1.0,
+  "thread_growth_budget_per_hour": 0.1,
+  "latency_drift_budget_ratio": 1.3,
+  "satisfies_level": "government_production"
+}

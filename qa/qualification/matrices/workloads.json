@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "default_seed": 428931,
+  "profiles": [
+    "write_heavy",
+    "read_heavy",
+    "mixed",
+    "soc_ingestion",
+    "soc_investigation",
+    "burst",
+    "adversarial_cardinality"
+  ],
+  "mixed_operation_percent": {
+    "ingest": 70,
+    "attribute_query": 10,
+    "text": 5,
+    "vector": 5,
+    "graph": 5,
+    "as_of_analytics": 5
+  },
+  "ramp_percent": [10, 25, 50, 75, 100, 125, 150],
+  "required_metrics": [
+    "throughput_eps",
+    "latency_p50_ms",
+    "latency_p95_ms",
+    "latency_p99_ms",
+    "cpu_percent",
+    "memory_bytes",
+    "disk_read_bytes",
+    "disk_write_bytes",
+    "network_bytes",
+    "replication_lag",
+    "sentinel_lag"
+  ],
+  "pass_invariants": [
+    "acknowledged_event_loss == 0",
+    "silent_corruption == 0",
+    "unexpected_process_crash == 0",
+    "out_of_memory == 0"
+  ]
+}

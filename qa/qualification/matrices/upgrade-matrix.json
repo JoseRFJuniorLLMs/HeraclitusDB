@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "upgrade_paths": [
+    { "from": "N-1", "to": "N", "required": true },
+    { "from": "N-2", "to": "N", "required": false }
+  ],
+  "phases": [
+    "backup_and_verify",
+    "capture_pre_upgrade_head_and_sample_hashes",
+    "upgrade_with_active_workload",
+    "mixed_version_window_if_supported",
+    "post_upgrade_integrity_and_serve",
+    "rollback_or_explicit_irreversibility_drill"
+  ],
+  "required_declaration": {
+    "rollback_supported": "boolean",
+    "irreversible_migrations": "list",
+    "operator_acknowledgement": "required when rollback_supported=false"
+  },
+  "hard_gates": [
+    "acknowledged_event_loss == 0",
+    "post_upgrade_integrity == true",
+    "schema_compatibility == true",
+    "failed_upgrade_recovers_to_declared_state"
+  ]
+}

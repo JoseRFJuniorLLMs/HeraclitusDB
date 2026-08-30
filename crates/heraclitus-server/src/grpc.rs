@@ -9,11 +9,22 @@ use tonic::{Request, Response, Status};
 
 pub struct Service {
     engine: Arc<Engine>,
+    sentinel: Option<Arc<heraclitus_sentinel::SentinelRuntime>>,
 }
 
 impl Service {
     pub fn new(engine: Arc<Engine>) -> Self {
-        Self { engine }
+        Self {
+            engine,
+            sentinel: None,
+        }
+    }
+
+    pub fn new_with_sentinel(
+        engine: Arc<Engine>,
+        sentinel: Option<Arc<heraclitus_sentinel::SentinelRuntime>>,
+    ) -> Self {
+        Self { engine, sentinel }
     }
 }
 
@@ -255,7 +266,9 @@ impl pb::heraclitus_server::Heraclitus for Service {
         req: Request<pb::AdminRequest>,
     ) -> Result<Response<pb::AdminResponse>, Status> {
         let required = match req.get_ref().op.as_str() {
-            "stats" | "verify" => AccessRole::Auditor,
+            "stats" | "verify" | "sentinel-status" | "sentinel-incidents" | "sentinel-actions" => {
+                AccessRole::Auditor
+            }
             _ => AccessRole::Admin,
         };
         let principal = crate::auth::require(&req, required)?;
@@ -264,6 +277,7 @@ impl pb::heraclitus_server::Heraclitus for Service {
         // em logs grandes. Correr isso no worker async estagnava o reactor do
         // tokio (o mesmo padrão já corrigido no `append`/`query`).
         let engine = self.engine.clone();
+        let sentinel = self.sentinel.clone();
         let operation = r.op.clone();
         let audit_principal = principal.name.clone();
         let (ok, message) = tokio::task::spawn_blocking(move || {
@@ -272,6 +286,77 @@ impl pb::heraclitus_server::Heraclitus for Service {
                 "verify" => match engine.verify() {
                     Ok(v) => (true, v.to_string()),
                     Err(e) => (false, e.to_string()),
+                },
+                "sentinel-status" => match sentinel.as_ref() {
+                    Some(runtime) => (true, serde_json::to_string(&runtime.status()).unwrap_or_default()),
+                    None => (false, "sentinel desabilitado".into()),
+                },
+                "sentinel-incidents" => match sentinel.as_ref() {
+                    Some(runtime) => match runtime.query_incidents(heraclitus_sentinel::IncidentFilter::default()) {
+                        Ok(incidents) => (true, serde_json::to_string(&incidents).unwrap_or_default()),
+                        Err(error) => (false, error.to_string()),
+                    },
+                    None => (false, "sentinel desabilitado".into()),
+                },
+                "sentinel-actions" => match sentinel.as_ref() {
+                    Some(runtime) => match runtime.l4_events(None, None, None, 10_000) {
+                        Ok(rows) => {
+                            let values: Vec<_> = rows.into_iter().map(|(lsn, episode)| serde_json::json!({
+                                "lsn": lsn,
+                                "kind": episode.kind.label(),
+                                "attrs": episode.attrs,
+                                "content": crate::rest::bytes_str(&episode.content),
+                            })).collect();
+                            (true, serde_json::to_string(&values).unwrap_or_default())
+                        }
+                        Err(error) => (false, error.to_string()),
+                    },
+                    None => (false, "sentinel desabilitado".into()),
+                },
+                "sentinel-checkpoint" => match sentinel.as_ref() {
+                    Some(runtime) => match runtime.checkpoint() {
+                        Ok(lsn) => (true, format!("checkpoint_lsn={lsn}")),
+                        Err(error) => (false, error.to_string()),
+                    },
+                    None => (false, "sentinel desabilitado".into()),
+                },
+                "sentinel-approve" | "sentinel-deny" => match sentinel.as_ref() {
+                    Some(runtime) => {
+                        let body = serde_json::from_str::<serde_json::Value>(&r.arg);
+                        let result = body
+                            .ok()
+                            .and_then(|body| {
+                                Some((
+                                    body.get("incident_id")?.as_str()?.to_owned(),
+                                    body.get("proposal_id")?.as_str()?.to_owned(),
+                                    body.get("approval_id")?.as_str()?.to_owned(),
+                                    body.get("approver")?.as_str()?.to_owned(),
+                                    body.get("reason")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("")
+                                        .to_owned(),
+                                ))
+                            })
+                            .ok_or_else(|| "arg deve conter incident_id, proposal_id, approval_id e approver".to_string())
+                            .and_then(|(incident_id, proposal_id, approval_id, approver, reason)| {
+                                runtime
+                                    .persist_human_approval_for(
+                                        &incident_id,
+                                        &proposal_id,
+                                        &approval_id,
+                                        &approver,
+                                        operation == "sentinel-approve",
+                                        &reason,
+                                    )
+                                    .map(|lsn| format!("approval_lsn={lsn}"))
+                                    .map_err(|error| error.to_string())
+                            });
+                        match result {
+                            Ok(message) => (true, message),
+                            Err(error) => (false, error),
+                        }
+                    }
+                    None => (false, "sentinel desabilitado".into()),
                 },
                 "rebuild" => {
                     let view = if r.arg.is_empty() {

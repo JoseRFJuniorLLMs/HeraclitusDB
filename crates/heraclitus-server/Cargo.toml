@@ -21,6 +21,7 @@ heraclitus-btree = { workspace = true }
 heraclitus-compliance = { workspace = true }
 heraclitus-crypto = { workspace = true }
 heraclitus-log = { workspace = true }
+heraclitus-sentinel = { workspace = true }
 heraclitus-manifold = { workspace = true }
 heraclitus-memtable = { workspace = true }
 heraclitus-views = { workspace = true }
@@ -32,6 +33,7 @@ heraclitus-activation = { workspace = true }
 heraclitus-retrieval = { workspace = true }
 heraclitus-query = { workspace = true }
 heraclitus-proto = { workspace = true }
+serde = { workspace = true }
 heraclitus-raft = { workspace = true, optional = true }
 heraclitus-analytics = { workspace = true, optional = true }
 heraclitus-tier = { workspace = true, optional = true }

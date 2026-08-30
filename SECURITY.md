@@ -4,6 +4,10 @@ Relate vulnerabilidades de forma privada pelo recurso **Security Advisories** do
 repositório. Não publique dados pessoais, credenciais, amostras de logs de
 clientes ou detalhes exploráveis em issues públicas.
 
+O fluxo completo de triagem, severidade, SLA, release emergencial,
+divulgação coordenada e regressão está em
+[`docs/security/vulnerability-response.md`](docs/security/vulnerability-response.md).
+
 ## Gate de dependências
 
 O CI executa `cargo audit --deny warnings` e falha para qualquer achado que não

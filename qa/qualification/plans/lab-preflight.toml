@@ -1,0 +1,102 @@
+schema_version = 1
+suite_version = "1.0.5"
+release_version = "1.0.5-preflight"
+level = "development"
+target = "developer-workstation"
+build_profile = "release"
+binary = "target/release/heraclitus-server.exe"
+known_limitations = [
+    "Preflight exercises the automation, not the release. Nothing here can raise a build above Development, and the gates a laboratory must attest are deliberately absent.",
+]
+
+[metadata]
+purpose = "Exercise every harness the project can run itself, before a laboratory run"
+owner = "HeraclitusDB Engineering"
+
+# --- Development gates (required at this level) -----------------------------
+
+[[trials]]
+id = "unit_tests"
+description = "Locked workspace unit tests"
+mode = "command"
+assurance = "development"
+program = "cargo"
+args = ["test", "--workspace", "--lib", "--all-features", "--locked"]
+timeout_seconds = 5400
+
+[[trials]]
+id = "integration_tests"
+description = "Locked workspace integration tests"
+mode = "command"
+assurance = "development"
+program = "cargo"
+args = ["test", "--workspace", "--tests", "--all-features", "--locked"]
+timeout_seconds = 5400
+
+[[trials]]
+id = "lint"
+description = "Clippy with warnings denied"
+mode = "command"
+assurance = "development"
+program = "cargo"
+args = ["clippy", "--workspace", "--all-targets", "--all-features", "--locked", "--", "-D", "warnings"]
+timeout_seconds = 5400
+
+[[trials]]
+id = "basic_fuzz"
+description = "Bounded decoder fuzz campaign"
+mode = "command"
+assurance = "development"
+program = "cargo"
+args = ["+nightly-2026-02-17", "fuzz", "run", "log_decode", "--", "-max_total_time=60"]
+timeout_seconds = 300
+
+# --- Extra gates: not required at this level, but a failure still blocks -----
+
+[[trials]]
+id = "crash_loop"
+description = "Ten abrupt kills of the release binary with full re-read of acknowledgements"
+mode = "command"
+assurance = "development"
+program = "cargo"
+args = [
+    "run", "--offline", "--locked", "--release", "-p", "heraclitus-qualifier", "--",
+    "crash-loop",
+    "--server-binary", "{binary}",
+    "--root", "{evidence}/trials/crash_loop/run",
+    "--cycles", "10",
+    "--concurrency", "4",
+    "--durability", "always",
+    "--seed", "428931",
+    "--report", "{evidence}/trials/crash_loop/crash-report.json",
+]
+timeout_seconds = 1800
+[trials.env]
+CARGO_NET_OFFLINE = "true"
+
+[[trials]]
+id = "config_doctor"
+description = "Configuration qualification of the shipped production template"
+mode = "command"
+assurance = "development"
+program = "cargo"
+args = [
+    "run", "--offline", "--locked", "-p", "heraclitus-qualifier", "--",
+    "doctor",
+    "--config", "qa/qualification/configs/reference-loopback.toml",
+    "--out", "{evidence}/trials/config_doctor/doctor.json",
+]
+timeout_seconds = 300
+[trials.env]
+CARGO_NET_OFFLINE = "true"
+
+[[trials]]
+id = "sbom"
+description = "CycloneDX SBOM generated from the locked dependency graph"
+mode = "command"
+assurance = "development"
+program = "cargo"
+args = ["run", "--offline", "--locked", "-p", "heraclitus-qualifier", "--", "sbom", "--out", "{evidence}/sbom/bom.cdx.json"]
+timeout_seconds = 900
+[trials.env]
+CARGO_NET_OFFLINE = "true"

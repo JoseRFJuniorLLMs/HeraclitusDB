@@ -3185,6 +3185,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "heraclitus-qualifier"
+version = "1.0.5"
+dependencies = [
+ "anyhow",
+ "clap",
+ "heraclitus-client",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "toml",
+ "ulid",
+]
+
+[[package]]
 name = "heraclitus-query"
 version = "1.0.5"
 dependencies = [
@@ -3236,6 +3252,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "heraclitus-sentinel"
+version = "1.0.5"
+dependencies = [
+ "blake3",
+ "crossbeam-channel",
+ "heraclitus-core",
+ "heraclitus-log",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "heraclitus-server"
 version = "1.0.5"
 dependencies = [
@@ -3261,8 +3291,10 @@ dependencies = [
  "heraclitus-query",
  "heraclitus-raft",
  "heraclitus-retrieval",
+ "heraclitus-sentinel",
  "heraclitus-tier",
  "heraclitus-views",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

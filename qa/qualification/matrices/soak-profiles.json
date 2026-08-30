@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "development": { "hours": 6 },
+    "release_candidate": { "hours": 24 },
+    "government_production": { "hours": 72 },
+    "mission_critical": { "hours": 168 }
+  },
+  "sample_interval_seconds": 30,
+  "required_series": [
+    "rss_bytes",
+    "heap_bytes",
+    "open_handles",
+    "throughput_eps",
+    "latency_p99_ms",
+    "disk_bytes",
+    "replication_lag",
+    "sentinel_lag"
+  ],
+  "gates": [
+    "no unbounded positive memory slope",
+    "no acknowledged event loss",
+    "no silent corruption",
+    "no unresolved latency degradation",
+    "post-soak integrity verification passes"
+  ]
+}

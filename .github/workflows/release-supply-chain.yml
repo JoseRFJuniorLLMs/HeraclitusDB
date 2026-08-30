@@ -1,0 +1,135 @@
+name: Release supply chain
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: Version recorded in the release dossier
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  build-sbom-sign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable action
+        with:
+          toolchain: 1.96.0
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+
+      - name: Build candidate twice and require reproducibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/build-a"
+          cargo build --release --locked -p heraclitus-server -p heraclitus-qualifier
+          mkdir -p "$RUNNER_TEMP/first"
+          cp "$CARGO_TARGET_DIR/release/heraclitus-server" "$RUNNER_TEMP/first/"
+          cp "$CARGO_TARGET_DIR/release/heraclitus-qualifier" "$RUNNER_TEMP/first/"
+
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/build-b"
+          cargo build --release --locked -p heraclitus-server -p heraclitus-qualifier
+          cmp "$RUNNER_TEMP/first/heraclitus-server" "$CARGO_TARGET_DIR/release/heraclitus-server"
+          cmp "$RUNNER_TEMP/first/heraclitus-qualifier" "$CARGO_TARGET_DIR/release/heraclitus-qualifier"
+
+      - name: Assemble offline release payload and CycloneDX SBOM
+        id: payload
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.release_version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG:-$INPUT_VERSION}"
+          test -n "$version"
+          source_date_epoch="$(git show -s --format=%ct HEAD)"
+          dist="$RUNNER_TEMP/heraclitus-${version}-linux-x86_64"
+          mkdir -p "$dist/bin" "$dist/windows" "$dist/docs/security" "$dist/docs/qualification" "$dist/docs/runbooks" "$dist/sbom"
+          cp "$RUNNER_TEMP/first/heraclitus-server" "$dist/bin/"
+          cp "$RUNNER_TEMP/first/heraclitus-qualifier" "$dist/bin/"
+          cp windows/heraclitus-service.ps1 windows/heraclitus-production.ps1 windows/heraclitus-backup.ps1 "$dist/windows/"
+          cp SECURITY.md "$dist/"
+          cp docs/security/vulnerability-response.md "$dist/docs/security/"
+          cp -R docs/qualification/. "$dist/docs/qualification/"
+          # SPEC-0049 §117/§119 — the eleven operational runbooks travel with
+          # the release, and the check runs against the *packaged* copy so a
+          # broken copy step fails here instead of in a data centre.
+          cp -R docs/runbooks/. "$dist/docs/runbooks/"
+          "$RUNNER_TEMP/first/heraclitus-qualifier" runbooks --root "$dist/docs/runbooks"
+          cp Cargo.lock "$dist/"
+          "$dist/bin/heraclitus-qualifier" sbom --out "$dist/sbom/bom.cdx.json"
+          jq -n \
+            --arg release "$version" \
+            --arg commit "$GITHUB_SHA" \
+            --arg source_date_epoch "$source_date_epoch" \
+            '{schema_version:1,release_version:$release,git_commit:$commit,source_date_epoch:$source_date_epoch,build_profile:"release",rust:"1.96.0",reproducible_same_runner:true}' \
+            > "$dist/build-manifest.json"
+          (
+            cd "$dist"
+            find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+          )
+          tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner \
+            -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/$(basename "$dist").tar.gz" "$(basename "$dist")"
+          sha256sum "$RUNNER_TEMP/$(basename "$dist").tar.gz" > "$RUNNER_TEMP/$(basename "$dist").tar.gz.sha256"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "dist=$dist" >> "$GITHUB_OUTPUT"
+          echo "archive=$RUNNER_TEMP/$(basename "$dist").tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Sigstore build provenance for exact release subjects
+        id: attest
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: |
+            ${{ steps.payload.outputs.archive }}
+            ${{ steps.payload.outputs.archive }}.sha256
+            ${{ steps.payload.outputs.dist }}/sbom/bom.cdx.json
+
+      - name: Preserve attestation bundle with release payload
+        shell: bash
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+          ARCHIVE: ${{ steps.payload.outputs.archive }}
+        run: cp "$BUNDLE_PATH" "$ARCHIVE.sigstore.json"
+
+      - name: Upload immutable workflow artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: heraclitus-${{ steps.payload.outputs.version }}-linux-x86_64
+          if-no-files-found: error
+          path: |
+            ${{ steps.payload.outputs.archive }}
+            ${{ steps.payload.outputs.archive }}.sha256
+            ${{ steps.payload.outputs.archive }}.sigstore.json
+            ${{ steps.payload.outputs.dist }}/sbom/bom.cdx.json
+            ${{ steps.payload.outputs.dist }}/build-manifest.json
+
+      - name: Attach assets to published GitHub release
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          ARCHIVE: ${{ steps.payload.outputs.archive }}
+        run: >-
+          gh release upload "$TAG"
+          "$ARCHIVE"
+          "$ARCHIVE.sha256"
+          "$ARCHIVE.sigstore.json"
+          --repo "$GITHUB_REPOSITORY"

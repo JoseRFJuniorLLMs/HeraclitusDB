@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "campaigns": [
+    "sast",
+    "dependency_audit",
+    "malformed_protocol",
+    "parser_fuzz",
+    "authentication_bypass",
+    "authorization_boundary",
+    "tenant_isolation",
+    "configuration_abuse",
+    "resource_exhaustion",
+    "red_team"
+  ],
+  "required_disposition": [
+    "finding_id",
+    "severity",
+    "affected_binary_sha256",
+    "reproduction_evidence",
+    "owner",
+    "status",
+    "fix_or_risk_acceptance",
+    "regression_test_when_technically_possible"
+  ],
+  "government_blockers": ["critical_open", "high_open_without_formal_acceptance"]
+}

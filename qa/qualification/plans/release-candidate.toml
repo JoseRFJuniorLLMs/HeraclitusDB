@@ -1,0 +1,119 @@
+schema_version = 1
+suite_version = "1.0.5"
+release_version = "1.0.5-rc"
+level = "release_candidate"
+target = "reference-lab"
+build_profile = "release"
+binary = "target/release/heraclitus-server.exe"
+known_limitations = []
+
+[metadata]
+purpose = "Release-candidate qualification template"
+owner = "HeraclitusDB Release Engineering"
+
+[external_verifier]
+program = "cosign"
+args = ["verify-blob", "--key", "qa/qualification/trust/lab.pub", "--signature", "{signature}", "{attestation}"]
+timeout_seconds = 120
+
+[[trials]]
+id = "unit_tests"
+description = "Locked workspace unit tests"
+mode = "command"
+assurance = "development"
+program = "cargo"
+args = ["test", "--workspace", "--lib", "--all-features", "--locked"]
+timeout_seconds = 5400
+
+[[trials]]
+id = "integration_tests"
+description = "Locked workspace integration tests"
+mode = "command"
+assurance = "development"
+program = "cargo"
+args = ["test", "--workspace", "--tests", "--all-features", "--locked"]
+timeout_seconds = 5400
+
+[[trials]]
+id = "lint"
+description = "Clippy with warnings denied"
+mode = "command"
+assurance = "development"
+program = "cargo"
+args = ["clippy", "--workspace", "--all-targets", "--all-features", "--locked", "--", "-D", "warnings"]
+timeout_seconds = 5400
+
+[[trials]]
+id = "basic_fuzz"
+description = "Bounded decoder fuzz campaign"
+mode = "command"
+assurance = "development"
+program = "cargo"
+args = ["+nightly-2026-02-17", "fuzz", "run", "log_decode", "--", "-max_total_time=60"]
+timeout_seconds = 180
+
+[[trials]]
+id = "benchmark"
+description = "Signed benchmark report from the reference lab"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/benchmark.json"
+
+[[trials]]
+id = "crash_loop"
+description = "Abrupt termination of the release server process, reopen, and re-read of every acknowledged append"
+mode = "command"
+assurance = "qualification_lab"
+program = "cargo"
+args = [
+    "run", "--offline", "--locked", "--release", "-p", "heraclitus-qualifier", "--",
+    "crash-loop",
+    "--server-binary", "{binary}",
+    "--root", "{evidence}/trials/crash_loop/run",
+    "--cycles", "50",
+    "--concurrency", "8",
+    "--durability", "always",
+    "--seed", "428931",
+    "--report", "{evidence}/trials/crash_loop/crash-report.json",
+]
+timeout_seconds = 7200
+[trials.env]
+CARGO_NET_OFFLINE = "true"
+
+# The library-level crash test stays as a separate, non-required gate. It kills
+# a writer inside the harness process; the gate above kills the shipped binary.
+# Both matter, and neither substitutes for the other.
+[[trials]]
+id = "crash_loop_library"
+description = "One thousand abrupt writer kills inside the log crate"
+mode = "command"
+assurance = "development"
+program = "cargo"
+args = ["test", "-p", "heraclitus-log", "--test", "crash_injection", "--locked", "--", "--nocapture"]
+timeout_seconds = 7200
+[trials.env]
+CRASH_ITERS = "1000"
+CARGO_NET_OFFLINE = "true"
+
+[[trials]]
+id = "upgrade"
+description = "Signed N-1 to N upgrade and declared rollback report"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/upgrade.json"
+
+[[trials]]
+id = "sbom"
+description = "CycloneDX SBOM generated from the locked dependency graph"
+mode = "command"
+assurance = "qualification_lab"
+program = "cargo"
+args = ["run", "--offline", "--locked", "-p", "heraclitus-qualifier", "--", "sbom", "--out", "{evidence}/sbom/bom.cdx.json"]
+timeout_seconds = 900
+
+[[trials]]
+id = "artifact_signature"
+description = "Detached signature bound to the release binary"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/artifact_signature.json"

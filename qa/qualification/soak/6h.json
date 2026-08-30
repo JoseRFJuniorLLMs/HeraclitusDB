@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "soak-6h",
+  "description": "Six-hour steady SOC mix. The shortest window in SPEC-0049 §18 that can distinguish cache fill from unbounded growth. Note: replication_lag and sentinel_lag, listed in matrices/soak-profiles.json, are not sampled — the server does not expose them yet, and a series that reads as a constant zero would make a growing lag look stable.",
+  "duration_seconds": 21600,
+  "sample_interval_seconds": 60,
+  "stabilization_seconds": 1800,
+  "concurrency": 16,
+  "workload_profile": "mixed",
+  "memory_growth_budget_bytes_per_hour": 33554432,
+  "handle_growth_budget_per_hour": 4.0,
+  "thread_growth_budget_per_hour": 0.5,
+  "latency_drift_budget_ratio": 1.5,
+  "satisfies_level": "development"
+}

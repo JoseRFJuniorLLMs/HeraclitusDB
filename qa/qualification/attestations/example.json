@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "gate_id": "q1_load",
+  "release_version": "EXAMPLE-ONLY",
+  "subject_binary_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "issuer": "EXAMPLE-ONLY",
+  "executed_at_unix": 0,
+  "status": "inconclusive",
+  "findings": [
+    "Template only; this is not qualification evidence."
+  ],
+  "metrics": {},
+  "artifacts": [],
+  "signature": "example.json.sig"
+}

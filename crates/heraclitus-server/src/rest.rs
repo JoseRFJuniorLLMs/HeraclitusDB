@@ -2,13 +2,15 @@
 
 use crate::engine::Engine;
 use axum::{
-    extract::{Path, Request, State},
+    extract::{Extension, Path, Query, Request, State},
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
+use heraclitus_sentinel::{IncidentFilter, IncidentState, SentinelRuntime};
+use serde::Deserialize;
 use std::sync::Arc;
 
 /// Se `POST /titular/:id/eliminar` esta autorizado. Vem da config
@@ -67,6 +69,20 @@ pub fn router(
     cors_origins: Vec<String>,
     allow_erasure: bool,
 ) -> Router {
+    router_with_sentinel(engine, None, basic_auth, cors_origins, allow_erasure)
+}
+
+/// Build the REST surface with an optional live Sentinel handle.  The legacy
+/// [`router`] entry point remains unchanged for embedded hosts that do not
+/// start Sentinel; the server passes the handle here so the read-only
+/// `/sentinel/*` endpoints cannot outlive the worker set accidentally.
+pub fn router_with_sentinel(
+    engine: Arc<Engine>,
+    sentinel: Option<Arc<SentinelRuntime>>,
+    basic_auth: Option<String>,
+    cors_origins: Vec<String>,
+    allow_erasure: bool,
+) -> Router {
     ERASURE.store(allow_erasure, std::sync::atomic::Ordering::Relaxed);
     let routes = Router::new()
         .route("/healthz", get(healthz))
@@ -91,7 +107,30 @@ pub fn router(
         .route("/hvm/state", get(hvm_state))
         .route("/hvm/upsert", axum::routing::post(hvm_upsert))
         .route("/hvm/delete", axum::routing::post(hvm_delete))
-        .route("/hvm/checkpoint", axum::routing::post(hvm_checkpoint));
+        .route("/hvm/checkpoint", axum::routing::post(hvm_checkpoint))
+        // SPEC-0045 §88 — Sentinel status/incident views.  The checkpoint is
+        // an auditable derived write; response actions remain unavailable
+        // until durable approval/executor wiring.
+        .route("/sentinel/status", get(sentinel_status))
+        .route(
+            "/sentinel/checkpoint",
+            axum::routing::post(sentinel_checkpoint),
+        )
+        .route("/sentinel/incidents", get(sentinel_incidents))
+        .route("/sentinel/incidents/:id", get(sentinel_incident))
+        .route("/sentinel/incidents/:id/evidence", get(sentinel_incident_evidence))
+        .route("/sentinel/incidents/:id/why", get(sentinel_incident_why))
+        .route(
+            "/sentinel/incidents/:id/approve",
+            axum::routing::post(sentinel_approve),
+        )
+        .route(
+            "/sentinel/incidents/:id/deny",
+            axum::routing::post(sentinel_deny),
+        )
+        .route("/sentinel/actions", get(sentinel_actions))
+        .route("/sentinel/actions/:id", get(sentinel_action))
+        .route("/sentinel/dashboard", get(sentinel_dashboard));
     // SPEC-016 (feature `analytics`): data plane Flight — o log inteiro como um
     // stream Arrow IPC, legível por pyarrow/Polars/DuckDB sem parsing por linha.
     #[cfg(feature = "analytics")]
@@ -105,7 +144,9 @@ pub fn router(
         .route("/tier/demote", axum::routing::post(tier_demote))
         .route("/tier/receipts", get(tier_receipts))
         .route("/tier/fetch/:segment", get(tier_fetch));
-    let routes = routes.with_state(engine);
+    let routes = routes
+        .with_state(engine)
+        .layer(Extension(sentinel));
 
     let protegido = aplicar_auth(routes, basic_auth);
     // O CORS fica por FORA da autenticação: o browser envia o preflight
@@ -140,6 +181,446 @@ fn aplicar_auth(routes: Router, basic_auth: Option<String>) -> Router {
                 }
             }))
         }
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct SentinelIncidentQuery {
+    state: Option<String>,
+    min_severity: Option<u8>,
+    subject_kind: Option<String>,
+    subject_id: Option<String>,
+    incident_id: Option<String>,
+    as_of_lsn: Option<u64>,
+    limit: Option<usize>,
+}
+
+fn parse_incident_state(value: &str) -> Option<IncidentState> {
+    match value.to_ascii_lowercase().as_str() {
+        "new" => Some(IncidentState::New),
+        "enriching" => Some(IncidentState::Enriching),
+        "investigating" => Some(IncidentState::Investigating),
+        "actionproposed" | "action_proposed" => Some(IncidentState::ActionProposed),
+        "awaitingapproval" | "awaiting_approval" => Some(IncidentState::AwaitingApproval),
+        "contained" => Some(IncidentState::Contained),
+        "monitoring" => Some(IncidentState::Monitoring),
+        "resolved" => Some(IncidentState::Resolved),
+        "falsepositive" | "false_positive" => Some(IncidentState::FalsePositive),
+        _ => None,
+    }
+}
+
+fn incident_filter(query: SentinelIncidentQuery) -> Result<IncidentFilter, String> {
+    let state = match query.state.as_deref() {
+        None => None,
+        Some(value) => Some(
+            parse_incident_state(value)
+                .ok_or_else(|| "state de incidente inválido".to_string())?,
+        ),
+    };
+    let subject = match (query.subject_kind, query.subject_id) {
+        (None, None) => None,
+        (Some(kind), Some(id)) if !kind.trim().is_empty() && !id.trim().is_empty() => {
+            Some(heraclitus_sentinel::EntityRef {
+                kind,
+                id,
+                name: None,
+            })
+        }
+        _ => return Err("subject_kind e subject_id devem ser fornecidos juntos".into()),
+    };
+    Ok(IncidentFilter {
+        state,
+        min_severity: query.min_severity,
+        subject,
+        as_of_lsn: query.as_of_lsn,
+        limit: query.limit,
+    })
+}
+
+fn sentinel_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "sentinel_unavailable",
+            "message": "Sentinel está desabilitado ou não iniciou"
+        })),
+    )
+        .into_response()
+}
+
+async fn sentinel_status(
+    Extension(runtime): Extension<Option<Arc<SentinelRuntime>>>,
+) -> Response {
+    let Some(runtime) = runtime else {
+        return sentinel_unavailable();
+    };
+    Json(serde_json::json!({
+        "available": true,
+        "status": runtime.status()
+    }))
+    .into_response()
+}
+
+async fn sentinel_checkpoint(
+    Extension(runtime): Extension<Option<Arc<SentinelRuntime>>>,
+) -> Response {
+    let Some(runtime) = runtime else {
+        return sentinel_unavailable();
+    };
+    match runtime.checkpoint() {
+        Ok(lsn) => Json(serde_json::json!({ "checkpoint_lsn": lsn })).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn sentinel_incidents(
+    Extension(runtime): Extension<Option<Arc<SentinelRuntime>>>,
+    Query(query): Query<SentinelIncidentQuery>,
+) -> Response {
+    let Some(runtime) = runtime else {
+        return sentinel_unavailable();
+    };
+    let filter = match incident_filter(query) {
+        Ok(filter) => filter,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response()
+        }
+    };
+    match runtime.query_incidents(filter) {
+        Ok(incidents) => Json(serde_json::json!({
+            "incidents": incidents,
+            "count": incidents.len()
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn sentinel_incident(
+    Extension(runtime): Extension<Option<Arc<SentinelRuntime>>>,
+    Path(id): Path<String>,
+    Query(query): Query<SentinelIncidentQuery>,
+) -> Response {
+    let Some(runtime) = runtime else {
+        return sentinel_unavailable();
+    };
+    let result = if let Some(as_of_lsn) = query.as_of_lsn {
+        runtime.incident_as_of(&id, as_of_lsn)
+    } else {
+        Ok(runtime.get_incident(&id))
+    };
+    match result {
+        Ok(Some(incident)) => Json(incident).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "incident_not_found" })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn sentinel_incident_evidence(
+    Extension(runtime): Extension<Option<Arc<SentinelRuntime>>>,
+    Path(id): Path<String>,
+    Query(query): Query<SentinelIncidentQuery>,
+) -> Response {
+    let Some(runtime) = runtime else {
+        return sentinel_unavailable();
+    };
+    let result = if let Some(as_of_lsn) = query.as_of_lsn {
+        runtime.incident_as_of(&id, as_of_lsn)
+    } else {
+        Ok(runtime.get_incident(&id))
+    };
+    match result {
+        Ok(Some(incident)) => Json(serde_json::json!({
+            "incident_id": incident.incident_id,
+            "evidence": incident.evidence
+        }))
+        .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "incident_not_found" })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SentinelApprovalBody {
+    approval_id: String,
+    proposal_id: String,
+    approver: String,
+    #[serde(default)]
+    reason: String,
+}
+
+async fn sentinel_approve(
+    Extension(runtime): Extension<Option<Arc<SentinelRuntime>>>,
+    Path(incident_id): Path<String>,
+    Json(body): Json<SentinelApprovalBody>,
+) -> Response {
+    sentinel_approval(runtime, incident_id, body, true).await
+}
+
+async fn sentinel_deny(
+    Extension(runtime): Extension<Option<Arc<SentinelRuntime>>>,
+    Path(incident_id): Path<String>,
+    Json(body): Json<SentinelApprovalBody>,
+) -> Response {
+    sentinel_approval(runtime, incident_id, body, false).await
+}
+
+async fn sentinel_approval(
+    runtime: Option<Arc<SentinelRuntime>>,
+    incident_id: String,
+    body: SentinelApprovalBody,
+    approved: bool,
+) -> Response {
+    let Some(runtime) = runtime else {
+        return sentinel_unavailable();
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        runtime.persist_human_approval_for(
+            &incident_id,
+            &body.proposal_id,
+            &body.approval_id,
+            &body.approver,
+            approved,
+            &body.reason,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(lsn)) => Json(serde_json::json!({
+            "approved": approved,
+            "approval_lsn": lsn
+        }))
+        .into_response(),
+        Ok(Err(error)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+fn l4_json(lsn: u64, episode: &heraclitus_core::Episode) -> serde_json::Value {
+    serde_json::json!({
+        "lsn": lsn,
+        "id": episode.id.to_string(),
+        "kind": episode.kind.label(),
+        "content": bytes_str(&episode.content),
+        "attrs": episode.attrs,
+        "parents": episode.parents.iter().map(ToString::to_string).collect::<Vec<_>>(),
+    })
+}
+
+async fn sentinel_actions(
+    Extension(runtime): Extension<Option<Arc<SentinelRuntime>>>,
+    Query(query): Query<SentinelIncidentQuery>,
+) -> Response {
+    let Some(runtime) = runtime else {
+        return sentinel_unavailable();
+    };
+    let limit = query.limit.unwrap_or(100).min(10_000);
+    let result = tokio::task::spawn_blocking(move || {
+        runtime.l4_events(None, query.incident_id.as_deref(), query.as_of_lsn, limit)
+    })
+    .await;
+    match result {
+        Ok(Ok(rows)) => {
+            let actions: Vec<_> = rows
+                .into_iter()
+                .filter(|(_, episode)| {
+                    matches!(
+                        &episode.kind,
+                        heraclitus_core::EventKind::Custom(kind)
+                            if kind == "SecurityActionProposal" || kind == "SecurityActionResult"
+                    )
+                })
+                .map(|(lsn, episode)| l4_json(lsn, &episode))
+                .collect();
+            Json(serde_json::json!({ "actions": actions, "count": actions.len() })).into_response()
+        }
+        Ok(Err(error)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn sentinel_action(
+    Extension(runtime): Extension<Option<Arc<SentinelRuntime>>>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(runtime) = runtime else {
+        return sentinel_unavailable();
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let rows = runtime.l4_events(None, None, None, 10_000)?;
+        Ok::<_, heraclitus_sentinel::SentinelError>(rows.into_iter().find(|(_, episode)| {
+            episode.attrs.get("sentinel.action_proposal_id").map(String::as_str) == Some(id.as_str())
+                || episode.attrs.get("sentinel.action_id").map(String::as_str) == Some(id.as_str())
+        }))
+    })
+    .await;
+    match result {
+        Ok(Ok(Some((lsn, episode)))) => Json(l4_json(lsn, &episode)).into_response(),
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "action_not_found" })),
+        )
+            .into_response(),
+        Ok(Err(error)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn sentinel_incident_why(
+    Extension(runtime): Extension<Option<Arc<SentinelRuntime>>>,
+    Path(id): Path<String>,
+    Query(query): Query<SentinelIncidentQuery>,
+) -> Response {
+    let Some(runtime) = runtime else {
+        return sentinel_unavailable();
+    };
+    let as_of = query.as_of_lsn;
+    let result = tokio::task::spawn_blocking(move || {
+        let incident = match as_of {
+            Some(lsn) => runtime.incident_as_of(&id, lsn)?,
+            None => runtime.get_incident(&id),
+        };
+        let records = runtime.l4_events(None, Some(&id), as_of, 10_000)?;
+        Ok::<_, heraclitus_sentinel::SentinelError>((incident, records))
+    })
+    .await;
+    match result {
+        Ok(Ok((Some(incident), records))) => {
+            let records: Vec<_> = records
+                .iter()
+                .map(|(lsn, episode)| l4_json(*lsn, episode))
+                .collect();
+            Json(serde_json::json!({
+                "incident": incident,
+                "why": {
+                    "evidence": incident.evidence,
+                    "risk_score": incident.risk_score,
+                    "records": records
+                }
+            }))
+            .into_response()
+        }
+        Ok(Ok((None, _))) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "incident_not_found" })),
+        )
+            .into_response(),
+        Ok(Err(error)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn sentinel_dashboard(
+    Extension(runtime): Extension<Option<Arc<SentinelRuntime>>>,
+) -> Response {
+    let Some(runtime) = runtime else {
+        return sentinel_unavailable();
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let status = runtime.status();
+        let incidents = runtime.current_incidents();
+        let actions = runtime.l4_events(None, None, None, 10_000)?;
+        Ok::<_, heraclitus_sentinel::SentinelError>((status, incidents, actions))
+    })
+    .await;
+    match result {
+        Ok(Ok((status, incidents, actions))) => {
+            let active = incidents
+                .iter()
+                .filter(|incident| {
+                    !matches!(
+                        incident.state,
+                        IncidentState::Resolved | IncidentState::FalsePositive
+                    )
+                })
+                .count();
+            let critical = incidents.iter().filter(|incident| incident.severity >= 8).count();
+            let approvals = actions
+                .iter()
+                .filter(|(_, episode)| matches!(&episode.kind, heraclitus_core::EventKind::Custom(kind) if kind == "SecurityApproval"))
+                .count();
+            Json(serde_json::json!({
+                "status": status,
+                "threat_level": if critical > 0 { "critical" } else if active > 0 { "elevated" } else { "normal" },
+                "active_incidents": active,
+                "critical_incidents": critical,
+                "pending_approvals": approvals,
+                "incidents": incidents,
+                "why_endpoint": "/sentinel/incidents/:id/why"
+            }))
+            .into_response()
+        }
+        Ok(Err(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
     }
 }
 
@@ -826,14 +1307,64 @@ async fn stats(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
     Json(engine.stats())
 }
 
-async fn metrics(State(engine): State<Arc<Engine>>) -> Response {
+async fn metrics(
+    State(engine): State<Arc<Engine>>,
+    Extension(sentinel): Extension<Option<Arc<SentinelRuntime>>>,
+) -> Response {
     match engine.prometheus_metrics() {
-        Ok(body) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
-            body,
-        )
-            .into_response(),
+        Ok(mut body) => {
+            if let Some(runtime) = sentinel {
+                let status = runtime.status();
+                body.push_str(&format!(
+                    concat!(
+                        "\nsentinel_events_seen_total {}\n",
+                        "sentinel_queue_depth {}\n",
+                        "sentinel_queue_overflow_total {}\n",
+                        "sentinel_catchup_lag_lsn {}\n",
+                        "sentinel_l0_latency_us {}\n",
+                        "sentinel_l1_latency_ms {}\n",
+                        "sentinel_l2_latency_ms {}\n",
+                        "sentinel_l3_latency_ms {}\n",
+                        "sentinel_signals_total {}\n",
+                        "sentinel_incidents_total {}\n",
+                        "sentinel_ai_requests_total {}\n",
+                        "sentinel_ai_failures_total {}\n",
+                        "sentinel_ai_latency_ms {}\n",
+                        "sentinel_ai_tokens_total {}\n",
+                        "sentinel_actions_proposed_total {}\n",
+                        "sentinel_actions_approved_total {}\n",
+                        "sentinel_actions_denied_total {}\n",
+                        "sentinel_actions_executed_total {}\n",
+                        "sentinel_action_failures_total {}\n"
+                    ),
+                    status.events_seen_total,
+                    status.queue_depth,
+                    status.queue_overflow_total,
+                    status.detection_lag_lsn,
+                    status.l0_latency_us,
+                    status.l1_latency_ms,
+                    status.l2_latency_ms,
+                    status.l3_latency_ms,
+                    status.signals_emitted_total,
+                    status.incidents_created_total,
+                    status.ai_requests_total,
+                    status.ai_failures_total,
+                    status.ai_latency_ms,
+                    status.ai_tokens_total,
+                    status.actions_proposed_total,
+                    status.actions_approved_total,
+                    status.actions_denied_total,
+                    status.actions_executed_total,
+                    status.action_failures_total,
+                ));
+            }
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+                body,
+            )
+                .into_response()
+        }
         Err(error) => (StatusCode::NOT_IMPLEMENTED, error.to_string()).into_response(),
     }
 }

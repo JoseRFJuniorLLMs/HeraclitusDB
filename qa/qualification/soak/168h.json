@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "id": "soak-168h",
+  "description": "Seven-day extended soak required by SPEC-0049 §4.4 for MissionCritical. The budgets are the tightest of the four profiles: at this duration a slope that looks like noise over six hours becomes gigabytes.",
+  "duration_seconds": 604800,
+  "sample_interval_seconds": 300,
+  "stabilization_seconds": 14400,
+  "concurrency": 32,
+  "workload_profile": "soc_ingestion",
+  "memory_growth_budget_bytes_per_hour": 4194304,
+  "handle_growth_budget_per_hour": 0.5,
+  "thread_growth_budget_per_hour": 0.05,
+  "latency_drift_budget_ratio": 1.25,
+  "satisfies_level": "mission_critical"
+}

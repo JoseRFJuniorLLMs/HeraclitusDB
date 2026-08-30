@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "topologies": [3, 5],
+  "scenarios": [
+    { "id": "leader_process_loss", "fault": "kill leader process", "quorum_expected": true },
+    { "id": "leader_host_loss", "fault": "remove leader host", "quorum_expected": true },
+    { "id": "follower_process_loss", "fault": "kill follower process", "quorum_expected": true },
+    { "id": "minority_partition", "fault": "isolate minority", "quorum_expected": true },
+    { "id": "leader_minority_partition", "fault": "isolate old leader from majority", "quorum_expected": true },
+    { "id": "quorum_partition", "fault": "remove majority connectivity", "quorum_expected": false },
+    { "id": "packet_loss", "fault": "inject bounded packet loss", "quorum_expected": true },
+    { "id": "network_latency", "fault": "inject latency and jitter", "quorum_expected": true },
+    { "id": "disk_stall", "fault": "stall one node storage", "quorum_expected": true },
+    { "id": "restart_catchup", "fault": "restart stale follower", "quorum_expected": true },
+    { "id": "permanent_removal", "fault": "remove and replace a node", "quorum_expected": true }
+  ],
+  "required_metrics": [
+    "leader_loss_detect_ms",
+    "election_ms",
+    "write_unavailable_ms",
+    "catchup_ms",
+    "duplicate_effects",
+    "committed_entry_loss",
+    "divergent_history"
+  ],
+  "hard_gates": [
+    "committed_entry_loss == 0",
+    "divergent_history == 0",
+    "split_brain == false",
+    "writes_fail_closed_without_quorum",
+    "retry_does_not_duplicate_external_effects"
+  ]
+}

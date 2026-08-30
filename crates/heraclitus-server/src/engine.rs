@@ -34,6 +34,49 @@ use std::sync::{Arc, Mutex};
 pub const IDEMPOTENCY_KEY_ATTR: &str = "__heraclitus_idempotency_key";
 pub const IDEMPOTENCY_HASH_ATTR: &str = "__heraclitus_idempotency_hash";
 
+const SENTINEL_DERIVED_KINDS: &[&str] = &[
+    "SecurityEvent",
+    "SecuritySignal",
+    "SecurityRiskAssessment",
+    "SecurityInvestigation",
+    "SecurityAiInvocation",
+    "SecurityIncident",
+    "SecurityIncidentTransition",
+    "SecurityHypothesis",
+    "SecurityActionProposal",
+    "SecurityActionResult",
+    "SecurityApproval",
+    "SecurityPolicyDecision",
+    "SecurityModelUpdate",
+    "SecurityRulesetUpdate",
+    "SecurityFeedback",
+    "SentinelCheckpoint",
+];
+
+fn is_internal_sentinel_episode(episode: &Episode) -> bool {
+    episode.agent_id == "sentinel"
+        && episode
+            .attrs
+            .get("sentinel.generated")
+            .is_some_and(|value| matches!(value.as_str(), "true" | "derived" | "1"))
+        && matches!(
+            &episode.kind,
+            EventKind::Custom(kind) if SENTINEL_DERIVED_KINDS.contains(&kind.as_str())
+        )
+}
+
+fn is_sentinel_reserved(episode: &Episode) -> bool {
+    episode.agent_id == "sentinel"
+        || episode
+            .attrs
+            .keys()
+            .any(|key| key.starts_with("sentinel.") || key.starts_with("sec."))
+        || matches!(
+            &episode.kind,
+            EventKind::Custom(kind) if SENTINEL_DERIVED_KINDS.contains(&kind.as_str())
+        )
+}
+
 pub struct Engine {
     /// Backend append-only selecionado explicitamente na configuração.
     /// `legacy` continua sendo o default; `v6` nunca é inferido nem migrado.
@@ -1451,6 +1494,12 @@ impl Engine {
                 vm_bridge::HVM_KIND
             )));
         }
+        if is_sentinel_reserved(&episode) {
+            return Err(HeraclitusError::Query(
+                "tipos, agente e atributos sentinel.* / sec.* são reservados ao pipeline interno"
+                    .into(),
+            ));
+        }
         if episode.attrs.contains_key(IDEMPOTENCY_KEY_ATTR)
             || episode.attrs.contains_key(IDEMPOTENCY_HASH_ATTR)
         {
@@ -1470,9 +1519,15 @@ impl Engine {
     /// check→append no líder. Depois de restart o índice é reconstruído do log.
     pub fn append_idempotent(
         &self,
-        mut episode: Episode,
+        episode: Episode,
         key: &str,
     ) -> Result<(Lsn, bool, String), HeraclitusError> {
+        if is_sentinel_reserved(&episode) {
+            return Err(HeraclitusError::Query(
+                "tipos, agente e atributos sentinel.* / sec.* são reservados ao pipeline interno"
+                    .into(),
+            ));
+        }
         if key.is_empty() {
             // O `EventId` é gerado por `Episode::new` ANTES de chegar aqui, e
             // `append_internal` nunca lhe toca (só o `ts_hlc` é carimbado pelo
@@ -1486,6 +1541,14 @@ impl Engine {
             let lsn = self.append(episode)?;
             return Ok((lsn, false, id));
         }
+        self.append_idempotent_validated(episode, key)
+    }
+
+    fn append_idempotent_validated(
+        &self,
+        mut episode: Episode,
+        key: &str,
+    ) -> Result<(Lsn, bool, String), HeraclitusError> {
         if self.log_only {
             return Err(HeraclitusError::Config(
                 "Append idempotente não é permitido em HERACLITUS_LOG_ONLY".into(),
@@ -1596,6 +1659,24 @@ impl Engine {
         let (lsn, stamped) = self.log.append_stamped(episode)?;
         self.index_applied(lsn, &stamped);
         Ok(lsn)
+    }
+
+    /// Authoritative append boundary for the in-process Sentinel.  Keeping it
+    /// separate from `append` lets external writers fail closed on reserved
+    /// security namespaces while derived writes still follow Engine indexing
+    /// (and, when leader ownership is implemented, the Raft router).
+    pub(crate) fn append_sentinel_derived(
+        &self,
+        episode: Episode,
+        idempotency_key: &str,
+    ) -> Result<Lsn, HeraclitusError> {
+        if !is_internal_sentinel_episode(&episode) {
+            return Err(HeraclitusError::Query(
+                "append_sentinel_derived exige episódio derivado válido do Sentinel".into(),
+            ));
+        }
+        self.append_idempotent_validated(episode, idempotency_key)
+            .map(|(lsn, _, _)| lsn)
     }
 
     pub fn snapshot(&self) -> Lsn {
@@ -2331,6 +2412,12 @@ impl QueryBackend for Engine {
     }
 }
 
+impl heraclitus_sentinel::DerivedEventSink for Engine {
+    fn append(&self, episode: Episode, idempotency_key: &str) -> Result<Lsn, HeraclitusError> {
+        self.append_sentinel_derived(episode, idempotency_key)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2370,6 +2457,50 @@ mod tests {
             ..Default::default()
         };
         Engine::open(&cfg).unwrap()
+    }
+
+    #[test]
+    fn sentinel_namespaces_are_external_reserved_but_internal_sink_can_append() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = engine_in(temp.path());
+
+        let forged = Episode::new(
+            "attacker",
+            EventKind::Custom("SecuritySignal".into()),
+            b"{}".to_vec(),
+        );
+        assert!(engine.append(forged).is_err());
+
+        let mut forged_attr = Episode::new("attacker", EventKind::Observation, b"{}".to_vec());
+        forged_attr
+            .attrs
+            .insert("sentinel.generated".into(), "true".into());
+        assert!(engine
+            .append_idempotent(forged_attr, "forged-sentinel")
+            .is_err());
+
+        let mut derived = Episode::new(
+            "sentinel",
+            EventKind::Custom("SecuritySignal".into()),
+            b"{}".to_vec(),
+        );
+        derived
+            .attrs
+            .insert("sentinel.generated".into(), "true".into());
+        let retry = derived.clone();
+        assert_eq!(
+            engine
+                .append_sentinel_derived(derived, "sentinel:test:derived")
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            engine
+                .append_sentinel_derived(retry, "sentinel:test:derived")
+                .unwrap(),
+            0
+        );
+        assert_eq!(engine.log.head(), 1);
     }
 
     #[test]

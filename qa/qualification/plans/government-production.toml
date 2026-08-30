@@ -1,0 +1,221 @@
+schema_version = 1
+suite_version = "1.0.5"
+release_version = "1.0.5-gov-candidate"
+level = "government_production"
+target = "government-reference-lab"
+build_profile = "release"
+binary = "target/release/heraclitus-server.exe"
+known_limitations = []
+
+[metadata]
+purpose = "GovernmentProduction qualification; exact SPEC-0049 gate set"
+owner = "HeraclitusDB Qualification Authority"
+
+[external_verifier]
+program = "cosign"
+args = ["verify-blob", "--key", "qa/qualification/trust/lab.pub", "--signature", "{signature}", "{attestation}"]
+timeout_seconds = 120
+
+[[trials]]
+id = "unit_tests"
+description = "Locked workspace unit tests"
+mode = "command"
+assurance = "development"
+program = "cargo"
+args = ["test", "--workspace", "--lib", "--all-features", "--locked"]
+timeout_seconds = 5400
+
+[[trials]]
+id = "integration_tests"
+description = "Locked workspace integration tests"
+mode = "command"
+assurance = "development"
+program = "cargo"
+args = ["test", "--workspace", "--tests", "--all-features", "--locked"]
+timeout_seconds = 5400
+
+[[trials]]
+id = "lint"
+description = "Clippy with warnings denied"
+mode = "command"
+assurance = "development"
+program = "cargo"
+args = ["clippy", "--workspace", "--all-targets", "--all-features", "--locked", "--", "-D", "warnings"]
+timeout_seconds = 5400
+
+[[trials]]
+id = "basic_fuzz"
+description = "Bounded fuzz campaign"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/basic_fuzz.json"
+
+[[trials]]
+id = "benchmark"
+description = "Reference-hardware benchmark with environment and workload manifests"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/benchmark.json"
+
+[[trials]]
+id = "crash_loop"
+description = "Repeated abrupt process termination and verified reopen"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/crash_loop.json"
+
+[[trials]]
+id = "upgrade"
+description = "N-1 to N upgrade and declared rollback behavior"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/upgrade.json"
+
+[[trials]]
+id = "sbom"
+description = "Complete CycloneDX release SBOM"
+mode = "command"
+assurance = "qualification_lab"
+program = "cargo"
+args = ["run", "--offline", "--locked", "-p", "heraclitus-qualifier", "--", "sbom", "--out", "{evidence}/sbom/bom.cdx.json"]
+timeout_seconds = 900
+
+[[trials]]
+id = "artifact_signature"
+description = "Verified detached signature for the exact release binary"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/artifact_signature.json"
+
+[[trials]]
+id = "q1_load"
+description = "Q1 realistic SOC load, ramp, burst and measured saturation"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/q1_load.json"
+
+[[trials]]
+id = "q2_failure"
+description = "Q2 real process, disk and corruption failure campaign"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/q2_failure.json"
+
+[[trials]]
+id = "q3_attack"
+description = "Q3 protocol, authn, authz, parser and adversarial attack campaign"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/q3_attack.json"
+
+[[trials]]
+id = "q4_upgrade"
+description = "Q4 upgrade over prior-version data and rollback declaration"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/q4_upgrade.json"
+
+[[trials]]
+id = "q5_node_loss"
+description = "Q5 Raft host loss, partition, latency and replacement matrix"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/q5_node_loss.json"
+
+[[trials]]
+id = "q6_restore"
+description = "Q6 restore into an empty environment, verify and serve"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/q6_restore.json"
+
+[[trials]]
+id = "long_soak"
+description = "Long soak with leak slope and latency stability metrics"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/long_soak.json"
+
+[[trials]]
+id = "power_loss"
+description = "Physical PDU or hypervisor power removal; not kill -9"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/power_loss.json"
+
+[[trials]]
+id = "corruption"
+description = "Bit flip, truncate, zero, duplicate and remove corruption matrix"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/corruption.json"
+
+[[trials]]
+id = "raft_failover"
+description = "Raft leader loss, quorum loss and split-brain gates"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/raft_failover.json"
+
+[[trials]]
+id = "dr"
+description = "Disaster recovery drill with measured RPO and RTO"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/dr.json"
+
+[[trials]]
+id = "red_team"
+description = "Completed red-team campaign and dispositioned findings"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/red_team.json"
+
+[[trials]]
+id = "airgap_install"
+description = "Install from the offline bundle with no external resolution"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/airgap_install.json"
+
+[[trials]]
+id = "airgap_update"
+description = "Offline update and declared rollback path"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/airgap_update.json"
+
+[[trials]]
+id = "zero_egress"
+description = "Network-isolated run with independently monitored zero egress"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/zero_egress.json"
+
+[[trials]]
+id = "dependency_audit"
+description = "Rust, Python and bundled dependency vulnerability analysis"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/dependency_audit.json"
+
+[[trials]]
+id = "supply_chain"
+description = "Build manifest, provenance, digests, SBOM and signatures"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/supply_chain.json"
+
+[[trials]]
+id = "vulnerability_policy"
+description = "Published and exercised vulnerability response process"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/vulnerability_policy.json"
+
+[[trials]]
+id = "runbooks"
+description = "Validated backup, restore, corruption, Raft, upgrade, air-gap and DR runbooks"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/runbooks.json"
