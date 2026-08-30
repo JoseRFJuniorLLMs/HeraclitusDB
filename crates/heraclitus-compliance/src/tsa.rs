@@ -6,9 +6,15 @@
 //!   [`DevToken`] (a P-256 signed `DevTstInfo`) so the whole anchor → stamp →
 //!   verify loop is exercised end-to-end **without any government credential**.
 //!   It is NOT RFC 3161 / ICP-Brasil valid; it exists to prove the architecture.
-//! * [`HttpTsa`] — POSTs a RFC 3161 `TimeStampReq` to an external endpoint and
-//!   returns its raw `.tst`. This is an evidence-ingestion scaffold only: this
-//!   build does not support HTTPS transport or validate CMS/X.509/ICP-Brasil.
+//! * [`HttpTsa`] — POSTs a RFC 3161 `TimeStampReq` to an external endpoint over
+//!   plain HTTP, extracts the `TimeStampToken` from the `TimeStampResp`, and
+//!   refuses a response the ACT did not grant. It does **not** validate the
+//!   CMS/X.509 chain, so its receipts stay `ExternalTokenUnvalidated`.
+//!
+//! O terceiro cliente não vive aqui: [`crate::secure_tsa::SecureTsaClient`]
+//! fala HTTPS e valida a cadeia contra as âncoras que o operador instalou
+//! (SPEC-0046 §10/§11). É o de produção. Este módulo descrevia-se como se ele
+//! não existisse — e uma descrição que envelhece manda corrigir a coisa errada.
 
 use crate::rfc3161::{MessageImprint, TimeStampReq};
 use crate::receipt::TimestampValidationState;
@@ -123,12 +129,17 @@ impl TsaClient for LocalTsa {
     }
 }
 
-/// External RFC 3161 endpoint over plain HTTP.
+/// Endpoint RFC 3161 externo sobre HTTP em claro.
 ///
-/// This client is deliberately unavailable to a production configuration:
-/// plain `http://` is not an acceptable trust boundary and `https://` is not
-/// implemented here. It returns raw bytes only; CMS/X.509 validation is a
-/// separate, still-missing capability.
+/// Deliberadamente indisponível numa configuração de produção: `http://` não é
+/// uma fronteira de confiança aceitável. Para HTTPS **com** validação de cadeia
+/// use [`crate::secure_tsa::SecureTsaClient`], que existe desde a SPEC-0046
+/// §10 — este cliente não é o único que há, é o que não valida nada.
+///
+/// O que ele faz e não fazia: extrai o `TimeStampToken` da `TimeStampResp` e
+/// recusa uma resposta não concedida. O que continua a não fazer: validar a
+/// cadeia CMS/X.509, pelo que os seus recibos ficam
+/// `ExternalTokenUnvalidated`.
 pub struct HttpTsa {
     url: String,
     policy: String,
@@ -183,10 +194,10 @@ impl TsaClient for HttpTsa {
     }
 }
 
-/// Minimal HTTP/1.1 POST of a binary body, returning the response body bytes.
-/// Honest scope: `http://` + `Content-Length` responses. No TLS, no chunked
-/// transfer, response parsing, or trust validation — never use this transport
-/// as a production compliance boundary.
+/// POST HTTP/1.1 mínimo de um corpo binário, devolvendo os bytes da resposta.
+/// Âmbito honesto: `http://` + respostas com `Content-Length`. Sem TLS, sem
+/// transfer-encoding chunked, sem validação de confiança — nunca usar este
+/// transporte como fronteira de conformidade de produção.
 fn http_post_der(
     url: &str,
     content_type: &str,
@@ -194,9 +205,11 @@ fn http_post_der(
     timeout: Duration,
 ) -> Result<Vec<u8>, CompError> {
     let rest = url.strip_prefix("http://").ok_or_else(|| {
-        CompError::Unsupported(
-            "HttpTsa só suporta http:// nesta versão; HTTPS e validação de confiança ainda não estão implementados".into(),
-        )
+        CompError::Unsupported(format!(
+            "HttpTsa só fala http:// e recebeu `{url}`. Para HTTPS use \
+             SecureTsaClient (SPEC-0046 §10), que valida a cadeia contra as âncoras \
+             configuradas — no servidor, ponha compliance_tsa_mode=https"
+        ))
     })?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),

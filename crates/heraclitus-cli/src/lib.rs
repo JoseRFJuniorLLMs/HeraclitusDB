@@ -733,7 +733,11 @@ pub fn anchor(
     receipts_dir: &std::path::Path,
     tsa_url: Option<String>,
     policy: String,
+    trust_store_dir: Option<&std::path::Path>,
 ) -> Result<String, String> {
+    use heraclitus_compliance::icp::TimestampValidationPolicy;
+    use heraclitus_compliance::secure_tsa::{SecureTsaClient, TlsPolicy};
+    use heraclitus_compliance::trust_store::TrustStore;
     use heraclitus_compliance::{anchor, current_watermark, HttpTsa, LocalTsa, TsaClient};
     let log =
         Log::open(log_dir, segmento(), FsyncPolicy::Always).map_err(|e| e.to_string())?;
@@ -742,13 +746,50 @@ pub fn anchor(
             "nada selado para ancorar (sem segmentos selados); apenda mais eventos primeiro".into(),
         );
     }
+    // A MESMA armadilha que estava no servidor: um URL `https://` entregue ao
+    // `HttpTsa` só falha na primeira tentativa de carimbo, com um erro sobre o
+    // esquema que não aponta para a causa. O esquema decide o cliente.
     let external_tsa = tsa_url.is_some();
     let tsa: Box<dyn TsaClient> = match tsa_url {
+        Some(u) if u.starts_with("https://") => {
+            let dir = trust_store_dir.ok_or_else(|| {
+                format!(
+                    "`{u}` é https:// e exige --trust-store com as âncoras do órgão (§11): \
+                     sem âncoras não há como autenticar a ACT, e um carimbo que ninguém \
+                     autenticou não é evidência"
+                )
+            })?;
+            let (store, relatorio) = TrustStore::load_dir(dir)
+                .map_err(|e| format!("trust store `{}`: {e}", dir.display()))?;
+            if store.is_empty() {
+                return Err(format!(
+                    "trust store `{}` sem âncoras utilizáveis ({} ficheiro(s) vistos)",
+                    dir.display(),
+                    relatorio.files_seen
+                ));
+            }
+            Box::new(
+                SecureTsaClient::new(
+                    u,
+                    policy,
+                    store,
+                    TlsPolicy::default(),
+                    std::time::Duration::from_secs(15),
+                )
+                .map_err(|e| e.to_string())?
+                .with_verifier(TimestampValidationPolicy::default()),
+            )
+        }
         Some(u) => Box::new(HttpTsa::new(u, policy)),
         None => Box::new(LocalTsa::generate(policy)),
     };
+    let verificado = tsa.validation_state()
+        == heraclitus_compliance::TimestampValidationState::ExternalTokenVerified;
     let r = anchor(&log, tsa.as_ref(), receipts_dir, None).map_err(|e| e.to_string())?;
-    let timestamp_note = if external_tsa {
+    let timestamp_note = if verificado {
+        "token externo VERIFICADO contra as âncoras instaladas; hora é a da autoridade · \
+         revogação não consultada por esta via"
+    } else if external_tsa {
         "token externo armazenado; cadeia CMS/X.509/ICP-Brasil NÃO validada; hora gravada é local"
     } else {
         "token de desenvolvimento verificado localmente; não é carimbo ICP-Brasil"

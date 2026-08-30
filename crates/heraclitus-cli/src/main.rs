@@ -138,9 +138,15 @@ enum Cmd {
         /// Where to write the receipt (default: <dir>/../receipts).
         #[arg(long)]
         receipts: Option<PathBuf>,
-        /// External RFC 3161 endpoint; HTTP only and unvalidated in this build.
+        /// Endpoint RFC 3161 externo. Um URL `https://` usa o cliente que
+        /// valida a cadeia e exige `--trust-store`; `http://` continua a ser
+        /// transporte em claro sem validacao nenhuma.
         #[arg(long)]
         tsa_url: Option<String>,
+        /// Pasta com as ancoras de confianca do orgao (SPEC-0046 §11).
+        /// Obrigatoria quando `--tsa-url` e https://.
+        #[arg(long)]
+        trust_store: Option<PathBuf>,
         /// Authority/policy name recorded in the receipt.
         #[arg(long, default_value = "ACT-dev")]
         policy: String,
@@ -248,9 +254,10 @@ fn main() {
             receipts,
             tsa_url,
             policy,
+            trust_store,
         } => {
             let rdir = receipts_dir_for(&dir, receipts);
-            heraclitus_cli::anchor(&dir, &rdir, tsa_url, policy)
+            heraclitus_cli::anchor(&dir, &rdir, tsa_url, policy, trust_store.as_deref())
         }
         Cmd::VerifyReceipts {
             dir,
