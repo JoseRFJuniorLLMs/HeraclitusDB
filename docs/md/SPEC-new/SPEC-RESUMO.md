@@ -1,6 +1,6 @@
 # SPEC-RESUMO — inventário verificado do HeraclitusDB
 
-**Auditado em:** 2026-08-21 · **Atualizado em:** 2026-08-24 (Fase 6 fechada; compliance em v6)  
+**Auditado em:** 2026-08-21 · **Atualizado em:** 2026-08-29 (auditoria completa contra o codigo; o GC do v6 nunca corre - ver STATUS.md)
 **Regra de leitura:** uma SPEC só é “feita” quando há evidência de código, testes
 executados e integração declarada. RFC, módulo de referência e decisão de
 arquitetura não são sinónimos de implementação completa.
@@ -17,6 +17,19 @@ arquitetura não são sinónimos de implementação completa.
 4. Os documentos `SPEC-new/` são propostas/RFCs salvo quando o código e os
    testes abaixo demonstram um recorte implementado.
 
+**Correção de auditoria — 2026-08-29 (SPEC-0045):** desde a auditoria acima,
+os níveis L0–L6 foram ligados ao runtime e revalidados: o adaptador L2 transforma
+`SecurityEvent` em features determinísticas com replay e snapshot AS-OF; o
+worker funde sinais L1/L2 e persiste `SecurityRiskAssessment`; há filtro de
+incidentes, incidente/grafo/baseline comportamental AS-OF, investigação L4 com
+auditoria persistida, policy/approval append-only, executor reversível e APIs
+REST/gRPC. O circuit breaker está ligado ao provider; governança de
+modelo/ruleset e feedback são eventos append-only; as métricas L0–L4/ações são
+expostas. A linha 0045 abaixo substitui o registro histórico da auditoria
+anterior. O DoD v1 está fechado; credenciais/adaptadores externos e a
+qualificação para `autonomous` continuam pertencendo ao host/laboratório por
+desenho normativo.
+
 ## Estado por grupo
 
 | SPEC | Estado verificado | Observação |
@@ -26,12 +39,12 @@ arquitetura não são sinónimos de implementação completa.
 | 0042 | **Concluída como decisão** | O Marco 0 mediu HUME versus DataFusion e decidiu manter DataFusion como motor vivo; HUME permanece em pausa. |
 | 0043 | Parcial / draft normativo | Há fundações relacionadas, mas o documento não está concluído nem libera um router HUME. |
 | 0044 | Pendente | Otimização de microarquitetura ainda é proposta; AVX explícito depende de benchmark real. |
-| 0045 | Pendente | Não há crate Sentinel, funil SOC ou IR de detecção implementados. |
+| 0045 | **Concluída — DoD v1 fechado; produção/autonomia condicionadas** | `heraclitus-sentinel` fornece configuração desabilitável, tail real, fila limitada/catch-up por LSN, normalização, Sigma L1, baseline L2, grafo/incidentes/fusão L3 e checkpoints append-only. L4 aceita apenas `IncidentContext` bounded/redigido, invoca `ModelBackend` do host, valida/persiste investigação e auditoria; policy persiste propostas, decisões e aprovações humanas. Guards incluem epoch/lease, ação idempotente, circuit breaker vivo e `MemoryReversibleExecutor`; governança de modelo/ruleset e feedback são append-only. O servidor expõe REST de incidentes, evidência, WHY, ações, aprovar/negar, dashboard e checkpoint, além de operações administrativas gRPC com RBAC. Em Raft, somente o líder vigente executa L4/respostas. Adaptadores/credenciais de produção e atestações laboratoriais são responsabilidades externas explícitas; `autonomous` permanece fail-closed até serem fornecidas. |
 | 0046 | Parcial | `heraclitus-compliance` cobre âncora/recibos RFC 3161 e passou a correr **também em HRKL v6**, ancorando pela raiz lógica canónica (§7.2) — que, ao contrário da raiz física legada, sobrevive a um repack sem invalidar recibos já emitidos. Ainda faltam StrictAirGap, cadeia ICP-Brasil validada e o plano regulatório completo. |
-| 0047 | Pendente | Não há integração STIX/TAXII/MISP ou Threat-Sync. |
+| 0047 | **Marcos 0, 1 e 4 implementados; 2, 3, 5–7 pendentes** | `heraclitus-sentinel::threat` existe (9 módulos): IR canónico com proveniência e ciclo de vida, canonicalização §21, índices exatos com Bloom só como prefilter, trust da fonte e gate de admissão, importador STIX 2.1 com os limites de §14, versionamento/rollback de feed, TLP 2.0 e sanitizador com gate de fuga. Gates T0/T3/T4/T5 cobertos por testes com esses nomes. **Sem** TAXII (§18–§19), MISP (§20), CTIR (§28–§32), bundles air-gap (§33–§35) e dashboard (§42) — todos precisam de rede, de fixtures reais, de uma API não publicada ou do servidor; T1/T2/T6/T7 por abrir. Detalhe em [STATUS.md](STATUS.md). |
 | 0048 | Pendente | Não há orquestrador, playbooks tipados, motor de aprovação ou plano forense completo. |
-| 0049 | Parcial | CI, fuzz e testes existem; Q1–Q6, qualificador, restauro, red-team e matrizes operacionais continuam pendentes. |
-| 0050 | **Fases 0–6 concluídas; 7 condicionada, 8 opcional** | HRKL v6 tem RAW, PACKED, manifesto `.hrkm`, gerações, GC, sidecar `.hrki`, object storage e **projecção lakehouse ligada ao caminho vivo** (Parquet v2 → Iceberg v2 → Delta → watermark → HRKM), com worker de background no servidor, `heraclitus export`/`manifest show` no CLI e 7 testes de integração ponta-a-ponta. A Fase 7 (`PackedEpisodeV1`) é condicionada por §204 a um benchmark; a Fase 8 é declarada opcional por §205. Raft em v6 continua recusado no boot (§184 coloca a política de réplicas fora desta spec). |
+| 0049 | **Definition of Done fechada; qualificação externa pendente por desenho** | Os 35 itens da §143 estão implementados — ver a secção dedicada abaixo. `heraclitus-qualifier` cobre manifests, workloads determinísticos, carga Q1, **crash-loop contra o binário de release**, **soak com o gate de fuga da §20**, corrupção, restore Q6, **monitor de egress**, **histórico append-only**, **compromisso criptográfico**, **doctor de configuração**, **regressão/golden**, **contrato do painel**, SBOM e supply-chain. Os gates que exigem laboratório (power-loss físico, perda de host, red team independente, soak de 168 h, DR, air-gap, runbooks executados por terceiros) continuam a produzir `Unqualified` — **isto é o comportamento correto**, não uma lacuna da implementação: a suíte recusa-se a auto-certificar o que a §35 e a §110 mandam vir de fora. |
+| 0050 | **Fases 0–6 concluídas; 7 condicionada, 8 opcional** | HRKL v6 tem RAW, PACKED, manifesto `.hrkm`, gerações, GC, sidecar `.hrki`, object storage e **projecção lakehouse ligada ao caminho vivo** (Parquet v2 → Iceberg v2 → Delta → watermark → HRKM), com worker de background no servidor, `heraclitus export`/`manifest show` no CLI e 7 testes de integração ponta-a-ponta. A Fase 7 (`PackedEpisodeV1`) é condicionada por §204 a um benchmark; a Fase 8 é declarada opcional por §205. Raft, compliance e o resto passaram a funcionar em v6, que é agora o `storage_format` por omissão. |
 | 0051–0070 | Propostas | Roadmap de segurança pós-0050 em `SPECs 0051.md`; não há estado de implementação individual confirmado nesta auditoria. |
 ## SPEC-0050 — progresso confirmado nesta auditoria
 
@@ -317,11 +330,162 @@ omissão duplicaria o disco de toda a gente sem pedir licença.
 inerte em v6 e o boot di-lo; implementar a v2 é trabalho a sério, não um
 adaptador.
 
+## SPEC-0049 — Definition of Done fechada (2026-08-29)
+
+Os 35 itens da §143 estão implementados. O que **não** está — e não pode estar —
+é a qualificação em si: os gates que exigem um laboratório continuam a produzir
+`Unqualified`, e isso é a suíte a funcionar, não a falhar.
+
+### O que passou a existir
+
+| §143 | onde | nota |
+|---|---|---|
+| soak suite | `qa/qualification/soak/{6h,24h,72h,168h}.json` + `qualifier soak` | o gate de fuga da §20 ignora a janela de aquecimento e ajusta a reta só ao troço estabilizado |
+| crash loop, `kill -9` | `qualifier crash-loop` | mata o **binário de release**, não um writer dentro do harness |
+| Q2 automatizado | idem | relê **todos** os appends confirmados; acima de 4096 amostra e di-lo |
+| Q5 automatizado | `Invoke-RaftFailureMatrix.ps1` | define o contrato do injetor e julga os gates duros; a falha real vem do hipervisor |
+| zero-egress implementado | `qualifier egress-monitor` | prova egress; **não** prova a ausência dele |
+| histórico preservado | `qualifier history` | append-only, sem comando de apagar — a ausência é a funcionalidade |
+| relatório vinculado ao binário | `qualification-commitment.json` + `verify --binary` | §121 vira erro, não promessa |
+| release de emergência | `.github/workflows/security-release.yml` | exige ramo `security/*` e teste de regressão nomeado ou justificação escrita |
+| runbooks §117 | `docs/runbooks/` (11) | `qualifier runbooks` verifica presença e substância |
+| fuzz §39/§41 | `fuzz/{config_parse,rfc3161_decode}.rs`, `fuzz/README.md` | política de corpus: cresce, não encolhe |
+| `heraclitus doctor` §138–§140 | `qualifier doctor` | lê TOML em **bruto** de propósito |
+| regressão / golden §126–§129 | `qualifier regression` + `regression-budgets.json` | métrica sem orçamento fica `Undetermined`, nunca passa em silêncio |
+| painel §108 | `qualifier dashboard` | métrica não medida sai `null`, para o painel distinguir §135 |
+| modo independente §110 | `run --profile` | terceiro corre a suíte sem editar código |
+
+### Quatro correções que a implementação forçou
+
+0. **O ambiente da máquina sobrepõe-se ao ficheiro de configuração, e apontava
+   para a base VIVA.** `HeraclitusConfig::load` aplica os `HERACLITUS_*`
+   **depois** do ficheiro; nesta máquina o ambiente tem `HERACLITUS_DATA_DIR =
+   D:\HeraclitusDB\data`. Um ensaio de crash teria matado à martelada um
+   servidor montado sobre dados de produção. O supervisor limpa agora todas as
+   `HERACLITUS_*` do filho e lista-as no relatório.
+
+0b. **O próprio soak tinha uma fuga de memória.** Acumulava toda a amostra de
+   latências da execução — num soak de 168 h, milhares de milhões de valores.
+   O detetor de fugas crescia sem limite e reprovaria a execução que estava a
+   medir. Passou a reservatório determinístico com decimação (teto de 262 144,
+   sem RNG); os percentis por janela, que são os que mostram deriva, continuam
+   exatos.
+
+1. **`source_digest` cobria ficheiros não versionados.** Um clone do commit
+   contém apenas os versionados, por isso o digest era irreprodutível por
+   qualquer terceiro — o oposto do que a §111 pede. Nesta árvore, com 48 635
+   ficheiros não versionados contra 1 640 versionados, também fazia cada
+   execução hashear uma pasta de build inteira: a suíte de testes do qualifier
+   passou de **mais de 28 minutos pendurada** para 38 s. O estado não versionado
+   deixou de entrar no hash e passou a ser **reportado** (`untracked_files`) e a
+   virar limitação declarada acima de Development.
+
+2. **`percentil` no bench `hume_vs_datafusion`** falhava `clippy -D warnings`,
+   o que reprovava o gate `lint` de **todos** os planos antes de qualquer outra
+   coisa correr.
+
+### O que continua por fazer, e porquê
+
+Nada disto é dívida técnica; é a §35 e a §110 a funcionar:
+
+- **power-loss físico** — cortar energia é do hipervisor ou da PDU (§25). O
+  `crash-loop` declara no próprio relatório que não é equivalente;
+- **perda de host, partição, disco parado** (Q5) — o harness julga, o
+  laboratório provoca;
+- **red team independente** — §35 quer equipa diferente da que implementou;
+- **soak de 168 h, DR, air-gap, assinatura** — tempo real e infraestrutura;
+- **runbooks validados** — §118: executados por quem não os escreveu. Enquanto
+  isso não acontecer são procedimentos *propostos*.
+
+## Tier frio em v6 — repack e recolha (2026-08-29)
+
+**Correção a este documento.** O item nº 1 da ordem de execução dizia
+«compaction do cold tier para recibos v2 — a única funcionalidade que o legado
+tem e o v6 não». O que o legado tem é o `compact_cold(… is_deleted …)`, que
+reescreve o segmento **omitindo registos**. §96 nomeia isso como *projection
+compaction* e §97 diz que um output com outras `CanonicalRecord`s tem outra raiz
+lógica e **não substitui** o segmento canónico. Portar essa função para recibos
+v2 seria implementar o que a spec proíbe — e passaria despercebido, porque o
+recibo v2 resultante seria internamente consistente e verificaria.
+
+O que faltava mesmo era o ciclo de vida das gerações frias:
+
+| entrega | onde |
+|---|---|
+| `ColdTierV6::repack_generation` (§189/§190) — outro codec/block size, mesma raiz | `tier/src/compaction.rs` |
+| `ColdTierV6::collect_cold_locations` — remoção física idempotente no bucket | `tier/src/compaction.rs` |
+| `GcExecution::cold_detached` — o GC do log deixa de tentar `remove_file` numa chave de bucket | `log/src/v6/gc.rs` |
+| `is_object_store_location` — o vocabulário partilhado que evita a divergência | `core/src/runtime.rs` |
+
+**O bug latente que isto fecha.** `PhysicalGeneration::location` tanto pode ser
+`segments/…` como `canonical/…/generation-N.hrkl`. O `commit_gc` mandava as duas
+para `resolve_gc_path`, que canonicaliza o pai contra a raiz local — inexistente
+para uma chave de bucket. O `?` devolvia `Err` **antes** do commit, portanto uma
+única geração fria superseded travava o GC do banco inteiro, gerações locais
+incluídas. Reproduzido em `hrkl_v6_manifest.rs` e validado por mutação.
+
+**Contra-argumento que ficou por resolver:** publicar uma geração fria não a
+cataloga no HRKM — não existe `record_cold_generation`. As duas modelações
+possíveis (cópia fria = geração N+1 nova, ou = outra `location` da mesma
+geração) têm custos diferentes e a segunda muda o formato do `.hrkm`. Fica
+sinalizado em vez de escolhido em silêncio. Consequência: o `plan_gc`
+nunca vê uma geração fria, e o `repack_generation`/`collect_cold_locations` ficam
+sem chamador. O resto do `ColdTierV6` **tem** chamador: `Engine::demote`
+publica a geração, `verify_demotion_v2` verifica-a e `recall` lê-a por
+intervalos.
+
+Validação: `cargo test --offline --workspace` — **896 testes, 0 falhas**;
+clippy `-D warnings` em `tier`, `log` e `core`. Detalhe e decisões em
+[STATUS.md](STATUS.md).
+
 ## Ordem de execução atual
 
-1. **Compaction do cold tier para recibos v2** — a única funcionalidade que o
-   legado tem e o v6 não.
-2. **§175 (compactação lakehouse)** se e quando o número de ficheiros por tabela
-   começar a doer; hoje é uma limitação declarada, não um defeito.
-3. Concluir a qualificação mensurável da SPEC-0049 antes de abrir plataformas
-   SOC grandes; depois seguir o roadmap 0051–0070 por dependência.
+Reordenada em 2026-08-29 pela auditoria de [STATUS.md](STATUS.md), que mediu o
+custo de cada pendência em vez de a ordenar por número de SPEC.
+
+1. **Ligar o GC do HRKL v6.** `plan_gc`/`commit_gc` não têm um único chamador de
+   produção: nenhuma task no servidor, nenhum subcomando na CLI, nenhum
+   `v6_gc_interval_secs` na config. O `record_pack` marca a geração RAW como
+   `Superseded` e nada a remove, portanto **cada banco guarda RAW + PACKED para
+   sempre**: com o rácio de 21,95% medido em §207, são **5,5× o disco** que o
+   formato promete. Com o GC parado ficam inertes o grace period (§93), os pins
+   (§92), o legal hold (§94), a política de cópias (§184) e o
+   `assert_gc_invariant` (§91). O código está escrito e testado com injecção de
+   crash; falta uma task, um knob e um subcomando. **É a única pendência com
+   custo a correr hoje.**
+2. **Corrigir o flaky do `hrkl_v6_crash::sobrevive_a_kills_repetidos`** — falha
+   ~2 em 6 corridas de `--workspace`, passa 4/4 isolado, porque mata um filho
+   numa janela de `sleep` fixa enquanto faz `cargo build` dentro de si. Um teste
+   de segurança contra crash que grita falsamente é o alarme que se aprende a
+   ignorar.
+3. **Fazer a suíte por omissão correr (ou declarar) os 18 testes de Raft.** Hoje
+   `cargo test --workspace` devolve `heraclitus_raft: 0 passed` e diz "ok".
+4. **SPEC-0046** (P0, em curso) — `StrictAirGap` não existe no crate e a cadeia
+   ICP-Brasil continua por validar, com o dizê-lo escrito no próprio código.
+5. **SPEC-0048** (P1) — a última SPEC completamente vazia: `heraclitus-orchestrator`
+   e `heraclitus-forensic` não existem.
+6. **Decidir como catalogar uma geração fria no HRKM** e ligar aí o repack e a
+   recolha. O `demote`/`verify`/`recall` v6 já correm no servidor; o par novo
+   não, porque sem gerações frias no `.hrkm` não há `plan_gc` que decida
+   coletá-las.
+7. **Dar consumidor ao plano de threat intel (SPEC-0047).** O módulo `threat`
+   não é referenciado fora de si próprio: nenhum feed é ingerido e nenhum
+   `SecurityEvent` é correlacionado contra o `IocIndex`. É wiring, como o GC, mas
+   sem custo a correr contra ele hoje.
+8. **§175 (compactação lakehouse)** — à luz do §96, o nome próprio da «compaction
+   que o legado tinha»: opera sobre a projecção, regenerável por definição
+   (§100). Hoje é limitação declarada, não defeito.
+9. **Correr `lab-preflight.toml`** e marcar tempo de laboratório para os gates da
+   SPEC-0049 que exigem infraestrutura; a suíte já não é o bloqueio.
+10. **SPEC-0047, o resto** — TAXII e MISP são transporte por cima da fronteira
+    `ThreatImporter` e pertencem ao servidor; o renderizador CTIR pode ser feito
+    já (é lógica pura), o transporte não (§30: a API não se presume); os bundles
+    air-gap devem esperar pela 0046 para não haver duas verificações de bundle
+    assinado.
+11. **Roadmap 0051–0070 por dependência.** A SPEC-0051 continua travada pelo seu
+    §14 — mas a pré-condição nº 1 («o writer ainda gera v5») está desactualizada
+    desde 2026-08-24: o `storage_format` é `v6` por omissão. Restam a
+    qualificação externa da 0049 e a decisão sobre `SKIP_VALUES` (§8.2).
+12. **Não fazer:** recuperar espaço de tombstones reescrevendo HRKL. §95 e §96
+    proíbem-no; o mecanismo para dado irrecuperável é o crypto-shredding de §98,
+    no `heraclitus-compliance`.

@@ -11,6 +11,575 @@ excluído (é cache, dá falsos positivos).
 > cada afirmação falsa/enganosa com a evidência. O estado real da plataforma e o
 > roteiro estão em [../PLANO-SPECS.md](../PLANO-SPECS.md).
 
+## AUDITORIA 2026-08-29 (3) — o estado real, verificado contra o código
+
+**Método:** o mesmo que este ficheiro exige de si próprio — cada afirmação
+verificada por leitura/grep sobre `crates/*/src` e `tools/*/src`, e pela suíte
+de testes executada. `graphify-out/` excluído. Nada aqui vem de ler os
+documentos.
+
+### O que está genuinamente feito
+
+| crate / ferramenta | LOC (src) | LOC (tests) | testes |
+|---|---|---|---|
+| `heraclitus-log` (HRKL v6) | 19 787 | 4 458 | 192 unit + 15 suítes |
+| `heraclitus-sentinel` | 16 544 | 486 | 156 unit + 12 integração |
+| `heraclitus-server` | 8 400 | 108 | 33 |
+| `heraclitus-qualifier` | 8 444 | — | 71 |
+| `heraclitus-query` | 6 299 | 323 | 44 + 10 |
+| `heraclitus-tier` | 5 810 | 1 183 | 68 unit + 18 integração |
+| `heraclitus-core` | 4 479 | — | 55 |
+| `heraclitus-raft` | 3 099 | — | 18 (só com `--features replication`) |
+| `heraclitus-compliance` | 1 716 | 151 | 18 + 4 |
+
+`cargo test --offline --workspace` — **996 testes, 0 falhas** (features por
+omissão). Dois factos que valem a pena registar porque são raros:
+
+- **zero `unimplemented!()`, zero `todo!()`, zero `#[ignore]`** em todo o
+  workspace. Não há "implementado" que seja um `panic!` à espera.
+- os módulos novos vêm com testes de mutação, não só com testes que passam.
+
+### O achado principal: o GC do HRKL v6 nunca corre
+
+`plan_gc` e `commit_gc` **não têm um único chamador de produção**. Só testes e
+comentários. Verificado três vezes, por caminhos diferentes:
+
+1. `grep -rn "plan_gc\|commit_gc"` fora de `src/v6/gc.rs` e de `tests/` devolve
+   apenas linhas de documentação;
+2. o servidor tem sete tasks de fundo (checkpoint, telemetria, packing v6, HRKI,
+   lakehouse, compaction do tier v1, distill) e **nenhuma** é de GC;
+3. não existe `v6_gc_interval_secs` na `HeraclitusConfig`, nem subcomando de GC
+   na CLI (`inspect`, `verify`, `prove`, `storage`, `manifest`, `migrate-v6`,
+   `export`, `migrate-encrypt`, `verify-receipts` — mais nenhum).
+
+**O custo é mensurável e é hoje.** O `record_pack` marca a geração RAW como
+`Superseded` (§88 passo 13) e nada a remove: o único `remove_file` no caminho do
+motor apaga um segmento activo *vazio*. Com o rácio `packed/raw` de **21,95%**
+medido no gate de §207 em 2026-08-24, um banco fica com `1,00 + 0,2195 = 1,22`
+do tamanho RAW em vez de `0,22` — **5,5× mais disco** do que o formato promete,
+para sempre, em todos os segmentos.
+
+E, com o GC parado, ficam inertes com ele: o grace period de §93, os pins de
+§92, o legal hold de §94, a política de cópias de §184, o `assert_gc_invariant`
+de §91 e o `cold_detached` corrigido nesta mesma sessão. É um andar inteiro de
+política a que nada chama.
+
+O trabalho para ligar é pequeno face ao que destranca: uma task de fundo com um
+intervalo configurável, um subcomando de CLI para o operador correr à mão, e o
+`GcExecution` a sair na telemetria. O `plan_gc` já explica cada bloqueio, o
+`commit_gc` já é crash-safe e já está testado com injecção de crash
+(`hrkl_v6_gc_crash.rs`).
+
+### O padrão, e o inventário completo dele
+
+O `SPEC-RESUMO.md` já lhe deu nome duas vezes ("9 testes a passar e **zero
+chamadores**"). Vale ter a lista toda num sítio, ordenada por custo:
+
+| o que | estado | custo hoje |
+|---|---|---|
+| GC v6 (`plan_gc`/`commit_gc`) | sem chamador | **5,5× disco**; toda a política de §90–§97 inerte |
+| `repack_generation` / `collect_cold_locations` | sem chamador | nenhum ainda; depende da catalogação no HRKM |
+| `threat::*` (SPEC-0047) | sem consumidor | nenhum feed é ingerido; nenhum `SecurityEvent` é correlacionado contra o `IocIndex` |
+| projecção lakehouse | `interval = 0` por omissão | nenhum — é deliberado e documentado (§99: duplicaria o disco sem pedir licença) |
+| compaction do tier v1 | `interval = 0` e inerte em v6 | nenhum — o boot di-lo |
+| `hume-ir`, `hume-sketches` | zero consumidores | nenhum — declarado no `Cargo.toml` como infra da SPEC-0043 |
+
+As três últimas linhas são escolhas registadas. As três primeiras não são: são
+código completo à espera de uma linha de wiring.
+
+### Achados sobre a própria suíte de testes
+
+**1. `hrkl_v6_crash::sobrevive_a_kills_repetidos_a_meio_do_append` é flaky sob
+carga.** Falhou **2 de ~6** corridas de `--workspace` e passou **4 de 4** em
+isolamento. A causa é estrutural, não aleatória: o teste faz `cargo build` dentro
+de si e mata um processo filho numa janela de tempo fixa
+(`sleep(25 + (i*11)%90)` ms). Sob a carga de um `--workspace` — que é
+exactamente o que o CI corre — a janela desloca-se e o filho morre antes de
+escrever o que o teste espera.
+
+Isto é pior do que um teste que falha: é um **teste de segurança contra crash**
+que grita falsamente. É o alarme que toda a gente aprende a ignorar, e no dia em
+que apanhar uma regressão a sério ninguém vai olhar. A correcção é fazer o filho
+sinalizar prontidão (um ficheiro, uma linha em stdout) em vez de se confiar num
+`sleep`.
+
+**2. Os 18 testes de consenso não correm nas features por omissão.**
+`cargo test --workspace` devolve `heraclitus_raft: 0 passed`. O CI corre
+`--all-features` e apanha-os, mas um programador que corra a suíte localmente
+fica sem cobertura nenhuma de Raft **e sem saber disso** — o resultado diz "ok",
+não "0 testes".
+
+### Números que os documentos tinham desactualizados
+
+Medidos agora, com features por omissão: `heraclitus-query` **44** (o resumo
+dizia 53), `heraclitus-qualifier` **71** (dizia 68), `heraclitus-server` **33**
+(dizia 31). Nenhuma discrepância é uma regressão — são contagens tiradas com
+conjuntos de features diferentes e nunca refrescadas. A tabela acima passa a ser
+a referência, e diz com que features foi medida.
+
+### O que está bloqueado em coisas de fora, e está certo assim
+
+- **SPEC-0049** — os gates `GovernmentProduction` exigem atestações
+  independentes de laboratório (carga, falhas, red-team, DR, PDU/hipervisor,
+  assinatura). A suíte recusa-se a auto-certificá-las e devolve exit 2. Correcto.
+- **SPEC-0046** — `StrictAirGap` não existe no crate (zero ocorrências) e a
+  cadeia ICP-Brasil está declaradamente por validar, com o dizê-lo escrito no
+  próprio código (`receipt.rs:16`, `verify.rs:41`, `tsa.rs:117`, `signer.rs:211`).
+- **SPEC-0051** — travada pelo seu §14; falta só a qualificação externa da 0049
+  e a decisão sobre `SKIP_VALUES`.
+
+### Recomendação, por ordem
+
+1. **Ligar o GC do v6.** É o único achado com custo de produção **hoje**, o
+   código já existe e já está testado com injecção de crash, e o trabalho é uma
+   task + um knob + um subcomando. Nada mais nesta lista tem esta relação entre
+   esforço e efeito.
+2. **Corrigir o flaky do `hrkl_v6_crash`.** Barato, e protege a credibilidade da
+   única suíte que testa perda de dados.
+3. **Fazer o `heraclitus-raft` correr na suíte por omissão**, ou fazer a suíte
+   dizer em voz alta que não o está a correr. "0 passed" a reportar "ok" é a
+   forma mais silenciosa de perder cobertura.
+4. **SPEC-0046** (em curso).
+5. **SPEC-0048** — é a última SPEC completamente vazia.
+6. Catalogação de gerações frias no HRKM, e o consumidor do plano de threat
+   intel — os dois são "ligar o que já existe", como o GC, mas sem custo a
+   correr contra eles hoje.
+
+## ATUALIZAÇÃO 2026-08-29 (2) — SPEC-0047 Threat-Sync: Marcos 0, 1 e 4 implementados
+
+A SPEC-0047 não tinha uma linha de código: o alvo `heraclitus-sentinel::threat`
+não existia. Passa a existir, com o IR canónico, os índices exatos, a camada de
+confiança, o importador STIX 2.1, o versionamento de feed e o sanitizador —
+`crates/heraclitus-sentinel/src/threat/` (9 módulos).
+
+### O que foi feito, por § da spec
+
+| § | área | módulo |
+|---|---|---|
+| §4–§6, §9, §12 | IR canónico, proveniência, ciclo de vida | `threat/ir.rs` |
+| §21 | canonicalização antes de indexar | `threat/canonical.rs` |
+| §22–§23 | TLP 2.0 e propagação | `threat/tlp.rs` |
+| §7 | índices exatos; Bloom só como prefilter | `threat/index.rs` |
+| §10–§13 | trust da fonte, gate de admissão, IOC→sinal | `threat/trust.rs` |
+| §36–§37 | sightings | `threat/sighting.rs` |
+| §40–§41 | versionamento e rollback de feed | `threat/feed.rs` |
+| §24–§27 | sharing policy, pseudonimização, gate de fuga | `threat/sharing.rs` |
+| §14–§17 | import STIX 2.1 com limites de entrada | `threat/stix.rs` |
+
+Cobre os Marcos 0 (IR + índices + proveniência), 1 (importer STIX) e 4 (TLP +
+sanitização + sharing policy).
+
+### Os invariantes são tipos, não comentários
+
+O padrão que organiza o módulo: onde a spec diz "nunca", o código não oferece a
+operação.
+
+- **T3 — «Bloom match != confirmed IOC match».** `prefilter()` devolve
+  `PrefilterHit`, que é opaco: sem campos, sem métodos, sem conversão para
+  `ConfirmedMatch`. O único produtor de `ConfirmedMatch` é `lookup()`, que
+  consulta a estrutura exata. Não há atalho para remover à pressa — que é
+  exatamente quando este atalho costuma ser tomado.
+- **T8 — sanitização antes de exportar.** `SanitizedThreatObject` tem um campo
+  privado, portanto só o sanitizador o constrói. Qualquer superfície de export
+  que o aceite está garantidamente a receber conteúdo sanitizado.
+- **T5 — provenance obrigatória.** `ThreatProvenance` é campo, não `Option`.
+- **T4 — intel sozinha nunca autoriza resposta.** Reutiliza (não duplica) o
+  `correlation::high_impact_allowed`, que exige ≥2 detectores independentes e
+  pelo menos um canal `Rule`/`Graph`. Há teste aqui porque uma garantia que vive
+  noutro módulo desaparece silenciosamente num refactor.
+- **T6 — ciclo de vida.** Um objeto sem `valid_until` e cuja fonte não declara
+  TTL é **recusado** no gate.
+
+### Decisões, e as objeções que levantaram
+
+- **IDNA não é aproximado — é recusado.** §21 pede normalização IDNA. Fazê-la a
+  sério é UTS-46 + tabela Unicode + verificações bidi, e o crate não tem (nem
+  deve ter) essa dependência. Meia implementação mapearia alguns domínios e
+  estragaria outros — e os estragados ficariam *guardados* estragados, sem nunca
+  casar com o tráfego que deviam apanhar. Um domínio não-ASCII devolve
+  `CanonicalError::IdnaUnsupported`; punycode (`xn--…`) é ASCII e passa.
+- **A canonicalização de URL é conservadora de propósito.** Normaliza esquema,
+  host e porto default. **Não** normaliza caixa do path, percent-encoding,
+  barra final nem ordem de query — cada um desses pares é dois recursos
+  diferentes, e fundi-los é a alteração semântica que o §21 proíbe. É uma
+  promessa mais estreita do que a de um normalizador de URL típico, e é a que a
+  spec pede.
+- **O subset de STIX patterning é declarado, não silencioso.** Implementar uma
+  fração da linguagem e tratar o resto como "sem indicadores" produz um
+  importador que reporta sucesso e ingere nada. O importador aceita comparações
+  de igualdade sobre paths conhecidos e reporta o resto como
+  `PatternSupport::{Partial, Unsupported}`, contado no `ImportReport`. O padrão
+  original é preservado para reexport (§17).
+- **Distinguir «não percebemos» de «o feed está mal».** Um path suportado com
+  valor inválido (`ipv4-addr:value = '999.1.1.1'`) entra em
+  `rejected_values`, não em `unsupported_patterns`. A primeira falha é nossa; a
+  segunda é do feed.
+- **`confidence` ausente é 50, não 100.** O STIX torna-o opcional. Ausente é
+  "não declarado", e o valor neutro é o meio da escala.
+- **TLP ausente ou ilegível é RED.** O default do enum é `Red`, e um
+  `object_marking_refs` que não resolve contribui `Red`. É o único default cujo
+  modo de falha é uma divulgação.
+- **O TTL ancora no `valid_from` da fonte, não na hora do download.** Ancorar em
+  `now` daria a um indicador de há seis anos uma vida nova a cada re-sync — §12
+  derrotado por um ciclo de refetch.
+- **Um match de sufixo/prefixo pesa metade de um exato.** Casar
+  `a.b.evil.com` contra `evil.com` é uma afirmação mais fraca do que casar
+  `evil.com`; pontuá-los igual é como um indicador largo passa a dominar uma
+  avaliação. O `MatchKind` viaja no match, no sinal e no sighting.
+- **Fontes untrusted pesam exatamente zero, e um match delas não gera sinal
+  nenhum** — não «um sinal com score 0». A mera presença de um sinal é lida como
+  significando algo por uma vista de incidente ou um dashboard.
+- **Hashes fuzzy (SSDEEP/TLSH) nunca entram no índice exato.** São digests de
+  *similaridade*: dois ficheiros diferentes partilham prefixo com frequência, e
+  tratar isso como identidade é produzir falsos positivos confiantes (T2). O
+  `insert_object` devolve quantos indicadores indexou, para que a diferença seja
+  visível em vez de silenciosa.
+- **A pseudonimização é `HMAC(chave_por_destino, id)`,** com `blake3::keyed_hash`.
+  Um hash simples de um identificador previsível está a uma wordlist de
+  distância do plaintext; e chaves diferentes por destino impedem que dois
+  destinatários cruzem pseudónimos e reconstruam o nosso inventário. O `Debug`
+  do `Pseudonymizer` imprime `<redacted>` — uma chave logada uma vez quebra o
+  esquema retroactivamente.
+- **Objeção resolvida a meio:** o `rollback_to` desativava apenas as versões
+  *posteriores* ao alvo. Libertar uma quarentena e depois ativar essa versão
+  deixava duas versões `Active` ao mesmo tempo, e o `active()` respondia com a
+  primeira do vetor. Passou a desativar todas as outras não-quarentenadas —
+  duas versões em vigor não é um estado que o tipo deva conseguir representar.
+
+### O que NÃO foi feito, e porquê
+
+Não são omissões por falta de tempo; cada uma precisa de algo que este crate não
+tem e não deve ter:
+
+- **Cliente e servidor TAXII (§18, §19).** O `heraclitus-sentinel` não tem
+  cliente HTTP, TLS nem runtime assíncrono, e adquiri-los aqui punha uma stack
+  de rede no plano de derivação. A fronteira `ThreatImporter` é a costura onde
+  um transporte encaixa: um cliente TAXII é um ciclo de fetch a alimentá-la, e
+  pertence ao servidor.
+- **Adaptador MISP (§20).** Mesma razão, mais o §1, que proíbe explicitamente
+  fixar a versão do formato — sem fixtures de uma instância real o adaptador não
+  prova nada.
+- **Transporte CTIR (§28–§32).** O §30 diz que a `HttpApi` "NÃO será presumida"
+  e a orientação atual é notificação institucional. Escrever um cliente contra
+  uma API que ninguém publicou é inventar um protocolo.
+- **Bundles air-gap (§33–§35).** Sobrepõe-se ao trabalho de evidência/air-gap da
+  SPEC-0046 que está em curso; duas implementações independentes de "verificar
+  um bundle assinado" divergiriam, e a que divergisse seria a menos exercitada.
+- **Dashboard (§42).** Precisa das views do servidor.
+
+Consequência honesta: os gates **T1 (TAXII)**, **T2 (MISP)**, **T6 (air-gap)** e
+**T7 (CTIR)** da §43 continuam por abrir. **T0, T3, T4 e T5** estão cobertos por
+testes com esses nomes.
+
+### Validação
+
+- `cargo test --offline --workspace` — **996 testes, 0 falhas**.
+- `heraclitus-sentinel`: **156 unitários** (92 no `threat`) + 4 adversariais +
+  **8 de integração** em `tests/spec0047_threat_sync.rs`, que percorrem o
+  pipeline inteiro: bundle STIX → import → admissão → índice → match → sinal →
+  sighting → sanitização → export.
+- `cargo clippy --offline -p heraclitus-sentinel --all-targets -- -D warnings` —
+  passou.
+- Validados por **mutação**: (1) fazer um hit de Bloom virar match derruba
+  `a_saturated_bloom_still_confirms_nothing`; (2) desligar o gate de fuga do §27
+  derruba `credentials_block_the_export_regardless_of_who_proposed_them`; (3)
+  fazer `may_share_to` devolver sempre `true` derruba três testes de TLP.
+
+## ATUALIZAÇÃO 2026-08-29 — compaction do tier frio em v6: o que a spec manda não é o que faltava
+
+O item nº 1 da "Ordem de execução atual" do `SPEC-RESUMO.md` dizia:
+
+> Compaction do cold tier para recibos v2 — a única funcionalidade que o legado
+> tem e o v6 não.
+
+**A primeira metade da frase estava errada, e vale a pena dizer porquê antes de
+dizer o que foi feito.** O que o legado tem é o
+`ColdTier::compact_cold(… is_deleted …)`: recebe um predicado, reescreve o
+segmento **sem** os registos marcados e recomputa a raiz Merkle. Portar isso
+para recibos v2 seria implementar exactamente o que a SPEC-0050 proíbe:
+
+- **§96** — uma operação equivalente a `compact_cold(… is_deleted …)` que
+  produza um `.hrkl` omitindo records "NÃO poderá ser tratada como nova
+  representação canônica equivalente"; é *projection compaction*.
+- **§97** — se `input CanonicalRecords != output CanonicalRecords` então as
+  raízes lógicas diferem e o output **não substitui** o segmento canónico.
+- **§95** — delete semântico é um evento *tombstone*, não a remoção do registo.
+- **§98** — o que torna dado pessoal irrecuperável é crypto-shredding (chave
+  destruída, evento preservado), e é do `heraclitus-compliance`.
+
+E o modo de falha seria caro: o recibo v2 produzido seria internamente
+consistente, verificaria, e o problema só apareceria quando alguém tentasse
+provar um LSN que já lá não estava — possivelmente meses depois, numa perícia.
+
+O que **realmente** faltava no v6 é o ciclo de vida das gerações frias: repack
+(§189/§190), recolha física no bucket, e o GC do log a saber que uma `location`
+pode não ser um caminho local.
+
+### O que foi feito
+
+| entrega | onde |
+|---|---|
+| `ColdTierV6::repack_generation` — repack de geração fria preservando a raiz | `tier/src/compaction.rs` |
+| `ColdTierV6::collect_cold_locations` — remoção física idempotente no bucket | `tier/src/compaction.rs` |
+| `GcExecution::cold_detached` + separação local/remoto no `commit_gc` | `log/src/v6/gc.rs` |
+| `OBJECT_STORE_GENERATION_PREFIX` / `is_object_store_location` | `core/src/runtime.rs` |
+
+### Um bug latente que isto fecha
+
+`PhysicalGeneration::location` tanto pode ser `segments/…` como
+`canonical/<ns>/segment-…/generation-N.hrkl` (§82) — o próprio comentário do
+campo já dizia "caminho local **ou** chave de object storage". O `commit_gc`
+mandava as duas para `resolve_gc_path`, que canonicaliza o directório-pai
+contra a raiz local. Para uma chave de bucket esse directório não existe: o `?`
+devolvia `Err` **antes** do commit do manifesto.
+
+Consequência prática: bastava **uma** geração fria ficar superseded para o GC do
+banco inteiro parar — incluindo o das gerações locais, que nada tinham a ver com
+o object store. Está reproduzido em
+`geracao_em_object_storage_e_desligada_mas_nao_apagada_pelo_gc`
+(`log/tests/hrkl_v6_manifest.rs`) e validado por mutação: com
+`is_object_store_location` a devolver sempre `false`, o teste falha com
+`Err(NotFound)` no `commit_gc`, que é exactamente o sintoma descrito.
+
+É um bug **latente**: arma-se no momento em que alguém catalogar gerações frias
+no HRKM. Hoje ninguém o faz — ver "o que continua a faltar", abaixo.
+
+### Decisões, e as objeções que levantaram
+
+- **Autenticar antes de repackar.** Os bytes descarregados são conferidos contra
+  o `physical_digest` do recibo (§84) *antes* de qualquer repack. Sem essa
+  paragem, um objecto corrompido no bucket seria relido, reempacotado e
+  publicado como geração nova com recibo próprio e consistente — a corrupção
+  ganharia uma certidão de nascimento limpa, e a geração de origem, ainda
+  correcta noutra réplica, ficaria marcada como superseded por ela. O CRC de
+  bloco apanha *alguns* casos (a mutação prova-o), mas cobre payloads de bloco,
+  não o ficheiro todo.
+- **O `.hrki` da origem nunca é herdado.** O sidecar indexa blocos por offset
+  (§56) e um repack com outro `block_target_bytes` muda todos os offsets. Um
+  sidecar herdado devolveria os blocos errados **em silêncio**, porque a raiz
+  lógica continuaria a bater. Publicar sem sidecar é o correcto: §56 manda
+  reconstruí-lo, e o recall por intervalo de LSN usa o directório de blocos do
+  próprio segmento.
+- **`collect_cold_locations` não decide nada.** Pins, grace period, legal hold e
+  o invariante de §91 são do `plan_gc`. O que ela garante sozinha é que só toca
+  em chaves que fazem `GenerationKey::parse` — um `location` corrompido no
+  manifesto não vira um `DELETE` arbitrário no bucket.
+- **`saved_bytes()` devolve `i64`, não `u64`.** Repackar de `Archive` para
+  `Fast` faz o objecto crescer, e é uma troca legítima quando o que se quer é
+  latência de leitura. Um `saturating_sub` reportaria "0 poupados" para um
+  objecto que engordou 30%.
+- **Contra-argumento que ficou por resolver:** publicar uma geração fria **não a
+  cataloga no HRKM**. Não existe `record_cold_generation`, e escolher como
+  catalogá-la é uma decisão de modelo, não de código:
+  1. a cópia fria é uma geração **nova** (N+1) com a mesma raiz lógica — cabe no
+     formato actual, mas gasta um número de geração por movimento de tier e faz
+     o `physical_digest` deixar de ser único entre gerações;
+  2. a cópia fria é outra `location` da **mesma** geração — é o que o conceito
+     pede, mas `PhysicalGeneration::location` é uma `String` só, portanto
+     implica mudar o formato do `.hrkm`.
+
+  Fica sinalizado em vez de silenciosamente escolhido, pela mesma razão do
+  `cumulative_watermark`: mexe no significado de bytes já em disco.
+
+### O que continua a faltar
+
+1. **O wiring do repack e da recolha.** *Correcção a uma versão anterior desta
+   nota, que dizia que o `ColdTierV6` não tinha chamador nenhum no caminho vivo:
+   tem.* `Engine::demote` publica a geração e appenda o recibo v2,
+   `verify_demotion_v2` verifica-a e `recall` lê-a por intervalos
+   (`server/src/engine.rs`). O que **não** tem chamador é o par novo —
+   `repack_generation` e `collect_cold_locations` — e isso depende da decisão de
+   catalogação acima: sem gerações frias no HRKM não há `plan_gc` que decida
+   coletá-las.
+2. **A geração fria vive no log, não no catálogo.** O recibo v2 entra no log
+   como episódio, mas nada chama um `record_cold_generation` (que não existe)
+   para a pôr no `.hrkm`. Consequências concretas: os estados de §72
+   (`Active`/`Verified`/`Superseded`) não se aplicam a uma cópia fria, o
+   `plan_gc` nunca a vê, e o defeito de localidade corrigido acima permanece
+   latente em vez de activo.
+3. **§175 (compactação lakehouse)** — que, à luz de §96, é o nome certo para "a
+   compaction que o legado tinha": *projection compaction*. O `compact_cold` do
+   v1 e o §175 resolvem o mesmo problema em camadas diferentes; a diferença é
+   que o §175 opera sobre a projecção, regenerável por definição (§100), e não
+   sobre o histórico canónico.
+4. **Recuperar espaço de tombstones no HRKL** — não é dívida, é proibido (§95).
+   Quem quiser dado irrecuperável usa crypto-shredding (§98).
+
+### Validação
+
+- `cargo test --offline --workspace` — **896 testes, 0 falhas**.
+- `heraclitus-tier`: 68 unitários + 5 (repack frio) + 6 (Fase 5) + 7 (Fase 6).
+- `heraclitus-log --test hrkl_v6_manifest`: 9 testes, incluindo o novo.
+- `cargo clippy --offline -p heraclitus-tier -p heraclitus-log -p heraclitus-core
+  --all-targets -- -D warnings` — passou.
+- Validados por **mutação**: `is_object_store_location → false` derruba o teste
+  do GC com `Err(NotFound)`; desligar a conferência de `physical_digest` derruba
+  o teste do objecto adulterado (o erro deixa de nomear a causa).
+- Nota de flakiness, sem relação com esta mudança:
+  `hrkl_v6_crash::sobrevive_a_kills_repetidos_a_meio_do_append` falhou uma vez
+  numa corrida de workspace e passou em quatro corridas seguintes. O teste faz
+  `cargo build` dentro de si e mata um processo filho por janela de tempo
+  (`sleep(25 + (i*11)%90)` ms); sob a carga de um `--workspace` a janela
+  desloca-se. É sensibilidade a carga, não regressão — nenhum caminho tocado
+  aqui entra no append RAW, na reparação de cauda ou no rodapé.
+
+## ATUALIZAÇÃO 2026-08-29 — SPEC-0049 validada; SPEC-0045 v1 fechada
+
+Esta nota acrescenta o estado verificado nesta auditoria ao relatório histórico
+acima. O aviso de que a pasta contém RFCs continua válido para as specs que não
+foram implementadas; não deve ser lido como prova de que nenhuma peça posterior
+foi construída.
+
+### SPEC-0049 — suíte de qualificação
+
+`tools/heraclitus-qualifier` agora implementa planos Q1–Q6, workload
+determinístico, execução de carga/corrupção/restore, evidências seladas,
+verificação, SBOM, supply-chain e modo air-gap. Os harnesses, runbooks e
+workflows de CI estão em `qa/`, `docs/qualification/` e `.github/workflows/`.
+
+Validação local: `cargo test --offline --workspace --all-features --locked`
+terminou com **0 falhas**, incluindo os 19 testes do qualifier. A suíte pode
+produzir evidência de desenvolvimento verificável, mas o perfil
+`GovernmentProduction` permanece **Unqualified** até receber as atestações
+externas assinadas exigidas pelo plano (carga, falhas, red-team, DR,
+PDU/hipervisor e assinatura).
+
+## ATUALIZAÇÃO 2026-08-29 — SPEC-0049: Definition of Done (§143) fechada
+
+Os 35 itens da §143 passaram a estar implementados. O detalhe item a item está
+em [SPEC-RESUMO.md](SPEC-RESUMO.md); aqui fica o que muda na leitura do estado.
+
+**O que a nota de 2026-08-27 dizia e já não é verdade.** Faltavam a suíte de
+soak, o crash-loop contra o processo de release, o runner da matriz Raft, o
+gate de zero-egress, o histórico de qualificação, o compromisso criptográfico
+que liga o relatório ao binário, o workflow de release de emergência, os onze
+runbooks da §117, o doctor de configuração e a comparação de regressão. Todos
+existem, com testes: o `heraclitus-qualifier` passou de 19 para **68 testes**.
+
+**O que continua Unqualified, e porquê isso está certo.** Power-loss físico,
+perda de host, red team independente, soak de 168 h, DR, air-gap e runbooks
+validados por terceiros exigem laboratório e infraestrutura. A suíte recusa-se
+a auto-certificá-los — §35 e §110 mandam-nos vir de fora, e §107 garante que
+`Skipped` e `Inconclusive` nunca contam como `Passed`. Correr o plano
+governamental hoje devolve exit code 2, que é o resultado correto.
+
+### Quatro correções que a implementação forçou, e que valem por si
+
+1. **`source_digest` incluía ficheiros não versionados** (`git ls-files
+   --others`). Um clone do commit só traz os versionados, por isso o digest era
+   irreprodutível por qualquer terceiro — exatamente o contrário do que a §111
+   exige. Efeito secundário medido nesta árvore: 48 635 ficheiros não
+   versionados contra 1 640 versionados, e a suíte de testes do qualifier
+   ficava **mais de 28 minutos pendurada** a hashear uma pasta de build. Passou
+   a 38 s. O estado não versionado deixou de entrar no hash e passou a ser
+   reportado em `untracked_files`, virando limitação declarada acima de
+   Development. A afirmação anterior de que a suíte corria com 0 falhas
+   continua verdadeira, mas corria por 28 minutos por esta razão.
+
+2. **`percentil` em `crates/heraclitus-analytics/benches/hume_vs_datafusion.rs`**
+   falhava `cargo clippy --workspace --all-targets --all-features -- -D
+   warnings`. Como esse comando **é** o gate `lint` de todos os planos, ele
+   reprovava antes de qualquer outro gate correr. Corrigido (`&mut Vec` →
+   `&mut [_]`); o clippy do workspace passa agora com `-D warnings`.
+
+3. **Variáveis de ambiente da máquina sobrepõem-se ao ficheiro de
+   configuração — e apontavam para a base de dados VIVA.** Descoberto ao correr
+   o `crash-loop` pela primeira vez contra um servidor real nesta máquina:
+   `HeraclitusConfig::load` aplica os overrides `HERACLITUS_*` **depois** do
+   ficheiro, e o ambiente de máquina aqui tem `HERACLITUS_DATA_DIR =
+   D:\HeraclitusDB\data` e `HERACLITUS_GRPC_ADDR = 127.0.0.1:7474`. Sem
+   tratamento, um ensaio de crash teria arrancado um servidor sobre os dados de
+   produção e matado o processo à martelada — e a evidência teria registado a
+   configuração que o harness escreveu, não a que correu, o que a §7 e a §9
+   proíbem. O que salvou foi o `AddrInUse` do porto já ocupado pelo serviço.
+   O supervisor passa a limpar **todas** as variáveis `HERACLITUS_*` do
+   ambiente do filho e a listá-las no relatório (`neutralised_environment`).
+   Vale para além do qualifier: qualquer ferramenta que passe um ficheiro de
+   configuração ao servidor nesta máquina está sujeita ao mesmo efeito.
+
+4. **O próprio soak tinha uma fuga de memória.** O registo de latências
+   acumulava toda a amostra da execução; num soak de 168 h a alguns milhares de
+   operações por segundo isso são milhares de milhões de amostras. O detetor de
+   fugas cresceria sem limite e reprovaria a execução que estava a medir. Passou
+   a usar um reservatório determinístico com decimação (teto de 262 144
+   amostras, sem RNG, para a §111 continuar a valer), e o relatório declara
+   quando os percentis globais são amostrados. Os percentis **por janela** —
+   que são os que mostram deriva — continuam exatos.
+
+### Limites que o código declara nos próprios relatórios
+
+Não estão só na documentação; estão nos artefactos, para que ninguém os
+descubra tarde:
+
+- `crash-loop` grava `power_loss_equivalent: false` e a razão (§25: a page
+  cache do SO sobrevive ao `kill -9`);
+- `egress-monitor` grava que a amostragem prova egress mas **não** a ausência
+  dele, e que a ausência é do tap de rede independente (§98);
+- o soak marca `Inconclusive` — nunca `Passed` — quando o host não consegue ler
+  alguma série de recursos (PQ17);
+- o crash-loop grava `neutralised_environment` com as variáveis que removeu do
+  ambiente do servidor.
+
+### Execução real, não só testes unitários
+
+O Q2 foi corrido ponta a ponta contra o binário do servidor: **3 ciclos, 203
+appends confirmados, 3 mortes abruptas, 0 ausentes após reabrir**, verificação
+de integridade OK em cada reinício e re-leitura **individual** de todos os 203
+(escopo `full`, não amostrado). `head` após o reinício ficou em 72, 131 e 206
+para 71, 58 e 74 confirmados — a progressão que a §24 exige.
+
+### SPEC-0045 — Sentinel
+
+A fundação da Fase 0 existe em `crates/heraclitus-sentinel`: configuração
+desabilitável, `SecuritySubscriber` não bloqueante, fila limitada com catch-up
+por LSN, cursor persistido, normalização genérica determinística, proteção
+contra reprocessamento de eventos derivados, `SecurityEvent` com proveniência,
+métricas e integração opcional ao servidor legado/v6. A Fase 1 agora inclui um
+frontend Sigma restrito e fail-closed, carregamento determinístico de regras,
+integração L1 ao replay do runtime e persistência idempotente de
+`SecuritySignal`. A Fase 2 acrescenta o `BehavioralEngine` com adaptador runtime
+determinístico: eventos canónicos viram features escalares limitadas por
+entidade, com EWMA/Welford/quantis, score robusto, perfis shadow, promoção
+explícita, quarentena, rate limiting e snapshots AS-OF de replay; eventos
+suspeitos e evidência L1 ficam fora do baseline salvo feedback confiável
+explícito.
+
+Fase 3 agora também fornece um grafo temporal de segurança com AS-OF/path
+determinístico, `IncidentEngine` com agrupamento/transições e `EvidenceFusion`
+versionada com guarda de independência. O adaptador L3 é opt-in por
+`[sentinel.l3]`: o worker projeta `SecurityEvent` no grafo, consome
+`SecuritySignal` live/replay e persiste revisões append-only de
+`SecurityIncident` com identidade BLAKE3 e parents causais. O worker também
+funde sinais L1/L2 em revisões versionadas de `SecurityRiskAssessment`. O boot
+reconstrói o estado em ordem de LSN de transação; as APIs internas oferecem
+filtro, incidente AS-OF, grafo AS-OF e baseline comportamental AS-OF. Testes
+rebobinam o cursor e confirmam que eventos/sinais/riscos/incidentes não duplicam.
+Derivados do servidor passam por `Engine` e os
+namespaces/tipos Sentinel são reservados contra forja externa. Em configuração
+Raft, todas as réplicas podem manter L0–L3, mas apenas o epoch do líder pode
+executar L4, aprovações ou respostas. A Fase 4 agora invoca um `ModelBackend`
+fornecido pelo host, valida e persiste `SecurityInvestigation`; a Fase 5
+persiste propostas, decisões e `SecurityApproval` append-only. A Fase 6 mantém
+epoch/lease, identidade idempotente e circuit breaker ligado ao caminho L4, e inclui um
+`MemoryReversibleExecutor` seguro para integração, além do `DryRunExecutor`.
+Atualizações de modelo/ruleset e feedback humano são agora eventos de
+governança versionados e append-only; feedback não altera diretamente modelo,
+baseline ou policy. As métricas P0–L4/ações estão expostas no status.
+O servidor expõe views REST (incidentes, evidência, WHY, ações, aprovar/negar,
+dashboard e checkpoint) e equivalentes gRPC administrativos com RBAC. O DoD
+v1 da §115 está fechado no código e nos testes. Credenciais/adaptadores reais
+para IAM/firewall/Kubernetes e atestações laboratoriais pertencem ao
+host/ambiente por §51–52 e §114; por isso `autonomous` continua rejeitado
+fail-closed até receber evidência e executor qualificados.
+
+O gate P0 passou em três execuções consecutivas do benchmark final, usando
+`FsyncPolicy::Always`, seis rondas de 1.000 appends e ordem baseline/subscriber
+alternada. As medianas observadas foram `-1,38%`, `1,21%` e `-21,97%`; todas
+ficaram abaixo do limite normativo de `3%`. O benchmark falha o processo quando
+a mediana ultrapassa o limite e mede apenas o trabalho alcançável antes do ACK
+(broadcast, atomics e `try_send`); processamento L0–L4 e appends derivados são
+assíncronos e ficam fora do caminho crítico por arquitetura.
+
 ## ATUALIZAÇÃO 2026-08-24 (4) — HRKL v6 é o banco. Nenhuma capability recusa arrancar.
 
 `storage_format` passou a ter **`v6` por omissão**. E, mais importante do que a
