@@ -60,6 +60,7 @@ pub mod canonical;
 pub mod feed;
 pub mod index;
 pub mod ir;
+pub mod plane;
 pub mod sharing;
 pub mod sighting;
 pub mod stix;
@@ -76,6 +77,7 @@ pub use ir::{
 pub use sharing::{
     Pseudonymizer, SanitizationError, SanitizedThreatObject, SharingPolicy, ThreatSanitizer,
 };
+pub use plane::{trust_from_config, ThreatLoadReport, ThreatPlane};
 pub use sighting::ThreatSighting;
 pub use stix::{StixImporter, ThreatImportError, ThreatImporter, ThreatInputLimits};
 pub use tlp::TlpLevel;

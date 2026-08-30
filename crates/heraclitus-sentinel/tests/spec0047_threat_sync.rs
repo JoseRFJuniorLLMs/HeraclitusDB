@@ -353,3 +353,195 @@ fn every_admitted_object_has_an_expiry_and_stops_matching_at_it() {
         "an expired indicator must stop matching without anyone sweeping the index"
     );
 }
+
+// ---------------------------------------------------------------------------
+// O plano ligado ao runtime: um evento entra, evidencia sai
+// ---------------------------------------------------------------------------
+
+/// Ate 2026-08-30 o modulo `threat` era codigo completo e testado sem um unico
+/// chamador — o padrao que esta base ja repetiu e que a auditoria nomeou. Este
+/// teste e o que prova que deixou de ser: um episodio bruto no log, e um
+/// `SecuritySignal` e um `ThreatSighting` derivados no fim, sem ninguem
+/// chamar nada a mao.
+#[test]
+fn um_evento_com_ioc_produz_evidencia_no_log() {
+    use heraclitus_core::config::FsyncPolicy;
+    use heraclitus_core::{Episode, EventKind, SentinelConfig, SentinelMode, SentinelThreatConfig};
+    use heraclitus_log::AnyLog;
+    use heraclitus_sentinel::SentinelRuntime;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let temp = tempfile::tempdir().unwrap();
+    let feeds = temp.path().join("feeds");
+    std::fs::create_dir_all(&feeds).unwrap();
+    // Bundle proprio, e nao o `bundle()` dos outros testes: aquele fixa
+    // `valid_from` em 2027 para casar com o relogio fixo deles, e aqui o
+    // relogio e o real. Um indicador cuja janela ainda nao abriu nao casa —
+    // que e o comportamento certo, e tornaria este teste enganador.
+    std::fs::write(
+        feeds.join("cert.json"),
+        br#"{
+          "type": "bundle",
+          "id": "bundle--runtime",
+          "objects": [
+            {"type":"marking-definition","id":"marking-definition--amber","name":"TLP:AMBER"},
+            {"type":"indicator","id":"indicator--net","spec_version":"2.1","confidence":90,
+             "pattern":"[ipv4-addr:value = '203.0.113.0/24']",
+             "object_marking_refs":["marking-definition--amber"]},
+            {"type":"indicator","id":"indicator--dom","spec_version":"2.1","confidence":85,
+             "pattern":"[domain-name:value = 'evil.example']",
+             "object_marking_refs":["marking-definition--amber"]},
+            {"type":"indicator","id":"indicator--hash","spec_version":"2.1","confidence":95,
+             "pattern":"[file:hashes.'SHA-256' = 'ababababababababababababababababababababababababababababababab00']",
+             "object_marking_refs":["marking-definition--amber"]}
+          ]
+        }"#,
+    )
+    .unwrap();
+
+    let log = Arc::new(
+        AnyLog::open(
+            heraclitus_core::StorageFormat::Legacy,
+            temp.path().join("log"),
+            1 << 20,
+            FsyncPolicy::Always,
+        )
+        .unwrap(),
+    );
+    let config = SentinelConfig {
+        enabled: true,
+        mode: SentinelMode::Observe,
+        worker_threads: 1,
+        threat: SentinelThreatConfig {
+            enabled: true,
+            feeds_dir: feeds.to_string_lossy().into_owned(),
+            source_id: "cert".into(),
+            trust_level: "institutional".into(),
+            minimum_confidence: 50,
+            // O feed nao declara expiracao, portanto §12 aplica esta — e um
+            // objecto sem expiracao e sem TTL de politica seria RECUSADO, que
+            // e o que acontecia com `0` aqui.
+            default_ttl_secs: 90 * 24 * 3_600,
+        },
+        ..SentinelConfig::default()
+    };
+    let runtime = SentinelRuntime::start(log.clone(), config)
+        .unwrap()
+        .unwrap();
+
+    // O feed carregou: 3 indicadores, e o relatorio distingue "vazio porque
+    // nada importou" de "vazio porque nao ha feeds".
+    let report = runtime.threat_load_report().expect("plano ligado");
+    assert_eq!(report.files_read, 1);
+    assert!(report.files_failed.is_empty(), "{:?}", report.files_failed);
+    assert_eq!(runtime.threat_indicator_count(), 3);
+
+    // Um evento de rede para dentro do bloco publicado pelo feed.
+    log.append(Episode::new(
+        "collector",
+        EventKind::Observation,
+        br#"{"source":"nginx","category":"network","activity":"connect","outcome":"allowed",
+             "host":"web-01","dst":{"ip":"203.0.113.42","port":443}}"#
+            .to_vec(),
+    ))
+    .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut sinais = 0usize;
+    let mut sightings = 0usize;
+    while std::time::Instant::now() < deadline {
+        let rows = log.scan(0, log.head()).unwrap();
+        sinais = rows
+            .iter()
+            .filter(|(_, e)| matches!(&e.kind, EventKind::Custom(k) if k == "SecuritySignal"))
+            .count();
+        sightings = rows
+            .iter()
+            .filter(|(_, e)| matches!(&e.kind, EventKind::Custom(k) if k == "ThreatSighting"))
+            .count();
+        if sinais >= 1 && sightings >= 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    assert!(sinais >= 1, "nenhum SecuritySignal derivado do match de IOC");
+    assert!(sightings >= 1, "nenhum ThreatSighting persistido (§36)");
+
+    // §11: o que saiu e evidencia. Nao ha nenhum episodio de accao, porque
+    // este caminho nao tem tipo nenhum que seja uma accao.
+    let rows = log.scan(0, log.head()).unwrap();
+    assert!(
+        !rows.iter().any(|(_, e)| matches!(&e.kind, EventKind::Custom(k)
+            if k == "SecurityAction" || k == "AuthorizedAction")),
+        "um match de IOC nunca pode autorizar uma accao"
+    );
+
+    // O sinal aponta para o sujeito certo e traz a proveniencia do feed.
+    let sinal = rows
+        .iter()
+        .find(|(_, e)| matches!(&e.kind, EventKind::Custom(k) if k == "SecuritySignal"))
+        .map(|(_, e)| serde_json::from_slice::<serde_json::Value>(&e.content).unwrap())
+        .unwrap();
+    assert_eq!(sinal["detector"]["id"], "threat-intel");
+    assert_eq!(sinal["subject"]["id"], "web-01");
+    assert_eq!(sinal["labels"]["threat.max_tlp"], "TLP:AMBER");
+
+    // Idempotencia: nada mais e emitido sem eventos novos.
+    let antes = log.head();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(log.head(), antes, "o derivado nao pode realimentar-se");
+
+    runtime.shutdown();
+}
+
+/// Com o plano desligado — o default — nada disto acontece, e o relatorio diz
+/// que nao ha plano em vez de dizer que ha um vazio.
+#[test]
+fn com_o_plano_desligado_nao_ha_correlacao_nenhuma() {
+    use heraclitus_core::config::FsyncPolicy;
+    use heraclitus_core::{Episode, EventKind, SentinelConfig, SentinelMode};
+    use heraclitus_log::AnyLog;
+    use heraclitus_sentinel::SentinelRuntime;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let temp = tempfile::tempdir().unwrap();
+    let log = Arc::new(
+        AnyLog::open(
+            heraclitus_core::StorageFormat::Legacy,
+            temp.path().join("log"),
+            1 << 20,
+            FsyncPolicy::Always,
+        )
+        .unwrap(),
+    );
+    let runtime = SentinelRuntime::start(
+        log.clone(),
+        SentinelConfig {
+            enabled: true,
+            mode: SentinelMode::Observe,
+            worker_threads: 1,
+            ..SentinelConfig::default()
+        },
+    )
+    .unwrap()
+    .unwrap();
+
+    assert!(runtime.threat_load_report().is_none());
+    assert_eq!(runtime.threat_indicator_count(), 0);
+
+    log.append(Episode::new(
+        "collector",
+        EventKind::Observation,
+        br#"{"source":"nginx","category":"network","activity":"connect","host":"web-01","dst":{"ip":"203.0.113.42"}}"#.to_vec(),
+    ))
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let rows = log.scan(0, log.head()).unwrap();
+    assert!(!rows
+        .iter()
+        .any(|(_, e)| matches!(&e.kind, EventKind::Custom(k) if k == "ThreatSighting")));
+    runtime.shutdown();
+}

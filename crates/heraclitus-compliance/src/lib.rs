@@ -27,16 +27,50 @@
 //! ainda.
 
 pub mod commit;
+pub mod classification;
+pub mod model_bundle;
+pub mod privacy;
+pub mod regulatory;
 pub mod receipt;
 pub mod rfc3161;
 pub mod signer;
+pub mod sovereignty;
 pub mod tsa;
 pub mod verify;
 pub mod worker;
 
 pub use commit::{commit_at, commit_now, current_watermark, Commitment};
+pub use classification::{
+    classify_derived_episode, ClassificationControls, ClassificationDecision,
+    ClassificationDowngradeAuthorization, ClassificationError, ClassificationPolicy,
+    SourceClassification,
+};
+pub use model_bundle::{
+    build_signed_model_bundle, verify_model_bundle, BundleSignature, BundleSignatureScheme,
+    ModelBundleBody, ModelBundleError, ModelBundlePolicy, ModelBundleRegistry, ModelManifest,
+    SignedModelBundle, VerifiedModelBundle,
+};
+pub use privacy::{
+    AnpdCommunicationPackage, AnpdPackageReceipt, BusinessCalendar, ComplianceEvidenceRef,
+    DeadlinePolicy, DeadlineState, DeadlineUrgency, IncidentPackageData, PackageManifest,
+    PrivacyError, PrivacyExportPolicy, PrivacyIncidentAssessment, PrivacyIncidentEngine,
+    PrivacySanitizationReport, PrivacyState, RegulatoryDeadline, RipdEvidenceAppendix, RiskLevel,
+    SubmissionState,
+};
+pub use regulatory::{
+    ComplianceContext, CompliancePredicate, ComplianceRequirement, ConfiguredRegulatoryPolicy,
+    EvidenceSelector, LegalHold, LegalHoldRecord, LegalHoldRelease, PolicyActivation,
+    PolicyActivationRecord, PolicyIdentity, RegulatoryDecision, RegulatoryDecisionRecord,
+    RegulatoryError, RegulatoryPolicy, RegulatoryPolicyEngine, RegulatoryRule, RegulatoryState,
+    RequirementEffect, RetentionClass,
+};
 pub use receipt::{load_manifest, read_token, LegalReceipt, TimestampValidationState};
 pub use signer::{InstitutionalSignature, InstitutionalSigner, Pkcs11Signer, SoftKeySigner};
+pub use sovereignty::{
+    EgressDecision, EgressEndpoint, EgressPermit, EgressPurpose, GuardedModelBackend,
+    GuardedTsaClient, ModelDecision, ModelSovereignty, SovereignModelBackend, SovereigntyAuditState,
+    SovereigntyError, SovereigntyMode, SovereigntyPolicy, SovereigntyRuntime, SovereigntyVerdict,
+};
 pub use tsa::{HttpTsa, LocalTsa, TsaClient};
 pub use verify::{is_dev_token, verify_dev_token, VerifiedTime};
 pub use worker::{run_worker, tick};

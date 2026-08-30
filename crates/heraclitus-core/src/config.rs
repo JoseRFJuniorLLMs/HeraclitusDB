@@ -81,6 +81,51 @@ impl Default for SentinelL3Config {
     }
 }
 
+/// SPEC-0047 — configuração do plano de threat intelligence.
+///
+/// Opt-in pela mesma razão que o L2 e o L3: uma instalação que ligou o L0 não
+/// deve começar a ingerir feeds externos e a manter índices de IOC só por
+/// isso.
+///
+/// Um feed é **entrada não confiável** (§13, `source != truth`), e por isso a
+/// política da fonte vive aqui e não no ficheiro do feed: quem decide a
+/// confiança é o operador, não quem publica os indicadores.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SentinelThreatConfig {
+    pub enabled: bool,
+    /// Directório de onde os bundles STIX 2.1 (`*.json`) são carregados no
+    /// arranque. Um ficheiro que não importe é registado e ignorado — um feed
+    /// malformado não pode impedir o servidor de arrancar.
+    pub feeds_dir: String,
+    /// Identidade da fonte, que liga os objectos importados a esta política.
+    pub source_id: String,
+    /// §10 — `untrusted` faz os indicadores entrarem em quarentena e pesarem
+    /// exactamente zero; `community`, `commercial`, `institutional` e
+    /// `internal` pesam progressivamente mais.
+    pub trust_level: String,
+    /// §10 — objectos abaixo desta confiança são recusados na admissão.
+    pub minimum_confidence: u8,
+    /// §12 — expiração aplicada quando o feed não declara nenhuma. `0` exige
+    /// que o feed a declare, e recusa os objectos que não o façam.
+    pub default_ttl_secs: u64,
+}
+
+impl Default for SentinelThreatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            feeds_dir: String::new(),
+            source_id: "threat-feed".to_string(),
+            // O default é o mais desconfiado: um feed que ninguém classificou
+            // entra em quarentena e não move nenhuma decisão. §13.
+            trust_level: "untrusted".to_string(),
+            minimum_confidence: 0,
+            default_ttl_secs: 30 * 24 * 3_600,
+        }
+    }
+}
+
 /// Configuration shared by the host and the optional `heraclitus-sentinel`
 /// runtime.  The core owns only serializable host controls; detector and graph
 /// implementations remain in `heraclitus-sentinel`.
@@ -107,6 +152,8 @@ pub struct SentinelConfig {
     pub l2: SentinelL2Config,
     /// Optional deterministic graph/incident adapter.
     pub l3: SentinelL3Config,
+    /// SPEC-0047 — plano de threat intelligence (opt-in).
+    pub threat: SentinelThreatConfig,
 }
 
 impl Default for SentinelConfig {
@@ -121,6 +168,7 @@ impl Default for SentinelConfig {
             l1: SentinelL1Config::default(),
             l2: SentinelL2Config::default(),
             l3: SentinelL3Config::default(),
+            threat: SentinelThreatConfig::default(),
         }
     }
 }

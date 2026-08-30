@@ -12,6 +12,10 @@ pub struct SentinelMetrics {
     pub(crate) events_processed_total: AtomicU64,
     pub(crate) events_normalized_total: AtomicU64,
     pub(crate) signals_emitted_total: AtomicU64,
+    /// SPEC-0047 — matches confirmados contra o índice de IOC.
+    pub(crate) threat_matches_total: AtomicU64,
+    /// SPEC-0047 §36 — observações locais de um IOC externo.
+    pub(crate) threat_sightings_emitted_total: AtomicU64,
     pub(crate) risk_assessments_emitted_total: AtomicU64,
     pub(crate) incidents_created_total: AtomicU64,
     pub(crate) incident_revisions_emitted_total: AtomicU64,
@@ -62,6 +66,8 @@ pub struct SentinelStatus {
     pub events_processed_total: u64,
     pub events_normalized_total: u64,
     pub signals_emitted_total: u64,
+    pub threat_matches_total: u64,
+    pub threat_sightings_emitted_total: u64,
     pub risk_assessments_emitted_total: u64,
     pub incidents_created_total: u64,
     pub incident_revisions_emitted_total: u64,
@@ -124,6 +130,10 @@ impl SentinelMetrics {
             events_processed_total: self.events_processed_total.load(Ordering::Acquire),
             events_normalized_total: self.events_normalized_total.load(Ordering::Acquire),
             signals_emitted_total: self.signals_emitted_total.load(Ordering::Acquire),
+            threat_matches_total: self.threat_matches_total.load(Ordering::Acquire),
+            threat_sightings_emitted_total: self
+                .threat_sightings_emitted_total
+                .load(Ordering::Acquire),
             risk_assessments_emitted_total: self
                 .risk_assessments_emitted_total
                 .load(Ordering::Acquire),

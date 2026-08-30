@@ -159,6 +159,9 @@ struct RuntimeInner {
     cursor: Mutex<SentinelCursor>,
     normalizer: GenericNormalizer,
     rule_engine: Option<RuleEngine>,
+    /// SPEC-0047 — índice de IOC e políticas de fonte. `None` quando o plano
+    /// de threat intel está desligado, que é o default.
+    threat: Option<crate::threat::ThreatPlane>,
     rule_history: Mutex<Vec<(Lsn, SecurityEvent)>>,
     behavior_engine: Option<Mutex<BehavioralEngine>>,
     fusion: Option<Mutex<EvidenceFusion>>,
@@ -256,6 +259,31 @@ impl SentinelRuntime {
             )));
         }
         let stop = Arc::new(AtomicBool::new(false));
+        // SPEC-0047 — os feeds são lidos uma vez, no arranque. Recarregar a
+        // quente é outra coisa (§40/§41 querem versionamento e rollback), e
+        // fazê-lo mal daria dois índices diferentes a decidir ao mesmo tempo.
+        // O que o carregamento apurou não vai para um log: vai para o
+        // `SentinelStatus`, como o resto do estado deste crate. Um feed que
+        // não importou tem de ser consultável depois do arranque, não só
+        // visível na altura em que passou.
+        let threat = if config.threat.enabled {
+            let policy = crate::threat::ThreatSourcePolicy {
+                source_id: config.threat.source_id.clone(),
+                trust_level: crate::threat::trust_from_config(&config.threat.trust_level),
+                minimum_confidence: config.threat.minimum_confidence,
+                // §11 — mesmo `true` não seria permissão, e nada nesta versão
+                // executa acções: o valor é conservador até haver executor.
+                auto_block_allowed: false,
+                default_ttl_secs: config.threat.default_ttl_secs,
+            };
+            Some(crate::threat::ThreatPlane::load(
+                std::path::Path::new(&config.threat.feeds_dir),
+                policy,
+                now_ms(),
+            ))
+        } else {
+            None
+        };
         let rule_engine = if config.l1.enabled {
             let path = config.l1.rules_path.as_ref().ok_or_else(|| {
                 SentinelError::Config(
@@ -339,6 +367,7 @@ impl SentinelRuntime {
             cursor: Mutex::new(cursor),
             normalizer: GenericNormalizer::default(),
             rule_engine,
+            threat,
             rule_history: Mutex::new(runtime_rule_history),
             behavior_engine,
             fusion,
@@ -428,6 +457,20 @@ impl SentinelRuntime {
         status
     }
 
+    /// SPEC-0047 — o que o carregamento dos feeds apurou no arranque.
+    ///
+    /// `None` quando o plano está desligado. Um índice vazio porque nenhum
+    /// ficheiro importou tem de ser distinguível de um índice vazio porque não
+    /// há feeds configurados, e é isso que este relatório permite.
+    pub fn threat_load_report(&self) -> Option<crate::threat::ThreatLoadReport> {
+        self.inner.threat.as_ref().map(|p| p.report().clone())
+    }
+
+    /// Quantos indicadores exactos estão no índice de IOC.
+    pub fn threat_indicator_count(&self) -> usize {
+        self.inner.threat.as_ref().map_or(0, |p| p.indicator_count())
+    }
+
     /// Append an auditable checkpoint of the current derived-state watermarks.
     /// The local cursor remains the fast restart hint; this event is the
     /// durable AS-OF record that can be verified and replayed by another host.
@@ -455,6 +498,21 @@ impl SentinelRuntime {
             detector_versions.insert(
                 "l3.temporal-graph".into(),
                 format!("pipeline-{}", self.inner.config.pipeline_version),
+            );
+        }
+        if let Some(plane) = self.inner.threat.as_ref() {
+            // O número de indicadores entra na versão do detector de
+            // propósito: dois checkpoints com o mesmo `pipeline_version` mas
+            // índices diferentes não descrevem o mesmo detector, e um replay
+            // que não distinguisse os dois explicaria mal porque é que o mesmo
+            // evento deu resultados diferentes.
+            detector_versions.insert(
+                "threat-intel".into(),
+                format!(
+                    "pipeline-{}-indicators-{}",
+                    self.inner.config.pipeline_version,
+                    plane.indicator_count()
+                ),
             );
         }
         let checkpoint = SentinelCheckpoint {
@@ -1578,6 +1636,7 @@ fn process_until(inner: &RuntimeInner) -> Result<(), SentinelError> {
                                 .unwrap_or(lsn);
                             remember_rule_event(inner, source_lsn, &event);
                             apply_security_graph(inner, lsn, &event)?;
+                            evaluate_threat(inner, lsn, event.raw_event_id, &event)?;
                             let l1_suspicious = evaluate_l1(inner)?;
                             evaluate_l2(
                                 inner,
@@ -1632,6 +1691,15 @@ fn process_until(inner: &RuntimeInner) -> Result<(), SentinelError> {
             remember_rule_event(inner, lsn, &normalized.event);
             if let Some(derived_lsn) = derived_lsn {
                 apply_security_graph(inner, derived_lsn, &normalized.event)?;
+                // SPEC-0047 — depois do grafo e antes do L1/L2, pela mesma
+                // razão que o grafo vem antes: o evento derivado já tem LSN,
+                // portanto a evidência pode apontar para ele.
+                evaluate_threat(
+                    inner,
+                    derived_lsn,
+                    normalized.event.raw_event_id,
+                    &normalized.event,
+                )?;
             }
             let l1_suspicious = evaluate_l1(inner)?;
             if let Some(derived_lsn) = derived_lsn {
@@ -1701,6 +1769,81 @@ fn remember_rule_event(inner: &RuntimeInner, source_lsn: Lsn, event: &SecurityEv
             });
         }
     }
+}
+
+
+/// SPEC-0047 §11/§36 — correlaciona o evento contra o índice de IOC e persiste
+/// o que daí sai: **evidência**, nunca uma acção.
+///
+/// A idempotência é a mesma dos outros derivados: o `signal_id` é
+/// determinístico (BLAKE3 sobre detector + sujeito + evidência + janela), por
+/// isso um replay do mesmo LSN não emite um segundo sinal. As sightings vão
+/// pela mesma chave de deduplicação do sink.
+fn evaluate_threat(
+    inner: &RuntimeInner,
+    source_lsn: Lsn,
+    derived_event_id: EventId,
+    event: &SecurityEvent,
+) -> Result<(), SentinelError> {
+    let Some(plane) = inner.threat.as_ref() else {
+        return Ok(());
+    };
+    // O relógio do evento, não o da máquina: um replay a um LSN antigo tem de
+    // reproduzir a decisão que era correcta então (§12).
+    let now = if event.observed_at != 0 {
+        event.observed_at
+    } else {
+        now_ms()
+    };
+    let hits = plane.correlate(event, now);
+    if hits.is_empty() {
+        return Ok(());
+    }
+    inner
+        .metrics
+        .threat_matches_total
+        .fetch_add(hits.len() as u64, Ordering::Relaxed);
+
+    for sighting in plane.sightings(&hits, derived_event_id, source_lsn, now) {
+        let key = format!(
+            "t:{}:{}:{}",
+            sighting.indicator_id, sighting.match_kind, source_lsn
+        );
+        inner.derived_sink.append(sighting.into_episode()?, &key)?;
+        inner
+            .metrics
+            .threat_sightings_emitted_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    if let Some(signal) = plane.signal_for(event, &hits, source_lsn, derived_event_id) {
+        let already_emitted = inner
+            .signal_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&signal.signal_id);
+        if !already_emitted {
+            let signal_id = signal.signal_id.clone();
+            let mut episode = signal.into_episode()?;
+            episode.attrs.insert(
+                "sentinel.pipeline_version".into(),
+                inner.config.pipeline_version.to_string(),
+            );
+            inner
+                .derived_sink
+                .append(episode, &format!("s:{signal_id}"))?;
+            inner
+                .signal_ids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(signal_id);
+            inner
+                .metrics
+                .signals_emitted_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    Ok(())
 }
 
 fn apply_security_graph(
@@ -2145,6 +2288,7 @@ mod tests {
                 enabled: true,
                 max_graph_hops: 6,
             },
+            threat: Default::default(),
         }
     }
 
@@ -2239,6 +2383,7 @@ mod tests {
                 l1: SentinelL1Config::default(),
                 l2: SentinelL2Config::default(),
                 l3: SentinelL3Config::default(),
+                threat: Default::default(),
             },
         )
         .unwrap()
@@ -2297,6 +2442,7 @@ mod tests {
                 l1: SentinelL1Config::default(),
                 l2: SentinelL2Config::default(),
                 l3: SentinelL3Config::default(),
+                threat: Default::default(),
             },
         )
         .unwrap()
@@ -2369,6 +2515,7 @@ mod tests {
                 l1: SentinelL1Config::default(),
                 l2: SentinelL2Config::default(),
                 l3: SentinelL3Config::default(),
+                threat: Default::default(),
             },
         )
         .unwrap()
@@ -2432,6 +2579,7 @@ mod tests {
                 l1: SentinelL1Config::default(),
                 l2: SentinelL2Config::default(),
                 l3: SentinelL3Config::default(),
+                threat: Default::default(),
             },
         )
         .unwrap()
@@ -2606,6 +2754,7 @@ mod tests {
             l1: SentinelL1Config::default(),
             l2: SentinelL2Config::default(),
             l3: SentinelL3Config::default(),
+            threat: Default::default(),
         };
         let runtime = SentinelRuntime::start(log.clone(), config)
             .unwrap()
@@ -2668,6 +2817,7 @@ detection:
             },
             l2: SentinelL2Config::default(),
             l3: SentinelL3Config::default(),
+            threat: Default::default(),
         };
         let runtime = SentinelRuntime::start(log.clone(), config)
             .unwrap()
@@ -2722,6 +2872,7 @@ detection:
                 },
                 l2: SentinelL2Config::default(),
                 l3: SentinelL3Config::default(),
+                threat: Default::default(),
             },
         )
         .unwrap()
@@ -2762,6 +2913,7 @@ detection:
                     suspicious_severity: 9,
                 },
                 l3: SentinelL3Config::default(),
+                threat: Default::default(),
             },
         )
         .unwrap()

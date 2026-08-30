@@ -38,7 +38,7 @@ use super::header::FileHeaderV6;
 use super::hrki::{caminho_sidecar, construir_para_packed, Hrki, IndexPolicySet};
 use super::manifest::{
     attach_parquet, attach_sidecar, quarantine_generation as quarantine_manifest_generation,
-    record_pack,
+    record_pack, set_legal_hold,
     register_sealed_raw, ManifestStore, HRKM_MAGIC,
 };
 use super::packed::{open_packed, PackOptions, ScanCounters};
@@ -1469,6 +1469,95 @@ impl V6Log {
             return Err(err);
         }
         Ok(true)
+    }
+
+    /// Apply or remove a legal hold from every sealed segment intersecting an
+    /// inclusive LSN range.  The HRKM update is committed atomically; callers
+    /// may safely retry after a crash.
+    pub fn set_legal_hold_range(
+        &self,
+        lsn_start: Lsn,
+        lsn_end: Lsn,
+        hold: bool,
+    ) -> Result<usize, HeraclitusError> {
+        if lsn_start > lsn_end {
+            return Err(HeraclitusError::Config(
+                "legal hold possui intervalo LSN invertido".into(),
+            ));
+        }
+        let mut state = self.lock_state()?;
+        let segment_ids: Vec<_> = state
+            .manifest
+            .segments_v2
+            .iter()
+            .filter(|segment| lsn_start <= segment.last_lsn && segment.first_lsn <= lsn_end)
+            .map(|segment| segment.segment_id)
+            .collect();
+        if segment_ids.is_empty() {
+            return Ok(0);
+        }
+        let before = state.manifest.clone();
+        for segment_id in &segment_ids {
+            if let Err(error) = set_legal_hold(&mut state.manifest, *segment_id, hold) {
+                state.manifest = before;
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.manifest_store.commit(&mut state.manifest) {
+            state.manifest = before;
+            return Err(error);
+        }
+        Ok(segment_ids.len())
+    }
+
+    /// Rebuild all per-segment HRKM flags from the active event-sourced legal
+    /// hold ranges.  This closes the crash/restart window and protects segments
+    /// that were sealed after a hold was first recorded.
+    pub fn reconcile_legal_hold_ranges(
+        &self,
+        active_ranges: &[(Lsn, Lsn)],
+    ) -> Result<usize, HeraclitusError> {
+        if active_ranges.iter().any(|(start, end)| start > end) {
+            return Err(HeraclitusError::Config(
+                "legal hold possui intervalo LSN invertido".into(),
+            ));
+        }
+        let mut state = self.lock_state()?;
+        let desired: Vec<_> = state
+            .manifest
+            .segments_v2
+            .iter()
+            .map(|segment| {
+                let hold = active_ranges.iter().any(|(start, end)| {
+                    *start <= segment.last_lsn && segment.first_lsn <= *end
+                });
+                (segment.segment_id, hold)
+            })
+            .collect();
+        let changed = desired
+            .iter()
+            .filter(|(segment_id, hold)| {
+                state
+                    .manifest
+                    .segment(*segment_id)
+                    .is_some_and(|segment| segment.retention.legal_hold != *hold)
+            })
+            .count();
+        if changed == 0 {
+            return Ok(0);
+        }
+        let before = state.manifest.clone();
+        for (segment_id, hold) in desired {
+            if let Err(error) = set_legal_hold(&mut state.manifest, segment_id, hold) {
+                state.manifest = before;
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.manifest_store.commit(&mut state.manifest) {
+            state.manifest = before;
+            return Err(error);
+        }
+        Ok(changed)
     }
 
 

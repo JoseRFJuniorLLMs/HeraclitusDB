@@ -11,6 +11,69 @@ excluído (é cache, dá falsos positivos).
 > cada afirmação falsa/enganosa com a evidência. O estado real da plataforma e o
 > roteiro estão em [../PLANO-SPECS.md](../PLANO-SPECS.md).
 
+## ATUALIZAÇÃO 2026-08-30 (2) — SPEC-0047 deixou de ser código sem chamador
+
+A auditoria nomeou o padrão desta base — *implementado, testado, nunca
+chamado* — e a SPEC-0047 tinha acabado de lhe acrescentar um caso meu: o
+módulo `threat` não era referenciado fora de si próprio. Deixou de ser.
+
+`threat/plane.rs` liga as peças ao runtime:
+
+```text
+arranque   feeds_dir/*.json → StixImporter → admit (§10/§12) → IocIndex
+por evento SecurityEvent → indicadores → lookup exacto → SecuritySignal
+                                                       + ThreatSighting
+```
+
+Opt-in por `[sentinel.threat]`, como o L2 e o L3, e pela mesma razão: quem
+ligou o L0 não deve começar a ingerir feeds externos por causa disso.
+
+### Decisões, e as objeções
+
+- **A extracção de indicadores é declarada, não adivinhada.** A tentação é
+  varrer o `attributes` do evento à procura do que *pareça* um domínio ou um
+  hash. Isso produz falsos positivos com ar de autoridade: um `user_agent` que
+  contém `evil.com` não é uma ligação a `evil.com`, e um campo de 64 hex pode
+  ser um id de sessão — e o analista que recebe o match não tem como saber que
+  foi uma heurística a inventá-lo. Por isso a extracção sai de campos tipados
+  (`src`/`dst`) e de uma lista fechada de chaves de atributo. Um indicador que
+  a base observa mas não está na lista não é correlacionado: é uma lacuna
+  visível (acrescenta-se a chave) em vez de um match errado.
+- **Um feed malformado não impede o arranque.** Fica no `ThreatLoadReport` e
+  o resto carrega. Deixar um problema de terceiros virar indisponibilidade
+  nossa é a troca errada.
+- **O relatório distingue "vazio porque nada importou" de "vazio porque não há
+  feeds"** — e é consultável depois do arranque, não só visível no momento em
+  que passou.
+- **O mesmo indicador em dois campos conta uma vez.** Casar duas vezes inflaria
+  o score de §11 sem evidência nova.
+- **O relógio é o do evento, não o da máquina.** Um replay a um LSN antigo
+  reproduz a decisão que era correcta então (§12).
+- **Um `trust_level` mal escrito cai para `untrusted`.** §13: um erro de
+  configuração não pode promover um feed a autoridade.
+- **Um evento sem sujeito não produz sinal.** Um sinal sem sujeito não é
+  accionável e só enche o incidente.
+- **O nº de indicadores entra na versão do detector no checkpoint.** Dois
+  checkpoints com o mesmo `pipeline_version` e índices diferentes não descrevem
+  o mesmo detector, e um replay que não os distinguisse explicaria mal porque é
+  que o mesmo evento deu resultados diferentes.
+- **Contra-argumento que ficou por resolver:** os feeds são lidos **uma vez**,
+  no arranque. Recarregar a quente é outra coisa — §40/§41 querem versionamento
+  e rollback, o `ThreatFeed` existe para isso e ainda não está ligado — e fazê-lo
+  mal daria dois índices a decidir ao mesmo tempo. Hoje um feed novo exige
+  reiniciar o serviço.
+
+### Validação
+
+- 10 testes em `tests/spec0047_threat_sync.rs`, dos quais dois novos percorrem
+  o runtime real: um episódio bruto entra no log e saem um `SecuritySignal` e um
+  `ThreatSighting` derivados, sem ninguém chamar nada à mão. O teste verifica
+  também que **nenhum** episódio de acção aparece — §11 — e que o derivado não
+  se realimenta.
+- 10 unitários em `threat/plane.rs`.
+- `cargo test --offline --workspace` — **1030 testes, 0 falhas**; clippy
+  `--workspace --all-targets -D warnings` passa.
+
 ## CORREÇÕES 2026-08-30 — os seis achados fechados, e um erro meu
 
 ### O erro primeiro: aquilo não era flakiness, era um bug de disponibilidade

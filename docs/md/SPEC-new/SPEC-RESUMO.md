@@ -440,52 +440,61 @@ clippy `-D warnings` em `tier`, `log` e `core`. Detalhe e decisões em
 
 ## Ordem de execução atual
 
-Reordenada em 2026-08-29 pela auditoria de [STATUS.md](STATUS.md), que mediu o
-custo de cada pendência em vez de a ordenar por número de SPEC.
+Ordenada por custo medido, não por número de SPEC. Os três primeiros itens da
+lista de 2026-08-29 foram fechados em 2026-08-30 — ver as notas em
+[STATUS.md](STATUS.md).
 
-1. **Ligar o GC do HRKL v6.** `plan_gc`/`commit_gc` não têm um único chamador de
-   produção: nenhuma task no servidor, nenhum subcomando na CLI, nenhum
-   `v6_gc_interval_secs` na config. O `record_pack` marca a geração RAW como
-   `Superseded` e nada a remove, portanto **cada banco guarda RAW + PACKED para
-   sempre**: com o rácio de 21,95% medido em §207, são **5,5× o disco** que o
-   formato promete. Com o GC parado ficam inertes o grace period (§93), os pins
-   (§92), o legal hold (§94), a política de cópias (§184) e o
-   `assert_gc_invariant` (§91). O código está escrito e testado com injecção de
-   crash; falta uma task, um knob e um subcomando. **É a única pendência com
-   custo a correr hoje.**
-2. **Corrigir o flaky do `hrkl_v6_crash::sobrevive_a_kills_repetidos`** — falha
-   ~2 em 6 corridas de `--workspace`, passa 4/4 isolado, porque mata um filho
-   numa janela de `sleep` fixa enquanto faz `cargo build` dentro de si. Um teste
-   de segurança contra crash que grita falsamente é o alarme que se aprende a
-   ignorar.
-3. **Fazer a suíte por omissão correr (ou declarar) os 18 testes de Raft.** Hoje
-   `cargo test --workspace` devolve `heraclitus_raft: 0 passed` e diz "ok".
-4. **SPEC-0046** (P0, em curso) — `StrictAirGap` não existe no crate e a cadeia
-   ICP-Brasil continua por validar, com o dizê-lo escrito no próprio código.
-5. **SPEC-0048** (P1) — a última SPEC completamente vazia: `heraclitus-orchestrator`
-   e `heraclitus-forensic` não existem.
-6. **Decidir como catalogar uma geração fria no HRKM** e ligar aí o repack e a
-   recolha. O `demote`/`verify`/`recall` v6 já correm no servidor; o par novo
-   não, porque sem gerações frias no `.hrkm` não há `plan_gc` que decida
-   coletá-las.
-7. **Dar consumidor ao plano de threat intel (SPEC-0047).** O módulo `threat`
-   não é referenciado fora de si próprio: nenhum feed é ingerido e nenhum
-   `SecurityEvent` é correlacionado contra o `IocIndex`. É wiring, como o GC, mas
-   sem custo a correr contra ele hoje.
-8. **§175 (compactação lakehouse)** — à luz do §96, o nome próprio da «compaction
-   que o legado tinha»: opera sobre a projecção, regenerável por definição
-   (§100). Hoje é limitação declarada, não defeito.
-9. **Correr `lab-preflight.toml`** e marcar tempo de laboratório para os gates da
-   SPEC-0049 que exigem infraestrutura; a suíte já não é o bloqueio.
-10. **SPEC-0047, o resto** — TAXII e MISP são transporte por cima da fronteira
-    `ThreatImporter` e pertencem ao servidor; o renderizador CTIR pode ser feito
-    já (é lógica pura), o transporte não (§30: a API não se presume); os bundles
-    air-gap devem esperar pela 0046 para não haver duas verificações de bundle
-    assinado.
-11. **Roadmap 0051–0070 por dependência.** A SPEC-0051 continua travada pelo seu
-    §14 — mas a pré-condição nº 1 («o writer ainda gera v5») está desactualizada
-    desde 2026-08-24: o `storage_format` é `v6` por omissão. Restam a
-    qualificação externa da 0049 e a decisão sobre `SKIP_VALUES` (§8.2).
-12. **Não fazer:** recuperar espaço de tombstones reescrevendo HRKL. §95 e §96
-    proíbem-no; o mecanismo para dado irrecuperável é o crypto-shredding de §98,
-    no `heraclitus-compliance`.
+### Feito
+
+- ~~**Ligar o GC do HRKL v6.**~~ `V6Log::collect_garbage`, task de fundo
+  (`v6_gc_interval_secs`, 300 s por omissão), `heraclitus gc --dry-run` e a API
+  de retenção que a §93/§94 exigia e não tinha superfície. Em produção desde
+  2026-08-30.
+- ~~**O "flaky" do `hrkl_v6_crash`.**~~ Não era flakiness: o
+  `RawSegmentWriter::create` não sincronizava o header, e um crash nessa janela
+  deixava a base impossível de abrir. Corrigido na origem (fsync do header e da
+  entrada de directório) e na recuperação (um activo sem header completo é um
+  toco de crash, e sai).
+- ~~**Raft invisível na suíte por omissão.**~~ O comentário que justificava o
+  off-by-default estava obsoleto; a lacuna passou a ser visível pelo nome de um
+  teste, já que o output do `cargo test` imprime sempre os nomes.
+
+### A fazer
+
+1. **SPEC-0046** (P0, em curso) — `StrictAirGap` não existe no crate e a cadeia
+   ICP-Brasil continua por validar, com o dizê-lo escrito no próprio código
+   (`receipt.rs:16`, `verify.rs:41`, `tsa.rs:117`, `signer.rs:211`).
+2. **Reduzir a pilha do "implementado, testado, nunca chamado"** antes de a
+   aumentar. É o padrão que esta base repete e que a auditoria nomeou; e a
+   SPEC-0047 acrescentou-lhe um caso meu. Por ordem de facilidade:
+   - **dar consumidor ao plano de threat intel** — o módulo `threat` não é
+     referenciado fora de si próprio: nenhum feed é ingerido e nenhum
+     `SecurityEvent` é correlacionado contra o `IocIndex`. É wiring, sem decisão
+     de formato pelo meio;
+   - **catalogar gerações frias no HRKM** — precisa de uma **decisão de modelo**
+     e por isso está parado à espera dela, não de código. Ver a nota do tier
+     frio: ou a cópia fria é uma geração nova (N+1) com a mesma raiz lógica, que
+     cabe no formato actual mas gasta um número de geração por movimento de tier
+     e faz o `physical_digest` deixar de ser único; ou é outra `location` da
+     mesma geração, que é o que o conceito pede mas implica mudar o `.hrkm`.
+     Enquanto não for decidida, o `plan_gc` nunca vê uma geração fria e o
+     `repack_generation`/`collect_cold_locations` ficam sem chamador.
+3. **SPEC-0048** (P1) — a última SPEC completamente vazia:
+   `heraclitus-orchestrator` e `heraclitus-forensic` não existem.
+4. **§175 (compactação lakehouse)** — à luz do §96, o nome próprio da
+   «compaction que o legado tinha»: opera sobre a projecção, regenerável por
+   definição (§100). Hoje é limitação declarada, não defeito.
+5. **Correr `lab-preflight.toml`** e marcar tempo de laboratório para os gates
+   da SPEC-0049 que exigem infraestrutura; a suíte já não é o bloqueio.
+6. **SPEC-0047, o resto** — TAXII e MISP são transporte por cima da fronteira
+   `ThreatImporter` e pertencem ao servidor; o renderizador CTIR pode ser feito
+   já (é lógica pura), o transporte não (§30: a API não se presume); os bundles
+   air-gap devem esperar pela 0046 para não haver duas verificações de bundle
+   assinado.
+7. **Roadmap 0051–0070 por dependência.** A SPEC-0051 continua travada pelo seu
+   §14 — mas a pré-condição nº 1 («o writer ainda gera v5») está desactualizada
+   desde 2026-08-24: o `storage_format` é `v6` por omissão. Restam a
+   qualificação externa da 0049 e a decisão sobre `SKIP_VALUES` (§8.2).
+8. **Não fazer:** recuperar espaço de tombstones reescrevendo HRKL. §95 e §96
+   proíbem-no; o mecanismo para dado irrecuperável é o crypto-shredding de §98,
+   no `heraclitus-compliance`.
