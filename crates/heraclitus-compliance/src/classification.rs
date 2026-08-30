@@ -276,6 +276,11 @@ pub fn classify_derived_episode(
             "classification.retention_policy",
             target.retention_policy.clone(),
         ),
+        // O guard de destruição e as políticas regulatórias consomem a chave
+        // canónica `retention.class`. A classificação é o produtor autoritativo
+        // para eventos derivados; manter apenas o alias namespaced tornava a
+        // retenção descritiva, mas não executável.
+        ("retention.class", target.retention_policy.clone()),
         ("classification.maximum_source_label", maximum.label.clone()),
         (
             "classification.source_set_digest",
@@ -418,6 +423,7 @@ mod tests {
             derived.attrs["classification.access_policy"],
             "access-secret"
         );
+        assert_eq!(derived.attrs["retention.class"], "retention-secret");
         assert_eq!(derived.parents.len(), 2);
     }
 

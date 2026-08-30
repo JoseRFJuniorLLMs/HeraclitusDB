@@ -2,6 +2,7 @@
 
 use crate::engine::Engine;
 use heraclitus_core::{AccessRole, Episode, EventKind, ProductPoint};
+use heraclitus_log::EpisodeLog;
 use heraclitus_proto::v1 as pb;
 use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -269,7 +270,15 @@ impl pb::heraclitus_server::Heraclitus for Service {
             // `legal-holds` e leitura: saber quem esta retido nao muda nada.
             // Colocar e levantar um hold ficam no ramo Admin abaixo.
             "stats" | "verify" | "sentinel-status" | "sentinel-incidents" | "sentinel-actions"
-            | "legal-holds" => AccessRole::Auditor,
+            | "legal-holds"
+            | "regulatory-policies"
+            | "regulatory-decisions"
+            | "privacy-state"
+            | "deferred-anchor-prepare"
+            | "deferred-anchors"
+            | "model-bundles" => {
+                AccessRole::Auditor
+            }
             _ => AccessRole::Admin,
         };
         let principal = crate::auth::require(&req, required)?;
@@ -293,6 +302,22 @@ impl pb::heraclitus_server::Heraclitus for Service {
                 // garantia que só os testes conseguiam exercer.
                 op @ ("legal-hold-place" | "legal-hold-release" | "legal-holds") => {
                     crate::grpc::legal_hold_op(&engine, op, &r.arg)
+                }
+                op @ ("regulatory-policy-activate"
+                | "regulatory-evaluate"
+                | "regulatory-policies"
+                | "regulatory-decisions") => {
+                    crate::grpc::regulatory_policy_op(&engine, op, &r.arg)
+                }
+                op @ ("privacy-assessment"
+                | "privacy-deadline"
+                | "privacy-package"
+                | "privacy-state") => crate::grpc::privacy_incident_op(&engine, op, &r.arg),
+                op @ ("deferred-anchor-prepare" | "deferred-anchor-import" | "deferred-anchors") => {
+                    crate::grpc::deferred_anchor_op(&engine, op, &r.arg)
+                }
+                op @ ("model-bundle-activate" | "model-bundles") => {
+                    crate::grpc::model_bundle_op(&engine, op, &r.arg)
                 }
                 "verify" => match engine.verify() {
                     Ok(v) => (true, v.to_string()),
@@ -417,6 +442,13 @@ pub(crate) fn legal_hold_op(
     op: &str,
     arg: &str,
 ) -> (bool, String) {
+    if engine.is_replicated() && op != "legal-holds" {
+        return (
+            false,
+            "operação regulatória direta recusada em nó replicado; o append ainda não passa pelo consenso"
+                .into(),
+        );
+    }
     let body = match serde_json::from_str::<serde_json::Value>(arg) {
         Ok(value) => value,
         // A listagem não precisa de corpo; as outras duas precisam.
@@ -496,5 +528,372 @@ pub(crate) fn legal_hold_op(
             }
         }
         outra => (false, format!("operação desconhecida: {outra}")),
+    }
+}
+
+/// SPEC-0046 — superfície operacional do motor regulatório versionado.
+///
+/// Ativações e decisões são eventos imutáveis no mesmo log da base. As duas
+/// listagens expõem o estado reconstruído por replay; não mantêm um segundo
+/// banco oportunista que pudesse divergir da evidência.
+pub(crate) fn regulatory_policy_op(
+    engine: &std::sync::Arc<crate::engine::Engine>,
+    op: &str,
+    arg: &str,
+) -> (bool, String) {
+    if engine.is_replicated()
+        && matches!(op, "regulatory-policy-activate" | "regulatory-evaluate")
+    {
+        return (
+            false,
+            "operação regulatória direta recusada em nó replicado; o append ainda não passa pelo consenso"
+                .into(),
+        );
+    }
+
+    let regulatory = heraclitus_compliance::RegulatoryPolicyEngine::new(engine.log.clone());
+    match op {
+        "regulatory-policy-activate" => {
+            let activation = match serde_json::from_str::<heraclitus_compliance::PolicyActivation>(
+                arg,
+            ) {
+                Ok(activation) => activation,
+                Err(error) => return (false, format!("ativação de política inválida: {error}")),
+            };
+            match regulatory.activate_policy(activation) {
+                Ok(lsn) => (true, format!("policy_activation_lsn={lsn}")),
+                Err(error) => (false, error.to_string()),
+            }
+        }
+        "regulatory-evaluate" => {
+            #[derive(serde::Deserialize)]
+            struct RequestBody {
+                policy_id: String,
+                context: heraclitus_compliance::ComplianceContext,
+            }
+            let request = match serde_json::from_str::<RequestBody>(arg) {
+                Ok(request) => request,
+                Err(error) => return (false, format!("avaliação regulatória inválida: {error}")),
+            };
+            match regulatory.evaluate_and_persist(&request.policy_id, request.context) {
+                Ok((lsn, decision)) => (
+                    true,
+                    serde_json::json!({ "lsn": lsn, "decision": decision }).to_string(),
+                ),
+                Err(error) => (false, error.to_string()),
+            }
+        }
+        "regulatory-policies" => match regulatory.state() {
+            Ok(state) => {
+                let policies: Vec<_> = state
+                    .policy_activations
+                    .into_iter()
+                    .map(|record| {
+                        serde_json::json!({
+                            "lsn": record.lsn,
+                            "activation": record.activation,
+                        })
+                    })
+                    .collect();
+                (true, serde_json::Value::Array(policies).to_string())
+            }
+            Err(error) => (false, error.to_string()),
+        },
+        "regulatory-decisions" => match regulatory.state() {
+            Ok(state) => {
+                let decisions: Vec<_> = state
+                    .decisions
+                    .into_iter()
+                    .map(|record| {
+                        serde_json::json!({
+                            "lsn": record.lsn,
+                            "decision": record.decision,
+                        })
+                    })
+                    .collect();
+                (true, serde_json::Value::Array(decisions).to_string())
+            }
+            Err(error) => (false, error.to_string()),
+        },
+        other => (false, format!("operação desconhecida: {other}")),
+    }
+}
+
+/// SPEC-0046 — avaliação de incidente LGPD, prazo versionado e geração do
+/// rascunho ANPD. Não existe operação de "submit": o pacote termina
+/// explicitamente em `awaiting_human_authorization`.
+pub(crate) fn privacy_incident_op(
+    engine: &std::sync::Arc<crate::engine::Engine>,
+    op: &str,
+    arg: &str,
+) -> (bool, String) {
+    if engine.is_replicated()
+        && matches!(op, "privacy-assessment" | "privacy-deadline" | "privacy-package")
+    {
+        return (
+            false,
+            "operação de privacidade direta recusada em nó replicado; o append ainda não passa pelo consenso"
+                .into(),
+        );
+    }
+    let privacy = heraclitus_compliance::PrivacyIncidentEngine::new(engine.log.clone());
+    match op {
+        "privacy-assessment" => {
+            let assessment = match serde_json::from_str::<
+                heraclitus_compliance::PrivacyIncidentAssessment,
+            >(arg) {
+                Ok(assessment) => assessment,
+                Err(error) => return (false, format!("avaliação de privacidade inválida: {error}")),
+            };
+            match privacy.persist_assessment(assessment) {
+                Ok(lsn) => (true, format!("privacy_assessment_lsn={lsn}")),
+                Err(error) => (false, error.to_string()),
+            }
+        }
+        "privacy-deadline" => {
+            #[derive(serde::Deserialize)]
+            struct RequestBody {
+                incident_id: String,
+                triggered_at: u64,
+                policy: heraclitus_compliance::DeadlinePolicy,
+            }
+            let request = match serde_json::from_str::<RequestBody>(arg) {
+                Ok(request) => request,
+                Err(error) => return (false, format!("pedido de prazo inválido: {error}")),
+            };
+            match privacy.calculate_and_persist_deadline(
+                request.incident_id,
+                request.triggered_at,
+                &request.policy,
+            ) {
+                Ok((lsn, deadline)) => (
+                    true,
+                    serde_json::json!({ "lsn": lsn, "deadline": deadline }).to_string(),
+                ),
+                Err(error) => (false, error.to_string()),
+            }
+        }
+        "privacy-package" => {
+            #[derive(serde::Deserialize)]
+            struct RequestBody {
+                assessment_id: String,
+                deadline_id: String,
+                export_id: String,
+                data: heraclitus_compliance::IncidentPackageData,
+                export_policy: heraclitus_compliance::PrivacyExportPolicy,
+            }
+            let request = match serde_json::from_str::<RequestBody>(arg) {
+                Ok(request) => request,
+                Err(error) => return (false, format!("pedido de pacote ANPD inválido: {error}")),
+            };
+            let state = match privacy.state() {
+                Ok(state) => state,
+                Err(error) => return (false, error.to_string()),
+            };
+            let assessment = match state
+                .assessments
+                .iter()
+                .find(|(_, value)| value.assessment_id == request.assessment_id)
+                .map(|(_, value)| value)
+            {
+                Some(value) => value,
+                None => return (false, "assessment_id não persistido".into()),
+            };
+            let deadline = match state
+                .deadlines
+                .iter()
+                .find(|(_, value)| value.deadline_id == request.deadline_id)
+                .map(|(_, value)| value)
+            {
+                Some(value) => value,
+                None => return (false, "deadline_id não persistido".into()),
+            };
+            let output = match engine.compliance_export_dir("anpd", &request.export_id) {
+                Ok(output) => output,
+                Err(error) => return (false, error.to_string()),
+            };
+            match privacy.generate_package(
+                assessment,
+                deadline,
+                &request.data,
+                &request.export_policy,
+                &output,
+            ) {
+                Ok((lsn, receipt)) => (
+                    true,
+                    serde_json::json!({ "lsn": lsn, "receipt": receipt }).to_string(),
+                ),
+                Err(error) => (false, error.to_string()),
+            }
+        }
+        "privacy-state" => match privacy.state() {
+            Ok(state) => (
+                true,
+                serde_json::json!({
+                    "assessments": state.assessments,
+                    "deadlines": state.deadlines,
+                    "exports": state.exports,
+                })
+                .to_string(),
+            ),
+            Err(error) => (false, error.to_string()),
+        },
+        other => (false, format!("operação desconhecida: {other}")),
+    }
+}
+
+/// SPEC-0046 — fronteira air-gap. `prepare` devolve somente um compromisso
+/// criptográfico (nunca episódios); a assinatura institucional pode ocorrer
+/// fora do processo. `import` verifica as duas assinaturas, o binding exato da
+/// resposta e persiste a âncora encadeada.
+pub(crate) fn deferred_anchor_op(
+    engine: &std::sync::Arc<crate::engine::Engine>,
+    op: &str,
+    arg: &str,
+) -> (bool, String) {
+    if engine.is_replicated() && op == "deferred-anchor-import" {
+        return (
+            false,
+            "importação de âncora direta recusada em nó replicado; o append ainda não passa pelo consenso"
+                .into(),
+        );
+    }
+    let registry = heraclitus_compliance::DeferredAnchorRegistry::new(engine.log.clone());
+    match op {
+        "deferred-anchor-prepare" => {
+            #[derive(serde::Deserialize)]
+            struct RequestBody {
+                lsn_start: u64,
+                lsn_end: u64,
+                created_at_hlc: u64,
+            }
+            let request = match serde_json::from_str::<RequestBody>(arg) {
+                Ok(request) => request,
+                Err(error) => return (false, format!("pedido de commitment inválido: {error}")),
+            };
+            let commitment = match heraclitus_compliance::EvidenceCommitment::from_log(
+                engine.log.as_ref(),
+                request.lsn_start,
+                request.lsn_end,
+                request.created_at_hlc,
+            ) {
+                Ok(commitment) => commitment,
+                Err(error) => return (false, error.to_string()),
+            };
+            let previous = match registry.state() {
+                Ok(state) => state.latest_digest(),
+                Err(error) => return (false, error.to_string()),
+            };
+            match heraclitus_compliance::DeferredAnchorRequest::new(commitment, previous) {
+                Ok(request) => (true, serde_json::to_string(&request).unwrap_or_default()),
+                Err(error) => (false, error.to_string()),
+            }
+        }
+        "deferred-anchor-import" => {
+            #[derive(serde::Deserialize)]
+            struct RequestBody {
+                signed_request: heraclitus_compliance::SignedDeferredAnchorRequest,
+                signed_response: heraclitus_compliance::SignedDeferredAnchorResponse,
+                policy: heraclitus_compliance::DeferredTransferPolicy,
+            }
+            let request = match serde_json::from_str::<RequestBody>(arg) {
+                Ok(request) => request,
+                Err(error) => return (false, format!("importação de âncora inválida: {error}")),
+            };
+            let anchor = match heraclitus_compliance::import_deferred_response(
+                &request.signed_request,
+                &request.signed_response,
+                &request.policy,
+            ) {
+                Ok(anchor) => anchor,
+                Err(error) => return (false, error.to_string()),
+            };
+            match registry.persist(anchor.clone()) {
+                Ok(lsn) => (
+                    true,
+                    serde_json::json!({ "lsn": lsn, "anchor": anchor }).to_string(),
+                ),
+                Err(error) => (false, error.to_string()),
+            }
+        }
+        "deferred-anchors" => match registry.state() {
+            Ok(state) => (true, serde_json::to_string(&state.anchors).unwrap_or_default()),
+            Err(error) => (false, error.to_string()),
+        },
+        other => (false, format!("operação desconhecida: {other}")),
+    }
+}
+
+/// SPEC-0046 — valida e ativa bundles offline já colocados sob a raiz de dados
+/// controlada pelo servidor. O pedido escolhe um `bundle_id`, nunca um caminho
+/// arbitrário do host.
+pub(crate) fn model_bundle_op(
+    engine: &std::sync::Arc<crate::engine::Engine>,
+    op: &str,
+    arg: &str,
+) -> (bool, String) {
+    if engine.is_replicated() && op == "model-bundle-activate" {
+        return (
+            false,
+            "ativação de bundle direta recusada em nó replicado; o append ainda não passa pelo consenso"
+                .into(),
+        );
+    }
+    match op {
+        "model-bundle-activate" => {
+            #[derive(serde::Deserialize)]
+            struct RequestBody {
+                bundle_id: String,
+                policy: heraclitus_compliance::ModelBundlePolicy,
+            }
+            let request = match serde_json::from_str::<RequestBody>(arg) {
+                Ok(request) => request,
+                Err(error) => return (false, format!("pedido de bundle inválido: {error}")),
+            };
+            let root = match engine.compliance_export_dir("model-bundles", &request.bundle_id) {
+                Ok(root) => root,
+                Err(error) => return (false, error.to_string()),
+            };
+            let signed = match heraclitus_compliance::SignedModelBundle::load(&root) {
+                Ok(signed) => signed,
+                Err(error) => return (false, error.to_string()),
+            };
+            let verified = match heraclitus_compliance::verify_model_bundle(
+                &root,
+                &signed,
+                &request.policy,
+            ) {
+                Ok(verified) => verified,
+                Err(error) => return (false, error.to_string()),
+            };
+            match heraclitus_compliance::ModelBundleRegistry::new(engine.log.clone())
+                .activate(verified.clone())
+            {
+                Ok(lsn) => (
+                    true,
+                    serde_json::json!({ "lsn": lsn, "bundle": verified }).to_string(),
+                ),
+                Err(error) => (false, error.to_string()),
+            }
+        }
+        "model-bundles" => {
+            let rows = match engine.log.scan(0, engine.log.head()) {
+                Ok(rows) => rows,
+                Err(error) => return (false, error.to_string()),
+            };
+            let bundles: Vec<_> = rows
+                .into_iter()
+                .filter(|(_, episode)| episode.kind.label() == "SecurityModelActivation")
+                .filter_map(|(lsn, episode)| {
+                    serde_json::from_slice::<heraclitus_compliance::VerifiedModelBundle>(
+                        &episode.content,
+                    )
+                    .ok()
+                    .map(|bundle| serde_json::json!({ "lsn": lsn, "bundle": bundle }))
+                })
+                .collect();
+            (true, serde_json::Value::Array(bundles).to_string())
+        }
+        other => (false, format!("operação desconhecida: {other}")),
     }
 }

@@ -94,6 +94,7 @@ pub fn router_with_sentinel(
         .route("/stats", get(stats))
         .route("/metrics", get(metrics))
         .route("/state", get(state))
+        .route("/compliance/status", get(compliance_status))
         .route("/verify", get(verify))
         .route("/verify/:segment", get(verify_segment))
         // Fluxo ao vivo de appends (SSE). O log já emitia cada append
@@ -1312,6 +1313,28 @@ async fn healthz() -> &'static str {
 
 async fn stats(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
     Json(engine.stats())
+}
+
+async fn compliance_status(State(engine): State<Arc<Engine>>) -> Response {
+    match tokio::task::spawn_blocking(move || engine.compliance_status()).await {
+        Ok(Ok(snapshot)) => Json(snapshot).into_response(),
+        Ok(Err(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "compliance_status_failed",
+                "message": error.to_string()
+            })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "compliance_status_join_failed",
+                "message": error.to_string()
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn metrics(

@@ -7,7 +7,9 @@ use heraclitus_core::{
     Episode, EventKind, HeraclitusConfig, HeraclitusError, Lsn, ProductPoint, SegmentId,
 };
 use heraclitus_crypto::KeyStore;
-use heraclitus_compliance::{RegulatoryState, RequirementEffect};
+use heraclitus_compliance::{
+    ComplianceDashboardSnapshot, RegulatoryState, RequirementEffect,
+};
 use heraclitus_index_attr::AttrIndex;
 use heraclitus_index_graph::entity::EntityResolver;
 use heraclitus_index_graph::temporal::TemporalGraph;
@@ -642,6 +644,50 @@ impl Engine {
         Ok(path)
     }
 
+    /// SPEC-0046 §36 — snapshot operacional derivado exclusivamente do log
+    /// append-only e dos recibos persistidos em `<data_dir>/receipts`.
+    ///
+    /// A construção é deliberadamente read-only e mantém tokens externos sem
+    /// trust chain no estado `not_yet_production_trusted`; a superfície REST não
+    /// pode promover evidência apenas por estar apresentando-a num dashboard.
+    pub fn compliance_status(&self) -> Result<ComplianceDashboardSnapshot, HeraclitusError> {
+        let data_dir = self.attr_dir.parent().unwrap_or(self.attr_dir.as_path());
+        ComplianceDashboardSnapshot::build(
+            self.log.as_ref(),
+            data_dir.join("receipts"),
+            heraclitus_compliance::now_unix_ms() / 1_000,
+        )
+        .map_err(|error| HeraclitusError::Config(format!("compliance dashboard: {error}")))
+    }
+
+    /// Resolve a server-owned compliance export directory. Remote callers can
+    /// choose an identifier, never an arbitrary host path.
+    pub(crate) fn compliance_export_dir(
+        &self,
+        category: &str,
+        export_id: &str,
+    ) -> Result<std::path::PathBuf, HeraclitusError> {
+        let safe = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        };
+        if !safe(category) || !safe(export_id) {
+            return Err(HeraclitusError::Config(
+                "category/export_id deve conter apenas ASCII alfanumérico, '-', '_' ou '.'"
+                    .into(),
+            ));
+        }
+        let data_dir = self.attr_dir.parent().unwrap_or(self.attr_dir.as_path());
+        Ok(data_dir
+            .join("compliance")
+            .join("exports")
+            .join(category)
+            .join(export_id))
+    }
+
     /// True when the consensus replication router is installed (cluster mode).
     /// Usado por endpoints cuja escrita ainda **não** passa pelo consenso (o
     /// `tier` demote appenda o recibo direto ao log) para os recusar sob
@@ -988,6 +1034,10 @@ impl Engine {
         &self,
         cfg: &heraclitus_distill::DistillConfig,
     ) -> Result<Vec<Lsn>, HeraclitusError> {
+        use heraclitus_compliance::{
+            classify_derived_episode, ClassificationPolicy, SourceClassification,
+        };
+        use std::collections::HashMap as StdHashMap;
         use std::sync::atomic::Ordering;
         let from = self.distill_cursor.load(Ordering::Acquire);
         let head = self.log.head();
@@ -1002,7 +1052,106 @@ impl Engine {
         let next_cursor = episodes.last().map(|(l, _)| l + 1).unwrap_or(head);
 
         let distiller = heraclitus_distill::Distiller::new(self.metric.clone(), cfg.clone());
-        let facts = distiller.distill_episodes(&episodes, head)?;
+        let mut facts = distiller.distill_episodes(&episodes, head)?;
+
+        // SPEC-0046: classificação acompanha a proveniência real do distill.
+        // Preparar TODOS os Facts antes de appendar evita uma emissão parcial se
+        // uma fonte estiver sem rótulo ou a política não puder ser validada.
+        let sources_by_id: StdHashMap<_, _> = episodes
+            .iter()
+            .map(|(_, episode)| (episode.id, episode))
+            .collect();
+        let mut classification_policy: Option<ClassificationPolicy> = None;
+        for fact in &mut facts {
+            let classified_parent_count = fact
+                .parents
+                .iter()
+                .filter_map(|id| sources_by_id.get(id))
+                .filter(|source| source.attrs.contains_key("classification.label"))
+                .count();
+            if classified_parent_count == 0 {
+                continue;
+            }
+            if classified_parent_count != fact.parents.len() {
+                return Err(HeraclitusError::Config(
+                    "distill recusado: cluster mistura fontes classificadas e sem classificação"
+                        .into(),
+                ));
+            }
+
+            if classification_policy.is_none() {
+                let data_dir = self.attr_dir.parent().unwrap_or(self.attr_dir.as_path());
+                let path = data_dir
+                    .join("compliance")
+                    .join("classification-policy.json");
+                let raw = std::fs::read(&path).map_err(|error| {
+                    HeraclitusError::Config(format!(
+                        "fontes classificadas exigem política em {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                let policy: ClassificationPolicy =
+                    serde_json::from_slice(&raw).map_err(|error| {
+                        HeraclitusError::Config(format!(
+                            "política de classificação inválida em {}: {error}",
+                            path.display()
+                        ))
+                    })?;
+                policy.validate().map_err(|error| {
+                    HeraclitusError::Config(format!(
+                        "política de classificação inválida em {}: {error}",
+                        path.display()
+                    ))
+                })?;
+                if policy.identity.effective_from > head {
+                    return Err(HeraclitusError::Config(format!(
+                        "política de classificação {} só vigora a partir do LSN {} (head atual: {head})",
+                        policy.identity.policy_id, policy.identity.effective_from
+                    )));
+                }
+                classification_policy = Some(policy);
+            }
+
+            let sources: Vec<SourceClassification> = fact
+                .parents
+                .iter()
+                .map(|id| {
+                    let source = sources_by_id.get(id).ok_or_else(|| {
+                        HeraclitusError::Config(format!(
+                            "distill perdeu a fonte classificada {id} da janela corrente"
+                        ))
+                    })?;
+                    let label = source
+                        .attrs
+                        .get("classification.label")
+                        .cloned()
+                        .ok_or_else(|| {
+                            HeraclitusError::Config(format!(
+                                "fonte {id} não possui classification.label"
+                            ))
+                    })?;
+                    Ok(SourceClassification {
+                        event_id: *id,
+                        label,
+                    })
+                })
+                .collect::<Result<_, HeraclitusError>>()?;
+            classify_derived_episode(
+                fact,
+                &sources,
+                None,
+                None,
+                classification_policy
+                    .as_ref()
+                    .expect("policy was loaded for classified sources"),
+            )
+            .map_err(|error| {
+                HeraclitusError::Config(format!(
+                    "não foi possível classificar FactDerived {}: {error}",
+                    fact.id
+                ))
+            })?;
+        }
         let mut out = Vec::with_capacity(facts.len());
         for ev in facts {
             out.push(self.append(ev)?); // §2.6
@@ -2940,6 +3089,95 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "distill")]
+    #[test]
+    fn distill_tick_propagates_the_most_restrictive_classification() {
+        use heraclitus_compliance::{ClassificationControls, ClassificationPolicy};
+        use heraclitus_core::ProductPoint;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let dir = tempfile::tempdir().unwrap();
+        let compliance_dir = dir.path().join("compliance");
+        std::fs::create_dir_all(&compliance_dir).unwrap();
+        let labels = BTreeMap::from([
+            (
+                "internal".into(),
+                ClassificationControls {
+                    label: "internal".into(),
+                    rank: 1,
+                    access_policy: "employees".into(),
+                    export_policy: "company-only".into(),
+                    ai_disclosure_policy: "approved-models".into(),
+                    retention_policy: "ordinary".into(),
+                },
+            ),
+            (
+                "secret".into(),
+                ClassificationControls {
+                    label: "secret".into(),
+                    rank: 5,
+                    access_policy: "need-to-know".into(),
+                    export_policy: "never".into(),
+                    ai_disclosure_policy: "deny".into(),
+                    retention_policy: "classified_information".into(),
+                },
+            ),
+        ]);
+        let policy = ClassificationPolicy::new(
+            "classification-main",
+            "2026-08-30",
+            0,
+            labels,
+            BTreeSet::new(),
+        )
+        .unwrap();
+        std::fs::write(
+            compliance_dir.join("classification-policy.json"),
+            serde_json::to_vec_pretty(&policy).unwrap(),
+        )
+        .unwrap();
+
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            ..Default::default()
+        };
+        let engine = Engine::open(&cfg).unwrap();
+        for i in 0..4 {
+            let mut event = Episode::new(
+                "classified-source",
+                EventKind::Observation,
+                format!("segredo {i}").into_bytes(),
+            );
+            event.embedding = Some(ProductPoint {
+                hyp: vec![0.40 + i as f32 * 0.01, 0.0],
+                sph: vec![],
+                euc: vec![],
+            });
+            event
+                .attrs
+                .insert("classification.label".into(), "secret".into());
+            engine.append(event).unwrap();
+        }
+
+        let facts = engine
+            .distill_tick(&heraclitus_distill::DistillConfig::default())
+            .unwrap();
+        assert_eq!(facts.len(), 1);
+        let (_, derived) = engine.log.read(facts[0]).unwrap().unwrap();
+        assert_eq!(derived.attrs["classification.label"], "secret");
+        assert_eq!(derived.attrs["classification.rank"], "5");
+        assert_eq!(
+            derived.attrs["classification.retention_policy"],
+            "classified_information"
+        );
+        assert_eq!(
+            derived.attrs["classification.policy_id"],
+            "classification-main"
+        );
+        assert_eq!(derived.parents.len(), 4);
+    }
+
     #[test]
     fn spec027_telemetry_lands_in_log_and_is_gql_queryable() {
         // SPEC-027 wired: emit_telemetry appends SystemMetric episodes to the
@@ -3815,6 +4053,446 @@ mod legal_hold_entrypoint_tests {
         assert!(
             holds[0]["lsn_end"].as_u64().unwrap() < depois,
             "o hold cobriu um evento posterior a sua criacao"
+        );
+    }
+}
+
+#[cfg(test)]
+mod regulatory_entrypoint_tests {
+    use super::*;
+    use heraclitus_compliance::{
+        BusinessCalendar, ComplianceContext, ComplianceEvidenceRef, CompliancePredicate,
+        ComplianceRequirement, ConfiguredRegulatoryPolicy, DeadlinePolicy,
+        DeferredAnchorRequest, DeferredTransferPolicy, IncidentPackageData, InstitutionalSigner,
+        LocalTsa, ModelBundlePolicy, ModelManifest, PolicyActivation, PolicyIdentity,
+        PrivacyExportPolicy, PrivacyIncidentAssessment, RegulatoryRule, RequirementEffect,
+        RetentionClass, RiskLevel, SignedDeferredAnchorRequest, SoftKeySigner,
+    };
+    use heraclitus_core::{FsyncPolicy, HeraclitusConfig};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+
+    #[test]
+    fn admin_activates_evaluates_lists_and_enforces_regulatory_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            encryption_at_rest: true,
+            ..Default::default()
+        };
+        let engine = Arc::new(Engine::open(&cfg).unwrap());
+        let subject = "titular:hmac-sha256:policy-protected";
+        engine
+            .append(Episode::new(
+                subject,
+                EventKind::Custom("PersonalData".into()),
+                b"protected by policy".to_vec(),
+            ))
+            .unwrap();
+
+        let policy = ConfiguredRegulatoryPolicy::new(
+            "lgpd-retention",
+            "2026.1",
+            0,
+            vec![RegulatoryRule {
+                rule_id: "prevent-personal-data-destruction".into(),
+                predicate: CompliancePredicate {
+                    event_kind: Some("PersonalData".into()),
+                    retention_class: Some(RetentionClass::PersonalData),
+                    attr_equals: BTreeMap::new(),
+                },
+                requirements: vec![ComplianceRequirement {
+                    requirement_id: "legal-basis-required".into(),
+                    legal_basis: "LGPD art. 16".into(),
+                    effect: RequirementEffect::PreventDestruction,
+                }],
+            }],
+        )
+        .unwrap();
+        let activation = PolicyActivation {
+            policy,
+            activated_by: "dpo@example.test".into(),
+            approval_ref: "change-0046".into(),
+        };
+        let (ok, message) = crate::grpc::regulatory_policy_op(
+            &engine,
+            "regulatory-policy-activate",
+            &serde_json::to_string(&activation).unwrap(),
+        );
+        assert!(ok, "{message}");
+
+        let context = ComplianceContext {
+            subject_id: subject.into(),
+            event_kind: "PersonalData".into(),
+            attrs: BTreeMap::new(),
+            retention_class: RetentionClass::PersonalData,
+            effective_at: 0,
+            as_of_lsn: engine.log.head().saturating_sub(1),
+        };
+        let request = serde_json::json!({
+            "policy_id": "lgpd-retention",
+            "context": context,
+        });
+        let (ok, decision) = crate::grpc::regulatory_policy_op(
+            &engine,
+            "regulatory-evaluate",
+            &request.to_string(),
+        );
+        assert!(ok, "{decision}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&decision).unwrap()["decision"]
+                ["requirements"][0]["effect"]["effect"],
+            "prevent_destruction"
+        );
+
+        let (ok, policies) =
+            crate::grpc::regulatory_policy_op(&engine, "regulatory-policies", "");
+        assert!(ok, "{policies}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&policies)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let (ok, decisions) =
+            crate::grpc::regulatory_policy_op(&engine, "regulatory-decisions", "");
+        assert!(ok, "{decisions}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&decisions)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        assert!(
+            engine.shred(subject).is_err(),
+            "a decisão persistida precisa bloquear a destruição real"
+        );
+    }
+
+    #[test]
+    fn admin_builds_auditable_anpd_draft_under_the_server_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            ..Default::default()
+        };
+        let engine = Arc::new(Engine::open(&cfg).unwrap());
+        let evidence = Episode::new(
+            "sentinel",
+            EventKind::Custom("IncidentEvidence".into()),
+            b"evidence".to_vec(),
+        );
+        let evidence_id = evidence.id;
+        let evidence_lsn = engine.append_internal(evidence).unwrap();
+        let evidence_ref = ComplianceEvidenceRef {
+            lsn: evidence_lsn,
+            event_id: evidence_id,
+            relation: "source incident".into(),
+        };
+        let assessment = PrivacyIncidentAssessment {
+            assessment_id: "assessment-anpd-1".into(),
+            incident_id: "incident-anpd-1".into(),
+            personal_data_involved: true,
+            categories: vec!["credentials".into()],
+            estimated_subjects: Some(12),
+            vulnerable_subjects: false,
+            sensitive_data: false,
+            estimated_risk: RiskLevel::High,
+            evidence: vec![evidence_ref.clone()],
+            assessed_by: "privacy-officer".into(),
+            assessed_at_lsn: engine.log.head(),
+            policy: PolicyIdentity {
+                policy_id: "incident-assessment".into(),
+                version: "2026.1".into(),
+                digest: [7; 32],
+                effective_from: 0,
+            },
+        };
+        let (ok, message) = crate::grpc::privacy_incident_op(
+            &engine,
+            "privacy-assessment",
+            &serde_json::to_string(&assessment).unwrap(),
+        );
+        assert!(ok, "{message}");
+
+        let deadline_policy = DeadlinePolicy::new(
+            "anpd-deadline",
+            "resolution-15-2024/v1",
+            0,
+            "ANPD",
+            3,
+            20,
+            "Resolução CD/ANPD 15/2024",
+            BusinessCalendar::default(),
+        )
+        .unwrap();
+        let deadline_request = serde_json::json!({
+            "incident_id": "incident-anpd-1",
+            "triggered_at": 0,
+            "policy": deadline_policy,
+        });
+        let (ok, deadline_response) = crate::grpc::privacy_incident_op(
+            &engine,
+            "privacy-deadline",
+            &deadline_request.to_string(),
+        );
+        assert!(ok, "{deadline_response}");
+        let deadline_id = serde_json::from_str::<serde_json::Value>(&deadline_response).unwrap()
+            ["deadline"]["deadline_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let export_policy = PrivacyExportPolicy::new(
+            "anpd-export",
+            "2026.1",
+            0,
+            [
+                "assessment".into(),
+                "incident".into(),
+                "affected_data".into(),
+                "mitigation".into(),
+                "timeline".into(),
+            ]
+            .into_iter()
+            .collect::<BTreeSet<String>>(),
+            BTreeSet::new(),
+        )
+        .unwrap();
+        let package_request = serde_json::json!({
+            "assessment_id": "assessment-anpd-1",
+            "deadline_id": deadline_id,
+            "export_id": "incident-anpd-1",
+            "data": IncidentPackageData {
+                summary: "credential disclosure under investigation".into(),
+                affected_assets: vec!["portal".into()],
+                affected_data: BTreeMap::from([("category".into(), "credential".into())]),
+                mitigation_actions: vec!["credential rotation".into()],
+                timeline: vec![evidence_ref],
+                evidence_anchor_ids: vec!["anchor-1".into()],
+            },
+            "export_policy": export_policy,
+        });
+        let (ok, package_response) = crate::grpc::privacy_incident_op(
+            &engine,
+            "privacy-package",
+            &package_request.to_string(),
+        );
+        assert!(ok, "{package_response}");
+        let expected = dir
+            .path()
+            .join("compliance/exports/anpd/incident-anpd-1");
+        assert!(expected.join("evidence-manifest.json").is_file());
+        assert!(expected.join("privacy-sanitization.json").is_file());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&package_response).unwrap()["receipt"]
+                ["submission_state"],
+            "awaiting_human_authorization"
+        );
+
+        let (ok, state) = crate::grpc::privacy_incident_op(&engine, "privacy-state", "");
+        assert!(ok, "{state}");
+        let state: serde_json::Value = serde_json::from_str(&state).unwrap();
+        assert_eq!(state["assessments"].as_array().unwrap().len(), 1);
+        assert_eq!(state["deadlines"].as_array().unwrap().len(), 1);
+        assert_eq!(state["exports"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn admin_prepares_and_imports_a_signed_air_gap_anchor_without_raw_events() {
+        use heraclitus_compliance::{stamp_deferred_request, BundleSignatureScheme};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            storage_format: heraclitus_core::StorageFormat::V6,
+            ..Default::default()
+        };
+        let engine = Arc::new(Engine::open(&cfg).unwrap());
+        engine
+            .append(Episode::new(
+                "evidence-source",
+                EventKind::Observation,
+                b"raw evidence must stay here".to_vec(),
+            ))
+            .unwrap();
+        let v6 = engine.log.v6_arc().unwrap();
+        v6.seal_active().unwrap();
+        let sealed = v6.manifest().segments_v2[0].clone();
+
+        let prepare = serde_json::json!({
+            "lsn_start": sealed.first_lsn,
+            "lsn_end": sealed.last_lsn,
+            "created_at_hlc": 42,
+        });
+        let (ok, request_json) = crate::grpc::deferred_anchor_op(
+            &engine,
+            "deferred-anchor-prepare",
+            &prepare.to_string(),
+        );
+        assert!(ok, "{request_json}");
+        assert!(
+            !request_json.contains("raw evidence"),
+            "a fronteira air-gap transportou conteúdo bruto"
+        );
+        let request: DeferredAnchorRequest = serde_json::from_str(&request_json).unwrap();
+
+        let export_signer = SoftKeySigner::generate("offline-zone");
+        let response_signer = SoftKeySigner::generate("connected-zone");
+        let signed_request = SignedDeferredAnchorRequest::sign(
+            request,
+            &export_signer,
+            BundleSignatureScheme::P256Development,
+        )
+        .unwrap();
+        let response_key = response_signer
+            .sign_snapshot(b"key-discovery")
+            .unwrap()
+            .public_key_sec1;
+        let policy = DeferredTransferPolicy {
+            policy_id: "air-gap-transfer".into(),
+            version: "2026.1".into(),
+            approved_export_key_digests: [
+                *blake3::hash(&signed_request.signature.public_key).as_bytes(),
+            ]
+            .into_iter()
+            .collect(),
+            approved_response_key_digests: [*blake3::hash(&response_key).as_bytes()]
+                .into_iter()
+                .collect(),
+            allowed_signature_schemes: [BundleSignatureScheme::P256Development]
+                .into_iter()
+                .collect(),
+            max_timestamp_token_bytes: 1024 * 1024,
+        };
+        let tsa = LocalTsa::generate("ACT-dev");
+        let signed_response = stamp_deferred_request(
+            &signed_request,
+            &policy,
+            &tsa,
+            &response_signer,
+            BundleSignatureScheme::P256Development,
+        )
+        .unwrap();
+        let import = serde_json::json!({
+            "signed_request": signed_request,
+            "signed_response": signed_response,
+            "policy": policy,
+        });
+        let (ok, imported) = crate::grpc::deferred_anchor_op(
+            &engine,
+            "deferred-anchor-import",
+            &import.to_string(),
+        );
+        assert!(ok, "{imported}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&imported).unwrap()["anchor"]
+                ["validation_state"],
+            "development_only"
+        );
+
+        let (ok, anchors) =
+            crate::grpc::deferred_anchor_op(&engine, "deferred-anchors", "");
+        assert!(ok, "{anchors}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&anchors)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn admin_verifies_and_activates_a_server_owned_offline_model_bundle() {
+        use heraclitus_compliance::{build_signed_model_bundle, BundleSignatureScheme};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            ..Default::default()
+        };
+        let engine = Arc::new(Engine::open(&cfg).unwrap());
+        let root = engine
+            .compliance_export_dir("model-bundles", "sentinel-investigator-v1")
+            .unwrap();
+        for directory in ["model", "tokenizer", "sbom"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        std::fs::write(root.join("model/weights.bin"), b"weights-v1").unwrap();
+        std::fs::write(root.join("tokenizer/vocab.json"), b"{\"a\":1}").unwrap();
+        std::fs::write(root.join("sbom/sbom.json"), b"{\"spdx\":true}").unwrap();
+
+        let signer = SoftKeySigner::generate("model-release-office");
+        let signed = build_signed_model_bundle(
+            &root,
+            ModelManifest {
+                model_id: "sentinel-investigator".into(),
+                version: "v1".into(),
+                artifact_digest: [0; 32],
+                tokenizer_digest: [0; 32],
+                runtime_id: "onnxruntime".into(),
+                runtime_version: "1.22".into(),
+                quantization: None,
+                approved_by: "security-office".into(),
+            },
+            &signer,
+            BundleSignatureScheme::P256Development,
+        )
+        .unwrap();
+        signed.write_metadata(&root).unwrap();
+        let policy = ModelBundlePolicy {
+            policy_id: "offline-models".into(),
+            version: "2026.1".into(),
+            allowed_models: ["sentinel-investigator".into()].into_iter().collect(),
+            approved_runtimes: [(
+                "onnxruntime".into(),
+                ["1.22".into()].into_iter().collect(),
+            )]
+            .into_iter()
+            .collect(),
+            approved_signer_key_digests: [*blake3::hash(&signed.signature.public_key).as_bytes()]
+                .into_iter()
+                .collect(),
+            allowed_signature_schemes: [BundleSignatureScheme::P256Development]
+                .into_iter()
+                .collect(),
+        };
+        let request = serde_json::json!({
+            "bundle_id": "sentinel-investigator-v1",
+            "policy": policy,
+        });
+        let (ok, activation) = crate::grpc::model_bundle_op(
+            &engine,
+            "model-bundle-activate",
+            &request.to_string(),
+        );
+        assert!(ok, "{activation}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&activation).unwrap()["bundle"]["model"]
+                ["model_id"],
+            "sentinel-investigator"
+        );
+
+        let (ok, bundles) = crate::grpc::model_bundle_op(&engine, "model-bundles", "");
+        assert!(ok, "{bundles}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&bundles)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
         );
     }
 }
