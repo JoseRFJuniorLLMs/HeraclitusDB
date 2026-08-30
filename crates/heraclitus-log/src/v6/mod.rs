@@ -122,7 +122,8 @@ pub use doctor::{
 };
 pub use error::V6Result;
 pub use engine::{
-    persisted_record_hash, HrkiBuildOutcome, LakehousePending, PackedGenerationSource, V6Log,
+    persisted_record_hash, GcRunOptions, HrkiBuildOutcome, LakehousePending, PackedGenerationSource,
+    V6Log,
     V6MetricsSnapshot,
 };
 pub use footer::FooterV6;

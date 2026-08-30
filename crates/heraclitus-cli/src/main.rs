@@ -40,6 +40,26 @@ enum Cmd {
         #[arg(long)]
         no_session_id: bool,
     },
+    /// SPEC-0050 §90-§97 — plan or run the physical generation GC.
+    ///
+    /// Reclaims superseded generations (typically the RAW left behind by
+    /// packing). Never removes the last canonical authority (§91), always
+    /// respects the grace period (§93), legal hold (§94) and the verified-copy
+    /// policy (§184). Quarantined generations (§127) need `--collect-quarantined`.
+    Gc {
+        /// HRKL v6 storage root.
+        target: PathBuf,
+        /// Show the plan and exit without removing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// How many HRKM generations to keep (§90).
+        #[arg(long, default_value_t = 3)]
+        keep_manifests: usize,
+        /// §127 — also collect quarantined generations. This destroys evidence
+        /// of a problem: only pass it deliberately.
+        #[arg(long)]
+        collect_quarantined: bool,
+    },
     /// Storage diagnostics that never repair or mutate the inspected database.
     Storage {
         #[command(subcommand)]
@@ -168,6 +188,13 @@ fn main() {
         Cmd::Prove { segment, lsn } => {
             heraclitus_cli::prove_v6_lsn(&segment, lsn).map_err(|e| e.to_string())
         }
+        Cmd::Gc {
+            target,
+            dry_run,
+            keep_manifests,
+            collect_quarantined,
+        } => heraclitus_cli::gc_v6(&target, dry_run, keep_manifests, collect_quarantined)
+            .map_err(|e| e.to_string()),
         Cmd::Manifest { command } => match command {
             ManifestCmd::Show { dir } => {
                 heraclitus_cli::manifest_show_v6(&dir).map_err(|e| e.to_string())

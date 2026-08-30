@@ -2,6 +2,129 @@ use crate::error::HeraclitusError;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Operational mode for the Heraclitus Sentinel security plane.
+///
+/// The enum lives in `heraclitus-core` so configuration parsing does not create
+/// a dependency cycle (`server -> sentinel -> core`).  The Sentinel crate
+/// re-exports it and adds the runtime implementation.  `Disabled` is the
+/// default and is intentionally fail-safe: enabling the database never starts
+/// security workers implicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SentinelMode {
+    #[default]
+    Disabled,
+    Observe,
+    Shadow,
+    Assist,
+    Autonomous,
+}
+
+/// Configuration for the deterministic L1 rule plane.  The path is explicit:
+/// no globbing or implicit rules are loaded by the server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SentinelL1Config {
+    pub enabled: bool,
+    pub rules_path: Option<PathBuf>,
+}
+
+/// Configuration for the deterministic L2 behavioral adapter.  Numeric
+/// scoring remains owned by `heraclitus-sentinel`; core only carries the
+/// bounded, serializable controls needed by hosts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SentinelL2Config {
+    pub enabled: bool,
+    /// Number of trusted observations required before an active profile can
+    /// score a subject.
+    pub minimum_support: u64,
+    /// Extra observations kept in the shadow profile before promotion.
+    pub learning_delay_events: u64,
+    /// When true, profiles never promote automatically and L2 only learns in
+    /// shadow mode.
+    pub shadow_only: bool,
+    /// Events at or above this severity are scored but cannot update the
+    /// active baseline without trusted feedback.
+    pub suspicious_severity: u8,
+}
+
+impl Default for SentinelL2Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            minimum_support: 20,
+            learning_delay_events: 10,
+            shadow_only: true,
+            suspicious_severity: 7,
+        }
+    }
+}
+
+/// Configuration for deterministic L3 temporal correlation.  L3 remains
+/// independently opt-in so existing Sentinel deployments do not start
+/// retaining graph/incident state merely because L0 or L1 is enabled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SentinelL3Config {
+    pub enabled: bool,
+    /// Maximum directed graph traversal depth used while correlating signals.
+    pub max_graph_hops: usize,
+}
+
+impl Default for SentinelL3Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_graph_hops: 6,
+        }
+    }
+}
+
+/// Configuration shared by the host and the optional `heraclitus-sentinel`
+/// runtime.  The core owns only serializable host controls; detector and graph
+/// implementations remain in `heraclitus-sentinel`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SentinelConfig {
+    /// Starts the subscriber and workers when true.  `false` means no
+    /// subscriber is attached and no background thread is created.
+    pub enabled: bool,
+    pub mode: SentinelMode,
+    /// Maximum number of notification LSNs retained in memory.
+    pub queue_capacity: usize,
+    /// Number of worker threads.  Workers serialize cursor commits, while the
+    /// bounded queue remains safe under a notification storm.
+    pub worker_threads: usize,
+    /// Version of the deterministic pipeline recorded in the cursor and in
+    /// derived event attributes.
+    pub pipeline_version: u32,
+    /// Maximum number of log records consumed by one catch-up pass.
+    pub catch_up_batch: usize,
+    /// Optional fail-closed Sigma ruleset loaded by the Sentinel workers.
+    pub l1: SentinelL1Config,
+    /// Optional deterministic behavioral baseline adapter.
+    pub l2: SentinelL2Config,
+    /// Optional deterministic graph/incident adapter.
+    pub l3: SentinelL3Config,
+}
+
+impl Default for SentinelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: SentinelMode::Disabled,
+            queue_capacity: 65_536,
+            worker_threads: 4,
+            pipeline_version: 1,
+            catch_up_batch: 1_024,
+            l1: SentinelL1Config::default(),
+            l2: SentinelL2Config::default(),
+            l3: SentinelL3Config::default(),
+        }
+    }
+}
+
 /// Papéis de acesso aplicados por RPC. `Writer` inclui leitura; `Auditor`
 /// inclui leitura + verificação; `Admin` pode executar qualquer operação.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +262,26 @@ pub struct HeraclitusConfig {
     /// SPEC-0050 — intervalo do worker assíncrono que transforma RAWs v6
     /// selados em gerações PACKED. `0` desliga; ignorado no formato legado.
     pub v6_packing_interval_secs: u64,
+    /// SPEC-0050 §90–§97 — intervalo do GC de gerações físicas. `0` desliga.
+    ///
+    /// **Ligado por omissão (300 s), e a escolha merece justificação.** O
+    /// precedente desta config é o lakehouse, que fica em `0` porque ligá-lo
+    /// duplicaria o disco de toda a gente sem pedir licença. O GC é o
+    /// contrário: *não* o correr é que custa. O `record_pack` marca a geração
+    /// RAW como `Superseded` (§88 passo 13) e, sem GC, ela fica em disco para
+    /// sempre — cada banco guarda RAW **e** PACKED de tudo. Com o rácio
+    /// `packed/raw` de 21,95% medido no gate de §207, isso é 5,5× o disco que
+    /// o formato promete.
+    ///
+    /// O que torna o default seguro não é otimismo, são quatro camadas
+    /// independentes: §91 nunca remove a última autoridade canónica (e o
+    /// `assert_gc_invariant` volta a verificá-lo por um caminho separado), §93
+    /// impõe 24 h de grace period, §94 respeita legal hold e §184 exige as
+    /// cópias verificadas configuradas. Uma geração em quarentena (§127) só
+    /// sai com pedido explícito, que a task de fundo nunca faz.
+    pub v6_gc_interval_secs: u64,
+    /// SPEC-0050 §90 — quantas gerações do HRKM manter em cada passagem de GC.
+    pub v6_gc_keep_manifests: usize,
     /// SPEC-0050 Fase 4 — intervalo da reconstrução de `.hrki` para PACKEDs
     /// que ainda não têm sidecar válido. `0` desliga.
     pub v6_hrki_interval_secs: u64,
@@ -255,6 +398,9 @@ pub struct HeraclitusConfig {
     /// cluster e as escritas passam pelo líder. Requer a feature `replication`
     /// no `heraclitus-server` (sem ela o campo é ignorado com um aviso).
     pub replication: Option<ReplicationConfig>,
+    /// SPEC-0045 Fase 0 — plano de segurança derivado, desligado por omissão.
+    /// O host pode iniciar o Sentinel sem alterar o caminho de append.
+    pub sentinel: SentinelConfig,
 }
 
 /// Transporte de rede do consenso raft (SPEC-015/021). Ambos correm os mesmos
@@ -343,6 +489,8 @@ impl Default for HeraclitusConfig {
             v6_lakehouse_path: String::new(),
             v6_lakehouse_table: "episodios".to_string(),
             v6_packing_interval_secs: 30,
+            v6_gc_interval_secs: 300,
+            v6_gc_keep_manifests: 3,
             v6_hrki_interval_secs: 45,
             v6_hrki_bloom_fpr: 0.01,
             v6_hrki_index_agent_id: true,
@@ -369,6 +517,7 @@ impl Default for HeraclitusConfig {
             flight_addr: None,
             telemetry_interval_secs: 0,
             replication: None,
+            sentinel: SentinelConfig::default(),
         }
     }
 }
@@ -536,6 +685,103 @@ impl HeraclitusConfig {
                 self.telemetry_interval_secs = s;
             }
         }
+        if let Ok(v) = std::env::var("HERACLITUS_SENTINEL_ENABLED") {
+            self.sentinel.enabled = parse_strict_bool("HERACLITUS_SENTINEL_ENABLED", &v)?;
+            if !self.sentinel.enabled {
+                self.sentinel.mode = SentinelMode::Disabled;
+            } else if self.sentinel.mode == SentinelMode::Disabled {
+                self.sentinel.mode = SentinelMode::Observe;
+            }
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_SENTINEL_MODE") {
+            self.sentinel.mode = match v.to_ascii_lowercase().as_str() {
+                "disabled" | "off" => SentinelMode::Disabled,
+                "observe" => SentinelMode::Observe,
+                "shadow" => SentinelMode::Shadow,
+                "assist" => SentinelMode::Assist,
+                "autonomous" => SentinelMode::Autonomous,
+                _ => {
+                    return Err(HeraclitusError::Config(format!(
+                        "HERACLITUS_SENTINEL_MODE inválido: {v:?}"
+                    )))
+                }
+            };
+            self.sentinel.enabled = self.sentinel.mode != SentinelMode::Disabled;
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_SENTINEL_QUEUE_CAPACITY") {
+            self.sentinel.queue_capacity = v.parse().map_err(|e| {
+                HeraclitusError::Config(format!(
+                    "HERACLITUS_SENTINEL_QUEUE_CAPACITY deve ser inteiro positivo: {e}"
+                ))
+            })?;
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_SENTINEL_WORKERS") {
+            self.sentinel.worker_threads = v.parse().map_err(|e| {
+                HeraclitusError::Config(format!(
+                    "HERACLITUS_SENTINEL_WORKERS deve ser inteiro positivo: {e}"
+                ))
+            })?;
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_SENTINEL_PIPELINE_VERSION") {
+            self.sentinel.pipeline_version = v.parse().map_err(|e| {
+                HeraclitusError::Config(format!(
+                    "HERACLITUS_SENTINEL_PIPELINE_VERSION deve ser inteiro: {e}"
+                ))
+            })?;
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_SENTINEL_CATCH_UP_BATCH") {
+            self.sentinel.catch_up_batch = v.parse().map_err(|e| {
+                HeraclitusError::Config(format!(
+                    "HERACLITUS_SENTINEL_CATCH_UP_BATCH deve ser inteiro positivo: {e}"
+                ))
+            })?;
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_SENTINEL_L1_ENABLED") {
+            self.sentinel.l1.enabled = parse_strict_bool("HERACLITUS_SENTINEL_L1_ENABLED", &v)?;
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_SENTINEL_L1_RULES_PATH") {
+            if !v.trim().is_empty() {
+                self.sentinel.l1.rules_path = Some(PathBuf::from(v));
+            }
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_SENTINEL_L2_ENABLED") {
+            self.sentinel.l2.enabled = parse_strict_bool("HERACLITUS_SENTINEL_L2_ENABLED", &v)?;
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_SENTINEL_L2_MINIMUM_SUPPORT") {
+            self.sentinel.l2.minimum_support = v.parse().map_err(|e| {
+                HeraclitusError::Config(format!(
+                    "HERACLITUS_SENTINEL_L2_MINIMUM_SUPPORT deve ser inteiro positivo: {e}"
+                ))
+            })?;
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_SENTINEL_L2_LEARNING_DELAY_EVENTS") {
+            self.sentinel.l2.learning_delay_events = v.parse().map_err(|e| {
+                HeraclitusError::Config(format!(
+                    "HERACLITUS_SENTINEL_L2_LEARNING_DELAY_EVENTS deve ser inteiro positivo: {e}"
+                ))
+            })?;
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_SENTINEL_L2_SHADOW_ONLY") {
+            self.sentinel.l2.shadow_only =
+                parse_strict_bool("HERACLITUS_SENTINEL_L2_SHADOW_ONLY", &v)?;
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_SENTINEL_L2_SUSPICIOUS_SEVERITY") {
+            self.sentinel.l2.suspicious_severity = v.parse().map_err(|e| {
+                HeraclitusError::Config(format!(
+                    "HERACLITUS_SENTINEL_L2_SUSPICIOUS_SEVERITY deve ser inteiro entre 0 e 10: {e}"
+                ))
+            })?;
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_SENTINEL_L3_ENABLED") {
+            self.sentinel.l3.enabled = parse_strict_bool("HERACLITUS_SENTINEL_L3_ENABLED", &v)?;
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_SENTINEL_L3_MAX_GRAPH_HOPS") {
+            self.sentinel.l3.max_graph_hops = v.parse().map_err(|e| {
+                HeraclitusError::Config(format!(
+                    "HERACLITUS_SENTINEL_L3_MAX_GRAPH_HOPS deve ser inteiro positivo: {e}"
+                ))
+            })?;
+        }
         if let Ok(v) = std::env::var("HERACLITUS_TIER_COMPACTION_INTERVAL") {
             if let Ok(s) = v.parse() {
                 self.tier_compaction_interval_secs = s;
@@ -545,6 +791,20 @@ impl HeraclitusConfig {
             self.v6_packing_interval_secs = v.parse().map_err(|e| {
                 HeraclitusError::Config(format!(
                     "HERACLITUS_V6_PACKING_INTERVAL deve ser inteiro em segundos: {e}"
+                ))
+            })?;
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_V6_GC_INTERVAL") {
+            self.v6_gc_interval_secs = v.parse().map_err(|e| {
+                HeraclitusError::Config(format!(
+                    "HERACLITUS_V6_GC_INTERVAL deve ser inteiro em segundos: {e}"
+                ))
+            })?;
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_V6_GC_KEEP_MANIFESTS") {
+            self.v6_gc_keep_manifests = v.parse().map_err(|e| {
+                HeraclitusError::Config(format!(
+                    "HERACLITUS_V6_GC_KEEP_MANIFESTS deve ser inteiro: {e}"
                 ))
             })?;
         }
@@ -580,16 +840,12 @@ impl HeraclitusConfig {
             })?;
         }
         if let Ok(v) = std::env::var("HERACLITUS_V6_HRKI_INDEX_AGENT_ID") {
-            self.v6_hrki_index_agent_id = parse_strict_bool(
-                "HERACLITUS_V6_HRKI_INDEX_AGENT_ID",
-                &v,
-            )?;
+            self.v6_hrki_index_agent_id =
+                parse_strict_bool("HERACLITUS_V6_HRKI_INDEX_AGENT_ID", &v)?;
         }
         if let Ok(v) = std::env::var("HERACLITUS_V6_HRKI_INDEX_SESSION_ID") {
-            self.v6_hrki_index_session_id = parse_strict_bool(
-                "HERACLITUS_V6_HRKI_INDEX_SESSION_ID",
-                &v,
-            )?;
+            self.v6_hrki_index_session_id =
+                parse_strict_bool("HERACLITUS_V6_HRKI_INDEX_SESSION_ID", &v)?;
         }
         if let Ok(v) = std::env::var("HERACLITUS_DISTILL_INTERVAL") {
             if let Ok(s) = v.parse() {
@@ -617,6 +873,76 @@ impl HeraclitusConfig {
 
     pub fn validate_security(&self) -> Result<(), HeraclitusError> {
         let invalid = |message: String| HeraclitusError::Config(message);
+        if self.sentinel.enabled && self.sentinel.mode == SentinelMode::Disabled {
+            return Err(invalid(
+                "sentinel.enabled=true exige sentinel.mode diferente de disabled".into(),
+            ));
+        }
+        if !self.sentinel.enabled && self.sentinel.mode != SentinelMode::Disabled {
+            return Err(invalid(
+                "sentinel.mode ativo exige sentinel.enabled=true".into(),
+            ));
+        }
+        if self.sentinel.mode == SentinelMode::Autonomous {
+            return Err(invalid(
+                "sentinel.mode=autonomous está bloqueado: exige permit verificado dos gates e executor qualificado"
+                    .into(),
+            ));
+        }
+        if self.sentinel.enabled && self.sentinel.queue_capacity == 0 {
+            return Err(invalid(
+                "sentinel.queue_capacity deve ser maior que zero".into(),
+            ));
+        }
+        if self.sentinel.enabled && self.sentinel.worker_threads == 0 {
+            return Err(invalid(
+                "sentinel.worker_threads deve ser maior que zero".into(),
+            ));
+        }
+        if self.sentinel.enabled && self.sentinel.catch_up_batch == 0 {
+            return Err(invalid(
+                "sentinel.catch_up_batch deve ser maior que zero".into(),
+            ));
+        }
+        if self.sentinel.l1.enabled && !self.sentinel.enabled {
+            return Err(invalid(
+                "sentinel.l1.enabled=true exige sentinel.enabled=true".into(),
+            ));
+        }
+        if self.sentinel.l1.enabled && self.sentinel.l1.rules_path.is_none() {
+            return Err(invalid(
+                "sentinel.l1.enabled=true exige sentinel.l1.rules_path".into(),
+            ));
+        }
+        if self.sentinel.l2.enabled && !self.sentinel.enabled {
+            return Err(invalid(
+                "sentinel.l2.enabled=true exige sentinel.enabled=true".into(),
+            ));
+        }
+        if self.sentinel.l2.enabled
+            && (self.sentinel.l2.minimum_support == 0
+                || self.sentinel.l2.learning_delay_events == 0)
+        {
+            return Err(invalid(
+                "sentinel.l2 minimum_support e learning_delay_events devem ser maiores que zero"
+                    .into(),
+            ));
+        }
+        if self.sentinel.l2.suspicious_severity > 10 {
+            return Err(invalid(
+                "sentinel.l2.suspicious_severity deve estar entre 0 e 10".into(),
+            ));
+        }
+        if self.sentinel.l3.enabled && !self.sentinel.enabled {
+            return Err(invalid(
+                "sentinel.l3.enabled=true exige sentinel.enabled=true".into(),
+            ));
+        }
+        if self.sentinel.l3.enabled && !(1..=32).contains(&self.sentinel.l3.max_graph_hops) {
+            return Err(invalid(
+                "sentinel.l3.max_graph_hops deve estar entre 1 e 32".into(),
+            ));
+        }
         if !(1e-6..=0.5).contains(&self.v6_hrki_bloom_fpr) {
             return Err(invalid(format!(
                 "v6_hrki_bloom_fpr deve estar entre 0.000001 e 0.5; veio {}",
@@ -831,6 +1157,101 @@ mod tests {
         let legado: HeraclitusConfig = toml::from_str("storage_format = \"legacy\"").unwrap();
         assert_eq!(legado.storage_format, StorageFormat::Legacy);
         assert_eq!(legado.storage_format.as_str(), "legacy");
+    }
+
+    #[test]
+    fn sentinel_config_roundtrips_and_defaults_to_disabled() {
+        let cfg = HeraclitusConfig::default();
+        assert!(!cfg.sentinel.enabled);
+        assert_eq!(cfg.sentinel.mode, SentinelMode::Disabled);
+        let text = toml::to_string(&cfg).unwrap();
+        let back: HeraclitusConfig = toml::from_str(&text).unwrap();
+        assert_eq!(back.sentinel, cfg.sentinel);
+
+        let enabled: HeraclitusConfig = toml::from_str(
+            r#"[sentinel]
+enabled = true
+mode = "observe"
+queue_capacity = 8
+worker_threads = 1
+pipeline_version = 2
+catch_up_batch = 16
+
+[sentinel.l1]
+enabled = true
+rules_path = "rules"
+
+[sentinel.l2]
+enabled = true
+minimum_support = 4
+learning_delay_events = 2
+shadow_only = false
+suspicious_severity = 8
+
+[sentinel.l3]
+enabled = true
+max_graph_hops = 6
+"#,
+        )
+        .unwrap();
+        assert!(enabled.sentinel.enabled);
+        assert_eq!(enabled.sentinel.mode, SentinelMode::Observe);
+        assert_eq!(enabled.sentinel.queue_capacity, 8);
+        assert!(enabled.sentinel.l1.enabled);
+        assert!(enabled.sentinel.l2.enabled);
+        assert_eq!(enabled.sentinel.l2.minimum_support, 4);
+        assert!(!enabled.sentinel.l2.shadow_only);
+        assert!(enabled.sentinel.l3.enabled);
+        assert_eq!(enabled.sentinel.l3.max_graph_hops, 6);
+        assert_eq!(
+            enabled.sentinel.l1.rules_path.as_deref(),
+            Some(std::path::Path::new("rules"))
+        );
+    }
+
+    #[test]
+    fn sentinel_l3_is_fail_closed_and_bounds_graph_traversal() {
+        let mut cfg = HeraclitusConfig::default();
+        cfg.sentinel.l3.enabled = true;
+        assert!(cfg.validate_security().is_err());
+
+        cfg.sentinel.enabled = true;
+        cfg.sentinel.mode = SentinelMode::Observe;
+        cfg.sentinel.l3.max_graph_hops = 0;
+        assert!(cfg.validate_security().is_err());
+        cfg.sentinel.l3.max_graph_hops = 33;
+        assert!(cfg.validate_security().is_err());
+        cfg.sentinel.l3.max_graph_hops = 6;
+        assert!(cfg.validate_security().is_ok());
+    }
+
+    #[test]
+    fn sentinel_l2_is_opt_in_and_bounds_baseline_controls() {
+        let mut cfg = HeraclitusConfig::default();
+        cfg.sentinel.l2.enabled = true;
+        assert!(cfg.validate_security().is_err());
+
+        cfg.sentinel.enabled = true;
+        cfg.sentinel.mode = SentinelMode::Observe;
+        cfg.sentinel.l2.minimum_support = 0;
+        assert!(cfg.validate_security().is_err());
+        cfg.sentinel.l2.minimum_support = 2;
+        cfg.sentinel.l2.learning_delay_events = 0;
+        assert!(cfg.validate_security().is_err());
+        cfg.sentinel.l2.learning_delay_events = 1;
+        cfg.sentinel.l2.suspicious_severity = 11;
+        assert!(cfg.validate_security().is_err());
+        cfg.sentinel.l2.suspicious_severity = 7;
+        assert!(cfg.validate_security().is_ok());
+    }
+
+    #[test]
+    fn autonomous_mode_is_not_a_configuration_bypass() {
+        let mut cfg = HeraclitusConfig::default();
+        cfg.sentinel.enabled = true;
+        cfg.sentinel.mode = SentinelMode::Autonomous;
+        let error = cfg.validate_security().unwrap_err().to_string();
+        assert!(error.contains("autonomous") && error.contains("bloqueado"));
     }
 
     #[test]

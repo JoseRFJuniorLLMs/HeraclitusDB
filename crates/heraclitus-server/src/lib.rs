@@ -62,9 +62,14 @@ pub async fn serve_with(
     // SPEC-015/021 — replicação por consenso Raft (opt-in). Quando configurada,
     // o nó junta-se/forma o cluster e as escritas passam a ir pelo líder.
     #[cfg(feature = "replication")]
+    let mut sentinel_ownership: Option<Arc<dyn heraclitus_sentinel::LeaderOwnership>> = None;
+    #[cfg(not(feature = "replication"))]
+    let sentinel_ownership: Option<Arc<dyn heraclitus_sentinel::LeaderOwnership>> = None;
+    #[cfg(feature = "replication")]
     let cluster_tasks = if let Some(rep) = config.replication.clone() {
         match cluster::spawn(&engine, &rep, &config.data_dir).await {
             Ok((handle, tasks)) => {
+                sentinel_ownership = Some(handle.clone());
                 engine.set_replication(handle);
                 boot.warn_line(
                     "Replicação Raft",
@@ -85,6 +90,64 @@ pub async fn serve_with(
         }
     } else {
         None
+    };
+
+    // SPEC-0045 — derived writes go through Engine rather than AnyLog, keeping
+    // live indexes coherent. In a Raft cluster every replica may maintain L0-L3
+    // views, while the shared epoch gate permits only the current leader to
+    // investigate, approve, or execute response actions.
+    let sentinel_runtime = if config.replication.is_some()
+        && config.sentinel.enabled
+        && sentinel_ownership.is_none()
+    {
+        boot.warn_line(
+            "Heraclitus Sentinel",
+            "não iniciou em modo replicado; ownership Raft indisponível",
+        );
+        None
+    } else {
+        match heraclitus_sentinel::SentinelRuntime::start_with_sink_and_ownership(
+            engine.log.clone(),
+            engine.clone(),
+            config.sentinel.clone(),
+            sentinel_ownership,
+        ) {
+            Ok(Some(runtime)) => {
+                boot.ok_line(
+                    "Heraclitus Sentinel",
+                    &format!(
+                        "L0{}{}{} ativo(s) · modo {:?} · fila {} · {} worker(s)",
+                        if config.sentinel.l1.enabled {
+                            "/L1"
+                        } else {
+                            ""
+                        },
+                        if config.sentinel.l2.enabled {
+                            "/L2"
+                        } else {
+                            ""
+                        },
+                        if config.sentinel.l3.enabled {
+                            "/L3"
+                        } else {
+                            ""
+                        },
+                        config.sentinel.mode,
+                        config.sentinel.queue_capacity,
+                        config.sentinel.worker_threads
+                    ),
+                );
+                Some(Arc::new(runtime))
+            }
+            Ok(None) => None,
+            Err(error) => {
+                boot.warn_line(
+                    "Heraclitus Sentinel",
+                    &format!("não iniciou; o banco continua disponível: {error}"),
+                );
+                None
+            }
+        }
     };
 
     let grpc_addr: std::net::SocketAddr = config
@@ -117,7 +180,10 @@ pub async fn serve_with(
         )));
     }
     let auth = move |req| authenticator.authenticate(req);
-    let svc = HeraclitusServer::with_interceptor(grpc::Service::new(engine.clone()), auth);
+    let svc = HeraclitusServer::with_interceptor(
+        grpc::Service::new_with_sentinel(engine.clone(), sentinel_runtime.clone()),
+        auth,
+    );
     if config.rest_basic_auth.is_some() {
         boot.warn_line("Auth REST", "HTTP Basic EXIGIDO em cada chamada");
     } else if !rest_addr.ip().is_loopback() {
@@ -133,8 +199,9 @@ pub async fn serve_with(
             "sem auth (loopback) — escritas locais /hvm//tier/sql abertas",
         );
     }
-    let rest = rest::router(
+    let rest = rest::router_with_sentinel(
         engine.clone(),
+        sentinel_runtime.clone(),
         config.rest_basic_auth.clone(),
         config.rest_cors_origins.clone(),
         config.rest_allow_erasure,
@@ -151,6 +218,7 @@ pub async fn serve_with(
     // no shutdown gracioso. Nunca no caminho de escrita (spawn_blocking).
     let checkpoint_task = if config.checkpoint_interval_secs > 0 {
         let engine_ck = engine.clone();
+        let sentinel_ck = sentinel_runtime.clone();
         let every = std::time::Duration::from_secs(config.checkpoint_interval_secs);
         Some(tokio::spawn(async move {
             let mut tick = tokio::time::interval(every);
@@ -159,9 +227,15 @@ pub async fn serve_with(
             loop {
                 tick.tick().await;
                 let e = engine_ck.clone();
+                let sentinel = sentinel_ck.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     if let Err(err) = e.checkpoint_views() {
                         tracing::warn!(error = %err, "checkpoint periódico falhou (próximo boot replaya mais cauda)");
+                    }
+                    if let Some(runtime) = sentinel {
+                        if let Err(err) = runtime.checkpoint() {
+                            tracing::warn!(error = %err, "checkpoint do Sentinel falhou (próximo boot replaya a cauda)");
+                        }
                     }
                 })
                 .await;
@@ -244,6 +318,104 @@ pub async fn serve_with(
             }
         }))
     } else {
+        None
+    };
+
+    // SPEC-0050 §90–§97 — GC de gerações físicas.
+    //
+    // Até 2026-08-29 o `plan_gc`/`commit_gc` não tinham chamador nenhum: a
+    // política estava escrita, testada e com injecção de crash, e nunca corria.
+    // O efeito era invisível e caro — o `record_pack` marca a geração RAW como
+    // `Superseded` e nada a removia, portanto cada banco guardava RAW **e**
+    // PACKED de tudo, para sempre.
+    let v6_gc_task = if config.storage_format == heraclitus_core::StorageFormat::V6
+        && config.v6_gc_interval_secs > 0
+    {
+        let log = engine.log.v6_arc().ok_or_else(|| {
+            HeraclitusError::StorageEngine(
+                "configuração v6 abriu um backend que não é V6Log".into(),
+            )
+        })?;
+        let every = std::time::Duration::from_secs(config.v6_gc_interval_secs);
+        let opts = heraclitus_log::v6::GcRunOptions {
+            keep_manifests: config.v6_gc_keep_manifests,
+            // §127: uma passagem automática NUNCA coleta quarentena. Isso é um
+            // pedido explícito de um operador que sabe que está a destruir
+            // evidência.
+            collect_quarantined: false,
+        };
+        match log.gc_reclaimable_bytes() {
+            Ok(bytes) if bytes > 0 => boot.ok_line(
+                "GC HRKL v6",
+                &format!(
+                    "background a cada {}s; {} recuperáveis agora",
+                    config.v6_gc_interval_secs,
+                    human_bytes(bytes)
+                ),
+            ),
+            _ => boot.ok_line(
+                "GC HRKL v6",
+                &format!("background a cada {}s", config.v6_gc_interval_secs),
+            ),
+        }
+        Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                match log.clone().collect_garbage_async(opts).await {
+                    Ok(execution) => {
+                        // A esmagadora maioria das passagens não encontra nada;
+                        // registá-las encheria o log de ruído e escondia as que
+                        // interessam.
+                        if !execution.removed.is_empty()
+                            || !execution.orphaned.is_empty()
+                            || !execution.cold_detached.is_empty()
+                        {
+                            tracing::info!(
+                                manifest_generation = execution.manifest_generation,
+                                removed = execution.removed.len(),
+                                orphaned = execution.orphaned.len(),
+                                cold_detached = execution.cold_detached.len(),
+                                lakehouse_detached = execution.lakehouse_detached.len(),
+                                "GC HRKL v6"
+                            );
+                        }
+                        // §176/§82 — o que este GC desligou do HRKM mas não pode
+                        // apagar. Reportar a dívida é honesto; fingir a remoção
+                        // não é, e um objecto vivo num bucket contado como
+                        // removido é espaço que ninguém volta a procurar.
+                        for location in &execution.cold_detached {
+                            tracing::warn!(
+                                location = %location,
+                                "geração fria desligada do HRKM: os bytes ficam no object store até o tier os coletar"
+                            );
+                        }
+                        for location in &execution.lakehouse_detached {
+                            tracing::warn!(
+                                location = %location,
+                                "projecção lakehouse desligada do HRKM: a remoção é das regras do lakehouse (§176)"
+                            );
+                        }
+                    }
+                    Err(err) => tracing::warn!(error = %err, "GC HRKL v6 falhou"),
+                }
+            }
+        }))
+    } else {
+        if config.storage_format == heraclitus_core::StorageFormat::V6 {
+            // Desligado é uma escolha legítima — mas tem de ser uma escolha
+            // informada, e o número é o que a torna informada.
+            let detalhe = match engine.log.v6_arc().map(|l| l.gc_reclaimable_bytes()) {
+                Some(Ok(bytes)) if bytes > 0 => format!(
+                    "DESLIGADO (v6_gc_interval_secs = 0): {} de gerações superseded ficam em disco",
+                    human_bytes(bytes)
+                ),
+                _ => "DESLIGADO (v6_gc_interval_secs = 0)".to_string(),
+            };
+            boot.warn_line("GC HRKL v6", &detalhe);
+        }
         None
     };
 
@@ -589,7 +761,16 @@ pub async fn serve_with(
     if let Some(t) = checkpoint_task {
         t.abort();
     }
+    if let Some(runtime) = sentinel_runtime {
+        if let Err(error) = runtime.checkpoint() {
+            tracing::warn!(error = %error, "checkpoint final do Sentinel falhou (próximo boot replaya a cauda)");
+        }
+        runtime.shutdown();
+    }
     if let Some(t) = telemetry_task {
+        t.abort();
+    }
+    if let Some(t) = v6_gc_task {
         t.abort();
     }
     if let Some(t) = v6_packing_task {
@@ -626,3 +807,23 @@ pub async fn serve_with(
     }
     Ok(())
 }
+/// Bytes em unidades que um humano lê sem contar dígitos.
+///
+/// Existe porque a linha de arranque do GC precisa de dizer um número que o
+/// operador entenda à primeira: "1 234 567 890" não comunica nada; "1.15 GiB"
+/// comunica.
+fn human_bytes(bytes: u64) -> String {
+    const UNIDADES: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut valor = bytes as f64;
+    let mut i = 0;
+    while valor >= 1024.0 && i + 1 < UNIDADES.len() {
+        valor /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{valor:.2} {}", UNIDADES[i])
+    }
+}
+

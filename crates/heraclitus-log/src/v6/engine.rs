@@ -57,6 +57,26 @@ const RAW_GENERATION: u32 = 0;
 /// writer é serializado por mutex e faz I/O síncrono; o motor legado permanece
 /// a opção de throughput até a substituição do pipeline ser medida e aprovada
 /// pelo gate de desempenho da SPEC.
+/// Opções de uma passagem de GC (SPEC-0050 §90, §127).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GcRunOptions {
+    /// Quantas gerações do manifesto manter (§90).
+    pub keep_manifests: usize,
+    /// §127 — uma geração em quarentena é evidência de um problema. Coletá-la
+    /// exige um pedido explícito, para que um scrub automático não destrua o
+    /// ficheiro que a perícia quer ver. **Nunca ligar isto numa task de fundo.**
+    pub collect_quarantined: bool,
+}
+
+impl Default for GcRunOptions {
+    fn default() -> Self {
+        Self {
+            keep_manifests: 3,
+            collect_quarantined: false,
+        }
+    }
+}
+
 pub struct V6Log {
     root: PathBuf,
     segments_dir: PathBuf,
@@ -74,6 +94,8 @@ pub struct V6Log {
     keystore: Option<Arc<KeyStore>>,
     tail_tx: broadcast::Sender<(Lsn, Arc<Episode>)>,
     metrics: V6Metrics,
+    /// SPEC-0050 §92 — leitores pinados que o GC tem de respeitar.
+    pins: super::gc::PinRegistry,
 }
 
 #[derive(Default)]
@@ -368,6 +390,7 @@ impl V6Log {
             keystore,
             tail_tx,
             metrics: V6Metrics::default(),
+            pins: super::gc::PinRegistry::new(),
         })
     }
 
@@ -1425,6 +1448,183 @@ impl V6Log {
         Ok(true)
     }
 
+
+    // -----------------------------------------------------------------
+    // SPEC-0050 §90–§97 — garbage collection
+    // -----------------------------------------------------------------
+
+    /// O registo de pins de §92.
+    ///
+    /// **Nenhum leitor interno pina hoje**, e vale dizer porquê em vez de
+    /// deixar isso implícito. O que §92 protege é remover uma geração que
+    /// alguém está a ler, e o `commit_gc` já é seguro nos dois sistemas onde
+    /// isto corre: em Unix o `unlink` de um ficheiro aberto deixa o descritor
+    /// válido, e em Windows o `remove_file` falha com sharing violation e a
+    /// geração é reportada como `orphaned` — nunca como removida — para uma
+    /// passagem posterior. O invariante que impede perda de dados é o §91, que
+    /// é verificado por `assert_gc_invariant` e não por pins.
+    ///
+    /// O registo existe e é honrado pelo plano: quem tiver um leitor de longa
+    /// duração (um recall frio, uma exportação) deve pinar por aqui.
+    pub fn pins(&self) -> &super::gc::PinRegistry {
+        &self.pins
+    }
+
+    /// SPEC-0050 §93/§94 — lê a política de retenção de um segmento.
+    pub fn retention(
+        &self,
+        segment_id: SegmentId,
+    ) -> Result<Option<heraclitus_core::runtime::RetentionPolicy>, HeraclitusError> {
+        Ok(self
+            .lock_state()?
+            .manifest
+            .segment(segment_id)
+            .map(|s| s.retention))
+    }
+
+    /// Define a política de retenção de um segmento e comita o HRKM.
+    ///
+    /// Existe porque §93 e §94 são política **por segmento** e até aqui não
+    /// tinham superfície nenhuma: o grace period e o legal hold estavam no
+    /// formato e no `plan_gc`, e não havia como um operador os definir.
+    pub fn set_retention(
+        &self,
+        segment_id: SegmentId,
+        retention: heraclitus_core::runtime::RetentionPolicy,
+    ) -> Result<(), HeraclitusError> {
+        let mut state = self.lock_state()?;
+        let before = state.manifest.clone();
+        let Some(desc) = state.manifest.segment_mut(segment_id) else {
+            return Err(corrupt(
+                "hrkm retention",
+                format!("segmento {segment_id} não está catalogado"),
+            ));
+        };
+        desc.retention = retention;
+        if let Err(err) = self.manifest_store.commit(&mut state.manifest) {
+            state.manifest = before;
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// SPEC-0050 §94 — legal hold. Bloqueia GC de geração canónica, migração
+    /// destrutiva, crypto-shredding e purga de arquivo.
+    ///
+    /// Separado do [`Self::set_retention`] genérico de propósito: é a operação
+    /// que alguém executa sob pressão, com um advogado ao telefone, e tem de
+    /// ser impossível de confundir com «ajustar a retenção».
+    pub fn set_legal_hold(
+        &self,
+        segment_id: SegmentId,
+        hold: bool,
+    ) -> Result<(), HeraclitusError> {
+        let atual = self.retention(segment_id)?.ok_or_else(|| {
+            corrupt(
+                "hrkm legal_hold",
+                format!("segmento {segment_id} não está catalogado"),
+            )
+        })?;
+        self.set_retention(
+            segment_id,
+            heraclitus_core::runtime::RetentionPolicy {
+                legal_hold: hold,
+                ..atual
+            },
+        )
+    }
+
+    /// O plano de GC, sem remover nada (§90). É o que o `--dry-run` mostra.
+    ///
+    /// Devolve candidatos **e** bloqueados com a razão de cada bloqueio: um GC
+    /// que não sabe explicar o que não apagou não é auditável.
+    pub fn gc_plan(&self, opts: GcRunOptions) -> Result<super::gc::GcPlan, HeraclitusError> {
+        let state = self.lock_state()?;
+        Ok(super::gc::plan_gc(
+            &state.manifest,
+            &self.pins,
+            &super::gc::GcOptions {
+                now_hlc: self.hlc.now(),
+                keep_manifests: opts.keep_manifests,
+                collect_quarantined: opts.collect_quarantined,
+            },
+        ))
+    }
+
+    /// Bytes que um GC recuperaria agora, sem executar nada.
+    ///
+    /// Existe para o arranque poder dizer o número em voz alta. O estado que
+    /// esta função mede — gerações RAW superseded que nunca são coletadas —
+    /// era invisível: o `record_pack` marca a origem `Superseded` (§88 passo
+    /// 13) e, sem ninguém a chamar o GC, ela fica em disco para sempre. Um
+    /// banco acaba com RAW **e** PACKED de tudo.
+    pub fn gc_reclaimable_bytes(&self) -> Result<u64, HeraclitusError> {
+        Ok(self.gc_plan(GcRunOptions::default())?.reclaimable_bytes())
+    }
+
+    /// Executa uma passagem de GC (§90–§97).
+    ///
+    /// A ordem é a do `commit_gc` e não é negociável: validar tudo → publicar
+    /// um HRKM que já não referencia os candidatos → remover os bytes. Um
+    /// crash entre os dois últimos passos deixa espaço desperdiçado e um
+    /// manifesto auto-consistente; a ordem inversa deixaria o HRKM a apontar
+    /// para ficheiros ausentes.
+    ///
+    /// Partilha o `packing_lock` com o packer de propósito: empacotar publica
+    /// gerações e o GC remove-as, e as duas coisas a decidir ao mesmo tempo
+    /// sobre o mesmo segmento é a corrida que produziria um plano calculado
+    /// sobre um manifesto que já mudou.
+    pub fn collect_garbage(
+        &self,
+        opts: GcRunOptions,
+    ) -> Result<super::gc::GcExecution, HeraclitusError> {
+        let _packing = self
+            .packing_lock
+            .lock()
+            .map_err(|_| HeraclitusError::StorageEngine("v6 packing lock poisoned".into()))?;
+        let mut state = self.lock_state()?;
+        let plan = super::gc::plan_gc(
+            &state.manifest,
+            &self.pins,
+            &super::gc::GcOptions {
+                now_hlc: self.hlc.now(),
+                keep_manifests: opts.keep_manifests,
+                collect_quarantined: opts.collect_quarantined,
+            },
+        );
+        if plan.is_empty() {
+            return Ok(super::gc::GcExecution {
+                manifest_generation: state.manifest.manifest_generation,
+                removed: Vec::new(),
+                orphaned: Vec::new(),
+                lakehouse_detached: Vec::new(),
+                cold_detached: Vec::new(),
+            });
+        }
+        let execution = super::gc::commit_gc(
+            &self.manifest_store,
+            &mut state.manifest,
+            &self.root,
+            &plan,
+        )?;
+        drop(state);
+        // §90 — manifestos antigos também são lixo, e o `keep` vem da mesma
+        // opção para que um operador não tenha dois botões a dizer a mesma
+        // coisa.
+        self.manifest_store.prune_old_manifests(opts.keep_manifests)?;
+        Ok(execution)
+    }
+
+    /// Variante para workers Tokio: o I/O síncrono sai para `spawn_blocking`,
+    /// como no `pack_pending_async`.
+    pub async fn collect_garbage_async(
+        self: Arc<Self>,
+        opts: GcRunOptions,
+    ) -> Result<super::gc::GcExecution, HeraclitusError> {
+        tokio::task::spawn_blocking(move || self.collect_garbage(opts))
+            .await
+            .map_err(|e| HeraclitusError::StorageEngine(format!("v6 gc worker: {e}")))?
+    }
     /// O HLC do log, para carimbar artefactos derivados com o mesmo relogio
     /// que carimba os canonicos.
     pub fn now_hlc(&self) -> u64 {

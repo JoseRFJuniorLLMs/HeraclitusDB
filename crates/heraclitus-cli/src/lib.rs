@@ -981,6 +981,134 @@ pub fn bench_recall(n: usize, dim: usize, queries: usize) -> BenchReport {
     }
 }
 
+
+/// SPEC-0050 §90–§97 — mostra o plano de GC, ou executa-o.
+///
+/// O `--dry-run` é o default de facto do fluxo do operador: o `plan_gc` já
+/// explica cada bloqueio, e ver a lista de bloqueados com a razão é a maior
+/// parte do valor. Um GC que não sabe dizer o que **não** apagou não é
+/// auditável.
+pub fn gc_v6(
+    root: &std::path::Path,
+    dry_run: bool,
+    keep_manifests: usize,
+    collect_quarantined: bool,
+) -> Result<String, heraclitus_core::HeraclitusError> {
+    use heraclitus_core::config::FsyncPolicy;
+    use heraclitus_log::v6::{GcRunOptions, V6Log};
+
+    if collect_quarantined && dry_run {
+        // Não é um erro, mas vale dizer: a combinação existe para se ver o que
+        // um pedido explícito removeria antes de o fazer.
+    }
+    let log = V6Log::open(root, 1 << 30, FsyncPolicy::Always)?;
+    let opts = GcRunOptions {
+        keep_manifests,
+        collect_quarantined,
+    };
+    let plano = log.gc_plan(opts)?;
+
+    let mut out = String::new();
+    out.push_str(&format!("HRKL v6 GC — {}\n\n", root.display()));
+
+    if plano.generations.is_empty() {
+        out.push_str("candidatos: nenhum\n");
+    } else {
+        out.push_str(&format!(
+            "candidatos: {} ({} recuperáveis)\n",
+            plano.generations.len(),
+            bytes_legiveis(plano.reclaimable_bytes())
+        ));
+        for c in &plano.generations {
+            out.push_str(&format!(
+                "  segmento {:>6} geração {:>3}  {:>12}  {}\n",
+                c.segment_id,
+                c.generation,
+                bytes_legiveis(c.physical_size),
+                c.location
+            ));
+        }
+    }
+
+    if !plano.blocked.is_empty() {
+        out.push_str(&format!("\nbloqueados: {}\n", plano.blocked.len()));
+        for b in &plano.blocked {
+            out.push_str(&format!(
+                "  segmento {:>6} geração {:>3}  {}\n",
+                b.segment_id,
+                b.generation,
+                razao(&b.reason)
+            ));
+        }
+    }
+
+    if !plano.stale_artifacts.is_empty() {
+        out.push_str(&format!(
+            "\nderivados obsoletos: {}\n",
+            plano.stale_artifacts.len()
+        ));
+    }
+
+    if dry_run {
+        out.push_str("\n(dry-run: nada foi removido)\n");
+        return Ok(out);
+    }
+
+    let execucao = log.collect_garbage(opts)?;
+    out.push_str(&format!(
+        "\nexecutado: HRKM geração {}\n  removidos: {}\n  órfãos: {}\n",
+        execucao.manifest_generation,
+        execucao.removed.len(),
+        execucao.orphaned.len()
+    ));
+    // §176/§82 — o que este GC desligou mas não pode apagar. Contá-los como
+    // removidos seria dizer que espaço foi libertado quando não foi.
+    for location in &execucao.cold_detached {
+        out.push_str(&format!(
+            "  geração fria desligada (bytes ficam no object store): {location}\n"
+        ));
+    }
+    for location in &execucao.lakehouse_detached {
+        out.push_str(&format!(
+            "  projecção lakehouse desligada (remoção é do lakehouse, §176): {location}\n"
+        ));
+    }
+    Ok(out)
+}
+
+fn razao(r: &heraclitus_log::v6::GcBlockReason) -> String {
+    use heraclitus_log::v6::GcBlockReason as R;
+    match r {
+        R::NotSuperseded => "em uso (activa ou ainda não substituída)".into(),
+        R::LegalHold => "§94 legal hold".into(),
+        R::LastCanonicalAuthority => "§91 é a última autoridade canónica".into(),
+        R::ReaderPinned { pins } => format!("§92 {pins} leitor(es) pinado(s)"),
+        R::GracePeriod { remaining_seconds } => {
+            format!("§93 grace period: faltam {remaining_seconds}s")
+        }
+        R::InsufficientVerifiedCopies { have, need } => {
+            format!("§184 cópias verificadas {have}/{need}")
+        }
+        R::Quarantined => "§127 em quarentena (exige pedido explícito)".into(),
+        R::LegacyOriginalPreserved => "§133 original legado preservado".into(),
+    }
+}
+
+fn bytes_legiveis(bytes: u64) -> String {
+    const UNIDADES: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut valor = bytes as f64;
+    let mut i = 0;
+    while valor >= 1024.0 && i + 1 < UNIDADES.len() {
+        valor /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{valor:.2} {}", UNIDADES[i])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
