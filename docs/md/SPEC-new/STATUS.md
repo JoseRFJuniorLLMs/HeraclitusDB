@@ -11,6 +11,146 @@ excluído (é cache, dá falsos positivos).
 > cada afirmação falsa/enganosa com a evidência. O estado real da plataforma e o
 > roteiro estão em [../PLANO-SPECS.md](../PLANO-SPECS.md).
 
+## VERIFICAÇÃO 2026-08-30 (3) — SPEC-0046: o que foi construído, e o que dele está ligado
+
+Uma sessão paralela implementou os Marcos 1–4 da SPEC-0046 (≈5 500 linhas em
+sete módulos novos do `heraclitus-compliance`) e ficou sem quota a meio. Esta
+nota é a verificação adversarial desse trabalho **contra o código**, com nove
+agentes independentes cuja tarefa foi **refutar** cada afirmação, mais três a
+inventariar lacunas. Não é um resumo do que a outra sessão relatou.
+
+### O veredicto, numa linha
+
+O código está correcto e **quase nada dele estava ligado**. Oito das nove
+afirmações vieram `PARCIAL`, todas pela mesma razão, e é a razão que esta base
+já tem nome próprio para: *implementado, testado, nunca chamado*.
+
+| garantia | corpo da função | chamador de produção |
+|---|---|---|
+| legal hold → HRKM → GC bloqueado | correcta, elo a elo | **não havia** |
+| política versionada + replay AS OF | correcta (sem global; a versão está gravada na decisão) | não |
+| pacote ANPD determinista, sem submissão automática | correcta | não |
+| StrictAirGap nega antes do backend | correcta no wrapper | não |
+| propagação de classificação | correcta (conjunto vazio dá o nível mais alto) | não |
+| allowlist/denylist do exportador ANPD | correcta | não |
+| ancoragem diferida A0→A1 | correcta | não |
+| bundle offline assinado | correcta — rehash da árvore toda, não só do manifesto | não |
+| honestidade sobre ICP-Brasil | **correcta e imposta** | **sim** |
+
+A última linha é a excepção que interessa: a honestidade não é um comentário, é
+estrutural. `config.validate_security()` torna `production_mode = true`
+impossível de arrancar, o boot declara "não validada", e `verify_receipts` falha
+fechado perante um token externo. O invariante C4/C5 aguenta.
+
+### O que foi ligado agora
+
+**1. A porta de entrada do legal hold (§94 / C10).** O circuito estava inteiro —
+`place_legal_hold` persiste o evento *e* carimba o HRKM, o `plan_gc` respeita o
+bit, o `ensure_crypto_shred_allowed` bloqueia o crypto-shred — e era
+**inalcançável**: não havia rota REST, nem RPC, nem comando. Em produção o bit
+`retention.legal_hold` nunca passava de `false`, portanto o ramo
+`GcBlockReason::LegalHold` era código morto num servidor real.
+
+Passou a haver três operações no RPC `admin`: `legal-hold-place` e
+`legal-hold-release` com papel `Admin`, `legal-holds` com `Auditor` — ler quem
+está retido não muda nada. A lógica saiu do despachante para
+`grpc::legal_hold_op`, porque o que precisa de teste é o **efeito**, e testar um
+braço de `match` exigiria montar um `Request` autenticado.
+
+Duas decisões que valem por si:
+
+- **O `created_at_lsn` é carimbado pelo servidor, não pelo pedido.** Um cliente
+  que escolhesse o LSN podia datar o hold antes de uma destruição já ocorrida e
+  fazer o registo mentir sobre a ordem dos factos.
+- **Omitir `lsn_end` retém o que existe agora, não o futuro.** Um hold de fim
+  aberto reteria eventos que nenhuma autoridade avaliou.
+
+**2. A reconciliação que o próprio código exigia e ninguém fazia.** O
+doc-comment de `reconcile_legal_holds` diz *"Call at boot and immediately before
+any automated GC cycle"* — e não tinha um único chamador. O
+`set_legal_hold_range` só marca os segmentos que **existem** no momento em que o
+hold é colocado; um segmento selado depois disso, dentro do mesmo intervalo de
+LSN, ficava sem o bit e o GC automático coletava-o. Prova sob retenção judicial
+apagada, sem nada o assinalar.
+
+A janela era teórica enquanto nada em produção conseguia colocar um hold.
+Deixou de ser no momento em que o RPC passou a conseguir — por isso as duas
+correcções andam juntas. Agora reconcilia-se **no arranque** (o log é a
+autoridade, o HRKM é derivado, e um restauro de manifesto fá-los discordar) e
+**antes de cada passagem de GC**. Uma falha na reconciliação **salta** a coleta
+dessa passagem: trocar prova por espaço em disco é a troca errada.
+
+Testes: quatro, incluindo um que percorre a operação do RPC com o corpo JSON que
+um operador enviaria e verifica que o crypto-shred passa a falhar, que o GC fica
+sem candidatos, e que levantar o hold devolve as duas coisas. Validados por
+mutação — saltar a reconciliação derruba o teste da janela.
+
+### O que continua por ligar, e porquê
+
+**O guard de soberania não é instalável.** `EgressEndpoint::validate()` exige
+`scheme == "https"`; o `HttpTsa` que o servidor usa em produção fala HTTP sobre
+um `TcpStream` cru e **recusa** qualquer coisa que não seja `http://`. São
+mutuamente exclusivos por construção. Não é wiring em falta — é o cliente HTTPS
+do Marco 0, que não existe. Enquanto não existir, ligar o `GuardedTsaClient` é
+impossível, e a promessa de air-gap não vale nada em runtime: o worker de
+compliance faz egress com o cliente cru.
+
+**O veto `PreventDestruction` lê decisões que nada pode escrever.** O
+`ensure_crypto_shred_allowed` consulta-as, mas `evaluate_and_persist` não tem
+chamador — é um gate cosmético até ter um.
+
+**`retention.class` e `classification.rank` não têm produtor.** O gate do
+crypto-shred lê estes atributos do episódio; nenhum caminho do repositório os
+escreve. Ficam dependentes de um cliente externo os pôr à mão — leitura
+oportunista, não enforcement. E o `classify_derived_episode` continua sem
+chamador: o produtor real de derivados (`heraclitus-distill`) ignora-o.
+
+**Sem superfície para o resto.** Dashboard, ANPD, ancoragem diferida, bundles de
+modelo e soberania não têm rota REST nem subcomando. Os motores existem e não há
+operador que os accione.
+
+### Definition of Done: 19 dos 20 itens por satisfazer
+
+O Marco 0 está **inteiramente ausente** — verifiquei por conta própria: zero
+ocorrências de `TrustStore`, `X509`, `CMS` ou de um cliente HTTPS em todo o
+crate. Isso derruba quatro itens do DoD directamente (verificador RFC 3161 de
+produção, cadeia de confiança, trust store, HTTPS), e a ausência propaga-se:
+sem validação de cadeia não há prova temporal (C6), e o `LegalReceipt` que o
+`anchor()` de produção emite não tem sequer campo para o digest anterior,
+portanto "anchors encadeados" é inalcançável pelo worker.
+
+A transcrição da sessão paralela termina com *"Vou agora atacar essa fronteira
+de produção"* — o Marco 0 era o passo seguinte quando a quota acabou. A
+sequência estava certa; é onde recomeçar.
+
+### O item do DoD que está satisfeito
+
+*"Replay mantém histórico de políticas"* — e a hipótese de refutação (versão
+lida de um global no momento da avaliação, o que faria o replay reproduzir a
+política de hoje) **não se confirmou**: não há global nenhum, a `PolicyIdentity`
+viaja dentro da `RegulatoryDecision` e o `decision_id` é um BLAKE3 sobre
+(identidade da política, contexto, requisitos). C12 aguenta.
+
+### Nota operacional: o disco encheu, e a suíte é cúmplice
+
+Durante esta sessão o volume `D:` chegou a **0 bytes livres** — o mesmo volume
+onde a base viva escreve. Duas causas:
+
+1. `D:\cargo-target` com **352 GB**. É cache de build partilhado por toda a
+   máquina (`CARGO_TARGET_DIR`), inflado por ter passado a coexistirem
+   artefactos de perfis diferentes — ligar `overflow-checks` em release muda o
+   hash do perfil e cria um conjunto novo sem apagar o antigo. Removidos os
+   perfis `release`, `doc`, `criterion` e o alvo cruzado: 15 GB livres.
+2. **897 directórios de teste abandonados** em `D:\tmp`. O `dir_teste` do
+   `hrkl_v6_manifest.rs` construía `temp_dir()/hrkm-it-{pid}-{nome}` e fazia
+   `remove_dir_all` **no início** — o que limpa a corrida anterior do *mesmo*
+   pid, e o pid muda a cada corrida. Cada `cargo test` deixava o seu lixo.
+
+O segundo é um defeito, não um incómodo: uma suíte que cresce sem limite acaba
+por parar a máquina que a corre, e neste caso a máquina também aloja a base. O
+helper passou a devolver um `tempfile::TempDir`, que se apaga no `Drop` — daí
+devolver o guarda em vez do `PathBuf`: um `PathBuf` não tem como saber quando o
+teste acabou. Verificado: nove testes passam e deixam **zero** directórios.
 ## ATUALIZAÇÃO 2026-08-30 (2) — SPEC-0047 deixou de ser código sem chamador
 
 A auditoria nomeou o padrão desta base — *implementado, testado, nunca

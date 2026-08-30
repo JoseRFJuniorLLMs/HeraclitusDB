@@ -53,11 +53,24 @@ fn hasher(_lsn: Lsn, _hlc: u64, payload: &[u8]) -> V6Result<[u8; 32]> {
     Ok(*h.finalize().as_bytes())
 }
 
-fn dir_teste(nome: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("hrkm-it-{}-{nome}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+/// Directorio temporario que se apaga sozinho no fim do teste.
+///
+/// Era `temp_dir().join(format!("hrkm-it-{pid}-{nome}"))` com um
+/// `remove_dir_all` **no inicio** — o que limpa a corrida anterior do MESMO
+/// pid, e o pid muda a cada corrida. Resultado: cada `cargo test` deixava os
+/// seus directorios para tras. Em 2026-08-30 estavam 897 acumulados em
+/// `D:\tmp`, e o disco chegou a 0 bytes livres num volume que tambem aloja a
+/// base de dados viva.
+///
+/// O `TempDir` do `tempfile` apaga-se no `Drop`, portanto o chamador tem de o
+/// manter vivo — e e por isso que a funcao devolve o guarda em vez do
+/// `PathBuf`. Nao e ceremonia: um `PathBuf` nao tem como saber quando o teste
+/// acabou.
+fn dir_teste(nome: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("hrkm-it-{nome}-"))
+        .tempdir()
+        .unwrap()
 }
 
 /// Escreve e sela um segmento RAW, devolvendo o caminho e o footer.
@@ -216,12 +229,13 @@ fn golden_vector_do_hrkm() {
 #[test]
 fn parquet_obsoleto_e_desligado_do_hrkm_mas_nao_apagado_pelo_gc() {
     let d = dir_teste("gc-lakehouse");
+    let d = d.path();
     let store = ManifestStore::open(d.join("manifests")).unwrap();
     let mut m = DatabaseManifest {
         storage_namespace_id: NAMESPACE,
         ..Default::default()
     };
-    let raw = sela_e_cataloga(&d, &mut m, 0, 1, 100);
+    let raw = sela_e_cataloga(d, &mut m, 0, 1, 100);
     let target = d.join("00000000000000000000.g1.hrkl");
     pack_and_commit(
         &store,
@@ -275,7 +289,7 @@ fn parquet_obsoleto_e_desligado_do_hrkm_mas_nao_apagado_pelo_gc() {
 
     // Com o comportamento antigo isto falhava: `resolve_gc_path` não sabe
     // resolver `file:///bucket/...` sob a raiz do banco.
-    let executado = commit_gc(&store, &mut m, &d, &plano).unwrap();
+    let executado = commit_gc(&store, &mut m, d, &plano).unwrap();
 
     assert_eq!(
         executado.lakehouse_detached,
@@ -312,6 +326,7 @@ fn parquet_obsoleto_e_desligado_do_hrkm_mas_nao_apagado_pelo_gc() {
 #[test]
 fn ciclo_completo_selar_catalogar_packar_coletar() {
     let d = dir_teste("ciclo");
+    let d = d.path();
     let store = ManifestStore::open(d.join("manifests")).unwrap();
     let mut m = DatabaseManifest {
         storage_namespace_id: NAMESPACE,
@@ -321,7 +336,7 @@ fn ciclo_completo_selar_catalogar_packar_coletar() {
     // 1. Três segmentos selados e catalogados.
     let mut raws = Vec::new();
     for i in 0..3u64 {
-        raws.push(sela_e_cataloga(&d, &mut m, i, 1 + i * 1_000, 1_000));
+        raws.push(sela_e_cataloga(d, &mut m, i, 1 + i * 1_000, 1_000));
     }
     store.commit(&mut m).unwrap();
     assert_eq!(m.packing_queue(), vec![0, 1, 2]);
@@ -388,7 +403,7 @@ fn ciclo_completo_selar_catalogar_packar_coletar() {
 
     // 5. Aplicar: HRKM primeiro, ficheiros depois. Um crash no meio deixa
     // apenas órfãos; nunca deixa o manifesto a apontar para bytes apagados.
-    let executado = commit_gc(&store, &mut m, &d, &plano).unwrap();
+    let executado = commit_gc(&store, &mut m, d, &plano).unwrap();
     assert_eq!(executado.removed.len(), 3);
     assert!(executado.orphaned.is_empty());
 
@@ -423,13 +438,14 @@ fn crash_em_qualquer_etapa_nunca_perde_registos() {
 
     for etapa in etapas {
         let d = dir_teste(&format!("crash-{etapa}"));
+        let d = d.path();
         let store = ManifestStore::open(d.join("manifests")).unwrap();
         let mut m = DatabaseManifest {
             storage_namespace_id: NAMESPACE,
             ..Default::default()
         };
 
-        let raw = sela_e_cataloga(&d, &mut m, 7, 1, 1_000);
+        let raw = sela_e_cataloga(d, &mut m, 7, 1, 1_000);
         let root = m.segment(7).unwrap().logical_root;
         store.commit(&mut m).unwrap();
         if etapa == "apos_seal" {
@@ -540,6 +556,7 @@ fn nenhuma_sequencia_de_operacoes_deixa_um_segmento_sem_autoridade() {
     };
 
     let d = dir_teste("sequencias");
+    let d = d.path();
     let store = ManifestStore::open(d.join("manifests")).unwrap();
     let mut m = DatabaseManifest {
         storage_namespace_id: NAMESPACE,
@@ -549,7 +566,7 @@ fn nenhuma_sequencia_de_operacoes_deixa_um_segmento_sem_autoridade() {
 
     let mut caminhos = Vec::new();
     for i in 0..6u64 {
-        caminhos.push(sela_e_cataloga(&d, &mut m, i, 1 + i * 200, 200));
+        caminhos.push(sela_e_cataloga(d, &mut m, i, 1 + i * 200, 200));
     }
     store.commit(&mut m).unwrap();
 
@@ -617,7 +634,7 @@ fn nenhuma_sequencia_de_operacoes_deixa_um_segmento_sem_autoridade() {
                 );
                 assert_gc_invariant(&m, &plano)
                     .unwrap_or_else(|e| panic!("passo {passo}: plano inválido: {e}"));
-                commit_gc(&store, &mut m, &d, &plano).unwrap();
+                commit_gc(&store, &mut m, d, &plano).unwrap();
             }
         }
 
@@ -657,13 +674,14 @@ fn nenhuma_sequencia_de_operacoes_deixa_um_segmento_sem_autoridade() {
 #[test]
 fn boot_com_hrkm_nao_abre_nenhum_segmento() {
     let d = dir_teste("boot");
+    let d = d.path();
     let store = ManifestStore::open(d.join("manifests")).unwrap();
     let mut m = DatabaseManifest {
         storage_namespace_id: NAMESPACE,
         ..Default::default()
     };
     for i in 0..8u64 {
-        sela_e_cataloga(&d, &mut m, i, 1 + i * 500, 500);
+        sela_e_cataloga(d, &mut m, i, 1 + i * 500, 500);
     }
     store.commit(&mut m).unwrap();
 
@@ -693,7 +711,8 @@ fn boot_com_hrkm_nao_abre_nenhum_segmento() {
 #[test]
 fn manifestos_antigos_sao_podados_sem_perder_o_corrente() {
     let d = dir_teste("retencao");
-    let store = ManifestStore::open(&d).unwrap();
+    let d = d.path();
+    let store = ManifestStore::open(d).unwrap();
     let mut m = DatabaseManifest {
         storage_namespace_id: NAMESPACE,
         ..Default::default()
@@ -716,12 +735,13 @@ fn manifestos_antigos_sao_podados_sem_perder_o_corrente() {
 #[test]
 fn legal_hold_impede_o_gc_ate_ser_levantado() {
     let d = dir_teste("legalhold");
+    let d = d.path();
     let store = ManifestStore::open(d.join("manifests")).unwrap();
     let mut m = DatabaseManifest {
         storage_namespace_id: NAMESPACE,
         ..Default::default()
     };
-    let raw = sela_e_cataloga(&d, &mut m, 1, 1, 300);
+    let raw = sela_e_cataloga(d, &mut m, 1, 1, 300);
     store.commit(&mut m).unwrap();
     let target = d.join("um.g1.hrkl");
     pack_and_commit(
@@ -780,12 +800,13 @@ fn geracao_em_object_storage_e_desligada_mas_nao_apagada_pelo_gc() {
     use heraclitus_core::runtime::{CompressionCodec, PhysicalGeneration};
 
     let d = dir_teste("gc-cold");
+    let d = d.path();
     let store = ManifestStore::open(d.join("manifests")).unwrap();
     let mut m = DatabaseManifest {
         storage_namespace_id: NAMESPACE,
         ..Default::default()
     };
-    let raw = sela_e_cataloga(&d, &mut m, 0, 1, 100);
+    let raw = sela_e_cataloga(d, &mut m, 0, 1, 100);
     let target = d.join("00000000000000000000.g1.hrkl");
     pack_and_commit(
         &store,
@@ -858,7 +879,7 @@ fn geracao_em_object_storage_e_desligada_mas_nao_apagada_pelo_gc() {
 
     // Com o comportamento antigo isto era `Err`: a chave `canonical/…` não
     // canonicaliza sob a raiz local.
-    let executado = commit_gc(&store, &mut m, &d, &plano).unwrap();
+    let executado = commit_gc(&store, &mut m, d, &plano).unwrap();
 
     assert_eq!(
         executado.cold_detached,

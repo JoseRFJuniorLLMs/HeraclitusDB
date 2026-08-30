@@ -1226,8 +1226,7 @@ mod tests {
         assert!(sanitization.removed_paths.contains("affected_data.cpf"));
         let all_files = std::fs::read_dir(&output)
             .unwrap()
-            .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
-            .flatten()
+            .flat_map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
             .collect::<Vec<_>>();
         assert!(!String::from_utf8_lossy(&all_files).contains("000.000.000-00"));
     }

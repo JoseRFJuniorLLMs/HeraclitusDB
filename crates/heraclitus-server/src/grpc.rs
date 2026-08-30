@@ -266,9 +266,10 @@ impl pb::heraclitus_server::Heraclitus for Service {
         req: Request<pb::AdminRequest>,
     ) -> Result<Response<pb::AdminResponse>, Status> {
         let required = match req.get_ref().op.as_str() {
-            "stats" | "verify" | "sentinel-status" | "sentinel-incidents" | "sentinel-actions" => {
-                AccessRole::Auditor
-            }
+            // `legal-holds` e leitura: saber quem esta retido nao muda nada.
+            // Colocar e levantar um hold ficam no ramo Admin abaixo.
+            "stats" | "verify" | "sentinel-status" | "sentinel-incidents" | "sentinel-actions"
+            | "legal-holds" => AccessRole::Auditor,
             _ => AccessRole::Admin,
         };
         let principal = crate::auth::require(&req, required)?;
@@ -283,6 +284,16 @@ impl pb::heraclitus_server::Heraclitus for Service {
         let (ok, message) = tokio::task::spawn_blocking(move || {
             let result = match r.op.as_str() {
                 "stats" => (true, engine.stats().to_string()),
+                // SPEC-0046 §94 / invariante C10 — a porta de entrada do legal
+                // hold. O circuito já existia inteiro e era inalcançável:
+                // `place_legal_hold` persiste o evento e chama
+                // `set_legal_hold_range` no HRKM, o `plan_gc` respeita-o e o
+                // `ensure_crypto_shred_allowed` do `crypto_shred` bloqueia — mas
+                // nada em produção podia CRIAR um hold, portanto §94 era uma
+                // garantia que só os testes conseguiam exercer.
+                op @ ("legal-hold-place" | "legal-hold-release" | "legal-holds") => {
+                    crate::grpc::legal_hold_op(&engine, op, &r.arg)
+                }
                 "verify" => match engine.verify() {
                     Ok(v) => (true, v.to_string()),
                     Err(e) => (false, e.to_string()),
@@ -388,5 +399,102 @@ impl pb::heraclitus_server::Heraclitus for Service {
         .await
         .map_err(internal)?;
         Ok(Response::new(pb::AdminResponse { ok, message }))
+    }
+}
+
+/// SPEC-0046 §94 / invariante C10 — as três operações de legal hold do RPC
+/// `admin`.
+///
+/// Vive fora do despachante por duas razões, e a segunda é a que importa: o
+/// braço do `match` seria testável apenas montando um `Request` com
+/// autenticação, e o que precisa de teste é o **efeito** — colocar um hold
+/// bloqueia mesmo o crypto-shred e o GC, levantá-lo desbloqueia, e a listagem
+/// diz a verdade.
+///
+/// Devolve `(ok, mensagem)` como o resto do `admin`.
+pub(crate) fn legal_hold_op(
+    engine: &std::sync::Arc<crate::engine::Engine>,
+    op: &str,
+    arg: &str,
+) -> (bool, String) {
+    let body = match serde_json::from_str::<serde_json::Value>(arg) {
+        Ok(value) => value,
+        // A listagem não precisa de corpo; as outras duas precisam.
+        Err(_) if op == "legal-holds" => serde_json::Value::Null,
+        Err(error) => return (false, format!("corpo inválido: {error}")),
+    };
+    let campo = |nome: &str| {
+        body.get(nome)
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_owned()
+    };
+
+    match op {
+        "legal-hold-place" => {
+            let head = engine.log.head();
+            let hold = heraclitus_compliance::LegalHold {
+                hold_id: campo("hold_id"),
+                scope: heraclitus_compliance::EvidenceSelector {
+                    lsn_start: body.get("lsn_start").and_then(|v| v.as_u64()).unwrap_or(0),
+                    // Omitir `lsn_end` retém tudo o que existe AGORA, e não
+                    // "para sempre": um hold de fim aberto reteria eventos
+                    // futuros que nenhuma autoridade avaliou.
+                    lsn_end: body
+                        .get("lsn_end")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or_else(|| head.saturating_sub(1)),
+                },
+                authority: campo("authority"),
+                reason: campo("reason"),
+                // Carimbado pelo servidor, não pelo pedido: um cliente que
+                // escolhesse o LSN podia datar o hold antes de uma destruição
+                // já ocorrida e fazer o registo mentir sobre a ordem.
+                created_at_lsn: head,
+            };
+            match heraclitus_compliance::RegulatoryPolicyEngine::new(engine.log.clone())
+                .place_legal_hold(hold)
+            {
+                Ok(lsn) => (true, format!("legal_hold_lsn={lsn}")),
+                Err(error) => (false, error.to_string()),
+            }
+        }
+        "legal-hold-release" => {
+            let release = heraclitus_compliance::LegalHoldRelease {
+                hold_id: campo("hold_id"),
+                authority: campo("authority"),
+                reason: campo("reason"),
+                released_at_lsn: engine.log.head(),
+            };
+            match heraclitus_compliance::RegulatoryPolicyEngine::new(engine.log.clone())
+                .release_legal_hold(release)
+            {
+                Ok(lsn) => (true, format!("legal_hold_release_lsn={lsn}")),
+                Err(error) => (false, error.to_string()),
+            }
+        }
+        "legal-holds" => {
+            let head = engine.log.head();
+            match heraclitus_compliance::RegulatoryState::replay(engine.log.as_ref(), head) {
+                Ok(state) => {
+                    let holds: Vec<_> = state
+                        .active_holds()
+                        .map(|record| {
+                            serde_json::json!({
+                                "hold_id": record.hold.hold_id,
+                                "authority": record.hold.authority,
+                                "reason": record.hold.reason,
+                                "lsn_start": record.hold.scope.lsn_start,
+                                "lsn_end": record.hold.scope.lsn_end,
+                                "placed_at_lsn": record.lsn,
+                            })
+                        })
+                        .collect();
+                    (true, serde_json::to_string(&holds).unwrap_or_default())
+                }
+                Err(error) => (false, error.to_string()),
+            }
+        }
+        outra => (false, format!("operação desconhecida: {outra}")),
     }
 }

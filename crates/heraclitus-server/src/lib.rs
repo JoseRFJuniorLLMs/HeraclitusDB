@@ -336,6 +336,29 @@ pub async fn serve_with(
                 "configuração v6 abriu um backend que não é V6Log".into(),
             )
         })?;
+        // O mesmo log visto como `AnyLog`, que e o que o motor regulatorio
+        // aceita: a reconciliacao de §94 corre neste mesmo ciclo.
+        let log_regulatorio = engine.log.clone();
+        // SPEC-0046 §94 — reconciliar TAMBEM no arranque, e nao so antes de
+        // cada GC. O bit `legal_hold` vive no HRKM; os holds vivem no log. Um
+        // restauro de manifesto, uma migracao, ou um arranque sobre um HRKM
+        // mais antigo que o log deixam os dois a discordar — e quem perde e o
+        // hold, porque o default de `RetentionPolicy` e `legal_hold: false`.
+        // O log e a autoridade; o HRKM e derivado. Reconciliar aqui repoe essa
+        // ordem antes de a primeira passagem de GC sequer poder correr.
+        match heraclitus_compliance::RegulatoryPolicyEngine::new(log_regulatorio.clone())
+            .reconcile_legal_holds()
+        {
+            Ok(0) => {}
+            Ok(marcados) => boot.ok_line(
+                "Legal holds (§94)",
+                &format!("{marcados} segmento(s) reconciliado(s) a partir do log"),
+            ),
+            Err(error) => boot.warn_line(
+                "Legal holds (§94)",
+                &format!("reconciliação falhou no arranque: {error}"),
+            ),
+        }
         let every = std::time::Duration::from_secs(config.v6_gc_interval_secs);
         let opts = heraclitus_log::v6::GcRunOptions {
             keep_manifests: config.v6_gc_keep_manifests,
@@ -364,6 +387,53 @@ pub async fn serve_with(
             tick.tick().await;
             loop {
                 tick.tick().await;
+                // SPEC-0046 §94 — reconciliar ANTES de coletar, e nao por
+                // simetria: o `set_legal_hold_range` so marca os segmentos que
+                // existiam no momento em que o hold foi colocado. Um segmento
+                // selado DEPOIS disso, dentro do mesmo intervalo de LSN, fica
+                // sem o bit no HRKM e o GC coletava-o — apagando prova sob
+                // retencao judicial sem nada o assinalar.
+                //
+                // A janela era teorica enquanto nada em producao conseguia
+                // colocar um hold. Deixou de ser quando o RPC `admin` passou a
+                // conseguir. Reconciliar aqui e barato (le o estado por replay
+                // e carimba os segmentos em falta) e fecha-a.
+                //
+                // Uma falha na reconciliacao SALTA a coleta desta passagem: e a
+                // ordem fail-closed. Coletar com holds possivelmente por
+                // aplicar seria trocar prova por espaco em disco.
+                let reconciliado = {
+                    let gc_log = log_regulatorio.clone();
+                    tokio::task::spawn_blocking(move || {
+                        heraclitus_compliance::RegulatoryPolicyEngine::new(gc_log)
+                            .reconcile_legal_holds()
+                    })
+                    .await
+                };
+                match reconciliado {
+                    Ok(Ok(marcados)) => {
+                        if marcados > 0 {
+                            tracing::info!(
+                                segmentos = marcados,
+                                "legal holds reconciliados antes do GC"
+                            );
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            error = %error,
+                            "reconciliacao de legal holds falhou: GC adiado nesta passagem"
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "worker de reconciliacao de legal holds falhou: GC adiado"
+                        );
+                        continue;
+                    }
+                }
                 match log.clone().collect_garbage_async(opts).await {
                     Ok(execution) => {
                         // A esmagadora maioria das passagens não encontra nada;

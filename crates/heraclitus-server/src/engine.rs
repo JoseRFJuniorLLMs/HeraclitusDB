@@ -7,6 +7,7 @@ use heraclitus_core::{
     Episode, EventKind, HeraclitusConfig, HeraclitusError, Lsn, ProductPoint, SegmentId,
 };
 use heraclitus_crypto::KeyStore;
+use heraclitus_compliance::{RegulatoryState, RequirementEffect};
 use heraclitus_index_attr::AttrIndex;
 use heraclitus_index_graph::entity::EntityResolver;
 use heraclitus_index_graph::temporal::TemporalGraph;
@@ -1419,6 +1420,7 @@ impl Engine {
         let ks = self.keystore.as_ref().ok_or_else(|| {
             HeraclitusError::Config("encryption at rest is disabled; nothing to shred".into())
         })?;
+        self.ensure_crypto_shred_allowed(agent_id)?;
         std::fs::create_dir_all(&self.attr_dir)?;
         let marker = self.attr_dir.join("privacy-rebuild-required");
         let recovery_pending = marker.exists();
@@ -1476,6 +1478,93 @@ impl Engine {
         self.append(receipt)?;
         std::fs::remove_file(marker)?;
         Ok(destroyed || recovery_pending)
+    }
+
+    /// Fail-closed compliance gate for the irreversible key destruction.
+    ///
+    /// Legal holds are resolved from their append-only events, not only from
+    /// sealed-segment HRKM flags, so a hold also protects an active tail that
+    /// has not sealed yet. Regulatory `PreventDestruction`, protected retention
+    /// classes and non-public classification independently veto the operation.
+    fn ensure_crypto_shred_allowed(&self, agent_id: &str) -> Result<(), HeraclitusError> {
+        let head = self.log.head();
+        let state = RegulatoryState::replay(self.log.as_ref(), head).map_err(|error| {
+            HeraclitusError::Config(format!(
+                "crypto-shred bloqueado: estado regulatório inválido: {error}"
+            ))
+        })?;
+        if let Some(record) = state.decisions.iter().find(|record| {
+            record.decision.context.subject_id == agent_id
+                && record
+                    .decision
+                    .requirements
+                    .iter()
+                    .any(|requirement| requirement.effect == RequirementEffect::PreventDestruction)
+        }) {
+            return Err(HeraclitusError::Config(format!(
+                "crypto-shred bloqueado pela decisão regulatória {}",
+                record.decision.decision_id
+            )));
+        }
+
+        let active_holds: Vec<_> = state
+            .active_holds()
+            .map(|record| {
+                (
+                    record.hold.hold_id.as_str(),
+                    record.hold.scope.lsn_start,
+                    record.hold.scope.lsn_end,
+                )
+            })
+            .collect();
+        let mut cursor = 0;
+        while cursor < head {
+            let batch = self.log.scan_capped(cursor, head, 100_000)?;
+            let Some((last_lsn, _)) = batch.last() else {
+                break;
+            };
+            for (lsn, episode) in &batch {
+                if episode.agent_id != agent_id {
+                    continue;
+                }
+                if let Some((hold_id, _, _)) = active_holds
+                    .iter()
+                    .find(|(_, start, end)| *start <= *lsn && *lsn <= *end)
+                {
+                    return Err(HeraclitusError::Config(format!(
+                        "crypto-shred bloqueado pelo LegalHold {hold_id}"
+                    )));
+                }
+                if episode
+                    .attrs
+                    .get("retention.class")
+                    .is_some_and(|class| {
+                        matches!(
+                            class.as_str(),
+                            "incident_evidence"
+                                | "permanent_archive"
+                                | "classified_information"
+                                | "legal_hold"
+                        )
+                    })
+                {
+                    return Err(HeraclitusError::Config(format!(
+                        "crypto-shred bloqueado pela classe de retenção no LSN {lsn}"
+                    )));
+                }
+                if episode
+                    .attrs
+                    .get("classification.rank")
+                    .is_some_and(|rank| rank.parse::<u16>().map_or(true, |rank| rank > 0))
+                {
+                    return Err(HeraclitusError::Config(format!(
+                        "crypto-shred bloqueado por informação classificada no LSN {lsn}"
+                    )));
+                }
+            }
+            cursor = last_lsn.saturating_add(1);
+        }
+        Ok(())
     }
 
     /// Append + synchronously index into memtable AND views.
@@ -2715,6 +2804,61 @@ mod tests {
         assert!(reopened.log.read(lsn).unwrap().is_some());
     }
 
+    #[test]
+    fn legal_hold_blocks_crypto_shred_before_key_destruction() {
+        use heraclitus_compliance::{
+            EvidenceSelector, LegalHold, LegalHoldRelease, RegulatoryPolicyEngine,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            storage_format: heraclitus_core::StorageFormat::V6,
+            encryption_at_rest: true,
+            ..Default::default()
+        };
+        let engine = Engine::open(&cfg).unwrap();
+        let agent = "titular:hmac-sha256:held-subject";
+        let lsn = engine
+            .append(Episode::new(
+                agent,
+                EventKind::Custom("PersonalData".into()),
+                b"protected".to_vec(),
+            ))
+            .unwrap();
+        let regulatory = RegulatoryPolicyEngine::new(engine.log.clone());
+        regulatory
+            .place_legal_hold(LegalHold {
+                hold_id: "hold-shred-test".into(),
+                scope: EvidenceSelector {
+                    lsn_start: lsn,
+                    lsn_end: lsn,
+                },
+                authority: "court".into(),
+                reason: "preserve evidence".into(),
+                created_at_lsn: lsn,
+            })
+            .unwrap();
+
+        assert!(engine.shred(agent).is_err());
+        assert_eq!(engine.log.read(lsn).unwrap().unwrap().1.content, b"protected");
+
+        regulatory
+            .release_legal_hold(LegalHoldRelease {
+                hold_id: "hold-shred-test".into(),
+                authority: "court".into(),
+                reason: "case closed".into(),
+                released_at_lsn: engine.log.head(),
+            })
+            .unwrap();
+        assert!(engine.shred(agent).unwrap());
+        assert_eq!(
+            engine.log.read(lsn).unwrap().unwrap().1.content,
+            heraclitus_crypto::SHREDDED
+        );
+    }
+
     /// §3.9/§2.6 — a task de distill consolida clusters em Facts pelo caminho
     /// unificado (Engine::append): os Facts ficam indexados AO VIVO (state_hash
     /// do grafo idêntico vivo vs reopen), o cursor evita re-emissão, e episódios
@@ -3441,6 +3585,236 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// SPEC-0046 §94 — a janela que o `reconcile_legal_holds` fecha, e que so
+    /// passou a importar quando o hold se tornou colocavel.
+    ///
+    /// O `set_legal_hold_range` marca os segmentos que EXISTEM no momento em
+    /// que o hold e colocado. Um segmento selado depois disso, dentro do mesmo
+    /// intervalo de LSN, ficava sem o bit no HRKM — e o GC automatico
+    /// coletava-o, apagando prova sob retencao judicial sem nada o assinalar.
+    ///
+    /// A task de GC do servidor passou a reconciliar antes de cada passagem.
+    /// Este teste faz o mesmo pela via directa: coloca o hold, sela DEPOIS, e
+    /// verifica que so apos a reconciliacao o segmento novo fica protegido.
+    #[test]
+    fn a_reconciliacao_protege_um_segmento_selado_depois_do_hold() {
+        use heraclitus_compliance::RegulatoryPolicyEngine;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            storage_format: heraclitus_core::StorageFormat::V6,
+            ..Default::default()
+        };
+        let engine = Arc::new(Engine::open(&cfg).unwrap());
+        engine
+            .append(Episode::new("a", EventKind::Observation, b"antes".to_vec()))
+            .unwrap();
+
+        // Hold com fim aberto ate um LSN muito a frente: cobre o que vier.
+        let (ok, msg) = crate::grpc::legal_hold_op(
+            &engine,
+            "legal-hold-place",
+            r#"{"hold_id":"h","lsn_start":0,"lsn_end":1000000,
+                "authority":"tribunal","reason":"preservar"}"#,
+        );
+        assert!(ok, "{msg}");
+
+        let v6 = engine.log.v6_arc().expect("v6");
+        // Um segmento NOVO, selado depois de o hold ter sido colocado.
+        engine
+            .append(Episode::new("a", EventKind::Observation, b"depois".to_vec()))
+            .unwrap();
+        v6.seal_active().unwrap();
+
+        let sem_hold = v6
+            .manifest()
+            .segments_v2
+            .iter()
+            .filter(|s| !s.retention.legal_hold)
+            .count();
+        assert!(
+            sem_hold > 0,
+            "premissa do teste: tem de haver um segmento por proteger antes da reconciliacao"
+        );
+
+        let marcados = RegulatoryPolicyEngine::new(engine.log.clone())
+            .reconcile_legal_holds()
+            .unwrap();
+        assert!(marcados > 0, "a reconciliacao nao marcou nada");
+        assert_eq!(
+            v6.manifest()
+                .segments_v2
+                .iter()
+                .filter(|s| !s.retention.legal_hold)
+                .count(),
+            0,
+            "sobrou um segmento no intervalo do hold sem proteccao no HRKM"
+        );
+    }
+}
+
+#[cfg(test)]
+mod legal_hold_entrypoint_tests {
+    use super::*;
+    use heraclitus_core::config::HeraclitusConfig;
+    use heraclitus_core::{Episode, EventKind, FsyncPolicy};
+    use std::sync::Arc;
+
+    /// SPEC-0046 §94 / C10 — a porta de entrada do legal hold.
+    ///
+    /// A verificacao adversarial de 2026-08-30 apurou que o circuito estava
+    /// inteiro e era **inalcancavel**: `place_legal_hold` persiste o evento e
+    /// carimba o HRKM, o `plan_gc` respeita-o, o `ensure_crypto_shred_allowed`
+    /// bloqueia — e nada em producao podia criar um hold. Nem rota REST, nem
+    /// RPC, nem comando. §94 era uma garantia que so os testes exerciam.
+    ///
+    /// Este teste percorre a operacao do RPC `admin`, com o corpo JSON que um
+    /// operador enviaria, e verifica o EFEITO: bloqueia, lista, liberta.
+    #[test]
+    fn a_operacao_admin_coloca_lista_e_levanta_um_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            storage_format: heraclitus_core::StorageFormat::V6,
+            encryption_at_rest: true,
+            ..Default::default()
+        };
+        let engine = Arc::new(Engine::open(&cfg).unwrap());
+        let agent = "titular:hmac-sha256:sujeito-retido";
+        let lsn = engine
+            .append(Episode::new(
+                agent,
+                EventKind::Custom("PersonalData".into()),
+                b"protegido".to_vec(),
+            ))
+            .unwrap();
+
+        // Antes do hold, o shred passa — e este ramo do teste e o que da
+        // significado ao resto: sem ele, "bloqueado" podia ser um shred que
+        // nunca funcionou.
+        let sonda = "titular:hmac-sha256:sem-hold";
+        engine
+            .append(Episode::new(
+                sonda,
+                EventKind::Custom("PersonalData".into()),
+                b"efemero".to_vec(),
+            ))
+            .unwrap();
+        assert!(engine.shred(sonda).unwrap());
+
+        let (ok, msg) = crate::grpc::legal_hold_op(
+            &engine,
+            "legal-hold-place",
+            &format!(
+                r#"{{"hold_id":"hold-1","lsn_start":{lsn},"lsn_end":{lsn},
+                     "authority":"tribunal","reason":"preservar prova"}}"#
+            ),
+        );
+        assert!(ok, "{msg}");
+
+        // A listagem diz a verdade sobre o que esta retido.
+        let (ok, listagem) = crate::grpc::legal_hold_op(&engine, "legal-holds", "");
+        assert!(ok, "{listagem}");
+        let holds: serde_json::Value = serde_json::from_str(&listagem).unwrap();
+        assert_eq!(holds.as_array().unwrap().len(), 1);
+        assert_eq!(holds[0]["hold_id"], "hold-1");
+        assert_eq!(holds[0]["authority"], "tribunal");
+
+        // O efeito: §98 (crypto-shred) cede perante §94 (legal hold) — C10.
+        assert!(engine.shred(agent).is_err());
+        assert_eq!(engine.log.read(lsn).unwrap().unwrap().1.content, b"protegido");
+
+        // E o GC nao pode coletar o que esta retido.
+        if let Some(v6) = engine.log.v6_arc() {
+            let plano = v6
+                .gc_plan(heraclitus_log::v6::GcRunOptions::default())
+                .unwrap();
+            assert!(
+                plano.generations.is_empty(),
+                "o GC nao pode ter candidatos com um hold activo: {:?}",
+                plano.generations
+            );
+        }
+
+        // Levantar exige autoridade e razao, e e auditado no log.
+        let (ok, msg) = crate::grpc::legal_hold_op(
+            &engine,
+            "legal-hold-release",
+            r#"{"hold_id":"hold-1","authority":"tribunal","reason":"caso encerrado"}"#,
+        );
+        assert!(ok, "{msg}");
+
+        let (_, listagem) = crate::grpc::legal_hold_op(&engine, "legal-holds", "");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&listagem)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(engine.shred(agent).unwrap());
+    }
+
+    /// Um pedido sem autoridade ou sem razao e recusado: um hold anonimo nao
+    /// e accionavel por quem o tiver de justificar depois.
+    #[test]
+    fn um_hold_sem_autoridade_ou_razao_e_recusado() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            storage_format: heraclitus_core::StorageFormat::V6,
+            ..Default::default()
+        };
+        let engine = Arc::new(Engine::open(&cfg).unwrap());
+        for corpo in [
+            r#"{"hold_id":"h","lsn_start":0,"lsn_end":0,"reason":"r"}"#,
+            r#"{"hold_id":"h","lsn_start":0,"lsn_end":0,"authority":"a"}"#,
+            r#"{"lsn_start":0,"lsn_end":0,"authority":"a","reason":"r"}"#,
+            "isto nao e json",
+        ] {
+            let (ok, _) = crate::grpc::legal_hold_op(&engine, "legal-hold-place", corpo);
+            assert!(!ok, "aceitou um pedido incompleto: {corpo}");
+        }
+    }
+
+    /// Sem `lsn_end`, o hold cobre o que existe AGORA — nao o futuro. Um hold
+    /// de fim aberto reteria eventos que nenhuma autoridade avaliou.
+    #[test]
+    fn um_hold_sem_fim_nao_retem_o_futuro() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            storage_format: heraclitus_core::StorageFormat::V6,
+            ..Default::default()
+        };
+        let engine = Arc::new(Engine::open(&cfg).unwrap());
+        engine
+            .append(Episode::new("a", EventKind::Observation, b"antes".to_vec()))
+            .unwrap();
+        let (ok, _) = crate::grpc::legal_hold_op(
+            &engine,
+            "legal-hold-place",
+            r#"{"hold_id":"h","authority":"a","reason":"r"}"#,
+        );
+        assert!(ok);
+        let depois = engine
+            .append(Episode::new("a", EventKind::Observation, b"depois".to_vec()))
+            .unwrap();
+
+        let (_, listagem) = crate::grpc::legal_hold_op(&engine, "legal-holds", "");
+        let holds: serde_json::Value = serde_json::from_str(&listagem).unwrap();
+        assert!(
+            holds[0]["lsn_end"].as_u64().unwrap() < depois,
+            "o hold cobriu um evento posterior a sua criacao"
         );
     }
 }

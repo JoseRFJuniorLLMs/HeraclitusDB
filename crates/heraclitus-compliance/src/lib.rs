@@ -27,7 +27,9 @@
 //! ainda.
 
 pub mod commit;
+pub mod dashboard;
 pub mod classification;
+pub mod deferred;
 pub mod model_bundle;
 pub mod privacy;
 pub mod regulatory;
@@ -40,10 +42,21 @@ pub mod verify;
 pub mod worker;
 
 pub use commit::{commit_at, commit_now, current_watermark, Commitment};
+pub use dashboard::{
+    AnchorHealthSnapshot, ComplianceDashboardError, ComplianceDashboardSnapshot,
+    ComplianceOverallStatus, DeadlineHealthSnapshot, LegalHoldSnapshot,
+    SovereigntyHealthSnapshot,
+};
 pub use classification::{
     classify_derived_episode, ClassificationControls, ClassificationDecision,
     ClassificationDowngradeAuthorization, ClassificationError, ClassificationPolicy,
     SourceClassification,
+};
+pub use deferred::{
+    import_deferred_response, stamp_deferred_request, DeferredAnchorError,
+    DeferredAnchorRegistry, DeferredAnchorRequest, DeferredAnchorResponse, DeferredAnchorState,
+    DeferredSignature, DeferredTransferPolicy, EvidenceAnchor, EvidenceCommitment,
+    SignedDeferredAnchorRequest, SignedDeferredAnchorResponse,
 };
 pub use model_bundle::{
     build_signed_model_bundle, verify_model_bundle, BundleSignature, BundleSignatureScheme,
