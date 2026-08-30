@@ -11,6 +11,115 @@ excluído (é cache, dá falsos positivos).
 > cada afirmação falsa/enganosa com a evidência. O estado real da plataforma e o
 > roteiro estão em [../PLANO-SPECS.md](../PLANO-SPECS.md).
 
+## AUDITORIA DE BUGS 2026-08-30 — relatório completo
+
+**Método:** varrimento por classe de defeito sobre `crates/*/src` e `tools/*/src`,
+com leitura do contexto de cada candidato. Um "candidato" só entra abaixo depois
+de eu ler o código à volta e perceber se a guarda existe. Inclui os resultados
+**negativos**, porque numa auditoria saber o que foi verificado e está bem vale
+tanto como a lista de defeitos.
+
+### Achados
+
+#### 🟠 1. O GC segura o mutex do writer durante os `remove_file`
+
+`V6Log::collect_garbage` (código meu, desta sessão) chama `commit_gc` com o
+`state` tomado. O `commit_gc` faz duas coisas: comita o HRKM **e** desliga os
+ficheiros. A primeira tem de ser sob o lock; a segunda não. Como está, os
+`unlink` acontecem com o mutex do writer na mão, portanto **os appends param**
+durante a passagem.
+
+Normalmente é irrelevante (uma geração RAW por segmento empacotado, microssegundos
+por ficheiro). O caso que importa é o outro: **a primeira passagem num banco que
+nunca correu GC** — que é a situação de todas as instalações existentes, porque
+até hoje o GC não corria. Um banco com mil gerações superseded acumuladas para
+appends durante a varredura inteira.
+
+Correcção: partir o `commit_gc` em comitar-manifesto (devolve os caminhos
+resolvidos) e desligar-ficheiros, e fazer o segundo depois de largar o lock. A
+ordem crash-safe mantém-se — é a mesma sequência, só com a fronteira do lock
+noutro sítio.
+
+#### 🟠 2. Overflow silencioso em release, sem rede de segurança
+
+`[profile.release]` define `lto` e `codegen-units` e **não define
+`overflow-checks`**. Em release, `a - b` em `u64` dá a volta em silêncio.
+
+Verifiquei os sítios que importam e **não encontrei nenhum explorável**: os
+decoders de bloco e de rodapé chamam `check_coherence` no `decode`, e essa
+função recusa `first_lsn > last_lsn`, `restart_count` que não cabe no bloco e
+`uncompressed_len` acima do tecto de §140 — antes de qualquer subtracção. Os
+`unwrap` em `u32::from_le_bytes(buf[a..b].try_into().unwrap())` estão todos
+depois de um `if buf.len() < N { return Torn }`.
+
+O problema não é o código de hoje, é a ausência de rede. Toda a garantia assenta
+em verificações escritas à mão, uma a uma. Para um banco cujo modelo de ameaça
+inclui explicitamente ficheiros adulterados (§84, §140), `overflow-checks = true`
+converte um wrap silencioso num crash — que é o comportamento que se quer, porque
+um crash é visível e um wrap não. Custo: alguns por cento. É decisão de produto,
+mas o estado actual significa que a **próxima** verificação em falta será
+silenciosa.
+
+#### 🟡 3. `KeyStore::shred` promete mais do que o sistema de ficheiros dá
+
+```rust
+// Best-effort overwrite so the raw key bytes do not linger on disk.
+if let Ok(meta) = std::fs::metadata(&path) {
+    let _ = std::fs::write(&path, vec![0u8; meta.len() as usize]);
+}
+std::fs::remove_file(&path)?;
+```
+
+Reescrever um ficheiro no sítio **não apaga os blocos originais** num sistema
+copy-on-write (ReFS, btrfs, ZFS) nem num SSD com wear levelling: o controlador
+escreve noutra página e a antiga fica lá até ser reciclada.
+
+O que a §98 exige de facto é a **destruição da chave**, e isso o `remove_file`
+faz. A lacuna é entre o nome (`shred`) e a garantia: quem lê a assinatura pode
+concluir que os bytes desapareceram. O comentário diz "best-effort" mas não diz
+*porquê* é best-effort, que é a parte accionável.
+
+#### 🟡 4. `ERASURE` é estado global de processo, não do router
+
+`rest.rs:18` — `static ERASURE: AtomicBool`, escrito em
+`router_with_sentinel`. Dois routers no mesmo processo (testes, ou uma segunda
+instância embebida) partilham o flag: o último a ser construído decide pelos
+dois. No desenho actual — um servidor por processo — não é explorável, mas é
+configuração guardada fora do estado a que pertence, e é o tipo de coisa que
+surpreende primeiro num teste e só depois em produção.
+
+#### 🟡 5. e 6. Já reportados na auditoria de ontem
+
+O flaky do `hrkl_v6_crash` sob carga, e os 18 testes de Raft que não correm nas
+features por omissão (`cargo test --workspace` diz "ok" com `0 passed`).
+
+### Verificado e **sem** defeito
+
+Isto não é enchimento: são as hipóteses que testei e que o código refutou.
+
+| classe | resultado |
+|---|---|
+| `unwrap` em decoders sobre input externo | **guardado** — todos precedidos de verificação de comprimento (`format.rs`, `block.rs`, `footer.rs`) |
+| coerência de cabeçalhos v6 | **guardada** — `check_coherence` corre em cada `decode`, no bloco e no rodapé |
+| ordem de aquisição de locks | **consistente** — `packing_lock`/`sidecar_lock` sempre antes de `state`, nunca ao contrário, em todos os 28 sítios |
+| `block_on` dentro de async | **ausente** do caminho de produção; o deadlock de 2026-07-10 não voltou |
+| erros de fsync engolidos | os três `let _ =` estão em caminhos best-effort documentados (rollback após escrita falhada; fsync de directório que é no-op em Windows) — **nenhum no caminho durável do append** |
+| limite de corpo HTTP | **existe** — os únicos extractores são `Json<T>` e `Query`, e o axum 0.7 aplica o tecto de 2 MB por omissão |
+| exposição por omissão | **fechada** — REST e gRPC em `127.0.0.1`, CORS vazio, `rest_allow_erasure = false` |
+| bind público sem auth | **recusado na validação** — `config.rs:1016-1022` erra se o endereço não for loopback sem auth, e sem TLS no gRPC |
+| `unimplemented!()` / `todo!()` / `#[ignore]` | **zero** em todo o workspace |
+| `prune_old_manifests` vs. commit concorrente | **seguro** — protege explicitamente a geração corrente e só remove abaixo do `keep` |
+
+### Leitura geral
+
+O código defende-se bem contra a classe de erro que mais o ameaça — input
+corrompido ou adulterado. Cada decoder valida antes de indexar, e as validações
+estão escritas nos dois sentidos (a política decide, e um invariante separado
+volta a verificar). Os dois achados com peso não são erros de lógica: um é uma
+fronteira de lock que eu próprio pus no sítio errado ontem, e o outro é uma
+opção de compilação em falta que hoje não custa nada e amanhã custa a primeira
+verificação esquecida.
+
 ## AUDITORIA 2026-08-29 (3) — o estado real, verificado contra o código
 
 **Método:** o mesmo que este ficheiro exige de si próprio — cada afirmação
