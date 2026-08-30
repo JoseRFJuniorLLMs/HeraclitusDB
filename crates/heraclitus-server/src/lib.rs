@@ -736,35 +736,134 @@ pub async fn serve_with(
 
     // Compliance daemon (RFC 3161 watermark timestamping). Off by default; never
     // on the append path. Receipts under `<data_dir>/receipts`.
+    // (a guarda de soberania vive em `instalar_guarda_de_soberania`, abaixo)
     let compliance_task = if config.compliance_enabled {
+        use heraclitus_compliance::icp::TimestampValidationPolicy;
+        use heraclitus_compliance::secure_tsa::{SecureTsaClient, TlsPolicy};
+        use heraclitus_compliance::trust_store::TrustStore;
         use heraclitus_compliance::{run_worker, HttpTsa, LocalTsa, TsaClient, WorkerConfig};
         use std::time::Duration;
-        let tsa: std::sync::Arc<dyn TsaClient + Send + Sync> =
-            if config.compliance_tsa_mode.eq_ignore_ascii_case("http") {
-                std::sync::Arc::new(HttpTsa::new(
-                    config.compliance_tsa_url.clone(),
-                    config.compliance_tsa_policy.clone(),
-                ))
-            } else {
-                std::sync::Arc::new(LocalTsa::generate(config.compliance_tsa_policy.clone()))
+
+        let modo = config.compliance_tsa_mode.to_ascii_lowercase();
+        let (tsa, evidence_status): (std::sync::Arc<dyn TsaClient + Send + Sync>, String) =
+            match modo.as_str() {
+                // SPEC-0046 §10/§11 — o caminho de produção.
+                "https" => {
+                    let dir = config.compliance_trust_store_dir.as_ref().ok_or_else(|| {
+                        HeraclitusError::Config(
+                            "compliance_tsa_mode=https exige                              HERACLITUS_COMPLIANCE_TRUST_STORE com as âncoras do órgão (§11)"
+                                .into(),
+                        )
+                    })?;
+                    let (store, relatorio) = TrustStore::load_dir(dir)
+                        .map_err(|e| HeraclitusError::Config(format!("trust store: {e}")))?;
+                    // Arrancar com o trust store vazio daria um servidor que
+                    // aceita carimbos que ninguém autenticou e os grava como
+                    // recibos. Recusar arrancar é a resposta certa: a falha é de
+                    // configuração e tem correcção óbvia.
+                    if store.is_empty() {
+                        return Err(HeraclitusError::Config(format!(
+                            "trust store `{}` sem âncoras utilizáveis ({} ficheiro(s) vistos,                              {} recusado(s)): sem âncoras não há ACT a autenticar",
+                            dir.display(),
+                            relatorio.files_seen,
+                            relatorio.files_seen.saturating_sub(store.len())
+                        )));
+                    }
+                    boot.ok_line(
+                        "Trust store",
+                        &format!("{} âncora(s) de {}", store.len(), dir.display()),
+                    );
+                    // §9 — revogação, quando o operador instalou CRLs.
+                    let crls = match config.compliance_crl_dir.as_ref() {
+                        Some(d) => {
+                            let (crls, rel) =
+                                heraclitus_compliance::crl::CrlStore::load_dir(d).map_err(|e| {
+                                    HeraclitusError::Config(format!("CRLs: {e}"))
+                                })?;
+                            // Pedir consulta de revogação e não a poder fazer
+                            // pararia toda a ancoragem no primeiro carimbo,
+                            // com um erro por marco em vez de um no arranque.
+                            if crls.is_empty() {
+                                return Err(HeraclitusError::Config(format!(
+                                    "pasta de CRLs `{}` sem CRLs utilizáveis ({} ficheiro(s) vistos)",
+                                    d.display(),
+                                    rel.files_seen
+                                )));
+                            }
+                            boot.ok_line(
+                                "CRLs",
+                                &format!("{} CRL(s) de {}", crls.len(), d.display()),
+                            );
+                            Some(crls)
+                        }
+                        None => None,
+                    };
+                    let revogacao_ligada = crls.is_some();
+
+                    let mut cliente = SecureTsaClient::new(
+                        config.compliance_tsa_url.clone(),
+                        config.compliance_tsa_policy.clone(),
+                        store,
+                        TlsPolicy::default(),
+                        Duration::from_secs(15),
+                    )
+                    .map_err(|e| HeraclitusError::Config(format!("cliente ACT: {e}")))?
+                    .with_verifier(TimestampValidationPolicy::default());
+                    if let Some(crls) = crls {
+                        cliente = cliente
+                            .with_crls(
+                                crls,
+                                heraclitus_compliance::crl::CrlPolicy {
+                                    max_staleness: Duration::from_secs(
+                                        config.compliance_crl_max_staleness_secs,
+                                    ),
+                                },
+                            )
+                            .map_err(|e| HeraclitusError::Config(e.to_string()))?;
+                    }
+
+                    let estado = if revogacao_ligada {
+                        "token externo VERIFICADO contra âncoras instaladas · revogação \
+                         consultada por CRL"
+                            .to_string()
+                    } else {
+                        "token externo VERIFICADO contra âncoras instaladas · revogação NÃO \
+                         consultada (sem HERACLITUS_COMPLIANCE_CRL_DIR)"
+                            .to_string()
+                    };
+                    (
+                        instalar_guarda_de_soberania(cliente, &config, engine.log.clone())?,
+                        estado,
+                    )
+                }
+                "http" => (
+                    std::sync::Arc::new(HttpTsa::new(
+                        config.compliance_tsa_url.clone(),
+                        config.compliance_tsa_policy.clone(),
+                    )),
+                    "token externo SEM validação CMS/X.509/ICP-Brasil e em claro na rede".into(),
+                ),
+                _ => (
+                    std::sync::Arc::new(LocalTsa::generate(
+                        config.compliance_tsa_policy.clone(),
+                    )),
+                    "token de desenvolvimento; não é ICP-Brasil".into(),
+                ),
             };
         let wcfg = WorkerConfig::new(
             Duration::from_secs(config.compliance_interval_secs.max(1)),
             config.compliance_min_lsn_step,
             config.data_dir.join("receipts"),
         );
-        let evidence_status = if config.compliance_tsa_mode.eq_ignore_ascii_case("http") {
-            "token externo sem validação CMS/X.509/ICP-Brasil"
-        } else {
-            "token de desenvolvimento; não é ICP-Brasil"
-        };
-        boot.warn_line(
-            "Compliance evidence",
-            &format!(
-                "ancoragem ATIVA · modo {} · {}",
-                config.compliance_tsa_mode, evidence_status
-            ),
+        let linha = format!(
+            "ancoragem ATIVA · modo {} · {}",
+            config.compliance_tsa_mode, evidence_status
         );
+        if modo == "https" {
+            boot.ok_line("Compliance evidence", &linha);
+        } else {
+            boot.warn_line("Compliance evidence", &linha);
+        }
         // SPEC-0050 §7.2 — o worker corre sobre `AnyLog`, não sobre o `Log`
         // legado. O compromisso é calculado a partir do `DatabaseManifest`,
         // que ambos os backends publicam: o legado dá raízes Merkle físicas,
@@ -897,3 +996,83 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// SPEC-0046 — envolve o cliente da ACT na guarda de egresso, quando o operador
+/// a pediu.
+///
+/// `off` devolve o cliente **cru**, e é o default. Instalar a guarda com uma
+/// política que autoriza tudo seria pior do que não a instalar: daria a
+/// aparência de um controlo de egresso a quem lesse a configuração, sem que
+/// ninguém estivesse a decidir o que sai. Aqui, quando não há decisão, não há
+/// guarda — e vê-se na linha de arranque.
+fn instalar_guarda_de_soberania(
+    cliente: heraclitus_compliance::secure_tsa::SecureTsaClient,
+    config: &heraclitus_core::HeraclitusConfig,
+    log: std::sync::Arc<heraclitus_log::AnyLog>,
+) -> Result<std::sync::Arc<dyn heraclitus_compliance::TsaClient + Send + Sync>, HeraclitusError> {
+    use heraclitus_compliance::sovereignty::{
+        EgressEndpoint, EgressPurpose, GuardedTsaClient, SovereigntyMode, SovereigntyPolicy,
+        SovereigntyRuntime,
+    };
+
+    let modo = match config.compliance_sovereignty_mode.to_ascii_lowercase().as_str() {
+        "off" | "" => return Ok(std::sync::Arc::new(cliente)),
+        "controlled" | "controlled_egress" => SovereigntyMode::ControlledEgress,
+        "strict" | "strict_air_gap" | "strict-air-gap" => SovereigntyMode::StrictAirGap,
+        outro => {
+            return Err(HeraclitusError::Config(format!(
+                "compliance_sovereignty_mode `{outro}` desconhecido: use off, controlled ou \
+                 strict-air-gap"
+            )))
+        }
+    };
+
+    // O destino da guarda é derivado do MESMO URL que o cliente vai usar. Se
+    // fosse configurado à parte, a allowlist podia autorizar um host e o
+    // cliente ligar a outro, e a guarda passaria a autorizar uma ligação que
+    // não é a que acontece.
+    let resto = config
+        .compliance_tsa_url
+        .strip_prefix("https://")
+        .ok_or_else(|| {
+            HeraclitusError::Config("guarda de soberania exige compliance_tsa_url https://".into())
+        })?;
+    let autoridade = resto.split('/').next().unwrap_or(resto);
+    let (host, porto) = match autoridade.rsplit_once(':') {
+        Some((h, p)) => (
+            h.to_string(),
+            p.parse::<u16>().map_err(|_| {
+                HeraclitusError::Config(format!("porto inválido em `{autoridade}`"))
+            })?,
+        ),
+        None => (autoridade.to_string(), 443u16),
+    };
+    let endpoint = EgressEndpoint {
+        scheme: "https".into(),
+        host,
+        port: porto,
+        purpose: EgressPurpose::TimestampAuthority,
+    };
+
+    // Em air-gap estrito a política PROÍBE endpoints — e é isso que se quer:
+    // o carimbo em linha passa a ser negado e auditado, e a ancoragem tem de
+    // ir pelo caminho diferido. Não é um erro de configuração, é a
+    // configuração a fazer o que diz.
+    let allowed = if modo == SovereigntyMode::StrictAirGap {
+        Default::default()
+    } else {
+        [endpoint.clone()].into_iter().collect()
+    };
+    let policy = SovereigntyPolicy {
+        policy_id: "compliance-anchor".into(),
+        version: "1".into(),
+        mode: modo,
+        allowed_endpoints: allowed,
+        allow_local_network_models: false,
+        allow_external_models: false,
+    };
+    let runtime = SovereigntyRuntime::new(policy, log)
+        .map_err(|e| HeraclitusError::Config(format!("política de soberania: {e}")))?;
+    let guarded = GuardedTsaClient::new(cliente, runtime, endpoint, "compliance-anchor-worker")
+        .map_err(|e| HeraclitusError::Config(format!("guarda de egresso: {e}")))?;
+    Ok(std::sync::Arc::new(guarded))
+}

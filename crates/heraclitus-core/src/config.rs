@@ -422,14 +422,58 @@ pub struct HeraclitusConfig {
     pub compliance_interval_secs: u64,
     /// Minimum LSN advance between anchors.
     pub compliance_min_lsn_step: u64,
-    /// `"local"` (in-process dev ACT) or `"http"` (external RFC 3161 token
-    /// intake at `compliance_tsa_url`). The HTTP backend is not valid for a
-    /// production compliance boundary: it has no TLS or trust-chain verifier.
+    /// `"local"` (ACT de desenvolvimento em processo), `"http"` (RFC 3161 em
+    /// claro) ou `"https"` (SPEC-0046 §10 — `SecureTsaClient` com validação de
+    /// cadeia).
+    ///
+    /// `"http"` não é uma fronteira de conformidade válida: não tem TLS nem
+    /// verificador de cadeia. `"https"` só é aceite com
+    /// `compliance_trust_store_dir` povoado — sem âncoras o cliente nem se
+    /// constrói, por decisão de §11.
     pub compliance_tsa_mode: String,
     /// ACT endpoint when `compliance_tsa_mode = "http"`.
     pub compliance_tsa_url: String,
     /// Authority/policy name recorded in each receipt.
     pub compliance_tsa_policy: String,
+    /// SPEC-0046 §11 — pasta com as âncoras de confiança (PEM/DER) que o órgão
+    /// instalou. É a MESMA confiança usada para o TLS da ACT e para a cadeia do
+    /// carimbo, de propósito: se fossem duas, o sistema autenticaria o canal
+    /// contra um conjunto e o carimbo contra outro, e a divergência só
+    /// apareceria no dia em que uma das duas falhasse.
+    ///
+    /// Não há default e não há fallback para as raízes do sistema operativo:
+    /// "ainda não disse em quem confiar" não pode significar "confia em
+    /// qualquer um".
+    pub compliance_trust_store_dir: Option<PathBuf>,
+    /// SPEC-0046 — guarda de egresso à frente da ACT: `"off"` (default),
+    /// `"controlled"` ou `"strict-air-gap"`.
+    ///
+    /// O default é `"off"` e isso é deliberado. A alternativa seria instalar a
+    /// guarda com uma política que autoriza tudo, o que daria a APARÊNCIA de um
+    /// controlo de egresso sem o controlo — pior do que não ter guarda nenhuma,
+    /// porque um auditor veria o componente na configuração e concluiria que
+    /// alguém decide o que sai. Aqui, `off` significa off e vê-se.
+    ///
+    /// `"controlled"` autoriza exactamente um destino: o
+    /// `compliance_tsa_url`. `"strict-air-gap"` nega o carimbo em linha — a
+    /// ancoragem passa a ter de ir pelo caminho diferido (`deferred`).
+    pub compliance_sovereignty_mode: String,
+    /// SPEC-0046 §9 — pasta com as CRLs (`.crl`/`.pem`/`.der`) das ACs.
+    ///
+    /// `None` (default) mantém o comportamento anterior: a revogação NÃO é
+    /// consultada e `revocation_checked` fica `false` no resultado, para que
+    /// nenhum relatório construído a partir dele possa afirmar mais do que foi
+    /// feito. Com a pasta definida, cada certificado da cadeia passa a exigir
+    /// uma CRL assinada pelo seu emissor — e a verificação FALHA se ela faltar,
+    /// porque "pedi consulta e não a consegui fazer" não pode devolver um
+    /// resultado que se leia como limpo.
+    pub compliance_crl_dir: Option<PathBuf>,
+    /// Quantos segundos depois de `nextUpdate` uma CRL ainda é aceite.
+    ///
+    /// Zero (default) recusa CRLs expiradas. Um órgão em air-gap que só recebe
+    /// CRLs periodicamente alarga isto — e ao alargá-lo está a declarar quanto
+    /// risco aceita, em vez de o sistema decidir por ele em silêncio.
+    pub compliance_crl_max_staleness_secs: u64,
 
     /// SPEC-016 — endereço do servidor Arrow Flight (gRPC, feature `analytics`).
     /// `None` = desligado (default).
@@ -562,6 +606,10 @@ impl Default for HeraclitusConfig {
             compliance_tsa_mode: "local".to_string(),
             compliance_tsa_url: String::new(),
             compliance_tsa_policy: "ACT-dev".to_string(),
+            compliance_trust_store_dir: None,
+            compliance_sovereignty_mode: "off".to_string(),
+            compliance_crl_dir: None,
+            compliance_crl_max_staleness_secs: 0,
             flight_addr: None,
             telemetry_interval_secs: 0,
             replication: None,
@@ -907,8 +955,37 @@ impl HeraclitusConfig {
         }
         if let Ok(v) = std::env::var("HERACLITUS_COMPLIANCE_TSA_URL") {
             if !v.is_empty() {
+                // O modo vem do ESQUEMA, não é fixo em "http". Antes, pôr um
+                // URL `https://` aqui deixava o modo em "http" e entregava o
+                // cliente em claro a quem tinha pedido TLS — falhava só na
+                // primeira tentativa de carimbo, com uma mensagem sobre o
+                // esquema não suportado que não apontava para a causa.
+                self.compliance_tsa_mode = if v.starts_with("https://") {
+                    "https".to_string()
+                } else {
+                    "http".to_string()
+                };
                 self.compliance_tsa_url = v;
-                self.compliance_tsa_mode = "http".to_string();
+            }
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_COMPLIANCE_TRUST_STORE") {
+            if !v.is_empty() {
+                self.compliance_trust_store_dir = Some(PathBuf::from(v));
+            }
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_COMPLIANCE_SOVEREIGNTY") {
+            if !v.is_empty() {
+                self.compliance_sovereignty_mode = v;
+            }
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_COMPLIANCE_CRL_DIR") {
+            if !v.is_empty() {
+                self.compliance_crl_dir = Some(PathBuf::from(v));
+            }
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_COMPLIANCE_CRL_MAX_STALENESS") {
+            if let Ok(n) = v.parse::<u64>() {
+                self.compliance_crl_max_staleness_secs = n;
             }
         }
         if let Ok(v) = std::env::var("HERACLITUS_COMPLIANCE_TSA_POLICY") {
@@ -1147,31 +1224,56 @@ impl HeraclitusConfig {
                     ));
                 }
             }
-            if !self.compliance_enabled
-                || !self.compliance_tsa_mode.eq_ignore_ascii_case("http")
-                || self.compliance_tsa_url.is_empty()
-            {
+            if !self.compliance_enabled || self.compliance_tsa_url.is_empty() {
                 return Err(invalid(
                     "produção exige uma TSA externa configurada; LocalTsa não é evidência legal"
                         .into(),
                 ));
             }
-            if self.compliance_tsa_url.starts_with("http://") {
+            if self.compliance_tsa_url.starts_with("http://")
+                || self.compliance_tsa_mode.eq_ignore_ascii_case("http")
+            {
                 return Err(invalid(
-                    "produção proíbe TSA em HTTP puro; esta build não implementa transporte HTTPS seguro"
+                    "produção proíbe TSA em HTTP puro: o digest do que se está a ancorar                      atravessaria a rede em claro e sem autenticar o servidor"
                         .into(),
                 ));
             }
-            if self.compliance_tsa_url.starts_with("https://") {
+            if !self.compliance_tsa_mode.eq_ignore_ascii_case("https")
+                || !self.compliance_tsa_url.starts_with("https://")
+            {
+                return Err(invalid(format!(
+                    "produção exige compliance_tsa_mode=https com URL https:// (está `{}` / `{}`)",
+                    self.compliance_tsa_mode, self.compliance_tsa_url
+                )));
+            }
+            // §11 — sem âncoras o `SecureTsaClient` nem se constrói, e um
+            // recibo produzido sem elas é `ExternalTokenUnvalidated`. Deixar
+            // arrancar assim daria um sistema que se diz em produção e emite
+            // evidência que não vale como evidência.
+            let Some(dir) = self.compliance_trust_store_dir.as_ref() else {
                 return Err(invalid(
-                    "produção com TSA HTTPS está bloqueada: esta build ainda não implementa HTTPS nem validação CMS/X.509/ICP-Brasil"
+                    "produção exige HERACLITUS_COMPLIANCE_TRUST_STORE com as âncoras ICP-Brasil                      do órgão (§11): sem elas o carimbo não é validado contra autoridade nenhuma"
                         .into(),
                 ));
+            };
+            // Verificação superficial de propósito: este crate não conhece
+            // X.509. Que os ficheiros sejam âncoras auto-emitidas e utilizáveis
+            // é decidido ao carregar, no arranque do servidor, que recusa
+            // arrancar se o conjunto vier vazio. Aqui apanha-se só o erro
+            // comum — a pasta errada ou vazia — e apanha-se antes de o
+            // processo abrir o log.
+            let ficheiros = std::fs::read_dir(dir)
+                .map_err(|e| invalid(format!("trust store `{}`: {e}", dir.display())))?
+                .filter_map(Result::ok)
+                .filter(|e| e.path().is_file())
+                .count();
+            if ficheiros == 0 {
+                return Err(invalid(format!(
+                    "trust store `{}` não tem ficheiros: produção exige pelo menos uma âncora",
+                    dir.display()
+                )));
             }
-            return Err(invalid(
-                "produção exige URL HTTPS para TSA externa, mas suporte HTTPS e validação de confiança ainda não estão implementados"
-                    .into(),
-            ));
+            return Ok(());
         }
         Ok(())
     }
@@ -1383,11 +1485,10 @@ max_graph_hops = 6
             token_blake3: "b".repeat(64),
             roles: vec![AccessRole::Writer],
         });
+        // O MODO manda, não o esquema do URL: `mode=http` com um URL `https://`
+        // continua a ser o cliente em claro, e é recusado.
         let err = cfg.validate_security().unwrap_err().to_string();
-        assert!(
-            err.contains("HTTPS") && err.contains("bloqueada"),
-            "configuração não pode alegar compliance de produção sem transporte e trust chain: {err}"
-        );
+        assert!(err.contains("HTTP puro"), "{err}");
 
         cfg.compliance_tsa_url = "http://tsa.example.invalid".into();
         assert!(cfg
@@ -1396,6 +1497,37 @@ max_graph_hops = 6
             .to_string()
             .contains("HTTP puro"));
 
+        // §10 — HTTPS existe desde o Marco 0, mas sem âncoras o carimbo não é
+        // validado contra autoridade nenhuma, e um recibo assim não vale como
+        // evidência. A recusa aqui é sobre o trust store, não sobre a falta de
+        // implementação: a mensagem que dizia "esta build não implementa
+        // HTTPS" sobreviveu à implementação e mandava corrigir a coisa errada.
+        cfg.compliance_tsa_mode = "https".into();
+        cfg.compliance_tsa_url = "https://tsa.example.invalid".into();
+        let err = cfg.validate_security().unwrap_err().to_string();
+        assert!(err.contains("TRUST_STORE"), "{err}");
+
+        // Pasta indicada mas vazia: o erro comum, apanhado antes de o processo
+        // abrir o log.
+        let dir = tempfile::tempdir().unwrap();
+        cfg.compliance_trust_store_dir = Some(dir.path().to_path_buf());
+        let err = cfg.validate_security().unwrap_err().to_string();
+        assert!(err.contains("não tem ficheiros"), "{err}");
+
+        // Com uma âncora instalada, o perfil de produção PASSA. É a mudança
+        // desta ronda: antes, todos os caminhos devolviam erro e não havia
+        // configuração nenhuma que arrancasse em produção.
+        //
+        // Que o ficheiro seja um certificado auto-emitido utilizável é
+        // decidido ao CARREGAR, no arranque do servidor — este crate não
+        // conhece X.509 e não finge conhecer.
+        std::fs::write(dir.path().join("raiz.pem"), b"-----BEGIN CERTIFICATE-----").unwrap();
+        cfg.validate_security()
+            .expect("perfil de produção completo tem de arrancar");
+
+        // E continua fail-closed noutro eixo: uma senha curta derruba tudo
+        // outra vez, para que o sucesso acima não se leia como "a guarda
+        // deixou de guardar".
         cfg.rest_basic_auth = Some("admin:short".into());
         assert!(cfg.validate_security().is_err());
     }

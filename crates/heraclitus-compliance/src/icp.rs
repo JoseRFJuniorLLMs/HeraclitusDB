@@ -208,13 +208,29 @@ pub struct VerifiedTimestamp {
 /// SPEC-0046 §9.
 #[derive(Debug, Clone)]
 pub struct IcpBrasilTimestampVerifier {
+    /// CRLs e regra de frescura, quando o operador as instalou.
+    crls: Option<(crate::crl::CrlStore, crate::crl::CrlPolicy)>,
     trust_store: TrustStore,
     policy: TimestampValidationPolicy,
 }
 
 impl IcpBrasilTimestampVerifier {
+    /// Instala a consulta de revogação por CRL.
+    ///
+    /// Sem isto, `revocation_checked` é `false` e um certificado revogado
+    /// dentro da validade passa — o que está declarado no resultado, mas
+    /// continua a ser a lacuna. Com isto, cada certificado da cadeia tem de ter
+    /// uma CRL assinada pelo seu emissor e dentro da janela, ou a verificação
+    /// FALHA: "pedi consulta de revogação e não a consegui fazer" não pode
+    /// devolver um resultado que se leia como limpo.
+    pub fn with_crls(mut self, store: crate::crl::CrlStore, policy: crate::crl::CrlPolicy) -> Self {
+        self.crls = Some((store, policy));
+        self
+    }
+
     pub fn new(trust_store: TrustStore, policy: TimestampValidationPolicy) -> Self {
         Self {
+            crls: None,
             trust_store,
             policy,
         }
@@ -398,6 +414,12 @@ impl IcpBrasilTimestampVerifier {
         }
         verificar_eku_timestamping(signer_cert)?;
 
+        // §9 — revogação. Só depois de a cadeia estar validada: consultar uma
+        // CRL para um certificado que nem encadeia seria trabalho sobre uma
+        // premissa falsa, e um erro de revogação aqui leria-se como se o
+        // problema fosse a revogação quando é a cadeia.
+        let revocation_checked = self.verificar_revogacao(&cadeia, gen_unix_ms, now_unix_ms)?;
+
         Ok(VerifiedTimestamp {
             gen_unix_ms,
             policy_oid: tst.policy,
@@ -407,8 +429,47 @@ impl IcpBrasilTimestampVerifier {
             chain_len: cadeia.certs.len(),
             accuracy_secs: tst.accuracy.as_ref().and_then(|a| a.seconds),
             nonce_matched,
-            revocation_checked: false,
+            revocation_checked,
         })
+    }
+
+    /// Consulta a revogação de cada certificado da cadeia. Devolve `true` se a
+    /// consulta foi feita, `false` se não há CRLs instaladas, e `Err` se foi
+    /// pedida e não pôde ser concluída.
+    ///
+    /// A âncora NÃO é consultada: uma raiz auto-emitida não é revogada por uma
+    /// CRL sua — retirá-la da confiança é remover o ficheiro da pasta, que é o
+    /// mecanismo que o operador tem e vê.
+    fn verificar_revogacao(
+        &self,
+        cadeia: &Cadeia,
+        gen_unix_ms: u64,
+        now_unix_ms: u64,
+    ) -> Result<bool, CompError> {
+        let Some((store, politica)) = self.crls.as_ref() else {
+            return Ok(false);
+        };
+        let assinatura = |emissor: &Certificate,
+                          oid: &ObjectIdentifier,
+                          msg: &[u8],
+                          sig: &[u8]| verificar_assinatura(emissor, oid, msg, sig);
+        let tempo = |t: &x509_cert::time::Time| tempo_para_unix_ms(t);
+
+        for (i, cert) in cadeia.certs.iter().enumerate() {
+            // O emissor é o elo seguinte da cadeia; para o último, é a âncora.
+            let emissor = cadeia.certs.get(i + 1).unwrap_or(&cadeia.anchor_cert);
+            crate::crl::consultar(
+                store,
+                cert,
+                emissor,
+                gen_unix_ms,
+                now_unix_ms,
+                politica,
+                &assinatura,
+                &tempo,
+            )?;
+        }
+        Ok(true)
     }
 
     /// Constrói a cadeia do signatário até uma âncora do trust store.
@@ -435,6 +496,7 @@ impl IcpBrasilTimestampVerifier {
                     return Ok(Cadeia {
                         certs,
                         anchor: anchor.fingerprint,
+                        anchor_cert: anchor.certificate.clone(),
                     });
                 }
             }
@@ -472,6 +534,9 @@ impl IcpBrasilTimestampVerifier {
 struct Cadeia {
     certs: Vec<Certificate>,
     anchor: [u8; 32],
+    /// O certificado da âncora. A impressão digital chega para identificar,
+    /// mas não para verificar a assinatura da CRL que a âncora emite.
+    anchor_cert: Certificate,
 }
 
 // ---------------------------------------------------------------------------
@@ -1108,5 +1173,197 @@ mod tests {
             .verify(b"nao sou DER nenhum", &imprint(), None, AGORA_MS)
             .unwrap_err();
         assert!(erro.to_string().contains("ContentInfo"), "{erro}");
+    }
+
+    // -----------------------------------------------------------------
+    // §9 — revogação. O que estes testes fixam não é "a CRL é lida", é a
+    // relação entre uma revogação e um carimbo JÁ EMITIDO, que não é a mesma
+    // pergunta que "este certificado serve hoje".
+    // -----------------------------------------------------------------
+
+    const CRL_INICIO_S: u64 = AGORA_S - 3_600;
+    const CRL_FIM_S: u64 = AGORA_S + 86_400;
+
+    fn verificador_com_crl(
+        chain: &test_pki::Chain,
+        crl_der: &[u8],
+        politica: crate::crl::CrlPolicy,
+    ) -> IcpBrasilTimestampVerifier {
+        let mut store = TrustStore::new();
+        store.add_pem_or_der("raiz", &chain.root_der).unwrap();
+        let mut crls = crate::crl::CrlStore::new();
+        crls.add_pem_or_der(crl_der).unwrap();
+        IcpBrasilTimestampVerifier::new(store, TimestampValidationPolicy::default())
+            .with_crls(crls, politica)
+    }
+
+    fn crl_da_raiz(chain: &test_pki::Chain, revogados: Vec<test_pki::Revogacao>) -> Vec<u8> {
+        test_pki::crl_de_teste(
+            &chain.root,
+            &chain.root_key,
+            CRL_INICIO_S,
+            Some(CRL_FIM_S),
+            revogados,
+        )
+    }
+
+    fn token_padrao(chain: &test_pki::Chain) -> Vec<u8> {
+        test_pki::token_de_teste(chain, &imprint(), AGORA_S - 60, None, OpcoesToken::default())
+    }
+
+    /// Sem CRLs instaladas nada muda — e o resultado continua a dizer que a
+    /// revogação NÃO foi consultada, em vez de calar a lacuna.
+    #[test]
+    fn sem_crls_instaladas_a_revogacao_fica_declaradamente_por_consultar() {
+        let chain = test_pki::chain_de_teste();
+        let v = verificador(&chain)
+            .verify(&token_padrao(&chain), &imprint(), None, AGORA_MS)
+            .unwrap();
+        assert!(!v.revocation_checked);
+    }
+
+    #[test]
+    fn uma_crl_limpa_marca_a_revogacao_como_consultada() {
+        let chain = test_pki::chain_de_teste();
+        let crl = crl_da_raiz(&chain, vec![]);
+        let v = verificador_com_crl(&chain, &crl, Default::default())
+            .verify(&token_padrao(&chain), &imprint(), None, AGORA_MS)
+            .unwrap();
+        assert!(
+            v.revocation_checked,
+            "com CRL válida a consulta aconteceu e o campo tem de o dizer"
+        );
+    }
+
+    /// O caso que a lacuna deixava passar: a autoridade já tinha dito que
+    /// aquela chave não valia, e o carimbo foi emitido à mesma.
+    #[test]
+    fn um_certificado_revogado_antes_de_carimbar_e_recusado() {
+        let chain = test_pki::chain_de_teste();
+        let crl = crl_da_raiz(
+            &chain,
+            vec![test_pki::Revogacao {
+                serial: chain.tsa.tbs_certificate.serial_number.clone(),
+                quando_s: AGORA_S - 600,
+                motivo: None,
+            }],
+        );
+        let erro = verificador_com_crl(&chain, &crl, Default::default())
+            .verify(&token_padrao(&chain), &imprint(), None, AGORA_MS)
+            .unwrap_err();
+        assert!(erro.to_string().contains("já estava revogado"), "{erro}");
+    }
+
+    /// A outra metade da regra, e a que é fácil errar por excesso de zelo: um
+    /// carimbo emitido enquanto o certificado valia CONTINUA a provar a hora
+    /// depois de ele ser revogado. É a razão de existir de um carimbo.
+    #[test]
+    fn um_certificado_revogado_depois_de_carimbar_continua_a_provar_a_hora() {
+        let chain = test_pki::chain_de_teste();
+        let crl = crl_da_raiz(
+            &chain,
+            vec![test_pki::Revogacao {
+                serial: chain.tsa.tbs_certificate.serial_number.clone(),
+                // 10 s antes de agora, mas 50 s DEPOIS do carimbo.
+                quando_s: AGORA_S - 10,
+                motivo: Some(4), // superseded
+            }],
+        );
+        let v = verificador_com_crl(&chain, &crl, Default::default())
+            .verify(&token_padrao(&chain), &imprint(), None, AGORA_MS)
+            .expect("revogação posterior não invalida um carimbo anterior");
+        assert!(v.revocation_checked);
+    }
+
+    /// O caso que impede isto de ser uma comparação de datas. A data de
+    /// revogação é quando a AC SOUBE do compromisso, não quando ele aconteceu:
+    /// quem tem a chave carimba com o `genTime` que quiser, incluindo um
+    /// anterior à revogação.
+    #[test]
+    fn key_compromise_invalida_o_carimbo_mesmo_tendo_sido_revogado_depois() {
+        let chain = test_pki::chain_de_teste();
+        let crl = crl_da_raiz(
+            &chain,
+            vec![test_pki::Revogacao {
+                serial: chain.tsa.tbs_certificate.serial_number.clone(),
+                quando_s: AGORA_S - 10,
+                motivo: Some(1), // keyCompromise
+            }],
+        );
+        let erro = verificador_com_crl(&chain, &crl, Default::default())
+            .verify(&token_padrao(&chain), &imprint(), None, AGORA_MS)
+            .unwrap_err();
+        assert!(erro.to_string().contains("keyCompromise"), "{erro}");
+    }
+
+    /// "Pedi consulta de revogação e não a consegui fazer" não pode devolver um
+    /// resultado que se leia como limpo.
+    #[test]
+    fn sem_crl_do_emissor_a_verificacao_falha_em_vez_de_dizer_limpo() {
+        let chain = test_pki::chain_de_teste();
+        let outra = test_pki::self_signed_root("Raiz Sem Relacao");
+        let crl = test_pki::crl_de_teste(
+            &outra.certificate,
+            &outra.key,
+            CRL_INICIO_S,
+            Some(CRL_FIM_S),
+            vec![],
+        );
+        let erro = verificador_com_crl(&chain, &crl, Default::default())
+            .verify(&token_padrao(&chain), &imprint(), None, AGORA_MS)
+            .unwrap_err();
+        assert!(erro.to_string().contains("não há CRL do emissor"), "{erro}");
+    }
+
+    /// Uma CRL de 2019 responderia "não revogado" com a mesma confiança de uma
+    /// de hoje. A frescura é imposta, e a tolerância é uma decisão explícita do
+    /// operador em vez de um default silencioso.
+    #[test]
+    fn uma_crl_expirada_nao_e_consultada() {
+        let chain = test_pki::chain_de_teste();
+        let crl = test_pki::crl_de_teste(
+            &chain.root,
+            &chain.root_key,
+            AGORA_S - 7_200,
+            Some(AGORA_S - 3_600),
+            vec![],
+        );
+        let erro = verificador_com_crl(&chain, &crl, Default::default())
+            .verify(&token_padrao(&chain), &imprint(), None, AGORA_MS)
+            .unwrap_err();
+        assert!(erro.to_string().contains("expirou"), "{erro}");
+
+        // A mesma CRL passa quando o operador DECLARA que aceita esta idade.
+        let tolerante = crate::crl::CrlPolicy {
+            max_staleness: std::time::Duration::from_secs(7_200),
+        };
+        let v = verificador_com_crl(&chain, &crl, tolerante)
+            .verify(&token_padrao(&chain), &imprint(), None, AGORA_MS)
+            .expect("com tolerância declarada a CRL serve");
+        assert!(v.revocation_checked);
+    }
+
+    /// Sem verificar a assinatura, qualquer um que escreva na pasta pode
+    /// declarar um certificado como não revogado — e é essa a resposta que
+    /// passa despercebida.
+    #[test]
+    fn uma_crl_assinada_por_outra_chave_nao_conta() {
+        let chain = test_pki::chain_de_teste();
+        let impostor = test_pki::self_signed_root("Impostor");
+        // Emitida em NOME da raiz verdadeira, mas assinada pela chave errada.
+        let crl = test_pki::crl_de_teste(
+            &chain.root,
+            &impostor.key,
+            CRL_INICIO_S,
+            Some(CRL_FIM_S),
+            vec![],
+        );
+        let erro = verificador_com_crl(&chain, &crl, Default::default())
+            .verify(&token_padrao(&chain), &imprint(), None, AGORA_MS)
+            .unwrap_err();
+        assert!(
+            erro.to_string().contains("assinatura da CRL não confere"),
+            "{erro}"
+        );
     }
 }

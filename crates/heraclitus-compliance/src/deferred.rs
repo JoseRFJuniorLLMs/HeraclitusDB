@@ -496,10 +496,36 @@ impl EvidenceAnchor {
 /// Air-gap import operation. It verifies both transfer signatures and exact
 /// request binding. A development token is cryptographically checked; an
 /// external token is retained as `ExternalTokenUnvalidated`, never promoted.
+/// Importa uma resposta que se declara verificada, confirmando-a contra as
+/// âncoras **deste** órgão.
+///
+/// O verificador é o de quem IMPORTA, não o de quem carimbou: é a única forma
+/// de a validação significar alguma coisa deste lado do air-gap. Um token que
+/// não encadeie até uma âncora local é recusado mesmo que a resposta venha
+/// assinada por uma chave aprovada — a assinatura de transferência prova quem
+/// enviou, não que o carimbo valha.
+pub fn import_deferred_response_with_verifier(
+    signed_request: &SignedDeferredAnchorRequest,
+    signed_response: &SignedDeferredAnchorResponse,
+    policy: &DeferredTransferPolicy,
+    verifier: &crate::icp::IcpBrasilTimestampVerifier,
+) -> Result<EvidenceAnchor, DeferredAnchorError> {
+    importar_resposta(signed_request, signed_response, policy, Some(verifier))
+}
+
 pub fn import_deferred_response(
     signed_request: &SignedDeferredAnchorRequest,
     signed_response: &SignedDeferredAnchorResponse,
     policy: &DeferredTransferPolicy,
+) -> Result<EvidenceAnchor, DeferredAnchorError> {
+    importar_resposta(signed_request, signed_response, policy, None)
+}
+
+fn importar_resposta(
+    signed_request: &SignedDeferredAnchorRequest,
+    signed_response: &SignedDeferredAnchorResponse,
+    policy: &DeferredTransferPolicy,
+    verifier: Option<&crate::icp::IcpBrasilTimestampVerifier>,
 ) -> Result<EvidenceAnchor, DeferredAnchorError> {
     policy.validate()?;
     signed_request.request.validate()?;
@@ -538,6 +564,28 @@ pub fn import_deferred_response(
         }
         TimestampValidationState::ExternalTokenUnvalidated
         | TimestampValidationState::LegacyUnverified => {}
+        // A resposta vem de FORA da fronteira de confiança — é exactamente a
+        // parte contra a qual o air-gap existe. Que ela se declare
+        // "verificada" é uma alegação de quem carimbou, não um facto que este
+        // lado possa registar sem o confirmar.
+        TimestampValidationState::ExternalTokenVerified => {
+            let Some(v) = verifier else {
+                return Err(DeferredAnchorError::Invalid(
+                    "resposta importada declara-se verificada mas este importador não tem trust                      store: use `import_deferred_response_with_verifier` com as âncoras do órgão                      (§11) — aceitar gravaria um anchor cujo estado afirma uma validação que                      ninguém deste lado fez"
+                        .into(),
+                ));
+            };
+            // Sem nonce: o nonce do pedido ficou do outro lado do air-gap e
+            // nunca atravessa. A frescura de um carimbo diferido não vem do
+            // nonce — vem do `request_id` e do `export_digest`, já confrontados
+            // acima contra o pedido original.
+            v.verify(&response.timestamp_token, &imprint, None, crate::now_unix_ms())
+                .map_err(|e| {
+                    DeferredAnchorError::Invalid(format!(
+                        "resposta declara-se verificada mas o carimbo não confirma contra as                          âncoras deste órgão: {e}"
+                    ))
+                })?;
+        }
     }
     let previous_anchor_digest = signed_request.request.previous_anchor_digest;
     let anchor_digest = evidence_anchor_digest(

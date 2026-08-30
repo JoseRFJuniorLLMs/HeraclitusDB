@@ -773,9 +773,14 @@ pub fn anchor(
 pub fn verify_receipts(
     log_dir: &std::path::Path,
     receipts_dir: &std::path::Path,
+    trust_store_dir: Option<&std::path::Path>,
+    crl_dir: Option<&std::path::Path>,
 ) -> Result<String, String> {
+    use heraclitus_compliance::icp::{IcpBrasilTimestampVerifier, TimestampValidationPolicy};
+    use heraclitus_compliance::trust_store::TrustStore;
     use heraclitus_compliance::{
-        load_manifest, verify_receipt, ReceiptVerification, TimestampValidationState,
+        load_manifest, verify_receipt, verify_receipt_with_verifier, ReceiptVerification,
+        TimestampValidationState,
     };
     let log =
         Log::open(log_dir, segmento(), FsyncPolicy::Always).map_err(|e| e.to_string())?;
@@ -783,6 +788,53 @@ pub fn verify_receipts(
     if receipts.is_empty() {
         return Ok("nenhum recibo encontrado (manifest.jsonl vazio ou ausente)".into());
     }
+    // §11 — as âncoras vêm de uma pasta que o OPERADOR indica. Uma falha a
+    // carregá-las é fatal e não silenciosa: continuar sem verificador daria um
+    // relatório "INCONCLUSIVO" que se leria como "não há verificador nesta
+    // build", quando na verdade o operador PEDIU um e ele não abriu.
+    let verificador = match trust_store_dir {
+        Some(d) => {
+            let (store, relatorio) = TrustStore::load_dir(d).map_err(|e| {
+                format!("trust store `{}` não carrega: {e}", d.display())
+            })?;
+            if store.is_empty() {
+                return Err(format!(
+                    "trust store `{}` não tem âncoras utilizáveis ({} ficheiro(s) vistos):                      sem âncoras não há cadeia contra que validar",
+                    d.display(),
+                    relatorio.files_seen
+                ));
+            }
+            let mut v = IcpBrasilTimestampVerifier::new(
+                store,
+                TimestampValidationPolicy::default(),
+            );
+            if let Some(cd) = crl_dir {
+                let (crls, rel) = heraclitus_compliance::crl::CrlStore::load_dir(cd)
+                    .map_err(|e| format!("CRLs `{}`: {e}", cd.display()))?;
+                if crls.is_empty() {
+                    return Err(format!(
+                        "pasta de CRLs `{}` sem CRLs utilizáveis ({} ficheiro(s) vistos)",
+                        cd.display(),
+                        rel.files_seen
+                    ));
+                }
+                v = v.with_crls(crls, heraclitus_compliance::crl::CrlPolicy::default());
+            }
+            Some(v)
+        }
+        None => {
+            if crl_dir.is_some() {
+                // Sem âncoras não há cadeia, e sem cadeia não há certificado
+                // cuja revogação consultar. Aceitar em silêncio daria um
+                // relatório sem revogação a quem a pediu.
+                return Err(
+                    "--crl-dir exige --trust-store: a revogação consulta-se sobre os                      certificados de uma cadeia, e sem âncoras não há cadeia"
+                        .into(),
+                );
+            }
+            None
+        }
+    };
     // Forensic step 1: recompute every sealed-segment Merkle root from the
     // actual records (the M0 guarantee). This catches record-level tampering
     // that a stale footer root would otherwise hide.
@@ -802,8 +854,30 @@ pub fn verify_receipts(
     out += &format!("{} recibo(s) a verificar:\n", receipts.len());
     let mut integrity_ok = true;
     let mut timestamp_unvalidated = false;
+    let mut autoridade_confirmada = 0usize;
     for r in &receipts {
-        match verify_receipt(&log, receipts_dir, r) {
+        let resultado = match &verificador {
+            Some(v) => verify_receipt_with_verifier(&log, receipts_dir, r, v),
+            None => verify_receipt(&log, receipts_dir, r),
+        };
+        match resultado {
+            Ok(ReceiptVerification::AuthorityVerified(v)) => {
+                autoridade_confirmada += 1;
+                out += &format!(
+                    "  OK    LSN {:>12}  {} seg  autoridade {} ms  âncora {}  cadeia {}  '{}'{}\n",
+                    r.lsn,
+                    r.segments,
+                    v.gen_unix_ms,
+                    &v.anchor_fingerprint_hex[..v.anchor_fingerprint_hex.len().min(16)],
+                    v.chain_len,
+                    v.signer_subject,
+                    if v.revocation_checked {
+                        ""
+                    } else {
+                        " · revogação NÃO consultada"
+                    }
+                );
+            }
             Ok(ReceiptVerification::DevelopmentOnly(v)) => {
                 out += &format!(
                     "  DEV   LSN {:>12}  {} seg  registro {} ms  origem '{}' (não ICP-Brasil)\n",
@@ -818,6 +892,11 @@ pub fn verify_receipts(
                     }
                     TimestampValidationState::LegacyUnverified => {
                         "manifesto legado sem estado de validação"
+                    }
+                    // Só chega aqui sem verificador instalado: com um, este
+                    // estado teria seguido por `AuthorityVerified` ou falhado.
+                    TimestampValidationState::ExternalTokenVerified => {
+                        "recibo declara-se verificado · nenhum trust store passado a esta                          verificação, portanto a alegação NÃO foi reconfirmada"
                     }
                     TimestampValidationState::DevelopmentOnly => unreachable!(
                         "a verificação de desenvolvimento retorna DevelopmentOnly"
@@ -838,8 +917,23 @@ pub fn verify_receipts(
         out += "\n*** ATENÇÃO: pelo menos um recibo NÃO confere — possível adulteração retroativa do log. ***";
         Err(out)
     } else if timestamp_unvalidated {
-        out += "\nINCONCLUSIVO: os commitments conferem; esta build não valida a cadeia de confiança dos tokens externos. Isto NÃO é uma deteção de fraude e NÃO é validação legal/ICP-Brasil.";
+        out += if verificador.is_some() {
+            "\nINCONCLUSIVO: os commitments conferem, mas pelo menos um recibo não tinha cadeia \
+             para validar (token de desenvolvimento ou externo não validado na origem). Isto NÃO \
+             é uma deteção de fraude."
+        } else {
+            "\nINCONCLUSIVO: os commitments conferem; nenhuma cadeia de confiança foi validada \
+             porque não foi passado um trust store (--trust-store). Isto NÃO é uma deteção de \
+             fraude e NÃO é validação legal/ICP-Brasil."
+        };
         Err(out)
+    } else if autoridade_confirmada > 0 {
+        out += &format!(
+            "\n{autoridade_confirmada} recibo(s) com cadeia validada até uma âncora instalada. \
+             Ressalva que NÃO se pode omitir: a revogação dos certificados não é consultada, \
+             portanto um certificado revogado dentro da validade passaria."
+        );
+        Ok(out)
     } else {
         out += "\nTodos os commitments e tokens de desenvolvimento conferem — nenhuma validação legal/ICP-Brasil foi executada.";
         Ok(out)
@@ -1321,7 +1415,7 @@ mod tests {
         anchor_receipt(&log, &ExternalTsa, &receipts, None).unwrap();
         drop(log);
 
-        let report = verify_receipts(&log_dir, &receipts).unwrap_err();
+        let report = verify_receipts(&log_dir, &receipts, None, None).unwrap_err();
         assert!(report.contains("INCONCLUSIVO"));
         assert!(report.contains("NÃO é uma deteção de fraude"));
         assert!(!report.contains("possível adulteração retroativa"));

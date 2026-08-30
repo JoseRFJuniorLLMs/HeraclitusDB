@@ -11,6 +11,117 @@ excluído (é cache, dá falsos positivos).
 > cada afirmação falsa/enganosa com a evidência. O estado real da plataforma e o
 > roteiro estão em [../PLANO-SPECS.md](../PLANO-SPECS.md).
 
+## BLOQUEIOS DE PRODUÇÃO — 2026-08-30 (5)
+
+Esta nota **substitui** três afirmações da nota "MARCO 0" abaixo, que
+envelheceram nesta mesma ronda: (a) "o `SecureTsaClient` ainda não substituiu o
+`HttpTsa` no worker" — substituiu; (b) "revogação não é consultada" — passou a
+ser; (c) "falta a decisão de trocar o cliente no worker" — foi tomada, e é
+opt-in por configuração. O relatório completo está em
+[../../BLOQUEIOS-PRODUCAO.md](../../BLOQUEIOS-PRODUCAO.md).
+
+### O bloqueio que não estava na lista, e era o pior
+
+`TimeStampResp` **nunca era parseada em lado nenhum**. O `HttpTsa::stamp`
+devolvia o corpo HTTP inteiro e o worker gravava-o como se fosse o carimbo. Pela
+RFC 3161 §2.4.2 esse corpo é uma `TimeStampResp`, não um `ContentInfo`, e o
+`PKIStatus` nunca era lido. Consequência: **uma ACT que RECUSA (`status=2`, sem
+token nenhum anexado) via a sua recusa persistida no manifesto como evidência
+legal.** O mesmo para `revocationWarning`/`revocationNotification` — a ACT a
+avisar que a sua própria chave está a ser revogada.
+
+Não apareceu na auditoria anterior porque essa procurou por peças em falta, e
+esta é uma peça **presente e errada**: havia um `TimeStampReq`, o código
+compilava, os testes passavam, e o campo que decidia tudo nunca era lido.
+
+### O que ficou ligado
+
+| bloqueio | antes | agora |
+|---|---|---|
+| resposta da ACT | corpo HTTP gravado como token | `TimeStampResp` + `PKIStatus` + `failInfo` por nome |
+| `SecureTsaClient` | escrito, testado, **sem implementar `TsaClient`** | implementa; verifica **dentro** do `stamp` |
+| estado "verificado" | não existia variante | `ExternalTokenVerified`, só produzível com verificador |
+| reverificação | nenhuma | `verify_receipt_with_verifier`, `import_deferred_response_with_verifier` |
+| worker | `HttpTsa` fixo | `mode=https` → cliente com cadeia validada |
+| `GuardedTsaClient` | incompatível por construção | instalável, `off` por defeito |
+| revogação | `revocation_checked` sempre `false` | CRL offline, com semântica de carimbo |
+
+### As decisões que custaram, e as objeções que ficaram
+
+- **`grantedWithMods` é aceite.** Não é confiança na ACT: tudo o que ela possa
+  ter alterado e que importe — imprint, nonce, política, certificado — é
+  reverificado a seguir e recusado se não bater. Aceitar aqui é adiar a decisão
+  para quem a pode tomar com prova.
+- **A revogação NÃO é uma comparação de datas.** Revogado antes do `genTime`
+  recusa; revogado *depois* com motivo comum **aceita** (um carimbo emitido
+  enquanto o certificado valia continua a provar a hora — é a razão de existir
+  de um carimbo); `keyCompromise`/`cACompromise` recusa **em qualquer data**,
+  porque a `revocationDate` é quando a AC soube, não quando a chave foi
+  comprometida, e quem tem a chave carimba com o `genTime` que quiser. Esta
+  terceira regra é o que impede o módulo de ser teatro, e está validada por
+  mutação: `invalida_retroativamente → false` derruba um teste, e só esse.
+- **CRL de ficheiro, não OCSP.** OCSP é uma ligação de rede por verificação, e
+  traria rede para dentro do caminho que tem de funcionar em air-gap anos
+  depois, quando o respondedor da AC já não existir. A contrapartida assumida é
+  a frescura, imposta por `CrlPolicy::max_staleness` (default zero).
+- **Uma CRL em falta FALHA a verificação.** "Pedi consulta de revogação e não a
+  consegui fazer" não pode devolver um resultado que se leia como limpo.
+- **A guarda de soberania fica `off` por defeito.** Instalá-la com uma política
+  que autoriza tudo daria a *aparência* de um controlo de egresso sem o
+  controlo — pior do que não ter guarda, porque um auditor veria o componente na
+  configuração e concluiria que alguém decide o que sai.
+- **Objecção que mantenho:** não bastava pôr a guarda de `production_mode` a
+  devolver `Ok`. Três das suas mensagens diziam que a build não implementava
+  HTTPS nem validação CMS/X.509 — e ambos existiam desde o Marco 0. Corrigir só
+  a mensagem teria deixado produção a arrancar com o cliente em claro. **Um
+  bloqueio só sai da lista quando o código o resolve, não quando a mensagem
+  deixa de o mencionar.**
+
+### Armadilha de configuração corrigida pelo caminho
+
+`HERACLITUS_COMPLIANCE_TSA_URL=https://…` forçava `compliance_tsa_mode` para
+`"http"`. Quem pedia TLS recebia o cliente em claro e só descobria na primeira
+tentativa de carimbo, com um erro sobre o esquema que não apontava para a causa.
+O modo passa a vir do esquema do URL.
+
+### O que continua por fazer, e não se resolve com código
+
+- **As âncoras ICP-Brasil reais não estão instaladas.** Só o órgão as pode
+  instalar, do canal oficial do ITI, com a impressão digital conferida fora de
+  banda. Enquanto o trust store estiver vazio, `production_mode = true` **não
+  arranca** — por desenho, não por acidente.
+- **Interoperabilidade com uma ACT credenciada não está provada.** Os testes
+  usam uma PKI sintética com a mesma estrutura. Um `.tst` real é evidência de
+  laboratório e entra pela SPEC-0049. Riscos que só um token real expõe:
+  `SHA256withRSA` com parâmetros que a PKI de teste não gera, cadeias com
+  intermédios a mais, `signedAttrs` com atributos opcionais inesperados.
+- **Sem `nameConstraints` nem `policyMapping`.** Chega para raiz → AC → ACT;
+  para uma malha com cross-certificados não chega, e **recusa em vez de
+  adivinhar**.
+- **Atestações externas (SPEC-0049)** — fora do alcance de qualquer commit.
+
+### Validação
+
+- `heraclitus-compliance`: **87 testes unitários** (eram 79). Os 8 novos cobrem
+  a revogação: CRL limpa, revogado antes, revogado depois, `keyCompromise`, CRL
+  em falta, CRL expirada com e sem tolerância declarada, CRL assinada por outra
+  chave.
+- Mutação: `invalida_retroativamente → false` derruba
+  `key_compromise_invalida_o_carimbo_mesmo_tendo_sido_revogado_depois` e mais
+  nenhum teste.
+- `cargo clippy --workspace --all-targets -- -D warnings` — limpo.
+- `production_profile_is_fail_closed` foi reescrito: fixava a mensagem antiga
+  ("HTTPS … bloqueada"), e agora prova os **dois** sentidos — um perfil
+  incompleto recusa em cada eixo, e um perfil completo **arranca**, que é a
+  mudança desta ronda.
+
+### Definition of Done: de 5/20 para 8/20
+
+Passam a estar satisfeitos, além dos quatro do Marco 0: **resposta da ACT
+validada**, **cliente de produção ligado ao worker**, **revogação consultada**.
+Continua por satisfazer o resto, incluindo "anchors encadeados" — o
+`LegalReceipt` que o `anchor()` emite continua sem campo para o digest anterior.
+
 ## MARCO 0 DA SPEC-0046 — 2026-08-30 (4)
 
 O Marco 0 estava **inteiramente ausente**: zero ocorrências de `TrustStore`,

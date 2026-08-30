@@ -147,6 +147,15 @@ enum Cmd {
     },
     /// Re-verify receipts: commitment integrity plus available token validation.
     VerifyReceipts {
+        /// Pasta com as âncoras de confiança (PEM/DER) do órgão. Sem ela a
+        /// cadeia dos tokens externos NÃO é validada e o resultado é
+        /// inconclusivo por construção (SPEC-0046 §11).
+        #[arg(long)]
+        trust_store: Option<PathBuf>,
+        /// Pasta com as CRLs das ACs. Exige `--trust-store`. Sem ela a
+        /// revogação NÃO é consultada e o relatório di-lo (SPEC-0046 §9).
+        #[arg(long)]
+        crl_dir: Option<PathBuf>,
         /// Log directory.
         dir: PathBuf,
         /// Receipts directory (default: <dir>/../receipts).
@@ -243,9 +252,19 @@ fn main() {
             let rdir = receipts_dir_for(&dir, receipts);
             heraclitus_cli::anchor(&dir, &rdir, tsa_url, policy)
         }
-        Cmd::VerifyReceipts { dir, receipts } => {
+        Cmd::VerifyReceipts {
+            dir,
+            receipts,
+            trust_store,
+            crl_dir,
+        } => {
             let rdir = receipts_dir_for(&dir, receipts);
-            heraclitus_cli::verify_receipts(&dir, &rdir)
+            heraclitus_cli::verify_receipts(
+                &dir,
+                &rdir,
+                trust_store.as_deref(),
+                crl_dir.as_deref(),
+            )
         }
     };
     match result {

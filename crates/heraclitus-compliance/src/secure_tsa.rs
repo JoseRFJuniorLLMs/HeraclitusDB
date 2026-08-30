@@ -47,7 +47,11 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::icp::{IcpBrasilTimestampVerifier, TimestampValidationPolicy};
+use crate::receipt::TimestampValidationState;
+use crate::rfc3161::{TimeStampReq, TimeStampResp};
 use crate::trust_store::TrustStore;
+use crate::tsa::TsaClient;
 use crate::CompError;
 
 /// Tecto absoluto da resposta, independentemente da política. Uma
@@ -105,6 +109,8 @@ pub struct SecureTsaClient {
     tls: TlsPolicy,
     timeout: Duration,
     trust_store: TrustStore,
+    /// Quando presente, o token é verificado ANTES de sair deste cliente.
+    verifier: Option<IcpBrasilTimestampVerifier>,
 }
 
 impl SecureTsaClient {
@@ -154,7 +160,56 @@ impl SecureTsaClient {
             tls,
             timeout,
             trust_store,
+            verifier: None,
         })
+    }
+
+    /// Instala o verificador ICP-Brasil **a partir do trust store deste
+    /// cliente**, e não de um que o chamador traga.
+    ///
+    /// É deliberado não aceitar um `IcpBrasilTimestampVerifier` já construído:
+    /// se o chamador pudesse passar um, podia passar um com âncoras diferentes
+    /// das do TLS, e o sistema ficava a autenticar o *canal* contra um conjunto
+    /// e o *carimbo* contra outro — uma divergência que ninguém veria na
+    /// configuração e que só apareceria no dia em que uma das duas falhasse.
+    ///
+    /// Com o verificador instalado, [`TsaClient::stamp`] passa a **verificar o
+    /// token antes de o devolver**: um carimbo que não encadeie até uma âncora
+    /// nunca chega a ser escrito como recibo.
+    pub fn with_verifier(mut self, policy: TimestampValidationPolicy) -> Self {
+        self.verifier = Some(IcpBrasilTimestampVerifier::new(
+            self.trust_store.clone(),
+            policy,
+        ));
+        self
+    }
+
+    /// Instala CRLs no verificador deste cliente (§9).
+    ///
+    /// Devolve `Err` se [`Self::with_verifier`] não foi chamado antes, em vez
+    /// de aceitar em silêncio: sem cadeia validada não há certificado cuja
+    /// revogação consultar, e um cliente que aceitasse CRLs sem verificador
+    /// deixaria o operador convencido de que a revogação está ligada quando
+    /// nada a consulta.
+    pub fn with_crls(
+        mut self,
+        store: crate::crl::CrlStore,
+        policy: crate::crl::CrlPolicy,
+    ) -> Result<Self, CompError> {
+        let v = self.verifier.take().ok_or_else(|| {
+            CompError::Tsa(
+                "with_crls exige with_verifier antes: sem cadeia validada não há certificado \
+                 cuja revogação consultar"
+                    .into(),
+            )
+        })?;
+        self.verifier = Some(v.with_crls(store, policy));
+        Ok(self)
+    }
+
+    /// Se este cliente verifica o que recebe.
+    pub const fn verifies(&self) -> bool {
+        self.verifier.is_some()
     }
 
     pub fn endpoint(&self) -> &str {
@@ -305,6 +360,86 @@ impl SecureTsaClient {
             return Err(CompError::Tsa(format!("ACT respondeu {codigo}")));
         }
         Ok(bruto[sep + 4..].to_vec())
+    }
+
+    /// Os octetos de valor do INTEGER do nonce, como o
+    /// [`IcpBrasilTimestampVerifier`] os vai comparar.
+    ///
+    /// Passa pelo mesmo codificador e descodificador DER que produziu o pedido
+    /// em vez de reproduzir a codificação à mão: a forma mínima com
+    /// complemento para dois tem casos de fronteira (o `0x00` à cabeça quando o
+    /// bit alto está aceso) e um nonce que não bate faz o carimbo ser recusado
+    /// como repetição — uma falha que só apareceria contra uma ACT real.
+    fn nonce_octetos(nonce: u64) -> Result<Vec<u8>, CompError> {
+        use der::{Decode, Encode};
+        let tlv = nonce
+            .to_der()
+            .map_err(|e| CompError::Tsa(format!("nonce não codifica: {e}")))?;
+        let int = der::asn1::Int::from_der(&tlv)
+            .map_err(|e| CompError::Tsa(format!("nonce não relê: {e}")))?;
+        Ok(int.as_bytes().to_vec())
+    }
+}
+
+impl TsaClient for SecureTsaClient {
+    fn policy_name(&self) -> &str {
+        &self.policy_name
+    }
+
+    /// Sem verificador isto é exactamente o que o [`crate::tsa::HttpTsa`] era —
+    /// um transporte melhor, e nada mais. O estado tem de o dizer.
+    fn validation_state(&self) -> TimestampValidationState {
+        if self.verifier.is_some() {
+            TimestampValidationState::ExternalTokenVerified
+        } else {
+            TimestampValidationState::ExternalTokenUnvalidated
+        }
+    }
+
+    fn stamp(&self, imprint: &[u8; 32]) -> Result<Vec<u8>, CompError> {
+        let mut bruto = [0u8; 8];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bruto);
+        // Bit alto limpo: um nonce negativo é legal em DER mas irrita
+        // implementações de ACT que o tratam como sem sinal, e não ganha
+        // entropia nenhuma que interesse.
+        let nonce = u64::from_be_bytes(bruto) >> 1;
+
+        let req = TimeStampReq::new(imprint, nonce)
+            .map_err(|e| CompError::Tsa(format!("pedido não codifica: {e}")))?;
+        let corpo = req
+            .to_der_bytes()
+            .map_err(|e| CompError::Tsa(format!("pedido não codifica: {e}")))?;
+        let resposta = self.post_timestamp_request(&corpo)?;
+
+        // §2.4.2 — o corpo é uma `TimeStampResp`, não um token. Guardar o corpo
+        // inteiro como se fosse o carimbo faria uma RECUSA da ACT ficar
+        // persistida como evidência legal.
+        let resp = TimeStampResp::from_der_bytes(&resposta)
+            .map_err(|e| CompError::Tsa(format!("resposta da ACT não é TimeStampResp: {e}")))?;
+        let token = resp
+            .granted_token()
+            .map_err(|e| CompError::Tsa(e.to_string()))?;
+
+        if let Some(v) = &self.verifier {
+            let esperado = Self::nonce_octetos(nonce)?;
+            // A verificação acontece AQUI, e não no worker: um token que não
+            // encadeie até uma âncora nunca chega a ser escrito em disco como
+            // recibo. Falhar cedo é a diferença entre "não temos carimbo desta
+            // marca" e "temos um recibo que não vale nada e ninguém sabe".
+            v.verify(&token, imprint, Some(&esperado), crate::now_unix_ms())?;
+        }
+        Ok(token)
+    }
+
+    fn verified_gen_unix_ms(&self, token: &[u8], imprint: &[u8; 32]) -> Option<u64> {
+        // Sem nonce: o nonce do pedido já não existe aqui, e a frescura foi
+        // confirmada em `stamp`. O que esta segunda passagem tem de garantir é
+        // que o `genTime` devolvido veio de um token que ENCADEIA — não é uma
+        // leitura optimista do campo.
+        let v = self.verifier.as_ref()?;
+        v.verify(token, imprint, None, crate::now_unix_ms())
+            .ok()
+            .map(|t| t.gen_unix_ms)
     }
 }
 

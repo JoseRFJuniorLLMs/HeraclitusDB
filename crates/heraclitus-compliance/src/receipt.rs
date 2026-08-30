@@ -12,10 +12,14 @@ use std::path::{Path, PathBuf};
 
 /// What this build has actually verified about a timestamp token.
 ///
-/// There deliberately is no "legally validated" variant yet: validation of a
-/// RFC 3161 CMS token against an ICP-Brasil trust store is not implemented.
-/// Old manifests deserialize to [`LegacyUnverified`], so a missing field can
-/// never silently promote historical evidence.
+/// [`ExternalTokenVerified`] existe desde que o verificador CMS/X.509 passou a
+/// existir (SPEC-0046 §9), e **só** um cliente que verifique o token contra um
+/// trust store povoado o pode produzir. Continua a não haver variante que
+/// afirme conformidade legal plena: falta a consulta de revogação e a prova de
+/// interoperabilidade com uma ACT credenciada.
+///
+/// Manifestos antigos desserializam para [`LegacyUnverified`], de forma a que
+/// um campo em falta nunca promova evidência histórica em silêncio.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TimestampValidationState {
@@ -25,6 +29,17 @@ pub enum TimestampValidationState {
     /// A token received from an external endpoint, with no CMS/X.509 trust
     /// validation yet. Its commitment can still be recomputed locally.
     ExternalTokenUnvalidated,
+    /// Um `TimeStampToken` RFC 3161 externo cuja cadeia CMS/X.509 foi validada
+    /// contra uma âncora que o **operador** instalou (SPEC-0046 §9/§11), com
+    /// `messageImprint` e nonce confirmados.
+    ///
+    /// Este estado só pode ser produzido por um cliente que tenha um
+    /// [`crate::icp::IcpBrasilTimestampVerifier`] instalado e que tenha
+    /// verificado o token ANTES de o devolver. Não diz que a revogação foi
+    /// consultada — isso está em `revocation_checked`, no resultado da
+    /// verificação, e um recibo neste estado pode ter sido emitido por um
+    /// certificado revogado dentro da validade.
+    ExternalTokenVerified,
     /// A receipt written before validation state was persisted.
     #[default]
     LegacyUnverified,
@@ -36,6 +51,7 @@ impl TimestampValidationState {
         match self {
             Self::DevelopmentOnly => "somente desenvolvimento",
             Self::ExternalTokenUnvalidated => "token externo não validado",
+            Self::ExternalTokenVerified => "token externo verificado (cadeia ICP)",
             Self::LegacyUnverified => "recibo legado não validado",
         }
     }

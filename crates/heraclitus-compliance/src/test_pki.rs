@@ -370,3 +370,99 @@ pub fn token_de_teste(
     ci.to_der().expect("token der")
 }
 
+
+// ---------------------------------------------------------------------------
+// CRLs sinteticas (SPEC-0046 §9). Emitidas pela mesma raiz que emite a folha,
+// para que os testes de revogacao usem uma cadeia REAL em vez de fingirem uma.
+// ---------------------------------------------------------------------------
+
+use x509_cert::crl::{CertificateList, RevokedCert, TbsCertList};
+
+/// Uma entrada de revogacao a colocar na CRL.
+pub struct Revogacao {
+    /// Serial do certificado revogado.
+    pub serial: SerialNumber,
+    /// Instante da revogacao (segundos Unix).
+    pub quando_s: u64,
+    /// `reasonCode` (RFC 5280 §5.3.1): 1 = keyCompromise, 2 = cACompromise.
+    /// `None` nao escreve a extensao.
+    pub motivo: Option<u8>,
+}
+
+/// Emite uma CRL assinada por `emissor_key` em nome de `emissor`.
+///
+/// `next_update_s = None` produz uma CRL sem `nextUpdate` — legal em RFC 5280 e
+/// util para provar que o verificador nao exige o campo mas tambem nao inventa
+/// uma janela.
+pub fn crl_de_teste(
+    emissor: &Certificate,
+    emissor_key: &SigningKey,
+    this_update_s: u64,
+    next_update_s: Option<u64>,
+    revogados: Vec<Revogacao>,
+) -> Vec<u8> {
+    use der::asn1::BitString;
+    use p256::ecdsa::signature::Signer;
+    use x509_cert::ext::Extension;
+    use x509_cert::time::Time;
+
+    const OID_CRL_REASON: const_oid::ObjectIdentifier =
+        const_oid::ObjectIdentifier::new_unwrap("2.5.29.21");
+
+    let entradas: Vec<RevokedCert> = revogados
+        .into_iter()
+        .map(|r| {
+            let extensions = r.motivo.map(|codigo| {
+                // ENUMERATED (tag 0x0A), um octeto.
+                let valor = der::asn1::Any::new(
+                    Tag::Enumerated,
+                    OctetString::new(vec![codigo]).expect("octet").as_bytes().to_vec(),
+                )
+                .expect("enumerated");
+                vec![Extension {
+                    extn_id: OID_CRL_REASON,
+                    critical: false,
+                    extn_value: OctetString::new(valor.to_der().expect("der enum"))
+                        .expect("octet ext"),
+                }]
+            });
+            RevokedCert {
+                serial_number: r.serial,
+                revocation_date: Time::try_from(
+                    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(r.quando_s),
+                )
+                .expect("data de revogacao"),
+                crl_entry_extensions: extensions,
+            }
+        })
+        .collect();
+
+    let tbs = TbsCertList {
+        version: x509_cert::Version::V2,
+        signature: emissor.tbs_certificate.signature.clone(),
+        issuer: emissor.tbs_certificate.subject.clone(),
+        this_update: Time::try_from(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(this_update_s),
+        )
+        .expect("thisUpdate"),
+        next_update: next_update_s.map(|s| {
+            Time::try_from(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(s))
+                .expect("nextUpdate")
+        }),
+        revoked_certificates: if entradas.is_empty() {
+            None
+        } else {
+            Some(entradas)
+        },
+        crl_extensions: None,
+    };
+
+    let tbs_der = tbs.to_der().expect("tbsCertList em DER");
+    let assinatura: DerSignature = emissor_key.sign(&tbs_der);
+    let crl = CertificateList {
+        tbs_cert_list: tbs,
+        signature_algorithm: emissor.signature_algorithm.clone(),
+        signature: BitString::from_bytes(assinatura.as_bytes()).expect("bitstring da CRL"),
+    };
+    crl.to_der().expect("CRL em DER")
+}

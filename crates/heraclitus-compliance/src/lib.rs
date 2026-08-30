@@ -29,6 +29,7 @@
 pub mod commit;
 pub mod dashboard;
 pub mod classification;
+pub mod crl;
 pub mod deferred;
 pub mod model_bundle;
 pub mod privacy;
@@ -155,12 +156,15 @@ pub enum CompError {
 /// `CommitmentOnly` is intentionally not an error: the log can be intact even
 /// while the timestamp token lacks a verifier. It must not be presented as an
 /// ICP-Brasil or other legal timestamp validation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReceiptVerification {
     /// A development token was internally verified. It is not legal evidence.
     DevelopmentOnly(VerifiedTime),
     /// The commitment matches, but no authority-token trust validation exists.
     CommitmentOnly(TimestampValidationState),
+    /// O compromisso bate **e** o `TimeStampToken` foi reverificado agora
+    /// contra as âncoras instaladas — não é a alegação que o recibo trazia.
+    AuthorityVerified(Box<crate::icp::VerifiedTimestamp>),
 }
 
 /// Anchor the log at `watermark` (or the current watermark when `None`):
@@ -184,14 +188,27 @@ pub fn anchor<L: heraclitus_log::EpisodeLog + ?Sized>(
     // backend records local creation time and persists an explicit unvalidated
     // state until a real external-token verifier exists.
     let validation_state = tsa.validation_state();
-    let authority_gen_unix_ms = if validation_state == TimestampValidationState::DevelopmentOnly {
-        Some(
+    let authority_gen_unix_ms = match validation_state {
+        TimestampValidationState::DevelopmentOnly => Some(
             verify_dev_token(&token, &imprint)
                 .map_err(|e| CompError::Verify(format!("token de desenvolvimento inválido: {e}")))?
                 .gen_unix_ms,
-        )
-    } else {
-        None
+        ),
+        // Um cliente que declara ter verificado TEM de saber dizer a hora que
+        // verificou. Se não sabe, as duas afirmações contradizem-se, e a
+        // contradição não se resolve escrevendo o recibo à mesma: isso deixaria
+        // em disco um estado `verificado` com hora de autoridade ausente — a
+        // combinação que um auditor lê como prova e que não prova nada.
+        TimestampValidationState::ExternalTokenVerified => Some(
+            tsa.verified_gen_unix_ms(&token, &imprint).ok_or_else(|| {
+                CompError::Verify(
+                    "cliente declara token verificado mas não devolve genTime verificado:                      recibo não escrito"
+                        .into(),
+                )
+            })?,
+        ),
+        TimestampValidationState::ExternalTokenUnvalidated
+        | TimestampValidationState::LegacyUnverified => None,
     };
     let gen_ms = authority_gen_unix_ms.unwrap_or_else(now_unix_ms);
     receipt::persist(
@@ -233,7 +250,13 @@ pub fn verify_receipt<L: heraclitus_log::EpisodeLog + ?Sized>(
             verify_dev_token(&token, &imprint).map(ReceiptVerification::DevelopmentOnly)
         }
         TimestampValidationState::ExternalTokenUnvalidated
-        | TimestampValidationState::LegacyUnverified => {
+        | TimestampValidationState::LegacyUnverified
+        // Um recibo que se declara verificado NÃO é reverificado aqui, e o
+        // resultado diz `CommitmentOnly` para o dizer. A alternativa —
+        // devolver `AuthorityVerified` com base no campo do próprio recibo —
+        // faria o verificador repetir a alegação que devia estar a testar.
+        // Quem quer a reverificação chama `verify_receipt_with_verifier`.
+        | TimestampValidationState::ExternalTokenVerified => {
             // The commitment is already confirmed above. Do not conflate an
             // absent authority-token verifier with evidence of fraud.
             Ok(ReceiptVerification::CommitmentOnly(
@@ -241,6 +264,45 @@ pub fn verify_receipt<L: heraclitus_log::EpisodeLog + ?Sized>(
             ))
         }
     }
+}
+
+/// Como [`verify_receipt`], mas reverifica também o `TimeStampToken` contra as
+/// âncoras instaladas.
+///
+/// É esta a função que separa "o log não foi alterado" de "uma autoridade
+/// credenciada afirmou esta hora". Um recibo que se declarava verificado e que
+/// agora não confirma devolve `Err`: ou as âncoras mudaram, ou o token foi
+/// substituído — e nenhuma das duas pode passar em silêncio.
+pub fn verify_receipt_with_verifier<L: heraclitus_log::EpisodeLog + ?Sized>(
+    log: &L,
+    receipts_dir: impl AsRef<Path>,
+    receipt: &LegalReceipt,
+    verifier: &crate::icp::IcpBrasilTimestampVerifier,
+) -> Result<ReceiptVerification, CompError> {
+    let base = verify_receipt(log, &receipts_dir, receipt)?;
+    // Um token de desenvolvimento não encadeia até âncora nenhuma, por
+    // construção. Passá-lo ao verificador ICP daria um erro que se leria como
+    // fraude, quando é só um token de outro formato.
+    if receipt.validation_state == TimestampValidationState::DevelopmentOnly {
+        return Ok(base);
+    }
+    let commitment = commit_at(log, receipt.lsn);
+    let imprint = commitment.message_imprint_sha256();
+    let token = receipt::read_token(&receipts_dir, receipt)?;
+
+    // Um recibo LEGADO foi escrito antes de o estado ser persistido, e pode
+    // conter qualquer um dos dois formatos. Distinguir antes de decidir é o que
+    // separa um relatório útil de um alarme falso: dizer "possível fraude"
+    // sobre um recibo de desenvolvimento de 2024 destrói a credibilidade da
+    // ferramenta precisamente no momento em que ela precisa de ser acreditada.
+    if receipt.validation_state == TimestampValidationState::LegacyUnverified
+        && verify_dev_token(&token, &imprint).is_ok()
+    {
+        return Ok(base);
+    }
+
+    let verificado = verifier.verify(&token, &imprint, None, now_unix_ms())?;
+    Ok(ReceiptVerification::AuthorityVerified(Box::new(verificado)))
 }
 
 #[cfg(test)]

@@ -33,6 +33,18 @@ pub trait TsaClient {
     fn validation_state(&self) -> TimestampValidationState;
     /// Stamp `imprint`, returning DER token bytes to persist verbatim.
     fn stamp(&self, imprint: &[u8; 32]) -> Result<Vec<u8>, CompError>;
+
+    /// `genTime` da autoridade para um token que este cliente acabou de
+    /// produzir — e **apenas** quando o próprio cliente o verificou contra um
+    /// trust store.
+    ///
+    /// O default é `None` de propósito: um cliente que não sabe verificar não
+    /// pode contribuir com uma hora de autoridade. O `genTime` lido de um token
+    /// que ninguém validou é uma *alegação* da ACT, não um facto, e gravá-lo
+    /// num recibo seria dar-lhe um estatuto que não tem.
+    fn verified_gen_unix_ms(&self, _token: &[u8], _imprint: &[u8; 32]) -> Option<u64> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -147,12 +159,27 @@ impl TsaClient for HttpTsa {
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut nonce);
         let req = TimeStampReq::new(imprint, u64::from_be_bytes(nonce))?;
         let body = req.to_der_bytes()?;
-        http_post_der(
+        let resposta = http_post_der(
             &self.url,
             "application/timestamp-query",
             &body,
             self.timeout,
-        )
+        )?;
+        // O corpo é uma `TimeStampResp` (§2.4.2), não um token. Devolvê-lo
+        // inteiro — como aqui se fazia — tinha duas consequências: uma RECUSA
+        // da ACT (`status=2`, sem token nenhum) ficava persistida como recibo,
+        // e o que ficava em disco nunca poderia ser verificado por um
+        // verificador CMS, porque não era um `ContentInfo`.
+        //
+        // Este cliente continua a não validar a cadeia — é o que
+        // `ExternalTokenUnvalidated` diz. Mas o que ele guarda passa a ser um
+        // token, e um token guardado hoje pode ser verificado amanhã, quando o
+        // órgão instalar as âncoras.
+        let resp = crate::rfc3161::TimeStampResp::from_der_bytes(&resposta).map_err(|e| {
+            CompError::Tsa(format!("resposta da ACT não é uma TimeStampResp: {e}"))
+        })?;
+        resp.granted_token()
+            .map_err(|e| CompError::Tsa(e.to_string()))
     }
 }
 
