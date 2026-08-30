@@ -168,6 +168,22 @@ impl RawSegmentWriter {
             storage_namespace_id: init.storage_namespace_id,
         };
         file.write_all(&header.encode())?;
+        // O header TEM de ser durável antes de esta função devolver, e a
+        // ausência deste fsync era um bug de disponibilidade: o
+        // `create_new` publica a entrada no directório imediatamente, mas o
+        // `write_all` fica em buffers do SO. Um crash nessa janela deixava um
+        // ficheiro de segmento com zero bytes (ou meio header) no disco, e o
+        // arranque seguinte parava nele — `repair_active_tail` chama
+        // `scan_raw_segment`, que faz `FileHeaderV6::decode` e devolve "short
+        // header". Resultado: a base recusava abrir e só saía dali com
+        // intervenção manual.
+        //
+        // O invariante que este `sync_data` estabelece é o que a recuperação
+        // pode assumir: **um ficheiro de segmento que existe tem um header
+        // completo**. Custa um fsync por rolagem de segmento (8 MiB+), o que
+        // não se mede.
+        file.sync_data()?;
+        sync_parent_dir(path)?;
         Ok(Self {
             file,
             header,
@@ -592,6 +608,28 @@ pub fn read_footer(path: &Path) -> V6Result<Option<FooterV6>> {
         Ok(f) => Ok(Some(f)),
         Err(_) => Ok(None),
     }
+}
+
+
+
+/// Torna durável a **entrada de directório** de um ficheiro acabado de criar.
+///
+/// Sem isto, o `create_new` pode não sobreviver a um crash mesmo com o
+/// conteúdo já sincronizado: em POSIX o nome só é durável depois de o
+/// directório ser sincronizado. Em Windows não se abre um directório como
+/// `File`, portanto isto é no-op e a durabilidade do nome fica pela
+/// atomicidade do NTFS — o mesmo compromisso, declarado, que o
+/// `heraclitus-raft::fsync_dir` já assume.
+fn sync_parent_dir(path: &Path) -> V6Result<()> {
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        if let Ok(f) = File::open(dir) {
+            f.sync_all()?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 #[cfg(test)]

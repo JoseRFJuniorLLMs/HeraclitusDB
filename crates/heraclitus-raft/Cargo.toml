@@ -8,9 +8,20 @@ description = "Replication: log shipping v0 (RFC-003); openraft consensus behind
 
 [features]
 # SPEC-015/021 — the openraft consensus upgrade: leader election + quorum
-# commit + automatic failover, proven by the in-process cluster tests in
-# src/consensus.rs. Off by default: the lean v0 log-shipping path stays the
-# default until the network transport + durable raft-log milestones land.
+# commit + automatic failover, proven by the 18 in-process cluster tests in
+# src/consensus.rs (they pass against both storage formats; see
+# HERACLITUS_RAFT_TEST_FORMAT).
+#
+# Still off by default, but NOT for the reason this comment used to give. The
+# network transport and the durable raft-log landed on 2026-07-10; the reason
+# now is dependency weight: turning it on pulls openraft and tonic into every
+# consumer of this crate, and heraclitus-server gates it behind its own
+# `replication` feature anyway.
+#
+# The cost of it being off is that `cargo test --workspace` reports "ok" with
+# "0 passed" for this crate, which reads as coverage and is not. Until that is
+# a hard error somewhere, `consenso_so_e_testado_com_features_replication`
+# below makes the gap visible in the default test output.
 replication = [
     "dep:openraft",
     "dep:tokio",

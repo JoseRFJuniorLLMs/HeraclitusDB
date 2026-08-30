@@ -485,6 +485,55 @@ pub fn commit_gc_with_observer(
     plan: &GcPlan,
     observer: &mut dyn FnMut(PackingStage) -> V6Result<()>,
 ) -> V6Result<GcExecution> {
+    let pending =
+        commit_gc_manifest_with_observer(store, manifest, storage_root, plan, observer)?;
+    unlink_gc_targets(pending, observer)
+}
+
+/// O que sobra depois de [`commit_gc_manifest`]: o HRKM já não referencia nada
+/// disto, e os bytes ainda estão em disco.
+///
+/// Existe para que o desligar dos ficheiros possa acontecer **fora** do lock
+/// que serializa o writer. O `commit` do HRKM tem de ser sob esse lock — muda o
+/// estado do motor. Os `unlink` não têm, e mantê-los lá dentro parava os
+/// appends durante a passagem inteira. Numa passagem de regime é irrelevante
+/// (uma geração RAW por segmento empacotado, microssegundos por ficheiro); na
+/// **primeira** passagem de um banco que nunca correu GC — o caso de todas as
+/// instalações que existem hoje, porque até 2026-08-29 o GC não tinha chamador
+/// — são milhares de ficheiros e o stall é a passagem toda.
+///
+/// A ordem crash-safe não muda: o HRKM é publicado primeiro e os bytes saem
+/// depois, portanto um crash no meio deixa espaço desperdiçado e um manifesto
+/// auto-consistente. É a mesma sequência de §90; muda a fronteira do lock.
+#[derive(Debug, Clone)]
+#[must_use = "os bytes só desaparecem quando `unlink_gc_targets` correr"]
+pub struct PendingGcUnlink {
+    pub manifest_generation: u64,
+    /// Caminhos locais já resolvidos e validados contra a raiz de storage.
+    pub targets: Vec<PathBuf>,
+    pub lakehouse_detached: Vec<String>,
+    pub cold_detached: Vec<String>,
+}
+
+/// Passo 2 de §90 — valida o plano, publica o HRKM que já não referencia os
+/// candidatos, e devolve o que falta desligar **sem** remover nada.
+pub fn commit_gc_manifest(
+    store: &ManifestStore,
+    manifest: &mut DatabaseManifest,
+    storage_root: &Path,
+    plan: &GcPlan,
+) -> V6Result<PendingGcUnlink> {
+    commit_gc_manifest_with_observer(store, manifest, storage_root, plan, &mut |_| Ok(()))
+}
+
+#[doc(hidden)]
+pub fn commit_gc_manifest_with_observer(
+    store: &ManifestStore,
+    manifest: &mut DatabaseManifest,
+    storage_root: &Path,
+    plan: &GcPlan,
+    observer: &mut dyn FnMut(PackingStage) -> V6Result<()>,
+) -> V6Result<PendingGcUnlink> {
     assert_gc_invariant(manifest, plan)?;
 
     // Resolver e validar TODOS os alvos antes do commit. Depois do commit não
@@ -539,9 +588,28 @@ pub fn commit_gc_with_observer(
     *manifest = next;
     observer(PackingStage::GcManifestCommitted)?;
 
+    Ok(PendingGcUnlink {
+        manifest_generation: committed.generation,
+        targets: generation_paths.into_iter().chain(artifact_paths).collect(),
+        lakehouse_detached,
+        cold_detached,
+    })
+}
+
+/// Passo 3 de §90 — remove os bytes.
+///
+/// Uma falha é **órfão**, não erro: o manifesto já não os referencia, portanto
+/// o pior caso é espaço desperdiçado que o `storage doctor` detecta depois. É
+/// também o que torna seguro correr isto sem o lock — em Windows um ficheiro
+/// aberto por um leitor recusa o `remove_file` e vira órfão, em vez de falhar
+/// a passagem.
+pub fn unlink_gc_targets(
+    pending: PendingGcUnlink,
+    observer: &mut dyn FnMut(PackingStage) -> V6Result<()>,
+) -> V6Result<GcExecution> {
     let mut removed = Vec::new();
     let mut orphaned = Vec::new();
-    for path in generation_paths.into_iter().chain(artifact_paths) {
+    for path in pending.targets {
         match std::fs::remove_file(&path) {
             Ok(()) => removed.push(path),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -554,14 +622,13 @@ pub fn commit_gc_with_observer(
     observer(PackingStage::GcObjectsUnlinked)?;
 
     Ok(GcExecution {
-        manifest_generation: committed.generation,
+        manifest_generation: pending.manifest_generation,
         removed,
         orphaned,
-        lakehouse_detached,
-        cold_detached,
+        lakehouse_detached: pending.lakehouse_detached,
+        cold_detached: pending.cold_detached,
     })
 }
-
 fn resolve_gc_path(storage_root: &Path, location: &str) -> V6Result<PathBuf> {
     const CTX: &str = "hrkl v6 gc path";
     let root = std::fs::canonicalize(storage_root)?;

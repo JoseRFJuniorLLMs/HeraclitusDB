@@ -128,7 +128,8 @@ pub use engine::{
 };
 pub use footer::FooterV6;
 pub use gc::{
-    apply_gc, assert_gc_invariant, classify_compaction, commit_gc, commit_gc_with_observer,
+    apply_gc, assert_gc_invariant, classify_compaction, commit_gc, commit_gc_manifest,
+    commit_gc_manifest_with_observer, commit_gc_with_observer, unlink_gc_targets, PendingGcUnlink,
     plan_gc, GcBlockReason, GcExecution, GcOptions, GcPlan, PinRegistry,
 };
 pub use header::{FileHeaderV6, PhysicalLayout, FORMAT_VERSION_V6};

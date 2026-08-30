@@ -192,9 +192,30 @@ impl KeyStore {
         Some(k)
     }
 
-    /// Crypto-shred: best-effort overwrite then delete the agent's key (file +
-    /// cache). Returns whether a key was present. Idempotent; never touches the
-    /// log.
+    /// Crypto-shred (SPEC-0050 §98): destroy the agent's key, so the events
+    /// encrypted with it stop being readable while staying in the log.
+    ///
+    /// Returns whether a key was present. Idempotent; never touches the log.
+    ///
+    /// # What this guarantees, and what it does not
+    ///
+    /// **The guarantee is the deletion of the key**, not the erasure of its
+    /// bytes. `remove_file` unlinks it, the cache entry goes, and nothing in
+    /// this process can decrypt those events again.
+    ///
+    /// The zero-fill before the unlink is **belt, and a weak one**: it is a
+    /// rewrite *in place*, and in-place rewrites do not reliably erase
+    /// anything on the storage this actually runs on. A copy-on-write
+    /// filesystem (ReFS, btrfs, ZFS) writes the zeros to a new extent and
+    /// leaves the old one until it is reclaimed; an SSD with wear levelling
+    /// does the same at the flash-translation layer, whatever the filesystem
+    /// asked for. Snapshots, replicas and backups are untouched by
+    /// construction.
+    ///
+    /// So: do not tell anyone the key material is gone from the medium. Tell
+    /// them the key is destroyed — which is the property §98 asks for and the
+    /// one that holds. Erasure at the medium level needs full-disk encryption
+    /// with a destroyed volume key, or physical destruction.
     pub fn shred(&self, agent_id: &str) -> io::Result<bool> {
         self.cache.remove(agent_id);
         let path = self.key_path(agent_id);

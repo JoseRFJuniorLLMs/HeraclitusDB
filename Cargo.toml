@@ -137,3 +137,11 @@ encoding_rs = "0.8"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# Um banco cujo modelo de ameaça inclui ficheiros adulterados (§84, §140) não
+# pode ter aritmética que dá a volta em silêncio. Hoje os decoders validam tudo
+# à mão (o `check_coherence` recusa `first_lsn > last_lsn` e companhia antes de
+# qualquer subtracção), e a auditoria de 2026-08-30 não achou um sítio
+# explorável. Isto é a rede para a PRÓXIMA verificação que faltar: um crash é
+# visível, um wrap não. Custa alguns por cento; um índice silenciosamente
+# errado custa mais.
+overflow-checks = true

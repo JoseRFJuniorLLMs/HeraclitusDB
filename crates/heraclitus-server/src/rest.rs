@@ -15,7 +15,13 @@ use std::sync::Arc;
 
 /// Se `POST /titular/:id/eliminar` esta autorizado. Vem da config
 /// (`rest_allow_erasure`), `false` por omissao.
-static ERASURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+///
+/// Viaja como `Extension` do router e nao como `static` de processo: era um
+/// `AtomicBool` global, portanto dois routers no mesmo processo (testes, ou uma
+/// segunda instancia embebida) partilhavam o flag e o ultimo a ser construido
+/// decidia pelos dois. Configuracao de um router pertence ao router.
+#[derive(Debug, Clone, Copy)]
+struct ErasureAllowed(bool);
 
 /// Comparação em tempo constante (R17): o tempo não depende do prefixo
 /// coincidente, fechando o side-channel de timing do `==` de strings. O
@@ -83,7 +89,6 @@ pub fn router_with_sentinel(
     cors_origins: Vec<String>,
     allow_erasure: bool,
 ) -> Router {
-    ERASURE.store(allow_erasure, std::sync::atomic::Ordering::Relaxed);
     let routes = Router::new()
         .route("/healthz", get(healthz))
         .route("/stats", get(stats))
@@ -146,7 +151,8 @@ pub fn router_with_sentinel(
         .route("/tier/fetch/:segment", get(tier_fetch));
     let routes = routes
         .with_state(engine)
-        .layer(Extension(sentinel));
+        .layer(Extension(sentinel))
+        .layer(Extension(ErasureAllowed(allow_erasure)));
 
     let protegido = aplicar_auth(routes, basic_auth);
     // O CORS fica por FORA da autenticação: o browser envia o preflight
@@ -895,10 +901,11 @@ async fn titular_acessos(
 /// Exige `{"confirmar": "<id>"}` no corpo: um POST acidental nao apaga nada.
 async fn titular_eliminar(
     State(engine): State<Arc<Engine>>,
+    Extension(erasure): Extension<ErasureAllowed>,
     Path(id): Path<String>,
     Json(corpo): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if !ERASURE.load(std::sync::atomic::Ordering::Relaxed) {
+    if !erasure.0 {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({

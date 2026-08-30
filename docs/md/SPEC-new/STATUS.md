@@ -11,6 +11,71 @@ excluído (é cache, dá falsos positivos).
 > cada afirmação falsa/enganosa com a evidência. O estado real da plataforma e o
 > roteiro estão em [../PLANO-SPECS.md](../PLANO-SPECS.md).
 
+## CORREÇÕES 2026-08-30 — os seis achados fechados, e um erro meu
+
+### O erro primeiro: aquilo não era flakiness, era um bug de disponibilidade
+
+Escrevi duas vezes que o `hrkl_v6_crash::sobrevive_a_kills_repetidos` era
+"sensibilidade a carga" e "não regressão". **Estava errado.** O teste estava a
+apanhar um defeito real, e o timing só decidia se o kill calhava na janela.
+
+`RawSegmentWriter::create` fazia:
+
+```rust
+let mut file = OpenOptions::new().create_new(true)...open(path)?;
+file.write_all(&header.encode())?;
+Ok(Self { .. })          // ← sem fsync
+```
+
+O `create_new` publica a entrada no directório **imediatamente**; o `write_all`
+fica em buffers do SO. Morrer nessa janela deixa um ficheiro de segmento com
+zero bytes (ou meio header) no disco.
+
+No arranque seguinte, `V6Log::open` faz `read_v6_header(path)?` sobre o
+activo → `FileHeaderV6::decode` → `"short header"` → **a base recusa abrir**. Só
+saía dali com alguém a apagar o ficheiro à mão. Não há perda de dados
+committed — mas há perda de disponibilidade, e a recuperação exige uma pessoa
+que saiba o que está a fazer.
+
+A lição operacional é a que interessa: **um teste de segurança contra crash que
+falha intermitentemente é um relatório de bug, não ruído.** Foi precisamente
+por eu o ter classificado como ruído que ele sobreviveu duas auditorias.
+
+Corrigido nos dois lados:
+
+1. **Prevenir** — o `create` sincroniza o header e a entrada de directório
+   antes de devolver. O invariante que isso estabelece é o que a recuperação
+   pode assumir: *um ficheiro de segmento que existe tem um header completo*.
+   Custa um fsync por rolagem de segmento (8 MiB+), que não se mede.
+2. **Recuperar** — bases já partidas por uma build anterior voltam a abrir: um
+   ficheiro activo mais curto que `FILE_HEADER_LEN` é tratado como o que é, um
+   toco de crash, e removido com um aviso. Não pode conter nenhum registo
+   porque os registos vêm depois do header. A condição é só o comprimento: um
+   header completo com bytes errados continua a falhar alto, porque isso é
+   corrupção.
+
+Regressão em `um_segmento_activo_sem_header_nao_impede_o_arranque`, validada por
+mutação. E o crash-test passou **6 de 6** corridas depois da correcção.
+
+### Os outros cinco
+
+| # | achado | correcção |
+|---|---|---|
+| 1 | o GC segurava o mutex do writer durante os `unlink` | `commit_gc` partido em `commit_gc_manifest` (sob o lock) + `unlink_gc_targets` (fora dele). A ordem crash-safe de §90 não muda — muda a fronteira do lock |
+| 2 | sem `overflow-checks` em release | ligado. 328 testes em release, 0 falhas, nenhum overflow — a rede não custa correcção nenhuma hoje, e apanha a próxima verificação que faltar |
+| 3 | `KeyStore::shred` prometia mais do que o meio dá | documentado o que garante (destruição da chave, §98) e o que não garante (a reescrita in-place não apaga em CoW nem em SSD com wear levelling; snapshots e réplicas ficam intactos por construção) |
+| 4 | `ERASURE` era `static` de processo | passou a `Extension` do router. Dois routers no mesmo processo deixam de partilhar o flag |
+| 6 | Raft invisível na suíte por omissão | o comentário que justificava o off-by-default estava obsoleto (os marcos que ele esperava aterraram em 2026-07-10); actualizado, e um teste chamado `consenso_so_e_testado_com_features_replication` torna a lacuna visível no output, já que os nomes dos testes são sempre impressos |
+
+### Validação
+
+- `cargo test --offline --workspace` — sem falhas.
+- `cargo test --offline --release -p heraclitus-log -p heraclitus-core
+  -p heraclitus-tier -p heraclitus-query` — **328 testes, 0 falhas** com
+  `overflow-checks = true`.
+- `hrkl_v6_crash::sobrevive_a_kills_repetidos` — **6/6**.
+- Mutação: pôr `curto = false` na detecção do toco derruba a regressão nova.
+
 ## AUDITORIA DE BUGS 2026-08-30 — relatório completo
 
 **Método:** varrimento por classe de defeito sobre `crates/*/src` e `tools/*/src`,

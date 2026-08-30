@@ -59,7 +59,7 @@ pub mod grpc;
 /// ```
 ///
 /// O default é **v6**, porque é o formato por omissão do banco.
-#[cfg(test)]
+#[cfg(all(test, feature = "replication"))]
 pub(crate) fn formato_de_teste() -> heraclitus_core::StorageFormat {
     match std::env::var("HERACLITUS_RAFT_TEST_FORMAT").as_deref() {
         Ok("legacy") => heraclitus_core::StorageFormat::Legacy,
@@ -75,4 +75,20 @@ pub fn logs_equivalent(a: &AnyLog, b: &AnyLog) -> Result<bool, HeraclitusError> 
     Ok(ea.iter().zip(&eb).all(|((la, xa), (lb, xb))| {
         la == lb && xa.id == xb.id && xa.ts_hlc == xb.ts_hlc && xa.content == xb.content
     }))
+}
+
+#[cfg(all(test, not(feature = "replication")))]
+mod aviso_de_cobertura {
+    /// Este teste passa; o que ele faz é aparecer.
+    ///
+    /// Sem a feature `replication` os 18 testes de consenso não são
+    /// compilados, e `cargo test -p heraclitus-raft` reporta
+    /// `ok. 0 passed` — que se lê como "passou" e significa "não correu
+    /// nada". O nome deste teste é a mensagem: o output de `cargo test`
+    /// imprime sempre os nomes, portanto a lacuna deixa de ser silenciosa.
+    ///
+    /// Para correr o consenso a sério:
+    /// `cargo test -p heraclitus-raft --features replication`
+    #[test]
+    fn consenso_so_e_testado_com_features_replication() {}
 }

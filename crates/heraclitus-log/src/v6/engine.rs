@@ -308,6 +308,28 @@ impl V6Log {
         // Um active com footer válido caiu entre seal e rename. Promovê-lo
         // para RAW final antes do manifesto fecha essa janela sem truncamento.
         let mut active_from_disk = inventory.active.into_iter().next();
+        // Um ficheiro activo demasiado curto para conter um header é um toco de
+        // crash, não um segmento: os registos vêm DEPOIS do header, portanto um
+        // ficheiro sem header completo não pode conter um único registo
+        // committed. Removê-lo não perde nada; não o remover parava o arranque
+        // — era o que acontecia antes de o `RawSegmentWriter::create` passar a
+        // sincronizar o header, e foi o que o crash-test apanhou.
+        //
+        // A condição é deliberadamente só o comprimento. Um header completo com
+        // bytes errados NÃO entra aqui: isso é corrupção e tem de falhar alto.
+        if let Some((id, path)) = active_from_disk.as_ref() {
+            let curto = std::fs::metadata(path).map(|m| m.len()).unwrap_or(u64::MAX)
+                < super::header::FILE_HEADER_LEN as u64;
+            if curto {
+                tracing::warn!(
+                    segment = id,
+                    path = %path.display(),
+                    "segmento activo sem header completo: toco de um crash durante a criação; removido"
+                );
+                std::fs::remove_file(path)?;
+                active_from_disk = None;
+            }
+        }
         if let Some((id, path)) = active_from_disk.as_ref() {
             let header = read_v6_header(path)?;
             check_header_identity(&header, *id, namespace, PhysicalLayout::Raw)?;
@@ -347,6 +369,7 @@ impl V6Log {
 
         let mut next_lsn = next_lsn_from_manifest(&manifest)?;
         let active = match active_from_disk {
+
             Some((id, path)) => {
                 // A extensão `.active` é a autorização explícita para reparar.
                 // Um footer com magic completo mas CRC inválido é recusado pelo
@@ -1601,13 +1624,18 @@ impl V6Log {
                 cold_detached: Vec::new(),
             });
         }
-        let execution = super::gc::commit_gc(
+        // O commit do HRKM é sob o lock — muda o estado do motor. Os
+        // `unlink` não, e mantê-los aqui dentro parava os appends durante a
+        // passagem inteira: irrelevante em regime, mas a PRIMEIRA passagem de
+        // um banco que nunca correu GC são milhares de ficheiros.
+        let pending = super::gc::commit_gc_manifest(
             &self.manifest_store,
             &mut state.manifest,
             &self.root,
             &plan,
         )?;
         drop(state);
+        let execution = super::gc::unlink_gc_targets(pending, &mut |_| Ok(()))?;
         // §90 — manifestos antigos também são lixo, e o `keep` vem da mesma
         // opção para que um operador não tenha dois botões a dizer a mesma
         // coisa.

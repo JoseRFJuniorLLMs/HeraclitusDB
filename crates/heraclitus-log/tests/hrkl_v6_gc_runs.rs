@@ -258,3 +258,52 @@ fn a_quarentena_nao_e_coletada_por_uma_passagem_automatica() {
         .iter()
         .any(|p| p.to_string_lossy().contains("packed")));
 }
+
+/// Regressão: um crash entre criar o ficheiro do segmento e o header chegar ao
+/// disco deixava a base impossível de abrir.
+///
+/// O `RawSegmentWriter::create` fazia `create_new` (a entrada de directório
+/// aparece já) seguido de `write_all` do header **sem fsync**. Morrer nessa
+/// janela deixava um ficheiro de zero bytes; no arranque seguinte o
+/// `repair_active_tail` chamava `scan_raw_segment`, que faz
+/// `FileHeaderV6::decode` e devolve "short header" — e o `V6Log::open`
+/// propagava esse erro. A base só voltava a abrir depois de alguém apagar o
+/// ficheiro à mão.
+///
+/// Foi o teste `hrkl_v6_crash::sobrevive_a_kills_repetidos` que o apanhou, a
+/// falhar ~2 em 6 corridas sob carga. Foi lido como flakiness de timing; o
+/// timing só decidia se o kill calhava nesta janela.
+///
+/// Agora: o `create` sincroniza o header antes de devolver, e o arranque trata
+/// um ficheiro curto demais para ter header como o que ele é — um toco de
+/// crash, que não pode conter nenhum registo porque os registos vêm depois do
+/// header.
+#[test]
+fn um_segmento_activo_sem_header_nao_impede_o_arranque() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = banco_empacotado(dir.path());
+    let esperado = log.scan(0, N).unwrap().len();
+    drop(log);
+
+    // Simula o toco: trunca o segmento activo a zero bytes, que é exactamente
+    // o que um crash logo a seguir ao `create_new` deixava.
+    let segments = dir.path().join("segments");
+    let activo = ficheiros(&segments)
+        .into_iter()
+        .find(|p| p.to_string_lossy().contains(".active."))
+        .expect("segmento activo");
+    std::fs::write(&activo, b"").unwrap();
+
+    let reaberto = V6Log::open(dir.path(), 1 << 30, FsyncPolicy::Always)
+        .expect("um toco de crash nao pode impedir o arranque");
+    assert_eq!(
+        reaberto.scan(0, N).unwrap().len(),
+        esperado,
+        "o historico committed tem de sobreviver intacto"
+    );
+    // E a base volta a aceitar escritas.
+    reaberto
+        .append(Episode::new("gc", EventKind::Observation, b"depois".to_vec()))
+        .unwrap();
+}
+
