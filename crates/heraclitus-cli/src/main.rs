@@ -147,6 +147,13 @@ enum Cmd {
         /// Obrigatoria quando `--tsa-url` e https://.
         #[arg(long)]
         trust_store: Option<PathBuf>,
+        /// Pasta com as CRLs das ACs. Só se aplica a `https://` e exige
+        /// `--trust-store`.
+        #[arg(long)]
+        crl_dir: Option<PathBuf>,
+        /// OID RFC 3161 exigido no pedido e na resposta da ACT.
+        #[arg(long)]
+        policy_oid: Option<String>,
         /// Authority/policy name recorded in the receipt.
         #[arg(long, default_value = "ACT-dev")]
         policy: String,
@@ -173,6 +180,9 @@ enum Cmd {
         /// carimbo NAO e ligado a nenhum conteudo e o relatorio di-lo.
         #[arg(long)]
         imprint: Option<String>,
+        /// OID da política que o `TSTInfo` tem obrigatoriamente de declarar.
+        #[arg(long)]
+        policy_oid: Option<String>,
     },
     /// Re-verify receipts: commitment integrity plus available token validation.
     VerifyReceipts {
@@ -190,6 +200,9 @@ enum Cmd {
         /// Receipts directory (default: <dir>/../receipts).
         #[arg(long)]
         receipts: Option<PathBuf>,
+        /// OID da política que todos os tokens externos têm de declarar.
+        #[arg(long)]
+        policy_oid: Option<String>,
     },
 }
 
@@ -278,9 +291,19 @@ fn main() {
             tsa_url,
             policy,
             trust_store,
+            crl_dir,
+            policy_oid,
         } => {
             let rdir = receipts_dir_for(&dir, receipts);
-            heraclitus_cli::anchor(&dir, &rdir, tsa_url, policy, trust_store.as_deref())
+            heraclitus_cli::anchor(
+                &dir,
+                &rdir,
+                tsa_url,
+                policy,
+                trust_store.as_deref(),
+                crl_dir.as_deref(),
+                policy_oid.as_deref(),
+            )
         }
         Cmd::TrustStore { dir } => heraclitus_cli::trust_store_listar(&dir),
         Cmd::VerifyToken {
@@ -288,17 +311,20 @@ fn main() {
             trust_store,
             crl_dir,
             imprint,
+            policy_oid,
         } => heraclitus_cli::verify_token(
             &token,
             &trust_store,
             crl_dir.as_deref(),
             imprint.as_deref(),
+            policy_oid.as_deref(),
         ),
         Cmd::VerifyReceipts {
             dir,
             receipts,
             trust_store,
             crl_dir,
+            policy_oid,
         } => {
             let rdir = receipts_dir_for(&dir, receipts);
             heraclitus_cli::verify_receipts(
@@ -306,6 +332,7 @@ fn main() {
                 &rdir,
                 trust_store.as_deref(),
                 crl_dir.as_deref(),
+                policy_oid.as_deref(),
             )
         }
     };

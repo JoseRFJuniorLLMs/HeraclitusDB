@@ -2,16 +2,18 @@
 //!
 //! O motor garante a **integridade matemática** (log imutável + raiz de Merkle
 //! blake3). Este crate acrescenta uma camada de **evidência de desenvolvimento**
-//! sem tocar nesse core. Validade jurídica para um token RFC 3161 externo ainda
-//! depende de verificador CMS/X.509, trust store e política, que não existem
-//! nesta versão:
+//! sem tocar nesse core. Validade jurídica para um token RFC 3161 externo
+//! depende do verificador CMS/X.509, do trust store e da política escolhidos
+//! pelo operador; esses componentes existem, mas âncoras e evidência de uma ACT
+//! real nunca são inventadas pelo software:
 //!
 //! 1. [`commit`] — funde os roots dos segmentos selados num único commitment
 //!    reproduzível até uma watermark LSN, e deriva o imprint SHA-256.
 //! 2. [`rfc3161`] — o pedido RFC 3161 que pode ser enviado a uma ACT externa.
-//! 3. [`tsa`] — a ACT: [`tsa::LocalTsa`] (dev, ponta-a-ponta sem credencial) e
-//!    [`tsa::HttpTsa`] (ingestão HTTP de token externo, não produção).
-//! 4. [`verify`] — confere o token de desenvolvimento e extrai a sua hora.
+//! 3. [`tsa`] — a ACT: [`tsa::LocalTsa`] (dev) e [`tsa::HttpTsa`] (HTTP sem
+//!    validação, não produção); [`secure_tsa`] é o cliente HTTPS de produção.
+//! 4. [`verify`] confere tokens de desenvolvimento; [`icp`] valida CMS, cadeia,
+//!    política e revogação contra material instalado pelo órgão.
 //! 5. [`signer`] — assinatura institucional (CAdES) soft (dev) / HSM (produção).
 //! 6. [`receipt`] — o recibo jurídico persistido (token + manifesto auditável).
 //!
@@ -204,7 +206,7 @@ pub fn anchor<L: heraclitus_log::EpisodeLog + ?Sized>(
         TimestampValidationState::ExternalTokenVerified => Some(
             tsa.verified_gen_unix_ms(&token, &imprint).ok_or_else(|| {
                 CompError::Verify(
-                    "cliente declara token verificado mas não devolve genTime verificado:                      recibo não escrito"
+                    "cliente declara token verificado mas não devolve genTime verificado: recibo não escrito"
                         .into(),
                 )
             })?,
@@ -213,6 +215,25 @@ pub fn anchor<L: heraclitus_log::EpisodeLog + ?Sized>(
         | TimestampValidationState::LegacyUnverified => None,
     };
     let gen_ms = authority_gen_unix_ms.unwrap_or_else(now_unix_ms);
+    // Mesma regra que já vale para o `genTime`: um cliente que declara ter
+    // verificado TEM de saber dizer a política que o `TSTInfo` assinou. O campo
+    // é obrigatório na RFC 3161 §2.4.2, portanto uma verificação bem-sucedida
+    // sempre o tem — e um cliente que o cale está a contradizer-se.
+    //
+    // A contradição não se resolve escrevendo o recibo à mesma: ficaria em
+    // disco um estado `verificado` sem a política assinada, que é a combinação
+    // que um auditor lê como prova de conformidade com uma política e que não
+    // prova política nenhuma.
+    let tsa_policy_oid = if validation_state == TimestampValidationState::ExternalTokenVerified {
+        Some(tsa.verified_policy_oid(&token, &imprint).ok_or_else(|| {
+            CompError::Verify(
+                "cliente declara token verificado mas não devolve a política assinada do TSTInfo: recibo não escrito"
+                    .into(),
+            )
+        })?)
+    } else {
+        None
+    };
     receipt::persist(
         receipts_dir,
         &commitment,
@@ -222,6 +243,7 @@ pub fn anchor<L: heraclitus_log::EpisodeLog + ?Sized>(
             recorded_unix_ms: gen_ms,
             authority_gen_unix_ms,
             validation_state,
+            tsa_policy_oid,
         },
         &token,
     )
@@ -304,6 +326,14 @@ pub fn verify_receipt_with_verifier<L: heraclitus_log::EpisodeLog + ?Sized>(
     }
 
     let verificado = verifier.verify(&token, &imprint, None, now_unix_ms())?;
+    if let Some(declarada) = receipt.tsa_policy_oid.as_deref() {
+        let observada = verificado.policy_oid.to_string();
+        if declarada != observada {
+            return Err(CompError::Verify(format!(
+                "política do token mudou: recibo declara `{declarada}` e a reverificação encontrou `{observada}`"
+            )));
+        }
+    }
     Ok(ReceiptVerification::AuthorityVerified(Box::new(verificado)))
 }
 
@@ -416,3 +446,169 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod testes_politica_ponta_a_ponta {
+    use super::*;
+    use crate::icp::{IcpBrasilTimestampVerifier, TimestampValidationPolicy};
+    use crate::receipt::TimestampValidationState;
+    use crate::trust_store::TrustStore;
+    use crate::tsa::TsaClient;
+
+    const AGORA_S: u64 = 1_760_000_000;
+
+    /// Uma ACT sintética que devolve um token REAL (da PKI de teste) e verifica-o
+    /// com um verificador REAL, sem rede.
+    ///
+    /// Existe porque o `SecureTsaClient` precisa de um socket, e o elo que
+    /// faltava provar — o OID chegar ao RECIBO — está no `anchor()`, não no
+    /// cliente. Sem isto, `anchor()` podia deitar o OID fora e nenhum teste
+    /// dava por isso.
+    struct ActSintetica {
+        token: Vec<u8>,
+        verificador: IcpBrasilTimestampVerifier,
+        /// Simula um cliente que se declara verificado mas não sabe dizer a
+        /// política — a contradição que o `anchor()` tem de recusar.
+        cala_a_politica: bool,
+    }
+
+    impl ActSintetica {
+        fn nova(cala_a_politica: bool) -> (Self, [u8; 32]) {
+            let chain = crate::test_pki::chain_de_teste();
+            // O imprint tem de ser o do commitment que o teste vai ancorar;
+            // preenche-se depois, em `para_imprint`.
+            let imp = [0u8; 32];
+            let token = crate::test_pki::token_de_teste(
+                &chain,
+                &imp,
+                AGORA_S - 60,
+                None,
+                crate::test_pki::OpcoesToken::default(),
+            );
+            let mut store = TrustStore::new();
+            store.add_pem_or_der("raiz", &chain.root_der).unwrap();
+            (
+                Self {
+                    token,
+                    verificador: IcpBrasilTimestampVerifier::new(
+                        store,
+                        TimestampValidationPolicy::default(),
+                    ),
+                    cala_a_politica,
+                },
+                imp,
+            )
+        }
+
+        /// Reemite o token sobre um imprint concreto.
+        fn para_imprint(&mut self, imprint: &[u8; 32], chain: &crate::test_pki::Chain) {
+            self.token = crate::test_pki::token_de_teste(
+                chain,
+                imprint,
+                AGORA_S - 60,
+                None,
+                crate::test_pki::OpcoesToken::default(),
+            );
+        }
+    }
+
+    impl TsaClient for ActSintetica {
+        fn policy_name(&self) -> &str {
+            // Deliberadamente um ROTULO HUMANO, e não um OID: é assim que se
+            // apanha o erro de gravar o rótulo onde devia ir a política
+            // assinada.
+            "ACT de Teste do Órgão"
+        }
+        fn validation_state(&self) -> TimestampValidationState {
+            TimestampValidationState::ExternalTokenVerified
+        }
+        fn stamp(&self, _imprint: &[u8; 32]) -> Result<Vec<u8>, CompError> {
+            Ok(self.token.clone())
+        }
+        fn verified_gen_unix_ms(&self, token: &[u8], imprint: &[u8; 32]) -> Option<u64> {
+            self.verificador
+                .verify(token, imprint, None, AGORA_S * 1_000)
+                .ok()
+                .map(|v| v.gen_unix_ms)
+        }
+        fn verified_policy_oid(&self, token: &[u8], imprint: &[u8; 32]) -> Option<String> {
+            if self.cala_a_politica {
+                return None;
+            }
+            self.verificador
+                .verify(token, imprint, None, AGORA_S * 1_000)
+                .ok()
+                .map(|v| v.policy_oid.to_string())
+        }
+    }
+
+    fn log_com_eventos() -> (tempfile::TempDir, heraclitus_log::Log) {
+        use heraclitus_core::{Episode, EventKind, FsyncPolicy};
+        let dir = tempfile::tempdir().unwrap();
+        let log = heraclitus_log::Log::open(dir.path(), 256, FsyncPolicy::Always).unwrap();
+        for i in 0..200 {
+            log.append(Episode::new(
+                "auditor",
+                EventKind::Observation,
+                format!("evento {i}").into_bytes(),
+            ))
+            .unwrap();
+        }
+        (dir, log)
+    }
+
+    /// O elo que faltava: o OID **assinado pela ACT** tem de chegar ao recibo, e
+    /// não o rótulo humano que o operador escolheu.
+    #[test]
+    fn o_oid_assinado_chega_ao_recibo_e_nao_o_rotulo_humano() {
+        let (_d, log) = log_com_eventos();
+        let recibos = tempfile::tempdir().unwrap();
+        let chain = crate::test_pki::chain_de_teste();
+
+        // O imprint depende do commitment, portanto calcula-se primeiro.
+        let wm = current_watermark(&log);
+        let imprint = commit_at(&log, wm).message_imprint_sha256();
+
+        let (mut act, _) = ActSintetica::nova(false);
+        act.para_imprint(&imprint, &chain);
+
+        let r = anchor(&log, &act, recibos.path(), Some(wm)).expect("ancoragem");
+        assert_eq!(
+            r.validation_state,
+            TimestampValidationState::ExternalTokenVerified
+        );
+        assert_eq!(
+            r.tsa_policy_oid.as_deref(),
+            Some(crate::test_pki::OID_POLITICA_TESTE.to_string().as_str()),
+            "o recibo tem de trazer a política ASSINADA no TSTInfo"
+        );
+        assert_ne!(
+            r.tsa_policy_oid.as_deref(),
+            Some("ACT de Teste do Órgão"),
+            "o rótulo humano não é uma política RFC 3161"
+        );
+        assert_eq!(r.policy, "ACT de Teste do Órgão", "o rótulo fica no seu campo");
+    }
+
+    /// Um cliente que se declara verificado e não sabe dizer a política
+    /// contradiz-se. A contradição não se resolve escrevendo o recibo à mesma:
+    /// ficaria em disco um estado "verificado" sem a política assinada, que é a
+    /// combinação que um auditor lê como prova e que não prova a política.
+    #[test]
+    fn um_cliente_verificado_que_cala_a_politica_nao_escreve_recibo() {
+        let (_d, log) = log_com_eventos();
+        let recibos = tempfile::tempdir().unwrap();
+        let chain = crate::test_pki::chain_de_teste();
+        let wm = current_watermark(&log);
+        let imprint = commit_at(&log, wm).message_imprint_sha256();
+
+        let (mut act, _) = ActSintetica::nova(true);
+        act.para_imprint(&imprint, &chain);
+
+        let erro = anchor(&log, &act, recibos.path(), Some(wm)).unwrap_err();
+        assert!(
+            erro.to_string().contains("política"),
+            "a contradição tem de ser fatal: {erro}"
+        );
+    }
+}

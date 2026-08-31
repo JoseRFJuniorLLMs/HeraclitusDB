@@ -1,6 +1,6 @@
 # Bloqueios de produção — SPEC-0046
 
-Estado em **2026-08-31**. Este documento existe para responder a uma pergunta
+Estado em **2026-08-31** (segunda ronda). Este documento existe para responder a uma pergunta
 só: *o que impede `production_mode = true` de arrancar, e de quem é cada
 bloqueio*.
 
@@ -246,7 +246,43 @@ busca directamente com a ordem fixada, é que morre com a mutação.
 
 ---
 
-## Por resolver — e nenhum destes se resolve com código
+## Terceira passagem — gates que ainda estavam só “disponíveis”
+
+### O perfil de produção aceitava validação parcial
+
+Havia três componentes implementados, mas opcionais exactamente no perfil que
+não podia tratá-los como opcionais:
+
+- sem `HERACLITUS_COMPLIANCE_CRL_DIR`, o servidor arrancava e escrevia
+  `ExternalTokenVerified` com `revocation_checked=false`;
+- `HERACLITUS_COMPLIANCE_SOVEREIGNTY=off` deixava o cliente HTTPS fora do
+  `GuardedTsaClient` — havia guarda no código, mas produção podia não a usar;
+- `HERACLITUS_COMPLIANCE_TSA_POLICY` era apenas um rótulo humano. O pedido saía
+  sem `reqPolicy` e o verificador aceitava qualquer OID de política servido pela
+  mesma ACT.
+
+`production_mode=true` exige agora CRLs instaladas, soberania `controlled` e
+`HERACLITUS_COMPLIANCE_TSA_POLICY_OID`. O OID vai no `TimeStampReq.reqPolicy`,
+volta a ser exigido no `TSTInfo` assinado e é persistido separadamente do nome
+humano no recibo. No caminho air-gap, `EvidenceAnchor.tsa_policy_oid` deixou de
+receber por engano esse nome humano: agora só contém o OID observado depois da
+verificação, e uma resposta que contradiga o token é recusada.
+
+### A prova com ACT não estava ligada à qualificação
+
+`heraclitus verify-token` existia, mas um resultado verde podia ficar num
+terminal e o plano de `government_production` não o exigia. Existe agora o gate
+normativo `act_interoperability`, que permanece `Inconclusive` até receber uma
+atestação externa assinada, ligada ao binário exacto da release.
+
+`qa/qualification/harness/Invoke-ActInteroperability.ps1` produz o artefacto
+reproduzível: exige `.tst` real, imprint conhecido, OID esperado, trust store e
+CRLs; regista também SHA-256 do servidor, da CLI, do token e de todo o material
+de confiança usado. O script produz evidência — não assina a própria aprovação.
+
+---
+
+## Por resolver — dependências externas ainda reais
 
 ### A. As âncoras ICP-Brasil reais não estão instaladas
 
@@ -264,12 +300,17 @@ têm de vir do canal oficial do ITI, com a impressão digital conferida fora de
 banda. Instalar uma raiz que o software trouxe consigo destruiria o sentido de
 §11 — a confiança que interessa é a que o operador declarou.
 
+Fonte operacional: [Repositório da AC Raiz do ITI](https://www.gov.br/iti/pt-br/assuntos/repositorio/repositorio-ac-raiz).
+O próprio ITI publica também pacotes de certificados e hashes para conferência;
+a instalação continua a ser uma decisão do órgão, não do binário.
+
 Enquanto estiver vazio, `production_mode = true` **não arranca**, por desenho.
 
 ### B. Interoperabilidade com uma ACT credenciada não está provada
 
 > **O que passou a existir:** `heraclitus verify-token <ficheiro.tst>
-> --trust-store <dir> [--crl-dir <dir>] [--imprint <hex>]` pega num `.tst`
+> --trust-store <dir> --crl-dir <dir> --imprint <hex>
+> --policy-oid <oid>` pega num `.tst`
 > emitido por uma ACT e diz se este verificador o aceita — sem pôr o sistema a
 > ancorar em produção, que era a única forma de o testar. Sem `--imprint` o
 > relatório **diz** que o carimbo não foi ligado a conteúdo nenhum, em vez de
@@ -299,9 +340,9 @@ políticas de certificado (§6.1.2/§6.1.4 (a)-(e)): `certificatePolicies`,
 `certificatePolicies` marcado **crítico** faz agora recusar, o que é o
 comportamento seguro, com escotilha por OID declarada.
 
-A construção do caminho continua sem backtracking: com dois certificados do
-mesmo emissor no token (rollover de chave), escolhe-se o primeiro e desiste-se
-se ele não servir. Recusa em vez de adivinhar, mas recusa de mais.
+O `rollover` de chave deixou de pertencer a esta entrada: a construção do
+caminho faz backtracking e o teste fixa a ordem dos candidatos directamente.
+Uma mutação que reduz o laço ao primeiro candidato derruba esse teste.
 
 ### D. Atestações externas (SPEC-0049)
 
@@ -329,6 +370,7 @@ nomeados para que a decisão seja visível em vez de a lacuna ser descoberta.
 ```bash
 export HERACLITUS_COMPLIANCE=1
 export HERACLITUS_COMPLIANCE_TSA_URL=https://act.exemplo.gov.br/tsa
+export HERACLITUS_COMPLIANCE_TSA_POLICY_OID=2.16.76.x.y
 export HERACLITUS_COMPLIANCE_TRUST_STORE=/etc/heraclitus/ancoras
 export HERACLITUS_COMPLIANCE_CRL_DIR=/etc/heraclitus/crls
 export HERACLITUS_COMPLIANCE_CRL_MAX_STALENESS=0
@@ -338,7 +380,7 @@ export HERACLITUS_COMPLIANCE_SOVEREIGNTY=controlled
 Verificação forense com a cadeia validada:
 
 ```bash
-heraclitus verify-receipts --dir /var/lib/heraclitus/log --trust-store /etc/heraclitus/ancoras --crl-dir /etc/heraclitus/crls
+heraclitus verify-receipts --dir /var/lib/heraclitus/log --trust-store /etc/heraclitus/ancoras --crl-dir /etc/heraclitus/crls --policy-oid 2.16.76.x.y
 ```
 
 Sem `--trust-store` o relatório continua **inconcluso por construção**, e agora

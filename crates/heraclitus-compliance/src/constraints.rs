@@ -207,7 +207,7 @@ pub fn verificar_criticas(
     for ext in exts.iter() {
         if !vistos.insert(ext.extn_id) {
             return Err(erro(format!(
-                "certificado `{}` repete a extensão {}: §4.2 proíbe-o, porque com duas cópias                  é a ordem — e não a norma — que decide qual delas vale",
+                "certificado `{}` repete a extensão {}: §4.2 proíbe-o, porque com duas cópias é a ordem — e não a norma — que decide qual delas vale",
                 cert.tbs_certificate.subject, ext.extn_id
             )));
         }

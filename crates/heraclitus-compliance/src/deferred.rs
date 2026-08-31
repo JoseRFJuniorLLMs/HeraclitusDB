@@ -356,7 +356,12 @@ pub struct DeferredAnchorResponse {
     pub export_digest: [u8; 32],
     pub commitment_imprint: [u8; 32],
     pub timestamp_token: Vec<u8>,
+    /// Rótulo humano do cliente/autoridade, para operação e logs.
     pub tsa_policy: String,
+    /// OID efectivamente lido do `TSTInfo` depois de validar o token. Ausente
+    /// em respostas antigas e em tokens que não foram validados.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tsa_policy_oid: Option<String>,
     pub validation_state: TimestampValidationState,
 }
 
@@ -408,13 +413,20 @@ pub fn stamp_deferred_request(
             "token de timestamp vazio ou acima do limite".into(),
         ));
     }
+    let validation_state = tsa.validation_state();
+    let tsa_policy_oid = if validation_state == TimestampValidationState::ExternalTokenVerified {
+        tsa.verified_policy_oid(&token, &imprint)
+    } else {
+        None
+    };
     let response = DeferredAnchorResponse {
         request_id: signed_request.request.request_id.clone(),
         export_digest: signed_request.request.export_digest,
         commitment_imprint: imprint,
         timestamp_token: token,
         tsa_policy: tsa.policy_name().into(),
-        validation_state: tsa.validation_state(),
+        tsa_policy_oid,
+        validation_state,
     };
     let signature = response_signer.sign_snapshot(&canonical_bytes(&response)?)?;
     let signed = SignedDeferredAnchorResponse {
@@ -554,16 +566,31 @@ fn importar_resposta(
             "resposta não corresponde exatamente ao pedido exportado".into(),
         ));
     }
-    match response.validation_state {
+    let tsa_policy_oid = match response.validation_state {
         TimestampValidationState::DevelopmentOnly => {
             verify_dev_token(&response.timestamp_token, &imprint).map_err(|error| {
                 DeferredAnchorError::Invalid(format!(
                     "token de desenvolvimento importado inválido: {error}"
                 ))
             })?;
+            if response.tsa_policy_oid.is_some() {
+                return Err(DeferredAnchorError::Invalid(
+                    "token de desenvolvimento não pode declarar política RFC 3161 verificada"
+                        .into(),
+                ));
+            }
+            None
         }
         TimestampValidationState::ExternalTokenUnvalidated
-        | TimestampValidationState::LegacyUnverified => {}
+        | TimestampValidationState::LegacyUnverified => {
+            if response.tsa_policy_oid.is_some() {
+                return Err(DeferredAnchorError::Invalid(
+                    "resposta sem validação externa não pode promover um rótulo a OID verificado"
+                        .into(),
+                ));
+            }
+            None
+        }
         // A resposta vem de FORA da fronteira de confiança — é exactamente a
         // parte contra a qual o air-gap existe. Que ela se declare
         // "verificada" é uma alegação de quem carimbou, não um facto que este
@@ -571,7 +598,7 @@ fn importar_resposta(
         TimestampValidationState::ExternalTokenVerified => {
             let Some(v) = verifier else {
                 return Err(DeferredAnchorError::Invalid(
-                    "resposta importada declara-se verificada mas este importador não tem trust                      store: use `import_deferred_response_with_verifier` com as âncoras do órgão                      (§11) — aceitar gravaria um anchor cujo estado afirma uma validação que                      ninguém deste lado fez"
+                    "resposta importada declara-se verificada mas este importador não tem trust store: use `import_deferred_response_with_verifier` com as âncoras do órgão (§11) — aceitar gravaria um anchor cujo estado afirma uma validação que ninguém deste lado fez"
                         .into(),
                 ));
             };
@@ -579,19 +606,35 @@ fn importar_resposta(
             // nunca atravessa. A frescura de um carimbo diferido não vem do
             // nonce — vem do `request_id` e do `export_digest`, já confrontados
             // acima contra o pedido original.
-            v.verify(&response.timestamp_token, &imprint, None, crate::now_unix_ms())
+            let verificado = v
+                .verify(&response.timestamp_token, &imprint, None, crate::now_unix_ms())
                 .map_err(|e| {
                     DeferredAnchorError::Invalid(format!(
-                        "resposta declara-se verificada mas o carimbo não confirma contra as                          âncoras deste órgão: {e}"
+                        "resposta declara-se verificada mas o carimbo não confirma contra as âncoras deste órgão: {e}"
                     ))
                 })?;
+            let observado = verificado.policy_oid.to_string();
+            match response.tsa_policy_oid.as_deref() {
+                Some(declarado) if declarado == observado => Some(observado),
+                Some(declarado) => {
+                    return Err(DeferredAnchorError::Invalid(format!(
+                        "resposta declara política `{declarado}` e o token verificado contém `{observado}`"
+                    )))
+                }
+                None => {
+                    return Err(DeferredAnchorError::Invalid(
+                        "resposta ExternalTokenVerified sem tsa_policy_oid: estado verificado sem a política assinada"
+                            .into(),
+                    ))
+                }
+            }
         }
-    }
+    };
     let previous_anchor_digest = signed_request.request.previous_anchor_digest;
     let anchor_digest = evidence_anchor_digest(
         &signed_request.request.commitment,
         &response.timestamp_token,
-        Some(&response.tsa_policy),
+        tsa_policy_oid.as_deref(),
         response.validation_state,
         previous_anchor_digest,
         &response.request_id,
@@ -602,7 +645,7 @@ fn importar_resposta(
         anchor_id: format!("anchor-{}", hex_digest(&anchor_digest)),
         commitment: signed_request.request.commitment.clone(),
         timestamp_token: response.timestamp_token.clone(),
-        tsa_policy_oid: Some(response.tsa_policy.clone()),
+        tsa_policy_oid,
         validation_state: response.validation_state,
         previous_anchor_digest,
         anchor_digest,

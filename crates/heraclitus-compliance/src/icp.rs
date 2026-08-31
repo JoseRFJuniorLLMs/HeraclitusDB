@@ -990,7 +990,7 @@ fn verificar_extensoes_tstinfo(exts: &der::Any) -> Result<(), CompError> {
     for ext in lista.iter() {
         if ext.critical {
             return Err(verify_err(format!(
-                "TSTInfo com a extensão crítica {} que este verificador não processa: uma                  instrução crítica que não se sabe cumprir recusa-se, não se ignora",
+                "TSTInfo com a extensão crítica {} que este verificador não processa: uma instrução crítica que não se sabe cumprir recusa-se, não se ignora",
                 ext.extn_id
             )));
         }
@@ -1022,7 +1022,7 @@ fn certificados_de(
         .ok_or_else(|| verify_err("SignedData sem certificados: nada para ancorar".into()))?;
     if set.0.len() > max {
         return Err(verify_err(format!(
-            "token com {} certificados acima do tecto de {max}: a construção da cadeia percorre              o conjunto a cada elo, e o tamanho em bytes não é travão suficiente",
+            "token com {} certificados acima do tecto de {max}: a construção da cadeia percorre o conjunto a cada elo, e o tamanho em bytes não é travão suficiente",
             set.0.len()
         )));
     }
@@ -1107,7 +1107,7 @@ fn valor_unico<'a>(
 ) -> Result<&'a der::Any, CompError> {
     if attr.values.len() != 1 {
         return Err(verify_err(format!(
-            "atributo assinado `{nome}` com {} valores: a RFC 5652 §5.3 exige exactamente um,              e examinar só o primeiro deixaria o segundo dizer outra coisa",
+            "atributo assinado `{nome}` com {} valores: a RFC 5652 §5.3 exige exactamente um, e examinar só o primeiro deixaria o segundo dizer outra coisa",
             attr.values.len()
         )));
     }
@@ -1272,7 +1272,7 @@ fn verificar_eku_timestamping(
     }
     if !ext.critical {
         return Err(verify_err(
-            "extendedKeyUsage não é crítico: a RFC 3161 §2.3 exige que seja, porque é assim que              a restrição vincula quem processa o certificado. Para aceitar uma ACT não conforme,              desligue `eku_estrito` — conscientemente"
+            "extendedKeyUsage não é crítico: a RFC 3161 §2.3 exige que seja, porque é assim que a restrição vincula quem processa o certificado. Para aceitar uma ACT não conforme, desligue `eku_estrito` — conscientemente"
                 .into(),
         ));
     }
@@ -1284,7 +1284,7 @@ fn verificar_eku_timestamping(
             .map(|o| o.to_string())
             .collect();
         return Err(verify_err(format!(
-            "extendedKeyUsage declara mais propósitos além do carimbo ({}): a RFC 3161 §2.3              exige uma chave RESERVADA para carimbar, e uma chave que serve para outra coisa              não está reservada",
+            "extendedKeyUsage declara mais propósitos além do carimbo ({}): a RFC 3161 §2.3 exige uma chave RESERVADA para carimbar, e uma chave que serve para outra coisa não está reservada",
             outros.join(", ")
         )));
     }

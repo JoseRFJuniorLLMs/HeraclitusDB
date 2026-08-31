@@ -53,6 +53,7 @@ the JSON report the tool wrote as an `artifacts` entry:
 | `q5_node_loss`, `raft_failover` | `result.json` | `Invoke-RaftFailureMatrix.ps1` **plus the lab's own fault injector** |
 | `sbom`, `supply_chain` | `bom.cdx.json`, `build-manifest.json` | `sbom` + the release workflow |
 | `runbooks` | runbook check report | `heraclitus-qualifier runbooks` **plus the §118 execution record** |
+| `act_interoperability` | `act-interoperability.json` | `Invoke-ActInteroperability.ps1` with a real `.tst`, official trust anchors, current CRLs, exact imprint and expected policy OID |
 
 **The laboratory produces the evidence; no harness here can.** For these,
 attaching a report this repository generated would be circular:

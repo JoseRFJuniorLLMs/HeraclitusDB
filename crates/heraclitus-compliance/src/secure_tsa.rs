@@ -379,6 +379,19 @@ impl SecureTsaClient {
             .map_err(|e| CompError::Tsa(format!("nonce não relê: {e}")))?;
         Ok(int.as_bytes().to_vec())
     }
+
+    fn timestamp_request(
+        &self,
+        imprint: &[u8; 32],
+        nonce: u64,
+    ) -> Result<TimeStampReq, CompError> {
+        let req_policy = self
+            .verifier
+            .as_ref()
+            .and_then(|v| v.policy().required_policy_oid);
+        TimeStampReq::new_with_policy(imprint, nonce, req_policy)
+            .map_err(|e| CompError::Tsa(format!("pedido não codifica: {e}")))
+    }
 }
 
 impl TsaClient for SecureTsaClient {
@@ -404,8 +417,7 @@ impl TsaClient for SecureTsaClient {
         // entropia nenhuma que interesse.
         let nonce = u64::from_be_bytes(bruto) >> 1;
 
-        let req = TimeStampReq::new(imprint, nonce)
-            .map_err(|e| CompError::Tsa(format!("pedido não codifica: {e}")))?;
+        let req = self.timestamp_request(imprint, nonce)?;
         let corpo = req
             .to_der_bytes()
             .map_err(|e| CompError::Tsa(format!("pedido não codifica: {e}")))?;
@@ -440,6 +452,13 @@ impl TsaClient for SecureTsaClient {
         v.verify(token, imprint, None, crate::now_unix_ms())
             .ok()
             .map(|t| t.gen_unix_ms)
+    }
+
+    fn verified_policy_oid(&self, token: &[u8], imprint: &[u8; 32]) -> Option<String> {
+        let v = self.verifier.as_ref()?;
+        v.verify(token, imprint, None, crate::now_unix_ms())
+            .ok()
+            .map(|t| t.policy_oid.to_string())
     }
 }
 
@@ -484,6 +503,26 @@ mod tests {
         )
         .unwrap_err();
         assert!(erro.to_string().contains("trust store vazio"), "{erro}");
+    }
+
+    #[test]
+    fn politica_exigida_vai_no_req_policy_e_nao_so_no_verificador() {
+        let oid = const_oid::ObjectIdentifier::new_unwrap("2.16.76.1.7.1.1.2.3");
+        let client = SecureTsaClient::new(
+            "https://act.exemplo/tsa",
+            "ACT teste",
+            store_de_teste(),
+            TlsPolicy::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+        .with_verifier(TimestampValidationPolicy {
+            required_policy_oid: Some(oid),
+            ..Default::default()
+        });
+
+        let req = client.timestamp_request(&[0xA5; 32], 77).unwrap();
+        assert_eq!(req.req_policy, Some(oid));
     }
 
     #[test]

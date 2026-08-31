@@ -1120,3 +1120,56 @@ pub fn chain_rsa(digest: DigestRsa, raiz_fraca: bool) -> Chain {
     }
 }
 
+
+#[cfg(test)]
+mod despejo_para_o_harness {
+    /// Escreve uma cadeia sintetica completa em disco — ancora, token e CRL —
+    /// para o harness de qualificacao poder ser exercitado ponta a ponta sem um
+    /// `.tst` real.
+    ///
+    /// Nao substitui a evidencia de laboratorio: prova que a CANALIZACAO
+    /// funciona, nao que interoperamos com uma ACT credenciada. O unico input
+    /// que continua a faltar e o token real.
+    ///
+    /// `#[ignore]` de proposito: corre a mao, com `HERACLITUS_DESPEJO=<pasta>`.
+    #[test]
+    #[ignore]
+    fn escrever() {
+        let Ok(dir) = std::env::var("HERACLITUS_DESPEJO") else {
+            eprintln!("defina HERACLITUS_DESPEJO=<pasta>");
+            return;
+        };
+        let base = std::path::PathBuf::from(&dir);
+        let anc = base.join("ancoras");
+        let crls = base.join("crls");
+        std::fs::create_dir_all(&anc).unwrap();
+        std::fs::create_dir_all(&crls).unwrap();
+
+        let chain = super::chain_de_teste();
+        let conteudo = b"conteudo de qualificacao";
+        let imprint = crate::trust_store::sha256(conteudo);
+        let token = super::token_de_teste(
+            &chain,
+            &imprint,
+            1_760_000_000 - 60,
+            None,
+            super::OpcoesToken::default(),
+        );
+        let crl = super::crl_de_teste(
+            &chain.root,
+            &chain.root_key,
+            1_760_000_000 - 3_600,
+            Some(1_760_000_000 + 86_400 * 3650),
+            vec![],
+        );
+        std::fs::write(anc.join("raiz.der"), &chain.root_der).unwrap();
+        std::fs::write(crls.join("raiz.crl"), &crl).unwrap();
+        std::fs::write(base.join("carimbo.tst"), &token).unwrap();
+        let hex: String = imprint.iter().map(|b| format!("{b:02x}")).collect();
+        std::fs::write(base.join("imprint.txt"), &hex).unwrap();
+        std::fs::write(base.join("politica.txt"), super::OID_POLITICA_TESTE.to_string()).unwrap();
+        println!("despejado em {dir}");
+        println!("imprint  = {hex}");
+        println!("politica = {}", super::OID_POLITICA_TESTE);
+    }
+}

@@ -62,7 +62,7 @@ impl TimestampValidationState {
 /// This intentionally separates receipt creation time from a validated
 /// authority time. The latter must remain `None` unless the token verifier
 /// extracted and verified it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimestampEvidence {
     /// Local receipt-creation time, or the verified development token time.
     pub recorded_unix_ms: u64,
@@ -70,6 +70,8 @@ pub struct TimestampEvidence {
     pub authority_gen_unix_ms: Option<u64>,
     /// Strength of the available verification.
     pub validation_state: TimestampValidationState,
+    /// Política efectivamente lida do token depois da verificação externa.
+    pub tsa_policy_oid: Option<String>,
 }
 
 /// One notarized anchor, serialized into the manifest.
@@ -109,6 +111,10 @@ pub struct LegalReceipt {
     pub commitment_domain: String,
     /// Authority/policy name.
     pub policy: String,
+    /// Política RFC 3161 efectivamente assinada pela ACT. Recibos antigos e
+    /// tokens não validados ficam `None`.
+    #[serde(default)]
+    pub tsa_policy_oid: Option<String>,
     /// Token file name relative to the receipts dir.
     pub token_file: String,
 }
@@ -165,6 +171,7 @@ pub fn persist(
         authority_gen_unix_ms: timestamp.authority_gen_unix_ms,
         validation_state: timestamp.validation_state,
         policy: policy.to_string(),
+        tsa_policy_oid: timestamp.tsa_policy_oid,
         token_file,
     };
 
@@ -250,6 +257,7 @@ mod tests {
                 recorded_unix_ms: 1700,
                 authority_gen_unix_ms: Some(1700),
                 validation_state: TimestampValidationState::DevelopmentOnly,
+                tsa_policy_oid: None,
             },
             b"token-bytes",
         )
@@ -277,5 +285,6 @@ mod tests {
             TimestampValidationState::LegacyUnverified
         );
         assert_eq!(receipt.authority_gen_unix_ms, None);
+        assert_eq!(receipt.tsa_policy_oid, None);
     }
 }

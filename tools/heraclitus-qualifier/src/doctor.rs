@@ -108,6 +108,12 @@ const KNOWN_KEYS: &[&str] = &[
     "compliance_tsa_mode",
     "compliance_tsa_url",
     "compliance_tsa_policy",
+    "compliance_tsa_policy_oid",
+    "compliance_trust_store_dir",
+    "compliance_sovereignty_mode",
+    "compliance_crl_dir",
+    "compliance_crl_max_staleness_secs",
+    "compliance_crl_exigir_next_update",
     "flight_addr",
     "telemetry_interval_secs",
     "replication",
@@ -401,7 +407,16 @@ pub fn diagnose(config: &Value, config_dir: &Path) -> Vec<Finding> {
             "enable it where the regime requires read auditability",
         ));
     }
-    if boolean(config, "compliance_enabled").unwrap_or(false) {
+    let compliance_enabled = boolean(config, "compliance_enabled").unwrap_or(false);
+    if production && !compliance_enabled {
+        findings.push(finding(
+            "compliance",
+            Severity::Blocking,
+            "production_mode is on but compliance_enabled is false".to_owned(),
+            "enable compliance and configure the external ACT path",
+        ));
+    }
+    if compliance_enabled {
         let mode = string(config, "compliance_tsa_mode").unwrap_or_default();
         let url = string(config, "compliance_tsa_url").unwrap_or_default();
         if mode != "offline" && url.trim().is_empty() {
@@ -419,6 +434,76 @@ pub fn diagnose(config: &Value, config_dir: &Path) -> Vec<Finding> {
                 format!("compliance will reach {url} — incompatible with an air-gapped install"),
                 "use the offline TSA mode inside an air gap",
             ));
+        }
+        if production && (mode != "https" || !url.starts_with("https://")) {
+            findings.push(finding(
+                "compliance",
+                Severity::Blocking,
+                format!("production ACT must use mode=https and an https:// URL, got {mode:?} / {url:?}"),
+                "set compliance_tsa_mode = \"https\" and an authenticated HTTPS endpoint",
+            ));
+        }
+        if production
+            && string(config, "compliance_sovereignty_mode").as_deref() != Some("controlled")
+        {
+            findings.push(finding(
+                "airgap",
+                Severity::Blocking,
+                "production online ACT is not guarded by compliance_sovereignty_mode = \"controlled\""
+                    .to_owned(),
+                "set the sovereignty mode to controlled so the exact ACT endpoint is allowlisted",
+            ));
+        }
+        let policy_oid = string(config, "compliance_tsa_policy_oid");
+        if production && policy_oid.as_deref().is_none_or(str::is_empty) {
+            findings.push(finding(
+                "compliance",
+                Severity::Blocking,
+                "production ACT has no compliance_tsa_policy_oid".to_owned(),
+                "configure the exact RFC 3161 policy OID approved for this ACT",
+            ));
+        }
+        for (key, remedy) in [
+            (
+                "compliance_trust_store_dir",
+                "install the operator-approved ICP-Brasil roots before qualification",
+            ),
+            (
+                "compliance_crl_dir",
+                "install current issuer CRLs before qualification",
+            ),
+        ] {
+            match string(config, key) {
+                None if production => findings.push(finding(
+                    "compliance",
+                    Severity::Blocking,
+                    format!("production ACT has no {key}"),
+                    remedy,
+                )),
+                Some(path) => {
+                    let resolved = resolve(config_dir, &path);
+                    let has_file = resolved
+                        .read_dir()
+                        .ok()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Result::ok)
+                        .any(|entry| entry.path().is_file());
+                    if !has_file {
+                        findings.push(finding(
+                            "compliance",
+                            if production {
+                                Severity::Blocking
+                            } else {
+                                Severity::Warning
+                            },
+                            format!("{key} {} has no readable files", resolved.display()),
+                            remedy,
+                        ));
+                    }
+                }
+                None => {}
+            }
         }
     }
 
@@ -572,6 +657,24 @@ mod tests {
         assert!(has(&findings, Severity::Blocking, "neither access_credentials"));
         assert!(has(&findings, Severity::Blocking, "encryption_at_rest = false"));
         assert!(has(&findings, Severity::Blocking, "without TLS in production_mode"));
+    }
+
+    #[test]
+    fn production_compliance_exige_politica_guarda_ancoras_e_crls() {
+        let findings = diagnose_text(
+            "production_mode = true\ncompliance_enabled = true\ncompliance_tsa_mode = \"https\"\ncompliance_tsa_url = \"https://act.example/tsa\"\n",
+        );
+        for esperado in [
+            "sovereignty_mode",
+            "compliance_tsa_policy_oid",
+            "compliance_trust_store_dir",
+            "compliance_crl_dir",
+        ] {
+            assert!(
+                has(&findings, Severity::Blocking, esperado),
+                "não encontrou {esperado}: {findings:#?}"
+            );
+        }
     }
 
     #[test]

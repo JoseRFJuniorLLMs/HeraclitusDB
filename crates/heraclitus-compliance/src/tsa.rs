@@ -51,6 +51,14 @@ pub trait TsaClient {
     fn verified_gen_unix_ms(&self, _token: &[u8], _imprint: &[u8; 32]) -> Option<u64> {
         None
     }
+
+    /// OID de política lido de um token que este cliente verificou.
+    ///
+    /// É separado de [`Self::policy_name`]: esse é um rótulo humano escolhido
+    /// pelo operador; este vem do `TSTInfo` assinado pela ACT.
+    fn verified_policy_oid(&self, _token: &[u8], _imprint: &[u8; 32]) -> Option<String> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

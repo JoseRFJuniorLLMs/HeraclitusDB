@@ -70,10 +70,25 @@ impl TimeStampReq {
     /// Construct a v1 request for a SHA-256 imprint with the given anti-replay
     /// nonce.
     pub fn new(imprint: &[u8; 32], nonce: u64) -> Result<Self, der::Error> {
+        Self::new_with_policy(imprint, nonce, None)
+    }
+
+    /// Construct a v1 request and, when configured, require one exact TSA
+    /// policy. RFC 3161 calls this field `reqPolicy`.
+    ///
+    /// Omitting it lets the authority choose any policy it serves. That is
+    /// useful for development and interoperability inspection, but production
+    /// must pass the policy selected by the operator and verify that the same
+    /// OID comes back in `TSTInfo`.
+    pub fn new_with_policy(
+        imprint: &[u8; 32],
+        nonce: u64,
+        req_policy: Option<ObjectIdentifier>,
+    ) -> Result<Self, der::Error> {
         Ok(Self {
             version: 1,
             message_imprint: MessageImprint::sha256(imprint)?,
-            req_policy: None,
+            req_policy,
             nonce: Some(nonce),
             cert_req: true,
         })
@@ -323,6 +338,14 @@ mod tests {
         assert!(back.cert_req);
         assert_eq!(back.message_imprint.digest_bytes(), &imprint[..]);
         assert_eq!(back.message_imprint.hash_algorithm.algorithm, OID_SHA256);
+    }
+
+    #[test]
+    fn request_roundtrip_preserva_a_politica_exigida() {
+        let oid = ObjectIdentifier::new_unwrap("2.16.76.1.7.1.1.2.3");
+        let req = TimeStampReq::new_with_policy(&[0x11; 32], 42, Some(oid)).unwrap();
+        let back = TimeStampReq::from_der_bytes(&req.to_der_bytes().unwrap()).unwrap();
+        assert_eq!(back.req_policy, Some(oid));
     }
 
     // -----------------------------------------------------------------

@@ -751,7 +751,7 @@ pub async fn serve_with(
                 "https" => {
                     let dir = config.compliance_trust_store_dir.as_ref().ok_or_else(|| {
                         HeraclitusError::Config(
-                            "compliance_tsa_mode=https exige                              HERACLITUS_COMPLIANCE_TRUST_STORE com as âncoras do órgão (§11)"
+                            "compliance_tsa_mode=https exige HERACLITUS_COMPLIANCE_TRUST_STORE com as âncoras do órgão (§11)"
                                 .into(),
                         )
                     })?;
@@ -763,7 +763,7 @@ pub async fn serve_with(
                     // configuração e tem correcção óbvia.
                     if store.is_empty() {
                         return Err(HeraclitusError::Config(format!(
-                            "trust store `{}` sem âncoras utilizáveis ({} ficheiro(s) vistos,                              {} recusado(s)): sem âncoras não há ACT a autenticar",
+                            "trust store `{}` sem âncoras utilizáveis ({} ficheiro(s) vistos, {} recusado(s)): sem âncoras não há ACT a autenticar",
                             dir.display(),
                             relatorio.files_seen,
                             relatorio.files_seen.saturating_sub(store.len())
@@ -800,6 +800,16 @@ pub async fn serve_with(
                     };
                     let revogacao_ligada = crls.is_some();
 
+                    let mut timestamp_policy = TimestampValidationPolicy::default();
+                    if let Some(oid) = config.compliance_tsa_policy_oid.as_deref() {
+                        timestamp_policy.required_policy_oid = Some(oid.parse().map_err(|e| {
+                            HeraclitusError::Config(format!(
+                                "HERACLITUS_COMPLIANCE_TSA_POLICY_OID `{oid}`: {e}"
+                            ))
+                        })?);
+                        boot.ok_line("Política RFC 3161", oid);
+                    }
+
                     let mut cliente = SecureTsaClient::new(
                         config.compliance_tsa_url.clone(),
                         config.compliance_tsa_policy.clone(),
@@ -808,7 +818,7 @@ pub async fn serve_with(
                         Duration::from_secs(15),
                     )
                     .map_err(|e| HeraclitusError::Config(format!("cliente ACT: {e}")))?
-                    .with_verifier(TimestampValidationPolicy::default());
+                    .with_verifier(timestamp_policy);
                     if let Some(crls) = crls {
                         cliente = cliente
                             .with_crls(

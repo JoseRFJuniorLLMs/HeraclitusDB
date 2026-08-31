@@ -722,20 +722,34 @@ pub fn migrate_encrypt(
     ))
 }
 
-/// Anchor the current sealed state as development evidence.
+fn timestamp_validation_policy(
+    policy_oid: Option<&str>,
+) -> Result<heraclitus_compliance::icp::TimestampValidationPolicy, String> {
+    let mut policy = heraclitus_compliance::icp::TimestampValidationPolicy::default();
+    if let Some(oid) = policy_oid {
+        policy.required_policy_oid = Some(
+            oid.parse()
+                .map_err(|e| format!("OID de política `{oid}` inválido: {e}"))?,
+        );
+    }
+    Ok(policy)
+}
+
+/// Anchor the current sealed state.
 ///
 /// With no `--tsa-url`, an in-process dev ACT proves the end-to-end flow but
-/// has no ICP-Brasil or legal validity. With one, the current client only stores
-/// a raw external token over HTTP; HTTPS, CMS/X.509 and ICP-Brasil validation
-/// are deliberately not claimed by this build.
+/// has no ICP-Brasil or legal validity. `https://` uses the configured trust
+/// store, policy OID and optional offline CRLs; plain HTTP remains explicitly
+/// unvalidated development transport.
 pub fn anchor(
     log_dir: &std::path::Path,
     receipts_dir: &std::path::Path,
     tsa_url: Option<String>,
     policy: String,
     trust_store_dir: Option<&std::path::Path>,
+    crl_dir: Option<&std::path::Path>,
+    policy_oid: Option<&str>,
 ) -> Result<String, String> {
-    use heraclitus_compliance::icp::TimestampValidationPolicy;
     use heraclitus_compliance::secure_tsa::{SecureTsaClient, TlsPolicy};
     use heraclitus_compliance::trust_store::TrustStore;
     use heraclitus_compliance::{anchor, current_watermark, HttpTsa, LocalTsa, TsaClient};
@@ -768,34 +782,65 @@ pub fn anchor(
                     relatorio.files_seen
                 ));
             }
-            Box::new(
-                SecureTsaClient::new(
-                    u,
-                    policy,
-                    store,
-                    TlsPolicy::default(),
-                    std::time::Duration::from_secs(15),
-                )
-                .map_err(|e| e.to_string())?
-                .with_verifier(TimestampValidationPolicy::default()),
+            let mut client = SecureTsaClient::new(
+                u,
+                policy,
+                store,
+                TlsPolicy::default(),
+                std::time::Duration::from_secs(15),
             )
+            .map_err(|e| e.to_string())?
+            .with_verifier(timestamp_validation_policy(policy_oid)?);
+            if let Some(cd) = crl_dir {
+                let (crls, rel) = heraclitus_compliance::crl::CrlStore::load_dir(cd)
+                    .map_err(|e| format!("CRLs `{}`: {e}", cd.display()))?;
+                if crls.is_empty() {
+                    return Err(format!(
+                        "pasta de CRLs `{}` sem CRLs utilizáveis ({} ficheiro(s) vistos)",
+                        cd.display(),
+                        rel.files_seen
+                    ));
+                }
+                client = client
+                    .with_crls(crls, heraclitus_compliance::crl::CrlPolicy::default())
+                    .map_err(|e| e.to_string())?;
+            }
+            Box::new(client)
         }
-        Some(u) => Box::new(HttpTsa::new(u, policy)),
-        None => Box::new(LocalTsa::generate(policy)),
+        Some(u) => {
+            if trust_store_dir.is_some() || crl_dir.is_some() || policy_oid.is_some() {
+                return Err(
+                    "--trust-store, --crl-dir e --policy-oid só têm efeito com uma TSA https://; recuso ignorá-los num transporte HTTP não validado"
+                        .into(),
+                );
+            }
+            Box::new(HttpTsa::new(u, policy))
+        }
+        None => {
+            if trust_store_dir.is_some() || crl_dir.is_some() || policy_oid.is_some() {
+                return Err(
+                    "--trust-store, --crl-dir e --policy-oid exigem --tsa-url https://".into(),
+                );
+            }
+            Box::new(LocalTsa::generate(policy))
+        }
     };
     let verificado = tsa.validation_state()
         == heraclitus_compliance::TimestampValidationState::ExternalTokenVerified;
     let r = anchor(&log, tsa.as_ref(), receipts_dir, None).map_err(|e| e.to_string())?;
-    let timestamp_note = if verificado {
+    let timestamp_note = if verificado && crl_dir.is_some() {
         "token externo VERIFICADO contra as âncoras instaladas; hora é a da autoridade · \
-         revogação não consultada por esta via"
+         revogação consultada por CRL"
+    } else if verificado {
+        "token externo VERIFICADO contra as âncoras instaladas; hora é a da autoridade · \
+         revogação NÃO consultada (adicione --crl-dir)"
     } else if external_tsa {
         "token externo armazenado; cadeia CMS/X.509/ICP-Brasil NÃO validada; hora gravada é local"
     } else {
         "token de desenvolvimento verificado localmente; não é carimbo ICP-Brasil"
     };
     Ok(format!(
-        "ancorado: LSN {} · {} segmentos · root {}…\n  imprint SHA-256 {}…\n  registro {} (ms epoch) · origem '{}' · {}\n  recibo: {}",
+        "ancorado: LSN {} · {} segmentos · root {}…\n  imprint SHA-256 {}…\n  registro {} (ms epoch) · origem '{}' · {}\n  política RFC 3161: {}\n  recibo: {}",
         r.lsn,
         r.segments,
         &r.root_hex[..r.root_hex.len().min(16)],
@@ -803,6 +848,7 @@ pub fn anchor(
         r.gen_unix_ms,
         r.policy,
         timestamp_note,
+        r.tsa_policy_oid.as_deref().unwrap_or("não validada"),
         r.token_file
     ))
 }
@@ -816,8 +862,9 @@ pub fn verify_receipts(
     receipts_dir: &std::path::Path,
     trust_store_dir: Option<&std::path::Path>,
     crl_dir: Option<&std::path::Path>,
+    policy_oid: Option<&str>,
 ) -> Result<String, String> {
-    use heraclitus_compliance::icp::{IcpBrasilTimestampVerifier, TimestampValidationPolicy};
+    use heraclitus_compliance::icp::IcpBrasilTimestampVerifier;
     use heraclitus_compliance::trust_store::TrustStore;
     use heraclitus_compliance::{
         load_manifest, verify_receipt, verify_receipt_with_verifier, ReceiptVerification,
@@ -840,14 +887,14 @@ pub fn verify_receipts(
             })?;
             if store.is_empty() {
                 return Err(format!(
-                    "trust store `{}` não tem âncoras utilizáveis ({} ficheiro(s) vistos):                      sem âncoras não há cadeia contra que validar",
+                    "trust store `{}` não tem âncoras utilizáveis ({} ficheiro(s) vistos): sem âncoras não há cadeia contra que validar",
                     d.display(),
                     relatorio.files_seen
                 ));
             }
             let mut v = IcpBrasilTimestampVerifier::new(
                 store,
-                TimestampValidationPolicy::default(),
+                timestamp_validation_policy(policy_oid)?,
             );
             if let Some(cd) = crl_dir {
                 let (crls, rel) = heraclitus_compliance::crl::CrlStore::load_dir(cd)
@@ -864,12 +911,12 @@ pub fn verify_receipts(
             Some(v)
         }
         None => {
-            if crl_dir.is_some() {
+            if crl_dir.is_some() || policy_oid.is_some() {
                 // Sem âncoras não há cadeia, e sem cadeia não há certificado
                 // cuja revogação consultar. Aceitar em silêncio daria um
                 // relatório sem revogação a quem a pediu.
                 return Err(
-                    "--crl-dir exige --trust-store: a revogação consulta-se sobre os                      certificados de uma cadeia, e sem âncoras não há cadeia"
+                    "--crl-dir e --policy-oid exigem --trust-store: sem uma cadeia autenticada não há onde aplicar revogação nem política"
                         .into(),
                 );
             }
@@ -896,6 +943,8 @@ pub fn verify_receipts(
     let mut integrity_ok = true;
     let mut timestamp_unvalidated = false;
     let mut autoridade_confirmada = 0usize;
+    let mut revogacao_confirmada = 0usize;
+    let mut revogacao_nao_consultada = 0usize;
     for r in &receipts {
         let resultado = match &verificador {
             Some(v) => verify_receipt_with_verifier(&log, receipts_dir, r, v),
@@ -904,6 +953,11 @@ pub fn verify_receipts(
         match resultado {
             Ok(ReceiptVerification::AuthorityVerified(v)) => {
                 autoridade_confirmada += 1;
+                if v.revocation_checked {
+                    revogacao_confirmada += 1;
+                } else {
+                    revogacao_nao_consultada += 1;
+                }
                 out += &format!(
                     "  OK    LSN {:>12}  {} seg  autoridade {} ms  âncora {}  cadeia {}  '{}'{}\n",
                     r.lsn,
@@ -937,7 +991,7 @@ pub fn verify_receipts(
                     // Só chega aqui sem verificador instalado: com um, este
                     // estado teria seguido por `AuthorityVerified` ou falhado.
                     TimestampValidationState::ExternalTokenVerified => {
-                        "recibo declara-se verificado · nenhum trust store passado a esta                          verificação, portanto a alegação NÃO foi reconfirmada"
+                        "recibo declara-se verificado · nenhum trust store passado a esta verificação, portanto a alegação NÃO foi reconfirmada"
                     }
                     TimestampValidationState::DevelopmentOnly => unreachable!(
                         "a verificação de desenvolvimento retorna DevelopmentOnly"
@@ -970,10 +1024,21 @@ pub fn verify_receipts(
         Err(out)
     } else if autoridade_confirmada > 0 {
         out += &format!(
-            "\n{autoridade_confirmada} recibo(s) com cadeia validada até uma âncora instalada. \
-             Ressalva que NÃO se pode omitir: a revogação dos certificados não é consultada, \
-             portanto um certificado revogado dentro da validade passaria."
+            "\n{autoridade_confirmada} recibo(s) com cadeia validada até uma âncora instalada."
         );
+        if revogacao_nao_consultada == 0 {
+            out += &format!(
+                " Revogação consultada e confirmada em {revogacao_confirmada} recibo(s)."
+            );
+        } else {
+            out += &format!(
+                " ATENÇÃO: revogação NÃO consultada em {revogacao_nao_consultada} recibo(s); \
+                 um certificado revogado dentro da validade poderia passar nesses casos."
+            );
+        }
+        if let Some(oid) = policy_oid {
+            out += &format!(" Política RFC 3161 exigida: {oid}.");
+        }
         Ok(out)
     } else {
         out += "\nTodos os commitments e tokens de desenvolvimento conferem — nenhuma validação legal/ICP-Brasil foi executada.";
@@ -1456,7 +1521,7 @@ mod tests {
         anchor_receipt(&log, &ExternalTsa, &receipts, None).unwrap();
         drop(log);
 
-        let report = verify_receipts(&log_dir, &receipts, None, None).unwrap_err();
+        let report = verify_receipts(&log_dir, &receipts, None, None, None).unwrap_err();
         assert!(report.contains("INCONCLUSIVO"));
         assert!(report.contains("NÃO é uma deteção de fraude"));
         assert!(!report.contains("possível adulteração retroativa"));
@@ -1743,8 +1808,9 @@ pub fn verify_token(
     trust_store_dir: &std::path::Path,
     crl_dir: Option<&std::path::Path>,
     imprint_hex: Option<&str>,
+    policy_oid: Option<&str>,
 ) -> Result<String, String> {
-    use heraclitus_compliance::icp::{IcpBrasilTimestampVerifier, TimestampValidationPolicy};
+    use heraclitus_compliance::icp::IcpBrasilTimestampVerifier;
     use heraclitus_compliance::trust_store::TrustStore;
 
     let token = std::fs::read(token_path)
@@ -1759,7 +1825,7 @@ pub fn verify_token(
             relatorio.files_seen
         ));
     }
-    let mut v = IcpBrasilTimestampVerifier::new(store, TimestampValidationPolicy::default());
+    let mut v = IcpBrasilTimestampVerifier::new(store, timestamp_validation_policy(policy_oid)?);
     let mut revogacao_pedida = false;
     if let Some(cd) = crl_dir {
         let (crls, rel) = heraclitus_compliance::crl::CrlStore::load_dir(cd)
@@ -1802,6 +1868,11 @@ pub fn verify_token(
     out += &format!("  autoridade   : {}\n", verificado.signer_subject);
     out += &format!("  genTime      : {} ms (época Unix)\n", verificado.gen_unix_ms);
     out += &format!("  política     : {}\n", verificado.policy_oid);
+    if let Some(oid) = policy_oid {
+        out += &format!("  política exigida e confirmada: {oid}\n");
+    } else {
+        out += "  política exigida: NÃO configurada (foi aceite a política declarada pela ACT)\n";
+    }
     out += &format!("  série        : {}\n", verificado.serial_hex);
     out += &format!(
         "  âncora       : {} (cadeia de {} certificado(s) até ela)\n",
@@ -1888,7 +1959,7 @@ mod testes_operador {
         let tok = dir.path().join("t.tst");
         std::fs::write(&tok, b"qualquer coisa").unwrap();
         let vazio = tempfile::tempdir().unwrap();
-        let erro = verify_token(&tok, vazio.path(), None, None).unwrap_err();
+        let erro = verify_token(&tok, vazio.path(), None, None, None).unwrap_err();
         assert!(erro.contains("sem âncoras utilizáveis"), "{erro}");
     }
 
@@ -1899,7 +1970,7 @@ mod testes_operador {
         std::fs::write(dir.path().join("r.pem"), b"-----BEGIN CERTIFICATE-----").unwrap();
         let tok = dir.path().join("t.tst");
         std::fs::write(&tok, b"x").unwrap();
-        let erro = verify_token(&tok, dir.path(), None, Some("zz")).unwrap_err();
+        let erro = verify_token(&tok, dir.path(), None, Some("zz"), None).unwrap_err();
         assert!(erro.contains("âncoras"), "{erro}");
     }
 }

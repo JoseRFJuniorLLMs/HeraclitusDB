@@ -88,6 +88,13 @@ assurance = "qualification_lab"
 attestation = "qa/qualification/attestations/artifact_signature.json"
 
 [[trials]]
+id = "act_interoperability"
+description = "Real RFC 3161 token from an accredited ACT; exact imprint, policy OID, chain and revocation verified"
+mode = "external_attestation"
+assurance = "qualification_lab"
+attestation = "qa/qualification/attestations/act_interoperability.json"
+
+[[trials]]
 id = "q1_load"
 description = "Q1 realistic SOC load, ramp, burst and measured saturation"
 mode = "external_attestation"

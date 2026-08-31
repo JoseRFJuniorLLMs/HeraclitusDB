@@ -52,6 +52,11 @@ const RELEASE_CANDIDATE: &[GateRequirement] = &[
 
 const GOVERNMENT: &[GateRequirement] = &[
     gate(
+        "act_interoperability",
+        AssuranceLevel::QualificationLab,
+        "RFC 3161 interoperability with an accredited ACT",
+    ),
+    gate(
         "q1_load",
         AssuranceLevel::QualificationLab,
         "Q1 realistic load",

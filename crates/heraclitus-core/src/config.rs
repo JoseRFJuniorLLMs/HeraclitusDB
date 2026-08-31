@@ -435,6 +435,13 @@ pub struct HeraclitusConfig {
     pub compliance_tsa_url: String,
     /// Authority/policy name recorded in each receipt.
     pub compliance_tsa_policy: String,
+    /// OID da política RFC 3161 que a ACT tem de aplicar ao carimbo.
+    ///
+    /// É separado de `compliance_tsa_policy`, que é apenas o rótulo humano
+    /// persistido no recibo. Em produção este campo é obrigatório: sem ele o
+    /// pedido sai sem `reqPolicy` e um token emitido sob qualquer política da
+    /// mesma ACT seria aceite.
+    pub compliance_tsa_policy_oid: Option<String>,
     /// SPEC-0046 §11 — pasta com as âncoras de confiança (PEM/DER) que o órgão
     /// instalou. É a MESMA confiança usada para o TLS da ACT e para a cadeia do
     /// carimbo, de propósito: se fossem duas, o sistema autenticaria o canal
@@ -448,7 +455,7 @@ pub struct HeraclitusConfig {
     /// SPEC-0046 — guarda de egresso à frente da ACT: `"off"` (default),
     /// `"controlled"` ou `"strict-air-gap"`.
     ///
-    /// O default é `"off"` e isso é deliberado. A alternativa seria instalar a
+    /// Fora de produção, o default é `"off"` e isso é deliberado. A alternativa seria instalar a
     /// guarda com uma política que autoriza tudo, o que daria a APARÊNCIA de um
     /// controlo de egresso sem o controlo — pior do que não ter guarda nenhuma,
     /// porque um auditor veria o componente na configuração e concluiria que
@@ -456,17 +463,19 @@ pub struct HeraclitusConfig {
     ///
     /// `"controlled"` autoriza exactamente um destino: o
     /// `compliance_tsa_url`. `"strict-air-gap"` nega o carimbo em linha — a
-    /// ancoragem passa a ter de ir pelo caminho diferido (`deferred`).
+    /// ancoragem passa a ter de ir pelo caminho diferido (`deferred`). O perfil
+    /// de produção com ACT em linha exige `"controlled"`.
     pub compliance_sovereignty_mode: String,
     /// SPEC-0046 §9 — pasta com as CRLs (`.crl`/`.pem`/`.der`) das ACs.
     ///
-    /// `None` (default) mantém o comportamento anterior: a revogação NÃO é
+    /// `None` (default, fora de produção) mantém o comportamento anterior: a revogação NÃO é
     /// consultada e `revocation_checked` fica `false` no resultado, para que
     /// nenhum relatório construído a partir dele possa afirmar mais do que foi
     /// feito. Com a pasta definida, cada certificado da cadeia passa a exigir
     /// uma CRL assinada pelo seu emissor — e a verificação FALHA se ela faltar,
     /// porque "pedi consulta e não a consegui fazer" não pode devolver um
-    /// resultado que se leia como limpo.
+    /// resultado que se leia como limpo. O perfil de produção exige uma pasta
+    /// não vazia e o carregamento profundo do servidor recusa material inválido.
     pub compliance_crl_dir: Option<PathBuf>,
     /// Quantos segundos depois de `nextUpdate` uma CRL ainda é aceite.
     ///
@@ -614,6 +623,7 @@ impl Default for HeraclitusConfig {
             compliance_tsa_mode: "local".to_string(),
             compliance_tsa_url: String::new(),
             compliance_tsa_policy: "ACT-dev".to_string(),
+            compliance_tsa_policy_oid: None,
             compliance_trust_store_dir: None,
             compliance_sovereignty_mode: "off".to_string(),
             compliance_crl_dir: None,
@@ -647,6 +657,33 @@ fn parse_strict_bool(name: &str, value: &str) -> Result<bool, HeraclitusError> {
             "{name} deve ser true/false (ou 1/0; on/off; yes/no), veio `{value}`"
         ))),
     }
+}
+
+/// Validação sintática barata de um OID decimal pontuado.
+///
+/// A descodificação normativa continua no crate de compliance. O core faz
+/// esta verificação para que um erro de configuração apareça antes de abrir o
+/// log, sem puxar ASN.1/X.509 para a camada de configuração.
+fn oid_decimal_valido(value: &str) -> bool {
+    let arcs: Vec<&str> = value.split('.').collect();
+    if arcs.len() < 2
+        || arcs
+            .iter()
+            .any(|arc| arc.is_empty() || !arc.bytes().all(|b| b.is_ascii_digit()))
+        || arcs.iter().any(|arc| arc.len() > 1 && arc.starts_with('0'))
+    {
+        return false;
+    }
+    let Ok(first) = arcs[0].parse::<u8>() else {
+        return false;
+    };
+    let Ok(second) = arcs[1].parse::<u64>() else {
+        return false;
+    };
+    if first > 2 || (first < 2 && second > 39) {
+        return false;
+    }
+    arcs[2..].iter().all(|arc| arc.parse::<u64>().is_ok())
 }
 
 impl HeraclitusConfig {
@@ -1006,6 +1043,9 @@ impl HeraclitusConfig {
                 self.compliance_tsa_policy = v;
             }
         }
+        if let Ok(v) = std::env::var("HERACLITUS_COMPLIANCE_TSA_POLICY_OID") {
+            self.compliance_tsa_policy_oid = (!v.is_empty()).then_some(v);
+        }
         Ok(())
     }
 
@@ -1247,7 +1287,7 @@ impl HeraclitusConfig {
                 || self.compliance_tsa_mode.eq_ignore_ascii_case("http")
             {
                 return Err(invalid(
-                    "produção proíbe TSA em HTTP puro: o digest do que se está a ancorar                      atravessaria a rede em claro e sem autenticar o servidor"
+                    "produção proíbe TSA em HTTP puro: o digest do que se está a ancorar atravessaria a rede em claro e sem autenticar o servidor"
                         .into(),
                 ));
             }
@@ -1259,13 +1299,33 @@ impl HeraclitusConfig {
                     self.compliance_tsa_mode, self.compliance_tsa_url
                 )));
             }
+            if !self
+                .compliance_sovereignty_mode
+                .eq_ignore_ascii_case("controlled")
+            {
+                return Err(invalid(
+                    "produção com ACT em linha exige HERACLITUS_COMPLIANCE_SOVEREIGNTY=controlled: `off` não aplica a allowlist e `strict-air-gap` proíbe a própria ligação"
+                        .into(),
+                ));
+            }
+            let Some(policy_oid) = self.compliance_tsa_policy_oid.as_deref() else {
+                return Err(invalid(
+                    "produção exige HERACLITUS_COMPLIANCE_TSA_POLICY_OID: sem o OID esperado o pedido sai sem reqPolicy e qualquer política da ACT seria aceite"
+                        .into(),
+                ));
+            };
+            if !oid_decimal_valido(policy_oid) {
+                return Err(invalid(format!(
+                    "HERACLITUS_COMPLIANCE_TSA_POLICY_OID inválido: `{policy_oid}`"
+                )));
+            }
             // §11 — sem âncoras o `SecureTsaClient` nem se constrói, e um
             // recibo produzido sem elas é `ExternalTokenUnvalidated`. Deixar
             // arrancar assim daria um sistema que se diz em produção e emite
             // evidência que não vale como evidência.
             let Some(dir) = self.compliance_trust_store_dir.as_ref() else {
                 return Err(invalid(
-                    "produção exige HERACLITUS_COMPLIANCE_TRUST_STORE com as âncoras ICP-Brasil                      do órgão (§11): sem elas o carimbo não é validado contra autoridade nenhuma"
+                    "produção exige HERACLITUS_COMPLIANCE_TRUST_STORE com as âncoras ICP-Brasil do órgão (§11): sem elas o carimbo não é validado contra autoridade nenhuma"
                         .into(),
                 ));
             };
@@ -1284,6 +1344,23 @@ impl HeraclitusConfig {
                 return Err(invalid(format!(
                     "trust store `{}` não tem ficheiros: produção exige pelo menos uma âncora",
                     dir.display()
+                )));
+            }
+            let Some(crl_dir) = self.compliance_crl_dir.as_ref() else {
+                return Err(invalid(
+                    "produção exige HERACLITUS_COMPLIANCE_CRL_DIR: uma cadeia válida sem consulta de revogação não é evidência pronta para produção"
+                        .into(),
+                ));
+            };
+            let crl_files = std::fs::read_dir(crl_dir)
+                .map_err(|e| invalid(format!("CRLs `{}`: {e}", crl_dir.display())))?
+                .filter_map(Result::ok)
+                .filter(|e| e.path().is_file())
+                .count();
+            if crl_files == 0 {
+                return Err(invalid(format!(
+                    "pasta de CRLs `{}` não tem ficheiros: produção exige informação de revogação",
+                    crl_dir.display()
                 )));
             }
             return Ok(());
@@ -1518,6 +1595,18 @@ max_graph_hops = 6
         cfg.compliance_tsa_mode = "https".into();
         cfg.compliance_tsa_url = "https://tsa.example.invalid".into();
         let err = cfg.validate_security().unwrap_err().to_string();
+        assert!(err.contains("SOVEREIGNTY=controlled"), "{err}");
+
+        cfg.compliance_sovereignty_mode = "controlled".into();
+        let err = cfg.validate_security().unwrap_err().to_string();
+        assert!(err.contains("TSA_POLICY_OID"), "{err}");
+
+        cfg.compliance_tsa_policy_oid = Some("OID-invalido".into());
+        let err = cfg.validate_security().unwrap_err().to_string();
+        assert!(err.contains("inválido"), "{err}");
+
+        cfg.compliance_tsa_policy_oid = Some("2.16.76.1.7.1.1.2.3".into());
+        let err = cfg.validate_security().unwrap_err().to_string();
         assert!(err.contains("TRUST_STORE"), "{err}");
 
         // Pasta indicada mas vazia: o erro comum, apanhado antes de o processo
@@ -1535,6 +1624,14 @@ max_graph_hops = 6
         // decidido ao CARREGAR, no arranque do servidor — este crate não
         // conhece X.509 e não finge conhecer.
         std::fs::write(dir.path().join("raiz.pem"), b"-----BEGIN CERTIFICATE-----").unwrap();
+        let err = cfg.validate_security().unwrap_err().to_string();
+        assert!(err.contains("COMPLIANCE_CRL_DIR"), "{err}");
+
+        let crls = tempfile::tempdir().unwrap();
+        cfg.compliance_crl_dir = Some(crls.path().to_path_buf());
+        let err = cfg.validate_security().unwrap_err().to_string();
+        assert!(err.contains("não tem ficheiros"), "{err}");
+        std::fs::write(crls.path().join("ac.crl"), b"fixture validado no servidor").unwrap();
         cfg.validate_security()
             .expect("perfil de produção completo tem de arrancar");
 
@@ -1543,5 +1640,14 @@ max_graph_hops = 6
         // deixou de guardar".
         cfg.rest_basic_auth = Some("admin:short".into());
         assert!(cfg.validate_security().is_err());
+    }
+
+    #[test]
+    fn policy_oid_decimal_e_validado_sem_asn1_no_core() {
+        assert!(oid_decimal_valido("2.16.76.1.7.1.1.2.3"));
+        assert!(oid_decimal_valido("1.2.840.113549.1.9.16.1.4"));
+        for invalido in ["", "1", ".1.2", "3.1", "1.40", "1..2", "1.02.3", "a.b"] {
+            assert!(!oid_decimal_valido(invalido), "{invalido}");
+        }
     }
 }
