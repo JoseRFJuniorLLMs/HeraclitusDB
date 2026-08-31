@@ -26,6 +26,78 @@ pub struct TextHit {
     pub score: f32,
 }
 
+/// Acumulador de scores BM25 denso, com marcas de época.
+///
+/// # Porque não um `HashMap<u32, f32>`
+///
+/// A versão anterior fazia `*scores.entry(doc).or_default() += s` uma vez por
+/// **posting**, e um termo comum tem tantos postings quantos os documentos que
+/// o contêm. Cada uma dessas operações é um hash mais uma sondagem, e o mapa
+/// inteiro é construído e destruído a cada consulta.
+///
+/// Aqui o score de um documento é uma escrita indexada. A época diz quais das
+/// entradas pertencem a ESTA consulta, o que evita limpar o vector entre
+/// consultas; e `tocados` guarda quais foram escritos, o que evita percorrer
+/// todos os documentos no fim para recolher os resultados — sem essa lista, um
+/// índice com um milhão de documentos pagaria um milhão de leituras para
+/// devolver dez resultados.
+///
+/// O transbordo da época é tratado como no índice vectorial: ao dar a volta, as
+/// marcas são limpas uma vez, porque uma marca antiga a coincidir com a época
+/// nova faria um documento aparecer com o score de uma consulta anterior.
+#[derive(Debug, Default)]
+struct AcumuladorBm25 {
+    scores: Vec<f32>,
+    marcas: Vec<u32>,
+    tocados: Vec<u32>,
+    epoca: u32,
+}
+
+impl AcumuladorBm25 {
+    fn preparar(&mut self, n: usize) {
+        if self.marcas.len() < n {
+            self.marcas.resize(n, 0);
+            self.scores.resize(n, 0.0);
+        }
+        self.tocados.clear();
+        self.epoca = self.epoca.wrapping_add(1);
+        if self.epoca == 0 {
+            self.marcas.iter_mut().for_each(|m| *m = 0);
+            self.epoca = 1;
+        }
+    }
+
+    #[inline]
+    fn somar(&mut self, doc: u32, s: f32) {
+        let i = doc as usize;
+        if i >= self.marcas.len() {
+            return;
+        }
+        if self.marcas[i] == self.epoca {
+            self.scores[i] += s;
+        } else {
+            self.marcas[i] = self.epoca;
+            self.scores[i] = s;
+            self.tocados.push(doc);
+        }
+    }
+}
+
+thread_local! {
+    /// Scratch por thread, reutilizado entre consultas. `search` recebe `&self`
+    /// e não é reentrante, pelo que manter o empréstimo durante a consulta é
+    /// seguro.
+    static ACUMULADOR: std::cell::RefCell<AcumuladorBm25> =
+        const {
+            std::cell::RefCell::new(AcumuladorBm25 {
+                scores: Vec::new(),
+                marcas: Vec::new(),
+                tocados: Vec::new(),
+                epoca: 0,
+            })
+        };
+}
+
 impl TextIndex {
     pub fn new() -> Self {
         Self::default()
@@ -45,7 +117,9 @@ impl TextIndex {
             return Vec::new();
         }
         let avgdl = (self.total_len as f32 / n).max(1.0);
-        let mut scores: HashMap<u32, f32> = HashMap::new();
+        ACUMULADOR.with(|acc| {
+        let mut acc = acc.borrow_mut();
+        acc.preparar(self.ids.len());
         for term in tokenize(query) {
             let Some(plist) = self.postings.get(&term) else {
                 continue;
@@ -56,23 +130,33 @@ impl TextIndex {
                 let dl = self.doc_len[doc as usize] as f32;
                 let tf = tf as f32;
                 let s = idf * (tf * (K1 + 1.0)) / (tf + K1 * (1.0 - B + B * dl / avgdl));
-                *scores.entry(doc).or_default() += s;
+                acc.somar(doc, s);
             }
         }
-        let mut hits: Vec<TextHit> = scores
-            .into_iter()
-            .map(|(doc, score)| TextHit {
+        let mut hits: Vec<TextHit> = acc
+            .tocados
+            .iter()
+            .map(|&doc| TextHit {
                 id: self.ids[doc as usize],
                 lsn: self.lsns[doc as usize],
-                score,
+                score: acc.scores[doc as usize],
             })
             .collect();
-        // Desempate por LSN: os scores saem de um HashMap (ordem de iteração
-        // aleatória por seed) — sem isto, docs com score igual entravam/saíam
-        // do top-k de forma não-determinística entre execuções.
-        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.lsn.cmp(&b.lsn)));
-        hits.truncate(k);
+        // Desempate por LSN: a ordem por que os documentos foram TOCADOS
+        // depende da ordem dos postings, não do conteúdo — sem este desempate,
+        // docs com score igual entravam e saíam do top-k conforme a consulta.
+        let ordem = |a: &TextHit, b: &TextHit| {
+            b.score.total_cmp(&a.score).then_with(|| a.lsn.cmp(&b.lsn))
+        };
+        // Selecção parcial: para devolver `k` de `n` não é preciso ordenar os
+        // `n`. Resultado idêntico porque o comparador é uma ordem total.
+        if k < hits.len() {
+            hits.select_nth_unstable_by(k, ordem);
+            hits.truncate(k);
+        }
+        hits.sort_by(ordem);
         hits
+        })
     }
 }
 
@@ -186,5 +270,179 @@ mod tests {
         assert!(hits.iter().all(|h| h.id == ids[0] || h.id == ids[1]));
         let fire = idx.search("fire change", 3);
         assert_eq!(fire[0].id, ids[2]);
+    }
+}
+
+#[cfg(test)]
+mod testes_acumulador {
+    use super::*;
+    use heraclitus_core::EventKind;
+    use std::collections::HashMap;
+
+    struct Rng(u64);
+    impl Rng {
+        fn proximo(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    /// A implementacao anterior, palavra por palavra, so como referencia de
+    /// teste: um acumulador denso que devolvesse outra coisa nao seria uma
+    /// optimizacao.
+    fn search_referencia(idx: &TextIndex, query: &str, k: usize) -> Vec<TextHit> {
+        let n = idx.ids.len() as f32;
+        if n == 0.0 {
+            return Vec::new();
+        }
+        let avgdl = (idx.total_len as f32 / n).max(1.0);
+        let mut scores: HashMap<u32, f32> = HashMap::new();
+        for term in tokenize(query) {
+            let Some(plist) = idx.postings.get(&term) else {
+                continue;
+            };
+            let df = plist.len() as f32;
+            let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+            for &(doc, tf) in plist {
+                let dl = idx.doc_len[doc as usize] as f32;
+                let tf = tf as f32;
+                let s = idf * (tf * (K1 + 1.0)) / (tf + K1 * (1.0 - B + B * dl / avgdl));
+                *scores.entry(doc).or_default() += s;
+            }
+        }
+        let mut hits: Vec<TextHit> = scores
+            .into_iter()
+            .map(|(doc, score)| TextHit {
+                id: idx.ids[doc as usize],
+                lsn: idx.lsns[doc as usize],
+                score,
+            })
+            .collect();
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.lsn.cmp(&b.lsn)));
+        hits.truncate(k);
+        hits
+    }
+
+    fn corpus(n: usize, semente: u64) -> TextIndex {
+        const PALAVRAS: [&str; 12] = [
+            "rio", "fogo", "mudanca", "mesmo", "duas", "vezes", "agua", "pedra",
+            "tempo", "medida", "alma", "logos",
+        ];
+        let mut rng = Rng(semente);
+        let mut idx = TextIndex::new();
+        for i in 0..n {
+            let quantas = 3 + (rng.proximo() % 12) as usize;
+            let texto: Vec<&str> = (0..quantas)
+                .map(|_| PALAVRAS[(rng.proximo() % 12) as usize])
+                .collect();
+            let e = Episode::new("a", EventKind::Observation, texto.join(" ").into_bytes());
+            idx.apply(i as u64, &e);
+        }
+        idx
+    }
+
+    /// A prova de que o acumulador denso nao mudou a resposta: mesmos
+    /// documentos, mesma ordem, mesmos scores.
+    #[test]
+    fn o_acumulador_denso_concorda_com_o_hashmap() {
+        for semente in [1u64, 7, 99] {
+            let idx = corpus(300, semente);
+            for consulta in ["rio", "fogo mudanca", "mesmo rio duas vezes", "logos", "inexistente"] {
+                for k in [1usize, 5, 50, 400] {
+                    let novo = idx.search(consulta, k);
+                    let ref_ = search_referencia(&idx, consulta, k);
+                    assert_eq!(
+                        novo.len(),
+                        ref_.len(),
+                        "semente {semente} consulta {consulta:?} k={k}"
+                    );
+                    for (i, (a, b)) in novo.iter().zip(ref_.iter()).enumerate() {
+                        assert_eq!(a.id, b.id, "posicao {i} de {consulta:?} k={k}");
+                        assert!(
+                            (a.score - b.score).abs() < 1e-5,
+                            "score em {i}: {} vs {}",
+                            a.score,
+                            b.score
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// O caso subtil que o acumulador por epoca introduz: ao dar a volta ao
+    /// `u32`, uma marca antiga coincidiria com a epoca nova e um documento
+    /// apareceria com o score de uma consulta anterior.
+    #[test]
+    fn o_transbordo_da_epoca_nao_traz_scores_de_outra_consulta() {
+        let mut a = AcumuladorBm25::default();
+        a.preparar(4);
+        a.epoca = u32::MAX;
+        a.somar(2, 5.0);
+        assert_eq!(a.tocados, vec![2]);
+        assert_eq!(a.scores[2], 5.0);
+
+        a.preparar(4);
+        assert_eq!(a.epoca, 1, "recomeca em 1, nao em 0");
+        assert!(a.tocados.is_empty(), "a consulta nova comeca sem tocados");
+        a.somar(2, 1.0);
+        assert_eq!(
+            a.scores[2], 1.0,
+            "sem a limpeza, o 5.0 da consulta anterior teria sido somado"
+        );
+    }
+
+    /// Somar duas vezes o mesmo documento na MESMA consulta acumula; em
+    /// consultas diferentes, nao.
+    #[test]
+    fn somar_acumula_dentro_da_consulta_e_reinicia_entre_consultas() {
+        let mut a = AcumuladorBm25::default();
+        a.preparar(8);
+        a.somar(3, 1.5);
+        a.somar(3, 2.5);
+        assert_eq!(a.scores[3], 4.0);
+        assert_eq!(a.tocados, vec![3], "tocado uma so vez apesar de somado duas");
+        a.preparar(8);
+        a.somar(3, 1.0);
+        assert_eq!(a.scores[3], 1.0);
+    }
+}
+
+#[cfg(test)]
+mod medicao_bm25 {
+    use super::*;
+    use heraclitus_core::EventKind;
+    use std::time::Instant;
+
+    /// `cargo test -p heraclitus-index-text --lib medicao -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn custo_da_consulta() {
+        const PALAVRAS: [&str; 8] =
+            ["rio", "fogo", "mudanca", "agua", "pedra", "tempo", "alma", "logos"];
+        for n in [5_000usize, 50_000] {
+            let mut idx = TextIndex::new();
+            for i in 0..n {
+                let texto: Vec<&str> = (0..8).map(|j| PALAVRAS[(i + j) % 8]).collect();
+                let e = Episode::new("a", EventKind::Observation, texto.join(" ").into_bytes());
+                idx.apply(i as u64, &e);
+            }
+            for _ in 0..5 {
+                idx.search("rio fogo", 10);
+            }
+            let t0 = Instant::now();
+            let mut total = 0usize;
+            for _ in 0..100 {
+                total += idx.search("rio fogo agua", 10).len();
+            }
+            let dt = t0.elapsed();
+            println!(
+                "n={n:>7}  100 consultas em {:>10.3?}  ({:>9.1?}/consulta, {total} hits)",
+                dt,
+                dt / 100
+            );
+        }
     }
 }

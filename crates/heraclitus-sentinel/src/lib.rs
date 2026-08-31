@@ -215,6 +215,18 @@ struct RuntimeInner {
     metrics: Arc<SentinelMetrics>,
     cursor_store: CursorStore,
     cursor: Mutex<SentinelCursor>,
+    /// A posição do cursor, publicada para quem só quer LER o estado.
+    ///
+    /// `process_until` segura `cursor` durante o lote inteiro — appends e
+    /// `fsync` incluídos — e `status()` pegava no MESMO mutex. Consequência: a
+    /// rota `/sentinel/status` bloqueava atrás do worker, e o endpoint que
+    /// reporta o atraso deixava de responder exactamente quando o atraso era a
+    /// coisa que era preciso ver. Com replicação, um append à espera de quórum
+    /// prendia-o sem limite de tempo.
+    ///
+    /// Publicado **depois** do commit durável (`Release`), para que um
+    /// observador nunca veja uma posição que ainda não está em disco.
+    next_lsn_publicado: std::sync::atomic::AtomicU64,
     normalizer: GenericNormalizer,
     rule_engine: Option<RuleEngine>,
     /// SPEC-0047 — índice de IOC e políticas de fonte. `None` quando o plano
@@ -452,6 +464,7 @@ impl SentinelRuntime {
             queue: queue.clone(),
             metrics: metrics.clone(),
             cursor_store,
+            next_lsn_publicado: std::sync::atomic::AtomicU64::new(cursor.next_lsn),
             cursor: Mutex::new(cursor),
             normalizer: GenericNormalizer::default(),
             rule_engine,
@@ -532,13 +545,18 @@ impl SentinelRuntime {
     }
 
     pub fn status(&self) -> SentinelStatus {
-        let cursor = self.inner.cursor.lock().unwrap_or_else(|e| e.into_inner());
+        // Leitura sem lock, de propósito: ver o estado não pode depender de o
+        // worker ter largado o cursor. Ver `next_lsn_publicado`.
+        let next_lsn = self
+            .inner
+            .next_lsn_publicado
+            .load(std::sync::atomic::Ordering::Acquire);
         let mut status = self.inner.metrics.snapshot(
             self.inner.config.enabled,
             self.inner.config.mode,
             self.inner.config.pipeline_version,
             self.inner.log.head(),
-            cursor.next_lsn,
+            next_lsn,
             self.inner.queue.snapshot(),
         );
         let breaker = self
@@ -1825,6 +1843,11 @@ fn process_until(inner: &RuntimeInner) -> Result<(), SentinelError> {
         // This is the commit point: all recoverable work for `lsn` completed.
         cursor.next_lsn = lsn.saturating_add(1);
         inner.cursor_store.commit(*cursor)?;
+        // Só DEPOIS de o commit ser durável: publicar antes daria a um
+        // observador uma posição que um crash desfaria.
+        inner
+            .next_lsn_publicado
+            .store(cursor.next_lsn, std::sync::atomic::Ordering::Release);
         inner
             .metrics
             .events_processed_total
