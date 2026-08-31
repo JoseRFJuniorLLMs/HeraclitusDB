@@ -634,3 +634,76 @@ mod testes_prepared {
         assert!(!PreparedQuery::new(&metric, &q).dist2(&mau).is_finite());
     }
 }
+#[cfg(test)]
+mod perfil_componentes {
+    use super::*;
+    use std::time::Instant;
+
+    /// Onde e que o tempo por candidato vai mesmo.
+    ///
+    /// # Porque este diagnostico ficou no ficheiro
+    ///
+    /// O item 4 da SPEC-otimizacao pede SIMD (AVX2/FMA) nas metricas e da-lhe
+    /// tres asteriscos de CPU. Implementei-o de duas formas e MEDI as duas,
+    /// com a geometria real (H32 x S8 x E8):
+    ///
+    /// - intrinsecas AVX2 por componente, com despacho por chamada:
+    ///   **1,6x MAIS LENTO** (2,3 ms/consulta contra 1,4 ms). Uma funcao
+    ///   `#[target_feature]` nao pode ser inlinada num chamador sem a feature,
+    ///   portanto cada componente virava uma chamada real por candidato — e
+    ///   para vectores de 32 e 8 elementos isso custa mais do que vectorizar
+    ///   poupa;
+    /// - a funcao INTEIRA marcada com AVX2, com os lacos a entrar por
+    ///   `inline(always)` e auto-vectorizacao: 1,2--1,5 ms contra 1,4--1,5 ms
+    ///   escalar. Empate dentro do ruido.
+    ///
+    /// Este teste diz porque: cerca de **dois tercos** do tempo por candidato
+    /// esta nas transcendentais (`acosh`, `acos`) e na aritmetica escalar a
+    /// volta, nao nos produtos internos. Mesmo um SIMD perfeito no terco
+    /// restante daria menos de 1,4x global.
+    ///
+    /// Conclusao, e a razao de nao haver `unsafe` neste crate: para ESTA
+    /// geometria o item 4 nao e o alvo. Os alvos sao os que evitam trabalho em
+    /// vez de o acelerar — SQ8 para gerar candidatos (item 13) e `ef`
+    /// adaptativo (item 12), que reduzem QUANTOS candidatos se avaliam.
+    ///
+    /// Correr com:
+    ///   cargo test -p heraclitus-manifold --lib perfil -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn onde_vai_o_tempo_por_candidato() {
+        let metric = ProductMetric::default();
+        let mk = |s: u64| {
+            let mut x = s.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut p = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; ((x % 2001) as f32 / 2000.0 - 0.5) * 0.8 };
+            ProductPoint {
+                hyp: (0..32).map(|_| p()).collect(),
+                sph: (0..8).map(|_| p()).collect(),
+                euc: (0..8).map(|_| p()).collect(),
+            }
+        };
+        let q = mk(1);
+        let pts: Vec<ProductPoint> = (0..20_000).map(|i| mk(100 + i)).collect();
+        let pq = PreparedQuery::new(&metric, &q);
+
+        let t = Instant::now();
+        let mut acc = 0.0f64;
+        for p in &pts { acc += pq.dist2(p); }
+        let total = t.elapsed();
+
+        // So os produtos internos, sem transcendentais.
+        let t2 = Instant::now();
+        let mut acc2 = 0.0f64;
+        for p in &pts {
+            acc2 += dist_euc2(&q.hyp, &p.hyp)
+                + dot_f32(&q.sph, &p.sph)
+                + dist_euc2(&q.euc, &p.euc);
+        }
+        let so_produtos = t2.elapsed();
+
+        println!("dist2 completa   : {:>10.3?}  ({acc:.3})", total);
+        println!("so os produtos   : {:>10.3?}  ({acc2:.3})", so_produtos);
+        println!("fraccao em transcendentais e resto: {:.0}%",
+            100.0 * (1.0 - so_produtos.as_secs_f64() / total.as_secs_f64()));
+    }
+}
