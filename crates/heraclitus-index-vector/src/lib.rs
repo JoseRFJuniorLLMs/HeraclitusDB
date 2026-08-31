@@ -8,7 +8,7 @@
 pub mod gate;
 
 use heraclitus_core::{Episode, EventId, HeraclitusError, Lsn, ProductPoint};
-use heraclitus_manifold::{ProductMetric, Signature};
+use heraclitus_manifold::{PreparedQuery, ProductMetric, Signature};
 use heraclitus_views::View;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -210,6 +210,11 @@ impl VectorIndex {
         self.metric.dist(&self.nodes[a as usize].point, b)
     }
 
+    /// Distância AO QUADRADO do nó `a` à consulta preparada.
+    fn dist2(&self, a: u32, q: &PreparedQuery) -> f64 {
+        q.dist2(&self.nodes[a as usize].point)
+    }
+
     fn random_level(&mut self) -> usize {
         let ml = 1.0 / (self.m as f64).ln();
         let r: f64 = self.rng.gen_range(f64::MIN_POSITIVE..1.0);
@@ -224,9 +229,14 @@ impl VectorIndex {
     /// filtered hits (or the reachable set is exhausted) instead of returning
     /// fewer than `k` after a post-hoc filter. `filter = None` is identical to
     /// the unfiltered behavior.
+    /// `query` chega já preparado: as constantes da curvatura e as normas da
+    /// consulta são calculadas UMA vez por busca, não uma vez por candidato.
+    /// A ordenação usa a distância ao QUADRADO — a raiz é monótona, portanto a
+    /// ordem é a mesma, e quem precisa do valor tira-a no fim sobre os `k`
+    /// resultados em vez de sobre todos os candidatos visitados.
     fn search_layer(
         &self,
-        query: &ProductPoint,
+        query: &PreparedQuery,
         entry: u32,
         level: usize,
         ef: usize,
@@ -238,7 +248,7 @@ impl VectorIndex {
         let passes = |id: u32| {
             !self.tombstones.contains(id) && filter.map(|f| f.contains(id)).unwrap_or(true)
         };
-        let d0 = self.dist(entry, query);
+        let d0 = self.dist2(entry, query);
         // `candidates` drives traversal over every reachable node; `results`
         // keeps only filter-passing nodes (the ones we may return).
         let mut candidates = BinaryHeap::from([Candidate {
@@ -270,7 +280,7 @@ impl VectorIndex {
                 [level.min(self.nodes[c.id as usize].neighbors.len() - 1)]
             {
                 if visitados.marcar(n) {
-                    let d = self.dist(n, query);
+                    let d = self.dist2(n, query);
                     let worst = results.peek().map(|r| r.0.dist).unwrap_or(f64::MIN);
                     // Keep exploring while we still need filtered hits, or while
                     // n could improve the current frontier.
@@ -309,13 +319,14 @@ impl VectorIndex {
         self.ids.push(event_id);
         self.lsns.push(lsn);
 
+        let pq = PreparedQuery::new(&self.metric, &point);
         let old_entry = self.entry;
         if let Some(mut ep) = old_entry {
             let top = self.nodes[ep as usize].level;
             // descend greedily above the new node's level
             for l in ((level + 1)..=top).rev() {
                 let best =
-                    self.search_layer(&point, ep, l.min(self.nodes[ep as usize].level), 1, None);
+                    self.search_layer(&pq, ep, l.min(self.nodes[ep as usize].level), 1, None);
                 // Com tombstones, a camada pode não devolver candidatos
                 // elegíveis: mantém o entry-point atual em vez de indexar [0].
                 if let Some(b) = best.first() {
@@ -324,7 +335,7 @@ impl VectorIndex {
             }
             // connect at each level from min(level, top) down to 0
             for l in (0..=level.min(top)).rev() {
-                let neighbors = self.search_layer(&point, ep, l, self.ef_construction, None);
+                let neighbors = self.search_layer(&pq, ep, l, self.ef_construction, None);
                 let selected: Vec<u32> = neighbors
                     .iter()
                     .filter(|c| c.id != id)
@@ -371,25 +382,30 @@ impl VectorIndex {
         let Some(mut ep) = self.entry else {
             return Vec::new();
         };
+        // UMA vez por busca, não uma vez por candidato.
+        let pq = PreparedQuery::new(&self.metric, query);
         let top = self.nodes[ep as usize].level;
         // Entry-point descent ignores the filter (we want the best entry into
         // level 0 regardless); the filter is pushed down only at level 0.
         for l in (1..=top).rev() {
-            let best = self.search_layer(query, ep, l, 1, None);
+            let best = self.search_layer(&pq, ep, l, 1, None);
             if let Some(b) = best.first() {
                 ep = b.id;
             }
         }
         let ef = ef.max(k);
         let candidates =
-            self.search_layer(query, ep, 0, ef.max(self.ef_construction.min(64)), filter);
+            self.search_layer(&pq, ep, 0, ef.max(self.ef_construction.min(64)), filter);
         candidates
             .into_iter()
             .take(k)
             .map(|c| VectorHit {
                 id: self.ids[c.id as usize],
                 lsn: self.lsns[c.id as usize],
-                dist: c.dist as f32,
+                // `c.dist` e a distancia AO QUADRADO — a travessia ordena por
+                // ela porque a raiz e monotona. A raiz e tirada aqui, sobre os
+                // `k` resultados, e nao sobre os milhares de candidatos.
+                dist: (c.dist.max(0.0)).sqrt() as f32,
             })
             .collect()
     }
@@ -939,8 +955,25 @@ mod medicao_hnsw {
     use super::*;
     use std::time::Instant;
 
-    fn pt3(hyp: Vec<f32>) -> ProductPoint {
-        ProductPoint { hyp, sph: vec![], euc: vec![] }
+    /// Geometria REALISTA: H32 x S8 x E8, as 48 dimensoes que o arranque do
+    /// servidor reporta. A primeira versao deste benchmark usava 2 dimensoes
+    /// hiperbolicas e as outras componentes vazias — media o custo de uma
+    /// forma que a producao nao tem, e por isso nao via o trabalho que a
+    /// consulta preparada existe para poupar (duas normas completas e as
+    /// constantes da curvatura, por candidato).
+    fn ponto_realista(semente: u64) -> ProductPoint {
+        let mut x = semente.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut proximo = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            ((x % 2001) as f32 / 2000.0 - 0.5) * 0.8
+        };
+        ProductPoint {
+            hyp: (0..32).map(|_| proximo()).collect(),
+            sph: (0..8).map(|_| proximo()).collect(),
+            euc: (0..8).map(|_| proximo()).collect(),
+        }
     }
 
     /// `#[ignore]`: mede, nao afirma. Um numero de milissegundos falharia na
@@ -953,11 +986,10 @@ mod medicao_hnsw {
         for n in [2_000usize, 10_000] {
             let mut idx = VectorIndex::new(ProductMetric::default());
             for i in 0..n {
-                let x = (i as f32) / (n as f32 * 1.2);
-                idx.insert(EventId::new(), i as u64, pt3(vec![x, 0.1, x * 0.5]));
+                idx.insert(EventId::new(), i as u64, ponto_realista(i as u64));
             }
             let consultas: Vec<ProductPoint> = (0..200)
-                .map(|q| pt3(vec![(q as f32) / 240.0, 0.1, 0.2]))
+                .map(|q| ponto_realista(1_000_000 + q as u64))
                 .collect();
 
             // Aquece: a primeira travessia paga o crescimento do scratch.
@@ -976,6 +1008,57 @@ mod medicao_hnsw {
                 dt,
                 dt / consultas.len() as u32
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod testes_prepared_query {
+    use super::*;
+
+    fn pt4(hyp: Vec<f32>) -> ProductPoint {
+        ProductPoint { hyp, sph: vec![], euc: vec![] }
+    }
+
+    /// A travessia passou a ordenar pela distancia AO QUADRADO. O campo
+    /// `VectorHit.dist` e publico e tem de continuar a ser a distancia REAL —
+    /// se a raiz se perdesse, a API mentia sem que nenhum teste de recall desse
+    /// por isso, porque a ORDEM ficaria na mesma.
+    #[test]
+    fn o_dist_devolvido_e_a_distancia_canonica_e_nao_o_quadrado() {
+        let metric = ProductMetric::default();
+        let mut idx = VectorIndex::new(metric.clone());
+        let mut pontos = Vec::new();
+        let mut ids = Vec::new();
+        for i in 0..300 {
+            let x = (i as f32) / 400.0;
+            let p = pt4(vec![x, 0.1, x * 0.3]);
+            let id = EventId::new();
+            ids.push(id);
+            pontos.push(p.clone());
+            idx.insert(id, i as u64, p);
+        }
+        let q = pt4(vec![0.37, 0.1, 0.11]);
+        let hits = idx.search(&q, 5, 64, None);
+        assert_eq!(hits.len(), 5);
+        for h in &hits {
+            let i = ids.iter().position(|x| *x == h.id).expect("id conhecido");
+            let canonica = metric.dist(&pontos[i], &q) as f32;
+            assert!(
+                (h.dist - canonica).abs() < 1e-4,
+                "dist devolvida {} vs canonica {canonica}",
+                h.dist
+            );
+            // E a prova de que nao e o quadrado: para distancias < 1 o
+            // quadrado seria MENOR, para > 1 seria MAIOR.
+            assert!(
+                (h.dist - canonica * canonica).abs() > 1e-6 || canonica < 1e-3,
+                "o valor devolvido coincide com o quadrado — a raiz perdeu-se"
+            );
+        }
+        // E vem ordenado.
+        for par in hits.windows(2) {
+            assert!(par[0].dist <= par[1].dist);
         }
     }
 }

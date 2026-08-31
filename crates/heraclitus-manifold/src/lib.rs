@@ -195,6 +195,151 @@ impl ProductMetric {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// SPEC-otimizacao itens 1--3: consulta preparada, normas pre-calculadas, e
+// ranking por distancia AO QUADRADO.
+// ---------------------------------------------------------------------------
+
+/// Uma consulta com tudo o que depende SÓ dela já calculado.
+///
+/// # O que se repetia por candidato
+///
+/// `ProductMetric::dist` é chamada uma vez por candidato visitado — centenas ou
+/// milhares por busca — e cada chamada refazia, para a MESMA consulta:
+///
+/// - `max_norm = (1 - BALL_EPS) / sqrt(c)` e `1/sqrt(c)`: constantes da
+///   curvatura, nada a ver com o candidato;
+/// - `1/sqrt(k2)`: idem, na esfera;
+/// - `norm(consulta)` na componente hiperbólica **e** na esférica: duas
+///   passagens completas pelo vector mais duas raízes, idênticas em todas as
+///   chamadas;
+/// - a raiz euclidiana, imediatamente elevada ao quadrado a seguir;
+/// - a raiz final do produto, que não muda a ORDEM de nada.
+///
+/// Aqui isso é feito uma vez. O que sobra por candidato é o trabalho que
+/// depende mesmo do candidato.
+///
+/// # O que NÃO muda
+///
+/// [`ProductMetric::dist`] continua a ser a matemática canónica e não foi
+/// tocada. [`PreparedQuery::dist2`] devolve o QUADRADO da mesma distância, e
+/// como a raiz é monótona nos não-negativos a ordem é idêntica — quem precisa
+/// do valor tira a raiz no fim, sobre os `k` resultados em vez de sobre todos
+/// os candidatos. Há um teste que confronta as duas sobre milhares de pontos.
+#[derive(Debug, Clone)]
+pub struct PreparedQuery {
+    hyp: Vec<f32>,
+    sph: Vec<f32>,
+    euc: Vec<f32>,
+    /// Curvatura hiperbólica positiva (`c = -k1`).
+    c: f64,
+    max_norm_h: f64,
+    inv_sqrt_c: f64,
+    /// Escala de recorte da consulta.
+    escala_h: f64,
+    /// `1 - c·‖q‖²` já com a norma escalada: o factor da consulta no
+    /// denominador, que é a única forma em que a norma é usada.
+    denom_h: f64,
+    /// Norma esférica da consulta; zero significa "componente degenerada".
+    norma_sph: f64,
+    inv_sqrt_k2: f64,
+    pesos: [f64; 3],
+}
+
+impl PreparedQuery {
+    /// Prepara `q` para ser comparada muitas vezes sob `metric`.
+    pub fn new(metric: &ProductMetric, q: &ProductPoint) -> Self {
+        let c = -metric.sig.k1;
+        let max_norm_h = (1.0 - BALL_EPS) / c.sqrt();
+        let bruto = norm_f32(&q.hyp);
+        let escala_h = if bruto > max_norm_h {
+            max_norm_h / bruto
+        } else {
+            1.0
+        };
+        let norma_h = escala_h * bruto;
+        Self {
+            hyp: q.hyp.clone(),
+            sph: q.sph.clone(),
+            euc: q.euc.clone(),
+            c,
+            max_norm_h,
+            inv_sqrt_c: 1.0 / c.sqrt(),
+            escala_h,
+            denom_h: 1.0 - c * norma_h * norma_h,
+            norma_sph: norm_f32(&q.sph),
+            inv_sqrt_k2: 1.0 / metric.sig.k2.sqrt(),
+            pesos: metric.sig.weights,
+        }
+    }
+
+    /// Distância do produto **ao quadrado** entre a consulta e `b`.
+    ///
+    /// Mesma ordem que [`ProductMetric::dist`], sem a raiz final e sem
+    /// recalcular nada que dependa só da consulta.
+    pub fn dist2(&self, b: &ProductPoint) -> f64 {
+        let dh = self.dist_hyp(&b.hyp);
+        if !dh.is_finite() {
+            return f64::INFINITY;
+        }
+        let ds = self.dist_sph(&b.sph);
+        let de2 = dist_euc2(&self.euc, &b.euc);
+        let [w1, w2, w3] = self.pesos;
+        w1 * dh * dh + w2 * ds * ds + w3 * de2
+    }
+
+    fn dist_hyp(&self, v: &[f32]) -> f64 {
+        if self.hyp.is_empty() {
+            return 0.0;
+        }
+        let nv_raw = norm_f32(v);
+        let sv = if nv_raw > self.max_norm_h {
+            self.max_norm_h / nv_raw
+        } else {
+            1.0
+        };
+        let nv = sv * nv_raw;
+        let mut diff2 = 0.0f64;
+        for (x, y) in self.hyp.iter().zip(v) {
+            let t = self.escala_h * (*x as f64) - sv * (*y as f64);
+            diff2 += t * t;
+        }
+        let denom = self.denom_h * (1.0 - self.c * nv * nv);
+        let arg = 1.0 + (2.0 * self.c * diff2 / denom);
+        if !arg.is_finite() {
+            return f64::INFINITY;
+        }
+        self.inv_sqrt_c * arg.max(1.0).acosh()
+    }
+
+    fn dist_sph(&self, v: &[f32]) -> f64 {
+        if self.sph.is_empty() {
+            return 0.0;
+        }
+        let nv = norm_f32(v);
+        if self.norma_sph == 0.0 || nv == 0.0 {
+            return 0.0;
+        }
+        let cos = (dot_f32(&self.sph, v) / (self.norma_sph * nv)).clamp(-1.0, 1.0);
+        cos.acos() * self.inv_sqrt_k2
+    }
+}
+
+/// Distância euclidiana **ao quadrado** — a raiz de [`dist_euc`] só existia
+/// para ser desfeita a seguir pelo quadrado do produto.
+pub fn dist_euc2(u: &[f32], v: &[f32]) -> f64 {
+    if u.is_empty() {
+        return 0.0;
+    }
+    let mut s = 0.0f64;
+    for (x, y) in u.iter().zip(v) {
+        let t = *x as f64 - *y as f64;
+        s += t * t;
+    }
+    s
+}
+
 // ---------- hyperbolic operations (curvature -1 convention helpers) ----------
 
 /// Möbius addition on the Poincaré ball (c = 1).
@@ -392,5 +537,100 @@ mod tests {
             let n = norm(&to64(&s));
             prop_assert!((n - 1.0).abs() < SPHERE_EPS * 10.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod testes_prepared {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn proximo(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn f32(&mut self, amp: f32) -> f32 {
+            let u = (self.proximo() % 20_001) as f32 / 10_000.0 - 1.0;
+            u * amp
+        }
+    }
+
+    fn ponto(rng: &mut Rng, d: usize, amp: f32) -> ProductPoint {
+        ProductPoint {
+            hyp: (0..d).map(|_| rng.f32(amp)).collect(),
+            sph: (0..d).map(|_| rng.f32(1.0)).collect(),
+            euc: (0..d).map(|_| rng.f32(5.0)).collect(),
+        }
+    }
+
+    /// A prova de que a consulta preparada nao mudou a matematica.
+    #[test]
+    fn a_consulta_preparada_concorda_com_a_metrica_canonica() {
+        let mut rng = Rng(0x1234_5678_9abc_def0);
+        let metric = ProductMetric::default();
+        for caso in 0..2_000 {
+            let d = 1 + (rng.proximo() % 8) as usize;
+            let amp = match caso % 4 {
+                0 => 0.1,
+                1 => 0.6,
+                2 => 0.99,
+                _ => 3.0,
+            };
+            let q = ponto(&mut rng, d, amp);
+            let b = ponto(&mut rng, d, amp);
+            let canonica = metric.dist(&q, &b);
+            let preparada = PreparedQuery::new(&metric, &q).dist2(&b);
+            if !canonica.is_finite() {
+                assert!(!preparada.is_finite(), "caso {caso}");
+                continue;
+            }
+            let esperado = canonica * canonica;
+            let tol = 1e-9 * esperado.abs().max(1.0);
+            assert!(
+                (preparada - esperado).abs() <= tol,
+                "caso {caso} (d={d}, amp={amp}): {preparada} vs {esperado}"
+            );
+        }
+    }
+
+    /// O que interessa para o HNSW: a ORDEM.
+    #[test]
+    fn a_ordem_dos_candidatos_e_a_mesma() {
+        let mut rng = Rng(0xfeed_beef);
+        let metric = ProductMetric::default();
+        let q = ponto(&mut rng, 6, 0.5);
+        let cands: Vec<ProductPoint> = (0..200).map(|_| ponto(&mut rng, 6, 0.5)).collect();
+        let mut a: Vec<usize> = (0..cands.len()).collect();
+        a.sort_by(|&x, &y| metric.dist(&q, &cands[x]).total_cmp(&metric.dist(&q, &cands[y])));
+        let pq = PreparedQuery::new(&metric, &q);
+        let mut b: Vec<usize> = (0..cands.len()).collect();
+        b.sort_by(|&x, &y| pq.dist2(&cands[x]).total_cmp(&pq.dist2(&cands[y])));
+        assert_eq!(a, b);
+    }
+
+    /// Componentes vazias sao uma configuracao legitima.
+    #[test]
+    fn componentes_vazias_comportam_se_como_na_canonica() {
+        let metric = ProductMetric::default();
+        let so_euc = |v: Vec<f32>| ProductPoint { hyp: vec![], sph: vec![], euc: v };
+        let q = so_euc(vec![1.0, 2.0]);
+        let b = so_euc(vec![4.0, 6.0]);
+        let c = metric.dist(&q, &b);
+        let p = PreparedQuery::new(&metric, &q).dist2(&b);
+        assert!((p - c * c).abs() < 1e-9);
+        let vazio = ProductPoint { hyp: vec![], sph: vec![], euc: vec![] };
+        assert_eq!(PreparedQuery::new(&metric, &vazio).dist2(&vazio), 0.0);
+    }
+
+    /// Um NaN continua infinitamente distante, e nao vizinho universal.
+    #[test]
+    fn um_nan_continua_infinitamente_distante() {
+        let metric = ProductMetric::default();
+        let q = ProductPoint { hyp: vec![0.1, 0.2], sph: vec![], euc: vec![] };
+        let mau = ProductPoint { hyp: vec![f32::NAN, 0.2], sph: vec![], euc: vec![] };
+        assert!(!PreparedQuery::new(&metric, &q).dist2(&mau).is_finite());
     }
 }
