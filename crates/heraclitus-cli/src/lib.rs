@@ -1679,3 +1679,227 @@ mod tests {
             .contains("já existe"));
     }
 }
+
+/// Lista as âncoras instaladas com as impressões digitais, para o operador as
+/// conferir com as publicadas pelo ITI **fora de banda** (SPEC-0046 §11).
+///
+/// Sem isto não havia forma nenhuma de ver o que estava instalado. O trust
+/// store é o ponto onde toda a confiança do sistema assenta, e a única maneira
+/// de saber se lá estava a raiz certa era ler ficheiros DER à mão. Um operador
+/// que não consegue inspeccionar a raiz de confiança não consegue afirmar que
+/// ela está certa — e é essa afirmação que a conformidade exige dele.
+///
+/// Os ficheiros RECUSADOS aparecem com o motivo. O motivo já era calculado e
+/// não era mostrado a ninguém: quem pusesse um certificado intermédio na pasta
+/// via-o desaparecer sem explicação.
+pub fn trust_store_listar(dir: &std::path::Path) -> Result<String, String> {
+    use heraclitus_compliance::trust_store::TrustStore;
+    let (store, relatorio) =
+        TrustStore::load_dir(dir).map_err(|e| format!("trust store `{}`: {e}", dir.display()))?;
+
+    let mut out = format!(
+        "trust store: {}\n  {} ficheiro(s) vistos · {} âncora(s) carregada(s) · {} recusado(s)\n\n",
+        dir.display(),
+        relatorio.files_seen,
+        relatorio.anchors_loaded,
+        relatorio.rejected.len()
+    );
+    if store.is_empty() {
+        out += "NENHUMA ÂNCORA UTILIZÁVEL. Nada será validado contra autoridade nenhuma.\n";
+    }
+    for a in store.anchors() {
+        out += &format!(
+            "  SHA-256 {}\n    sujeito: {}\n",
+            a.fingerprint_hex(),
+            a.subject_display()
+        );
+    }
+    if !relatorio.rejected.is_empty() {
+        out += "\nRECUSADOS:\n";
+        for (ficheiro, motivo) in &relatorio.rejected {
+            out += &format!("  {ficheiro}\n    {motivo}\n");
+        }
+    }
+    out += "\nConfira cada impressão digital com a publicada pelo ITI por um canal \
+            independente desta máquina. Uma âncora instalada é uma afirmação de confiança \
+            que só o órgão pode fazer.\n";
+    Ok(out)
+}
+
+/// Verifica um `.tst` avulso — tipicamente um emitido por uma ACT credenciada —
+/// contra as âncoras instaladas, e relata o que encontrou.
+///
+/// É o caminho que faltava para provar interoperabilidade. Até aqui, a única
+/// forma de saber se este verificador aceita um token real era pôr o sistema a
+/// ancorar contra a ACT em produção — o que ninguém faz para testar.
+///
+/// `imprint_hex` é o que se espera ter sido carimbado. Sem ele, o token é
+/// verificado em tudo o resto e o relatório **di-lo** em vez de calar: um
+/// carimbo válido sobre um conteúdo desconhecido não prova nada sobre nenhum
+/// documento em particular, e um relatório que o omitisse seria pior do que
+/// nenhum.
+pub fn verify_token(
+    token_path: &std::path::Path,
+    trust_store_dir: &std::path::Path,
+    crl_dir: Option<&std::path::Path>,
+    imprint_hex: Option<&str>,
+) -> Result<String, String> {
+    use heraclitus_compliance::icp::{IcpBrasilTimestampVerifier, TimestampValidationPolicy};
+    use heraclitus_compliance::trust_store::TrustStore;
+
+    let token = std::fs::read(token_path)
+        .map_err(|e| format!("token `{}`: {e}", token_path.display()))?;
+    let (store, relatorio) = TrustStore::load_dir(trust_store_dir)
+        .map_err(|e| format!("trust store `{}`: {e}", trust_store_dir.display()))?;
+    if store.is_empty() {
+        return Err(format!(
+            "trust store `{}` sem âncoras utilizáveis ({} ficheiro(s) vistos): sem âncoras não \
+             há nada contra que validar",
+            trust_store_dir.display(),
+            relatorio.files_seen
+        ));
+    }
+    let mut v = IcpBrasilTimestampVerifier::new(store, TimestampValidationPolicy::default());
+    let mut revogacao_pedida = false;
+    if let Some(cd) = crl_dir {
+        let (crls, rel) = heraclitus_compliance::crl::CrlStore::load_dir(cd)
+            .map_err(|e| format!("CRLs `{}`: {e}", cd.display()))?;
+        if crls.is_empty() {
+            return Err(format!(
+                "pasta de CRLs `{}` sem CRLs utilizáveis ({} ficheiro(s) vistos)",
+                cd.display(),
+                rel.files_seen
+            ));
+        }
+        revogacao_pedida = true;
+        v = v.with_crls(crls, heraclitus_compliance::crl::CrlPolicy::default());
+    }
+
+    let agora = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let (verificado, imprint_no_token) = match imprint_hex {
+        Some(hex) => {
+            let bytes = hex_para_bytes(hex)
+                .ok_or_else(|| format!("--imprint `{hex}` não é hexadecimal de 32 bytes"))?;
+            let arr: [u8; 32] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| format!("--imprint tem {} bytes, esperados 32", bytes.len()))?;
+            let r = v
+                .verify(&token, &arr, None, agora)
+                .map_err(|e| format!("RECUSADO: {e}"))?;
+            (r, bytes)
+        }
+        None => v
+            .inspect(&token, agora)
+            .map_err(|e| format!("RECUSADO: {e}"))?,
+    };
+
+    let mut out = format!("ACEITE: {}\n", token_path.display());
+    out += &format!("  autoridade   : {}\n", verificado.signer_subject);
+    out += &format!("  genTime      : {} ms (época Unix)\n", verificado.gen_unix_ms);
+    out += &format!("  política     : {}\n", verificado.policy_oid);
+    out += &format!("  série        : {}\n", verificado.serial_hex);
+    out += &format!(
+        "  âncora       : {} (cadeia de {} certificado(s) até ela)\n",
+        verificado.anchor_fingerprint_hex, verificado.chain_len
+    );
+    if let Some(a) = verificado.accuracy_secs {
+        out += &format!("  precisão     : ±{a} s\n");
+    }
+    out += &format!("  imprint      : {}\n", bytes_para_hex(&imprint_no_token));
+
+    out += "\nO QUE ESTE RESULTADO NÃO DIZ:\n";
+    if imprint_hex.is_none() {
+        out += "  · Não foi passado --imprint: o carimbo NÃO foi ligado a nenhum conteúdo. \
+                Prova que a cadeia e a assinatura conferem, e mais nada.\n";
+    }
+    if !revogacao_pedida {
+        out += "  · Revogação NÃO consultada (sem --crl-dir): um certificado revogado dentro \
+                da validade passaria.\n";
+    } else if !verificado.revocation_checked {
+        out += "  · Revogação declarada como não consultada pelo verificador.\n";
+    } else {
+        out += &format!(
+            "  · Revogação consultada; a informação é boa até {} ms.\n",
+            verificado
+                .revocation_valid_until_ms
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "(sem nextUpdate)".into())
+        );
+    }
+    Ok(out)
+}
+
+fn hex_para_bytes(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+fn bytes_para_hex(b: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(b.len() * 2);
+    for x in b {
+        let _ = write!(s, "{x:02x}");
+    }
+    s
+}
+
+#[cfg(test)]
+mod testes_operador {
+    use super::*;
+
+    /// Um ficheiro que nao e um certificado tem de aparecer no relatorio COM o
+    /// motivo. O motivo ja era calculado e nao era mostrado a ninguem: quem
+    /// pusesse um intermedio na pasta via-o desaparecer sem explicacao.
+    #[test]
+    fn o_relatorio_do_trust_store_mostra_o_motivo_de_cada_recusa() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lixo.pem"), b"nao sou um certificado").unwrap();
+        let out = trust_store_listar(dir.path()).unwrap();
+        assert!(out.contains("1 ficheiro(s) vistos"), "{out}");
+        assert!(out.contains("RECUSADOS"), "{out}");
+        assert!(out.contains("lixo.pem"), "{out}");
+        assert!(out.contains("NENHUMA ÂNCORA UTILIZÁVEL"), "{out}");
+    }
+
+    /// Uma pasta vazia nao e um erro — e um estado, e tem de se ver que o e.
+    #[test]
+    fn uma_pasta_vazia_diz_que_nada_sera_validado() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = trust_store_listar(dir.path()).unwrap();
+        assert!(out.contains("0 âncora(s)"), "{out}");
+        assert!(out.contains("Nada será validado"), "{out}");
+    }
+
+    /// Verificar um token contra um trust store vazio nao pode devolver "ok".
+    #[test]
+    fn verificar_um_token_sem_ancoras_e_recusado_antes_de_o_ler() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = dir.path().join("t.tst");
+        std::fs::write(&tok, b"qualquer coisa").unwrap();
+        let vazio = tempfile::tempdir().unwrap();
+        let erro = verify_token(&tok, vazio.path(), None, None).unwrap_err();
+        assert!(erro.contains("sem âncoras utilizáveis"), "{erro}");
+    }
+
+    /// Um `--imprint` malformado e apanhado antes de qualquer criptografia.
+    #[test]
+    fn um_imprint_malformado_e_recusado_com_a_razao() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("r.pem"), b"-----BEGIN CERTIFICATE-----").unwrap();
+        let tok = dir.path().join("t.tst");
+        std::fs::write(&tok, b"x").unwrap();
+        let erro = verify_token(&tok, dir.path(), None, Some("zz")).unwrap_err();
+        assert!(erro.contains("âncoras"), "{erro}");
+    }
+}

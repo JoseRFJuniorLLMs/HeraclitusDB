@@ -2345,7 +2345,10 @@ mod tests {
     }
 
     fn wait_for_catch_up(runtime: &SentinelRuntime, log: &AnyLog) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // 30 s e nao 5, pela mesma razao documentada em
+        // `l2_behavioral_adapter_emits_replayable_signal_after_shadow_promotion`:
+        // o prazo mede carga da maquina, que o teste nao controla.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while runtime.cursor().next_lsn < log.head() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -2792,7 +2795,10 @@ mod tests {
             EventKind::Observation,
             br#"{"source":"auditd","category":"authentication","activity":"login","outcome":"failure","user":"alice"}"#.to_vec(),
         )).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // 30 s e nao 5, pela mesma razao documentada em
+        // `l2_behavioral_adapter_emits_replayable_signal_after_shadow_promotion`:
+        // o prazo mede carga da maquina, que o teste nao controla.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while runtime.status().events_normalized_total < 1 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -2856,7 +2862,10 @@ detection:
             br#"{"source":"auditd","EventID":4625}"#.to_vec(),
         ))
         .unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // 30 s e nao 5, pela mesma razao documentada em
+        // `l2_behavioral_adapter_emits_replayable_signal_after_shadow_promotion`:
+        // o prazo mede carga da maquina, que o teste nao controla.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while runtime.status().signals_emitted_total < 1 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -2957,11 +2966,24 @@ detection:
             ))
             .unwrap();
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // 30 s, e nao 5: a afirmacao que interessa e "o sinal E emitido", nao
+        // "em menos de 5 s". Este runtime tem UM worker, e num
+        // `cargo test --workspace` dezenas de binarios disputam os mesmos
+        // nucleos — o worker pode ficar sem processador muito para la de 5 s
+        // sem que nada esteja errado com o pipeline. Observado a falhar 3 vezes
+        // e a passar 3 vezes com o mesmo codigo em 2026-08-31.
+        //
+        // Alargar o prazo NAO enfraquece o teste: se o pipeline estivesse
+        // partido, nenhum prazo o salvaria. O que se remove e uma asseveracao
+        // sobre carga da maquina, que o teste nao controla e nao devia afirmar.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while runtime.status().signals_emitted_total < 1 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(runtime.status().signals_emitted_total >= 1);
+        assert!(
+            runtime.status().signals_emitted_total >= 1,
+            "o pipeline L2 nao emitiu sinal nenhum em 30 s"
+        );
         assert!(log.scan(0, log.head()).unwrap().iter().any(|(_, episode)| {
             matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecuritySignal")
                 && episode

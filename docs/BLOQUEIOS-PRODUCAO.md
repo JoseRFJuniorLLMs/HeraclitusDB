@@ -1,6 +1,6 @@
 # Bloqueios de produção — SPEC-0046
 
-Estado em **2026-08-30**. Este documento existe para responder a uma pergunta
+Estado em **2026-08-31**. Este documento existe para responder a uma pergunta
 só: *o que impede `production_mode = true` de arrancar, e de quem é cada
 bloqueio*.
 
@@ -157,9 +157,73 @@ código; fica registado por ter estado na lista.
 
 ---
 
+## Ronda de 2026-08-31 — levantamento exaustivo e o que ele apanhou
+
+Cinco auditores independentes contra a RFC 5280 §6.1 e a RFC 3161. **50
+achados crus.** Ressalva sobre o método, porque muda como se lê o número: a
+fase de refutação adversarial morreu no limite de sessão (37 dos 44 agentes),
+portanto só 2 achados foram testados por terceiros. Os restantes verifiquei
+eu, contra o código. O `refutados: 37` que o workflow reportou é aritmética
+enganadora — esses agentes **erraram**, não refutaram.
+
+### O bloqueio total, confirmado adversarialmente
+
+Só `sha256WithRSAEncryption` era aceite. A DOC-ICP-01.01 impõe RSA-4096 com
+**SHA-512** à AC Raiz: numa hierarquia real `Raiz → AC → ACT`, o elo `Raiz→AC`
+caía no ramo de recusa. **Um carimbo legítimo de uma ACT credenciada era
+recusado** — e com a mensagem errada, porque o erro do elo superior é engolido
+pelo `.is_ok()` da procura de âncora e reaparece como *"cadeia não chega a
+nenhuma âncora configurada"*. Quem lesse isso iria mexer na pasta certa pela
+razão errada.
+
+Corrigido em `algoritmos.rs`: RSA PKCS#1v1.5 e RSASSA-PSS com SHA-256/384/512,
+ECDSA P-256 com os três digests. Mais um piso de tamanho de chave — a caixa
+`rsa` impõe um máximo e **nenhum mínimo**, e um módulo de 512 bits era aceite.
+
+### As restrições eram ignoradas, não "recusadas"
+
+Este documento dizia que a cadeia *"recusa em vez de adivinhar"*. Era verdade
+para a **construção** do caminho e falso para as **restrições**. `nameConstraints`,
+`pathLenConstraint` e `keyUsage.keyCertSign` eram lidos por ninguém; extensões
+críticas desconhecidas eram ignoradas (§6.1.4(f) obriga a recusar); extensões
+**repetidas** eram aceites (§4.2 proíbe — com duas cópias é a ordem, não a
+norma, que decide qual vale). Tudo em `constraints.rs`.
+
+### Sete correcções nas CRLs, três de segurança
+
+Só a **primeira** CRL utilizável era consultada — o ficheiro que o `read_dir`
+devolvesse primeiro era a política de revogação do órgão. `cRLSign` não era
+exigido a quem assina. Delta CRLs passavam como completas. `issuingDistributionPoint`
+ignorado. Sem `nextUpdate` a CRL escapava à frescura por completo. O `reasonCode`
+era lido pelo último octeto sem confirmar a etiqueta. E a janela de validade
+era calculada e deitada fora — chega agora ao resultado.
+
+### O `genTime` com fracção de segundo
+
+A RFC 3161 §2.4.2 permite-a **explicitamente**, e o `GeneralizedTime` do `der`
+é DER-estrito e recusa-a. Um token de uma ACT que declarasse
+`20260830143012.500Z` **nem chegava a descodificar**, e o erro falava de ASN.1
+malformado. Novo tipo `GenTime`, tolerante e que preserva os milissegundos.
+
+No mesmo bloco: o `digestAlgorithm` do `SignerInfo` não era lido e o
+`messageDigest` era sempre comparado em SHA-256 (um token com `signedAttrs`
+sobre SHA-512 falhava sempre); e `contentType`/`messageDigest` com dois valores
+passavam, porque só o primeiro era examinado.
+
+---
+
 ## Por resolver — e nenhum destes se resolve com código
 
 ### A. As âncoras ICP-Brasil reais não estão instaladas
+
+> **O que passou a existir para tornar este passo seguro:**
+> `heraclitus trust-store <dir>` lista as âncoras instaladas com a impressão
+> digital SHA-256 de cada uma, e mostra o **motivo** de cada ficheiro recusado
+> — motivo que já era calculado e não era mostrado a ninguém. Sem isto, a única
+> forma de saber o que estava na raiz de confiança era ler DER à mão, e um
+> operador que não consegue inspeccionar a raiz de confiança não consegue
+> afirmar que ela está certa. Essa afirmação é o que a conformidade lhe exige.
+
 
 O trust store está vazio nesta máquina. **Só o órgão pode povoá-lo**: as raízes
 têm de vir do canal oficial do ITI, com a impressão digital conferida fora de
@@ -170,6 +234,19 @@ Enquanto estiver vazio, `production_mode = true` **não arranca**, por desenho.
 
 ### B. Interoperabilidade com uma ACT credenciada não está provada
 
+> **O que passou a existir:** `heraclitus verify-token <ficheiro.tst>
+> --trust-store <dir> [--crl-dir <dir>] [--imprint <hex>]` pega num `.tst`
+> emitido por uma ACT e diz se este verificador o aceita — sem pôr o sistema a
+> ancorar em produção, que era a única forma de o testar. Sem `--imprint` o
+> relatório **diz** que o carimbo não foi ligado a conteúdo nenhum, em vez de
+> calar; um carimbo válido sobre um conteúdo desconhecido não prova nada sobre
+> nenhum documento.
+>
+> A ronda de 2026-08-31 fechou a maior parte do que faria um token real
+> falhar (SHA-384/512, PSS, fracção de segundo, `digestAlgorithm`). O que
+> falta é o token.
+
+
 Os testes usam uma PKI sintética com a mesma estrutura. Um `.tst` emitido por
 uma ACT homologada é evidência de laboratório e entra pela SPEC-0049. Até lá, o
 que está provado é que o verificador aceita o que deve e recusa o que deve
@@ -179,11 +256,18 @@ Riscos concretos que só um token real expõe: `SHA256withRSA` com parâmetros q
 a PKI de teste não gera, cadeias com intermédios a mais, `signedAttrs` com
 atributos opcionais que o parser não espera.
 
-### C. Sem `nameConstraints` nem `policyMapping`
+### C. Sem `policyMapping` nem `policyConstraints`
 
-A cadeia é por correspondência exacta de nomes em DER com `basicConstraints`.
-Chega para a topologia raiz → AC → ACT da ICP-Brasil. Para uma malha com
-cross-certificados não chega — e **recusa em vez de adivinhar**.
+`nameConstraints` **passou a ser imposto** (ver acima); esta entrada dizia que
+não era preciso e estava errada. O que continua por fazer é o processamento de
+políticas de certificado (§6.1.2/§6.1.4 (a)-(e)): `certificatePolicies`,
+`policyMappings` e `policyConstraints` não são interpretados. Um
+`certificatePolicies` marcado **crítico** faz agora recusar, o que é o
+comportamento seguro, com escotilha por OID declarada.
+
+A construção do caminho continua sem backtracking: com dois certificados do
+mesmo emissor no token (rollover de chave), escolhe-se o primeiro e desiste-se
+se ele não servir. Recusa em vez de adivinhar, mas recusa de mais.
 
 ### D. Atestações externas (SPEC-0049)
 

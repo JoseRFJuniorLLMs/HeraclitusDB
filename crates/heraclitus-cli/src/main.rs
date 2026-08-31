@@ -151,6 +151,29 @@ enum Cmd {
         #[arg(long, default_value = "ACT-dev")]
         policy: String,
     },
+    /// Lista as ancoras instaladas com as impressoes digitais, para as conferir
+    /// com as publicadas pelo ITI fora de banda (SPEC-0046 §11).
+    TrustStore {
+        /// Pasta com as ancoras (PEM/DER).
+        dir: PathBuf,
+    },
+    /// Verifica um `.tst` avulso emitido por uma ACT contra as ancoras
+    /// instaladas. E o caminho para provar interoperabilidade sem por o
+    /// sistema a ancorar em producao.
+    VerifyToken {
+        /// Ficheiro com o TimeStampToken em DER.
+        token: PathBuf,
+        /// Pasta com as ancoras de confianca do orgao.
+        #[arg(long)]
+        trust_store: PathBuf,
+        /// Pasta com as CRLs. Sem ela a revogacao NAO e consultada.
+        #[arg(long)]
+        crl_dir: Option<PathBuf>,
+        /// O SHA-256 (hex) do que se espera ter sido carimbado. Sem ele, o
+        /// carimbo NAO e ligado a nenhum conteudo e o relatorio di-lo.
+        #[arg(long)]
+        imprint: Option<String>,
+    },
     /// Re-verify receipts: commitment integrity plus available token validation.
     VerifyReceipts {
         /// Pasta com as âncoras de confiança (PEM/DER) do órgão. Sem ela a
@@ -259,6 +282,18 @@ fn main() {
             let rdir = receipts_dir_for(&dir, receipts);
             heraclitus_cli::anchor(&dir, &rdir, tsa_url, policy, trust_store.as_deref())
         }
+        Cmd::TrustStore { dir } => heraclitus_cli::trust_store_listar(&dir),
+        Cmd::VerifyToken {
+            token,
+            trust_store,
+            crl_dir,
+            imprint,
+        } => heraclitus_cli::verify_token(
+            &token,
+            &trust_store,
+            crl_dir.as_deref(),
+            imprint.as_deref(),
+        ),
         Cmd::VerifyReceipts {
             dir,
             receipts,

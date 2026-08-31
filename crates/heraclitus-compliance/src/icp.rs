@@ -54,13 +54,13 @@
 use std::time::Duration;
 
 use const_oid::ObjectIdentifier;
-use der::asn1::{GeneralizedTime, Int, OctetString, SetOfVec};
+use der::asn1::{Int, OctetString, SetOfVec};
 use der::{Any, Decode, Encode, Sequence};
 use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage};
 use x509_cert::time::Time;
 use x509_cert::Certificate;
 
-use crate::trust_store::{sha256, TrustStore};
+use crate::trust_store::TrustStore;
 use crate::CompError;
 
 // ---------------------------------------------------------------------------
@@ -110,6 +110,157 @@ pub struct Accuracy {
     pub micros: Option<u16>,
 }
 
+/// `GeneralizedTime` tolerante a fracções de segundo, para o `genTime`.
+///
+/// A RFC 3161 §2.4.2 permite-as **explicitamente**: *"the ASN.1 GeneralizedTime
+/// syntax can include fraction-of-second details"*, e é assim que uma ACT
+/// declara precisão de milissegundos. O `GeneralizedTime` da caixa `der` é
+/// DER-estrito — o DER proíbe a fracção — e recusa-a.
+///
+/// O resultado era o pior possível: um token de uma ACT credenciada que
+/// declarasse `20260830143012.500Z` **nem chegava a descodificar**, e o erro
+/// falava de ASN.1 malformado. O operador procuraria um token corrompido que
+/// não existe.
+///
+/// Guarda-se a fracção em milissegundos porque é ela que o `genTime` significa;
+/// descartá-la truncaria a hora que a autoridade afirmou, que é precisamente o
+/// facto que o carimbo existe para registar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenTime {
+    pub unix_ms: u64,
+    /// Os octetos originais, para uma recodificação fiel.
+    bruto: Vec<u8>,
+}
+
+impl GenTime {
+    pub const fn unix_ms(&self) -> u64 {
+        self.unix_ms
+    }
+
+    /// Constrói a partir de segundos Unix, com uma fracção opcional em
+    /// milissegundos. `milis = None` emite a forma sem fracção.
+    pub fn nova(unix_secs: u64, milis: Option<u16>) -> Result<Self, CompError> {
+        let dias = (unix_secs / 86_400) as i64;
+        let resto = unix_secs % 86_400;
+        // civil_from_days (Howard Hinnant).
+        let z = dias + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let ano = if m <= 2 { y + 1 } else { y };
+        let texto = match milis {
+            Some(f) => format!(
+                "{ano:04}{m:02}{d:02}{:02}{:02}{:02}.{f:03}Z",
+                resto / 3_600,
+                (resto % 3_600) / 60,
+                resto % 60
+            ),
+            None => format!(
+                "{ano:04}{m:02}{d:02}{:02}{:02}{:02}Z",
+                resto / 3_600,
+                (resto % 3_600) / 60,
+                resto % 60
+            ),
+        };
+        let unix_ms = analisar_generalized(&texto).ok_or_else(|| {
+            verify_err(format!("genTime construído inválido: `{texto}`"))
+        })?;
+        Ok(Self {
+            unix_ms,
+            bruto: texto.into_bytes(),
+        })
+    }
+}
+
+impl der::FixedTag for GenTime {
+    const TAG: der::Tag = der::Tag::GeneralizedTime;
+}
+
+impl<'a> der::DecodeValue<'a> for GenTime {
+    fn decode_value<R: der::Reader<'a>>(
+        reader: &mut R,
+        header: der::Header,
+    ) -> der::Result<Self> {
+        let bruto = reader.read_vec(header.length)?;
+        let texto = std::str::from_utf8(&bruto)
+            .map_err(|_| der::Tag::GeneralizedTime.value_error())?;
+        let unix_ms = analisar_generalized(texto)
+            .ok_or_else(|| der::Tag::GeneralizedTime.value_error())?;
+        Ok(Self { unix_ms, bruto })
+    }
+}
+
+impl der::EncodeValue for GenTime {
+    fn value_len(&self) -> der::Result<der::Length> {
+        der::Length::try_from(self.bruto.len())
+    }
+    fn encode_value(&self, writer: &mut impl der::Writer) -> der::Result<()> {
+        writer.write(&self.bruto)
+    }
+}
+
+/// `YYYYMMDDHHMMSS[.fff…]Z` → ms desde a época.
+///
+/// Só a forma com `Z` é aceite. Uma hora com deslocamento local (`+0300`) é
+/// legal em BER e proibida no perfil da RFC 5280 §4.1.2.5.2; aceitá-la
+/// obrigaria a confiar num fuso que o emissor escolheu, num campo cujo
+/// propósito é fixar um instante absoluto.
+fn analisar_generalized(s: &str) -> Option<u64> {
+    let s = s.strip_suffix('Z')?;
+    let (base, fraccao) = match s.split_once('.') {
+        Some((b, f)) => (b, Some(f)),
+        None => match s.split_once(',') {
+            // A vírgula é o separador decimal alternativo do X.680.
+            Some((b, f)) => (b, Some(f)),
+            None => (s, None),
+        },
+    };
+    if base.len() != 14 || !base.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n = |i: usize, j: usize| base[i..j].parse::<i64>().ok();
+    let (ano, mes, dia) = (n(0, 4)?, n(4, 6)?, n(6, 8)?);
+    let (h, m, seg) = (n(8, 10)?, n(10, 12)?, n(12, 14)?);
+    if !(1..=12).contains(&mes) || !(1..=31).contains(&dia) || h > 23 || m > 59 || seg > 60 {
+        return None;
+    }
+    // Dias desde a época pelo algoritmo de Howard Hinnant (civil_from_days
+    // invertido). Evita uma dependência de calendário para meia dúzia de linhas.
+    let y = if mes <= 2 { ano - 1 } else { ano };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (mes + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + dia - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let dias = era * 146_097 + doe - 719_468;
+
+    let segundos = dias.checked_mul(86_400)? + h * 3_600 + m * 60 + seg;
+    if segundos < 0 {
+        return None;
+    }
+    let mut ms = (segundos as u64).checked_mul(1_000)?;
+    if let Some(f) = fraccao {
+        if f.is_empty() || !f.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        // Só os três primeiros dígitos interessam em ms; o resto é precisão
+        // que este tipo não representa e que descartar não altera a hora
+        // afirmada para lá do milissegundo.
+        let mut milis = 0u64;
+        for (i, b) in f.bytes().take(3).enumerate() {
+            milis += u64::from(b - b'0') * 10u64.pow(2 - i as u32);
+        }
+        ms = ms.checked_add(milis)?;
+    }
+    Some(ms)
+}
+
+
 /// `TSTInfo` de RFC 3161 §2.4.2.
 ///
 /// Os campos opcionais que este verificador não usa continuam declarados: um
@@ -121,7 +272,7 @@ pub struct TstInfo {
     pub policy: ObjectIdentifier,
     pub message_imprint: MessageImprint,
     pub serial_number: Int,
-    pub gen_time: GeneralizedTime,
+    pub gen_time: GenTime,
     #[asn1(optional = "true")]
     pub accuracy: Option<Accuracy>,
     #[asn1(default = "Default::default")]
@@ -154,6 +305,13 @@ pub struct TimestampValidationPolicy {
     pub max_chain_depth: usize,
     /// Tecto do token, aplicado antes de qualquer parsing.
     pub max_token_bytes: usize,
+    /// Tecto de certificados no conjunto do token.
+    ///
+    /// O tamanho em bytes era o único travão: um token de 512 KB cabe em
+    /// milhares de certificados minúsculos, e a construção da cadeia percorre o
+    /// conjunto a cada elo. É um travão de esforço, não uma regra da norma —
+    /// uma cadeia ICP-Brasil traz três ou quatro.
+    pub max_certificados: usize,
     /// SPEC-0046 §9 — rigidez da validação de cadeia (RFC 5280 §6.1):
     /// `nameConstraints`, `pathLenConstraint`, `keyUsage` e o tratamento de
     /// extensões críticas não reconhecidas.
@@ -173,6 +331,7 @@ impl Default for TimestampValidationPolicy {
             max_clock_skew: Duration::from_secs(300),
             max_chain_depth: 8,
             max_token_bytes: 512 * 1024,
+            max_certificados: 32,
             restricoes: crate::constraints::RestricoesPolicy::default(),
             algoritmos: crate::algoritmos::PoliticaAlgoritmos::default(),
         }
@@ -263,6 +422,53 @@ impl IcpBrasilTimestampVerifier {
     /// `now_unix_ms` é injectado em vez de lido do relógio para que a
     /// verificação seja reproduzível — o mesmo token verificado no mesmo
     /// instante lógico dá sempre o mesmo resultado.
+    /// Verifica **tudo menos** a ligação a um conteúdo: cadeia, assinatura,
+    /// `messageDigest`, EKU, validade, restrições e revogação. Devolve também o
+    /// `messageImprint` que o token declara.
+    ///
+    /// Existe para uma coisa só, e é a que faltava: pegar num `.tst` emitido
+    /// por uma ACT credenciada e ver se este verificador o aceita, sem ter o
+    /// documento original. É como se prova interoperabilidade — e sem isso a
+    /// única forma de a testar era pôr o sistema a ancorar em produção.
+    ///
+    /// **Não** prova que o token carimbou coisa nenhuma em particular. Quem
+    /// chama isto tem de o dizer no que reportar; é por isso que o imprint sai
+    /// no resultado em vez de ser silenciosamente aceite.
+    pub fn inspect(
+        &self,
+        token_der: &[u8],
+        now_unix_ms: u64,
+    ) -> Result<(VerifiedTimestamp, Vec<u8>), CompError> {
+        let imprint = Self::imprint_declarado(token_der)?;
+        let arr: [u8; 32] = imprint
+            .as_slice()
+            .try_into()
+            .map_err(|_| verify_err(format!(
+                "messageImprint de {} bytes: este verificador só sabe confrontar SHA-256",
+                imprint.len()
+            )))?;
+        let v = self.verify(token_der, &arr, None, now_unix_ms)?;
+        Ok((v, imprint))
+    }
+
+    /// O `messageImprint` que o token declara, sem verificar nada.
+    fn imprint_declarado(token_der: &[u8]) -> Result<Vec<u8>, CompError> {
+        let content = cms::content_info::ContentInfo::from_der(token_der)
+            .map_err(|e| verify_err(format!("não é um ContentInfo CMS: {e}")))?;
+        let signed = content
+            .content
+            .decode_as::<cms::signed_data::SignedData>()
+            .map_err(|e| verify_err(format!("SignedData inválido: {e}")))?;
+        let econtent = signed
+            .encap_content_info
+            .econtent
+            .ok_or_else(|| verify_err("SignedData sem eContent".into()))?;
+        let tst_bytes = econtent.value();
+        let tst = TstInfo::from_der(tst_bytes)
+            .map_err(|e| verify_err(format!("TSTInfo inválido: {e}")))?;
+        Ok(tst.message_imprint.hashed_message.as_bytes().to_vec())
+    }
+
     pub fn verify(
         &self,
         token_der: &[u8],
@@ -332,7 +538,7 @@ impl IcpBrasilTimestampVerifier {
         };
 
         // 3 — cadeia até uma âncora, ANTES de gastar CPU em assinaturas.
-        let certificados = certificados_de(&signed)?;
+        let certificados = certificados_de(&signed, self.policy.max_certificados)?;
         let signer_cert = encontrar_signatario(&certificados, &signer.sid)?;
         let cadeia = self.construir_cadeia(signer_cert, &certificados)?;
         let ancora = cadeia.anchor;
@@ -358,7 +564,15 @@ impl IcpBrasilTimestampVerifier {
         )?;
 
         // 5 — os atributos assinados descrevem ESTE conteúdo.
-        verificar_atributos(attrs, tst_bytes)?;
+        // §5.3 — o digest dos signedAttrs é o que o SignerInfo declara.
+        let digest_attrs = crate::algoritmos::Digest::do_oid(&signer.digest_alg.oid)
+            .ok_or_else(|| {
+                verify_err(format!(
+                    "digestAlgorithm {} do SignerInfo não suportado",
+                    signer.digest_alg.oid
+                ))
+            })?;
+        verificar_atributos(attrs, tst_bytes, digest_attrs)?;
 
         // 6 — o TSTInfo.
         let tst = TstInfo::from_der(tst_bytes)
@@ -408,7 +622,7 @@ impl IcpBrasilTimestampVerifier {
             (None, _) => false,
         };
 
-        let gen_unix_ms = generalized_para_unix_ms(&tst.gen_time)?;
+        let gen_unix_ms = tst.gen_time.unix_ms();
         let skew = self.policy.max_clock_skew.as_millis() as u64;
         if gen_unix_ms > now_unix_ms.saturating_add(skew) {
             return Err(verify_err(format!(
@@ -423,6 +637,12 @@ impl IcpBrasilTimestampVerifier {
         for cert in &cadeia.certs {
             validade_em(cert, gen_unix_ms)?;
         }
+        // A âncora também. A RFC 5280 §6.1 trata-a como dado de entrada e não
+        // exige validá-la, mas uma raiz cuja janela já tinha fechado quando o
+        // carimbo foi emitido não podia estar a certificar coisa nenhuma nesse
+        // instante — e o doc deste módulo afirmava que isto era verificado
+        // quando não era.
+        validade_em(&cadeia.anchor_cert, gen_unix_ms)?;
         verificar_eku_timestamping(signer_cert)?;
 
         // §6.1 — as restrições de emissão. Antes da revogação e depois da
@@ -635,11 +855,20 @@ fn mesmo_certificado(a: &Certificate, b: &Certificate) -> bool {
     }
 }
 
-fn certificados_de(signed: &cms::signed_data::SignedData) -> Result<Vec<Certificate>, CompError> {
+fn certificados_de(
+    signed: &cms::signed_data::SignedData,
+    max: usize,
+) -> Result<Vec<Certificate>, CompError> {
     let set = signed
         .certificates
         .as_ref()
         .ok_or_else(|| verify_err("SignedData sem certificados: nada para ancorar".into()))?;
+    if set.0.len() > max {
+        return Err(verify_err(format!(
+            "token com {} certificados acima do tecto de {max}: a construção da cadeia percorre              o conjunto a cada elo, e o tamanho em bytes não é travão suficiente",
+            set.0.len()
+        )));
+    }
     let mut out = Vec::new();
     for escolha in set.0.iter() {
         if let cms::cert::CertificateChoices::Certificate(cert) = escolha {
@@ -712,18 +941,34 @@ fn reencode_signed_attrs(attrs: &cms::signed_data::SignedAttributes) -> Result<V
         .map_err(|e| verify_err(format!("signedAttrs não recodificam: {e}")))
 }
 
+/// RFC 5652 §5.3 — `contentType` e `messageDigest` têm de ter **exactamente
+/// um** valor. Um atributo com dois, em que o primeiro está certo e o segundo
+/// não, passava: só o primeiro era examinado.
+fn valor_unico<'a>(
+    attr: &'a x509_cert::attr::Attribute,
+    nome: &str,
+) -> Result<&'a der::Any, CompError> {
+    if attr.values.len() != 1 {
+        return Err(verify_err(format!(
+            "atributo assinado `{nome}` com {} valores: a RFC 5652 §5.3 exige exactamente um,              e examinar só o primeiro deixaria o segundo dizer outra coisa",
+            attr.values.len()
+        )));
+    }
+    attr.values
+        .get(0)
+        .ok_or_else(|| verify_err(format!("{nome} sem valor")))
+}
+
 fn verificar_atributos(
     attrs: &cms::signed_data::SignedAttributes,
     tst_bytes: &[u8],
+    digest: crate::algoritmos::Digest,
 ) -> Result<(), CompError> {
     let mut viu_content_type = false;
     let mut viu_message_digest = false;
     for attr in attrs.iter() {
         if attr.oid == OID_ATTR_CONTENT_TYPE {
-            let valor = attr
-                .values
-                .get(0)
-                .ok_or_else(|| verify_err("contentType sem valor".into()))?;
+            let valor = valor_unico(attr, "contentType")?;
             let oid = valor
                 .decode_as::<ObjectIdentifier>()
                 .map_err(|e| verify_err(format!("contentType inválido: {e}")))?;
@@ -734,14 +979,15 @@ fn verificar_atributos(
             }
             viu_content_type = true;
         } else if attr.oid == OID_ATTR_MESSAGE_DIGEST {
-            let valor = attr
-                .values
-                .get(0)
-                .ok_or_else(|| verify_err("messageDigest sem valor".into()))?;
-            let digest = valor
+            let valor = valor_unico(attr, "messageDigest")?;
+            let declarado = valor
                 .decode_as::<OctetString>()
                 .map_err(|e| verify_err(format!("messageDigest inválido: {e}")))?;
-            if digest.as_bytes() != sha256(tst_bytes) {
+            // O digest vem do `digestAlgorithm` do SignerInfo, não fixado em
+            // SHA-256. Uma ACT que assine os signedAttrs sobre SHA-512 emite um
+            // `messageDigest` de 64 bytes, e compará-lo com um SHA-256 falharia
+            // sempre — com uma mensagem a culpar o conteúdo do token.
+            if declarado.as_bytes() != digest.digerir(tst_bytes) {
                 // Este é o elo que liga a assinatura ao conteúdo. Sem ele, a
                 // assinatura cobriria os atributos e o TSTInfo podia ser outro.
                 return Err(verify_err(
@@ -874,19 +1120,14 @@ fn tempo_para_unix_ms(t: &Time) -> Result<u64, CompError> {
         .ok_or_else(|| verify_err("tempo do certificado transborda em ms".into()))
 }
 
-fn generalized_para_unix_ms(t: &GeneralizedTime) -> Result<u64, CompError> {
-    t.to_unix_duration()
-        .as_secs()
-        .checked_mul(1_000)
-        .ok_or_else(|| verify_err("genTime transborda em ms".into()))
-}
+
 
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_pki::{self, OpcoesToken};
-    use crate::trust_store::TrustStore;
+    use crate::trust_store::{sha256, TrustStore};
 
     const AGORA_S: u64 = 1_760_000_000;
     const AGORA_MS: u64 = AGORA_S * 1_000;
@@ -1835,5 +2076,179 @@ mod tests {
         let (token2, v2) = token_e_verificador(&c, politica);
         v2.verify(&token2, &imprint(), None, AGORA_MS)
             .expect("com o OID declarado a extensao e tolerada");
+    }
+
+    // -----------------------------------------------------------------
+    // RFC 3161 §2.4.2 / RFC 5652 §5.3 — o que um token REAL traz e que a PKI
+    // sintetica nunca produzia.
+    // -----------------------------------------------------------------
+
+    /// A RFC 3161 permite EXPLICITAMENTE fraccao de segundo no `genTime`. O
+    /// `GeneralizedTime` do `der` e DER-estrito e recusava-a: um token de uma
+    /// ACT que declarasse precisao de milissegundos nem chegava a descodificar,
+    /// e o erro falava de ASN.1 malformado.
+    #[test]
+    fn um_gen_time_com_fraccao_de_segundo_descodifica_e_conta_os_milissegundos() {
+        let chain = test_pki::chain_de_teste();
+        let token = test_pki::token_de_teste(
+            &chain,
+            &imprint(),
+            AGORA_S - 60,
+            None,
+            OpcoesToken {
+                gen_time_milis: Some(500),
+                ..Default::default()
+            },
+        );
+        let v = verificador(&chain)
+            .verify(&token, &imprint(), None, AGORA_MS)
+            .expect("uma ACT real declara precisao em milissegundos");
+        assert_eq!(
+            v.gen_unix_ms,
+            (AGORA_S - 60) * 1_000 + 500,
+            "a fraccao e a hora que a autoridade afirmou; descarta-la trunca o facto"
+        );
+    }
+
+    /// O `genTime` sem fraccao continua a funcionar — a forma que a PKI
+    /// sintetica sempre produziu.
+    #[test]
+    fn um_gen_time_sem_fraccao_continua_a_funcionar() {
+        let chain = test_pki::chain_de_teste();
+        let v = verificador(&chain)
+            .verify(&token_padrao(&chain), &imprint(), None, AGORA_MS)
+            .unwrap();
+        assert_eq!(v.gen_unix_ms, (AGORA_S - 60) * 1_000);
+    }
+
+    /// A ida e volta do `GenTime` sobre instantes conhecidos, incluindo um ano
+    /// bissexto e a fronteira de mes.
+    #[test]
+    fn o_gen_time_converte_instantes_conhecidos() {
+        // 2020-02-29T12:00:00Z = 1582977600
+        let t = crate::icp::GenTime::nova(1_582_977_600, None).unwrap();
+        assert_eq!(t.unix_ms(), 1_582_977_600_000);
+        // 2000-03-01T00:00:00Z = 951868800
+        let t2 = crate::icp::GenTime::nova(951_868_800, Some(125)).unwrap();
+        assert_eq!(t2.unix_ms(), 951_868_800_125);
+        // A epoca.
+        assert_eq!(crate::icp::GenTime::nova(0, None).unwrap().unix_ms(), 0);
+    }
+
+    /// §5.3 — um atributo com dois valores, o primeiro certo e o segundo nao,
+    /// passava: so o primeiro era examinado.
+    #[test]
+    fn um_atributo_assinado_com_dois_valores_e_recusado() {
+        let chain = test_pki::chain_de_teste();
+        let token = test_pki::token_de_teste(
+            &chain,
+            &imprint(),
+            AGORA_S - 60,
+            None,
+            OpcoesToken {
+                content_type_com_dois_valores: true,
+                ..Default::default()
+            },
+        );
+        let erro = verificador(&chain)
+            .verify(&token, &imprint(), None, AGORA_MS)
+            .unwrap_err();
+        assert!(erro.to_string().contains("2 valores"), "{erro}");
+    }
+
+    /// O `messageDigest` e comparado com o digest que o SignerInfo DECLARA, e
+    /// nao com SHA-256 fixado no codigo.
+    #[test]
+    fn o_message_digest_usa_o_digest_declarado_pelo_signer_info() {
+        let chain = test_pki::chain_de_teste();
+        let token = test_pki::token_de_teste(
+            &chain,
+            &imprint(),
+            AGORA_S - 60,
+            None,
+            OpcoesToken {
+                digest_attrs_sha512: true,
+                ..Default::default()
+            },
+        );
+        verificador(&chain)
+            .verify(&token, &imprint(), None, AGORA_MS)
+            .expect("signedAttrs sobre SHA-512 sao legitimos e tem de passar");
+    }
+
+    /// Um `digestAlgorithm` que nao sabemos calcular e recusado com o OID, e
+    /// nao ignorado.
+    #[test]
+    fn um_digest_algorithm_desconhecido_e_recusado_com_o_oid() {
+        let chain = test_pki::chain_de_teste();
+        let token = test_pki::token_de_teste(
+            &chain,
+            &imprint(),
+            AGORA_S - 60,
+            None,
+            OpcoesToken {
+                digest_attrs_desconhecido: true,
+                ..Default::default()
+            },
+        );
+        let erro = verificador(&chain)
+            .verify(&token, &imprint(), None, AGORA_MS)
+            .unwrap_err();
+        assert!(erro.to_string().contains("digestAlgorithm"), "{erro}");
+    }
+}
+
+#[cfg(test)]
+mod testes_inspect {
+    use super::*;
+    use crate::test_pki::{self, OpcoesToken};
+    use crate::trust_store::{sha256, TrustStore};
+
+    const AGORA_S: u64 = 1_760_000_000;
+
+    /// `inspect` existe para pegar num `.tst` de uma ACT real e ver se este
+    /// verificador o aceita, sem ter o documento original — e devolve o
+    /// imprint para que quem reporte NAO possa calar que nada foi ligado.
+    #[test]
+    fn inspect_valida_a_cadeia_e_devolve_o_imprint_sem_o_ligar_a_nada() {
+        let chain = test_pki::chain_de_teste();
+        let esperado = sha256(b"o conteudo a carimbar");
+        let token = test_pki::token_de_teste(
+            &chain,
+            &esperado,
+            AGORA_S - 60,
+            None,
+            OpcoesToken::default(),
+        );
+        let mut store = TrustStore::new();
+        store.add_pem_or_der("raiz", &chain.root_der).unwrap();
+        let v = IcpBrasilTimestampVerifier::new(store, TimestampValidationPolicy::default());
+
+        let (r, imprint) = v.inspect(&token, AGORA_S * 1_000).expect("token valido");
+        assert_eq!(imprint, esperado.to_vec());
+        assert!(r.signer_subject.contains("ACT de Teste"));
+        assert_eq!(r.chain_len, 1);
+    }
+
+    /// E recusa o que tem de recusar: `inspect` nao e um atalho que salte a
+    /// validacao da cadeia.
+    #[test]
+    fn inspect_recusa_uma_cadeia_que_nao_chega_a_uma_ancora() {
+        let chain = test_pki::chain_de_teste();
+        let token = test_pki::token_de_teste(
+            &chain,
+            &sha256(b"x"),
+            AGORA_S - 60,
+            None,
+            OpcoesToken::default(),
+        );
+        let mut store = TrustStore::new();
+        store
+            .add_pem_or_der("outra", &test_pki::self_signed_root("Outra").certificate_der)
+            .unwrap();
+        let erro = IcpBrasilTimestampVerifier::new(store, TimestampValidationPolicy::default())
+            .inspect(&token, AGORA_S * 1_000)
+            .unwrap_err();
+        assert!(erro.to_string().contains("âncora"), "{erro}");
     }
 }

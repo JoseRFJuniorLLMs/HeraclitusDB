@@ -281,7 +281,10 @@ fn blake3_sha256(bytes: &[u8]) -> Box<[u8; 32]> {
     Box::new(fixed)
 }
 
-/// Reexportado para quem constrói o `TSTInfo` e precisa de comparar imprints.
+/// Usado pelos testes do verificador para construir imprints. O caminho de
+/// produção passou a calcular o digest pelo algoritmo que o token DECLARA
+/// (`crate::algoritmos::Digest`), em vez de o fixar em SHA-256.
+#[cfg(test)]
 pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
     *blake3_sha256(bytes)
 }

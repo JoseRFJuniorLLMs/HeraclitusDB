@@ -249,6 +249,16 @@ pub struct OpcoesToken {
     pub econtent_type_errado: bool,
     /// Dois `SignerInfo` em vez de um.
     pub dois_signatarios: bool,
+    /// Emite o `contentType` com DOIS valores, o primeiro correcto.
+    pub content_type_com_dois_valores: bool,
+    /// Assina os signedAttrs sobre SHA-512 (o `messageDigest` passa a ter 64
+    /// bytes e o `digestAlgorithm` a declarar SHA-512).
+    pub digest_attrs_sha512: bool,
+    /// Declara um `digestAlgorithm` que o verificador nao sabe calcular.
+    pub digest_attrs_desconhecido: bool,
+    /// Emite o `genTime` com fraccao de segundo, como uma ACT real que declare
+    /// precisao de milissegundos (RFC 3161 §2.4.2 permite-o explicitamente).
+    pub gen_time_milis: Option<u16>,
     /// Certificados a juntar ao conjunto do token, alem da folha e do emissor
     /// imediato. E o que permite testar uma cadeia de tres niveis: o intermedio
     /// viaja no token e a ancora fica no trust store.
@@ -264,7 +274,6 @@ pub fn token_de_teste(
     opcoes: OpcoesToken,
 ) -> Vec<u8> {
     use crate::icp::{Accuracy, MessageImprint, TstInfo};
-    use der::asn1::GeneralizedTime;
 
     let tst = TstInfo {
         version: 1,
@@ -274,10 +283,8 @@ pub fn token_de_teste(
             hashed_message: OctetString::new(imprint.to_vec()).expect("imprint"),
         },
         serial_number: Int::new(&[0x2a]).expect("serial"),
-        gen_time: GeneralizedTime::from_unix_duration(std::time::Duration::from_secs(
-            gen_unix_secs,
-        ))
-        .expect("genTime"),
+        gen_time: crate::icp::GenTime::nova(gen_unix_secs, opcoes.gen_time_milis)
+            .expect("genTime"),
         accuracy: Some(Accuracy {
             seconds: Some(1),
             millis: None,
@@ -290,25 +297,48 @@ pub fn token_de_teste(
     };
     let tst_der = tst.to_der().expect("tstinfo der");
 
-    let digest = if opcoes.message_digest_errado {
-        sha256(b"outro conteudo")
+    // O digest dos signedAttrs: SHA-256 por omissao, SHA-512 quando a opcao o
+    // pede — e o `digestAlgorithm` do SignerInfo tem de o declarar.
+    let (digest, oid_digest) = if opcoes.message_digest_errado {
+        (sha256(b"outro conteudo").to_vec(), OID_SHA256)
+    } else if opcoes.digest_attrs_sha512 {
+        use sha2::Digest as _;
+        (
+            sha2::Sha512::digest(&tst_der).to_vec(),
+            const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.3"),
+        )
+    } else if opcoes.digest_attrs_desconhecido {
+        (
+            sha256(&tst_der).to_vec(),
+            // id-md5 — deliberadamente fora do que se sabe calcular.
+            const_oid::ObjectIdentifier::new_unwrap("1.2.840.113549.2.5"),
+        )
     } else {
-        sha256(&tst_der)
+        (sha256(&tst_der).to_vec(), OID_SHA256)
     };
 
     let mut atributos: Vec<x509_cert::attr::Attribute> = Vec::new();
     if !opcoes.sem_content_type {
         atributos.push(x509_cert::attr::Attribute {
             oid: OID_ATTR_CONTENT_TYPE,
-            values: SetOfVec::try_from(vec![
-                Any::new(Tag::ObjectIdentifier, OID_CT_TST_INFO.as_bytes()).expect("any oid"),
-            ])
+            values: SetOfVec::try_from(if opcoes.content_type_com_dois_valores {
+                // O primeiro esta CERTO. So o segundo diz outra coisa — e era
+                // o primeiro que o verificador examinava.
+                vec![
+                    Any::new(Tag::ObjectIdentifier, OID_CT_TST_INFO.as_bytes())
+                        .expect("any oid"),
+                    Any::new(Tag::ObjectIdentifier, OID_SHA256.as_bytes()).expect("any oid 2"),
+                ]
+            } else {
+                vec![Any::new(Tag::ObjectIdentifier, OID_CT_TST_INFO.as_bytes())
+                    .expect("any oid")]
+            })
             .expect("set"),
         });
     }
     atributos.push(x509_cert::attr::Attribute {
         oid: OID_ATTR_MESSAGE_DIGEST,
-        values: SetOfVec::try_from(vec![Any::new(Tag::OctetString, digest.to_vec())
+        values: SetOfVec::try_from(vec![Any::new(Tag::OctetString, digest.clone())
             .expect("any digest")])
         .expect("set"),
     });
@@ -365,7 +395,7 @@ pub fn token_de_teste(
     let signer = SignerInfo {
         version: cms::content_info::CmsVersion::V1,
         sid,
-        digest_alg: algid(OID_SHA256),
+        digest_alg: algid(oid_digest),
         signed_attrs: Some(SetOfVec::try_from(atributos).expect("attrs")),
         signature_algorithm: algid(oid_assinatura),
         signature: OctetString::new(assinatura_bytes.clone()).expect("sig"),
@@ -740,28 +770,122 @@ impl x509_cert::ext::AsExtension for CriticaDesconhecida {
 use rsa::RsaPrivateKey;
 use std::sync::OnceLock;
 
-/// Gerar RSA-2048 custa quase um segundo. Gera-se UMA vez para toda a suite.
+// Chaves RSA FIXAS, em PKCS#8 DER.
+//
+// Gera-las a cada corrida custava ~2,5 s de um nucleo — e isso derrubou
+// `l2_behavioral_adapter_emits_replayable_signal_after_shadow_promotion` do
+// Sentinel, que espera ate 5 s por um worker unico e ficava sem CPU enquanto
+// esta suite fazia primalidade. O teste do Sentinel estava certo (espera em
+// polling, nao com `sleep` fixo); o problema era esta suite a roubar-lhe o
+// processador.
+//
+// Chaves fixas resolvem as duas coisas: nao ha custo nenhum, e dois testes que
+// gerem "a mesma" cadeia obtem mesmo a mesma — que e a regra que o resto deste
+// ficheiro ja seguia para as chaves ECDSA.
+//
+// Sao chaves de TESTE, geradas para este ficheiro e sem valor nenhum fora dele.
+const R2048A_PKCS8_HEX: &str = concat!(
+    "308204be020100300d06092a864886f70d0101010500048204a8308204a40201000282010100aa1aaa23b7923a9030ca",
+    "5e60797284829da5812504c93d98cac8ec1d5fb0fca0b30ebfe4d558e17ce84e6f117ccbe5fce7b885a2781013db9ac9",
+    "6dc335994c70e7840af4a907378e4a8df3cd7dc6482eec0891041a58abd16ba3a2edb197ce98eafac0cbb37d6ea86042",
+    "4e16ee70dd90690b519b44c6531d93a2a0a16a091d3b7f7e7c71629068c259d02144f26da8426bc7ec21324559d23515",
+    "b1b70b6c082973c515f55f3b49d84b15da8b5e93a773ba032808ff3061006d7056da62f04318e9105d5294ed1cffea53",
+    "316abb251093b07587d1662a01fd984881844b7afd996196e5642c59c3b877bf04523aba1a436db596159598442a5849",
+    "ce2ca058443102030100010282010100a6f9fdc189d554ff6da578f722c0332b342cde94c419f70921261200d38a1cb2",
+    "72922bf42929524f168ac7a456e8a01e9e2817a5e04d87f0ae04c466371b005a6428cdc85493ed09144e3be09f722031",
+    "4f292990e97bd94d7d67e7eb83c50cdc36ed668b8ee9b5d23a8b5bb44ee323db3a020e5d6829763536531172e16f88ec",
+    "e10912b2219d885f3f31c9cc512d36080f205d11d1fc6f7a840efa452748a026db5f0c542d4072d95903ce4e997a76d9",
+    "98f0175242e6ee2f285bdef1fc088616985ba54fb7469729159994f110dd2a05d598ab83e1e709c4f24ff9ee99716acb",
+    "6f58718bfdff1216e7ba4b4f78e2be43e96b621aeefaa3376a5b7b88650e7e7102818100d29cef2ffc2e5fada209b5aa",
+    "c5e1f4f20a1fecbc9ca078d9b17df023e5e42bd00f03fae79887bafefdaf560454ced2904d8f3e719457295f9ee38b97",
+    "4e86f3bdac406152be3eb35445f7bb88e2c4d037f339c0c51e1b93123487a3d5f5093a4738c254b201e3622ae02c5007",
+    "50778a742d47625aef6f37d1f9b69777e9076f5b02818100cec2f191fd172afb610971d560002be22a22731a9aa6298a",
+    "e06ad3f167474d49106e9f6d1d8337642eb5025c71a85eb38355d7e9ecaa932d48b0327697b449de4ece5ebcdb10b99b",
+    "edb1b4f7e64b7bcc4af7de8e4a150a5247936bb3b44f348ddb74c9582795c92aedbab5665b1f261b773071c0065be95d",
+    "ce93101b4d32dc630281800e82774c0400a1e0d16fffcf0310fd120bb68555bd28a50ac25a9dc7ab57dbd8da9ff8922a",
+    "04f7d2076223f7ea6bd13fd5c80f923d98ffa5b1c9955d58309dec2c48c72baf259caf2a9ed591a9a5cb7e7f48344aa0",
+    "37601b79f8fa458c3b1583c09a4ac174b5d89681992bee4511e73cf7bd9a3e0f8ec6f6b5506a00fdd1e04f0281800c98",
+    "234ed933c81277deb36863e89ec3affd59358da60171cc29b5af46b33929f22e4ad7c2ac737b4ebd07dfc9ac8fd82f6f",
+    "d32f14936f539ad1e0c1088c9ad347c99a4bb6ac5622016089bd6ff1b920c09048a6322d05ebed2035b7448c6e8f1587",
+    "0f9ca70ca0ac54bec2bdf15efc5b3fef5b7e6ee4ba5a5472f0d038eb983102818100b29588f559fbb9aa455064fc7281",
+    "9ba76b36b671e6f26c9c122d96b6d10e690379f77d8e1e66beb0434bbaeb3cd19b5e4b94545c449753786c775c07887a",
+    "4a0d30813da589682cafeacf6e217ada1ae6d982fd76ec97014a4db8380f88b3cef01784d8601e098e19b3a7261e6a27",
+    "220191be7db7ef8f7df85aac3fe0066c636c",
+);
+
+const R2048B_PKCS8_HEX: &str = concat!(
+    "308204be020100300d06092a864886f70d0101010500048204a8308204a40201000282010100b9593878b80e0ee53c52",
+    "a8be16199594f3b6ccf6171facd3a8766709e120fb26be845acc9a5252a843060439ff367fb48c8ee90f3c0ecd836bc5",
+    "f5dbc2c960a0ba303a8ac0d12edcc1e09011a420716ca4164c5be6aa46f933c32ef236a83430e2091e54610b29d4832c",
+    "6c31eead1a20106654cf98fe2dad8b5b51b22f9cfd41636d963b4d79da144ea327fec9e3d42ce784bd2aee4a0dfd36a6",
+    "26a985d4c71e32695a563391f45af4331d4e69addcdab37d43bac3f6d35a0b0aaaf024bca2ea90ca76945606be9a251f",
+    "bb931730696a8030c74914201b9e6ecc7ff93dcaa9af9fb05d00db57bc5c4a1b028d37e71078d2dfcfd9a6e007d36428",
+    "e5de7a2ad03f0203010001028201003b5c2caed4db83bfbce30831e0a80ef4e65ccc25a0603f9c85de6dbf873f65d011",
+    "c217c661422e40bf3e650a2207553d00ab204f05c003e7ac13795b09762f212aa0198fa89315fc138794fc6161169261",
+    "b6d67bb4532269db3f0e80fa2a4294c93f7c5c2fbc408853fe5d245cb9499dad42e8b497de07c905d1984785e234653a",
+    "22508fb5cfa3cb6968253b5180ee4fcb126edc7fecbf1a4e68eb15ee001167f39cdeee9340327f5e22336857af923338",
+    "a7bfa352210b0b7578804bfb1b0e0674a98b914cc0a890d48b00d71b979bb6a135df824de576bf3e031f85087d516bd6",
+    "a26174bfe9e78bd2561fb52dcf373085fd39080e3d03e37e4ba28c4b644d4102818100d5ab30286c9a590944d64d4c5b",
+    "b706dd4bbecd8471c12065e02b744be8246234e99c4e38832da673744636a3a12f95f133ae0799748d3017b1435382d8",
+    "c55355f4bc39d4f084f6c20f76736499b7904d51626b691f6119b9a1c190f9fc2cfafde26e9bd457dccc8c1da3d1067c",
+    "fb478cd1f654d640b71d6ff3d48707eb765f1f02818100de11b1bb083424971ac89d3b38b04f93acacdf54edbb214b04",
+    "09b60d0dfc5091107100cdd57c39b62afac00554e15761624e3fdc8c102f0db3e6dc6d89284479a249c793021a5f2a24",
+    "cfd1c2c95a2b54855c718f065f987df5bd3baa289ecb1c6fd0f81523cfee5d76af26f2aa860d020a86b8e5930e3d4f07",
+    "fbdc16ad560ae102818100a13951d63ed45c38953b8b0a01ee61fc9b49f6b3684e4c8ef28e776b4b5820ce4233d205ec",
+    "5d86ca7942fdb98c4766c1a0b8413db6674e91a20ce637c62f66c966289d0ea30a0153beed26f712d222cd648a79f7d1",
+    "58a85b9cc57d0a5410f0b69fa3cc6b767cc1cf3c123f07c148addd811479414d859e6dba33744c328c980b0281802c3f",
+    "f45d637618706faad801cbfafdf05c311a536f07a1cbb3e3477e7471f98fde69d6122ddf1214e59d8f93c06522a74a12",
+    "73913beba1a4a65b7342f458acc45bfd3da26281e4c29e1137280c3d4673121be898ea593426ad47e6d2b2436a0fa18c",
+    "4f52cf0f08dd60dfe7efe4e0cf48bfd63693b068def8978bad406b8bc0a1028181008f37838c3a556008ae3bc4378314",
+    "570c6ce6e13b6813bf8cea8bdd9a5c0bc2374f0b7bc12c44bc36a6df4f39959dc9008e26d14ac4e7e92688e9be1a4ea0",
+    "e93cb8cbfc58c7a193c890ac09204b2be24422655c531fa4677914b93ec0e35a9dc0b24a3b5429ce078ef009928d32c1",
+    "cfc297dc2329074198c709341effe9df1815",
+);
+
+const R1024_PKCS8_HEX: &str = concat!(
+    "30820277020100300d06092a864886f70d0101010500048202613082025d02010002818100db8c3104405cd4bf5b1fb6",
+    "e0e562029c1d70d650a06f926388f0a516ab07831aec5ada56cb3baf80652000c07b0753780d652fb5c790f90a3e519e",
+    "94773843ba91a9ffc0943b142651d47604118de8904ebfdfbfcf651b0b1149c26fd2b7d07ab10a8d371761a53b98c038",
+    "eb6cf3004843fb93587664d49ea722db105115f1a3020301000102818100b8abc59743e451f7dbd86365eccc72518ada",
+    "1d0b98c800a4c4cd56b028909b110c7aa769966dd003fa0bdf5608a672e96aab1064a1472a94193362669399ba2d27dd",
+    "8dee6fd58376344fc2bfc8dc533d315c3f2a3e1fc87bdda3c29c7bdba3b8b1c40ca6b7162c7c497aed9fa8b137442e91",
+    "22392dd0d4fb57e435d7ed13e211024100f35839fa6989f32a1694756eea38a4e8fc1a937401130cc8e8dd8fccafd1f8",
+    "60611057103b0f9d26f6bc25034c7a5e6508b5c4deb65a08cdbb15cb9b3accb885024100e6f7249cab7edb707f520fe8",
+    "ddd42c285d6c12c8a0cf645489b477119817443d3f0ad0f2bf77e6643d27674a3de8d6b10f3e09cb9f3f31bd605fa87b",
+    "95912e070240242d36995abd4e7030612bc02c83f54849ca6da76e4d75b61ca06bb3636414c7c746559b2d1c9a2163c6",
+    "febda9cdfb608bd5f209a6146680a7528b2d6da567bd024100c76ab1e0d7adb33821a62ff866b78fdcd634becf1d1193",
+    "d5ee03b41eabcbc2ee82a50b1ddcb5606641eae8a2d06b5e1b08470f5c114615e325f7d1d7ca9ecc370240161fae3c81",
+    "e2500e7712585c4b8095e5a6b861b0350acafc904cd4b2d64e666efade85e762cba9770916a5fcd55a72cc12eee84806",
+    "09cfdfb8f4057fe81edc93",
+);
+
+fn de_hex(h: &str) -> Vec<u8> {
+    (0..h.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&h[i..i + 2], 16).expect("hex da chave de teste"))
+        .collect()
+}
+
+fn chave_pkcs8(hex: &str) -> RsaPrivateKey {
+    use rsa::pkcs8::DecodePrivateKey;
+    RsaPrivateKey::from_pkcs8_der(&de_hex(hex)).expect("chave PKCS#8 de teste")
+}
+
 fn chave_rsa_2048() -> &'static RsaPrivateKey {
     static K: OnceLock<RsaPrivateKey> = OnceLock::new();
-    K.get_or_init(|| {
-        RsaPrivateKey::new(&mut rand::thread_rng(), 2048).expect("gerar RSA-2048")
-    })
+    K.get_or_init(|| chave_pkcs8(R2048A_PKCS8_HEX))
 }
 
 /// Uma chave deliberadamente fraca, para provar que o piso de tamanho existe.
 fn chave_rsa_1024() -> &'static RsaPrivateKey {
     static K: OnceLock<RsaPrivateKey> = OnceLock::new();
-    K.get_or_init(|| {
-        RsaPrivateKey::new(&mut rand::thread_rng(), 1024).expect("gerar RSA-1024")
-    })
+    K.get_or_init(|| chave_pkcs8(R1024_PKCS8_HEX))
 }
 
 /// Segunda chave de 2048, para a folha ser distinta da raiz.
 fn chave_rsa_2048_folha() -> &'static RsaPrivateKey {
     static K: OnceLock<RsaPrivateKey> = OnceLock::new();
-    K.get_or_init(|| {
-        RsaPrivateKey::new(&mut rand::thread_rng(), 2048).expect("gerar RSA-2048 folha")
-    })
+    K.get_or_init(|| chave_pkcs8(R2048B_PKCS8_HEX))
 }
 
 /// Que digest usar na assinatura dos certificados RSA.
@@ -862,3 +986,4 @@ pub fn chain_rsa(digest: DigestRsa, raiz_fraca: bool) -> Chain {
         rsa_digest: Some(digest),
     }
 }
+
