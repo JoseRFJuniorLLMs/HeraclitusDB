@@ -13,7 +13,7 @@
 //! Adjacency em `BTreeMap` = ordenação determinística (alimenta o `state_hash`) e O(log N).
 //! Não toca nos tipos existentes do crate (não quebra dependentes).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub type Lsn = u64;
 pub type EntityId = String;
@@ -508,12 +508,193 @@ impl TemporalGraph {
     ///
     /// Determinístico em tudo (⇒ estável entre replays):
     ///   - **comunidades**: componentes conexas (não-direcionadas). O id da
+    ///     comunidade é o **menor nó** da componente — os nós são indexados por
+    ///     ordem alfabética, logo o índice 0 de cada componente é o seu mínimo.
+    ///   - **centralidade**: grau normalizado `degree / (n-1)`.
+    ///   - **anomaly_score**: z-score do grau `(deg - média) / desvio`.
+    ///
+    /// # Representação: CSR sobre `u32`, não `BTreeMap<String, BTreeSet<String>>`
+    ///
+    /// A versão anterior construía a adjacência em mapas indexados por
+    /// `EntityId` — que é uma `String`. Por cada aresta viva fazia **seis
+    /// `clone()` de String** (dois para o conjunto de nós, dois para a
+    /// adjacência, dois para o grau) e cada `entry`/`get` custava uma
+    /// comparação de cadeias, não de inteiros. Numa análise sobre dezenas de
+    /// milhares de arestas isso é o grosso do trabalho, e nada disso é o
+    /// algoritmo.
+    ///
+    /// Agora os nomes são traduzidos UMA vez para índices densos, e a
+    /// adjacência vive em dois vectores contíguos — `offsets` e `vizinhos` —
+    /// que é a forma canónica (CSR) e a que o cache gosta. Os nomes só voltam
+    /// no fim, `n` vezes em vez de seis por aresta.
+    ///
+    /// Os duplicados na adjacência são deixados de propósito: a versão anterior
+    /// usava `BTreeSet` e portanto deduplicava, mas para alcançabilidade visitar
+    /// um vizinho duas vezes é inofensivo (o teste `visitado` trata disso), e o
+    /// `degree` conta ARESTAS e não vizinhos distintos — que é o que a versão
+    /// anterior também fazia. Deduplicar mudaria o grau.
+    pub fn analyze(&self, as_of: Lsn, min_confidence: f32) -> GraphAnalytics {
+        // Arestas vivas + confiáveis, em ordem determinística (por edge_id).
+        let alive: Vec<&Edge> = self
+            .edges
+            .values()
+            .filter(|e| e.alive_at(as_of) && self.belief_at(&e.id, as_of) >= min_confidence)
+            .collect();
+
+        // --- índice denso, por ordem alfabética -----------------------------
+        //
+        // Duas passagens, e a razão é medida: a primeira versão disto construía
+        // um `BTreeSet<&String>` com as duas pontas de cada aresta, ou seja
+        // 2·m inserções numa árvore ordenada — 200 mil comparações de CADEIA
+        // vezes log(n) para 100 mil arestas. Isso era 80% do tempo de
+        // `analyze`, e não é o algoritmo: é só chegar aos identificadores.
+        //
+        // Agora: um mapa de dispersão atribui ids por ordem de aparição (2·m
+        // dispersões, sem comparações), e só os `n` nomes ÚNICOS são ordenados
+        // no fim. Para 100 mil arestas e 10 mil nós, são 20 mil dispersões mais
+        // 10 mil·log(10 mil) comparações, em vez de 2,7 milhões.
+        //
+        // A ordem alfabética continua a importar: o id da comunidade é o menor
+        // nó, e é o `rank` que garante que o índice 0 de cada componente é esse
+        // mínimo.
+        // Os pares resolvidos ficam guardados: sem isto, cada nome era
+        // procurado TRÊS vezes — ao indexar, ao contar o grau, e ao preencher o
+        // CSR — e cada procura é uma dispersão de cadeia.
+        let mut idx: HashMap<&str, u32> = HashMap::with_capacity(alive.len());
+        let mut aparicao: Vec<&EntityId> = Vec::new();
+        let mut pares: Vec<(u32, u32)> = Vec::with_capacity(alive.len());
+        for e in &alive {
+            let mut ids = [0u32; 2];
+            for (slot, nome) in ids.iter_mut().zip([&e.from, &e.to]) {
+                *slot = match idx.get(nome.as_str()) {
+                    Some(i) => *i,
+                    None => {
+                        let novo = aparicao.len() as u32;
+                        idx.insert(nome.as_str(), novo);
+                        aparicao.push(nome);
+                        novo
+                    }
+                };
+            }
+            pares.push((ids[0], ids[1]));
+        }
+        let n = aparicao.len();
+        // Permutação para ordem alfabética: `rank[id_de_aparicao] = id_ordenado`.
+        let mut ordem: Vec<u32> = (0..n as u32).collect();
+        ordem.sort_unstable_by(|a, b| aparicao[*a as usize].cmp(aparicao[*b as usize]));
+        let mut rank = vec![0u32; n];
+        for (ordenado, &aparecido) in ordem.iter().enumerate() {
+            rank[aparecido as usize] = ordenado as u32;
+        }
+        let nomes: Vec<&EntityId> = ordem.iter().map(|&i| aparicao[i as usize]).collect();
+
+        if n == 0 {
+            return GraphAnalytics {
+                community: BTreeMap::new(),
+                metrics: BTreeMap::new(),
+            };
+        }
+
+        // --- grau (conta ARESTAS) e offsets do CSR --------------------------
+        // Os pares passam de ids de APARIÇÃO para ids ORDENADOS, uma vez.
+        for p in pares.iter_mut() {
+            *p = (rank[p.0 as usize], rank[p.1 as usize]);
+        }
+        let mut grau = vec![0u32; n];
+        for &(a, b) in &pares {
+            grau[a as usize] += 1;
+            grau[b as usize] += 1;
+        }
+        let mut offsets = vec![0u32; n + 1];
+        for i in 0..n {
+            offsets[i + 1] = offsets[i] + grau[i];
+        }
+        let mut vizinhos = vec![0u32; offsets[n] as usize];
+        let mut cursor: Vec<u32> = offsets[..n].to_vec();
+        for &(a, b) in &pares {
+            let (a, b) = (a as usize, b as usize);
+            vizinhos[cursor[a] as usize] = b as u32;
+            cursor[a] += 1;
+            vizinhos[cursor[b] as usize] = a as u32;
+            cursor[b] += 1;
+        }
+
+        // --- componentes conexas sobre os índices ---------------------------
+        const SEM_COMUNIDADE: u32 = u32::MAX;
+        let mut comunidade = vec![SEM_COMUNIDADE; n];
+        let mut pilha: Vec<u32> = Vec::new();
+        for semente in 0..n as u32 {
+            if comunidade[semente as usize] != SEM_COMUNIDADE {
+                continue;
+            }
+            comunidade[semente as usize] = semente;
+            pilha.push(semente);
+            while let Some(no) = pilha.pop() {
+                let (i, j) = (offsets[no as usize], offsets[no as usize + 1]);
+                for &m in &vizinhos[i as usize..j as usize] {
+                    if comunidade[m as usize] == SEM_COMUNIDADE {
+                        comunidade[m as usize] = semente;
+                        pilha.push(m);
+                    }
+                }
+            }
+        }
+
+        // --- centralidade e anomaly (z-score do grau) -----------------------
+        let media = grau.iter().map(|g| *g as f32).sum::<f32>() / n as f32;
+        let var = grau
+            .iter()
+            .map(|g| {
+                let x = *g as f32 - media;
+                x * x
+            })
+            .sum::<f32>()
+            / n as f32;
+        let std = var.sqrt();
+
+        // --- de volta aos nomes, `n` vezes ----------------------------------
+        let mut community: BTreeMap<EntityId, EntityId> = BTreeMap::new();
+        let mut metrics: BTreeMap<EntityId, NodeMetrics> = BTreeMap::new();
+        for i in 0..n {
+            community.insert(
+                nomes[i].clone(),
+                nomes[comunidade[i] as usize].clone(),
+            );
+            let deg = grau[i];
+            metrics.insert(
+                nomes[i].clone(),
+                NodeMetrics {
+                    degree: deg,
+                    centrality: if n > 1 {
+                        deg as f32 / (n as f32 - 1.0)
+                    } else {
+                        0.0
+                    },
+                    anomaly_score: if std > 0.0 {
+                        (deg as f32 - media) / std
+                    } else {
+                        0.0
+                    },
+                    computed_at_lsn: as_of,
+                },
+            );
+        }
+
+        GraphAnalytics { community, metrics }
+    }
+
+    /// Métricas de grafo (M14): comunidades, centralidade e anomaly score sobre
+    /// as arestas **vivas em `as_of`** com crença `>= min_confidence`.
+    ///
+    /// Determinístico em tudo (⇒ estável entre replays):
+    ///   - **comunidades**: componentes conexas (não-direcionadas). O id da
     ///     comunidade é o **menor nó** da componente — iteramos os nós ordenados,
     ///     logo a primeira semente não rotulada de uma componente é o seu mínimo.
     ///   - **centralidade**: grau normalizado `degree / (n-1)`.
     ///   - **anomaly_score**: z-score do grau `(deg - média) / desvio` — um "hub"
     ///     com grau muito acima da média (laranja que liga muita gente) destaca-se.
-    pub fn analyze(&self, as_of: Lsn, min_confidence: f32) -> GraphAnalytics {
+    #[cfg(test)]
+    pub(crate) fn analyze_referencia(&self, as_of: Lsn, min_confidence: f32) -> GraphAnalytics {
         // Arestas vivas + confiáveis, em ordem determinística (por edge_id).
         let alive: Vec<&Edge> = self
             .edges
@@ -899,7 +1080,7 @@ impl heraclitus_views::View for TemporalGraph {
 mod tests {
     use super::*;
 
-    fn ver(hyp: &str, conf: f32, etype: &EdgeType) -> EdgeVersion {
+    pub(super) fn ver(hyp: &str, conf: f32, etype: &EdgeType) -> EdgeVersion {
         EdgeVersion {
             hypothesis_id: hyp.into(),
             confidence: conf,
@@ -910,7 +1091,7 @@ mod tests {
         }
     }
 
-    fn edge(id: &str, from: &str, to: &str, etype: EdgeType, vf: Lsn) -> Edge {
+    pub(super) fn edge(id: &str, from: &str, to: &str, etype: EdgeType, vf: Lsn) -> Edge {
         Edge {
             id: id.into(),
             from: from.into(),
@@ -1426,5 +1607,176 @@ mod tests {
         // No LSN 5: tudo numa comunidade.
         let after = g.analyze(5, 0.0);
         assert_eq!(after.community["P"], after.community["S"]);
+    }
+}
+
+#[cfg(test)]
+mod testes_csr {
+    use super::tests::{edge, ver};
+    use super::*;
+    use std::time::Instant;
+
+    struct R(u64);
+    impl R {
+        fn p(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    /// Grafo com comunidades reais: blocos densos ligados por poucas pontes,
+    /// alguns nos isolados, e arestas PARALELAS (que e onde `degree` e
+    /// `adjacencia` divergem — o primeiro conta arestas, o segundo nao).
+    fn grafo(n_nos: usize, n_arestas: usize, semente: u64) -> TemporalGraph {
+        let mut g = TemporalGraph::new();
+        let mut r = R(semente);
+        for i in 0..n_arestas {
+            let bloco = (r.p() % 8) as usize;
+            let base = bloco * (n_nos / 8).max(1);
+            let a = base + (r.p() as usize % (n_nos / 8).max(1));
+            let b = base + (r.p() as usize % (n_nos / 8).max(1));
+            // Uma em cada 40 e uma ponte entre blocos.
+            let b = if i % 40 == 0 { r.p() as usize % n_nos } else { b };
+            let e = edge(
+                &format!("e{i}"),
+                &format!("no-{a:05}"),
+                &format!("no-{b:05}"),
+                EdgeType::SocioDe,
+                0,
+            );
+            let v = ver(&format!("h{i}"), 0.9, &EdgeType::SocioDe);
+            g.upsert_edge(e, vec![v]);
+        }
+        g
+    }
+
+    /// A prova de que o CSR nao mudou a resposta: comunidades, graus,
+    /// centralidade e anomaly identicos aos da versao com `BTreeMap<String, ...>`.
+    #[test]
+    fn o_csr_concorda_com_a_versao_em_btreemap_de_string() {
+        for (n_nos, n_arestas, semente) in [(50, 200, 1u64), (200, 1500, 7), (400, 5000, 99)] {
+            let g = grafo(n_nos, n_arestas, semente);
+            let novo = g.analyze(u64::MAX, 0.0);
+            let refer = g.analyze_referencia(u64::MAX, 0.0);
+
+            assert_eq!(
+                novo.community, refer.community,
+                "comunidades divergiram (n={n_nos}, m={n_arestas})"
+            );
+            assert_eq!(
+                novo.metrics.len(),
+                refer.metrics.len(),
+                "numero de nos divergiu"
+            );
+            for (no, m) in &refer.metrics {
+                let a = novo.metrics.get(no).unwrap_or_else(|| panic!("no {no} em falta"));
+                assert_eq!(a.degree, m.degree, "grau de {no}");
+                assert!((a.centrality - m.centrality).abs() < 1e-6, "centralidade de {no}");
+                assert!(
+                    (a.anomaly_score - m.anomaly_score).abs() < 1e-5,
+                    "anomaly de {no}: {} vs {}",
+                    a.anomaly_score,
+                    m.anomaly_score
+                );
+            }
+        }
+    }
+
+    /// O desempate que o CSR tem de preservar: o id da comunidade e o MENOR
+    /// no da componente. Indexar por ordem alfabetica e o que o garante.
+    #[test]
+    fn o_id_da_comunidade_continua_a_ser_o_menor_no() {
+        let mut g = TemporalGraph::new();
+        for (i, (a, b)) in [("zebra", "melancia"), ("melancia", "abacate")].iter().enumerate() {
+            g.upsert_edge(
+                edge(&format!("e{i}"), a, b, EdgeType::SocioDe, 0),
+                vec![ver(&format!("h{i}"), 0.9, &EdgeType::SocioDe)],
+            );
+        }
+        let a = g.analyze(u64::MAX, 0.0);
+        for no in ["abacate", "melancia", "zebra"] {
+            assert_eq!(a.community[no], "abacate", "comunidade de {no}");
+        }
+    }
+
+    /// Um grafo sem arestas vivas nao pode partir a indexacao densa.
+    #[test]
+    fn um_grafo_vazio_devolve_analise_vazia() {
+        let g = TemporalGraph::new();
+        let a = g.analyze(u64::MAX, 0.0);
+        assert!(a.community.is_empty() && a.metrics.is_empty());
+        assert_eq!(a.community, g.analyze_referencia(u64::MAX, 0.0).community);
+    }
+
+    /// `cargo test -p heraclitus-index-graph --lib medicao_csr -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn custo_da_analise() {
+        for (n_nos, n_arestas) in [(2_000usize, 20_000usize), (10_000, 100_000)] {
+            let g = grafo(n_nos, n_arestas, 42);
+            let t0 = Instant::now();
+            let a = g.analyze(u64::MAX, 0.0);
+            let csr = t0.elapsed();
+            let t1 = Instant::now();
+            let b = g.analyze_referencia(u64::MAX, 0.0);
+            let btree = t1.elapsed();
+            assert_eq!(a.community, b.community);
+            println!(
+                "nos={n_nos:>6} arestas={n_arestas:>7}  CSR {:>10.3?}  BTreeMap<String> {:>10.3?}  ganho {:.1}x",
+                csr,
+                btree,
+                btree.as_secs_f64() / csr.as_secs_f64().max(1e-9)
+            );
+        }
+    }
+
+    /// Onde e que o tempo do CSR vai: no algoritmo, ou a construir o
+    /// `BTreeMap<String, ...>` de saida?
+    #[test]
+    #[ignore]
+    fn onde_vai_o_tempo_do_csr() {
+        let g = grafo(10_000, 100_000, 42);
+        let t0 = Instant::now();
+        let a = g.analyze(u64::MAX, 0.0);
+        let completo = t0.elapsed();
+        // So a parte que constroi a saida: reinserir o mesmo conteudo em dois
+        // BTreeMap de String custa o mesmo que construi-los na analise.
+        let t1 = Instant::now();
+        let mut c2: BTreeMap<EntityId, EntityId> = BTreeMap::new();
+        let mut m2: BTreeMap<EntityId, NodeMetrics> = BTreeMap::new();
+        for (k, v) in &a.community {
+            c2.insert(k.clone(), v.clone());
+        }
+        for (k, v) in &a.metrics {
+            m2.insert(k.clone(), v.clone());
+        }
+        let saida = t1.elapsed();
+        // E o filtro `alive`, que chama `belief_at` por aresta?
+        let t2 = Instant::now();
+        let vivas = g
+            .edges
+            .values()
+            .filter(|e| e.alive_at(u64::MAX) && g.belief_at(&e.id, u64::MAX) >= 0.0)
+            .count();
+        let filtro = t2.elapsed();
+        // E so o `alive_at`, sem o belief?
+        let t3 = Instant::now();
+        let vivas2 = g.edges.values().filter(|e| e.alive_at(u64::MAX)).count();
+        let so_alive = t3.elapsed();
+        println!("analyze completa : {completo:>10.3?}");
+        println!("filtro alive+belief: {filtro:>10.3?}  ({vivas} arestas)");
+        println!("so alive_at        : {so_alive:>10.3?}  ({vivas2} arestas)");
+        println!(
+            "fraccao no belief  : {:.0}%",
+            100.0 * (filtro.as_secs_f64() - so_alive.as_secs_f64()) / completo.as_secs_f64()
+        );
+        println!("so a saida       : {saida:>10.3?}");
+        println!(
+            "fraccao na saida : {:.0}%  (nos={}, arestas=100000)",
+            100.0 * saida.as_secs_f64() / completo.as_secs_f64(),
+            a.metrics.len()
+        );
     }
 }
