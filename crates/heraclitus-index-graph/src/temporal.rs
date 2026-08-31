@@ -175,6 +175,42 @@ impl BeliefPolicy {
     /// portanto duas regras conflitantes coexistem sem quebrar a consistência —
     /// a crença simplesmente reflete o saldo das evidências.
     pub fn aggregate_as_of(&self, versions: &[EdgeVersion], as_of: Lsn) -> f32 {
+        // Uma passagem, sem alocar e sem ordenar.
+        //
+        // A versão anterior construía um `Vec<&EdgeVersion>` e ordenava-o por
+        // `hypothesis_id` — comparações de CADEIA — em cada chamada. Isso era
+        // redundante: `upsert_edge` já guarda as versions ordenadas por
+        // `hypothesis_id` (ver o `entry.sort_by` lá), e filtrar preserva a
+        // ordem relativa. A soma vista aqui é exactamente a mesma sequência de
+        // parcelas, pela mesma ordem, logo o resultado é idêntico até ao último
+        // bit — não é uma aproximação.
+        //
+        // Importa que seja bit-a-bit: a soma é de `f32` e a ordem das parcelas
+        // muda o arredondamento, e esta crença entra em decisões que têm de ser
+        // reprodutíveis entre replays.
+        //
+        // `belief_at` é chamada uma vez POR ARESTA no filtro de `analyze`, pelo
+        // que uma alocação e uma ordenação por chamada eram o grosso do custo
+        // dessa análise.
+        let mut sum = 0.0f32;
+        let mut alguma = false;
+        for v in versions.iter().filter(|v| v.valid_from_lsn <= as_of) {
+            sum += v.polarity * self.logit(v.confidence);
+            alguma = true;
+        }
+        if !alguma {
+            return 0.0;
+        }
+        1.0 / (1.0 + (-sum).exp()) // sigmoid
+    }
+
+    /// A implementação anterior, guardada SÓ como referência de teste.
+    #[cfg(test)]
+    pub(crate) fn aggregate_as_of_referencia(
+        &self,
+        versions: &[EdgeVersion],
+        as_of: Lsn,
+    ) -> f32 {
         let mut vs: Vec<&EdgeVersion> = versions
             .iter()
             .filter(|v| v.valid_from_lsn <= as_of)
@@ -187,7 +223,7 @@ impl BeliefPolicy {
             .iter()
             .map(|v| v.polarity * self.logit(v.confidence))
             .sum();
-        1.0 / (1.0 + (-sum).exp()) // sigmoid
+        1.0 / (1.0 + (-sum).exp())
     }
 
     /// Agrega todas as versions (head state) — atalho para `aggregate_as_of(.., MAX)`.
@@ -1778,5 +1814,110 @@ mod testes_csr {
             100.0 * saida.as_secs_f64() / completo.as_secs_f64(),
             a.metrics.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod testes_belief {
+    use super::tests::ver;
+    use super::*;
+    use std::time::Instant;
+
+    struct R(u64);
+    impl R {
+        fn p(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn conf(&mut self) -> f32 {
+            (self.p() % 9_999) as f32 / 10_000.0 + 0.00005
+        }
+    }
+
+    /// Versoes com hypothesis_id fora de ordem alfabetica de CHEGADA, para o
+    /// caso em que a ordenacao importaria se `upsert_edge` nao a fizesse.
+    fn versoes(n: usize, semente: u64) -> Vec<EdgeVersion> {
+        let mut r = R(semente);
+        let mut v: Vec<EdgeVersion> = (0..n)
+            .map(|i| {
+                let mut e = ver(&format!("h{:04}", (i * 7919) % 10_000), r.conf(), &EdgeType::SocioDe);
+                e.valid_from_lsn = (r.p() % 1_000) as Lsn;
+                e.polarity = if r.p().is_multiple_of(3) { -1.0 } else { 1.0 };
+                e
+            })
+            .collect();
+        // Como `upsert_edge` faria.
+        v.sort_by(|a, b| a.hypothesis_id.cmp(&b.hypothesis_id));
+        v
+    }
+
+    /// A prova de que remover a ordenacao nao mudou NADA: bit a bit.
+    ///
+    /// Nao e uma tolerancia — e igualdade exacta. A soma e de `f32` e a ordem
+    /// das parcelas muda o arredondamento; se a nova versao somasse por outra
+    /// ordem, este teste apanhava.
+    #[test]
+    fn a_agregacao_sem_ordenacao_e_bit_a_bit_identica() {
+        let politica = BeliefPolicy::default();
+        for (n, semente) in [(1usize, 1u64), (2, 5), (7, 11), (50, 23), (200, 97)] {
+            let vs = versoes(n, semente);
+            for as_of in [0u64, 250, 500, 999, u64::MAX] {
+                let novo = politica.aggregate_as_of(&vs, as_of);
+                let refer = politica.aggregate_as_of_referencia(&vs, as_of);
+                assert_eq!(
+                    novo.to_bits(),
+                    refer.to_bits(),
+                    "n={n} semente={semente} as_of={as_of}: {novo} vs {refer}"
+                );
+            }
+        }
+    }
+
+    /// Sem versoes vivas, zero — como antes.
+    #[test]
+    fn sem_versoes_vivas_a_crenca_e_zero() {
+        let politica = BeliefPolicy::default();
+        let vs = versoes(10, 3);
+        // `valid_from_lsn` gerado em [0, 1000); as_of abaixo do minimo.
+        let min = vs.iter().map(|v| v.valid_from_lsn).min().unwrap();
+        if min > 0 {
+            assert_eq!(politica.aggregate_as_of(&vs, min - 1), 0.0);
+        }
+        assert_eq!(politica.aggregate_as_of(&[], u64::MAX), 0.0);
+    }
+
+    /// `cargo test -p heraclitus-index-graph --lib custo_do_belief -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn custo_do_belief() {
+        let politica = BeliefPolicy::default();
+        for n in [3usize, 12, 60] {
+            let vs = versoes(n, 42);
+            let repeticoes = 200_000usize;
+
+            let t0 = Instant::now();
+            let mut a = 0.0f32;
+            for i in 0..repeticoes {
+                a += politica.aggregate_as_of(&vs, (i % 1000) as Lsn);
+            }
+            let novo = t0.elapsed();
+
+            let t1 = Instant::now();
+            let mut b = 0.0f32;
+            for i in 0..repeticoes {
+                b += politica.aggregate_as_of_referencia(&vs, (i % 1000) as Lsn);
+            }
+            let refer = t1.elapsed();
+
+            assert_eq!(a.to_bits(), b.to_bits());
+            println!(
+                "versoes={n:>3}  novo {:>10.3?}  com ordenacao {:>10.3?}  ganho {:.1}x",
+                novo,
+                refer,
+                refer.as_secs_f64() / novo.as_secs_f64().max(1e-9)
+            );
+        }
     }
 }
