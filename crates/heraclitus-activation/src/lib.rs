@@ -16,6 +16,9 @@ pub const RECENT_K: usize = 8;
 pub struct ActivationRecord {
     /// Last K access timestamps (seconds) — exact head.
     pub recent: ArrayVec<u64, RECENT_K>,
+    /// Posição a sobrescrever quando `recent` está cheio — o que torna o
+    /// buffer circular em vez de deslocado.
+    pub proximo_slot: usize,
     /// Total access count.
     pub n: u64,
     /// Lifetime anchor: first access timestamp.
@@ -27,10 +30,27 @@ impl ActivationRecord {
         if self.n == 0 {
             self.first_access = now_secs;
         }
+        // `remove(0)` desloca todo o buffer a cada acesso depois de ele
+        // encher — O(RECENT_K) por acesso, e o acesso é a operação mais
+        // frequente desta estrutura. Com o buffer cheio, sobrescreve-se a
+        // posição mais antiga em vez de deslocar: O(1).
+        //
+        // A ordem deixa de ser cronológica dentro do `ArrayVec`. O somatório
+        // em `raw_sum` não se importa — trata os instantes como um conjunto —
+        // mas a CAUDA importa-se: precisa da idade do acesso mais antigo ainda
+        // retido, que a versão deslocada lia em `recent.first()`.
+        //
+        // Num buffer circular esse elemento é exactamente o próximo a ser
+        // sobrescrito, portanto continua a ser O(1) — ver `mais_antigo`. Foi um
+        // teste existente (`approximation_error_bound`) que apanhou esta
+        // dependência depois de eu ter afirmado, no primeiro comentário, que a
+        // ordem não importava.
         if self.recent.is_full() {
-            self.recent.remove(0);
+            self.recent[self.proximo_slot] = now_secs;
+            self.proximo_slot = (self.proximo_slot + 1) % RECENT_K;
+        } else {
+            self.recent.push(now_secs);
         }
-        self.recent.push(now_secs);
         self.n += 1;
     }
 
@@ -48,6 +68,20 @@ impl ActivationRecord {
         self.raw_sum(now_secs, d).ln()
     }
 
+    /// O instante do acesso mais antigo ainda retido em `recent`.
+    ///
+    /// Com o buffer cheio, é a posição que vai ser sobrescrita a seguir — o
+    /// buffer é circular, portanto o próximo a sair é o mais velho. Antes de
+    /// encher, os elementos ainda estão por ordem de chegada e o mais antigo é
+    /// o primeiro.
+    fn mais_antigo(&self) -> Option<u64> {
+        if self.recent.is_full() {
+            self.recent.get(self.proximo_slot).copied()
+        } else {
+            self.recent.first().copied()
+        }
+    }
+
     /// The pre-logarithm activation mass (exposed for error-bound tests).
     pub fn raw_sum(&self, now_secs: u64, d: f64) -> f64 {
         if self.n == 0 {
@@ -61,9 +95,8 @@ impl ActivationRecord {
         let k = self.recent.len() as u64;
         if self.n > k {
             let life = (now_secs.saturating_sub(self.first_access)).max(1) as f64;
-            let oldest_recent_age = (now_secs
-                .saturating_sub(self.recent.first().copied().unwrap_or(now_secs)))
-            .max(1) as f64;
+            let oldest_recent_age =
+                (now_secs.saturating_sub(self.mais_antigo().unwrap_or(now_secs))).max(1) as f64;
             let (h, l) = (
                 oldest_recent_age.min(life),
                 life.max(oldest_recent_age + 1.0),
@@ -136,8 +169,22 @@ impl ActivationStore {
             .collect();
         // Desempate por id: o DashMap itera em ordem aleatória — o conjunto
         // top-k com scores empatados variava entre execuções.
-        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
-        hits.truncate(k);
+        let ordem =
+            |a: &ActivationHit, b: &ActivationHit| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id));
+        // Seleção parcial em vez de ordenação total: para devolver `k` de `n`
+        // não é preciso ordenar os `n`. `select_nth_unstable_by` é O(n) e
+        // deixa os `k` melhores no prefixo (por ordem arbitrária entre si);
+        // ordenar só esse prefixo custa O(k log k).
+        //
+        // O resultado é IDÊNTICO ao da ordenação total porque o comparador é
+        // uma ordem total — `total_cmp` sobre os scores, `id` a desempatar —
+        // pelo que o conjunto dos `k` primeiros e a sua ordem ficam
+        // determinados sem ambiguidade.
+        if k < hits.len() {
+            hits.select_nth_unstable_by(k, ordem);
+            hits.truncate(k);
+        }
+        hits.sort_by(ordem);
         hits
     }
 
@@ -336,5 +383,102 @@ mod watermark_order_tests {
             6,
             "watermark regrediu com entrega fora de ordem"
         );
+    }
+}
+
+#[cfg(test)]
+mod testes_otimizacao {
+    use super::*;
+
+    /// O buffer circular tem de continuar a saber qual e o acesso mais antigo.
+    /// Foi isto que o `approximation_error_bound` apanhou quando eu troquei o
+    /// `remove(0)` sem olhar para quem lia `recent.first()`.
+    #[test]
+    fn o_mais_antigo_esta_certo_depois_de_dar_a_volta() {
+        let mut r = ActivationRecord::default();
+        // Enche exactamente.
+        for t in 0..RECENT_K as u64 {
+            r.access(t + 1);
+        }
+        assert!(r.recent.is_full());
+        assert_eq!(r.mais_antigo(), Some(1), "antes de dar a volta, o primeiro");
+
+        // Uma volta completa: cada acesso substitui o mais velho.
+        for i in 0..RECENT_K as u64 {
+            let novo = 1000 + i;
+            r.access(novo);
+            let esperado = if i + 1 < RECENT_K as u64 {
+                // ainda sobram instantes antigos; o mais velho e o seguinte
+                i + 2
+            } else {
+                1000
+            };
+            assert_eq!(
+                r.mais_antigo(),
+                Some(esperado),
+                "depois de {} sobrescritas o mais antigo devia ser {esperado}",
+                i + 1
+            );
+        }
+    }
+
+    /// Antes de encher, o comportamento e o de sempre.
+    #[test]
+    fn antes_de_encher_o_mais_antigo_e_o_primeiro() {
+        let mut r = ActivationRecord::default();
+        r.access(10);
+        r.access(20);
+        assert_eq!(r.mais_antigo(), Some(10));
+        assert_eq!(r.recent.len(), 2);
+    }
+
+    /// O somatorio nao depende da ordem — e o que permite o buffer circular.
+    #[test]
+    fn o_somatorio_e_o_mesmo_seja_qual_for_a_ordem() {
+        let mut a = ActivationRecord::default();
+        let mut b = ActivationRecord::default();
+        for t in [100u64, 200, 300] {
+            a.access(t);
+        }
+        for t in [300u64, 100, 200] {
+            b.access(t);
+        }
+        a.n = 3;
+        b.n = 3;
+        let (sa, sb) = (a.raw_sum(1000, 0.5), b.raw_sum(1000, 0.5));
+        assert!((sa - sb).abs() < 1e-12, "{sa} vs {sb}");
+    }
+
+    /// A seleccao parcial devolve exactamente o mesmo que a ordenacao total —
+    /// mesmos elementos, mesma ordem, incluindo o desempate por id.
+    #[test]
+    fn o_top_k_parcial_concorda_com_a_ordenacao_total() {
+        let idx = ActivationStore::new(0.5);
+        let mut ids: Vec<EventId> = (0..500).map(|_| EventId::new()).collect();
+        ids.sort();
+        for (i, id) in ids.iter().enumerate() {
+            // Muitos empates de proposito: e onde o desempate por id se ve.
+            for _ in 0..=(i % 5) {
+                idx.touch(*id, 1_000);
+            }
+        }
+        for k in [1usize, 7, 50, 499, 500, 900] {
+            let parcial = idx.top_k(2_000, k);
+            // Referencia: ordenacao total, como era antes.
+            let mut total: Vec<ActivationHit> = idx
+                .records
+                .iter()
+                .map(|e| ActivationHit {
+                    id: *e.key(),
+                    score: e.value().score(2_000, idx.decay) as f32,
+                })
+                .collect();
+            total.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
+            total.truncate(k);
+            assert_eq!(parcial.len(), total.len(), "k={k}");
+            for (i, (p, t)) in parcial.iter().zip(total.iter()).enumerate() {
+                assert_eq!(p.id, t.id, "k={k} posicao {i}");
+            }
+        }
     }
 }
