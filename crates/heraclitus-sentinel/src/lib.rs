@@ -96,7 +96,7 @@ pub use threat::{
 use heraclitus_core::{Episode, EventId, EventKind, HeraclitusError, Lsn};
 use heraclitus_log::subscribe::attach_subscriber_with_stop;
 use heraclitus_log::AnyLog;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -149,6 +149,64 @@ impl DerivedEventSink for DirectLogSink {
     }
 }
 
+/// Conjunto de chaves recentes com tecto: deduplica sem crescer para sempre.
+///
+/// Um `HashSet` puro num processo de vida longa e um vazamento com outro nome.
+/// Aqui a ordem de insercao vive num `VecDeque` e a mais antiga sai quando o
+/// tecto e atingido.
+#[derive(Debug)]
+pub(crate) struct JanelaRecente<T> {
+    vistas: HashSet<T>,
+    ordem: VecDeque<T>,
+    tecto: usize,
+}
+
+impl<T: std::hash::Hash + Eq + Clone> JanelaRecente<T> {
+    pub(crate) fn nova(tecto: usize) -> Self {
+        Self {
+            vistas: HashSet::new(),
+            ordem: VecDeque::new(),
+            tecto: tecto.max(1),
+        }
+    }
+
+    /// `true` se a chave e NOVA (e portanto o trabalho deve ser feito).
+    pub(crate) fn inserir(&mut self, chave: &T) -> bool {
+        if self.vistas.contains(chave) {
+            return false;
+        }
+        if self.ordem.len() >= self.tecto {
+            if let Some(velha) = self.ordem.pop_front() {
+                self.vistas.remove(&velha);
+            }
+        }
+        self.vistas.insert(chave.clone());
+        self.ordem.push_back(chave.clone());
+        true
+    }
+
+    pub(crate) fn contem(&self, chave: &T) -> bool {
+        self.vistas.contains(chave)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn len(&self) -> usize {
+        self.ordem.len()
+    }
+}
+
+/// Nome antigo, mantido para o sitio que so lida com chaves de texto.
+pub(crate) type JanelaDeChaves = JanelaRecente<String>;
+
+/// Quantas chaves de sighting se guardam. O duplicado que a deduplicacao existe
+/// para apanhar chega no mesmo ciclo de processamento, portanto isto e ordens de
+/// grandeza mais do que o necessario — e continua a caber em poucos MB.
+pub(crate) const TECTO_CHAVES_SIGHTING: usize = 65_536;
+
+/// Quantos LSNs de origem se guardam. Cobre qualquer reordenacao realista entre
+/// a derivacao e o derivado a voltar pelo subscriber.
+pub(crate) const TECTO_LSN_DERIVADOS: usize = 262_144;
+
 struct RuntimeInner {
     log: Arc<AnyLog>,
     derived_sink: Arc<dyn DerivedEventSink>,
@@ -174,8 +232,30 @@ struct RuntimeInner {
     /// aqui — como ja vivia para os sinais. Sem isto, o mesmo evento visto
     /// pelos dois caminhos (a derivacao e o derivado a voltar pelo
     /// subscriber) produzia dois sightings da mesma observacao.
-    sighting_keys: Mutex<HashSet<String>>,
-    derived_sources: Mutex<HashSet<Lsn>>,
+    ///
+    /// Tem TECTO. Escrevi isto primeiro como um `HashSet<String>` puro, e essa
+    /// versao nunca largava nada: a chave inclui o `event_id`, que e um ULID
+    /// unico por evento, portanto **cada sighting emitido acrescentava uma
+    /// entrada permanente**. Num servico que corre semanas com um feed activo
+    /// sao centenas de MB de chaves que nunca mais servem para nada.
+    ///
+    /// A janela e suficiente porque o duplicado que isto existe para apanhar
+    /// chega PERTO: e o mesmo evento a voltar pelo subscriber logo a seguir a
+    /// derivacao, nao um evento de ha uma semana.
+    sighting_keys: Mutex<JanelaDeChaves>,
+    /// LSNs de origem ja derivados, para nao derivar duas vezes o mesmo evento.
+    ///
+    /// Tem TECTO, e nao tinha. Era um `HashSet<Lsn>` que recebia um `u64` por
+    /// CADA evento derivado e nunca largava nenhum: num servico desenhado para
+    /// correr indefinidamente, isso e um vazamento que cresce com o trafego —
+    /// alguns bytes por evento, mas sem fim.
+    ///
+    /// A janela e conservadora de proposito. Um marco de agua alta seria exacto
+    /// se o processamento fosse estritamente monotonico, e nao confirmei que
+    /// seja; uma janela funciona sob qualquer ordenacao. O que se troca e
+    /// explicito: um evento repetido a mais de `TECTO_LSN_DERIVADOS` de
+    /// distancia voltaria a ser derivado.
+    derived_sources: Mutex<JanelaRecente<Lsn>>,
     security_graph: Option<Mutex<TemporalSecurityGraph>>,
     incident_engine: Option<Mutex<IncidentEngine>>,
     incident_revision_ids: Mutex<HashSet<String>>,
@@ -381,8 +461,14 @@ impl SentinelRuntime {
             fusion,
             fusion_state: Mutex::new(BTreeMap::new()),
             signal_ids: Mutex::new(signal_ids),
-            sighting_keys: Mutex::new(HashSet::new()),
-            derived_sources: Mutex::new(derived_sources),
+            sighting_keys: Mutex::new(JanelaDeChaves::nova(TECTO_CHAVES_SIGHTING)),
+            derived_sources: Mutex::new({
+                let mut j = JanelaRecente::nova(TECTO_LSN_DERIVADOS);
+                for lsn in derived_sources {
+                    j.inserir(&lsn);
+                }
+                j
+            }),
             security_graph,
             incident_engine,
             incident_revision_ids: Mutex::new(incident_revision_ids),
@@ -1683,7 +1769,7 @@ fn process_until(inner: &RuntimeInner) -> Result<(), SentinelError> {
                     .derived_sources
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .contains(&lsn);
+                    .contem(&lsn);
             let derived_lsn = if !already_derived {
                 let derived = normalized.event.into_episode(
                     Some(normalized.source_lsn),
@@ -1699,7 +1785,7 @@ fn process_until(inner: &RuntimeInner) -> Result<(), SentinelError> {
                     .derived_sources
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(lsn);
+                    .inserir(&lsn);
                 Some(derived_lsn)
             } else {
                 None
@@ -1829,12 +1915,12 @@ fn evaluate_threat(
             "t:{}:{}:{}",
             sighting.indicator_id, sighting.match_kind, sighting.event_id
         );
-        let ja_emitido = !inner
+        let novo = inner
             .sighting_keys
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(key.clone());
-        if ja_emitido {
+            .inserir(&key.to_string());
+        if !novo {
             continue;
         }
         inner.derived_sink.append(sighting.into_episode()?, &key)?;
@@ -3175,5 +3261,103 @@ detection:
         assert_eq!(runtime.status().risk_assessments_emitted_total, 1);
         assert_eq!(runtime.status().incidents_created_total, 1);
         runtime.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod testes_janela_de_chaves {
+    use super::{JanelaDeChaves, TECTO_CHAVES_SIGHTING};
+
+    /// A propriedade que a deduplicacao existe para ter: o mesmo evento visto
+    /// duas vezes pelos dois caminhos so produz UM sighting.
+    #[test]
+    fn uma_chave_repetida_e_suprimida() {
+        let mut j = JanelaDeChaves::nova(8);
+        assert!(j.inserir(&"t:ioc-1:domain:E1".to_string()), "a primeira e nova");
+        assert!(!j.inserir(&"t:ioc-1:domain:E1".to_string()), "a segunda e o duplicado");
+        assert!(j.inserir(&"t:ioc-1:domain:E2".to_string()), "outro evento e outra chave");
+    }
+
+    /// A propriedade que faltava: a estrutura NAO cresce para sempre.
+    ///
+    /// A versao anterior era um `HashSet<String>` sem poda, e a chave inclui um
+    /// ULID unico por evento — cada sighting emitido deixava la uma entrada que
+    /// nunca mais servia para nada.
+    #[test]
+    fn a_janela_nao_cresce_para_alem_do_tecto() {
+        let mut j = JanelaDeChaves::nova(16);
+        for i in 0..10_000 {
+            j.inserir(&format!("t:ioc:kind:evento-{i}"));
+        }
+        assert_eq!(
+            j.len(),
+            16,
+            "dez mil chaves distintas nao podem deixar dez mil entradas"
+        );
+    }
+
+    /// A consequencia aceite de ter tecto: uma chave antiga sai, e se o mesmo
+    /// evento voltasse muito depois seria emitido outra vez. E aceitavel porque
+    /// o duplicado que isto apanha chega no mesmo ciclo, nao dias depois.
+    #[test]
+    fn a_chave_mais_antiga_sai_quando_o_tecto_e_atingido() {
+        let mut j = JanelaDeChaves::nova(2);
+        assert!(j.inserir(&"a".to_string()));
+        assert!(j.inserir(&"b".to_string()));
+        assert!(!j.inserir(&"a".to_string()), "ainda esta na janela");
+        j.inserir(&"c".to_string()); // expulsa "a"
+        assert!(j.inserir(&"a".to_string()), "saiu da janela, volta a ser nova");
+        assert_eq!(j.len(), 2);
+    }
+
+    /// Um tecto de zero seria um `insert` que nunca deduplica; a construcao
+    /// eleva-o a um.
+    #[test]
+    fn um_tecto_de_zero_e_elevado_a_um() {
+        let mut j = JanelaDeChaves::nova(0);
+        assert!(j.inserir(&"x".to_string()));
+        assert!(!j.inserir(&"x".to_string()));
+        assert_eq!(j.len(), 1);
+    }
+
+    #[test]
+    fn o_tecto_de_producao_e_o_declarado() {
+        let j = JanelaDeChaves::nova(TECTO_CHAVES_SIGHTING);
+        assert_eq!(j.len(), 0);
+        assert_eq!(TECTO_CHAVES_SIGHTING, 65_536);
+    }
+}
+
+#[cfg(test)]
+mod testes_janela_de_lsn {
+    use super::{JanelaRecente, TECTO_LSN_DERIVADOS};
+
+    /// A propriedade que existe para ter: nao derivar duas vezes o mesmo LSN.
+    #[test]
+    fn um_lsn_ja_derivado_e_reconhecido() {
+        let mut j: JanelaRecente<u64> = JanelaRecente::nova(8);
+        assert!(j.inserir(&42));
+        assert!(j.contem(&42));
+        assert!(!j.inserir(&42), "o segundo pedido nao e novo");
+        assert!(!j.contem(&43));
+    }
+
+    /// A que faltava: NAO cresce com o trafego. Era um `HashSet<Lsn>` que
+    /// recebia um u64 por evento derivado e nunca largava nenhum — num servico
+    /// desenhado para correr indefinidamente, um vazamento sem fim.
+    #[test]
+    fn a_janela_de_lsn_nao_cresce_com_o_trafego() {
+        let mut j: JanelaRecente<u64> = JanelaRecente::nova(64);
+        for lsn in 0..100_000u64 {
+            j.inserir(&lsn);
+        }
+        assert_eq!(j.len(), 64, "cem mil eventos nao podem deixar cem mil entradas");
+        assert!(j.contem(&99_999), "os recentes continuam la");
+        assert!(!j.contem(&0), "os antigos sairam, que e o que o tecto significa");
+    }
+
+    #[test]
+    fn o_tecto_de_producao_e_o_declarado() {
+        assert_eq!(TECTO_LSN_DERIVADOS, 262_144);
     }
 }
