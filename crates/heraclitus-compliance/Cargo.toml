@@ -36,6 +36,8 @@ fips204 = "0.4.6"
 x509-cert = { version = "0.2", features = ["builder"] }
 cms = "0.2"
 rsa = "0.9"
+# Parametros de RSASSA-PSS: o digest de um PSS vem dos parametros, nao do OID.
+pkcs1 = "0.7"
 # A feature `ring` e explicita porque a arvore tem `ring` E `aws-lc-rs`
 # (vindos de dependentes diferentes) e, com as duas presentes, o rustls nao
 # consegue escolher um provider por omissao — o `ClientConfig::builder()`
@@ -46,3 +48,11 @@ rustls-pki-types = "1"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# A feature `sha2` do `rsa` so acrescenta os impls de RsaSignatureAssociatedOid
+# (Sha256/384/512 -> OID de assinatura), de que a PKI SINTETICA precisa para
+# emitir certificados RSA. Fica em dev-dependencies de proposito: o binario de
+# producao nao precisa de emitir certificados, so de os verificar.
+#
+# `sha1` NAO e activada e nao deve ser: activa-la poria o OID de
+# sha1WithRSAEncryption ao alcance de codigo que nao o deve poder produzir.
+rsa = { version = "0.9", features = ["sha2"] }

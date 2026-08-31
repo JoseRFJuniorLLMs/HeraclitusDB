@@ -474,6 +474,14 @@ pub struct HeraclitusConfig {
     /// CRLs periodicamente alarga isto — e ao alargá-lo está a declarar quanto
     /// risco aceita, em vez de o sistema decidir por ele em silêncio.
     pub compliance_crl_max_staleness_secs: u64,
+    /// Exigir que cada CRL declare `nextUpdate` (default `true`).
+    ///
+    /// Sem `nextUpdate` a CRL escapa por completo à política de frescura: uma
+    /// de 2019 responderia "não revogado" com a mesma autoridade de uma de
+    /// hoje. A RFC 5280 diz que ACs conformes DEVEM emitir o campo, portanto
+    /// exigi-lo não recusa nada de legítimo — desligá-lo é uma decisão sobre
+    /// quanto risco se aceita, e por isso é explícita.
+    pub compliance_crl_exigir_next_update: bool,
 
     /// SPEC-016 — endereço do servidor Arrow Flight (gRPC, feature `analytics`).
     /// `None` = desligado (default).
@@ -610,6 +618,7 @@ impl Default for HeraclitusConfig {
             compliance_sovereignty_mode: "off".to_string(),
             compliance_crl_dir: None,
             compliance_crl_max_staleness_secs: 0,
+            compliance_crl_exigir_next_update: true,
             flight_addr: None,
             telemetry_interval_secs: 0,
             replication: None,
@@ -987,6 +996,10 @@ impl HeraclitusConfig {
             if let Ok(n) = v.parse::<u64>() {
                 self.compliance_crl_max_staleness_secs = n;
             }
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_COMPLIANCE_CRL_ALLOW_NO_NEXT_UPDATE") {
+            self.compliance_crl_exigir_next_update =
+                !matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes");
         }
         if let Ok(v) = std::env::var("HERACLITUS_COMPLIANCE_TSA_POLICY") {
             if !v.is_empty() {

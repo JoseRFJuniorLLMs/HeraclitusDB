@@ -28,7 +28,9 @@
 
 pub mod commit;
 pub mod dashboard;
+pub mod algoritmos;
 pub mod classification;
+pub mod constraints;
 pub mod crl;
 pub mod deferred;
 pub mod model_bundle;

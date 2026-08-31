@@ -39,7 +39,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use der::{Decode, Encode};
+use der::{Decode, Encode, Tagged};
 use x509_cert::crl::CertificateList;
 
 use crate::CompError;
@@ -57,7 +57,7 @@ const MAX_CRLS: usize = 256;
 /// recusa passaria a ser aceite sem que ninguém desse por isso.
 pub type VerificadorAssinatura<'a> = &'a dyn Fn(
     &x509_cert::Certificate,
-    &der::asn1::ObjectIdentifier,
+    &x509_cert::spki::AlgorithmIdentifierOwned,
     &[u8],
     &[u8],
 ) -> Result<(), CompError>;
@@ -77,12 +77,21 @@ pub struct CrlPolicy {
     /// alargá-lo está a declarar quanto risco aceita, que é melhor do que o
     /// sistema decidir por ele em silêncio.
     pub max_staleness: std::time::Duration,
+    /// Exigir que a CRL declare `nextUpdate`.
+    ///
+    /// `true` por defeito. Sem `nextUpdate` nao ha frescura nenhuma a impor e a
+    /// CRL escapa por completo a `max_staleness`: uma CRL de 2019 responderia
+    /// "nao revogado" com a mesma autoridade de uma de hoje. A RFC 5280 diz que
+    /// as ACs conformes DEVEM emitir `nextUpdate`, portanto exigi-lo nao recusa
+    /// nada de legitimo.
+    pub exigir_next_update: bool,
 }
 
 impl Default for CrlPolicy {
     fn default() -> Self {
         Self {
             max_staleness: std::time::Duration::ZERO,
+            exigir_next_update: true,
         }
     }
 }
@@ -261,77 +270,201 @@ pub struct EstadoRevogacao {
     pub crl_this_update_ms: u64,
 }
 
-/// Uma CRL que serve para este emissor: assinatura confere e está dentro da
-/// janela permitida.
-fn crl_utilizavel<'a>(
+/// Extensões de CRL que este validador processa. Uma extensão CRÍTICA fora
+/// desta lista faz recusar a CRL (RFC 5280 §5.2 + §6.3.3).
+const OID_DELTA_CRL_INDICATOR: der::asn1::ObjectIdentifier =
+    der::asn1::ObjectIdentifier::new_unwrap("2.5.29.27");
+const OID_ISSUING_DISTRIBUTION_POINT: der::asn1::ObjectIdentifier =
+    der::asn1::ObjectIdentifier::new_unwrap("2.5.29.28");
+const OID_CRL_NUMBER: der::asn1::ObjectIdentifier =
+    der::asn1::ObjectIdentifier::new_unwrap("2.5.29.20");
+const OID_AUTHORITY_KEY_ID: der::asn1::ObjectIdentifier =
+    der::asn1::ObjectIdentifier::new_unwrap("2.5.29.35");
+
+/// §5.2 — o âmbito da CRL. Uma CRL parcial usada como se fosse completa
+/// responde "não revogado" sobre certificados que ela nunca teve de cobrir.
+fn verificar_ambito(crl: &CertificateList, e_ca: bool) -> Result<(), CompError> {
+    let Some(exts) = crl.tbs_cert_list.crl_extensions.as_ref() else {
+        return Ok(());
+    };
+    for ext in exts.iter() {
+        match ext.extn_id {
+            // §5.2.4 — uma delta CRL lista só o que MUDOU desde uma CRL base.
+            // Tratá-la como completa é responder "não revogado" sobre tudo o
+            // que foi revogado antes dela. É sempre crítica, por esta razão.
+            OID_DELTA_CRL_INDICATOR => {
+                return Err(CompError::Verify(
+                    "esta é uma delta CRL: lista só as alterações desde uma CRL base e usá-la \
+                     como completa daria 'não revogado' a tudo o que foi revogado antes. \
+                     Instale a CRL completa"
+                        .into(),
+                ))
+            }
+            OID_ISSUING_DISTRIBUTION_POINT => {
+                let idp = x509_cert::ext::pkix::IssuingDistributionPoint::from_der(
+                    ext.extn_value.as_bytes(),
+                )
+                .map_err(|e| {
+                    CompError::Verify(format!("issuingDistributionPoint inválido: {e}"))
+                })?;
+                if idp.only_some_reasons.is_some() {
+                    return Err(CompError::Verify(
+                        "CRL limitada a alguns motivos de revogação (onlySomeReasons): não \
+                         cobre todos os casos e usá-la como completa esconderia os restantes"
+                            .into(),
+                    ));
+                }
+                if idp.indirect_crl {
+                    return Err(CompError::Verify(
+                        "CRL indirecta (indirectCRL): as entradas podem pertencer a outros \
+                         emissores via certificateIssuer, que este validador não interpreta"
+                            .into(),
+                    ));
+                }
+                // Uma CRL só de utilizadores não diz nada sobre uma AC, e
+                // vice-versa. Responder com ela é responder à pergunta errada.
+                if idp.only_contains_ca_certs && !e_ca {
+                    return Err(CompError::Verify(
+                        "CRL só de certificados de AC consultada para um certificado de fim de \
+                         entidade"
+                            .into(),
+                    ));
+                }
+                if idp.only_contains_user_certs && e_ca {
+                    return Err(CompError::Verify(
+                        "CRL só de certificados de utilizador consultada para uma AC".into(),
+                    ));
+                }
+            }
+            // Conhecidas e sem efeito na decisão.
+            OID_CRL_NUMBER | OID_AUTHORITY_KEY_ID => {}
+            outro if ext.critical => {
+                return Err(CompError::Verify(format!(
+                    "CRL com a extensão crítica {outro} que este validador não processa: §5.2 \
+                     manda recusar, porque crítica significa que ignorá-la muda a resposta"
+                )))
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Todas as CRLs deste emissor que servem: assinatura confere, âmbito
+/// compatível e dentro da janela permitida.
+///
+/// Devolve **todas** e não a primeira. Consultar só a primeira era um buraco
+/// real: um emissor com CRLs particionadas (ou simplesmente com duas versões na
+/// pasta) tem o serial revogado numa e ausente noutra, e a primeira que
+/// aparecesse decidia. O ficheiro que o `read_dir` devolvesse primeiro passava
+/// a ser a política de revogação do órgão.
+#[allow(clippy::type_complexity)]
+fn crls_utilizaveis<'a>(
     crls: &'a [CertificateList],
     emissor: &x509_cert::Certificate,
+    e_ca: bool,
     now_unix_ms: u64,
     policy: &CrlPolicy,
     verificar_assinatura: VerificadorAssinatura<'_>,
     tempo_ms: ConversorTempo<'_>,
-) -> Result<(&'a CertificateList, u64, Option<u64>), CompError> {
-    let mut ultimo_erro = String::from("nenhuma CRL para este emissor");
+) -> Result<Vec<(&'a CertificateList, u64, Option<u64>)>, CompError> {
+    // §6.3.3 — quem assina uma CRL tem de o poder fazer. `keyCertSign` não
+    // basta: são bits diferentes e a AC pode delegar um sem o outro.
+    crate::constraints::exigir_key_usage(
+        emissor,
+        x509_cert::ext::pkix::KeyUsages::CRLSign,
+        "assinar CRLs (cRLSign)",
+    )?;
+
+    let mut boas = Vec::new();
+    let mut motivos: Vec<String> = Vec::new();
     for crl in crls {
         let tbs = match crl.tbs_cert_list.to_der() {
             Ok(t) => t,
             Err(e) => {
-                ultimo_erro = format!("tbsCertList não codifica: {e}");
+                motivos.push(format!("tbsCertList não codifica: {e}"));
                 continue;
             }
         };
         let Some(assinatura) = crl.signature.as_bytes() else {
-            ultimo_erro = "assinatura da CRL não alinhada em bytes".into();
+            motivos.push("assinatura da CRL não alinhada em bytes".into());
             continue;
         };
         // A CRL é uma afirmação da AC. Sem verificar a assinatura, qualquer um
         // que escreva na pasta pode declarar um certificado como não revogado —
         // e é essa a resposta que passa despercebida.
-        if let Err(e) = verificar_assinatura(
-            emissor,
-            &crl.signature_algorithm.oid,
-            &tbs,
-            assinatura,
-        ) {
-            ultimo_erro = format!("assinatura da CRL não confere: {e}");
+        if let Err(e) = verificar_assinatura(emissor, &crl.signature_algorithm, &tbs, assinatura) {
+            // Distinguir "não sei verificar" de "não confere": a segunda
+            // lê-se como CRL adulterada e a primeira é uma lacuna nossa.
+            motivos.push(if e.to_string().contains("não suportado") {
+                format!("algoritmo da CRL não suportado: {e}")
+            } else {
+                format!("assinatura da CRL não confere: {e}")
+            });
+            continue;
+        }
+        if let Err(e) = verificar_ambito(crl, e_ca) {
+            motivos.push(e.to_string());
             continue;
         }
         let this_update = match tempo_ms(&crl.tbs_cert_list.this_update) {
             Ok(t) => t,
             Err(e) => {
-                ultimo_erro = e.to_string();
+                motivos.push(e.to_string());
                 continue;
             }
         };
         if this_update > now_unix_ms {
-            ultimo_erro = "CRL com thisUpdate no futuro".into();
+            motivos.push("CRL com thisUpdate no futuro".into());
             continue;
         }
         let next_update = match crl.tbs_cert_list.next_update.as_ref() {
             Some(t) => match tempo_ms(t) {
                 Ok(v) => Some(v),
                 Err(e) => {
-                    ultimo_erro = e.to_string();
+                    motivos.push(e.to_string());
                     continue;
                 }
             },
             None => None,
         };
-        if let Some(fim) = next_update {
-            let limite = fim.saturating_add(policy.max_staleness.as_millis() as u64);
-            if now_unix_ms > limite {
-                ultimo_erro = format!(
-                    "CRL expirou em {fim} ms e a tolerância configurada é de {} s",
-                    policy.max_staleness.as_secs()
+        match next_update {
+            Some(fim) => {
+                let limite = fim.saturating_add(policy.max_staleness.as_millis() as u64);
+                if now_unix_ms > limite {
+                    motivos.push(format!(
+                        "CRL expirou em {fim} ms e a tolerância configurada é de {} s",
+                        policy.max_staleness.as_secs()
+                    ));
+                    continue;
+                }
+            }
+            None if policy.exigir_next_update => {
+                // Sem `nextUpdate` não há frescura nenhuma a impor: a CRL
+                // escapava por completo à política. Uma CRL de 2019 respondia
+                // "não revogado" com a mesma autoridade de uma de hoje.
+                motivos.push(
+                    "CRL sem nextUpdate: não declara até quando é válida, e a política de \
+                     frescura não teria nada contra que a medir"
+                        .into(),
                 );
                 continue;
             }
+            None => {}
         }
-        return Ok((crl, this_update, next_update));
+        boas.push((crl, this_update, next_update));
     }
-    Err(CompError::Verify(format!(
-        "nenhuma CRL utilizável: {ultimo_erro}"
-    )))
+    if boas.is_empty() {
+        return Err(CompError::Verify(format!(
+            "nenhuma CRL utilizável: {}",
+            if motivos.is_empty() {
+                "nenhuma CRL para este emissor".to_string()
+            } else {
+                motivos.join(" · ")
+            }
+        )));
+    }
+    Ok(boas)
 }
 
 /// Consulta a revogação de `cert`, emitido por `emissor`, para um carimbo
@@ -347,6 +480,7 @@ pub fn consultar(
     store: &CrlStore,
     cert: &x509_cert::Certificate,
     emissor: &x509_cert::Certificate,
+    e_ca: bool,
     gen_unix_ms: u64,
     now_unix_ms: u64,
     policy: &CrlPolicy,
@@ -365,28 +499,38 @@ pub fn consultar(
             cert.tbs_certificate.issuer, cert.tbs_certificate.subject
         )));
     }
-    let (crl, this_update, next_update) = crl_utilizavel(
+    let boas = crls_utilizaveis(
         crls,
         emissor,
+        e_ca,
         now_unix_ms,
         policy,
         verificar_assinatura,
         tempo_ms,
     )
-    .map_err(|e| {
-        CompError::Verify(format!(
-            "emissor `{}`: {e}",
-            cert.tbs_certificate.issuer
-        ))
-    })?;
+    .map_err(|e| CompError::Verify(format!("emissor `{}`: {e}", cert.tbs_certificate.issuer)))?;
 
-    if let Some(revogados) = crl.tbs_cert_list.revoked_certificates.as_ref() {
+    // A janela de confiança do conjunto é a MAIS CURTA: a informação só é boa
+    // enquanto TODAS as CRLs que se consultaram continuarem válidas.
+    let mut next_update_min: Option<u64> = None;
+    let mut this_update_max = 0u64;
+
+    for (crl, this_update, next_update) in &boas {
+        this_update_max = this_update_max.max(*this_update);
+        next_update_min = match (next_update_min, next_update) {
+            (Some(a), Some(b)) => Some(a.min(*b)),
+            (None, Some(b)) => Some(*b),
+            (a, None) => a,
+        };
+        let Some(revogados) = crl.tbs_cert_list.revoked_certificates.as_ref() else {
+            continue;
+        };
         for entrada in revogados {
             if entrada.serial_number != cert.tbs_certificate.serial_number {
                 continue;
             }
             let quando = tempo_ms(&entrada.revocation_date)?;
-            let motivo = motivo_de(entrada);
+            let motivo = motivo_de(entrada)?;
             if motivo.invalida_retroativamente() {
                 return Err(CompError::Verify(format!(
                     "certificado `{}` revogado por {} em {} ms: um compromisso de chave \
@@ -410,31 +554,43 @@ pub fn consultar(
 
     Ok(EstadoRevogacao {
         subject: cert.tbs_certificate.subject.to_string(),
-        crl_next_update_ms: next_update,
-        crl_this_update_ms: this_update,
+        crl_next_update_ms: next_update_min,
+        crl_this_update_ms: this_update_max,
     })
 }
 
-fn motivo_de(entrada: &x509_cert::crl::RevokedCert) -> RevocationReason {
+/// Lê o `reasonCode` (2.5.29.21) de uma entrada.
+///
+/// A etiqueta é verificada. Ler o último octeto de um valor cuja etiqueta
+/// ninguém confirmou aceitaria, por exemplo, um OCTET STRING cujo último byte
+/// calhasse ser 1 — e trataria como `keyCompromise` uma entrada que não o é.
+/// No sentido inverso, um `reasonCode` que não se consegue ler é um erro e não
+/// um "outro": tratar o ilegível como benigno é a leitura que deixa passar
+/// exactamente o que interessa apanhar.
+fn motivo_de(entrada: &x509_cert::crl::RevokedCert) -> Result<RevocationReason, CompError> {
     const OID_CRL_REASON: der::asn1::ObjectIdentifier =
         der::asn1::ObjectIdentifier::new_unwrap("2.5.29.21");
     let Some(exts) = entrada.crl_entry_extensions.as_ref() else {
-        return RevocationReason::Outro(0);
+        return Ok(RevocationReason::Outro(0));
     };
     let Some(ext) = exts.iter().find(|e| e.extn_id == OID_CRL_REASON) else {
-        return RevocationReason::Outro(0);
+        return Ok(RevocationReason::Outro(0));
     };
-    // ENUMERATED de um octeto na esmagadora maioria dos casos. Um valor que
-    // não se consegue ler é tratado como "outro" e NÃO como compromisso: se
-    // fosse ao contrário, uma CRL malformada recusaria carimbos válidos.
-    match der::asn1::Any::from_der(ext.extn_value.as_bytes()) {
-        Ok(any) => {
-            let bytes = any.value();
-            bytes
-                .last()
-                .map(|v| RevocationReason::from_u8(*v))
-                .unwrap_or(RevocationReason::Outro(0))
-        }
-        Err(_) => RevocationReason::Outro(0),
+    let any = der::asn1::Any::from_der(ext.extn_value.as_bytes()).map_err(|e| {
+        CompError::Verify(format!(
+            "reasonCode não é DER válido: {e} — uma entrada de CRL ilegível não pode ser \
+             tratada como revogação benigna"
+        ))
+    })?;
+    if any.tag() != der::Tag::Enumerated {
+        return Err(CompError::Verify(format!(
+            "reasonCode com etiqueta {} em vez de ENUMERATED: recusado em vez de interpretado",
+            any.tag()
+        )));
     }
+    let bytes = any.value();
+    let v = bytes.last().copied().ok_or_else(|| {
+        CompError::Verify("reasonCode ENUMERATED vazio".into())
+    })?;
+    Ok(RevocationReason::from_u8(v))
 }

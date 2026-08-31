@@ -84,16 +84,9 @@ const OID_ATTR_MESSAGE_DIGEST: ObjectIdentifier =
 const OID_KP_TIME_STAMPING: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.8");
 /// NIST — `id-sha256`.
 const OID_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
-/// PKCS#1 — `sha256WithRSAEncryption`.
-const OID_SHA256_RSA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
-/// PKCS#1 — `rsaEncryption` (o algoritmo da chave pública).
-const OID_RSA_ENCRYPTION: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
-/// ANSI X9.62 — `ecdsa-with-SHA256`.
-const OID_ECDSA_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
-/// ANSI X9.62 — `id-ecPublicKey`.
-const OID_EC_PUBLIC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
-/// SECG — `prime256v1` / NIST P-256.
-const OID_PRIME256V1: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7");
+// Os OIDs de assinatura e de chave vivem agora em `crate::algoritmos`, que e
+// quem despacha a verificacao. Duplica-los aqui deixaria duas listas a
+// divergir — e a que ficasse desactualizada seria a que decide.
 
 // ---------------------------------------------------------------------------
 // TSTInfo (RFC 3161 §2.4.2)
@@ -161,6 +154,13 @@ pub struct TimestampValidationPolicy {
     pub max_chain_depth: usize,
     /// Tecto do token, aplicado antes de qualquer parsing.
     pub max_token_bytes: usize,
+    /// SPEC-0046 §9 — rigidez da validação de cadeia (RFC 5280 §6.1):
+    /// `nameConstraints`, `pathLenConstraint`, `keyUsage` e o tratamento de
+    /// extensões críticas não reconhecidas.
+    pub restricoes: crate::constraints::RestricoesPolicy,
+    /// SPEC-0046 §9 — que assinaturas se aceitam e com que tamanho mínimo de
+    /// chave. O default cobre a ICP-Brasil real (RSA com SHA-256/384/512).
+    pub algoritmos: crate::algoritmos::PoliticaAlgoritmos,
 }
 
 impl Default for TimestampValidationPolicy {
@@ -173,6 +173,8 @@ impl Default for TimestampValidationPolicy {
             max_clock_skew: Duration::from_secs(300),
             max_chain_depth: 8,
             max_token_bytes: 512 * 1024,
+            restricoes: crate::constraints::RestricoesPolicy::default(),
+            algoritmos: crate::algoritmos::PoliticaAlgoritmos::default(),
         }
     }
 }
@@ -203,6 +205,14 @@ pub struct VerifiedTimestamp {
     /// não só na documentação, para que quem construa um relatório a partir
     /// disto não possa afirmar mais do que foi feito.
     pub revocation_checked: bool,
+    /// Até quando a resposta de revogação é boa: o `nextUpdate` MAIS CURTO de
+    /// todas as CRLs consultadas, em ms.
+    ///
+    /// Era calculado e deitado fora. Sem ele, um relatório construído a partir
+    /// deste resultado não distingue uma consulta feita contra CRLs de hoje de
+    /// uma feita contra CRLs de 2019 — e `revocation_checked: true` lê-se igual
+    /// nos dois casos.
+    pub revocation_valid_until_ms: Option<u64>,
 }
 
 /// SPEC-0046 §9.
@@ -341,9 +351,10 @@ impl IcpBrasilTimestampVerifier {
         let attrs_der = reencode_signed_attrs(attrs)?;
         verificar_assinatura(
             signer_cert,
-            &signer.signature_algorithm.oid,
+            &signer.signature_algorithm,
             &attrs_der,
             signer.signature.as_bytes(),
+            &self.policy.algoritmos,
         )?;
 
         // 5 — os atributos assinados descrevem ESTE conteúdo.
@@ -414,11 +425,18 @@ impl IcpBrasilTimestampVerifier {
         }
         verificar_eku_timestamping(signer_cert)?;
 
+        // §6.1 — as restrições de emissão. Antes da revogação e depois da
+        // cadeia: uma cadeia que a política do emissor não autoriza não vale a
+        // pena consultar, e o erro tem de dizer que o problema é a autorização,
+        // não a revogação.
+        self.verificar_restricoes(&cadeia)?;
+
         // §9 — revogação. Só depois de a cadeia estar validada: consultar uma
         // CRL para um certificado que nem encadeia seria trabalho sobre uma
         // premissa falsa, e um erro de revogação aqui leria-se como se o
         // problema fosse a revogação quando é a cadeia.
-        let revocation_checked = self.verificar_revogacao(&cadeia, gen_unix_ms, now_unix_ms)?;
+        let (revocation_checked, revocation_valid_until_ms) =
+            self.verificar_revogacao(&cadeia, gen_unix_ms, now_unix_ms)?;
 
         Ok(VerifiedTimestamp {
             gen_unix_ms,
@@ -430,7 +448,46 @@ impl IcpBrasilTimestampVerifier {
             accuracy_secs: tst.accuracy.as_ref().and_then(|a| a.seconds),
             nonce_matched,
             revocation_checked,
+            revocation_valid_until_ms,
         })
+    }
+
+    /// Impõe as restrições que cada emissor da cadeia declarou (RFC 5280
+    /// §6.1.4): `nameConstraints`, `pathLenConstraint`, `keyUsage` da folha e
+    /// extensões críticas não reconhecidas.
+    ///
+    /// A âncora não é validada como certificado — é um dado de entrada
+    /// confiável por instalação, e a RFC 5280 §6.1 trata-a assim. Mas as suas
+    /// `nameConstraints` e o seu `pathLenConstraint` **aplicam-se**: são
+    /// afirmações sobre o que ela autoriza abaixo de si, e é para isso que
+    /// existem.
+    fn verificar_restricoes(&self, cadeia: &Cadeia) -> Result<(), CompError> {
+        let policy = &self.policy.restricoes;
+
+        // §6.1.4(f) — extensões críticas, em cada certificado do caminho.
+        for cert in &cadeia.certs {
+            crate::constraints::verificar_criticas(cert, policy)?;
+        }
+
+        // §4.2.1.9 — profundidade autorizada.
+        crate::constraints::verificar_path_len(&cadeia.certs, &cadeia.anchor_cert)?;
+
+        // §4.2.1.10 — nomes, da âncora para baixo. A ordem importa: cada AC
+        // acrescenta as suas restrições ANTES de se verificar o que ela emitiu,
+        // e nunca pode alargar o que herdou.
+        let mut restricoes = crate::constraints::Restricoes::default();
+        restricoes.acumular(&cadeia.anchor_cert)?;
+        for cert in cadeia.certs.iter().rev() {
+            restricoes.verificar(cert)?;
+            restricoes.acumular(cert)?;
+        }
+
+        // A folha tem de poder assinar. `id-kp-timeStamping` diz o propósito;
+        // `keyUsage` diz se a chave sequer assina.
+        if let Some(folha) = cadeia.certs.first() {
+            crate::constraints::exigir_assinatura_de_folha(folha)?;
+        }
+        Ok(())
     }
 
     /// Consulta a revogação de cada certificado da cadeia. Devolve `true` se a
@@ -445,31 +502,45 @@ impl IcpBrasilTimestampVerifier {
         cadeia: &Cadeia,
         gen_unix_ms: u64,
         now_unix_ms: u64,
-    ) -> Result<bool, CompError> {
+    ) -> Result<(bool, Option<u64>), CompError> {
         let Some((store, politica)) = self.crls.as_ref() else {
-            return Ok(false);
+            return Ok((false, None));
         };
+        let alg_policy = &self.policy.algoritmos;
         let assinatura = |emissor: &Certificate,
-                          oid: &ObjectIdentifier,
+                          alg: &x509_cert::spki::AlgorithmIdentifierOwned,
                           msg: &[u8],
-                          sig: &[u8]| verificar_assinatura(emissor, oid, msg, sig);
+                          sig: &[u8]| verificar_assinatura(emissor, alg, msg, sig, alg_policy);
         let tempo = |t: &x509_cert::time::Time| tempo_para_unix_ms(t);
+        let mut validade_ate: Option<u64> = None;
 
         for (i, cert) in cadeia.certs.iter().enumerate() {
             // O emissor é o elo seguinte da cadeia; para o último, é a âncora.
             let emissor = cadeia.certs.get(i + 1).unwrap_or(&cadeia.anchor_cert);
-            crate::crl::consultar(
+            // `e_ca` distingue folha de AC: uma CRL com escopo
+            // `onlyContainsUserCerts` nao diz nada sobre uma AC, e responder
+            // com ela seria responder a pergunta errada.
+            let e_ca = i > 0;
+            let estado = crate::crl::consultar(
                 store,
                 cert,
                 emissor,
+                e_ca,
                 gen_unix_ms,
                 now_unix_ms,
                 politica,
                 &assinatura,
                 &tempo,
             )?;
+            // A janela do conjunto é a mais curta: a informação só vale
+            // enquanto TODAS as CRLs consultadas continuarem válidas.
+            validade_ate = match (validade_ate, estado.crl_next_update_ms) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (None, b) => b,
+                (a, None) => a,
+            };
         }
-        Ok(true)
+        Ok((true, validade_ate))
     }
 
     /// Constrói a cadeia do signatário até uma âncora do trust store.
@@ -492,7 +563,8 @@ impl IcpBrasilTimestampVerifier {
             // se o emissor é confiável, não interessa que o token traga uma
             // cópia dele.
             for anchor in self.trust_store.anchors_for_issuer(&issuer_der) {
-                if verificar_emissao(&atual, &anchor.certificate).is_ok() {
+                if verificar_emissao(&atual, &anchor.certificate, &self.policy.algoritmos).is_ok()
+                {
                     return Ok(Cadeia {
                         certs,
                         anchor: anchor.fingerprint,
@@ -520,7 +592,7 @@ impl IcpBrasilTimestampVerifier {
             // qualquer emitida pela mesma AC podia assinar outra folha e a
             // cadeia fechava.
             verificar_ca(intermedio)?;
-            verificar_emissao(&atual, intermedio)?;
+            verificar_emissao(&atual, intermedio, &self.policy.algoritmos)?;
             certs.push(intermedio.clone());
             atual = intermedio.clone();
         }
@@ -694,67 +766,19 @@ fn verificar_atributos(
 /// por cima de um algoritmo que não conhece é um verificador que aceita tudo.
 fn verificar_assinatura(
     cert: &Certificate,
-    algoritmo: &ObjectIdentifier,
+    alg: &x509_cert::spki::AlgorithmIdentifierOwned,
     mensagem: &[u8],
     assinatura: &[u8],
+    politica: &crate::algoritmos::PoliticaAlgoritmos,
 ) -> Result<(), CompError> {
-    let spki = &cert.tbs_certificate.subject_public_key_info;
-    match *algoritmo {
-        OID_ECDSA_SHA256 => {
-            if spki.algorithm.oid != OID_EC_PUBLIC_KEY {
-                return Err(verify_err(
-                    "assinatura ECDSA com uma chave que não é EC".into(),
-                ));
-            }
-            let curva = spki
-                .algorithm
-                .parameters
-                .as_ref()
-                .and_then(|p| p.decode_as::<ObjectIdentifier>().ok());
-            if curva != Some(OID_PRIME256V1) {
-                return Err(verify_err(
-                    "só a curva P-256 é suportada nesta verificação".into(),
-                ));
-            }
-            let pontos = spki
-                .subject_public_key
-                .as_bytes()
-                .ok_or_else(|| verify_err("chave pública EC não alinhada em bytes".into()))?;
-            let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(pontos)
-                .map_err(|e| verify_err(format!("chave pública EC inválida: {e}")))?;
-            // O CMS traz a assinatura ECDSA em DER (SEQUENCE de r,s).
-            let sig = p256::ecdsa::DerSignature::from_bytes(assinatura)
-                .map_err(|e| verify_err(format!("assinatura ECDSA malformada: {e}")))?;
-            use p256::ecdsa::signature::Verifier;
-            vk.verify(mensagem, &sig)
-                .map_err(|_| verify_err("assinatura do carimbo não confere".into()))
-        }
-        OID_SHA256_RSA => {
-            if spki.algorithm.oid != OID_RSA_ENCRYPTION {
-                return Err(verify_err(
-                    "assinatura RSA com uma chave que não é RSA".into(),
-                ));
-            }
-            let der = spki
-                .subject_public_key
-                .as_bytes()
-                .ok_or_else(|| verify_err("chave pública RSA não alinhada em bytes".into()))?;
-            let chave = <rsa::RsaPublicKey as rsa::pkcs1::DecodeRsaPublicKey>::from_pkcs1_der(der)
-                .map_err(|e| verify_err(format!("chave pública RSA inválida: {e}")))?;
-            use sha2::{Digest, Sha256};
-            let digest = Sha256::digest(mensagem);
-            let esquema = rsa::Pkcs1v15Sign::new::<Sha256>();
-            chave
-                .verify(esquema, &digest, assinatura)
-                .map_err(|_| verify_err("assinatura do carimbo não confere".into()))
-        }
-        outro => Err(verify_err(format!(
-            "algoritmo de assinatura {outro} não suportado; a verificação recusa em vez de o ignorar"
-        ))),
-    }
+    crate::algoritmos::verificar(cert, alg, mensagem, assinatura, politica)
 }
 
-fn verificar_emissao(filho: &Certificate, emissor: &Certificate) -> Result<(), CompError> {
+fn verificar_emissao(
+    filho: &Certificate,
+    emissor: &Certificate,
+    politica: &crate::algoritmos::PoliticaAlgoritmos,
+) -> Result<(), CompError> {
     let tbs = filho
         .tbs_certificate
         .to_der()
@@ -763,7 +787,17 @@ fn verificar_emissao(filho: &Certificate, emissor: &Certificate) -> Result<(), C
         .signature
         .as_bytes()
         .ok_or_else(|| verify_err("assinatura do certificado não alinhada em bytes".into()))?;
-    verificar_assinatura(emissor, &filho.signature_algorithm.oid, &tbs, assinatura)
+    // §4.1.1.2 — o algoritmo que escolhe o verificador vinha do campo de FORA
+    // da assinatura, que ninguém assina. Comparar com o de dentro é o que
+    // impede que ele seja trocado sem invalidar nada.
+    crate::algoritmos::coerencia_de_algoritmo(filho)?;
+    verificar_assinatura(
+        emissor,
+        &filho.signature_algorithm,
+        &tbs,
+        assinatura,
+        politica,
+    )
 }
 
 fn verificar_ca(cert: &Certificate) -> Result<(), CompError> {
@@ -784,6 +818,14 @@ fn verificar_ca(cert: &Certificate) -> Result<(), CompError> {
             "certificado intermédio com CA=false: uma folha não pode emitir".into(),
         ));
     }
+    // §4.2.1.3 — `basicConstraints.cA` diz que o certificado é de uma AC;
+    // `keyUsage.keyCertSign` diz que ESTA chave assina certificados. São duas
+    // afirmações diferentes e a segunda não era lida.
+    crate::constraints::exigir_key_usage(
+        cert,
+        x509_cert::ext::pkix::KeyUsages::KeyCertSign,
+        "emitir certificados (keyCertSign)",
+    )?;
     Ok(())
 }
 
@@ -1246,6 +1288,7 @@ mod tests {
                 serial: chain.tsa.tbs_certificate.serial_number.clone(),
                 quando_s: AGORA_S - 600,
                 motivo: None,
+                motivo_com_etiqueta_errada: false,
             }],
         );
         let erro = verificador_com_crl(&chain, &crl, Default::default())
@@ -1267,6 +1310,7 @@ mod tests {
                 // 10 s antes de agora, mas 50 s DEPOIS do carimbo.
                 quando_s: AGORA_S - 10,
                 motivo: Some(4), // superseded
+                motivo_com_etiqueta_errada: false,
             }],
         );
         let v = verificador_com_crl(&chain, &crl, Default::default())
@@ -1288,6 +1332,7 @@ mod tests {
                 serial: chain.tsa.tbs_certificate.serial_number.clone(),
                 quando_s: AGORA_S - 10,
                 motivo: Some(1), // keyCompromise
+                motivo_com_etiqueta_errada: false,
             }],
         );
         let erro = verificador_com_crl(&chain, &crl, Default::default())
@@ -1336,6 +1381,7 @@ mod tests {
         // A mesma CRL passa quando o operador DECLARA que aceita esta idade.
         let tolerante = crate::crl::CrlPolicy {
             max_staleness: std::time::Duration::from_secs(7_200),
+            ..Default::default()
         };
         let v = verificador_com_crl(&chain, &crl, tolerante)
             .verify(&token_padrao(&chain), &imprint(), None, AGORA_MS)
@@ -1365,5 +1411,429 @@ mod tests {
             erro.to_string().contains("assinatura da CRL não confere"),
             "{erro}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // §9 — algoritmos. Antes desta ronda o unico RSA aceite era
+    // sha256WithRSAEncryption, e a DOC-ICP-01.01 impoe SHA-512 a AC Raiz: uma
+    // hierarquia ICP-Brasil real NAO encadeava. E o ramo RSA nunca era corrido
+    // por teste nenhum, porque toda a PKI sintetica era ECDSA.
+    // -----------------------------------------------------------------
+
+    fn verificador_rsa(chain: &test_pki::Chain) -> IcpBrasilTimestampVerifier {
+        let mut store = TrustStore::new();
+        store.add_pem_or_der("raiz", &chain.root_der).unwrap();
+        IcpBrasilTimestampVerifier::new(store, TimestampValidationPolicy::default())
+    }
+
+    /// O caso que a auditoria apanhou: uma cadeia assinada em SHA-512 — o que a
+    /// AC Raiz da ICP-Brasil usa — tem de encadear.
+    #[test]
+    fn uma_cadeia_rsa_sha512_encadeia() {
+        let chain = test_pki::chain_rsa(test_pki::DigestRsa::Sha512, false);
+        let token = test_pki::token_de_teste(
+            &chain,
+            &imprint(),
+            AGORA_S - 60,
+            None,
+            OpcoesToken::default(),
+        );
+        let v = verificador_rsa(&chain)
+            .verify(&token, &imprint(), None, AGORA_MS)
+            .expect("SHA-512 e o que a AC Raiz da ICP-Brasil usa");
+        assert_eq!(v.gen_unix_ms, (AGORA_S - 60) * 1_000);
+        assert!(v.signer_subject.contains("ACT RSA"));
+    }
+
+    #[test]
+    fn uma_cadeia_rsa_sha384_encadeia() {
+        let chain = test_pki::chain_rsa(test_pki::DigestRsa::Sha384, false);
+        let token = test_pki::token_de_teste(
+            &chain,
+            &imprint(),
+            AGORA_S - 60,
+            None,
+            OpcoesToken::default(),
+        );
+        verificador_rsa(&chain)
+            .verify(&token, &imprint(), None, AGORA_MS)
+            .expect("SHA-384 tem de encadear");
+    }
+
+    #[test]
+    fn uma_cadeia_rsa_sha256_encadeia() {
+        let chain = test_pki::chain_rsa(test_pki::DigestRsa::Sha256, false);
+        let token = test_pki::token_de_teste(
+            &chain,
+            &imprint(),
+            AGORA_S - 60,
+            None,
+            OpcoesToken::default(),
+        );
+        verificador_rsa(&chain)
+            .verify(&token, &imprint(), None, AGORA_MS)
+            .expect("SHA-256 continua a encadear");
+    }
+
+    /// A assinatura RSA e mesmo verificada, e nao apenas descodificada.
+    #[test]
+    fn uma_assinatura_rsa_de_outra_chave_nao_passa() {
+        let chain = test_pki::chain_rsa(test_pki::DigestRsa::Sha512, false);
+        let token = test_pki::token_de_teste(
+            &chain,
+            &imprint(),
+            AGORA_S - 60,
+            None,
+            OpcoesToken {
+                assinar_com_chave_errada: true,
+                ..Default::default()
+            },
+        );
+        let erro = verificador_rsa(&chain)
+            .verify(&token, &imprint(), None, AGORA_MS)
+            .unwrap_err();
+        assert!(erro.to_string().contains("não confere"), "{erro}");
+    }
+
+    /// Um modulo de 1024 bits fatoriza-se. A caixa `rsa` so impoe um MAXIMO;
+    /// o piso e desta politica, e aplica-se ao EMISSOR, nao so a folha.
+    #[test]
+    fn uma_raiz_rsa_de_1024_bits_e_recusada_pelo_piso_da_politica() {
+        let chain = test_pki::chain_rsa(test_pki::DigestRsa::Sha256, true);
+        let token = test_pki::token_de_teste(
+            &chain,
+            &imprint(),
+            AGORA_S - 60,
+            None,
+            OpcoesToken::default(),
+        );
+        let erro = verificador_rsa(&chain)
+            .verify(&token, &imprint(), None, AGORA_MS)
+            .unwrap_err();
+        assert!(
+            erro.to_string().contains("1024") || erro.to_string().contains("âncora"),
+            "{erro}"
+        );
+
+        // E passa quando o operador DECLARA que aceita esta fraqueza.
+        let mut store = TrustStore::new();
+        store.add_pem_or_der("raiz", &chain.root_der).unwrap();
+        let politica = TimestampValidationPolicy {
+            algoritmos: crate::algoritmos::PoliticaAlgoritmos { min_rsa_bits: 1024 },
+            ..Default::default()
+        };
+        IcpBrasilTimestampVerifier::new(store, politica)
+            .verify(&token, &imprint(), None, AGORA_MS)
+            .expect("com o piso declarado a 1024 a cadeia fecha");
+    }
+
+    /// §4.1.1.2 — o algoritmo que escolhe o verificador vinha do campo de FORA
+    /// da assinatura, que ninguem assina.
+    #[test]
+    fn um_certificado_com_algoritmos_divergentes_dentro_e_fora_e_recusado() {
+        use der::{Decode, Encode};
+        let chain = test_pki::chain_de_teste();
+        // Troca o `signatureAlgorithm` exterior da folha, deixando o
+        // `tbsCertificate.signature` intacto. A assinatura continua valida
+        // sobre o tbs — e por isso e que so a COMPARACAO apanha isto.
+        let mut folha = chain.tsa.clone();
+        folha.signature_algorithm.oid =
+            der::asn1::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
+        let der_alterado = folha.to_der().unwrap();
+        let relido = x509_cert::Certificate::from_der(&der_alterado).unwrap();
+        let erro = crate::algoritmos::coerencia_de_algoritmo(&relido).unwrap_err();
+        assert!(erro.to_string().contains("4.1.1.2") || erro.to_string().contains("iguais"),
+            "{erro}");
+    }
+
+    /// Um algoritmo desconhecido e recusado COM o OID, e nao ignorado.
+    #[test]
+    fn um_algoritmo_desconhecido_e_recusado_com_o_oid_no_erro() {
+        use crate::algoritmos::{verificar, PoliticaAlgoritmos};
+        let chain = test_pki::chain_de_teste();
+        let alg = x509_cert::spki::AlgorithmIdentifierOwned {
+            // md5WithRSAEncryption — precisamente o que nunca deve passar.
+            oid: der::asn1::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.4"),
+            parameters: None,
+        };
+        let erro = verificar(
+            &chain.tsa,
+            &alg,
+            b"mensagem",
+            &[0u8; 64],
+            &PoliticaAlgoritmos::default(),
+        )
+        .unwrap_err();
+        assert!(erro.to_string().contains("1.2.840.113549.1.1.4"), "{erro}");
+        assert!(erro.to_string().contains("não suportado"), "{erro}");
+    }
+
+    // -----------------------------------------------------------------
+    // §5.2/§6.3 — o que a auditoria de 2026-08-31 apanhou no codigo de CRLs.
+    // -----------------------------------------------------------------
+
+    fn verificador_com_crls(
+        chain: &test_pki::Chain,
+        crls_der: &[Vec<u8>],
+        politica: crate::crl::CrlPolicy,
+    ) -> IcpBrasilTimestampVerifier {
+        let mut store = TrustStore::new();
+        store.add_pem_or_der("raiz", &chain.root_der).unwrap();
+        let mut crls = crate::crl::CrlStore::new();
+        for c in crls_der {
+            crls.add_pem_or_der(c).unwrap();
+        }
+        IcpBrasilTimestampVerifier::new(store, TimestampValidationPolicy::default())
+            .with_crls(crls, politica)
+    }
+
+    /// O buraco: consultava-se **a primeira** CRL utilizavel do emissor. Com
+    /// duas na pasta, o ficheiro que o `read_dir` devolvesse primeiro passava a
+    /// ser a politica de revogacao do orgao.
+    #[test]
+    fn a_revogacao_e_procurada_em_todas_as_crls_do_emissor_nao_so_na_primeira() {
+        let chain = test_pki::chain_de_teste();
+        let limpa = crl_da_raiz(&chain, vec![]);
+        let com_revogacao = crl_da_raiz(
+            &chain,
+            vec![test_pki::Revogacao {
+                serial: chain.tsa.tbs_certificate.serial_number.clone(),
+                quando_s: AGORA_S - 600,
+                motivo: None,
+                motivo_com_etiqueta_errada: false,
+            }],
+        );
+        // A limpa vem primeiro, de proposito.
+        let erro = verificador_com_crls(&chain, &[limpa, com_revogacao], Default::default())
+            .verify(&token_padrao(&chain), &imprint(), None, AGORA_MS)
+            .unwrap_err();
+        assert!(
+            erro.to_string().contains("já estava revogado"),
+            "uma CRL limpa nao pode encobrir a revogacao declarada noutra: {erro}"
+        );
+    }
+
+    /// §5.2.4 — uma delta CRL lista so o que MUDOU. Usa-la como completa e
+    /// responder "nao revogado" a tudo o que foi revogado antes dela.
+    #[test]
+    fn uma_delta_crl_nao_e_aceite_como_completa() {
+        let chain = test_pki::chain_de_teste();
+        let delta = test_pki::crl_com(
+            &chain.root,
+            &chain.root_key,
+            CRL_INICIO_S,
+            Some(CRL_FIM_S),
+            vec![],
+            true,
+        );
+        let erro = verificador_com_crls(&chain, &[delta], Default::default())
+            .verify(&token_padrao(&chain), &imprint(), None, AGORA_MS)
+            .unwrap_err();
+        assert!(erro.to_string().contains("delta"), "{erro}");
+    }
+
+    /// Sem `nextUpdate` a CRL escapava por completo a politica de frescura: uma
+    /// de 2019 respondia com a mesma autoridade de uma de hoje.
+    #[test]
+    fn uma_crl_sem_next_update_e_recusada_por_nao_declarar_ate_quando_vale() {
+        let chain = test_pki::chain_de_teste();
+        let sem_fim = test_pki::crl_de_teste(
+            &chain.root,
+            &chain.root_key,
+            CRL_INICIO_S,
+            None,
+            vec![],
+        );
+        let erro = verificador_com_crls(&chain, std::slice::from_ref(&sem_fim), Default::default())
+            .verify(&token_padrao(&chain), &imprint(), None, AGORA_MS)
+            .unwrap_err();
+        assert!(erro.to_string().contains("nextUpdate"), "{erro}");
+
+        // E aceite quando o operador DECLARA que aceita CRLs sem prazo.
+        let permissiva = crate::crl::CrlPolicy {
+            exigir_next_update: false,
+            ..Default::default()
+        };
+        let v = verificador_com_crls(&chain, &[sem_fim], permissiva)
+            .verify(&token_padrao(&chain), &imprint(), None, AGORA_MS)
+            .expect("com a exigencia desligada a CRL serve");
+        assert!(v.revocation_checked);
+    }
+
+    /// Ler o ultimo octeto sem confirmar a etiqueta aceitaria um OCTET STRING
+    /// cujo ultimo byte calhasse ser 1 e trata-lo-ia como `keyCompromise`.
+    #[test]
+    fn um_reason_code_com_etiqueta_errada_e_recusado_em_vez_de_interpretado() {
+        let chain = test_pki::chain_de_teste();
+        let crl = crl_da_raiz(
+            &chain,
+            vec![test_pki::Revogacao {
+                serial: chain.tsa.tbs_certificate.serial_number.clone(),
+                quando_s: AGORA_S - 10,
+                motivo: Some(1),
+                motivo_com_etiqueta_errada: true,
+            }],
+        );
+        let erro = verificador_com_crls(&chain, &[crl], Default::default())
+            .verify(&token_padrao(&chain), &imprint(), None, AGORA_MS)
+            .unwrap_err();
+        assert!(erro.to_string().contains("ENUMERATED"), "{erro}");
+    }
+
+    /// A janela de confianca chega ao resultado: um relatorio construido a
+    /// partir disto pode dizer ate quando a resposta de revogacao vale.
+    #[test]
+    fn a_janela_de_validade_da_crl_chega_ao_resultado() {
+        let chain = test_pki::chain_de_teste();
+        let crl = crl_da_raiz(&chain, vec![]);
+        let v = verificador_com_crls(&chain, &[crl], Default::default())
+            .verify(&token_padrao(&chain), &imprint(), None, AGORA_MS)
+            .unwrap();
+        assert!(v.revocation_checked);
+        assert_eq!(
+            v.revocation_valid_until_ms,
+            Some(CRL_FIM_S * 1_000),
+            "sem isto, quem le o resultado nao sabe se a informacao e de hoje ou de 2019"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // RFC 5280 §6.1.4 — as restricoes que o emissor declara. Ate esta ronda
+    // eram lidas por ninguem: um certificado com nameConstraints,
+    // pathLenConstraint ou keyUsage era aceite como se elas nao existissem.
+    // -----------------------------------------------------------------
+
+    /// Monta o token de uma cadeia de tres niveis: a folha assina, o intermedio
+    /// viaja no token e a raiz fica no trust store.
+    fn token_e_verificador(
+        c: &test_pki::CadeiaTresNiveis,
+        policy: TimestampValidationPolicy,
+    ) -> (Vec<u8>, IcpBrasilTimestampVerifier) {
+        let token = test_pki::token_de_teste(
+            &c.chain,
+            &imprint(),
+            AGORA_S - 60,
+            None,
+            OpcoesToken {
+                certs_extra: vec![c.root.clone()],
+                ..Default::default()
+            },
+        );
+        let mut store = TrustStore::new();
+        store.add_pem_or_der("raiz", &c.root_der).unwrap();
+        (token, IcpBrasilTimestampVerifier::new(store, policy))
+    }
+
+    /// A cadeia de tres niveis fecha quando nada a restringe — a base contra a
+    /// qual os testes seguintes provam que a restricao e que os recusa.
+    #[test]
+    fn uma_cadeia_de_tres_niveis_sem_restricoes_fecha() {
+        let c = test_pki::cadeia_tres_niveis(Default::default());
+        let (token, v) = token_e_verificador(&c, TimestampValidationPolicy::default());
+        let r = v
+            .verify(&token, &imprint(), None, AGORA_MS)
+            .expect("raiz -> AC -> ACT e a topologia da ICP-Brasil");
+        assert_eq!(r.chain_len, 2, "folha + intermedio, ancorados na raiz");
+    }
+
+    /// §4.2.1.10 — uma AC restringida pela raiz nao pode emitir fora da sua
+    /// subarvore. Era o buraco: a restricao existe para limitar o estrago de
+    /// uma AC comprometida, e era como se nao estivesse la.
+    #[test]
+    fn uma_ac_restringida_nao_emite_fora_da_sua_subarvore() {
+        let c = test_pki::cadeia_tres_niveis(test_pki::OpcoesRestricoes {
+            raiz_permite_dn: Some("O=ICP-Brasil".into()),
+            // Nem o intermedio nem a folha caem sob `O=ICP-Brasil`.
+            ..Default::default()
+        });
+        let (token, v) = token_e_verificador(&c, TimestampValidationPolicy::default());
+        let erro = v.verify(&token, &imprint(), None, AGORA_MS).unwrap_err();
+        assert!(
+            erro.to_string().contains("nameConstraints"),
+            "a restricao da raiz tem de recusar: {erro}"
+        );
+    }
+
+    /// A outra metade: um nome DENTRO da subarvore passa. Sem este teste, uma
+    /// implementacao que recusasse tudo passaria o teste anterior.
+    #[test]
+    fn um_nome_dentro_da_subarvore_permitida_passa() {
+        let c = test_pki::cadeia_tres_niveis(test_pki::OpcoesRestricoes {
+            raiz_permite_dn: Some("O=ICP-Brasil".into()),
+            sub_dn: Some("CN=AC Intermedia,O=ICP-Brasil".into()),
+            folha_dn: Some("CN=ACT de Teste,O=ICP-Brasil".into()),
+            ..Default::default()
+        });
+        let (token, v) = token_e_verificador(&c, TimestampValidationPolicy::default());
+        v.verify(&token, &imprint(), None, AGORA_MS)
+            .expect("nomes sob a subarvore permitida tem de passar");
+    }
+
+    /// Uma subarvore EXCLUIDA recusa mesmo estando dentro das permitidas.
+    #[test]
+    fn uma_subarvore_excluida_recusa() {
+        let c = test_pki::cadeia_tres_niveis(test_pki::OpcoesRestricoes {
+            raiz_exclui_dn: Some("O=Proibido".into()),
+            sub_dn: Some("CN=AC Intermedia,O=Proibido".into()),
+            folha_dn: Some("CN=ACT,O=Proibido".into()),
+            ..Default::default()
+        });
+        let (token, v) = token_e_verificador(&c, TimestampValidationPolicy::default());
+        let erro = v.verify(&token, &imprint(), None, AGORA_MS).unwrap_err();
+        assert!(erro.to_string().contains("excludedSubtree"), "{erro}");
+    }
+
+    /// §4.2.1.9 — uma raiz com `pathLenConstraint: 0` nao autoriza nenhum
+    /// intermedio abaixo de si. O campo era descodificado e deitado fora.
+    #[test]
+    fn path_len_zero_na_raiz_recusa_um_intermedio() {
+        let c = test_pki::cadeia_tres_niveis(test_pki::OpcoesRestricoes {
+            raiz_path_len: Some(0),
+            ..Default::default()
+        });
+        let (token, v) = token_e_verificador(&c, TimestampValidationPolicy::default());
+        let erro = v.verify(&token, &imprint(), None, AGORA_MS).unwrap_err();
+        assert!(erro.to_string().contains("pathLenConstraint"), "{erro}");
+    }
+
+    /// E `pathLenConstraint: 1` autoriza exactamente um.
+    #[test]
+    fn path_len_um_na_raiz_autoriza_um_intermedio() {
+        let c = test_pki::cadeia_tres_niveis(test_pki::OpcoesRestricoes {
+            raiz_path_len: Some(1),
+            ..Default::default()
+        });
+        let (token, v) = token_e_verificador(&c, TimestampValidationPolicy::default());
+        v.verify(&token, &imprint(), None, AGORA_MS)
+            .expect("um intermedio cabe em pathLen=1");
+    }
+
+    /// §6.1.4(f) — critica significa "se nao percebes isto, nao uses este
+    /// certificado". Ignora-la transforma um mecanismo de seguranca no oposto.
+    #[test]
+    fn uma_extensao_critica_desconhecida_faz_recusar() {
+        let c = test_pki::cadeia_tres_niveis(test_pki::OpcoesRestricoes {
+            critica_desconhecida_na_folha: true,
+            ..Default::default()
+        });
+        let (token, v) = token_e_verificador(&c, TimestampValidationPolicy::default());
+        let erro = v.verify(&token, &imprint(), None, AGORA_MS).unwrap_err();
+        assert!(erro.to_string().contains("1.3.6.1.4.1.99999.1"), "{erro}");
+        assert!(erro.to_string().contains("crítica"), "{erro}");
+
+        // E passa quando o operador DECLARA que a leu e a tolera. A escotilha e
+        // por OID, nao um interruptor geral: tolerar "todas" seria voltar ao
+        // comportamento que se corrigiu.
+        let mut toleradas = std::collections::BTreeSet::new();
+        toleradas.insert(ObjectIdentifier::new_unwrap("1.3.6.1.4.1.99999.1"));
+        let politica = TimestampValidationPolicy {
+            restricoes: crate::constraints::RestricoesPolicy {
+                criticas_toleradas: toleradas,
+            },
+            ..Default::default()
+        };
+        let (token2, v2) = token_e_verificador(&c, politica);
+        v2.verify(&token2, &imprint(), None, AGORA_MS)
+            .expect("com o OID declarado a extensao e tolerada");
     }
 }

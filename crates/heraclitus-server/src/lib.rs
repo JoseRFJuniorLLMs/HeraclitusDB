@@ -817,6 +817,8 @@ pub async fn serve_with(
                                     max_staleness: Duration::from_secs(
                                         config.compliance_crl_max_staleness_secs,
                                     ),
+                                    exigir_next_update: config
+                                        .compliance_crl_exigir_next_update,
                                 },
                             )
                             .map_err(|e| HeraclitusError::Config(e.to_string()))?;
