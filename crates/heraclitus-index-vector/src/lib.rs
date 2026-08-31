@@ -15,7 +15,7 @@ use rand::{Rng, SeedableRng};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
 
 const DEFAULT_M: usize = 16;
@@ -35,6 +35,82 @@ struct Candidate {
     dist: f64,
     id: u32,
 }
+/// Conjunto de nós já visitados numa travessia, por marcas de época.
+///
+/// # Porque não um `HashSet<u32>`
+///
+/// A versão anterior criava um `HashSet<u32>` por chamada a `search_layer`, e
+/// `search_layer` é chamada uma vez por nível em cada busca e em cada inserção.
+/// Cada `insert` no conjunto é um hash mais uma sondagem, e o conjunto inteiro é
+/// alocado e destruído a cada camada — num índice grande, com `ef` alto, isso é
+/// a operação mais repetida do caminho quente.
+///
+/// Aqui a pertença é um `u32` por nó num vector contíguo: a verificação é uma
+/// leitura indexada e a inserção é uma escrita. Limpar entre travessias não
+/// custa nada — incrementa-se a época, e todas as marcas antigas passam a ser
+/// automaticamente diferentes da actual.
+///
+/// # O transbordo da época, que é o único caso subtil
+///
+/// A época é um `u32`. Depois de 2³²−1 travessias na mesma thread ela volta a
+/// zero, e uma marca antiga voltaria a coincidir com a época actual — um nó
+/// nunca visitado apareceria como visitado, e a busca saltava-o. Por isso, ao
+/// dar a volta, o vector é limpo uma vez. É O(n) uma vez em quatro mil milhões
+/// de travessias.
+#[derive(Debug, Default)]
+struct Visitados {
+    marcas: Vec<u32>,
+    epoca: u32,
+}
+
+impl Visitados {
+    /// Prepara para uma travessia nova sobre `n` nós.
+    fn preparar(&mut self, n: usize) {
+        if self.marcas.len() < n {
+            self.marcas.resize(n, 0);
+        }
+        self.epoca = self.epoca.wrapping_add(1);
+        if self.epoca == 0 {
+            // Deu a volta: uma marca antiga a zero seria confundida com a época
+            // actual. Limpa-se, e recomeça-se em 1 para que zero continue a
+            // significar "nunca marcado".
+            self.marcas.iter_mut().for_each(|m| *m = 0);
+            self.epoca = 1;
+        }
+    }
+
+    /// `true` se o nó é NOVO nesta travessia — mesma semântica de
+    /// `HashSet::insert`.
+    #[inline]
+    fn marcar(&mut self, id: u32) -> bool {
+        let i = id as usize;
+        // Um id fora do intervalo tinha, na versão anterior, de rebentar mais à
+        // frente em `self.nodes[id]`. Devolver `true` mantém exactamente esse
+        // percurso em vez de introduzir aqui um sítio de pânico novo.
+        match self.marcas.get_mut(i) {
+            Some(m) if *m == self.epoca => false,
+            Some(m) => {
+                *m = self.epoca;
+                true
+            }
+            None => true,
+        }
+    }
+}
+
+thread_local! {
+    /// Scratch por thread: reutilizado entre travessias, sem contenção e sem
+    /// alocação por chamada.
+    ///
+    /// `search_layer` não é reentrante — `search` e `insert` chamam-na em ciclo
+    /// sobre os níveis, uma de cada vez, nunca uma dentro da outra — pelo que
+    /// manter o empréstimo durante a travessia é seguro. Se alguém a tornar
+    /// reentrante, o `borrow_mut` rebenta alto em vez de corromper resultados
+    /// em silêncio, que é a falha certa a ter.
+    static VISITADOS: std::cell::RefCell<Visitados> =
+        const { std::cell::RefCell::new(Visitados { marcas: Vec::new(), epoca: 0 }) };
+}
+
 impl Eq for Candidate {}
 impl Ord for Candidate {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -162,7 +238,6 @@ impl VectorIndex {
         let passes = |id: u32| {
             !self.tombstones.contains(id) && filter.map(|f| f.contains(id)).unwrap_or(true)
         };
-        let mut visited: HashSet<u32> = HashSet::from([entry]);
         let d0 = self.dist(entry, query);
         // `candidates` drives traversal over every reachable node; `results`
         // keeps only filter-passing nodes (the ones we may return).
@@ -181,6 +256,10 @@ impl VectorIndex {
             }));
         }
 
+        VISITADOS.with(|v| {
+        let mut visitados = v.borrow_mut();
+        visitados.preparar(self.nodes.len());
+        visitados.marcar(entry);
         while let Some(c) = candidates.pop() {
             let worst = results.peek().map(|r| r.0.dist).unwrap_or(f64::MIN);
             // Stop only once we have ef filtered hits AND cannot improve them.
@@ -190,7 +269,7 @@ impl VectorIndex {
             for &n in &self.nodes[c.id as usize].neighbors
                 [level.min(self.nodes[c.id as usize].neighbors.len() - 1)]
             {
-                if visited.insert(n) {
+                if visitados.marcar(n) {
                     let d = self.dist(n, query);
                     let worst = results.peek().map(|r| r.0.dist).unwrap_or(f64::MIN);
                     // Keep exploring while we still need filtered hits, or while
@@ -207,6 +286,7 @@ impl VectorIndex {
                 }
             }
         }
+        });
         let mut out: Vec<Candidate> = results.into_iter().map(|r| r.0).collect();
         out.sort_by(|a, b| a.dist.total_cmp(&b.dist));
         out
@@ -755,5 +835,147 @@ mod tests {
         let empty_dir = tempfile::tempdir().unwrap();
         let mut fresh = VectorIndex::new(ProductMetric::default());
         assert!(!fresh.load_checkpoint(empty_dir.path()).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod testes_visitados {
+    use super::*;
+
+    fn pt2(hyp: Vec<f32>) -> ProductPoint {
+        ProductPoint {
+            hyp,
+            sph: vec![],
+            euc: vec![],
+        }
+    }
+
+    /// O caso que a substituicao do `HashSet` introduziu e que nenhum teste
+    /// existente alcanca: a epoca e um `u32` e ao dar a volta uma marca antiga
+    /// coincidiria com a epoca actual — um no nunca visitado apareceria como
+    /// visitado, e a busca saltava-o.
+    ///
+    /// Testa-se a estrutura directamente porque provocar 2^32 travessias reais
+    /// levaria dias.
+    #[test]
+    fn o_transbordo_da_epoca_nao_faz_um_no_novo_parecer_visitado() {
+        let mut v = Visitados::default();
+        v.preparar(4);
+        // Leva a epoca ate ao limite.
+        v.epoca = u32::MAX;
+        assert!(v.marcar(2), "novo nesta epoca");
+        assert!(!v.marcar(2), "ja marcado nesta epoca");
+        assert_eq!(v.marcas[2], u32::MAX);
+
+        // A travessia seguinte da a volta.
+        v.preparar(4);
+        assert_eq!(v.epoca, 1, "recomeca em 1, nao em 0");
+        assert_eq!(v.marcas[2], 0, "as marcas antigas foram limpas");
+        assert!(
+            v.marcar(2),
+            "sem a limpeza, a marca antiga passaria por visitada e o no seria saltado"
+        );
+    }
+
+    /// A semantica basica: mesma resposta que `HashSet::insert`.
+    #[test]
+    fn marcar_tem_a_semantica_de_hashset_insert() {
+        let mut v = Visitados::default();
+        v.preparar(8);
+        assert!(v.marcar(0));
+        assert!(v.marcar(7));
+        assert!(!v.marcar(0));
+        assert!(!v.marcar(7));
+        // Travessia nova: tudo volta a ser novo.
+        v.preparar(8);
+        assert!(v.marcar(0));
+        assert!(v.marcar(7));
+    }
+
+    /// Um id fora do intervalo devolve `true`, para manter exactamente o
+    /// percurso da versao anterior (que so rebentava mais a frente, ao indexar
+    /// `self.nodes`) em vez de introduzir aqui um sitio de panico novo.
+    #[test]
+    fn um_id_fora_do_intervalo_nao_entra_em_panico_aqui() {
+        let mut v = Visitados::default();
+        v.preparar(4);
+        assert!(v.marcar(999), "fora do intervalo conta como novo");
+    }
+
+    /// O scratch cresce com o indice e nunca encolhe — uma travessia sobre um
+    /// indice maior tem de continuar correcta.
+    #[test]
+    fn o_scratch_cresce_com_o_indice() {
+        let mut v = Visitados::default();
+        v.preparar(4);
+        assert!(v.marcar(3));
+        v.preparar(1000);
+        assert!(v.marcar(999), "o no novo cabe depois de crescer");
+        assert!(v.marcar(3), "e a travessia nova reinicia tudo");
+    }
+
+    /// A busca continua a devolver o vizinho exacto — a prova de que a troca
+    /// nao mexeu no recall.
+    #[test]
+    fn a_busca_continua_a_encontrar_o_vizinho_exacto() {
+        let mut idx = VectorIndex::new(ProductMetric::default());
+        let mut ids = Vec::new();
+        for i in 0..500 {
+            let x = (i as f32) / 600.0;
+            let id = EventId::new();
+            ids.push(id);
+            idx.insert(id, i as u64, pt2(vec![x, 0.1]));
+        }
+        for alvo in [0usize, 137, 250, 499] {
+            let x = (alvo as f32) / 600.0;
+            let hits = idx.search(&pt2(vec![x, 0.1]), 3, 64, None);
+            assert_eq!(hits[0].id, ids[alvo], "vizinho exacto para {alvo}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod medicao_hnsw {
+    use super::*;
+    use std::time::Instant;
+
+    fn pt3(hyp: Vec<f32>) -> ProductPoint {
+        ProductPoint { hyp, sph: vec![], euc: vec![] }
+    }
+
+    /// `#[ignore]`: mede, nao afirma. Um numero de milissegundos falharia na
+    /// maquina de outra pessoa.
+    ///
+    ///   cargo test -p heraclitus-index-vector --lib medicao -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn custo_da_busca() {
+        for n in [2_000usize, 10_000] {
+            let mut idx = VectorIndex::new(ProductMetric::default());
+            for i in 0..n {
+                let x = (i as f32) / (n as f32 * 1.2);
+                idx.insert(EventId::new(), i as u64, pt3(vec![x, 0.1, x * 0.5]));
+            }
+            let consultas: Vec<ProductPoint> = (0..200)
+                .map(|q| pt3(vec![(q as f32) / 240.0, 0.1, 0.2]))
+                .collect();
+
+            // Aquece: a primeira travessia paga o crescimento do scratch.
+            for c in consultas.iter().take(10) {
+                idx.search(c, 10, 64, None);
+            }
+            let t0 = Instant::now();
+            let mut total = 0usize;
+            for c in &consultas {
+                total += idx.search(c, 10, 64, None).len();
+            }
+            let dt = t0.elapsed();
+            println!(
+                "n={n:>6} ef=64  {} consultas em {:>10.3?}  ({:>8.1?}/consulta, {total} hits)",
+                consultas.len(),
+                dt,
+                dt / consultas.len() as u32
+            );
+        }
     }
 }
