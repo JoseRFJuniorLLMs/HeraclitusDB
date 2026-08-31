@@ -202,6 +202,16 @@ impl CrlStore {
         Ok((store, report))
     }
 
+    /// Acrescenta uma CRL ja descodificada — usada para as que viajam dentro
+    /// do proprio token.
+    pub fn acrescentar(&mut self, crl: CertificateList) {
+        let Ok(issuer) = crl.tbs_cert_list.issuer.to_der() else {
+            return;
+        };
+        self.por_emissor.entry(issuer).or_default().push(crl);
+        self.total += 1;
+    }
+
     /// Acrescenta uma CRL a partir de bytes DER ou PEM.
     pub fn add_pem_or_der(&mut self, bytes: &[u8]) -> Result<(), CompError> {
         let crl = if bytes.starts_with(b"-----BEGIN") {

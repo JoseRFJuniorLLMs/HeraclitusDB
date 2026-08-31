@@ -41,6 +41,7 @@ pub struct Root {
 }
 
 /// Cadeia completa: raiz + folha de ACT.
+#[derive(Clone)]
 pub struct Chain {
     /// Guardada para quem precise de emitir mais certificados sob esta raiz.
     #[allow(dead_code)]
@@ -256,6 +257,13 @@ pub struct OpcoesToken {
     pub digest_attrs_sha512: bool,
     /// Declara um `digestAlgorithm` que o verificador nao sabe calcular.
     pub digest_attrs_desconhecido: bool,
+    /// O envelope declara um digest DIFERENTE do que o SignerInfo usa.
+    pub envelope_declara_outro_digest: bool,
+    /// CRLs a anexar ao proprio token (DER), como faz uma ACT que serve
+    /// clientes em air-gap.
+    pub crls_no_token: Vec<Vec<u8>>,
+    /// Substitui o `messageImprint` por bytes e algoritmo arbitrarios.
+    pub imprint_bruto: Option<(Vec<u8>, const_oid::ObjectIdentifier)>,
     /// Emite o `genTime` com fraccao de segundo, como uma ACT real que declare
     /// precisao de milissegundos (RFC 3161 §2.4.2 permite-o explicitamente).
     pub gen_time_milis: Option<u16>,
@@ -263,6 +271,21 @@ pub struct OpcoesToken {
     /// imediato. E o que permite testar uma cadeia de tres niveis: o intermedio
     /// viaja no token e a ancora fica no trust store.
     pub certs_extra: Vec<Certificate>,
+}
+
+/// Como `token_de_teste`, mas com um `messageImprint` de tamanho e algoritmo
+/// arbitrarios — para exercitar digests que nao sejam SHA-256.
+pub fn token_de_teste_com_imprint(
+    chain: &Chain,
+    imprint: &[u8],
+    oid_digest: const_oid::ObjectIdentifier,
+    gen_unix_secs: u64,
+) -> Vec<u8> {
+    let o = OpcoesToken {
+        imprint_bruto: Some((imprint.to_vec(), oid_digest)),
+        ..Default::default()
+    };
+    token_de_teste(chain, &[0u8; 32], gen_unix_secs, None, o)
 }
 
 /// Constrói um `TimeStampToken` sobre `imprint`.
@@ -278,9 +301,15 @@ pub fn token_de_teste(
     let tst = TstInfo {
         version: 1,
         policy: OID_POLITICA_TESTE,
-        message_imprint: MessageImprint {
-            hash_algorithm: algid(OID_SHA256),
-            hashed_message: OctetString::new(imprint.to_vec()).expect("imprint"),
+        message_imprint: match &opcoes.imprint_bruto {
+            Some((bytes, oid)) => MessageImprint {
+                hash_algorithm: algid(*oid),
+                hashed_message: OctetString::new(bytes.clone()).expect("imprint bruto"),
+            },
+            None => MessageImprint {
+                hash_algorithm: algid(OID_SHA256),
+                hashed_message: OctetString::new(imprint.to_vec()).expect("imprint"),
+            },
         },
         serial_number: Int::new(&[0x2a]).expect("serial"),
         gen_time: crate::icp::GenTime::nova(gen_unix_secs, opcoes.gen_time_milis)
@@ -430,7 +459,17 @@ pub fn token_de_teste(
     };
     let signed = SignedData {
         version: cms::content_info::CmsVersion::V3,
-        digest_algorithms: SetOfVec::try_from(vec![algid(OID_SHA256)]).expect("digest algs"),
+        // Tem de bater com o `digestAlgorithm` do SignerInfo: o envelope
+        // declara os digests que o verificador vai precisar, e um SignerInfo
+        // que use outro contradi-lo.
+        digest_algorithms: SetOfVec::try_from(vec![algid(if opcoes
+            .envelope_declara_outro_digest
+        {
+            const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.3")
+        } else {
+            oid_digest
+        })])
+        .expect("digest algs"),
         encap_content_info: EncapsulatedContentInfo {
             econtent_type,
             econtent: Some(
@@ -438,7 +477,23 @@ pub fn token_de_teste(
             ),
         },
         certificates: certificados,
-        crls: None,
+        crls: if opcoes.crls_no_token.is_empty() {
+            None
+        } else {
+            use der::Decode;
+            let escolhas: Vec<cms::revocation::RevocationInfoChoice> = opcoes
+                .crls_no_token
+                .iter()
+                .map(|d| {
+                    cms::revocation::RevocationInfoChoice::Crl(
+                        x509_cert::crl::CertificateList::from_der(d).expect("CRL do token"),
+                    )
+                })
+                .collect();
+            Some(cms::revocation::RevocationInfoChoices(
+                SetOfVec::try_from(escolhas).expect("set de CRLs"),
+            ))
+        },
         signer_infos: SignerInfos(SetOfVec::try_from(infos).expect("signers")),
     };
     let ci = ContentInfo {
@@ -589,7 +644,6 @@ pub struct CadeiaTresNiveis {
     pub root_der: Vec<u8>,
     /// O certificado do intermedio. Guardado para um teste o poder inspeccionar
     /// sem o extrair do token.
-    #[allow(dead_code)]
     pub sub: Certificate,
     /// Pronta a passar a `token_de_teste`: `root` e o INTERMEDIO (o emissor
     /// imediato da folha) e `tsa` e a folha. A raiz verdadeira vai em
@@ -615,6 +669,11 @@ pub struct OpcoesRestricoes {
     pub folha_dn: Option<String>,
     /// Acrescenta uma extensao CRITICA com um OID que o validador nao processa.
     pub critica_desconhecida_na_folha: bool,
+    /// Emite a folha com um `extendedKeyUsage` que, alem do carimbo, declara
+    /// outro proposito — o que a RFC 3161 §2.3 proibe.
+    pub folha_eku_com_outro_proposito: bool,
+    /// Emite o `extendedKeyUsage` da folha como NAO critico.
+    pub folha_eku_nao_critico: bool,
 }
 
 /// Emite raiz -> intermedio -> folha com as restricoes pedidas.
@@ -708,8 +767,20 @@ pub fn cadeia_tres_niveis(opcoes: OpcoesRestricoes) -> CadeiaTresNiveis {
         &sub_key,
     )
     .expect("builder da folha");
-    fb.add_extension(&ExtendedKeyUsage(vec![ID_KP_TIME_STAMPING]))
-        .expect("eku");
+    if opcoes.folha_eku_nao_critico {
+        fb.add_extension(&EkuNaoCritico(vec![ID_KP_TIME_STAMPING]))
+            .expect("eku nao critico");
+    } else if opcoes.folha_eku_com_outro_proposito {
+        // id-kp-serverAuth a par do carimbo: a chave deixa de estar reservada.
+        fb.add_extension(&ExtendedKeyUsage(vec![
+            ID_KP_TIME_STAMPING,
+            const_oid::ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.1"),
+        ]))
+        .expect("eku duplo");
+    } else {
+        fb.add_extension(&ExtendedKeyUsage(vec![ID_KP_TIME_STAMPING]))
+            .expect("eku");
+    }
     if opcoes.critica_desconhecida_na_folha {
         // 1.3.6.1.4.1.99999.1 — nao esta em CRITICAS_PROCESSADAS, de proposito.
         fb.add_extension(&CriticaDesconhecida).expect("extensao critica");
@@ -733,6 +804,68 @@ pub fn cadeia_tres_niveis(opcoes: OpcoesRestricoes) -> CadeiaTresNiveis {
             rsa_folha: None,
             rsa_digest: None,
         },
+    }
+}
+
+/// Um SEGUNDO certificado de AC com o MESMO sujeito do intermedio da cadeia
+/// mas com outra chave — o que uma PKI real tem durante um rollover de chave.
+///
+/// Emitido por uma raiz DIFERENTE, de proposito: assim ele nao encadeia ate a
+/// ancora instalada, e a unica forma de a cadeia fechar e o verificador tentar
+/// tambem o outro candidato. Se escolher so o primeiro, falha.
+pub fn sosia_do_intermedio(c: &CadeiaTresNiveis) -> Certificate {
+    let outra_raiz = chave(53);
+    let raiz_spki = SubjectPublicKeyInfoOwned::from_key(*outra_raiz.verifying_key()).expect("spki");
+    let rb = CertificateBuilder::new(
+        Profile::Root,
+        SerialNumber::from(300u32),
+        validade_larga(),
+        nome("Raiz Estranha"),
+        raiz_spki,
+        &outra_raiz,
+    )
+    .expect("builder raiz estranha");
+    let raiz: Certificate = rb.build::<DerSignature>().expect("assinar raiz estranha");
+
+    let sosia_key = chave(59);
+    let spki = SubjectPublicKeyInfoOwned::from_key(*sosia_key.verifying_key()).expect("spki sosia");
+    let sb = CertificateBuilder::new(
+        Profile::SubCA {
+            issuer: raiz.tbs_certificate.subject.clone(),
+            path_len_constraint: None,
+        },
+        SerialNumber::from(301u32),
+        validade_larga(),
+        c.sub.tbs_certificate.subject.clone(),
+        spki,
+        &outra_raiz,
+    )
+    .expect("builder sosia");
+    sb.build::<DerSignature>().expect("assinar sosia")
+}
+
+/// `extendedKeyUsage` forcado a NAO critico. O builder decide a criticidade
+/// sozinho (critico quando nao ha `anyExtendedKeyUsage`), portanto a unica
+/// forma de produzir o caso nao conforme e envolver o tipo.
+struct EkuNaoCritico(Vec<const_oid::ObjectIdentifier>);
+
+impl AssociatedOid for EkuNaoCritico {
+    const OID: const_oid::ObjectIdentifier =
+        const_oid::ObjectIdentifier::new_unwrap("2.5.29.37");
+}
+
+impl der::Encode for EkuNaoCritico {
+    fn encoded_len(&self) -> der::Result<der::Length> {
+        ExtendedKeyUsage(self.0.clone()).encoded_len()
+    }
+    fn encode(&self, writer: &mut impl der::Writer) -> der::Result<()> {
+        ExtendedKeyUsage(self.0.clone()).encode(writer)
+    }
+}
+
+impl x509_cert::ext::AsExtension for EkuNaoCritico {
+    fn critical(&self, _s: &Name, _e: &[x509_cert::ext::Extension]) -> bool {
+        false
     }
 }
 

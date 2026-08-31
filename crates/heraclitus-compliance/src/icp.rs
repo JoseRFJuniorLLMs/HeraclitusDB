@@ -82,8 +82,8 @@ const OID_ATTR_MESSAGE_DIGEST: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.4");
 /// RFC 5280 — `id-kp-timeStamping`.
 const OID_KP_TIME_STAMPING: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.3.6.1.5.5.7.3.8");
-/// NIST — `id-sha256`.
-const OID_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
+// O OID de SHA-256 vive em `crate::algoritmos`; o imprint deixou de estar
+// fixado nele e passou a vir do que o token DECLARA.
 // Os OIDs de assinatura e de chave vivem agora em `crate::algoritmos`, que e
 // quem despacha a verificacao. Duplica-los aqui deixaria duas listas a
 // divergir — e a que ficasse desactualizada seria a que decide.
@@ -312,6 +312,12 @@ pub struct TimestampValidationPolicy {
     /// conjunto a cada elo. É um travão de esforço, não uma regra da norma —
     /// uma cadeia ICP-Brasil traz três ou quatro.
     pub max_certificados: usize,
+    /// Exigir o `extendedKeyUsage` da RFC 3161 §2.3: crítico e com o carimbo
+    /// como único propósito. `true` por omissão.
+    ///
+    /// Desligá-lo aceita uma ACT que não segue a norma, e é uma decisão sobre
+    /// quanto se aceita — não uma opção de conveniência.
+    pub eku_estrito: bool,
     /// SPEC-0046 §9 — rigidez da validação de cadeia (RFC 5280 §6.1):
     /// `nameConstraints`, `pathLenConstraint`, `keyUsage` e o tratamento de
     /// extensões críticas não reconhecidas.
@@ -332,6 +338,7 @@ impl Default for TimestampValidationPolicy {
             max_chain_depth: 8,
             max_token_bytes: 512 * 1024,
             max_certificados: 32,
+            eku_estrito: true,
             restricoes: crate::constraints::RestricoesPolicy::default(),
             algoritmos: crate::algoritmos::PoliticaAlgoritmos::default(),
         }
@@ -440,14 +447,7 @@ impl IcpBrasilTimestampVerifier {
         now_unix_ms: u64,
     ) -> Result<(VerifiedTimestamp, Vec<u8>), CompError> {
         let imprint = Self::imprint_declarado(token_der)?;
-        let arr: [u8; 32] = imprint
-            .as_slice()
-            .try_into()
-            .map_err(|_| verify_err(format!(
-                "messageImprint de {} bytes: este verificador só sabe confrontar SHA-256",
-                imprint.len()
-            )))?;
-        let v = self.verify(token_der, &arr, None, now_unix_ms)?;
+        let v = self.verify(token_der, &imprint, None, now_unix_ms)?;
         Ok((v, imprint))
     }
 
@@ -472,7 +472,7 @@ impl IcpBrasilTimestampVerifier {
     pub fn verify(
         &self,
         token_der: &[u8],
-        expected_imprint: &[u8; 32],
+        expected_imprint: &[u8],
         expected_nonce: Option<&[u8]>,
         now_unix_ms: u64,
     ) -> Result<VerifiedTimestamp, CompError> {
@@ -564,6 +564,22 @@ impl IcpBrasilTimestampVerifier {
         )?;
 
         // 5 — os atributos assinados descrevem ESTE conteúdo.
+        // §5.1 — o `digestAlgorithm` do SignerInfo tem de constar dos
+        // `digestAlgorithms` do SignedData. O campo existe para que um
+        // verificador saiba de antemão que digests vai precisar; um SignerInfo
+        // que use outro está a contradizer o envelope que o contém, e a
+        // contradição não é decorativa: é a marca de um token remontado.
+        if !signed
+            .digest_algorithms
+            .iter()
+            .any(|a| a.oid == signer.digest_alg.oid)
+        {
+            return Err(verify_err(format!(
+                "digestAlgorithm {} do SignerInfo não consta dos digestAlgorithms do SignedData",
+                signer.digest_alg.oid
+            )));
+        }
+
         // §5.3 — o digest dos signedAttrs é o que o SignerInfo declara.
         let digest_attrs = crate::algoritmos::Digest::do_oid(&signer.digest_alg.oid)
             .ok_or_else(|| {
@@ -591,13 +607,28 @@ impl IcpBrasilTimestampVerifier {
                 )));
             }
         }
-        if tst.message_imprint.hash_algorithm.oid != OID_SHA256 {
+        // O imprint pode ser SHA-256, 384 ou 512. Fixá-lo em SHA-256 recusava
+        // um carimbo legítimo de uma ACT que trabalhe com outro digest — e
+        // impedia que este verificador servisse para inspeccionar um `.tst`
+        // de terceiros, que é para o que ele existe fora do caminho vivo.
+        let d_imprint = crate::algoritmos::Digest::do_oid(&tst.message_imprint.hash_algorithm.oid);
+        if d_imprint.is_none() {
             return Err(verify_err(format!(
                 "messageImprint em {} — só SHA-256 é aceite",
                 tst.message_imprint.hash_algorithm.oid
             )));
         }
-        if tst.message_imprint.hashed_message.as_bytes() != expected_imprint.as_slice() {
+        let d_imprint = d_imprint.expect("verificado acima");
+        let recebido = tst.message_imprint.hashed_message.as_bytes();
+        if recebido.len() != d_imprint.bytes() {
+            return Err(verify_err(format!(
+                "messageImprint declara {} e traz {} bytes em vez de {}",
+                d_imprint.label(),
+                recebido.len(),
+                d_imprint.bytes()
+            )));
+        }
+        if recebido != expected_imprint {
             return Err(verify_err(
                 "o carimbo é sobre outro conteúdo (messageImprint não confere)".into(),
             ));
@@ -643,7 +674,15 @@ impl IcpBrasilTimestampVerifier {
         // instante — e o doc deste módulo afirmava que isto era verificado
         // quando não era.
         validade_em(&cadeia.anchor_cert, gen_unix_ms)?;
-        verificar_eku_timestamping(signer_cert)?;
+        verificar_eku_timestamping(signer_cert, self.policy.eku_estrito)?;
+
+        // §2.4.2 — extensões do TSTInfo. São opacas para este verificador; uma
+        // marcada CRÍTICA é uma instrução que não sabemos cumprir, e a resposta
+        // certa a uma instrução que não se entende num documento de evidência é
+        // recusar, não seguir em frente.
+        if let Some(exts) = tst.extensions.as_ref() {
+            verificar_extensoes_tstinfo(exts)?;
+        }
 
         // §6.1 — as restrições de emissão. Antes da revogação e depois da
         // cadeia: uma cadeia que a política do emissor não autoriza não vale a
@@ -655,8 +694,18 @@ impl IcpBrasilTimestampVerifier {
         // CRL para um certificado que nem encadeia seria trabalho sobre uma
         // premissa falsa, e um erro de revogação aqui leria-se como se o
         // problema fosse a revogação quando é a cadeia.
+        // §5.1 — as CRLs que o proprio token traz. Descarta-las era o que
+        // quebrava o caso air-gap: uma ACT que anexa a CRL ao carimbo esta a
+        // entregar exactamente a informacao de revogacao que uma maquina sem
+        // rede nunca conseguiria ir buscar, e nos deitavamo-la fora para depois
+        // falhar por "nao ha CRL do emissor".
+        //
+        // Usa-las nao e confiar nelas: cada uma e verificada contra o emissor
+        // como qualquer outra, e uma CRL forjada dentro do token nao passa a
+        // verificacao de assinatura.
+        let crls_do_token = crls_embutidas(&signed);
         let (revocation_checked, revocation_valid_until_ms) =
-            self.verificar_revogacao(&cadeia, gen_unix_ms, now_unix_ms)?;
+            self.verificar_revogacao(&cadeia, gen_unix_ms, now_unix_ms, &crls_do_token)?;
 
         Ok(VerifiedTimestamp {
             gen_unix_ms,
@@ -722,10 +771,24 @@ impl IcpBrasilTimestampVerifier {
         cadeia: &Cadeia,
         gen_unix_ms: u64,
         now_unix_ms: u64,
+        crls_do_token: &[x509_cert::crl::CertificateList],
     ) -> Result<(bool, Option<u64>), CompError> {
         let Some((store, politica)) = self.crls.as_ref() else {
             return Ok((false, None));
         };
+        // As do token juntam-se as instaladas. A ordem nao importa: `consultar`
+        // percorre TODAS as utilizaveis de um emissor, e uma revogacao declarada
+        // em qualquer uma delas conta.
+        let store = if crls_do_token.is_empty() {
+            std::borrow::Cow::Borrowed(store)
+        } else {
+            let mut juntas = store.clone();
+            for crl in crls_do_token {
+                juntas.acrescentar(crl.clone());
+            }
+            std::borrow::Cow::Owned(juntas)
+        };
+        let store = store.as_ref();
         let alg_policy = &self.policy.algoritmos;
         let assinatura = |emissor: &Certificate,
                           alg: &x509_cert::spki::AlgorithmIdentifierOwned,
@@ -763,64 +826,121 @@ impl IcpBrasilTimestampVerifier {
         Ok((true, validade_ate))
     }
 
-    /// Constrói a cadeia do signatário até uma âncora do trust store.
+    /// Constrói a cadeia do signatário até uma âncora do trust store, com
+    /// **backtracking**.
+    ///
+    /// A versão anterior escolhia o *primeiro* certificado do conjunto cujo
+    /// sujeito batesse com o emissor e desistia se ele não servisse. Isso
+    /// falhava no caso mais banal de uma PKI real: o **rollover de chave** de
+    /// uma AC. Durante a transição, a AC tem dois certificados com o mesmo
+    /// sujeito e chaves diferentes, e um carimbo legítimo traz os dois. Se o
+    /// primeiro do conjunto fosse o antigo, a cadeia não fechava — e o erro
+    /// dizia "emissor desconhecido", que é exactamente a coisa errada a
+    /// procurar quando o emissor está ali ao lado.
+    ///
+    /// Agora tentam-se todos os candidatos. O caminho já percorrido é
+    /// verificado a cada passo, o que também fecha ciclos: dois certificados
+    /// que se emitam mutuamente não fazem isto correr para sempre.
     fn construir_cadeia(
         &self,
         signer: &Certificate,
         pool: &[Certificate],
     ) -> Result<Cadeia, CompError> {
-        let mut certs: Vec<Certificate> = vec![signer.clone()];
-        let mut atual = signer.clone();
+        let mut caminho: Vec<Certificate> = vec![signer.clone()];
+        // A causa mais informativa que se encontrou pelo caminho. Sem isto, um
+        // elo recusado por ALGORITMO reaparecia como "emissor desconhecido" —
+        // o erro do `.is_ok()` era engolido e o operador procurava a âncora
+        // errada.
+        let mut porque = String::new();
+        match self.procurar_ancora(&mut caminho, pool, &mut porque) {
+            Some(c) => Ok(c),
+            None => Err(verify_err(if porque.is_empty() {
+                format!(
+                    "cadeia não chega a nenhuma âncora configurada (emissor `{}` desconhecido)",
+                    signer.tbs_certificate.issuer
+                )
+            } else {
+                format!(
+                    "cadeia não chega a nenhuma âncora configurada; o elo mais próximo falhou \
+                     por: {porque}"
+                )
+            })),
+        }
+    }
 
-        for _ in 0..self.policy.max_chain_depth {
-            let issuer_der = atual
-                .tbs_certificate
-                .issuer
-                .to_der()
-                .map_err(|e| verify_err(format!("issuer não codifica: {e}")))?;
+    fn procurar_ancora(
+        &self,
+        caminho: &mut Vec<Certificate>,
+        pool: &[Certificate],
+        porque: &mut String,
+    ) -> Option<Cadeia> {
+        if caminho.len() > self.policy.max_chain_depth {
+            if porque.is_empty() {
+                *porque = format!(
+                    "profundidade máxima de {} excedida",
+                    self.policy.max_chain_depth
+                );
+            }
+            return None;
+        }
+        let atual = caminho.last().cloned()?;
+        let issuer_der = atual.tbs_certificate.issuer.to_der().ok()?;
 
-            // Uma âncora fecha a cadeia. Procura-se primeiro no trust store:
-            // se o emissor é confiável, não interessa que o token traga uma
-            // cópia dele.
-            for anchor in self.trust_store.anchors_for_issuer(&issuer_der) {
-                if verificar_emissao(&atual, &anchor.certificate, &self.policy.algoritmos).is_ok()
-                {
-                    return Ok(Cadeia {
-                        certs,
+        // Uma âncora fecha a cadeia. Procura-se primeiro no trust store: se o
+        // emissor é confiável, não interessa que o token traga uma cópia dele.
+        for anchor in self.trust_store.anchors_for_issuer(&issuer_der) {
+            match verificar_emissao(&atual, &anchor.certificate, &self.policy.algoritmos) {
+                Ok(()) => {
+                    return Some(Cadeia {
+                        certs: caminho.clone(),
                         anchor: anchor.fingerprint,
                         anchor_cert: anchor.certificate.clone(),
-                    });
+                    })
+                }
+                Err(e) => {
+                    if porque.is_empty() {
+                        *porque = e.to_string();
+                    }
                 }
             }
+        }
 
-            // Senão, um intermédio do próprio token.
-            let intermedio = pool.iter().find(|c| {
-                c.tbs_certificate
-                    .subject
-                    .to_der()
-                    .map(|s| s == issuer_der)
-                    .unwrap_or(false)
-                    && !mesmo_certificado(c, &atual)
-            });
-            let Some(intermedio) = intermedio else {
-                return Err(verify_err(format!(
-                    "cadeia não chega a nenhuma âncora configurada (emissor `{}` desconhecido)",
-                    atual.tbs_certificate.issuer
-                )));
-            };
+        // Senão, cada intermédio do próprio token que se apresente como emissor.
+        for candidato in pool.iter().filter(|c| {
+            c.tbs_certificate
+                .subject
+                .to_der()
+                .map(|s| s == issuer_der)
+                .unwrap_or(false)
+        }) {
+            // Já está no caminho: seguir seria um ciclo.
+            if caminho.iter().any(|x| mesmo_certificado(x, candidato)) {
+                continue;
+            }
             // Um intermédio TEM de ser CA. Sem esta verificação, uma folha
             // qualquer emitida pela mesma AC podia assinar outra folha e a
             // cadeia fechava.
-            verificar_ca(intermedio)?;
-            verificar_emissao(&atual, intermedio, &self.policy.algoritmos)?;
-            certs.push(intermedio.clone());
-            atual = intermedio.clone();
+            if let Err(e) = verificar_ca(candidato) {
+                if porque.is_empty() {
+                    *porque = e.to_string();
+                }
+                continue;
+            }
+            if let Err(e) = verificar_emissao(&atual, candidato, &self.policy.algoritmos) {
+                if porque.is_empty() {
+                    *porque = e.to_string();
+                }
+                continue;
+            }
+            caminho.push(candidato.clone());
+            if let Some(c) = self.procurar_ancora(caminho, pool, porque) {
+                return Some(c);
+            }
+            caminho.pop();
         }
-        Err(verify_err(format!(
-            "cadeia excede a profundidade máxima de {}",
-            self.policy.max_chain_depth
-        )))
+        None
     }
+
 }
 
 struct Cadeia {
@@ -853,6 +973,43 @@ fn mesmo_certificado(a: &Certificate, b: &Certificate) -> bool {
         (Ok(x), Ok(y)) => x == y,
         _ => false,
     }
+}
+
+/// As CRLs anexadas ao `SignedData`. Formatos que nao sejam um
+/// `CertificateList` X.509 sao ignorados — nao ha nada de util a fazer com
+/// eles, e ignora-los nao e silencioso: se a revogacao nao puder ser
+/// concluida, o passo seguinte falha a dizer que nao havia CRL.
+/// As extensões do `TSTInfo` chegam como um `Any` opaco. Descodifica-se o
+/// suficiente para ver a criticidade de cada uma.
+fn verificar_extensoes_tstinfo(exts: &der::Any) -> Result<(), CompError> {
+    let der_bytes = exts
+        .to_der()
+        .map_err(|e| verify_err(format!("extensões do TSTInfo não recodificam: {e}")))?;
+    let lista = x509_cert::ext::Extensions::from_der(&der_bytes)
+        .map_err(|e| verify_err(format!("extensões do TSTInfo inválidas: {e}")))?;
+    for ext in lista.iter() {
+        if ext.critical {
+            return Err(verify_err(format!(
+                "TSTInfo com a extensão crítica {} que este verificador não processa: uma                  instrução crítica que não se sabe cumprir recusa-se, não se ignora",
+                ext.extn_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn crls_embutidas(signed: &cms::signed_data::SignedData) -> Vec<x509_cert::crl::CertificateList> {
+    let Some(escolhas) = signed.crls.as_ref() else {
+        return Vec::new();
+    };
+    escolhas
+        .0
+        .iter()
+        .filter_map(|e| match e {
+            cms::revocation::RevocationInfoChoice::Crl(c) => Some(c.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn certificados_de(
@@ -1075,7 +1232,22 @@ fn verificar_ca(cert: &Certificate) -> Result<(), CompError> {
     Ok(())
 }
 
-fn verificar_eku_timestamping(cert: &Certificate) -> Result<(), CompError> {
+/// RFC 3161 §2.3 — o certificado da ACT tem de declarar o carimbo como o
+/// **único** propósito, e declará-lo como crítico.
+///
+/// A norma não deixa margem: *"MUST contain only one instance of the extended
+/// key usage field extension ... with KeyPurposeID having value:
+/// id-kp-timeStamping. This extension MUST be critical."* É o mecanismo que
+/// obriga a ACT a reservar uma chave só para carimbar.
+///
+/// Aceitar um EKU não crítico e acompanhado de outros propósitos — o que se
+/// fazia — desfaz essa reserva: um certificado emitido para TLS que por acaso
+/// também liste `id-kp-timeStamping` passava a poder assinar carimbos, e a
+/// chave que serve um servidor web passava a servir evidência legal.
+fn verificar_eku_timestamping(
+    cert: &Certificate,
+    estrito: bool,
+) -> Result<(), CompError> {
     const OID_EKU: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.37");
     let exts = cert
         .tbs_certificate
@@ -1094,6 +1266,27 @@ fn verificar_eku_timestamping(cert: &Certificate) -> Result<(), CompError> {
         return Err(verify_err(
             "certificado sem id-kp-timeStamping: não está autorizado a carimbar".into(),
         ));
+    }
+    if !estrito {
+        return Ok(());
+    }
+    if !ext.critical {
+        return Err(verify_err(
+            "extendedKeyUsage não é crítico: a RFC 3161 §2.3 exige que seja, porque é assim que              a restrição vincula quem processa o certificado. Para aceitar uma ACT não conforme,              desligue `eku_estrito` — conscientemente"
+                .into(),
+        ));
+    }
+    if eku.0.len() != 1 {
+        let outros: Vec<String> = eku
+            .0
+            .iter()
+            .filter(|o| **o != OID_KP_TIME_STAMPING)
+            .map(|o| o.to_string())
+            .collect();
+        return Err(verify_err(format!(
+            "extendedKeyUsage declara mais propósitos além do carimbo ({}): a RFC 3161 §2.3              exige uma chave RESERVADA para carimbar, e uma chave que serve para outra coisa              não está reservada",
+            outros.join(", ")
+        )));
     }
     Ok(())
 }
@@ -2195,6 +2388,251 @@ mod tests {
             .verify(&token, &imprint(), None, AGORA_MS)
             .unwrap_err();
         assert!(erro.to_string().contains("digestAlgorithm"), "{erro}");
+    }
+
+    // -----------------------------------------------------------------
+    // RFC 3161 §2.3 — a chave da ACT tem de estar RESERVADA para carimbar.
+    // -----------------------------------------------------------------
+
+    /// Um certificado emitido para TLS que por acaso tambem liste
+    /// `id-kp-timeStamping` passava a poder assinar carimbos: a chave que serve
+    /// um servidor web servia evidencia legal.
+    #[test]
+    fn um_eku_com_outro_proposito_alem_do_carimbo_e_recusado() {
+        let c = test_pki::cadeia_tres_niveis(test_pki::OpcoesRestricoes {
+            folha_eku_com_outro_proposito: true,
+            ..Default::default()
+        });
+        let (token, v) = token_e_verificador(&c, TimestampValidationPolicy::default());
+        let erro = v.verify(&token, &imprint(), None, AGORA_MS).unwrap_err();
+        assert!(erro.to_string().contains("1.3.6.1.5.5.7.3.1"), "{erro}");
+        assert!(erro.to_string().contains("RESERVADA"), "{erro}");
+    }
+
+    /// A criticidade e o que vincula quem processa o certificado. Sem ela, a
+    /// restricao e uma sugestao.
+    #[test]
+    fn um_eku_nao_critico_e_recusado_e_a_escotilha_e_declarada() {
+        let c = test_pki::cadeia_tres_niveis(test_pki::OpcoesRestricoes {
+            folha_eku_nao_critico: true,
+            ..Default::default()
+        });
+        let (token, v) = token_e_verificador(&c, TimestampValidationPolicy::default());
+        let erro = v.verify(&token, &imprint(), None, AGORA_MS).unwrap_err();
+        assert!(erro.to_string().contains("não é crítico"), "{erro}");
+
+        // Uma ACT nao conforme e aceite so quando o operador o DECLARA.
+        let politica = TimestampValidationPolicy {
+            eku_estrito: false,
+            ..Default::default()
+        };
+        let (token2, v2) = token_e_verificador(&c, politica);
+        v2.verify(&token2, &imprint(), None, AGORA_MS)
+            .expect("com eku_estrito desligado a ACT nao conforme passa");
+    }
+
+    /// O `messageImprint` pode ser SHA-384 ou SHA-512. Fixa-lo em SHA-256
+    /// recusava um carimbo legitimo e impedia inspeccionar um `.tst` de
+    /// terceiros — que e para o que o `inspect` existe.
+    #[test]
+    fn um_imprint_sha512_e_aceite_e_confrontado_pelo_tamanho_certo() {
+        use crate::algoritmos::Digest;
+        let chain = test_pki::chain_de_teste();
+        let conteudo = b"o conteudo a carimbar";
+        let imp512 = Digest::Sha512.digerir(conteudo);
+        let token = test_pki::token_de_teste_com_imprint(
+            &chain,
+            &imp512,
+            crate::algoritmos::OID_SHA512,
+            AGORA_S - 60,
+        );
+        let (v, encontrado) = verificador(&chain)
+            .inspect(&token, AGORA_MS)
+            .expect("SHA-512 no imprint e legitimo");
+        assert_eq!(encontrado, imp512);
+        assert_eq!(v.gen_unix_ms, (AGORA_S - 60) * 1_000);
+    }
+
+    /// Um imprint cujo tamanho nao bate com o algoritmo declarado e malformado.
+    #[test]
+    fn um_imprint_com_tamanho_errado_para_o_algoritmo_e_recusado() {
+        let chain = test_pki::chain_de_teste();
+        let token = test_pki::token_de_teste_com_imprint(
+            &chain,
+            &[0u8; 20], // 20 bytes declarados como SHA-256
+            crate::algoritmos::OID_SHA256,
+            AGORA_S - 60,
+        );
+        let erro = verificador(&chain).inspect(&token, AGORA_MS).unwrap_err();
+        assert!(erro.to_string().contains("em vez de 32"), "{erro}");
+    }
+
+    /// §5.1 — uma ACT que serve clientes em air-gap anexa a CRL ao proprio
+    /// carimbo. Descarta-la era o que quebrava esse caso: a maquina sem rede
+    /// tinha a informacao na mao e falhava por "nao ha CRL do emissor".
+    #[test]
+    fn uma_crl_embutida_no_token_e_usada_e_verificada() {
+        let chain = test_pki::chain_de_teste();
+        let crl = crl_da_raiz(&chain, vec![]);
+        let token = test_pki::token_de_teste(
+            &chain,
+            &imprint(),
+            AGORA_S - 60,
+            None,
+            OpcoesToken {
+                crls_no_token: vec![crl],
+                ..Default::default()
+            },
+        );
+        // O trust store tem a ancora, e NENHUMA CRL instalada.
+        let mut store = TrustStore::new();
+        store.add_pem_or_der("raiz", &chain.root_der).unwrap();
+        let v = IcpBrasilTimestampVerifier::new(store, TimestampValidationPolicy::default())
+            .with_crls(crate::crl::CrlStore::new(), Default::default());
+        let r = v
+            .verify(&token, &imprint(), None, AGORA_MS)
+            .expect("a CRL veio dentro do token");
+        assert!(r.revocation_checked);
+    }
+
+    /// Usa-las NAO e confiar nelas: uma CRL forjada dentro do token nao passa a
+    /// verificacao de assinatura, e o resultado e o mesmo de nao haver CRL.
+    #[test]
+    fn uma_crl_forjada_dentro_do_token_nao_conta() {
+        let chain = test_pki::chain_de_teste();
+        let impostor = test_pki::self_signed_root("Impostor");
+        let crl_falsa = test_pki::crl_de_teste(
+            &chain.root,
+            &impostor.key,
+            CRL_INICIO_S,
+            Some(CRL_FIM_S),
+            vec![],
+        );
+        let token = test_pki::token_de_teste(
+            &chain,
+            &imprint(),
+            AGORA_S - 60,
+            None,
+            OpcoesToken {
+                crls_no_token: vec![crl_falsa],
+                ..Default::default()
+            },
+        );
+        let mut store = TrustStore::new();
+        store.add_pem_or_der("raiz", &chain.root_der).unwrap();
+        let erro = IcpBrasilTimestampVerifier::new(store, TimestampValidationPolicy::default())
+            .with_crls(crate::crl::CrlStore::new(), Default::default())
+            .verify(&token, &imprint(), None, AGORA_MS)
+            .unwrap_err();
+        assert!(
+            erro.to_string().contains("assinatura da CRL não confere"),
+            "{erro}"
+        );
+    }
+
+    /// Rollover de chave: durante a transicao a AC tem DOIS certificados com o
+    /// mesmo sujeito e chaves diferentes, e um carimbo legitimo traz os dois.
+    /// Escolher o primeiro e desistir fazia a cadeia falhar — com a mensagem
+    /// "emissor desconhecido", que manda procurar o emissor que esta ali.
+    #[test]
+    fn dois_certificados_do_mesmo_emissor_nao_fazem_a_cadeia_desistir() {
+        let c = test_pki::cadeia_tres_niveis(Default::default());
+        let sosia = test_pki::sosia_do_intermedio(&c);
+        // O conjunto do token e montado como [folha, chain.root, ...extras].
+        // Para o sosia ser o PRIMEIRO candidato — que e o unico cenario em que
+        // o backtracking se prova — ele tem de ocupar a posicao do emissor
+        // imediato, e o intermedio bom vem nos extras.
+        let mut baralhada = c.chain.clone();
+        baralhada.root = sosia;
+        let token = test_pki::token_de_teste(
+            &baralhada,
+            &imprint(),
+            AGORA_S - 60,
+            None,
+            OpcoesToken {
+                certs_extra: vec![c.sub.clone(), c.root.clone()],
+                ..Default::default()
+            },
+        );
+        let mut store = TrustStore::new();
+        store.add_pem_or_der("raiz", &c.root_der).unwrap();
+        let r = IcpBrasilTimestampVerifier::new(store, TimestampValidationPolicy::default())
+            .verify(&token, &imprint(), None, AGORA_MS)
+            .expect("com backtracking a cadeia fecha pelo candidato certo");
+        assert_eq!(r.chain_len, 2);
+    }
+
+    /// A prova do backtracking, com a ORDEM do conjunto fixada: o candidato
+    /// errado vem primeiro e a cadeia tem de fechar pelo segundo.
+    ///
+    /// Tem de ser aqui e nao num token: o `SET OF` do CMS e canonicamente
+    /// ordenado, portanto quem monta um token nao escolhe a ordem — e um teste
+    /// que nao escolhe a ordem nao prova backtracking nenhum. Escrevi um assim
+    /// primeiro: passava, e a mutacao que remove o backtracking nao o derrubava.
+    #[test]
+    fn a_busca_tenta_o_segundo_candidato_quando_o_primeiro_nao_serve() {
+        let c = test_pki::cadeia_tres_niveis(Default::default());
+        let sosia = test_pki::sosia_do_intermedio(&c);
+        let mut store = TrustStore::new();
+        store.add_pem_or_der("raiz", &c.root_der).unwrap();
+        let v = IcpBrasilTimestampVerifier::new(store, TimestampValidationPolicy::default());
+
+        // O sosia tem o mesmo sujeito do intermedio bom e NAO encadeia ate a
+        // ancora instalada. Vem primeiro, de proposito.
+        let pool = vec![c.chain.tsa.clone(), sosia, c.sub.clone(), c.root.clone()];
+        let cadeia = v
+            .construir_cadeia(&c.chain.tsa, &pool)
+            .expect("o segundo candidato serve");
+        assert_eq!(cadeia.certs.len(), 2, "folha + intermedio bom");
+        assert_eq!(
+            cadeia.anchor_cert.tbs_certificate.subject,
+            c.root.tbs_certificate.subject
+        );
+    }
+
+    /// E quando NENHUM candidato serve, o erro diz o que falhou de facto em vez
+    /// de "emissor desconhecido" — que era o que aparecia quando um elo era
+    /// recusado por algoritmo.
+    #[test]
+    fn o_erro_da_cadeia_diz_a_causa_mais_proxima() {
+        let chain = test_pki::chain_de_teste();
+        let token = test_pki::token_de_teste(
+            &chain,
+            &imprint(),
+            AGORA_S - 60,
+            None,
+            OpcoesToken::default(),
+        );
+        let mut store = TrustStore::new();
+        store
+            .add_pem_or_der("outra", &test_pki::self_signed_root("Outra").certificate_der)
+            .unwrap();
+        let erro = IcpBrasilTimestampVerifier::new(store, TimestampValidationPolicy::default())
+            .verify(&token, &imprint(), None, AGORA_MS)
+            .unwrap_err();
+        assert!(erro.to_string().contains("âncora"), "{erro}");
+    }
+
+    /// §5.1 — o `digestAlgorithm` do SignerInfo tem de constar dos
+    /// `digestAlgorithms` do envelope. A contradicao entre os dois e a marca de
+    /// um token remontado.
+    #[test]
+    fn um_signer_info_que_contradiz_o_envelope_e_recusado() {
+        let chain = test_pki::chain_de_teste();
+        let token = test_pki::token_de_teste(
+            &chain,
+            &imprint(),
+            AGORA_S - 60,
+            None,
+            OpcoesToken {
+                envelope_declara_outro_digest: true,
+                ..Default::default()
+            },
+        );
+        let erro = verificador(&chain)
+            .verify(&token, &imprint(), None, AGORA_MS)
+            .unwrap_err();
+        assert!(erro.to_string().contains("digestAlgorithms"), "{erro}");
     }
 }
 

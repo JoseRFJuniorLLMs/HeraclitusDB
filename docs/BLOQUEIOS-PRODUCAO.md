@@ -210,6 +210,40 @@ No mesmo bloco: o `digestAlgorithm` do `SignerInfo` não era lido e o
 sobre SHA-512 falhava sempre); e `contentType`/`messageDigest` com dois valores
 passavam, porque só o primeiro era examinado.
 
+### Segunda passagem — o que faltava do levantamento
+
+- **EKU (RFC 3161 §2.3).** A norma exige que o `extendedKeyUsage` seja
+  **crítico** e declare o carimbo como **único** propósito. Aceitava-se
+  não-crítico e acompanhado de outros: um certificado emitido para TLS que por
+  acaso listasse `id-kp-timeStamping` passava a poder assinar carimbos, e a
+  chave que serve um servidor web passava a servir evidência legal. Escotilha
+  `eku_estrito` para uma ACT não conforme, declarada.
+- **`messageImprint` fixado em SHA-256.** Recusava um carimbo legítimo com
+  SHA-384/512 e impedia inspeccionar um `.tst` de terceiros — que é para o que
+  o `inspect` existe. O tamanho passou também a ser confrontado com o algoritmo
+  declarado.
+- **CRLs embutidas no token eram descartadas.** É o que quebrava o caso
+  air-gap: uma ACT que anexa a CRL ao carimbo entrega exactamente a informação
+  que uma máquina sem rede nunca conseguiria ir buscar, e nós deitávamo-la fora
+  para depois falhar por *"não há CRL do emissor"*. Usá-las não é confiar nelas
+  — cada uma é verificada contra o emissor como qualquer outra.
+- **Sem backtracking na cadeia.** Escolhia-se o primeiro certificado com o
+  sujeito certo e desistia-se. Falhava no caso mais banal de uma PKI real: o
+  **rollover de chave** de uma AC, em que ela tem dois certificados com o mesmo
+  sujeito e o token traz os dois. O erro dizia "emissor desconhecido" — a coisa
+  errada a procurar quando o emissor está ali ao lado. E a causa mais próxima
+  passou a entrar na mensagem, em vez de ser engolida pelo `.is_ok()`.
+- **`digestAlgorithms` do envelope vs `SignerInfo`.** A contradição entre os
+  dois é a marca de um token remontado, e não era detectada.
+- **Extensões críticas do `TSTInfo`** eram ignoradas.
+
+Nota de método sobre o backtracking, porque custou três tentativas: as duas
+primeiras versões do teste **passavam pela razão errada** — o `SET OF` do CMS é
+canonicamente ordenado, portanto quem monta um token não escolhe a ordem do
+conjunto, e um teste que não escolhe a ordem não prova backtracking nenhum. A
+mutação que remove o backtracking não as derrubava. Só a terceira, que testa a
+busca directamente com a ordem fixada, é que morre com a mutação.
+
 ---
 
 ## Por resolver — e nenhum destes se resolve com código
@@ -272,6 +306,21 @@ se ele não servir. Recusa em vez de adivinhar, mas recusa de mais.
 ### D. Atestações externas (SPEC-0049)
 
 Fora do alcance de qualquer commit.
+
+### E. O que ficou por fazer do levantamento, e porquê
+
+Não são bloqueios; são endurecimento que não escolhi fazer nesta ronda. Ficam
+nomeados para que a decisão seja visível em vez de a lacuna ser descoberta.
+
+| item | porque não agora |
+|---|---|
+| `ESSCertID`/`ESSCertIDv2` (RFC 5035) | Amarra o token a um certificado em concreto. A assinatura sobre os `signedAttrs` já é feita pela chave do certificado e a cadeia já valida; isto protege contra uma substituição específica. Endurecimento real, não bloqueio. |
+| `signedAttrs` recodificados da estrutura | O `der` reordena o `SET OF` ao descodificar. Para um token conforme a DER — que é canónico — a recodificação é idêntica. O risco é com BER não canónico. |
+| `TSTInfo.tsa` vs sujeito do certificado | A RFC 3161 trata o campo como informativo. |
+| `CRLDistributionPoints` vs CRL usada | O `issuingDistributionPoint` já é verificado, que é o lado que a CRL declara. |
+| Cache de revogação | Desempenho. A CRL é reverificada por certificado e por token. |
+| Comparação de nomes por RFC 4518 | Faz-se por igualdade de bytes DER, que é o que a generalidade das implementações faz. Recusa de mais, nunca de menos. |
+| `policyMapping`/`policyConstraints` | Ver **C**. |
 
 ---
 
