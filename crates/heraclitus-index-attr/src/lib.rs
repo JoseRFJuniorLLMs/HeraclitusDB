@@ -236,6 +236,32 @@ fn ikey(field: &str, value: &str) -> String {
     s
 }
 
+thread_local! {
+    /// Buffer reutilizado para compor `campo␟valor`.
+    ///
+    /// `ikey` aloca uma `String` nova a cada chamada, e era chamada uma vez por
+    /// ATRIBUTO de cada evento indexado e uma vez por consulta. Num ingest de
+    /// milhoes de eventos com meia duzia de atributos cada, sao milhoes de
+    /// `malloc`/`free` que nao produzem nada — a chave e descartada
+    /// imediatamente a seguir a procura.
+    ///
+    /// A chave so passa a ser alocada quando e mesmo GUARDADA, ou seja, na
+    /// primeira vez que aquele par campo/valor aparece.
+    static CHAVE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Compoe a chave no buffer e corre `f` sobre ela, sem alocar.
+fn com_chave<R>(field: &str, value: &str, f: impl FnOnce(&str) -> R) -> R {
+    CHAVE.with(|b| {
+        let mut b = b.borrow_mut();
+        b.clear();
+        b.push_str(field);
+        b.push(SEP);
+        b.push_str(value);
+        f(&b)
+    })
+}
+
 impl AttrIndex {
     pub fn new() -> Self {
         Self::default()
@@ -279,9 +305,7 @@ impl AttrIndex {
 
     /// LSNs (ordenados) dos eventos cujo `field == value`. Vazio se nada bate.
     pub fn lookup(&self, field: &str, value: &str) -> &[Lsn] {
-        self.inner
-            .exact
-            .get(&ikey(field, value))
+        com_chave(field, value, |k| self.inner.exact.get(k))
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
@@ -550,11 +574,6 @@ impl View for AttrIndex {
         // concorrentes podem indexar 6 antes de 5 — o guard antigo
         // `lsn <= watermark → return` DESCARTAVA o 5 para sempre, um buraco
         // silencioso na view). Mantém o invariante "postings em ordem crescente".
-        fn insert_sorted(v: &mut Vec<Lsn>, lsn: Lsn) {
-            if let Err(i) = v.binary_search(&lsn) {
-                v.insert(i, lsn);
-            }
-        }
         // `agent_id` entra como pseudo-atributo, sob a chave reservada
         // `_agent`.
         //
@@ -571,7 +590,7 @@ impl View for AttrIndex {
         {
             let a = event.agent_id.trim();
             if !a.is_empty() && a.len() <= MAX_VALUE_LEN {
-                insert_sorted(self.inner.exact.entry(ikey("_agent", a)).or_default(), lsn);
+                com_chave("_agent", a, |k| upsert(&mut self.inner.exact, k, lsn));
             }
         }
 
@@ -597,16 +616,19 @@ impl View for AttrIndex {
             let k = event.kind.label();
             let k = k.trim();
             if !k.is_empty() && k.len() <= MAX_VALUE_LEN {
-                insert_sorted(self.inner.exact.entry(ikey("_kind", k)).or_default(), lsn);
+                com_chave("_kind", k, |c| upsert(&mut self.inner.exact, c, lsn));
             }
         }
 
         for (field, value) in &event.attrs {
             let v = value.trim();
-            if v.len() > MAX_VALUE_LEN || SKIP_VALUES.contains(&v.to_ascii_lowercase().as_str()) {
+            // `to_ascii_lowercase()` alocava uma `String` por atributo de cada
+            // evento, so para a deitar fora a seguir. `eq_ignore_ascii_case`
+            // compara sem alocar e da a mesma resposta.
+            if v.len() > MAX_VALUE_LEN || SKIP_VALUES.iter().any(|s| s.eq_ignore_ascii_case(v)) {
                 continue;
             }
-            insert_sorted(self.inner.exact.entry(ikey(field, v)).or_default(), lsn);
+            com_chave(field, v, |k| upsert(&mut self.inner.exact, k, lsn));
             // Valor numérico entra também no índice ordenado (range filtering).
             // Os SKIP_VALUES continuam de fora — "0"/"-1" ubíquos gerariam
             // postings gigantes sem poder discriminante.
@@ -642,6 +664,28 @@ impl View for AttrIndex {
         self.inner = Snapshot::default();
     }
 }
+
+/// Insere `lsn` mantendo a posting ordenada, sem duplicar.
+fn insert_sorted(v: &mut Vec<Lsn>, lsn: Lsn) {
+    if let Err(i) = v.binary_search(&lsn) {
+        v.insert(i, lsn);
+    }
+}
+
+/// Insere `lsn` na posting de `chave`, alocando a chave SO se for nova.
+///
+/// `entry(chave.to_owned())` alocaria sempre, mesmo quando a chave ja existe —
+/// que e o caso esmagadoramente mais comum depois do arranque.
+fn upsert(mapa: &mut HashMap<String, Vec<Lsn>>, chave: &str, lsn: Lsn) {
+    if let Some(v) = mapa.get_mut(chave) {
+        insert_sorted(v, lsn);
+    } else {
+        let mut v = Vec::new();
+        insert_sorted(&mut v, lsn);
+        mapa.insert(chave.to_owned(), v);
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1030,5 +1074,57 @@ mod compressao_tests {
     fn postings_curtos_nunca_pioram() {
         let (v1, v2) = tamanhos(&indice_com(20_000));
         assert!(v2 <= v1, "regressao: v2={v2} > v1={v1}");
+    }
+}
+
+#[cfg(test)]
+mod medicao_attr {
+    use super::*;
+    use heraclitus_core::{Episode, EventKind};
+    use std::time::Instant;
+
+    fn evento(i: usize) -> Episode {
+        let mut e = Episode::new(
+            "agente",
+            EventKind::Observation,
+            format!("evento {i}").into_bytes(),
+        );
+        // Atributos realistas: alguns campos, muitos valores distintos.
+        e.attrs.insert("cpf".into(), format!("{:011}", i * 7919 % 100_000_000_000u64 as usize));
+        e.attrs.insert("tipo".into(), ["contrato", "aditivo", "rescisao"][i % 3].into());
+        e.attrs.insert("orgao".into(), format!("org-{}", i % 50));
+        e.attrs.insert("valor".into(), format!("{}", i % 10_000));
+        e
+    }
+
+    /// `cargo test -p heraclitus-index-attr --lib medicao -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn custo_de_indexar_e_consultar() {
+        for n in [20_000usize, 100_000] {
+            let mut idx = AttrIndex::new();
+            let eventos: Vec<Episode> = (0..n).map(evento).collect();
+
+            let t0 = Instant::now();
+            for (i, e) in eventos.iter().enumerate() {
+                idx.apply(i as u64, e);
+            }
+            let indexar = t0.elapsed();
+
+            let t1 = Instant::now();
+            let mut total = 0usize;
+            for i in 0..20_000 {
+                total += idx.lookup("orgao", &format!("org-{}", i % 50)).len();
+            }
+            let consultar = t1.elapsed();
+
+            println!(
+                "n={n:>7}  indexar {:>10.3?} ({:>7.2?}/evento)  ·  20k consultas {:>10.3?} ({:>7.2?}/consulta, {total} hits)",
+                indexar,
+                indexar / n as u32,
+                consultar,
+                consultar / 20_000
+            );
+        }
     }
 }
