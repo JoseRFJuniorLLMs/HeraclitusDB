@@ -571,10 +571,36 @@ impl TemporalGraph {
     /// anterior também fazia. Deduplicar mudaria o grau.
     pub fn analyze(&self, as_of: Lsn, min_confidence: f32) -> GraphAnalytics {
         // Arestas vivas + confiáveis, em ordem determinística (por edge_id).
+        //
+        // MERGE JOIN, não `belief_at` por aresta. `self.edges` e
+        // `self.versions` são ambos `BTreeMap` indexados por `EdgeId` — que é
+        // uma `String` — e portanto já vêm ordenados pela MESMA chave. A versão
+        // anterior fazia uma procura na árvore por cada aresta: 100 mil
+        // descidas com comparação de cadeia, que medi serem **78% do custo de
+        // `belief_at`** — mais do que a agregação que o item 39 da SPEC ataca.
+        //
+        // Percorrer os dois em paralelo dá os mesmos pares sem uma única
+        // procura, e é exacto: mesma ordem, mesmos valores.
+        let mut it_versions = self.versions.iter().peekable();
         let alive: Vec<&Edge> = self
             .edges
-            .values()
-            .filter(|e| e.alive_at(as_of) && self.belief_at(&e.id, as_of) >= min_confidence)
+            .iter()
+            .filter_map(|(id, e)| {
+                // Avança SEMPRE, esteja a aresta viva ou não: é o que mantém os
+                // dois cursores alinhados.
+                while it_versions.peek().is_some_and(|(k, _)| *k < id) {
+                    it_versions.next();
+                }
+                let vs = match it_versions.peek() {
+                    Some((k, v)) if *k == id => Some(*v),
+                    _ => None,
+                };
+                if !e.alive_at(as_of) {
+                    return None;
+                }
+                let crenca = vs.map_or(0.0, |v| self.policy.aggregate_as_of(v, as_of));
+                (crenca >= min_confidence).then_some(e)
+            })
             .collect();
 
         // --- índice denso, por ordem alfabética -----------------------------
@@ -1665,7 +1691,7 @@ mod testes_csr {
     /// Grafo com comunidades reais: blocos densos ligados por poucas pontes,
     /// alguns nos isolados, e arestas PARALELAS (que e onde `degree` e
     /// `adjacencia` divergem — o primeiro conta arestas, o segundo nao).
-    fn grafo(n_nos: usize, n_arestas: usize, semente: u64) -> TemporalGraph {
+    pub(super) fn grafo(n_nos: usize, n_arestas: usize, semente: u64) -> TemporalGraph {
         let mut g = TemporalGraph::new();
         let mut r = R(semente);
         for i in 0..n_arestas {
@@ -1886,6 +1912,98 @@ mod testes_belief {
             assert_eq!(politica.aggregate_as_of(&vs, min - 1), 0.0);
         }
         assert_eq!(politica.aggregate_as_of(&[], u64::MAX), 0.0);
+    }
+
+    /// Com UMA version por aresta, onde vai o custo de `belief_at`: na procura
+    /// no `BTreeMap<EdgeId, _>` (EdgeId e `String`), ou na agregacao?
+    #[test]
+    #[ignore]
+    fn procura_ou_agregacao() {
+        let g = super::testes_csr::grafo(10_000, 100_000, 42);
+        let ids: Vec<EdgeId> = g.edges.keys().cloned().collect();
+
+        let t0 = Instant::now();
+        let mut a = 0.0f32;
+        for id in &ids {
+            a += g.belief_at(id, u64::MAX);
+        }
+        let completo = t0.elapsed();
+
+        // So a procura no mapa.
+        let t1 = Instant::now();
+        let mut n = 0usize;
+        for id in &ids {
+            n += g.versions.get(id).map_or(0, |v| v.len());
+        }
+        let so_procura = t1.elapsed();
+
+        // So a agregacao, sobre as versions ja em mao.
+        let todas: Vec<&Vec<EdgeVersion>> = ids.iter().filter_map(|i| g.versions.get(i)).collect();
+        let t2 = Instant::now();
+        let mut b = 0.0f32;
+        for vs in &todas {
+            b += g.policy.aggregate_as_of(vs, u64::MAX);
+        }
+        let so_agregacao = t2.elapsed();
+
+        println!("belief_at completo : {completo:>10.3?}  ({} arestas)", ids.len());
+        println!("so a procura       : {so_procura:>10.3?}  ({n} versions)");
+        println!("so a agregacao     : {so_agregacao:>10.3?}");
+        println!(
+            "fraccao na PROCURA : {:.0}%",
+            100.0 * so_procura.as_secs_f64() / completo.as_secs_f64()
+        );
+        let _ = (a, b);
+    }
+
+    /// Quanto do custo restante e o `logit()` (clamp + divisao + `ln`)?
+    ///
+    /// A resposta decide se vale a pena mudar a ordem canonica da soma para
+    /// permitir prefix sums (item 40) ou se basta cachear o log-odds.
+    #[test]
+    #[ignore]
+    fn quanto_custa_o_logit() {
+        let politica = BeliefPolicy::default();
+        for n in [3usize, 12, 60] {
+            let vs = versoes(n, 42);
+            // Log-odds ja calculados: e o tecto do que um cache daria.
+            let cache: Vec<f32> = vs
+                .iter()
+                .map(|v| v.polarity * politica.logit(v.confidence))
+                .collect();
+            let repeticoes = 200_000usize;
+
+            let t0 = Instant::now();
+            let mut a = 0.0f32;
+            for i in 0..repeticoes {
+                a += politica.aggregate_as_of(&vs, (i % 1000) as Lsn);
+            }
+            let com_logit = t0.elapsed();
+
+            let t1 = Instant::now();
+            let mut b = 0.0f32;
+            for i in 0..repeticoes {
+                let as_of = (i % 1000) as Lsn;
+                let mut sum = 0.0f32;
+                let mut alguma = false;
+                for (k, v) in vs.iter().enumerate() {
+                    if v.valid_from_lsn <= as_of {
+                        sum += cache[k];
+                        alguma = true;
+                    }
+                }
+                b += if alguma { 1.0 / (1.0 + (-sum).exp()) } else { 0.0 };
+            }
+            let com_cache = t1.elapsed();
+
+            assert_eq!(a.to_bits(), b.to_bits(), "o cache tem de dar o MESMO valor");
+            println!(
+                "versoes={n:>3}  com logit {:>10.3?}  com cache {:>10.3?}  ganho {:.1}x",
+                com_logit,
+                com_cache,
+                com_logit.as_secs_f64() / com_cache.as_secs_f64().max(1e-9)
+            );
+        }
     }
 
     /// `cargo test -p heraclitus-index-graph --lib custo_do_belief -- --ignored --nocapture`
