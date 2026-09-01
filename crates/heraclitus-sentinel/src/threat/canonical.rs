@@ -162,9 +162,7 @@ pub fn canonical_url(value: &str) -> Result<String, CanonicalError> {
         return Err(CanonicalError::NotAUrl(value.to_owned()));
     }
     // Authority ends at the first `/`, `?` or `#`.
-    let end = rest
-        .find(['/', '?', '#'])
-        .unwrap_or(rest.len());
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(end);
 
     // Userinfo is kept verbatim: credentials in a URL are part of the
@@ -457,7 +455,10 @@ mod tests {
 
     #[test]
     fn fuzzy_hashes_pass_through_without_a_length_rule() {
-        let f = canonical_file_hash(HashAlgorithm::Ssdeep, "3:AXGBicFlgVNhBGcL6wCrFQEv:AXGHsNhxLsr2C");
+        let f = canonical_file_hash(
+            HashAlgorithm::Ssdeep,
+            "3:AXGBicFlgVNhBGcL6wCrFQEv:AXGHsNhxLsr2C",
+        );
         assert!(f.is_ok());
     }
 

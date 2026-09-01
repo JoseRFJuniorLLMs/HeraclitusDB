@@ -312,7 +312,9 @@ impl IocIndex {
     /// answer — the prefilter simply does not narrow them.
     pub fn prefilter(&self, probe: &Indicator) -> PrefilterOutcome {
         match probe {
-            Indicator::Ip(_) | Indicator::Domain(_) => PrefilterOutcome::MaybePresent(PrefilterHit(())),
+            Indicator::Ip(_) | Indicator::Domain(_) => {
+                PrefilterOutcome::MaybePresent(PrefilterHit(()))
+            }
             other => {
                 if self.bloom.maybe_contains(&other.index_key()) {
                     PrefilterOutcome::MaybePresent(PrefilterHit(()))
@@ -379,9 +381,9 @@ impl IocIndex {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::canonical::{canonical_domain, canonical_ip};
     use super::super::ir::{HashAlgorithm, ThreatObjectType, ThreatProvenance};
+    use super::*;
 
     fn prov(source: &str, confidence: u8) -> ThreatProvenance {
         ThreatProvenance {
@@ -479,7 +481,10 @@ mod tests {
     #[test]
     fn cidr_blocks_match_by_longest_prefix() {
         let mut idx = IocIndex::new(16);
-        idx.insert_object(&object("net", vec![canonical_ip("203.0.113.0/24").unwrap()]));
+        idx.insert_object(&object(
+            "net",
+            vec![canonical_ip("203.0.113.0/24").unwrap()],
+        ));
         idx.insert_object(&object("host", vec![canonical_ip("203.0.113.7").unwrap()]));
 
         let hits = idx.lookup(&canonical_ip("203.0.113.7").unwrap(), 0);
@@ -487,14 +492,18 @@ mod tests {
         assert!(hits.iter().any(|h| h.kind == MatchKind::Exact));
         assert!(hits.iter().any(|h| h.kind == MatchKind::IpPrefix));
 
-        assert!(idx.lookup(&canonical_ip("203.0.114.7").unwrap(), 0).is_empty());
+        assert!(idx
+            .lookup(&canonical_ip("203.0.114.7").unwrap(), 0)
+            .is_empty());
     }
 
     #[test]
     fn v6_probes_never_match_v4_blocks() {
         let mut idx = IocIndex::new(16);
         idx.insert_object(&object("net", vec![canonical_ip("0.0.0.0/0").unwrap()]));
-        assert!(idx.lookup(&canonical_ip("2001:db8::1").unwrap(), 0).is_empty());
+        assert!(idx
+            .lookup(&canonical_ip("2001:db8::1").unwrap(), 0)
+            .is_empty());
     }
 
     #[test]
@@ -539,7 +548,10 @@ mod tests {
                 },
             ],
         ));
-        assert_eq!(indexed, 1, "the SSDEEP indicator must not enter an exact index");
+        assert_eq!(
+            indexed, 1,
+            "the SSDEEP indicator must not enter an exact index"
+        );
         assert_eq!(idx.len(), 1);
     }
 

@@ -70,73 +70,119 @@ pub fn evaluate_threshold(samples: &[LabeledFlag], threshold: f32) -> PolicyEval
 /// **O(n²)**, com o pior caso a acontecer exactamente quando todos os scores
 /// sao distintos, que e o caso normal com scores em vírgula flutuante.
 ///
-/// O sweep faz uma unica passagem descendente. Ao descer o threshold, o
-/// conjunto previsto so CRESCE, portanto `previstos` e `tp` acumulam e nunca
-/// precisam de ser recontados. O `total_pos` sai da mesma passagem.
+/// O sweep faz uma unica passagem ascendente. No menor threshold todos os
+/// scores ordenaveis estao previstos; ao subir o threshold, o grupo anterior
+/// sai e `previstos`/`tp` sao atualizados em O(1) por amostra.
 ///
 /// Custo: `O(n log n)` pela ordenacao e `O(n)` pelo sweep.
 ///
 /// # O que NAO muda
 ///
 /// O resultado. O desempate continua a ser pelo threshold MAIS BAIXO — mais
-/// recall — e por isso os candidatos sao percorridos por ordem crescente no
-/// fim, com a mesma regra de melhoria estrita (`> best + 1e-9`) que a versao
-/// anterior usava. Ha um teste que confronta as duas implementacoes sobre
-/// milhares de amostras geradas: se divergirem, falha.
+/// recall — com a mesma regra de melhoria estrita (`> best + 1e-9`) que a
+/// versao anterior usava. `NaN` nunca satisfaz `score >= threshold`; portanto
+/// nao e candidato, mas um `NaN` confirmado continua no denominador do recall,
+/// exactamente como em [`evaluate_threshold`]. Se todos os scores forem NaN,
+/// conserva-se `default`. Ha testes contra a referencia quadratica.
 pub fn learn_threshold(samples: &[LabeledFlag], default: f32) -> f32 {
+    learn_threshold_impl(samples, default).0
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct LearnWork {
+    input_samples: usize,
+    sortable_samples: usize,
+    sort_comparisons: usize,
+    sweep_updates: usize,
+    threshold_evaluations: usize,
+}
+
+fn learn_threshold_impl(samples: &[LabeledFlag], default: f32) -> (f32, LearnWork) {
+    let mut work = LearnWork {
+        input_samples: samples.len(),
+        ..LearnWork::default()
+    };
     if samples.is_empty() {
-        return default;
+        return (default, work);
     }
 
-    // Ordem DECRESCENTE de score: ao descer o threshold, o conjunto previsto
-    // cresce monotonicamente, que e o que torna o sweep possivel.
-    let mut ordenadas: Vec<(f32, bool)> = samples.iter().map(|s| (s.score, s.confirmed)).collect();
-    ordenadas.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    let total_pos = ordenadas.iter().filter(|(_, c)| *c).count() as f32;
-
-    // Um par (threshold, f1) por score DISTINTO, em ordem decrescente de
-    // threshold. Reserva-se o pior caso — todos distintos — para nao realocar.
-    let mut por_threshold: Vec<(f32, f32)> = Vec::with_capacity(ordenadas.len());
-
-    let mut previstos = 0.0f32;
-    let mut tp = 0.0f32;
-    let mut i = 0usize;
-    while i < ordenadas.len() {
-        let t = ordenadas[i].0;
-        // Consome TODAS as amostras com este score antes de avaliar: o
-        // threshold e `>=`, portanto os empates entram todos de uma vez.
-        while i < ordenadas.len() && ordenadas[i].0 == t {
-            previstos += 1.0;
-            if ordenadas[i].1 {
-                tp += 1.0;
-            }
-            i += 1;
+    // NaN nao e ordenavel e, pela propria semantica de `evaluate_threshold`,
+    // nunca e previsto por threshold algum. Mantemo-lo apenas em `total_pos`.
+    let mut ordered: Vec<(f32, bool)> = samples
+        .iter()
+        .filter(|sample| !sample.score.is_nan())
+        .map(|sample| (sample.score, sample.confirmed))
+        .collect();
+    work.sortable_samples = ordered.len();
+    if ordered.is_empty() {
+        return (default, work);
+    }
+    ordered.sort_by(|left, right| {
+        #[cfg(test)]
+        {
+            work.sort_comparisons += 1;
         }
-        let precision = if previstos > 0.0 { tp / previstos } else { 0.0 };
-        let recall = if total_pos > 0.0 { tp / total_pos } else { 0.0 };
+        left.0
+            .partial_cmp(&right.0)
+            .expect("NaN scores were removed before sorting")
+    });
+
+    let total_pos = samples.iter().filter(|sample| sample.confirmed).count() as f32;
+    let mut tp = 0.0f32;
+    let mut fp = 0.0f32;
+    for (_, confirmed) in &ordered {
+        if *confirmed {
+            tp += 1.0;
+        } else {
+            fp += 1.0;
+        }
+    }
+    // Confirmed NaNs start (and remain) as false negatives because no ordered
+    // threshold can predict them.
+    let mut false_negatives = total_pos - tp;
+
+    let mut best_threshold = ordered[0].0;
+    let mut best_f1 = -1.0f32;
+    let mut i = 0usize;
+    while i < ordered.len() {
+        let threshold = ordered[i].0;
+        let precision = if tp + fp > 0.0 { tp / (tp + fp) } else { 0.0 };
+        let recall = if tp + false_negatives > 0.0 {
+            tp / (tp + false_negatives)
+        } else {
+            0.0
+        };
         let f1 = if precision + recall > 0.0 {
             2.0 * precision * recall / (precision + recall)
         } else {
             0.0
         };
-        por_threshold.push((t, f1));
-    }
-
-    // Por ordem CRESCENTE de threshold, com melhoria estrita: o mais baixo
-    // ganha o empate, como antes.
-    let mut best_t = por_threshold
-        .last()
-        .map(|(t, _)| *t)
-        .unwrap_or(default);
-    let mut best_f1 = -1.0f32;
-    for &(t, f1) in por_threshold.iter().rev() {
+        work.threshold_evaluations += 1;
         if f1 > best_f1 + 1e-9 {
             best_f1 = f1;
-            best_t = t;
+            best_threshold = threshold;
+        }
+
+        // `score >= threshold`: so depois de avaliar este threshold o grupo
+        // empatado deixa o conjunto previsto para o proximo candidato.
+        while i < ordered.len() && ordered[i].0 == threshold {
+            if ordered[i].1 {
+                tp -= 1.0;
+                false_negatives += 1.0;
+            } else {
+                fp -= 1.0;
+            }
+            work.sweep_updates += 1;
+            i += 1;
         }
     }
-    best_t
+    (best_threshold, work)
+}
+
+#[cfg(test)]
+fn learn_threshold_with_work(samples: &[LabeledFlag], default: f32) -> (f32, LearnWork) {
+    learn_threshold_impl(samples, default)
 }
 
 /// A implementacao O(n²) anterior, mantida SO como referencia de teste.
@@ -149,8 +195,18 @@ pub(crate) fn learn_threshold_referencia(samples: &[LabeledFlag], default: f32) 
     if samples.is_empty() {
         return default;
     }
-    let mut candidates: Vec<f32> = samples.iter().map(|s| s.score).collect();
-    candidates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut candidates: Vec<f32> = samples
+        .iter()
+        .map(|sample| sample.score)
+        .filter(|score| !score.is_nan())
+        .collect();
+    if candidates.is_empty() {
+        return default;
+    }
+    candidates.sort_by(|left, right| {
+        left.partial_cmp(right)
+            .expect("NaN scores were removed before sorting")
+    });
     candidates.dedup();
 
     let mut best_t = candidates[0];
@@ -250,8 +306,14 @@ mod testes_sweep {
             // empates; com 4 quase nenhum.
             let casas = if caso.is_multiple_of(3) { 1 } else { 4 };
             let samples: Vec<LabeledFlag> = (0..n)
-                .map(|_| LabeledFlag {
-                    score: rng.f32_em(casas),
+                .map(|index| LabeledFlag {
+                    // NaN e aceite pelo parser f32 do chamador vivo. Ele nao
+                    // pode entrar na ordenacao nem virar um threshold.
+                    score: if caso.is_multiple_of(11) && index.is_multiple_of(13) {
+                        f32::NAN
+                    } else {
+                        rng.f32_em(casas)
+                    },
                     confirmed: rng.proximo().is_multiple_of(2),
                 })
                 .collect();
@@ -283,6 +345,47 @@ mod testes_sweep {
             (0..10)
                 .map(|i| LabeledFlag { score: i as f32, confirmed: true })
                 .collect(),
+            // NaNs nunca sao previstos; confirmados ainda contam no recall.
+            vec![
+                LabeledFlag {
+                    score: f32::NAN,
+                    confirmed: true,
+                },
+                LabeledFlag {
+                    score: 2.0,
+                    confirmed: true,
+                },
+                LabeledFlag {
+                    score: 1.0,
+                    confirmed: false,
+                },
+            ],
+            // Sem candidato ordenavel, conserva o default.
+            vec![
+                LabeledFlag {
+                    score: f32::NAN,
+                    confirmed: true,
+                },
+                LabeledFlag {
+                    score: f32::NAN,
+                    confirmed: false,
+                },
+            ],
+            // Infinidades continuam scores ordenaveis e candidatos legitimos.
+            vec![
+                LabeledFlag {
+                    score: f32::NEG_INFINITY,
+                    confirmed: false,
+                },
+                LabeledFlag {
+                    score: 0.0,
+                    confirmed: true,
+                },
+                LabeledFlag {
+                    score: f32::INFINITY,
+                    confirmed: true,
+                },
+            ],
         ];
         for (i, samples) in casos.iter().enumerate() {
             assert_eq!(
@@ -313,6 +416,58 @@ mod testes_sweep {
         let aval = evaluate_threshold(&samples, t);
         assert!(aval.f1 > 0.0, "o threshold aprendido tem de ter F1 positivo");
         assert!(t.is_finite());
+    }
+
+    #[test]
+    fn empates_preservam_o_menor_threshold_e_o_bit_de_zero() {
+        let negatives = [
+            LabeledFlag {
+                score: 3.0,
+                confirmed: false,
+            },
+            LabeledFlag {
+                score: -0.0,
+                confirmed: false,
+            },
+            LabeledFlag {
+                score: 2.0,
+                confirmed: false,
+            },
+            LabeledFlag {
+                score: 0.0,
+                confirmed: false,
+            },
+        ];
+        let learned = learn_threshold(&negatives, 1.5);
+        let reference = learn_threshold_referencia(&negatives, 1.5);
+        assert_eq!(learned.to_bits(), reference.to_bits());
+        assert_eq!(learned.to_bits(), (-0.0f32).to_bits());
+    }
+
+    #[test]
+    fn contador_prova_um_unico_sweep_depois_da_ordenacao() {
+        fn measure(n: usize) -> LearnWork {
+            let samples: Vec<_> = (0..n)
+                .map(|index| LabeledFlag {
+                    score: index as f32,
+                    confirmed: index.is_multiple_of(3),
+                })
+                .collect();
+            let (_, work) = learn_threshold_with_work(&samples, 1.5);
+            work
+        }
+
+        let small = measure(1_024);
+        let large = measure(2_048);
+        assert_eq!(small.input_samples, 1_024);
+        assert_eq!(small.sortable_samples, 1_024);
+        assert_eq!(small.sweep_updates, 1_024);
+        assert_eq!(small.threshold_evaluations, 1_024);
+        assert_eq!(large.sweep_updates, small.sweep_updates * 2);
+        assert_eq!(large.threshold_evaluations, small.threshold_evaluations * 2);
+        // A ordenacao da stdlib deve permanecer muito abaixo de n².
+        assert!(small.sort_comparisons < 1_024 * 32);
+        assert!(large.sort_comparisons < 2_048 * 32);
     }
 }
 

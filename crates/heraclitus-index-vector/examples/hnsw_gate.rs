@@ -10,7 +10,7 @@
 //! be used as evidence for the hyperbolic-only `Engine::nearest` path.
 
 use heraclitus_index_vector::gate::{
-    HnswGateConfig, load_hnsw_gate_corpus_json, run_hnsw_gate, write_hnsw_gate_json,
+    load_hnsw_gate_corpus_json, run_hnsw_gate, write_hnsw_gate_json, HnswGateConfig,
 };
 use std::path::PathBuf;
 

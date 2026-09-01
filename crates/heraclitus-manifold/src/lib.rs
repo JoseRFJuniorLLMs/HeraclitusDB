@@ -10,6 +10,15 @@ pub mod estimate;
 use heraclitus_core::ProductPoint;
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+thread_local! {
+    /// Instrumentacao de testes: permite provar que o caminho
+    /// `dist2_prepared` nao volta a percorrer os vetores residentes para obter
+    /// as suas normas. E thread-local para os testes paralelos nao interferirem
+    /// uns com os outros.
+    static NORM_F32_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Norms are clamped to `1 - BALL_EPS` before any hyperbolic operation.
 pub const BALL_EPS: f64 = 1e-5;
 /// Sphere normalization tolerance.
@@ -83,6 +92,8 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f64 {
 }
 
 fn norm_f32(a: &[f32]) -> f64 {
+    #[cfg(test)]
+    NORM_F32_CALLS.with(|calls| calls.set(calls.get() + 1));
     dot_f32(a, a).sqrt()
 }
 
@@ -195,11 +206,53 @@ impl ProductMetric {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // SPEC-otimizacao itens 1--3: consulta preparada, normas pre-calculadas, e
 // ranking por distancia AO QUADRADO.
 // ---------------------------------------------------------------------------
+
+/// Parte de um [`ProductPoint`] que pode ser calculada uma vez quando o ponto
+/// entra num indice e reutilizada em todas as consultas seguintes.
+///
+/// As normas sao mantidas em `f64`, apesar de os vetores serem `f32`, porque a
+/// metrica canonica promove cada elemento antes de acumular. Guardar os valores
+/// em `f32` pouparia 12 bytes por no, mas alteraria arredondamentos e poderia
+/// trocar candidatos quase empatados no HNSW.
+///
+/// `hyp_scale` depende da curvatura da metrica usada na preparacao. Portanto um
+/// `PreparedPoint` deve ser consumido por uma [`PreparedQuery`] criada a partir
+/// da mesma [`ProductMetric`]. O `VectorIndex` garante essa invariavel e
+/// reconstroi o cache quando restaura um checkpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PreparedPoint {
+    hyp_norm: f64,
+    hyp_scale: f64,
+    sph_norm: f64,
+}
+
+impl PreparedPoint {
+    /// Prepara as normas de um ponto residente sob `metric`.
+    #[must_use]
+    pub fn new(metric: &ProductMetric, point: &ProductPoint) -> Self {
+        let c = -metric.sig.k1;
+        let max_norm_h = (1.0 - BALL_EPS) / c.sqrt();
+        Self::with_max_norm(point, max_norm_h)
+    }
+
+    fn with_max_norm(point: &ProductPoint, max_norm_h: f64) -> Self {
+        let hyp_norm = norm_f32(&point.hyp);
+        let hyp_scale = if hyp_norm > max_norm_h {
+            max_norm_h / hyp_norm
+        } else {
+            1.0
+        };
+        Self {
+            hyp_norm,
+            hyp_scale,
+            sph_norm: norm_f32(&point.sph),
+        }
+    }
+}
 
 /// Uma consulta com tudo o que depende SÓ dela já calculado.
 ///
@@ -279,26 +332,34 @@ impl PreparedQuery {
     /// Mesma ordem que [`ProductMetric::dist`], sem a raiz final e sem
     /// recalcular nada que dependa só da consulta.
     pub fn dist2(&self, b: &ProductPoint) -> f64 {
-        let dh = self.dist_hyp(&b.hyp);
+        let prepared = PreparedPoint::with_max_norm(b, self.max_norm_h);
+        self.dist2_prepared(b, &prepared)
+    }
+
+    /// Distancia do produto **ao quadrado** para um ponto residente preparado.
+    ///
+    /// Ao contrario de [`Self::dist2`], este metodo nao percorre `b.hyp` nem
+    /// `b.sph` para recalcular normas. Os produtos internos e diferencas ainda
+    /// precisam ler os vetores — sao a parte que realmente depende do par
+    /// consulta/candidato.
+    #[must_use]
+    pub fn dist2_prepared(&self, b: &ProductPoint, prepared: &PreparedPoint) -> f64 {
+        let dh = self.dist_hyp_prepared(&b.hyp, prepared);
         if !dh.is_finite() {
             return f64::INFINITY;
         }
-        let ds = self.dist_sph(&b.sph);
+        let ds = self.dist_sph_prepared(&b.sph, prepared);
         let de2 = dist_euc2(&self.euc, &b.euc);
         let [w1, w2, w3] = self.pesos;
         w1 * dh * dh + w2 * ds * ds + w3 * de2
     }
 
-    fn dist_hyp(&self, v: &[f32]) -> f64 {
+    fn dist_hyp_prepared(&self, v: &[f32], prepared: &PreparedPoint) -> f64 {
         if self.hyp.is_empty() {
             return 0.0;
         }
-        let nv_raw = norm_f32(v);
-        let sv = if nv_raw > self.max_norm_h {
-            self.max_norm_h / nv_raw
-        } else {
-            1.0
-        };
+        let nv_raw = prepared.hyp_norm;
+        let sv = prepared.hyp_scale;
         let nv = sv * nv_raw;
         let mut diff2 = 0.0f64;
         for (x, y) in self.hyp.iter().zip(v) {
@@ -313,11 +374,11 @@ impl PreparedQuery {
         self.inv_sqrt_c * arg.max(1.0).acosh()
     }
 
-    fn dist_sph(&self, v: &[f32]) -> f64 {
+    fn dist_sph_prepared(&self, v: &[f32], prepared: &PreparedPoint) -> f64 {
         if self.sph.is_empty() {
             return 0.0;
         }
-        let nv = norm_f32(v);
+        let nv = prepared.sph_norm;
         if self.norma_sph == 0.0 || nv == 0.0 {
             return 0.0;
         }
@@ -421,26 +482,82 @@ pub fn sph_midpoint(u: &[f32], v: &[f32]) -> Vec<f32> {
     mid
 }
 
+/// Incremental Einstein-style centroid on the Poincare ball.
+///
+/// For points `x_i`, the centroid used by [`hyp_centroid`] is
+///
+/// `sum(gamma_i * x_i) / sum(gamma_i)`, where
+/// `gamma_i = 1 / sqrt(1 - min(||x_i||^2, 1 - BALL_EPS))`.
+///
+/// Both sufficient statistics are additive, so retaining them avoids rebuilding
+/// and cloning every point whenever a streaming cluster receives one more
+/// member. `add` is `O(dim)`, memory remains `O(dim)`, and points are accumulated
+/// in insertion order to preserve deterministic floating-point results.
+#[derive(Debug)]
+pub struct HypCentroidAccumulator {
+    weighted_sum: Vec<f64>,
+    weight_sum: f64,
+    centroid: Vec<f32>,
+}
+
+impl HypCentroidAccumulator {
+    /// Creates an empty accumulator for points with `dim` coordinates.
+    pub fn new(dim: usize) -> Self {
+        Self {
+            weighted_sum: vec![0.0; dim],
+            weight_sum: 0.0,
+            // Keep the materialized centroid in fixed-size storage too. This
+            // makes repeated `add` calls allocation-free after construction.
+            centroid: vec![0.0; dim],
+        }
+    }
+
+    /// Adds one point and updates the materialized centroid.
+    pub fn add(&mut self, point: &[f32]) {
+        // Keep the operation order identical to the former batch
+        // implementation: norm first, then one ordered accumulation per
+        // coordinate. Dimension mismatches retain its zip/truncation semantics.
+        let norm2: f64 = point
+            .iter()
+            .map(|x| {
+                let x = *x as f64;
+                x * x
+            })
+            .sum();
+        let norm2 = norm2.min(1.0 - BALL_EPS);
+        let gamma = 1.0 / (1.0 - norm2).sqrt();
+        for (sum, x) in self.weighted_sum.iter_mut().zip(point) {
+            *sum += gamma * (*x as f64);
+        }
+        self.weight_sum += gamma;
+
+        for (out, sum) in self.centroid.iter_mut().zip(&self.weighted_sum) {
+            *out = (*sum / self.weight_sum) as f32;
+        }
+        project_to_ball(&mut self.centroid);
+    }
+
+    /// Current centroid. Empty accumulators return a zero vector of `dim`.
+    pub fn centroid(&self) -> &[f32] {
+        &self.centroid
+    }
+
+    /// Consumes the accumulator and returns its current centroid.
+    pub fn into_centroid(self) -> Vec<f32> {
+        self.centroid
+    }
+}
+
 /// Einstein-style weighted midpoint on the ball (used by distill).
 pub fn hyp_centroid(points: &[Vec<f32>]) -> Vec<f32> {
-    if points.is_empty() {
+    let Some(first) = points.first() else {
         return Vec::new();
+    };
+    let mut accumulator = HypCentroidAccumulator::new(first.len());
+    for point in points {
+        accumulator.add(point);
     }
-    let dim = points[0].len();
-    let mut acc = vec![0.0f64; dim];
-    let mut wsum = 0.0f64;
-    for p in points {
-        let p64 = to64(p);
-        let n2 = dot(&p64, &p64).min(1.0 - BALL_EPS);
-        let gamma = 1.0 / (1.0 - n2).sqrt();
-        for (a, x) in acc.iter_mut().zip(&p64) {
-            *a += gamma * x;
-        }
-        wsum += gamma;
-    }
-    let mut out: Vec<f32> = acc.iter().map(|x| (x / wsum) as f32).collect();
-    project_to_ball(&mut out);
-    out
+    accumulator.into_centroid()
 }
 
 #[cfg(test)]
@@ -494,6 +611,66 @@ mod tests {
             euc: vec![3.0],
         };
         assert!(m.dist(&p, &p) < 1e-9);
+    }
+
+    fn batch_centroid_reference(points: &[Vec<f32>]) -> Vec<f32> {
+        if points.is_empty() {
+            return Vec::new();
+        }
+        let mut weighted_sum = vec![0.0f64; points[0].len()];
+        let mut weight_sum = 0.0f64;
+        for point in points {
+            let point64 = to64(point);
+            let norm2 = dot(&point64, &point64).min(1.0 - BALL_EPS);
+            let gamma = 1.0 / (1.0 - norm2).sqrt();
+            for (sum, x) in weighted_sum.iter_mut().zip(&point64) {
+                *sum += gamma * x;
+            }
+            weight_sum += gamma;
+        }
+        let mut centroid: Vec<f32> = weighted_sum
+            .iter()
+            .map(|sum| (sum / weight_sum) as f32)
+            .collect();
+        project_to_ball(&mut centroid);
+        centroid
+    }
+
+    #[test]
+    fn incremental_centroid_is_bit_identical_to_batch_reference() {
+        let points = [
+            vec![0.10, -0.20, 0.05],
+            vec![0.55, 0.12, -0.08],
+            vec![-0.32, 0.21, 0.17],
+            vec![0.91, 0.04, -0.02],
+            vec![0.03, -0.11, 0.44],
+        ];
+        let mut incremental = HypCentroidAccumulator::new(points[0].len());
+        for end in 1..=points.len() {
+            incremental.add(&points[end - 1]);
+            let reference = batch_centroid_reference(&points[..end]);
+            let got_bits: Vec<u32> = incremental.centroid().iter().map(|x| x.to_bits()).collect();
+            let reference_bits: Vec<u32> = reference.iter().map(|x| x.to_bits()).collect();
+            assert_eq!(
+                got_bits, reference_bits,
+                "prefix of {end} points must preserve the former operation order"
+            );
+        }
+    }
+
+    #[test]
+    fn incremental_centroid_storage_is_constant_after_construction() {
+        let mut incremental = HypCentroidAccumulator::new(32);
+        let sum_ptr = incremental.weighted_sum.as_ptr();
+        let centroid_ptr = incremental.centroid.as_ptr();
+        let point = vec![0.01; 32];
+        for _ in 0..10_000 {
+            incremental.add(&point);
+        }
+        assert_eq!(incremental.weighted_sum.as_ptr(), sum_ptr);
+        assert_eq!(incremental.centroid.as_ptr(), centroid_ptr);
+        assert_eq!(incremental.weighted_sum.len(), 32);
+        assert_eq!(incremental.centroid.len(), 32);
     }
 
     proptest! {
@@ -604,24 +781,88 @@ mod testes_prepared {
         let q = ponto(&mut rng, 6, 0.5);
         let cands: Vec<ProductPoint> = (0..200).map(|_| ponto(&mut rng, 6, 0.5)).collect();
         let mut a: Vec<usize> = (0..cands.len()).collect();
-        a.sort_by(|&x, &y| metric.dist(&q, &cands[x]).total_cmp(&metric.dist(&q, &cands[y])));
+        a.sort_by(|&x, &y| {
+            metric
+                .dist(&q, &cands[x])
+                .total_cmp(&metric.dist(&q, &cands[y]))
+        });
         let pq = PreparedQuery::new(&metric, &q);
         let mut b: Vec<usize> = (0..cands.len()).collect();
         b.sort_by(|&x, &y| pq.dist2(&cands[x]).total_cmp(&pq.dist2(&cands[y])));
         assert_eq!(a, b);
     }
 
+    /// O cache residente tem de ser uma optimizacao pura: para os mesmos
+    /// valores ja usados por `PreparedQuery::dist2`, o resultado e bit a bit
+    /// identico. Assim nao introduzimos uma nova fonte de desempate no HNSW.
+    #[test]
+    fn o_ponto_preparado_e_bit_a_bit_igual_ao_caminho_existente() {
+        let mut rng = Rng(0xd1ce_cafe_1234_5678);
+        for caso in 0..2_000 {
+            let mut metric = ProductMetric::default();
+            metric.sig.k1 = -[0.25, 1.0, 2.0][caso % 3];
+            metric.sig.k2 = [0.5, 1.0, 3.0][caso % 3];
+            let amp = [0.1, 0.6, 0.99, 3.0][caso % 4];
+            let q = ponto(&mut rng, 8, amp);
+            let b = ponto(&mut rng, 8, amp);
+            let query = PreparedQuery::new(&metric, &q);
+            let point = PreparedPoint::new(&metric, &b);
+            let anterior = query.dist2(&b);
+            let residente = query.dist2_prepared(&b, &point);
+            assert_eq!(
+                anterior.to_bits(),
+                residente.to_bits(),
+                "caso {caso}: {anterior} vs {residente}"
+            );
+        }
+    }
+
+    /// Prova mecanica do ganho pretendido pelo item 2: depois da preparacao,
+    /// cem comparacoes nao executam uma unica chamada a `norm_f32`. O caminho
+    /// de compatibilidade (`dist2`) continua a calcular as duas normas.
+    #[test]
+    fn dist2_prepared_nao_recalcula_normas_do_candidato() {
+        let mut rng = Rng(0xdec0_de01);
+        let metric = ProductMetric::default();
+        let q = ponto(&mut rng, 32, 0.5);
+        let b = ponto(&mut rng, 32, 0.5);
+        let query = PreparedQuery::new(&metric, &q);
+        let point = PreparedPoint::new(&metric, &b);
+
+        NORM_F32_CALLS.with(|calls| calls.set(0));
+        for _ in 0..100 {
+            std::hint::black_box(query.dist2_prepared(&b, &point));
+        }
+        let prepared_calls = NORM_F32_CALLS.with(std::cell::Cell::get);
+        assert_eq!(prepared_calls, 0, "o cache residente nao foi usado");
+
+        std::hint::black_box(query.dist2(&b));
+        let compatibility_calls = NORM_F32_CALLS.with(std::cell::Cell::get);
+        assert_eq!(
+            compatibility_calls, 2,
+            "hyp e sph devem ser as duas normas calculadas no caminho sem cache"
+        );
+    }
+
     /// Componentes vazias sao uma configuracao legitima.
     #[test]
     fn componentes_vazias_comportam_se_como_na_canonica() {
         let metric = ProductMetric::default();
-        let so_euc = |v: Vec<f32>| ProductPoint { hyp: vec![], sph: vec![], euc: v };
+        let so_euc = |v: Vec<f32>| ProductPoint {
+            hyp: vec![],
+            sph: vec![],
+            euc: v,
+        };
         let q = so_euc(vec![1.0, 2.0]);
         let b = so_euc(vec![4.0, 6.0]);
         let c = metric.dist(&q, &b);
         let p = PreparedQuery::new(&metric, &q).dist2(&b);
         assert!((p - c * c).abs() < 1e-9);
-        let vazio = ProductPoint { hyp: vec![], sph: vec![], euc: vec![] };
+        let vazio = ProductPoint {
+            hyp: vec![],
+            sph: vec![],
+            euc: vec![],
+        };
         assert_eq!(PreparedQuery::new(&metric, &vazio).dist2(&vazio), 0.0);
     }
 
@@ -629,8 +870,16 @@ mod testes_prepared {
     #[test]
     fn um_nan_continua_infinitamente_distante() {
         let metric = ProductMetric::default();
-        let q = ProductPoint { hyp: vec![0.1, 0.2], sph: vec![], euc: vec![] };
-        let mau = ProductPoint { hyp: vec![f32::NAN, 0.2], sph: vec![], euc: vec![] };
+        let q = ProductPoint {
+            hyp: vec![0.1, 0.2],
+            sph: vec![],
+            euc: vec![],
+        };
+        let mau = ProductPoint {
+            hyp: vec![f32::NAN, 0.2],
+            sph: vec![],
+            euc: vec![],
+        };
         assert!(!PreparedQuery::new(&metric, &q).dist2(&mau).is_finite());
     }
 }
@@ -675,7 +924,12 @@ mod perfil_componentes {
         let metric = ProductMetric::default();
         let mk = |s: u64| {
             let mut x = s.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-            let mut p = move || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; ((x % 2001) as f32 / 2000.0 - 0.5) * 0.8 };
+            let mut p = move || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                ((x % 2001) as f32 / 2000.0 - 0.5) * 0.8
+            };
             ProductPoint {
                 hyp: (0..32).map(|_| p()).collect(),
                 sph: (0..8).map(|_| p()).collect(),
@@ -688,22 +942,24 @@ mod perfil_componentes {
 
         let t = Instant::now();
         let mut acc = 0.0f64;
-        for p in &pts { acc += pq.dist2(p); }
+        for p in &pts {
+            acc += pq.dist2(p);
+        }
         let total = t.elapsed();
 
         // So os produtos internos, sem transcendentais.
         let t2 = Instant::now();
         let mut acc2 = 0.0f64;
         for p in &pts {
-            acc2 += dist_euc2(&q.hyp, &p.hyp)
-                + dot_f32(&q.sph, &p.sph)
-                + dist_euc2(&q.euc, &p.euc);
+            acc2 += dist_euc2(&q.hyp, &p.hyp) + dot_f32(&q.sph, &p.sph) + dist_euc2(&q.euc, &p.euc);
         }
         let so_produtos = t2.elapsed();
 
         println!("dist2 completa   : {:>10.3?}  ({acc:.3})", total);
         println!("so os produtos   : {:>10.3?}  ({acc2:.3})", so_produtos);
-        println!("fraccao em transcendentais e resto: {:.0}%",
-            100.0 * (1.0 - so_produtos.as_secs_f64() / total.as_secs_f64()));
+        println!(
+            "fraccao em transcendentais e resto: {:.0}%",
+            100.0 * (1.0 - so_produtos.as_secs_f64() / total.as_secs_f64())
+        );
     }
 }

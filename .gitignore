@@ -53,6 +53,5 @@ sdk/python/*.egg-info/
 
 # targets de build de agentes/sessoes paralelas — nunca commitar
 .target-codex*/
-
-# Build dir de uma toolchain alternativa — nunca commitar.
+target-codex*/
 /target-codex/

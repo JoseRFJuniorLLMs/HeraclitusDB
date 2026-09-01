@@ -616,14 +616,14 @@ fn parse_comparison(term: &str) -> Result<Option<Indicator>, String> {
             .map_err(refuse),
         "email-addr:value" => canonical_email(value).map(Some).map_err(refuse),
         "user-agent:value" => Ok(Some(Indicator::UserAgent(value.to_owned()))),
-        "x509-certificate:hashes.'SHA-256'" | "x509-certificate:hashes.SHA-256" => {
-            Ok(Some(Indicator::CertificateFingerprint(
-                value.as_bytes().to_vec(),
-            )))
-        }
+        "x509-certificate:hashes.'SHA-256'" | "x509-certificate:hashes.SHA-256" => Ok(Some(
+            Indicator::CertificateFingerprint(value.as_bytes().to_vec()),
+        )),
         other => {
             if let Some(algorithm) = file_hash_algorithm(other) {
-                canonical_file_hash(algorithm, value).map(Some).map_err(refuse)
+                canonical_file_hash(algorithm, value)
+                    .map(Some)
+                    .map_err(refuse)
             } else {
                 Ok(None)
             }
@@ -633,7 +633,10 @@ fn parse_comparison(term: &str) -> Result<Option<Indicator>, String> {
 
 fn file_hash_algorithm(path: &str) -> Option<HashAlgorithm> {
     let rest = path.strip_prefix("file:hashes.")?;
-    let name = rest.trim_matches('\'').trim_matches('"').to_ascii_uppercase();
+    let name = rest
+        .trim_matches('\'')
+        .trim_matches('"')
+        .to_ascii_uppercase();
     Some(match name.as_str() {
         "MD5" => HashAlgorithm::Md5,
         "SHA-1" | "SHA1" => HashAlgorithm::Sha1,
@@ -969,7 +972,10 @@ mod tests {
     #[test]
     fn rfc3339_parses_only_utc() {
         assert_eq!(parse_rfc3339_millis("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(parse_rfc3339_millis("2026-01-01T00:00:00Z"), Some(1_767_225_600_000));
+        assert_eq!(
+            parse_rfc3339_millis("2026-01-01T00:00:00Z"),
+            Some(1_767_225_600_000)
+        );
         assert_eq!(
             parse_rfc3339_millis("2026-01-01T00:00:00.250Z"),
             Some(1_767_225_600_250)

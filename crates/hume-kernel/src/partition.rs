@@ -42,7 +42,11 @@ impl Radix {
             indices[cursor[b] as usize] = i as u32;
             cursor[b] += 1;
         }
-        Self { bits, offsets, indices }
+        Self {
+            bits,
+            offsets,
+            indices,
+        }
     }
 
     /// Número de baldes (`2^bits`).
@@ -62,7 +66,9 @@ mod tests {
 
     #[test]
     fn partitions_by_high_bits_and_preserves_all() {
-        let hashes: Vec<u64> = (0..1000u64).map(|i| i.wrapping_mul(0x9E3779B97F4A7C15)).collect();
+        let hashes: Vec<u64> = (0..1000u64)
+            .map(|i| i.wrapping_mul(0x9E3779B97F4A7C15))
+            .collect();
         let bits = 4;
         let r = Radix::build(&hashes, bits);
         assert_eq!(r.num_buckets(), 16);

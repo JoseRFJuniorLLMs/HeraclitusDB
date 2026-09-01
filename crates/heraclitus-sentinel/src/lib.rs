@@ -2134,12 +2134,20 @@ fn evaluate_l1(inner: &RuntimeInner) -> Result<HashSet<EventId>, SentinelError> 
         return Ok(HashSet::new());
     };
     let _latency = LatencyRecorder::milliseconds(&inner.metrics.l1_latency_ms);
+    // Evaluate while borrowing the canonical history.  RuleEngine only reads
+    // it, and `process_until` serialises workers with the cursor mutex.  The
+    // previous deep clone duplicated every SecurityEvent (including strings
+    // and attribute maps) for every invocation and briefly doubled L1 memory.
+    //
+    // We intentionally do not discard rows based on observed_at: Sentinel
+    // accepts late/out-of-order event time, so no finite time horizon is safe
+    // until the configuration has an explicit lateness contract.
     let window = inner
         .rule_history
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let signals = rule_engine.evaluate(&window);
+    drop(window);
     let suspicious_events = signals
         .iter()
         .flat_map(|signal| signal.evidence.iter().map(|evidence| evidence.event_id))

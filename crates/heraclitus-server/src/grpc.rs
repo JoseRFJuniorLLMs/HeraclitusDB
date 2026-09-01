@@ -269,16 +269,18 @@ impl pb::heraclitus_server::Heraclitus for Service {
         let required = match req.get_ref().op.as_str() {
             // `legal-holds` e leitura: saber quem esta retido nao muda nada.
             // Colocar e levantar um hold ficam no ramo Admin abaixo.
-            "stats" | "verify" | "sentinel-status" | "sentinel-incidents" | "sentinel-actions"
+            "stats"
+            | "verify"
+            | "sentinel-status"
+            | "sentinel-incidents"
+            | "sentinel-actions"
             | "legal-holds"
             | "regulatory-policies"
             | "regulatory-decisions"
             | "privacy-state"
             | "deferred-anchor-prepare"
             | "deferred-anchors"
-            | "model-bundles" => {
-                AccessRole::Auditor
-            }
+            | "model-bundles" => AccessRole::Auditor,
             _ => AccessRole::Admin,
         };
         let principal = crate::auth::require(&req, required)?;
@@ -366,21 +368,40 @@ impl pb::heraclitus_server::Heraclitus for Service {
                                     body.get("incident_id")?.as_str()?.to_owned(),
                                     body.get("proposal_id")?.as_str()?.to_owned(),
                                     body.get("approval_id")?.as_str()?.to_owned(),
-                                    body.get("approver")?.as_str()?.to_owned(),
+                                    body.get("approver")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::to_owned),
                                     body.get("reason")
                                         .and_then(serde_json::Value::as_str)
                                         .unwrap_or("")
                                         .to_owned(),
                                 ))
                             })
-                            .ok_or_else(|| "arg deve conter incident_id, proposal_id, approval_id e approver".to_string())
+                            .ok_or_else(|| "arg deve conter incident_id, proposal_id e approval_id".to_string())
                             .and_then(|(incident_id, proposal_id, approval_id, approver, reason)| {
+                                // O `approver` vinha do CORPO do pedido: quem
+                                // alcancasse esta chamada registava uma
+                                // aprovacao humana em nome de qualquer pessoa,
+                                // e um registo de aprovacao existe precisamente
+                                // para atribuir responsabilidade. Passa a ser
+                                // sempre a identidade AUTENTICADA (a mesma que
+                                // ja vai para `audit_admin` na linha de baixo —
+                                // nao fazia sentido a auditoria saber quem era
+                                // e o registo de aprovacao nao saber).
+                                //
+                                // Se o corpo indicar um aprovador, tem de
+                                // coincidir: 403 em vez de correccao silenciosa,
+                                // para que a tentativa fique visivel.
+                                let approver = crate::auth::vincular_aprovador(
+                                    approver.as_deref(),
+                                    &audit_principal,
+                                )?;
                                 runtime
                                     .persist_human_approval_for(
                                         &incident_id,
                                         &proposal_id,
                                         &approval_id,
-                                        &approver,
+                                        approver,
                                         operation == "sentinel-approve",
                                         &reason,
                                     )
@@ -541,8 +562,7 @@ pub(crate) fn regulatory_policy_op(
     op: &str,
     arg: &str,
 ) -> (bool, String) {
-    if engine.is_replicated()
-        && matches!(op, "regulatory-policy-activate" | "regulatory-evaluate")
+    if engine.is_replicated() && matches!(op, "regulatory-policy-activate" | "regulatory-evaluate")
     {
         return (
             false,
@@ -554,12 +574,13 @@ pub(crate) fn regulatory_policy_op(
     let regulatory = heraclitus_compliance::RegulatoryPolicyEngine::new(engine.log.clone());
     match op {
         "regulatory-policy-activate" => {
-            let activation = match serde_json::from_str::<heraclitus_compliance::PolicyActivation>(
-                arg,
-            ) {
-                Ok(activation) => activation,
-                Err(error) => return (false, format!("ativação de política inválida: {error}")),
-            };
+            let activation =
+                match serde_json::from_str::<heraclitus_compliance::PolicyActivation>(arg) {
+                    Ok(activation) => activation,
+                    Err(error) => {
+                        return (false, format!("ativação de política inválida: {error}"))
+                    }
+                };
             match regulatory.activate_policy(activation) {
                 Ok(lsn) => (true, format!("policy_activation_lsn={lsn}")),
                 Err(error) => (false, error.to_string()),
@@ -628,7 +649,10 @@ pub(crate) fn privacy_incident_op(
     arg: &str,
 ) -> (bool, String) {
     if engine.is_replicated()
-        && matches!(op, "privacy-assessment" | "privacy-deadline" | "privacy-package")
+        && matches!(
+            op,
+            "privacy-assessment" | "privacy-deadline" | "privacy-package"
+        )
     {
         return (
             false,
@@ -639,12 +663,14 @@ pub(crate) fn privacy_incident_op(
     let privacy = heraclitus_compliance::PrivacyIncidentEngine::new(engine.log.clone());
     match op {
         "privacy-assessment" => {
-            let assessment = match serde_json::from_str::<
-                heraclitus_compliance::PrivacyIncidentAssessment,
-            >(arg) {
-                Ok(assessment) => assessment,
-                Err(error) => return (false, format!("avaliação de privacidade inválida: {error}")),
-            };
+            let assessment =
+                match serde_json::from_str::<heraclitus_compliance::PrivacyIncidentAssessment>(arg)
+                {
+                    Ok(assessment) => assessment,
+                    Err(error) => {
+                        return (false, format!("avaliação de privacidade inválida: {error}"))
+                    }
+                };
             match privacy.persist_assessment(assessment) {
                 Ok(lsn) => (true, format!("privacy_assessment_lsn={lsn}")),
                 Err(error) => (false, error.to_string()),
@@ -817,7 +843,10 @@ pub(crate) fn deferred_anchor_op(
             }
         }
         "deferred-anchors" => match registry.state() {
-            Ok(state) => (true, serde_json::to_string(&state.anchors).unwrap_or_default()),
+            Ok(state) => (
+                true,
+                serde_json::to_string(&state.anchors).unwrap_or_default(),
+            ),
             Err(error) => (false, error.to_string()),
         },
         other => (false, format!("operação desconhecida: {other}")),
@@ -858,14 +887,11 @@ pub(crate) fn model_bundle_op(
                 Ok(signed) => signed,
                 Err(error) => return (false, error.to_string()),
             };
-            let verified = match heraclitus_compliance::verify_model_bundle(
-                &root,
-                &signed,
-                &request.policy,
-            ) {
-                Ok(verified) => verified,
-                Err(error) => return (false, error.to_string()),
-            };
+            let verified =
+                match heraclitus_compliance::verify_model_bundle(&root, &signed, &request.policy) {
+                    Ok(verified) => verified,
+                    Err(error) => return (false, error.to_string()),
+                };
             match heraclitus_compliance::ModelBundleRegistry::new(engine.log.clone())
                 .activate(verified.clone())
             {

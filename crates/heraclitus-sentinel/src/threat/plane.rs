@@ -94,11 +94,7 @@ impl ThreatPlane {
     /// `now_ms` é injectado em vez de lido de um relógio para que dois
     /// carregamentos dos mesmos bytes dêem o mesmo estado — os TTL derivados
     /// de §12 dependem dele.
-    pub fn load(
-        feeds_dir: &Path,
-        policy: ThreatSourcePolicy,
-        now_ms: u64,
-    ) -> Self {
+    pub fn load(feeds_dir: &Path, policy: ThreatSourcePolicy, now_ms: u64) -> Self {
         let mut registry = ThreatSourceRegistry::new();
         let source_id = policy.source_id.clone();
         registry.insert(policy);
@@ -260,7 +256,10 @@ fn sujeito(event: &SecurityEvent) -> Option<EntityRef> {
 /// canonicaliza entra no `ImportReport`, porque aí é o feed que está errado.
 fn indicadores_do_evento(event: &SecurityEvent) -> Vec<Indicator> {
     let mut out = Vec::new();
-    for endpoint in [event.src.as_ref(), event.dst.as_ref()].into_iter().flatten() {
+    for endpoint in [event.src.as_ref(), event.dst.as_ref()]
+        .into_iter()
+        .flatten()
+    {
         if let Some(ip) = &endpoint.ip {
             if let Ok(i) = canonical_ip(ip) {
                 out.push(i);
@@ -404,7 +403,11 @@ mod tests {
         let plane = ThreatPlane::load(dir.path(), politica(TrustLevel::Institutional), 0);
         assert_eq!(plane.report().files_read, 1);
         assert_eq!(plane.report().files_failed.len(), 1);
-        assert_eq!(plane.indicator_count(), 2, "o feed bom continuou a carregar");
+        assert_eq!(
+            plane.indicator_count(),
+            2,
+            "o feed bom continuou a carregar"
+        );
     }
 
     #[test]
@@ -499,7 +502,10 @@ mod tests {
         // §13: um erro de configuracao nao pode promover um feed a autoridade.
         assert_eq!(trust_from_config("institucional"), TrustLevel::Untrusted);
         assert_eq!(trust_from_config(""), TrustLevel::Untrusted);
-        assert_eq!(trust_from_config("Institutional"), TrustLevel::Institutional);
+        assert_eq!(
+            trust_from_config("Institutional"),
+            TrustLevel::Institutional
+        );
     }
 
     #[test]

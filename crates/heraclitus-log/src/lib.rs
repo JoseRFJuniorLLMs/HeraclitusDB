@@ -2058,7 +2058,10 @@ impl Log {
                 segment_id: c.meta.id,
                 first_lsn: c.meta.base_lsn,
                 last_lsn: c.meta.max_lsn,
-                event_count: c.meta.max_lsn - c.meta.base_lsn + 1,
+                // Saturado pela mesma razao que `lsn_span_is_contiguous`: os
+                // limites vem do scan de um ficheiro, e um `manifest()` que
+                // entra em panico e pior do que um `event_count` aproximado.
+                event_count: c.meta.max_lsn.saturating_sub(c.meta.base_lsn).saturating_add(1),
                 payload_hash: c.meta.blake3_root.unwrap_or([0; 32]),
                 state: SegmentState::Frozen,
             })

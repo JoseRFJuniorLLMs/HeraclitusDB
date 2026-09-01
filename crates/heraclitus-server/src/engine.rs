@@ -2,14 +2,12 @@
 //! All intelligence lives in the agent; this is just the riverbed.
 
 use heraclitus_activation::ActivationStore;
+use heraclitus_compliance::{ComplianceDashboardSnapshot, RegulatoryState, RequirementEffect};
 use heraclitus_core::vm::{ConsistencyVirtualMachine, VmInstruction, VmState, VmVersion};
 use heraclitus_core::{
     Episode, EventKind, HeraclitusConfig, HeraclitusError, Lsn, ProductPoint, SegmentId,
 };
 use heraclitus_crypto::KeyStore;
-use heraclitus_compliance::{
-    ComplianceDashboardSnapshot, RegulatoryState, RequirementEffect,
-};
 use heraclitus_index_attr::AttrIndex;
 use heraclitus_index_graph::entity::EntityResolver;
 use heraclitus_index_graph::temporal::TemporalGraph;
@@ -676,8 +674,7 @@ impl Engine {
         };
         if !safe(category) || !safe(export_id) {
             return Err(HeraclitusError::Config(
-                "category/export_id deve conter apenas ASCII alfanumérico, '-', '_' ou '.'"
-                    .into(),
+                "category/export_id deve conter apenas ASCII alfanumérico, '-', '_' ou '.'".into(),
             ));
         }
         let data_dir = self.attr_dir.parent().unwrap_or(self.attr_dir.as_path());
@@ -797,18 +794,20 @@ impl Engine {
 
                 // Retry depois de resposta perdida: o PUT é idempotente e o
                 // log também não ganha um segundo recibo equivalente.
-                if let Some(existing) = self.demotion_receipts_any()?.into_iter().find_map(|r| {
-                    match r {
-                        heraclitus_tier::AnyDemotionReceipt::V2(v2)
-                            if v2.segment_id == receipt.segment_id
-                                && v2.generation == receipt.generation
-                                && v2.physical_digest == receipt.physical_digest =>
-                        {
-                            Some(v2)
-                        }
-                        _ => None,
-                    }
-                }) {
+                if let Some(existing) =
+                    self.demotion_receipts_any()?
+                        .into_iter()
+                        .find_map(|r| match r {
+                            heraclitus_tier::AnyDemotionReceipt::V2(v2)
+                                if v2.segment_id == receipt.segment_id
+                                    && v2.generation == receipt.generation
+                                    && v2.physical_digest == receipt.physical_digest =>
+                            {
+                                Some(v2)
+                            }
+                            _ => None,
+                        })
+                {
                     return Ok(heraclitus_tier::AnyDemotionReceipt::V2(existing));
                 }
                 self.append(receipt.episode()?)?;
@@ -965,8 +964,7 @@ impl Engine {
             };
             for (_lsn, ep) in &batch {
                 if ep.kind == EventKind::DemotionReceipt {
-                    if let Ok(r) =
-                        heraclitus_tier::receipts_v2::decode_receipt_payload(&ep.content)
+                    if let Ok(r) = heraclitus_tier::receipts_v2::decode_receipt_payload(&ep.content)
                     {
                         out.push(r);
                     }
@@ -1008,10 +1006,8 @@ impl Engine {
                     .await?;
                 self.cold_range_reads
                     .fetch_add(stats.requests, std::sync::atomic::Ordering::Relaxed);
-                self.cold_bytes_downloaded.fetch_add(
-                    stats.bytes_fetched,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                self.cold_bytes_downloaded
+                    .fetch_add(stats.bytes_fetched, std::sync::atomic::Ordering::Relaxed);
                 Ok(events)
             }
         }
@@ -1129,7 +1125,7 @@ impl Engine {
                             HeraclitusError::Config(format!(
                                 "fonte {id} não possui classification.label"
                             ))
-                    })?;
+                        })?;
                     Ok(SourceClassification {
                         event_id: *id,
                         label,
@@ -1290,7 +1286,11 @@ impl Engine {
             lsns.clone()
         } else {
             let metade = amostra_max / 2;
-            lsns.iter().take(metade).chain(lsns.iter().rev().take(amostra_max - metade)).copied().collect()
+            lsns.iter()
+                .take(metade)
+                .chain(lsns.iter().rev().take(amostra_max - metade))
+                .copied()
+                .collect()
         };
 
         let mut tipos: std::collections::BTreeMap<String, u64> = Default::default();
@@ -1534,7 +1534,9 @@ impl Engine {
                 Ok(l) => l,
                 Err(_) => break,
             };
-            let Some(&(ultimo, _)) = lote.last() else { break };
+            let Some(&(ultimo, _)) = lote.last() else {
+                break;
+            };
             for (lsn, ep) in &lote {
                 let e_auditoria = ep.attrs.contains_key("audit");
                 if !e_auditoria {
@@ -1642,14 +1644,14 @@ impl Engine {
                 "crypto-shred bloqueado: estado regulatório inválido: {error}"
             ))
         })?;
-        if let Some(record) = state.decisions.iter().find(|record| {
-            record.decision.context.subject_id == agent_id
-                && record
-                    .decision
-                    .requirements
-                    .iter()
-                    .any(|requirement| requirement.effect == RequirementEffect::PreventDestruction)
-        }) {
+        if let Some(record) =
+            state.decisions.iter().find(|record| {
+                record.decision.context.subject_id == agent_id
+                    && record.decision.requirements.iter().any(|requirement| {
+                        requirement.effect == RequirementEffect::PreventDestruction
+                    })
+            })
+        {
             return Err(HeraclitusError::Config(format!(
                 "crypto-shred bloqueado pela decisão regulatória {}",
                 record.decision.decision_id
@@ -1684,19 +1686,15 @@ impl Engine {
                         "crypto-shred bloqueado pelo LegalHold {hold_id}"
                     )));
                 }
-                if episode
-                    .attrs
-                    .get("retention.class")
-                    .is_some_and(|class| {
-                        matches!(
-                            class.as_str(),
-                            "incident_evidence"
-                                | "permanent_archive"
-                                | "classified_information"
-                                | "legal_hold"
-                        )
-                    })
-                {
+                if episode.attrs.get("retention.class").is_some_and(|class| {
+                    matches!(
+                        class.as_str(),
+                        "incident_evidence"
+                            | "permanent_archive"
+                            | "classified_information"
+                            | "legal_hold"
+                    )
+                }) {
                     return Err(HeraclitusError::Config(format!(
                         "crypto-shred bloqueado pela classe de retenção no LSN {lsn}"
                     )));
@@ -2166,26 +2164,31 @@ impl Engine {
                 })),
             },
             AnyLog::V6(log) => {
-                let Some(reports) = log.verify_segment(
-                    id,
-                    heraclitus_log::v6::IntegrityLevel::Logical,
-                )? else {
+                let Some(reports) =
+                    log.verify_segment(id, heraclitus_log::v6::IntegrityLevel::Logical)?
+                else {
                     return Ok(serde_json::json!({ "found": false, "id": id }));
                 };
                 let manifest = log.manifest();
-                let desc = manifest.segment(id).ok_or_else(|| HeraclitusError::Corruption {
-                    context: "hrkl v6 verify".into(),
-                    detail: format!("segmento {id} desapareceu do manifesto durante verificação"),
-                })?;
+                let desc = manifest
+                    .segment(id)
+                    .ok_or_else(|| HeraclitusError::Corruption {
+                        context: "hrkl v6 verify".into(),
+                        detail: format!(
+                            "segmento {id} desapareceu do manifesto durante verificação"
+                        ),
+                    })?;
                 let generations: Vec<_> = reports
                     .iter()
-                    .map(|r| serde_json::json!({
-                        "layout": format!("{:?}", r.layout).to_ascii_lowercase(),
-                        "records": r.record_count,
-                        "blocks": r.block_count,
-                        "physical_ok": r.physical_ok,
-                        "logical_ok": r.logical_ok,
-                    }))
+                    .map(|r| {
+                        serde_json::json!({
+                            "layout": format!("{:?}", r.layout).to_ascii_lowercase(),
+                            "records": r.record_count,
+                            "blocks": r.block_count,
+                            "physical_ok": r.physical_ok,
+                            "logical_ok": r.logical_ok,
+                        })
+                    })
                     .collect();
                 Ok(serde_json::json!({
                     "found": true,
@@ -2774,11 +2777,16 @@ mod tests {
         assert_eq!(reopened.log.read(5).unwrap().unwrap().1.content, b"event-5");
         let rows = heraclitus_query::execute("MATCH (n) RETURN n", &reopened).unwrap();
         assert_eq!(rows.as_array().unwrap().len(), 6);
-        assert_eq!(reopened.append(Episode::new(
-            "v6-test",
-            EventKind::Observation,
-            b"after-restart".to_vec(),
-        )).unwrap(), 6);
+        assert_eq!(
+            reopened
+                .append(Episode::new(
+                    "v6-test",
+                    EventKind::Observation,
+                    b"after-restart".to_vec(),
+                ))
+                .unwrap(),
+            6
+        );
     }
 
     #[test]
@@ -2798,11 +2806,7 @@ mod tests {
         for i in 0..40 {
             let agent = if i < 20 { "alice" } else { "bob" };
             engine
-                .append(Episode::new(
-                    agent,
-                    EventKind::Observation,
-                    vec![b'x'; 512],
-                ))
+                .append(Episode::new(agent, EventKind::Observation, vec![b'x'; 512]))
                 .unwrap();
         }
         let v6 = engine.log.v6_arc().unwrap();
@@ -2824,11 +2828,9 @@ mod tests {
         assert!(stats.hrki_pruned > 0);
         assert!(stats.bytes_pruned > 0);
 
-        let rows = heraclitus_query::execute(
-            "MATCH (n) WHERE n.agent_id = \"alice\" RETURN n",
-            &engine,
-        )
-        .unwrap();
+        let rows =
+            heraclitus_query::execute("MATCH (n) WHERE n.agent_id = \"alice\" RETURN n", &engine)
+                .unwrap();
         assert_eq!(rows.as_array().unwrap().len(), 20);
         let explain = heraclitus_query::execute(
             "EXPLAIN MATCH (n) WHERE n.agent_id = \"alice\" RETURN n",
@@ -2858,7 +2860,10 @@ mod tests {
             "canonical_verify_failures",
             "physical_crc_failures",
         ] {
-            assert!(prometheus.lines().any(|line| line.starts_with(name)), "{name}");
+            assert!(
+                prometheus.lines().any(|line| line.starts_with(name)),
+                "{name}"
+            );
         }
     }
 
@@ -2991,7 +2996,10 @@ mod tests {
             .unwrap();
 
         assert!(engine.shred(agent).is_err());
-        assert_eq!(engine.log.read(lsn).unwrap().unwrap().1.content, b"protected");
+        assert_eq!(
+            engine.log.read(lsn).unwrap().unwrap().1.content,
+            b"protected"
+        );
 
         regulatory
             .release_legal_hold(LegalHoldRelease {
@@ -3865,7 +3873,11 @@ mod tests {
         let v6 = engine.log.v6_arc().expect("v6");
         // Um segmento NOVO, selado depois de o hold ter sido colocado.
         engine
-            .append(Episode::new("a", EventKind::Observation, b"depois".to_vec()))
+            .append(Episode::new(
+                "a",
+                EventKind::Observation,
+                b"depois".to_vec(),
+            ))
             .unwrap();
         v6.seal_active().unwrap();
 
@@ -3966,7 +3978,10 @@ mod legal_hold_entrypoint_tests {
 
         // O efeito: §98 (crypto-shred) cede perante §94 (legal hold) — C10.
         assert!(engine.shred(agent).is_err());
-        assert_eq!(engine.log.read(lsn).unwrap().unwrap().1.content, b"protegido");
+        assert_eq!(
+            engine.log.read(lsn).unwrap().unwrap().1.content,
+            b"protegido"
+        );
 
         // E o GC nao pode coletar o que esta retido.
         if let Some(v6) = engine.log.v6_arc() {
@@ -4045,7 +4060,11 @@ mod legal_hold_entrypoint_tests {
         );
         assert!(ok);
         let depois = engine
-            .append(Episode::new("a", EventKind::Observation, b"depois".to_vec()))
+            .append(Episode::new(
+                "a",
+                EventKind::Observation,
+                b"depois".to_vec(),
+            ))
             .unwrap();
 
         let (_, listagem) = crate::grpc::legal_hold_op(&engine, "legal-holds", "");
@@ -4062,11 +4081,11 @@ mod regulatory_entrypoint_tests {
     use super::*;
     use heraclitus_compliance::{
         BusinessCalendar, ComplianceContext, ComplianceEvidenceRef, CompliancePredicate,
-        ComplianceRequirement, ConfiguredRegulatoryPolicy, DeadlinePolicy,
-        DeferredAnchorRequest, DeferredTransferPolicy, IncidentPackageData, InstitutionalSigner,
-        LocalTsa, ModelBundlePolicy, ModelManifest, PolicyActivation, PolicyIdentity,
-        PrivacyExportPolicy, PrivacyIncidentAssessment, RegulatoryRule, RequirementEffect,
-        RetentionClass, RiskLevel, SignedDeferredAnchorRequest, SoftKeySigner,
+        ComplianceRequirement, ConfiguredRegulatoryPolicy, DeadlinePolicy, DeferredAnchorRequest,
+        DeferredTransferPolicy, IncidentPackageData, InstitutionalSigner, LocalTsa,
+        ModelBundlePolicy, ModelManifest, PolicyActivation, PolicyIdentity, PrivacyExportPolicy,
+        PrivacyIncidentAssessment, RegulatoryRule, RequirementEffect, RetentionClass, RiskLevel,
+        SignedDeferredAnchorRequest, SoftKeySigner,
     };
     use heraclitus_core::{FsyncPolicy, HeraclitusConfig};
     use std::collections::{BTreeMap, BTreeSet};
@@ -4134,11 +4153,8 @@ mod regulatory_entrypoint_tests {
             "policy_id": "lgpd-retention",
             "context": context,
         });
-        let (ok, decision) = crate::grpc::regulatory_policy_op(
-            &engine,
-            "regulatory-evaluate",
-            &request.to_string(),
-        );
+        let (ok, decision) =
+            crate::grpc::regulatory_policy_op(&engine, "regulatory-evaluate", &request.to_string());
         assert!(ok, "{decision}");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&decision).unwrap()["decision"]
@@ -4146,8 +4162,7 @@ mod regulatory_entrypoint_tests {
             "prevent_destruction"
         );
 
-        let (ok, policies) =
-            crate::grpc::regulatory_policy_op(&engine, "regulatory-policies", "");
+        let (ok, policies) = crate::grpc::regulatory_policy_op(&engine, "regulatory-policies", "");
         assert!(ok, "{policies}");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&policies)
@@ -4286,9 +4301,7 @@ mod regulatory_entrypoint_tests {
             &package_request.to_string(),
         );
         assert!(ok, "{package_response}");
-        let expected = dir
-            .path()
-            .join("compliance/exports/anpd/incident-anpd-1");
+        let expected = dir.path().join("compliance/exports/anpd/incident-anpd-1");
         assert!(expected.join("evidence-manifest.json").is_file());
         assert!(expected.join("privacy-sanitization.json").is_file());
         assert_eq!(
@@ -4361,7 +4374,7 @@ mod regulatory_entrypoint_tests {
             policy_id: "air-gap-transfer".into(),
             version: "2026.1".into(),
             approved_export_key_digests: [
-                *blake3::hash(&signed_request.signature.public_key).as_bytes(),
+                *blake3::hash(&signed_request.signature.public_key).as_bytes()
             ]
             .into_iter()
             .collect(),
@@ -4387,11 +4400,8 @@ mod regulatory_entrypoint_tests {
             "signed_response": signed_response,
             "policy": policy,
         });
-        let (ok, imported) = crate::grpc::deferred_anchor_op(
-            &engine,
-            "deferred-anchor-import",
-            &import.to_string(),
-        );
+        let (ok, imported) =
+            crate::grpc::deferred_anchor_op(&engine, "deferred-anchor-import", &import.to_string());
         assert!(ok, "{imported}");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&imported).unwrap()["anchor"]
@@ -4399,8 +4409,7 @@ mod regulatory_entrypoint_tests {
             "development_only"
         );
 
-        let (ok, anchors) =
-            crate::grpc::deferred_anchor_op(&engine, "deferred-anchors", "");
+        let (ok, anchors) = crate::grpc::deferred_anchor_op(&engine, "deferred-anchors", "");
         assert!(ok, "{anchors}");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&anchors)
@@ -4455,12 +4464,9 @@ mod regulatory_entrypoint_tests {
             policy_id: "offline-models".into(),
             version: "2026.1".into(),
             allowed_models: ["sentinel-investigator".into()].into_iter().collect(),
-            approved_runtimes: [(
-                "onnxruntime".into(),
-                ["1.22".into()].into_iter().collect(),
-            )]
-            .into_iter()
-            .collect(),
+            approved_runtimes: [("onnxruntime".into(), ["1.22".into()].into_iter().collect())]
+                .into_iter()
+                .collect(),
             approved_signer_key_digests: [*blake3::hash(&signed.signature.public_key).as_bytes()]
                 .into_iter()
                 .collect(),
@@ -4472,11 +4478,8 @@ mod regulatory_entrypoint_tests {
             "bundle_id": "sentinel-investigator-v1",
             "policy": policy,
         });
-        let (ok, activation) = crate::grpc::model_bundle_op(
-            &engine,
-            "model-bundle-activate",
-            &request.to_string(),
-        );
+        let (ok, activation) =
+            crate::grpc::model_bundle_op(&engine, "model-bundle-activate", &request.to_string());
         assert!(ok, "{activation}");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&activation).unwrap()["bundle"]["model"]

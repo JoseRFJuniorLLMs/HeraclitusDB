@@ -347,7 +347,11 @@ pub mod column {
                 if !(1..=64).contains(&bits) {
                     return None;
                 }
-                let valores = if codec == Codec::DeltaBitpack { n.checked_sub(1)? } else { n };
+                let valores = if codec == Codec::DeltaBitpack {
+                    n.checked_sub(1)?
+                } else {
+                    n
+                };
                 let precisas = (valores.checked_mul(bits as usize)?).div_ceil(64);
                 let restantes = blob.len().checked_sub(at)? / 8;
                 if restantes < precisas {
@@ -470,11 +474,11 @@ mod column_tests {
         for caso in [
             vec![],
             vec![42],
-            vec![7, 7, 7, 7, 7, 7, 7, 7],                 // RLE
-            (0..1000).collect::<Vec<u64>>(),               // delta = 1
-            (0..500).map(|i| i * 7 + 3).collect(),         // delta constante
-            vec![u64::MAX, 0, u64::MAX / 2],               // extremos
-            vec![1000, 1001, 1000, 1002, 999],             // fora de ordem, faixa estreita
+            vec![7, 7, 7, 7, 7, 7, 7, 7],          // RLE
+            (0..1000).collect::<Vec<u64>>(),       // delta = 1
+            (0..500).map(|i| i * 7 + 3).collect(), // delta constante
+            vec![u64::MAX, 0, u64::MAX / 2],       // extremos
+            vec![1000, 1001, 1000, 1002, 999],     // fora de ordem, faixa estreita
         ] {
             assert_eq!(round(&caso), caso, "roundtrip falhou em {caso:?}");
         }
@@ -489,12 +493,15 @@ mod column_tests {
         for caso in [
             (0..64).map(|i| i * 0x1234_5678_9abc).collect::<Vec<u64>>(),
             vec![u64::MAX; 3],
-            (0..100).map(|i: u64| i.wrapping_mul(6364136223846793005)).collect(),
+            (0..100)
+                .map(|i: u64| i.wrapping_mul(6364136223846793005))
+                .collect(),
         ] {
             let cru = 9 + caso.len() * 8;
             assert!(
                 column::encode(&caso).len() <= cru,
-                "expandiu: {} > {cru}", column::encode(&caso).len()
+                "expandiu: {} > {cru}",
+                column::encode(&caso).len()
             );
         }
     }
@@ -507,7 +514,11 @@ mod column_tests {
         let blob = column::encode(&postings);
         assert_eq!(column::codec_of(&blob), Some(Codec::DeltaBitpack));
         let cru = postings.len() * 8;
-        assert!(blob.len() * 8 < cru, "esperado >8x menor; {} vs {cru}", blob.len());
+        assert!(
+            blob.len() * 8 < cru,
+            "esperado >8x menor; {} vs {cru}",
+            blob.len()
+        );
         assert_eq!(column::decode(&blob).unwrap(), postings);
     }
 
@@ -526,8 +537,10 @@ mod column_tests {
     fn blob_corrompido_devolve_none_em_vez_de_panicar() {
         assert!(column::decode(&[]).is_none());
         assert!(column::decode(&[200]).is_none(), "tag desconhecida");
-        assert!(column::decode(&[0, 255, 255, 255, 255, 255, 255, 255, 255]).is_none(),
-                "conta gigante sem bytes que a sustentem");
+        assert!(
+            column::decode(&[0, 255, 255, 255, 255, 255, 255, 255, 255]).is_none(),
+            "conta gigante sem bytes que a sustentem"
+        );
         // Truncar um blob valido em qualquer ponto: None, nunca panico.
         let bom = column::encode(&(0..200).collect::<Vec<u64>>());
         for corte in 1..bom.len() {
@@ -544,6 +557,9 @@ mod column_tests {
             hostil.extend_from_slice(&7u64.to_le_bytes());
             hostil.extend_from_slice(&u32::MAX.to_le_bytes());
         }
-        assert!(column::decode(&hostil).is_none(), "tem de recusar, nao alocar");
+        assert!(
+            column::decode(&hostil).is_none(),
+            "tem de recusar, nao alocar"
+        );
     }
 }

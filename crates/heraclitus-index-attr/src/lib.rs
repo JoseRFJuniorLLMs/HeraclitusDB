@@ -17,7 +17,9 @@
 use heraclitus_core::{CanonicalKeyCodec, Episode, HeraclitusError, Lsn};
 use heraclitus_views::View;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{hash_map::RandomState, BTreeMap, HashMap};
+use std::hash::BuildHasher;
+use std::num::NonZeroU32;
 use std::ops::Bound;
 use std::path::Path;
 
@@ -102,9 +104,12 @@ const MAGIC_V2: &[u8; 4] = b"HATR";
 /// Subir a versão faz o `open` recusar o checkpoint antigo e reconstruir por
 /// replay desde o LSN 0. Custa um replay no primeiro arranque; num log de 10M
 /// isso são minutos, uma vez.
-const FORMAT_V2: u16 = 4;
+const FORMAT_LEGACY_COMPRESSED: u16 = 4;
+/// v5 troca apenas o checkpoint DERIVADO para IDs densos. O log canónico não
+/// muda; checkpoints v4 e v1 continuam legíveis e são internados ao abrir.
+const FORMAT_CURRENT: u16 = 5;
 
-/// Espelho do [`Snapshot`] com os postings **comprimidos**.
+/// Espelho do [`ResidentSnapshot`] com os postings **comprimidos**.
 ///
 /// A estrutura (chaves, mapas) continua a ir em bincode — é texto e metadados,
 /// onde os codecs de inteiros não ajudam. O que muda são as colunas de `Lsn`:
@@ -131,56 +136,216 @@ fn escolher_forma(v: &[Lsn]) -> Option<Vec<u8>> {
     (packed.len() < plain).then_some(packed)
 }
 
+#[inline]
+fn postings_estritamente_crescentes(postings: &[Lsn]) -> bool {
+    postings.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+/// ID reversível de `(field, value)`. O par ocupa 8 bytes em vez de uma
+/// `String` de 24 bytes + alocação + os bytes repetidos do nome do campo.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct AttrKey {
+    field: u32,
+    value: u32,
+}
+
+/// Dicionário reversível que guarda os bytes de cada string exatamente uma vez.
+///
+/// `HashMap<String, id> + Vec<String>` duplicaria todos os bytes para oferecer
+/// lookup e materialização. Aqui o mapa aponta para uma cadeia de IDs por hash;
+/// a comparação final com o `Box<str>` torna colisões totalmente corretas.
+/// `RandomState` mantém resistência a entradas adversariais.
+struct StringDictionary {
+    strings: Vec<Box<str>>,
+    heads: HashMap<u64, NonZeroU32>,
+    next_collision: Vec<Option<NonZeroU32>>,
+    hash_builder: RandomState,
+}
+
+impl Default for StringDictionary {
+    fn default() -> Self {
+        Self {
+            strings: Vec::new(),
+            heads: HashMap::new(),
+            next_collision: Vec::new(),
+            hash_builder: RandomState::new(),
+        }
+    }
+}
+
+impl StringDictionary {
+    #[inline]
+    fn link(id: u32) -> NonZeroU32 {
+        // `intern` never permits id == u32::MAX.
+        NonZeroU32::new(id + 1).expect("dictionary id + 1 is non-zero")
+    }
+
+    #[inline]
+    fn id_from_link(link: NonZeroU32) -> u32 {
+        link.get() - 1
+    }
+
+    #[inline]
+    fn hash(&self, text: &str) -> u64 {
+        self.hash_builder.hash_one(text)
+    }
+
+    fn id(&self, text: &str) -> Option<u32> {
+        let mut current = self.heads.get(&self.hash(text)).copied();
+        while let Some(link) = current {
+            let id = Self::id_from_link(link);
+            if self.strings[id as usize].as_ref() == text {
+                return Some(id);
+            }
+            current = self.next_collision[id as usize];
+        }
+        None
+    }
+
+    fn intern(&mut self, text: &str) -> u32 {
+        if let Some(id) = self.id(text) {
+            return id;
+        }
+        assert!(
+            self.strings.len() < u32::MAX as usize,
+            "attribute dictionary exhausted u32 IDs"
+        );
+        let id = self.strings.len() as u32;
+        let hash = self.hash(text);
+        let previous_head = self.heads.insert(hash, Self::link(id));
+        self.strings.push(text.into());
+        self.next_collision.push(previous_head);
+        id
+    }
+
+    fn get(&self, id: u32) -> Option<&str> {
+        self.strings.get(id as usize).map(AsRef::as_ref)
+    }
+
+    fn materialize(&self) -> Vec<String> {
+        self.strings.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn from_materialized(strings: Vec<String>) -> Option<Self> {
+        let mut dictionary = Self::default();
+        for (expected, text) in strings.into_iter().enumerate() {
+            if dictionary.intern(&text) as usize != expected {
+                return None; // string duplicada ou IDs não canónicos
+            }
+        }
+        Some(dictionary)
+    }
+}
+
+#[derive(Default)]
+struct AttrDictionary {
+    fields: StringDictionary,
+    values: StringDictionary,
+}
+
+impl AttrDictionary {
+    fn intern(&mut self, field: &str, value: &str) -> AttrKey {
+        AttrKey {
+            field: self.fields.intern(field),
+            value: self.values.intern(value),
+        }
+    }
+
+    fn key(&self, field: &str, value: &str) -> Option<AttrKey> {
+        Some(AttrKey {
+            field: self.fields.id(field)?,
+            value: self.values.id(value)?,
+        })
+    }
+
+    fn decode(&self, key: AttrKey) -> Option<(&str, &str)> {
+        Some((self.fields.get(key.field)?, self.values.get(key.value)?))
+    }
+}
+
+#[derive(Default)]
+struct ResidentSnapshot {
+    watermark: Lsn,
+    applied: bool,
+    dictionary: AttrDictionary,
+    exact: HashMap<AttrKey, Vec<Lsn>>,
+    numeric: HashMap<u32, BTreeMap<u64, Vec<Lsn>>>,
+}
+
+/// Checkpoint v5: dicionários reversíveis + chaves densas, com postings ainda
+/// escolhidos por tamanho entre bincode e o codec de colunas do HUME.
 #[derive(Serialize, Deserialize)]
 struct CompressedSnapshot {
     watermark: Lsn,
     applied: bool,
+    fields: Vec<String>,
+    values: Vec<String>,
     /// Colunas onde o bincode varint ja e melhor -- a maioria, num indice com
     /// muitos valores quase unicos.
-    exact_plain: HashMap<String, Vec<Lsn>>,
+    exact_plain: HashMap<AttrKey, Vec<Lsn>>,
     /// Colunas onde o codec ganha. Uma chave vive num mapa OU no outro.
     ///
     /// Sao dois mapas e nao um enum por coluna porque o discriminante custa um
     /// byte POR COLUNA: com 50.000 colunas minusculas isso sozinho fazia o
     /// ficheiro crescer 5,6%. Num ficheiro dominado por metadados, a
     /// autodescricao paga-se em bytes.
-    exact_packed: HashMap<String, Vec<u8>>,
-    numeric_plain: HashMap<String, BTreeMap<u64, Vec<Lsn>>>,
-    numeric_packed: HashMap<String, BTreeMap<u64, Vec<u8>>>,
+    exact_packed: HashMap<AttrKey, Vec<u8>>,
+    numeric_plain: HashMap<u32, BTreeMap<u64, Vec<Lsn>>>,
+    numeric_packed: HashMap<u32, BTreeMap<u64, Vec<u8>>>,
 }
 
-impl From<&Snapshot> for CompressedSnapshot {
-    fn from(s: &Snapshot) -> Self {
+impl From<&ResidentSnapshot> for CompressedSnapshot {
+    fn from(s: &ResidentSnapshot) -> Self {
         let mut exact_plain = HashMap::new();
         let mut exact_packed = HashMap::new();
         for (k, v) in &s.exact {
             match escolher_forma(v) {
-                Some(blob) => { exact_packed.insert(k.clone(), blob); }
-                None => { exact_plain.insert(k.clone(), v.clone()); }
+                Some(blob) => {
+                    exact_packed.insert(*k, blob);
+                }
+                None => {
+                    exact_plain.insert(*k, v.clone());
+                }
             }
         }
-        let mut numeric_plain: HashMap<String, BTreeMap<u64, Vec<Lsn>>> = HashMap::new();
-        let mut numeric_packed: HashMap<String, BTreeMap<u64, Vec<u8>>> = HashMap::new();
+        let mut numeric_plain: HashMap<u32, BTreeMap<u64, Vec<Lsn>>> = HashMap::new();
+        let mut numeric_packed: HashMap<u32, BTreeMap<u64, Vec<u8>>> = HashMap::new();
         for (campo, por_valor) in &s.numeric {
             for (chave, v) in por_valor {
                 match escolher_forma(v) {
                     Some(blob) => {
-                        numeric_packed.entry(campo.clone()).or_default().insert(*chave, blob);
+                        numeric_packed
+                            .entry(*campo)
+                            .or_default()
+                            .insert(*chave, blob);
                     }
                     None => {
-                        numeric_plain.entry(campo.clone()).or_default().insert(*chave, v.clone());
+                        numeric_plain
+                            .entry(*campo)
+                            .or_default()
+                            .insert(*chave, v.clone());
                     }
                 }
             }
         }
-        Self { watermark: s.watermark, applied: s.applied, exact_plain, exact_packed, numeric_plain, numeric_packed }
+        Self {
+            watermark: s.watermark,
+            applied: s.applied,
+            fields: s.dictionary.fields.materialize(),
+            values: s.dictionary.values.materialize(),
+            exact_plain,
+            exact_packed,
+            numeric_plain,
+            numeric_packed,
+        }
     }
 }
 
 impl CompressedSnapshot {
     /// `None` se alguma coluna não descodificar — o chamador degrada para
     /// rebuild por replay, que é sempre correto por construção.
-    fn expand(self) -> Option<Snapshot> {
+    fn expand(self) -> Option<ResidentSnapshot> {
         use hume_kernel::compression::column;
         let mut exact = self.exact_plain;
         for (k, blob) in self.exact_packed {
@@ -193,17 +358,39 @@ impl CompressedSnapshot {
                 m.insert(chave, column::decode(&blob)?);
             }
         }
-        Some(Snapshot {
+        let dictionary = AttrDictionary {
+            fields: StringDictionary::from_materialized(self.fields)?,
+            values: StringDictionary::from_materialized(self.values)?,
+        };
+        if exact.keys().any(|key| dictionary.decode(*key).is_none())
+            || numeric
+                .keys()
+                .any(|field| dictionary.fields.get(*field).is_none())
+            || exact
+                .values()
+                .any(|postings| !postings_estritamente_crescentes(postings))
+            || numeric.values().any(|by_value| {
+                by_value
+                    .values()
+                    .any(|postings| !postings_estritamente_crescentes(postings))
+            })
+        {
+            return None;
+        }
+        Some(ResidentSnapshot {
             watermark: self.watermark,
             applied: self.applied,
+            dictionary,
             exact,
             numeric,
         })
     }
 }
 
+/// Layout v4/v1 antigo, mantido exclusivamente para restore e para medir o
+/// baseline. O estado residente nunca usa estas Strings compostas.
 #[derive(Default, Serialize, Deserialize)]
-struct Snapshot {
+struct LegacySnapshot {
     watermark: Lsn,
     applied: bool,
     /// `"campo\u{1f}valor" -> [LSN]` (postings em ordem crescente de LSN).
@@ -216,6 +403,175 @@ struct Snapshot {
     numeric: HashMap<String, BTreeMap<u64, Vec<Lsn>>>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct LegacyCompressedSnapshot {
+    watermark: Lsn,
+    applied: bool,
+    exact_plain: HashMap<String, Vec<Lsn>>,
+    exact_packed: HashMap<String, Vec<u8>>,
+    numeric_plain: HashMap<String, BTreeMap<u64, Vec<Lsn>>>,
+    numeric_packed: HashMap<String, BTreeMap<u64, Vec<u8>>>,
+}
+
+impl From<&LegacySnapshot> for LegacyCompressedSnapshot {
+    fn from(s: &LegacySnapshot) -> Self {
+        let mut exact_plain = HashMap::new();
+        let mut exact_packed = HashMap::new();
+        for (key, postings) in &s.exact {
+            match escolher_forma(postings) {
+                Some(blob) => {
+                    exact_packed.insert(key.clone(), blob);
+                }
+                None => {
+                    exact_plain.insert(key.clone(), postings.clone());
+                }
+            }
+        }
+        let mut numeric_plain: HashMap<String, BTreeMap<u64, Vec<Lsn>>> = HashMap::new();
+        let mut numeric_packed: HashMap<String, BTreeMap<u64, Vec<u8>>> = HashMap::new();
+        for (field, by_value) in &s.numeric {
+            for (value, postings) in by_value {
+                match escolher_forma(postings) {
+                    Some(blob) => {
+                        numeric_packed
+                            .entry(field.clone())
+                            .or_default()
+                            .insert(*value, blob);
+                    }
+                    None => {
+                        numeric_plain
+                            .entry(field.clone())
+                            .or_default()
+                            .insert(*value, postings.clone());
+                    }
+                }
+            }
+        }
+        Self {
+            watermark: s.watermark,
+            applied: s.applied,
+            exact_plain,
+            exact_packed,
+            numeric_plain,
+            numeric_packed,
+        }
+    }
+}
+
+impl LegacyCompressedSnapshot {
+    fn expand(self) -> Option<LegacySnapshot> {
+        use hume_kernel::compression::column;
+        let mut exact = self.exact_plain;
+        for (key, blob) in self.exact_packed {
+            exact.insert(key, column::decode(&blob)?);
+        }
+        let mut numeric = self.numeric_plain;
+        for (field, by_value) in self.numeric_packed {
+            let target = numeric.entry(field).or_default();
+            for (value, blob) in by_value {
+                target.insert(value, column::decode(&blob)?);
+            }
+        }
+        if exact
+            .values()
+            .any(|postings| !postings_estritamente_crescentes(postings))
+            || numeric.values().any(|by_value| {
+                by_value
+                    .values()
+                    .any(|postings| !postings_estritamente_crescentes(postings))
+            })
+        {
+            return None;
+        }
+        Some(LegacySnapshot {
+            watermark: self.watermark,
+            applied: self.applied,
+            exact,
+            numeric,
+        })
+    }
+}
+
+fn legacy_key(field: &str, value: &str) -> String {
+    let mut key = String::with_capacity(field.len() + value.len() + 1);
+    key.push_str(field);
+    key.push(SEP);
+    key.push_str(value);
+    key
+}
+
+impl ResidentSnapshot {
+    fn from_legacy(snapshot: LegacySnapshot) -> Option<Self> {
+        let mut resident = Self {
+            watermark: snapshot.watermark,
+            applied: snapshot.applied,
+            ..Self::default()
+        };
+        // HashMap iteration is randomized. Sorting gives stable IDs after every
+        // restore, which keeps EXPLAIN/checkpoint materialization deterministic.
+        let mut exact: Vec<_> = snapshot.exact.into_iter().collect();
+        exact.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for (composite, postings) in exact {
+            if !postings_estritamente_crescentes(&postings) {
+                return None;
+            }
+            let (field, value) = composite.split_once(SEP)?;
+            let key = resident.dictionary.intern(field, value);
+            if resident.exact.insert(key, postings).is_some() {
+                return None;
+            }
+        }
+        let mut numeric: Vec<_> = snapshot.numeric.into_iter().collect();
+        numeric.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for (field, postings) in numeric {
+            if postings
+                .values()
+                .any(|values| !postings_estritamente_crescentes(values))
+            {
+                return None;
+            }
+            let field_id = resident.dictionary.fields.intern(&field);
+            if resident.numeric.insert(field_id, postings).is_some() {
+                return None;
+            }
+        }
+        Some(resident)
+    }
+
+    fn to_legacy(&self) -> LegacySnapshot {
+        let exact = self
+            .exact
+            .iter()
+            .filter_map(|(key, postings)| {
+                let (field, value) = self.dictionary.decode(*key)?;
+                Some((legacy_key(field, value), postings.clone()))
+            })
+            .collect();
+        let numeric = self
+            .numeric
+            .iter()
+            .filter_map(|(field, postings)| {
+                Some((
+                    self.dictionary.fields.get(*field)?.to_owned(),
+                    postings.clone(),
+                ))
+            })
+            .collect();
+        LegacySnapshot {
+            watermark: self.watermark,
+            applied: self.applied,
+            exact,
+            numeric,
+        }
+    }
+
+    fn upsert_exact(&mut self, field: &str, value: &str, lsn: Lsn) -> AttrKey {
+        let key = self.dictionary.intern(field, value);
+        insert_sorted(self.exact.entry(key).or_default(), lsn);
+        key
+    }
+}
+
 // SPEC-009: a chave numérica ordenável é o `CanonicalKeyCodec::encode_f64` do
 // core — ordem total correta, com colapso de NaN e normalização de -0.0→+0.0
 // (o `f64_ordered` ad-hoc anterior não tratava esses casos). Para todo valor
@@ -225,41 +581,7 @@ struct Snapshot {
 /// Índice invertido de atributos. Persistido e reconstruível por replay.
 #[derive(Default)]
 pub struct AttrIndex {
-    inner: Snapshot,
-}
-
-fn ikey(field: &str, value: &str) -> String {
-    let mut s = String::with_capacity(field.len() + value.len() + 1);
-    s.push_str(field);
-    s.push(SEP);
-    s.push_str(value);
-    s
-}
-
-thread_local! {
-    /// Buffer reutilizado para compor `campo␟valor`.
-    ///
-    /// `ikey` aloca uma `String` nova a cada chamada, e era chamada uma vez por
-    /// ATRIBUTO de cada evento indexado e uma vez por consulta. Num ingest de
-    /// milhoes de eventos com meia duzia de atributos cada, sao milhoes de
-    /// `malloc`/`free` que nao produzem nada — a chave e descartada
-    /// imediatamente a seguir a procura.
-    ///
-    /// A chave so passa a ser alocada quando e mesmo GUARDADA, ou seja, na
-    /// primeira vez que aquele par campo/valor aparece.
-    static CHAVE: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
-}
-
-/// Compoe a chave no buffer e corre `f` sobre ela, sem alocar.
-fn com_chave<R>(field: &str, value: &str, f: impl FnOnce(&str) -> R) -> R {
-    CHAVE.with(|b| {
-        let mut b = b.borrow_mut();
-        b.clear();
-        b.push_str(field);
-        b.push(SEP);
-        b.push_str(value);
-        f(&b)
-    })
+    inner: ResidentSnapshot,
 }
 
 impl AttrIndex {
@@ -277,22 +599,28 @@ impl AttrIndex {
                 // mudança deitava fora um checkpoint válido e reconstruía o
                 // índice inteiro por replay — correto, mas caro e silencioso.
                 let snap = if bytes.starts_with(MAGIC_V2) {
-                    bytes
-                        .get(4..6)
-                        .map(|v| u16::from_le_bytes([v[0], v[1]]))
-                        .filter(|v| *v == FORMAT_V2)
-                        .and_then(|_| {
-                            bincode::serde::decode_from_slice::<CompressedSnapshot, _>(
+                    match bytes.get(4..6).map(|v| u16::from_le_bytes([v[0], v[1]])) {
+                        Some(FORMAT_CURRENT) => bincode::serde::decode_from_slice::<
+                            CompressedSnapshot,
+                            _,
+                        >(&bytes[6..], BINCODE_CFG)
+                        .ok()
+                        .and_then(|(snapshot, _)| snapshot.expand()),
+                        Some(FORMAT_LEGACY_COMPRESSED) => {
+                            bincode::serde::decode_from_slice::<LegacyCompressedSnapshot, _>(
                                 &bytes[6..],
                                 BINCODE_CFG,
                             )
                             .ok()
-                        })
-                        .and_then(|(c, _)| c.expand())
+                            .and_then(|(snapshot, _)| snapshot.expand())
+                            .and_then(ResidentSnapshot::from_legacy)
+                        }
+                        _ => None,
+                    }
                 } else {
-                    bincode::serde::decode_from_slice::<Snapshot, _>(&bytes, BINCODE_CFG)
+                    bincode::serde::decode_from_slice::<LegacySnapshot, _>(&bytes, BINCODE_CFG)
                         .ok()
-                        .map(|(s, _)| s)
+                        .and_then(|(snapshot, _)| ResidentSnapshot::from_legacy(snapshot))
                 };
                 match snap {
                     Some(inner) => AttrIndex { inner },
@@ -305,7 +633,10 @@ impl AttrIndex {
 
     /// LSNs (ordenados) dos eventos cujo `field == value`. Vazio se nada bate.
     pub fn lookup(&self, field: &str, value: &str) -> &[Lsn] {
-        com_chave(field, value, |k| self.inner.exact.get(k))
+        self.inner
+            .dictionary
+            .key(field, value)
+            .and_then(|key| self.inner.exact.get(&key))
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
@@ -314,7 +645,10 @@ impl AttrIndex {
     /// `field` cai no intervalo `[min, max]` (bounds à la `BTreeMap::range`).
     /// Vazio se o campo não tem valores numéricos indexados.
     pub fn lookup_range(&self, field: &str, min: Bound<f64>, max: Bound<f64>) -> Vec<Lsn> {
-        let Some(by_value) = self.inner.numeric.get(field) else {
+        let Some(field_id) = self.inner.dictionary.fields.id(field) else {
+            return Vec::new();
+        };
+        let Some(by_value) = self.inner.numeric.get(&field_id) else {
             return Vec::new();
         };
         let enc = |b: Bound<f64>| match b {
@@ -359,13 +693,24 @@ impl AttrIndex {
     /// Com `field = "_agent"` responde "que fontes escrevem neste log, e
     /// quanto" — sem varrer o log, so lendo o indice.
     pub fn field_values(&self, field: &str) -> Vec<(String, usize)> {
-        let prefixo = ikey(field, "");
+        let Some(field_id) = self.inner.dictionary.fields.id(field) else {
+            return Vec::new();
+        };
         let mut v: Vec<(String, usize)> = self
             .inner
             .exact
             .iter()
-            .filter_map(|(k, lsns)| {
-                k.strip_prefix(&prefixo).map(|val| (val.to_string(), lsns.len()))
+            .filter(|(key, _)| key.field == field_id)
+            .map(|(key, lsns)| {
+                (
+                    self.inner
+                        .dictionary
+                        .values
+                        .get(key.value)
+                        .expect("resident AttrKey validated")
+                        .to_owned(),
+                    lsns.len(),
+                )
             })
             .collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -391,10 +736,14 @@ impl AttrIndex {
     /// materia-prima do registo de operacoes de tratamento (LGPD art. 37).
     pub fn fields(&self) -> BTreeMap<String, usize> {
         let mut m: BTreeMap<String, usize> = BTreeMap::new();
-        for k in self.inner.exact.keys() {
-            if let Some((campo, _)) = k.split_once(SEP) {
-                *m.entry(campo.to_string()).or_insert(0) += 1;
-            }
+        for key in self.inner.exact.keys() {
+            let field = self
+                .inner
+                .dictionary
+                .fields
+                .get(key.field)
+                .expect("resident AttrKey validated");
+            *m.entry(field.to_owned()).or_insert(0) += 1;
         }
         m
     }
@@ -407,11 +756,13 @@ impl AttrIndex {
     /// primeira resposta, dada por engano, e uma declaracao falsa a um titular
     /// de dados.
     pub fn field_entries(&self, field: &str) -> usize {
-        let prefixo = ikey(field, "");
+        let Some(field_id) = self.inner.dictionary.fields.id(field) else {
+            return 0;
+        };
         self.inner
             .exact
             .keys()
-            .filter(|k| k.starts_with(&prefixo))
+            .filter(|key| key.field == field_id)
             .count()
     }
 
@@ -441,8 +792,12 @@ impl AttrIndex {
         let ant = de.saturating_sub(largura);
         let mut por_campo: BTreeMap<String, DiffCampo> = BTreeMap::new();
 
-        for (k, lsns) in self.inner.exact.iter() {
-            let Some((campo, valor)) = k.split_once(SEP) else { continue };
+        for (key, lsns) in &self.inner.exact {
+            let (campo, valor) = self
+                .inner
+                .dictionary
+                .decode(*key)
+                .expect("resident AttrKey validated");
             // `partition_point` num vetor ordenado: quantos LSN sao < bound.
             let ate_i = lsns.partition_point(|l| *l < ate);
             let de_i = lsns.partition_point(|l| *l < de);
@@ -533,7 +888,7 @@ impl AttrIndex {
     /// da compressão varia entre −83% e zero consoante o perfil do índice;
     /// um valor fixo em documentação seria verdade num caso e mentira noutro.
     pub fn snapshot_bincode_len(&self) -> usize {
-        bincode::serde::encode_to_vec(&self.inner, BINCODE_CFG)
+        bincode::serde::encode_to_vec(self.inner.to_legacy(), BINCODE_CFG)
             .map(|b| b.len())
             .unwrap_or(0)
     }
@@ -547,7 +902,7 @@ impl AttrIndex {
             .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
         let mut bytes = Vec::with_capacity(corpo.len() + 6);
         bytes.extend_from_slice(MAGIC_V2);
-        bytes.extend_from_slice(&FORMAT_V2.to_le_bytes());
+        bytes.extend_from_slice(&FORMAT_CURRENT.to_le_bytes());
         bytes.extend_from_slice(&corpo);
         let dst = dir.as_ref().join(SNAPSHOT_FILE);
         let tmp = dir.as_ref().join(format!("{SNAPSHOT_FILE}.tmp"));
@@ -590,7 +945,7 @@ impl View for AttrIndex {
         {
             let a = event.agent_id.trim();
             if !a.is_empty() && a.len() <= MAX_VALUE_LEN {
-                com_chave("_agent", a, |k| upsert(&mut self.inner.exact, k, lsn));
+                self.inner.upsert_exact("_agent", a, lsn);
             }
         }
 
@@ -616,7 +971,7 @@ impl View for AttrIndex {
             let k = event.kind.label();
             let k = k.trim();
             if !k.is_empty() && k.len() <= MAX_VALUE_LEN {
-                com_chave("_kind", k, |c| upsert(&mut self.inner.exact, c, lsn));
+                self.inner.upsert_exact("_kind", k, lsn);
             }
         }
 
@@ -628,7 +983,7 @@ impl View for AttrIndex {
             if v.len() > MAX_VALUE_LEN || SKIP_VALUES.iter().any(|s| s.eq_ignore_ascii_case(v)) {
                 continue;
             }
-            com_chave(field, v, |k| upsert(&mut self.inner.exact, k, lsn));
+            let key = self.inner.upsert_exact(field, v, lsn);
             // Valor numérico entra também no índice ordenado (range filtering).
             // Os SKIP_VALUES continuam de fora — "0"/"-1" ubíquos gerariam
             // postings gigantes sem poder discriminante.
@@ -637,7 +992,7 @@ impl View for AttrIndex {
                     insert_sorted(
                         self.inner
                             .numeric
-                            .entry(field.clone())
+                            .entry(key.field)
                             .or_default()
                             .entry(CanonicalKeyCodec::encode_f64(n))
                             .or_default(),
@@ -661,28 +1016,21 @@ impl View for AttrIndex {
     }
 
     fn reset(&mut self) {
-        self.inner = Snapshot::default();
+        self.inner = ResidentSnapshot::default();
     }
 }
 
 /// Insere `lsn` mantendo a posting ordenada, sem duplicar.
 fn insert_sorted(v: &mut Vec<Lsn>, lsn: Lsn) {
-    if let Err(i) = v.binary_search(&lsn) {
-        v.insert(i, lsn);
-    }
-}
-
-/// Insere `lsn` na posting de `chave`, alocando a chave SO se for nova.
-///
-/// `entry(chave.to_owned())` alocaria sempre, mesmo quando a chave ja existe —
-/// que e o caso esmagadoramente mais comum depois do arranque.
-fn upsert(mapa: &mut HashMap<String, Vec<Lsn>>, chave: &str, lsn: Lsn) {
-    if let Some(v) = mapa.get_mut(chave) {
-        insert_sorted(v, lsn);
-    } else {
-        let mut v = Vec::new();
-        insert_sorted(&mut v, lsn);
-        mapa.insert(chave.to_owned(), v);
+    match v.last().copied() {
+        None => v.push(lsn),
+        Some(last) if last < lsn => v.push(lsn),
+        Some(last) if last == lsn => {}
+        Some(_) => {
+            if let Err(i) = v.binary_search(&lsn) {
+                v.insert(i, lsn);
+            }
+        }
     }
 }
 
@@ -969,6 +1317,57 @@ mod tests {
             &[0, 3, 6, 9, 12, 15, 18, 21, 24, 27]
         );
     }
+
+    #[test]
+    fn dictionary_is_reversible_and_reduces_logical_key_storage() {
+        let mut index = AttrIndex::new();
+        let mut lsn = 0u64;
+        for field in 0..64 {
+            for value in 0..128 {
+                let mut event = Episode::new("etl", EventKind::Observation, Vec::new());
+                event
+                    .attrs
+                    .insert(format!("field-{field:02}"), format!("value-{value:03}"));
+                index.apply(lsn, &event);
+                lsn += 1;
+            }
+        }
+
+        assert_eq!(std::mem::size_of::<AttrKey>(), 8);
+        assert_eq!(index.field_entries("field-17"), 128);
+        assert_eq!(index.field_values("field-17").len(), 128);
+        assert_eq!(index.lookup("field-17", "value-042"), &[17 * 128 + 42]);
+
+        // Compara somente a parte que muda (chaves/dicionários); Vec<Posting>
+        // e buckets do HashMap existem nos dois desenhos e cancelam-se.
+        let legacy = index.inner.to_legacy();
+        let legacy_key_storage: usize = legacy
+            .exact
+            .keys()
+            .map(|key| std::mem::size_of::<String>() + key.capacity())
+            .sum();
+        let dictionary_string_storage = index
+            .inner
+            .dictionary
+            .fields
+            .strings
+            .iter()
+            .chain(&index.inner.dictionary.values.strings)
+            .map(|text| std::mem::size_of::<Box<str>>() + text.len())
+            .sum::<usize>();
+        let dictionary_entries = index.inner.dictionary.fields.strings.len()
+            + index.inner.dictionary.values.strings.len();
+        let resident_key_storage = index.inner.exact.len() * std::mem::size_of::<AttrKey>()
+            + dictionary_string_storage
+            + dictionary_entries
+                * (std::mem::size_of::<u64>()
+                    + std::mem::size_of::<NonZeroU32>()
+                    + std::mem::size_of::<Option<NonZeroU32>>());
+        assert!(
+            resident_key_storage * 3 < legacy_key_storage,
+            "dense={resident_key_storage} legacy={legacy_key_storage}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -997,11 +1396,16 @@ mod compressao_tests {
     }
 
     #[test]
-    fn o_ficheiro_gravado_e_v2() {
+    fn o_ficheiro_gravado_e_v5() {
         let dir = tempfile::tempdir().unwrap();
         indice_com(10).save(dir.path()).unwrap();
         let bytes = std::fs::read(dir.path().join(SNAPSHOT_FILE)).unwrap();
         assert!(bytes.starts_with(MAGIC_V2), "checkpoint tem de trazer o magic v2");
+        assert_eq!(
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            FORMAT_CURRENT,
+            "checkpoint novo deve usar dictionary IDs"
+        );
     }
 
     /// Sem isto, o primeiro arranque depois desta mudanca deitava fora um
@@ -1012,11 +1416,54 @@ mod compressao_tests {
         let dir = tempfile::tempdir().unwrap();
         let ix = indice_com(200);
         // Grava no formato ANTIGO: bincode cru, sem magic.
-        let cru = bincode::serde::encode_to_vec(&ix.inner, BINCODE_CFG).unwrap();
+        let cru = bincode::serde::encode_to_vec(ix.inner.to_legacy(), BINCODE_CFG).unwrap();
         std::fs::write(dir.path().join(SNAPSHOT_FILE), &cru).unwrap();
 
         let lido = AttrIndex::open(dir.path());
         assert_eq!(lido.lookup("campo", "valor").len(), 200, "v1 tem de continuar legivel");
+    }
+
+    #[test]
+    fn checkpoint_v4_comprimido_continua_a_ser_lido() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = indice_com(5_000);
+        let legacy = original.inner.to_legacy();
+        let compressed = LegacyCompressedSnapshot::from(&legacy);
+        let body = bincode::serde::encode_to_vec(&compressed, BINCODE_CFG).unwrap();
+        let mut bytes = Vec::with_capacity(body.len() + 6);
+        bytes.extend_from_slice(MAGIC_V2);
+        bytes.extend_from_slice(&FORMAT_LEGACY_COMPRESSED.to_le_bytes());
+        bytes.extend_from_slice(&body);
+        std::fs::write(dir.path().join(SNAPSHOT_FILE), bytes).unwrap();
+
+        let restored = AttrIndex::open(dir.path());
+        assert_eq!(restored.watermark(), original.watermark());
+        assert_eq!(
+            restored.lookup("campo", "valor"),
+            original.lookup("campo", "valor")
+        );
+        assert_eq!(restored.fields(), original.fields());
+        assert_eq!(restored.field_values("seq"), original.field_values("seq"));
+    }
+
+    #[test]
+    fn dictionary_checkpoint_is_smaller_than_v4_for_repeated_fields() {
+        let index = indice_com(20_000);
+        let legacy = index.inner.to_legacy();
+        let legacy_body = bincode::serde::encode_to_vec(
+            LegacyCompressedSnapshot::from(&legacy),
+            BINCODE_CFG,
+        )
+        .unwrap();
+        let current_body =
+            bincode::serde::encode_to_vec(CompressedSnapshot::from(&index.inner), BINCODE_CFG)
+                .unwrap();
+        assert!(
+            current_body.len() < legacy_body.len(),
+            "v5={} v4={} bytes",
+            current_body.len(),
+            legacy_body.len()
+        );
     }
 
     #[test]
@@ -1052,7 +1499,9 @@ mod compressao_tests {
         let dir = tempfile::tempdir().unwrap();
         ix.save(dir.path()).unwrap();
         let v2 = std::fs::metadata(dir.path().join(SNAPSHOT_FILE)).unwrap().len();
-        let v1 = bincode::serde::encode_to_vec(&ix.inner, BINCODE_CFG).unwrap().len() as u64;
+        let v1 = bincode::serde::encode_to_vec(ix.inner.to_legacy(), BINCODE_CFG)
+            .unwrap()
+            .len() as u64;
         (v1, v2)
     }
 
@@ -1126,5 +1575,89 @@ mod medicao_attr {
                 consultar / 20_000
             );
         }
+    }
+
+    /// A/B do desenho anterior (`String "field<SEP>value"`) contra os IDs
+    /// densos. Sem limiar temporal para não tornar CI flakey; execute em
+    /// release e compare também os bytes lógicos impressos.
+    ///
+    /// `cargo test -p heraclitus-index-attr --release dictionary_vs_composite_keys_ab -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn dictionary_vs_composite_keys_ab() {
+        use std::hint::black_box;
+
+        let pairs: Vec<(String, String, Lsn)> = (0..200_000u64)
+            .map(|lsn| {
+                (
+                    format!("field-{:03}", lsn % 256),
+                    format!("value-{lsn:09}"),
+                    lsn,
+                )
+            })
+            .collect();
+
+        let mut dense = ResidentSnapshot::default();
+        let started = Instant::now();
+        for (field, value, lsn) in &pairs {
+            dense.upsert_exact(field, value, *lsn);
+        }
+        let dense_insert = started.elapsed();
+
+        let mut legacy = HashMap::<String, Vec<Lsn>>::new();
+        let started = Instant::now();
+        for (field, value, lsn) in &pairs {
+            insert_sorted(
+                legacy.entry(legacy_key(field, value)).or_default(),
+                *lsn,
+            );
+        }
+        let legacy_insert = started.elapsed();
+
+        let started = Instant::now();
+        let mut dense_hits = 0u64;
+        for query in 0..1_000_000usize {
+            let (field, value, _) = &pairs[(query * 7919) % pairs.len()];
+            let key = dense.dictionary.key(black_box(field), black_box(value));
+            dense_hits ^= key
+                .and_then(|key| dense.exact.get(&key))
+                .and_then(|postings| postings.first())
+                .copied()
+                .unwrap_or_default();
+        }
+        let dense_lookup = started.elapsed();
+
+        // O código anterior já reutilizava a String temporária em lookup; este
+        // buffer reproduz isso para não favorecer artificialmente os IDs.
+        let mut buffer = String::new();
+        let started = Instant::now();
+        let mut legacy_hits = 0u64;
+        for query in 0..1_000_000usize {
+            let (field, value, _) = &pairs[(query * 7919) % pairs.len()];
+            buffer.clear();
+            buffer.push_str(black_box(field));
+            buffer.push(SEP);
+            buffer.push_str(black_box(value));
+            legacy_hits ^= legacy
+                .get(buffer.as_str())
+                .and_then(|postings| postings.first())
+                .copied()
+                .unwrap_or_default();
+        }
+        let legacy_lookup = started.elapsed();
+        assert_eq!(dense_hits, legacy_hits);
+
+        let dense_text_bytes: usize = dense
+            .dictionary
+            .fields
+            .strings
+            .iter()
+            .chain(&dense.dictionary.values.strings)
+            .map(|text| text.len())
+            .sum();
+        let legacy_text_bytes: usize = legacy.keys().map(|key| key.len()).sum();
+        eprintln!(
+            "AttrIndex IDs: insert={dense_insert:?} lookup={dense_lookup:?} utf8={dense_text_bytes}; composite: insert={legacy_insert:?} lookup={legacy_lookup:?} utf8={legacy_text_bytes}"
+        );
     }
 }

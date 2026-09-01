@@ -87,7 +87,9 @@ pub enum SanitizationError {
         category: &'static str,
         field: String,
     },
-    #[error("nothing left to share for object `{object_id}`: every indicator was withheld by policy")]
+    #[error(
+        "nothing left to share for object `{object_id}`: every indicator was withheld by policy"
+    )]
     NothingLeftToShare { object_id: String },
 }
 
@@ -224,7 +226,9 @@ impl ThreatSanitizer for PolicySanitizer {
                     indicators.push(self.pseudonymizer.pseudonym("email", address));
                     *withheld.entry("user_identity".into()).or_default() += 1;
                 }
-                Indicator::Domain(name) if is_internal_hostname(name) && !policy.allow_asset_names => {
+                Indicator::Domain(name)
+                    if is_internal_hostname(name) && !policy.allow_asset_names =>
+                {
                     indicators.push(self.pseudonymizer.pseudonym("asset", name));
                     *withheld.entry("asset_name".into()).or_default() += 1;
                 }
@@ -256,9 +260,10 @@ impl ThreatSanitizer for PolicySanitizer {
 fn render(indicator: &Indicator) -> String {
     match indicator {
         Indicator::Ip(cidr) => cidr.to_string(),
-        Indicator::Domain(v) | Indicator::Url(v) | Indicator::Email(v) | Indicator::UserAgent(v) => {
-            v.clone()
-        }
+        Indicator::Domain(v)
+        | Indicator::Url(v)
+        | Indicator::Email(v)
+        | Indicator::UserAgent(v) => v.clone(),
         Indicator::FileHash { algorithm, value } => {
             format!("{}:{}", algorithm.label(), hex(value))
         }
@@ -570,9 +575,6 @@ mod tests {
                 &open_policy(),
             )
             .unwrap_err();
-        assert!(matches!(
-            err,
-            SanitizationError::NothingLeftToShare { .. }
-        ));
+        assert!(matches!(err, SanitizationError::NothingLeftToShare { .. }));
     }
 }

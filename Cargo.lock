@@ -3095,6 +3095,7 @@ name = "heraclitus-index-graph"
 version = "1.0.5"
 dependencies = [
  "blake3",
+ "criterion",
  "dashmap",
  "heraclitus-core",
  "heraclitus-views",

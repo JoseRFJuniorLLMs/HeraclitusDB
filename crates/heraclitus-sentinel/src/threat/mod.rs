@@ -68,16 +68,16 @@ pub mod tlp;
 pub mod trust;
 
 pub use canonical::CanonicalError;
-pub use feed::{FeedVersionState, ThreatFeed, ThreatFeedUpdate, FeedError};
+pub use feed::{FeedError, FeedVersionState, ThreatFeed, ThreatFeedUpdate};
 pub use index::{ConfirmedMatch, IocIndex, MatchKind, PrefilterHit, PrefilterOutcome};
 pub use ir::{
     HashAlgorithm, Indicator, IndicatorState, IpCidr, ThreatObject, ThreatObjectType,
     ThreatProvenance, ThreatRelation,
 };
+pub use plane::{trust_from_config, ThreatLoadReport, ThreatPlane};
 pub use sharing::{
     Pseudonymizer, SanitizationError, SanitizedThreatObject, SharingPolicy, ThreatSanitizer,
 };
-pub use plane::{trust_from_config, ThreatLoadReport, ThreatPlane};
 pub use sighting::ThreatSighting;
 pub use stix::{StixImporter, ThreatImportError, ThreatImporter, ThreatInputLimits};
 pub use tlp::TlpLevel;

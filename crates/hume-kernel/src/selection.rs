@@ -58,6 +58,9 @@ pub enum Rep {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectionVector {
     len: usize,
+    /// Cardinalidade materializada junto com a representação. Bitmaps não
+    /// precisam repetir `popcount` em cada consulta de seletividade/capacidade.
+    selected: usize,
     rep: Rep,
 }
 
@@ -125,20 +128,19 @@ impl SelectionVector {
     pub fn from_bitmap(len: usize, mut words: Vec<u64>) -> Self {
         words.resize(words_for(len), 0);
         clear_tail(&mut words, len);
+        let selected = words.iter().map(|x| x.count_ones() as usize).sum();
         Self {
             len,
+            selected,
             rep: Rep::Bitmap(words),
         }
         .optimized()
     }
 
     /// Número de linhas ativas (RowIDs selecionados).
+    #[inline]
     pub fn selected(&self) -> usize {
-        match &self.rep {
-            Rep::Bitmap(w) => w.iter().map(|x| x.count_ones() as usize).sum(),
-            Rep::Index16(v) => v.len(),
-            Rep::Index32(v) => v.len(),
-        }
+        self.selected
     }
 
     /// Seletividade real = `selected / len` (0.0 se o domínio for vazio).
@@ -200,6 +202,7 @@ impl SelectionVector {
         if density >= BITMAP_DENSITY_THRESHOLD {
             return Self {
                 len,
+                selected,
                 rep: Rep::Bitmap(self.to_bitmap()),
             };
         }
@@ -210,7 +213,7 @@ impl SelectionVector {
         } else {
             Rep::Index32(indices)
         };
-        Self { len, rep }
+        Self { len, selected, rep }
     }
 
     /// Constrói a partir de índices **já ordenados, únicos e em `0..len`**,
@@ -228,10 +231,11 @@ impl SelectionVector {
             sorted.last().is_none_or(|&x| (x as usize) < len),
             "índice fora do domínio {len}"
         );
+        let selected = sorted.len();
         let density = if len == 0 {
             0.0
         } else {
-            sorted.len() as f64 / len as f64
+            selected as f64 / len as f64
         };
         let rep = if density >= BITMAP_DENSITY_THRESHOLD {
             let mut words = vec![0u64; words_for(len)];
@@ -245,7 +249,7 @@ impl SelectionVector {
         } else {
             Rep::Index32(sorted)
         };
-        Self { len, rep }
+        Self { len, selected, rep }
     }
 
     /// Interseção booleana (`AND`) com outro vetor do **mesmo domínio**.
@@ -259,25 +263,34 @@ impl SelectionVector {
     /// Se os domínios (`len`) diferirem.
     pub fn and(&self, other: &Self) -> Self {
         assert_eq!(self.len, other.len, "ops booleanas exigem o mesmo domínio");
-        if self.is_index() && other.is_index() {
-            let a = self.to_indices();
-            let b = other.to_indices();
-            let mut out = Vec::with_capacity(a.len().min(b.len()));
-            let (mut i, mut j) = (0usize, 0usize);
-            while i < a.len() && j < b.len() {
-                match a[i].cmp(&b[j]) {
-                    std::cmp::Ordering::Less => i += 1,
-                    std::cmp::Ordering::Greater => j += 1,
-                    std::cmp::Ordering::Equal => {
-                        out.push(a[i]);
-                        i += 1;
-                        j += 1;
-                    }
-                }
+        let out = match (&self.rep, &other.rep) {
+            // Cada combinação esparsa opera directamente sobre a largura que
+            // já está residente: sem dois `to_indices()` e sem dois temporários.
+            (Rep::Index16(a), Rep::Index16(b)) => {
+                intersect_sorted_by(a, b, |&x| x as u32, |&x| x as u32)
             }
-            return Self::from_sorted_indices(self.len, out);
-        }
-        self.zip_words(other, |a, b| a & b)
+            (Rep::Index32(a), Rep::Index32(b)) => intersect_sorted_by(a, b, |&x| x, |&x| x),
+            (Rep::Index16(a), Rep::Index32(b)) => intersect_sorted_by(a, b, |&x| x as u32, |&x| x),
+            (Rep::Index32(a), Rep::Index16(b)) => intersect_sorted_by(a, b, |&x| x, |&x| x as u32),
+            // Bitmap ∩ lista testa apenas os RowIDs da lista. Converter o
+            // bitmap inteiro seria precisamente o custo que a representação
+            // adaptativa pretende evitar.
+            (Rep::Bitmap(words), Rep::Index16(v)) | (Rep::Index16(v), Rep::Bitmap(words)) => v
+                .iter()
+                .map(|&x| x as u32)
+                .filter(|&x| bitmap_contains(words, x))
+                .collect(),
+            (Rep::Bitmap(words), Rep::Index32(v)) | (Rep::Index32(v), Rep::Bitmap(words)) => v
+                .iter()
+                .copied()
+                .filter(|&x| bitmap_contains(words, x))
+                .collect(),
+            (Rep::Bitmap(a), Rep::Bitmap(b)) => {
+                let words = a.iter().zip(b).map(|(&left, &right)| left & right).collect();
+                return Self::from_bitmap(self.len, words);
+            }
+        };
+        Self::from_sorted_indices(self.len, out)
     }
 
     /// União booleana (`OR`) com outro vetor do **mesmo domínio**.
@@ -296,11 +309,7 @@ impl SelectionVector {
             *w = !*w;
         }
         clear_tail(&mut words, self.len);
-        Self {
-            len: self.len,
-            rep: Rep::Bitmap(words),
-        }
-        .optimized()
+        Self::from_bitmap(self.len, words)
     }
 
     fn zip_words(&self, other: &Self, op: impl Fn(u64, u64) -> u64) -> Self {
@@ -312,12 +321,136 @@ impl SelectionVector {
             out[i] = op(a[i], b[i]);
         }
         clear_tail(&mut out, self.len);
-        Self {
-            len: self.len,
-            rep: Rep::Bitmap(out),
-        }
-        .optimized()
+        Self::from_bitmap(self.len, out)
     }
+}
+
+#[inline]
+fn bitmap_contains(words: &[u64], index: u32) -> bool {
+    let index = index as usize;
+    words
+        .get(index / 64)
+        .is_some_and(|word| word & (1u64 << (index % 64)) != 0)
+}
+
+const GALLOP_RATIO: usize = 8;
+
+/// Primeiro índice `>= target`, partindo de `start`, com busca exponencial e
+/// refinamento binário. O prefixo anterior a `start` já foi descartado.
+fn gallop_lower_bound<T>(
+    values: &[T],
+    start: usize,
+    target: u32,
+    value: impl Fn(&T) -> u32 + Copy,
+) -> usize {
+    if start >= values.len() {
+        return values.len();
+    }
+    intersection_probe();
+    if value(&values[start]) >= target {
+        return start;
+    }
+
+    let mut step = 1usize;
+    while start.saturating_add(step) < values.len() {
+        intersection_probe();
+        if value(&values[start + step]) >= target {
+            break;
+        }
+        step = step.saturating_mul(2);
+    }
+
+    // `start` e todas as posições até `step/2` já foram provadas menores.
+    let mut lo = start
+        .saturating_add(step / 2)
+        .saturating_add(1)
+        .min(values.len());
+    let mut hi = start
+        .saturating_add(step)
+        .saturating_add(1)
+        .min(values.len());
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        intersection_probe();
+        if value(&values[mid]) < target {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// Interseção de duas listas ordenadas, possivelmente com larguras físicas
+/// diferentes. Quando uma lista é muito menor, salta exponencialmente na maior;
+/// em tamanhos próximos, o merge linear continua mais barato.
+fn intersect_sorted_by<A, B>(
+    a: &[A],
+    b: &[B],
+    a_value: impl Fn(&A) -> u32 + Copy,
+    b_value: impl Fn(&B) -> u32 + Copy,
+) -> Vec<u32> {
+    let mut out = Vec::with_capacity(a.len().min(b.len()));
+    if a.len().saturating_mul(GALLOP_RATIO) <= b.len() {
+        let mut j = 0;
+        for item in a {
+            let needle = a_value(item);
+            j = gallop_lower_bound(b, j, needle, b_value);
+            if j == b.len() {
+                break;
+            }
+            intersection_probe();
+            if b_value(&b[j]) == needle {
+                out.push(needle);
+                j += 1;
+            }
+        }
+        return out;
+    }
+    if b.len().saturating_mul(GALLOP_RATIO) <= a.len() {
+        let mut i = 0;
+        for item in b {
+            let needle = b_value(item);
+            i = gallop_lower_bound(a, i, needle, a_value);
+            if i == a.len() {
+                break;
+            }
+            intersection_probe();
+            if a_value(&a[i]) == needle {
+                out.push(needle);
+                i += 1;
+            }
+        }
+        return out;
+    }
+
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        intersection_probe();
+        match a_value(&a[i]).cmp(&b_value(&b[j])) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                out.push(a_value(&a[i]));
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn intersection_probe() {}
+
+#[cfg(test)]
+static INTERSECTION_PROBES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+#[inline]
+fn intersection_probe() {
+    INTERSECTION_PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Zera os bits da cauda (posições `>= len`) da última palavra, mantendo o
@@ -426,6 +559,68 @@ mod tests {
         let got = a.and(&b);
         let expect: Vec<u32> = (0..1000).filter(|x| x % 7 == 0 && x % 11 == 0).collect();
         assert_eq!(got.to_indices(), expect);
+    }
+
+    #[test]
+    fn cardinalidade_em_cache_sobrevive_a_todas_as_operacoes() {
+        let a = SelectionVector::from_indices(10_000, &(0..8_000).step_by(3).collect::<Vec<_>>());
+        let b = SelectionVector::from_indices(10_000, &(0..9_000).step_by(5).collect::<Vec<_>>());
+        for resultado in [a.clone(), a.and(&b), a.or(&b), a.not()] {
+            let materializado = resultado.to_indices().len();
+            assert_eq!(resultado.selected(), materializado);
+            assert_eq!(resultado.selected(), resultado.selected());
+        }
+    }
+
+    /// Exercita explicitamente as seis combinações normativas. As variantes
+    /// mistas de largura podem surgir de dados/checkpoints produzidos com um
+    /// tamanho de morsel anterior, mesmo que o construtor atual normalize-as.
+    #[test]
+    fn and_especializado_cobre_todas_as_representacoes() {
+        fn selection(len: usize, rep: Rep) -> SelectionVector {
+            let selected = match &rep {
+                Rep::Bitmap(words) => words.iter().map(|x| x.count_ones() as usize).sum(),
+                Rep::Index16(v) => v.len(),
+                Rep::Index32(v) => v.len(),
+            };
+            SelectionVector { len, selected, rep }
+        }
+
+        let len = 200_000;
+        let i16_a = selection(len, Rep::Index16(vec![1, 7, 20, 1000]));
+        let i16_b = selection(len, Rep::Index16(vec![0, 7, 1000, 2000]));
+        let i32_a = selection(len, Rep::Index32(vec![1, 7, 20, 1000, 100_000]));
+        let i32_b = selection(len, Rep::Index32(vec![7, 1000, 90_000, 100_000]));
+        let mut bitmap = vec![0u64; words_for(len)];
+        for index in [7usize, 20, 90_000, 100_000] {
+            bitmap[index / 64] |= 1 << (index % 64);
+        }
+        let dense = selection(len, Rep::Bitmap(bitmap));
+
+        assert_eq!(i16_a.and(&i16_b).to_indices(), vec![7, 1000]);
+        assert_eq!(i32_a.and(&i32_b).to_indices(), vec![7, 1000, 100_000]);
+        assert_eq!(i16_a.and(&i32_b).to_indices(), vec![7, 1000]);
+        assert_eq!(i32_b.and(&i16_a).to_indices(), vec![7, 1000]);
+        assert_eq!(dense.and(&i16_a).to_indices(), vec![7, 20]);
+        assert_eq!(i32_b.and(&dense).to_indices(), vec![7, 90_000, 100_000]);
+        assert_eq!(dense.and(&dense).to_indices(), vec![7, 20, 90_000, 100_000]);
+    }
+
+    #[test]
+    fn galloping_nao_varre_a_lista_grande() {
+        let grande: Vec<u32> = (0..1_000_000).collect();
+        let pequena: Vec<u32> = (0..100).map(|i| i * 10_000).collect();
+
+        INTERSECTION_PROBES.store(0, std::sync::atomic::Ordering::Relaxed);
+        let got = intersect_sorted_by(&pequena, &grande, |&x| x, |&x| x);
+        let probes = INTERSECTION_PROBES.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(got, pequena);
+        assert!(
+            probes < 10_000,
+            "galloping fez {probes} comparações para {}x{} elementos",
+            pequena.len(),
+            grande.len()
+        );
     }
 
     #[test]

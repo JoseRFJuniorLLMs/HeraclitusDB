@@ -137,7 +137,10 @@ pub enum ThreatGateError {
         minimum: u8,
     },
     #[error("object `{object_id}` has no expiry and source `{source_id}` declares no default TTL (§12 requires every indicator to have an expiration policy)")]
-    NoExpiryPolicy { object_id: String, source_id: String },
+    NoExpiryPolicy {
+        object_id: String,
+        source_id: String,
+    },
     #[error("object `{object_id}` carries no indicators")]
     NoIndicators { object_id: String },
 }
@@ -196,7 +199,11 @@ impl ThreatSourceRegistry {
     /// be stored, would match, and the only trace would be a source id nobody
     /// recognises. Callers that genuinely want a permissive default can insert
     /// `unconfigured` explicitly, which leaves a record of the choice.
-    pub fn admit(&self, mut object: ThreatObject, now_ms: u64) -> Result<Admission, ThreatGateError> {
+    pub fn admit(
+        &self,
+        mut object: ThreatObject,
+        now_ms: u64,
+    ) -> Result<Admission, ThreatGateError> {
         let source = object.provenance.source_id.clone();
         let Some(policy) = self.policies.get(&source) else {
             return Err(ThreatGateError::UnknownSource { source_id: source });
@@ -305,15 +312,12 @@ impl ThreatIntelDetector {
         }
         let mut labels = BTreeMap::new();
         labels.insert("threat.match_count".into(), matches.len().to_string());
-        labels.insert(
-            "threat.object_ids".into(),
-            {
-                let mut ids: Vec<&str> = matches.iter().map(|m| m.object_id.as_str()).collect();
-                ids.sort_unstable();
-                ids.dedup();
-                ids.join(",")
-            },
-        );
+        labels.insert("threat.object_ids".into(), {
+            let mut ids: Vec<&str> = matches.iter().map(|m| m.object_id.as_str()).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids.join(",")
+        });
         labels.insert(
             "threat.max_tlp".into(),
             matches
@@ -367,9 +371,7 @@ mod tests {
     use super::*;
     use crate::correlation::{high_impact_allowed, EvidenceFusion, FusionWeights};
     use crate::threat::index::MatchKind;
-    use crate::threat::ir::{
-        HashAlgorithm, Indicator, ThreatObjectType, ThreatProvenance,
-    };
+    use crate::threat::ir::{HashAlgorithm, Indicator, ThreatObjectType, ThreatProvenance};
     use crate::threat::tlp::TlpLevel;
 
     fn prov(source: &str, confidence: u8) -> ThreatProvenance {
@@ -551,14 +553,7 @@ mod tests {
         let detector = ThreatIntelDetector::new("1.0.0");
         let fusion = EvidenceFusion::new(FusionWeights::default(), "m1").unwrap();
         let assessment = fusion
-            .fuse(
-                EntityRef::new("host", "h1"),
-                0.0,
-                0.0,
-                0.0,
-                1.0,
-                vec![],
-            )
+            .fuse(EntityRef::new("host", "h1"), 0.0, 0.0, 0.0, 1.0, vec![])
             .unwrap();
         assert!(
             !high_impact_allowed(&assessment, &[detector.agreement()]),

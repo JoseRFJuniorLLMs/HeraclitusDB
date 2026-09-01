@@ -18,7 +18,7 @@ use heraclitus_sentinel::threat::sharing::PolicySanitizer;
 use heraclitus_sentinel::{
     Admission, EntityRef, Indicator, IndicatorState, IocIndex, MatchKind, PrefilterOutcome,
     Pseudonymizer, SanitizationError, SharingPolicy, StixImporter, ThreatImporter,
-    ThreatIntelDetector, ThreatSanitizer, ThreatSourcePolicy, ThreatSourceRegistry, ThreatSighting,
+    ThreatIntelDetector, ThreatSanitizer, ThreatSighting, ThreatSourcePolicy, ThreatSourceRegistry,
     TlpLevel, TrustLevel,
 };
 
@@ -466,14 +466,19 @@ fn um_evento_com_ioc_produz_evidencia_no_log() {
         std::thread::sleep(Duration::from_millis(25));
     }
 
-    assert!(sinais >= 1, "nenhum SecuritySignal derivado do match de IOC");
+    assert!(
+        sinais >= 1,
+        "nenhum SecuritySignal derivado do match de IOC"
+    );
     assert!(sightings >= 1, "nenhum ThreatSighting persistido (§36)");
 
     // §11: o que saiu e evidencia. Nao ha nenhum episodio de accao, porque
     // este caminho nao tem tipo nenhum que seja uma accao.
     let rows = log.scan(0, log.head()).unwrap();
     assert!(
-        !rows.iter().any(|(_, e)| matches!(&e.kind, EventKind::Custom(k)
+        !rows
+            .iter()
+            .any(|(_, e)| matches!(&e.kind, EventKind::Custom(k)
             if k == "SecurityAction" || k == "AuthorizedAction")),
         "um match de IOC nunca pode autorizar uma accao"
     );

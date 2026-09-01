@@ -251,7 +251,11 @@ impl ThreatFeed {
     ///
     /// Nothing is deleted: every version keeps its record, and the ones passed
     /// over become `Inactive` with a note saying which rollback did it.
-    pub fn rollback_to(&mut self, version: u32, reason: impl Into<String>) -> Result<(), FeedError> {
+    pub fn rollback_to(
+        &mut self,
+        version: u32,
+        reason: impl Into<String>,
+    ) -> Result<(), FeedError> {
         let target = self
             .versions
             .iter()

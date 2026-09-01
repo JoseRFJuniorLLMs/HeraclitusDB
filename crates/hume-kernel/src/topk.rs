@@ -41,7 +41,9 @@ mod tests {
 
     #[test]
     fn matches_full_sort() {
-        let data: Vec<u64> = (0..1000u64).map(|i| (i.wrapping_mul(2654435761)) % 9973).collect();
+        let data: Vec<u64> = (0..1000u64)
+            .map(|i| (i.wrapping_mul(2654435761)) % 9973)
+            .collect();
         for k in [0usize, 1, 5, 50, 1000, 2000] {
             assert_eq!(top_k_u64(&data, k), brute_top_k(&data, k), "k={k}");
         }

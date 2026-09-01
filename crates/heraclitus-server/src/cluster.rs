@@ -477,7 +477,10 @@ mod tests {
         assert!(recibo.segments > 0, "nada selado; o teste seria vácuo");
 
         // Empacotar: os bytes físicos passam a ser outros.
-        let v6 = engines[0].log.v6_arc().expect("o default tem de abrir V6Log");
+        let v6 = engines[0]
+            .log
+            .v6_arc()
+            .expect("o default tem de abrir V6Log");
         let empacotados = v6
             .pack_pending(heraclitus_log::v6::PackingProfile::Balanced)
             .unwrap();

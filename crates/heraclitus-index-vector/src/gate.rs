@@ -598,12 +598,10 @@ mod tests {
         assert!(first.mean_recall_at_k > 0.0);
         assert!(first.latency.p50_ns <= first.latency.p95_ns);
         assert!(first.latency.p95_ns <= first.latency.p99_ns);
-        assert!(
-            first
-                .queries
-                .iter()
-                .all(|query| query.approximate_ids.len() == 5 && query.exact_ids.len() == 5)
-        );
+        assert!(first
+            .queries
+            .iter()
+            .all(|query| query.approximate_ids.len() == 5 && query.exact_ids.len() == 5));
     }
 
     #[test]

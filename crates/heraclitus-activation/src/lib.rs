@@ -12,6 +12,17 @@ use heraclitus_views::View;
 
 pub const RECENT_K: usize = 8;
 
+#[inline]
+fn decay_mass(age: f64, d: f64) -> f64 {
+    // O perfil padrão ACT-R usa d=0.5. A potência genérica entra em libm;
+    // 1/sqrt(age) é a mesma função matemática e usa a instrução especializada.
+    if d.to_bits() == 0.5f64.to_bits() {
+        1.0 / age.sqrt()
+    } else {
+        age.powf(-d)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ActivationRecord {
     /// Last K access timestamps (seconds) — exact head.
@@ -90,7 +101,7 @@ impl ActivationRecord {
         let mut sum = 0.0f64;
         for &t in &self.recent {
             let age = (now_secs.saturating_sub(t)).max(1) as f64;
-            sum += age.powf(-d);
+            sum += decay_mass(age, d);
         }
         let k = self.recent.len() as u64;
         if self.n > k {
@@ -104,7 +115,9 @@ impl ActivationRecord {
             // Caso d == 1.0: (l^(1-d) - h^(1-d))/(1-d) é 0/0; o limite correto é
             // ln(l) - ln(h). Sem isto o NaN era mascarado por max(0.0) e a cauda
             // contribuía 0 em silêncio — score errado para todo item longevo.
-            let tail_num = if (1.0 - d).abs() < 1e-12 {
+            let tail_num = if d.to_bits() == 0.5f64.to_bits() {
+                2.0 * (l.sqrt() - h.sqrt())
+            } else if (1.0 - d).abs() < 1e-12 {
                 l.ln() - h.ln()
             } else {
                 (l.powf(1.0 - d) - h.powf(1.0 - d)) / (1.0 - d)
@@ -169,8 +182,9 @@ impl ActivationStore {
             .collect();
         // Desempate por id: o DashMap itera em ordem aleatória — o conjunto
         // top-k com scores empatados variava entre execuções.
-        let ordem =
-            |a: &ActivationHit, b: &ActivationHit| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id));
+        let ordem = |a: &ActivationHit, b: &ActivationHit| {
+            b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id))
+        };
         // Seleção parcial em vez de ordenação total: para devolver `k` de `n`
         // não é preciso ordenar os `n`. `select_nth_unstable_by` é O(n) e
         // deixa os `k` melhores no prefixo (por ordem arbitrária entre si);
@@ -389,6 +403,72 @@ mod watermark_order_tests {
 #[cfg(test)]
 mod testes_otimizacao {
     use super::*;
+
+    /// O fast path de `d = 0.5` troca apenas a forma de calcular a mesma
+    /// função. A comparação cobre idades pequenas, grandes e não inteiras;
+    /// a tolerância admite somente a diferença de arredondamento entre as
+    /// implementações de `sqrt` e `powf` da plataforma.
+    #[test]
+    fn decay_meio_concorda_com_powf() {
+        for age in [
+            1.0,
+            2.0,
+            3.5,
+            17.0,
+            1_000.0,
+            1_000_000_000.0,
+            u32::MAX as f64,
+        ] {
+            let rapido = decay_mass(age, 0.5);
+            let referencia = age.powf(-0.5);
+            let erro_relativo = ((rapido - referencia) / referencia).abs();
+            assert!(
+                erro_relativo <= 4.0 * f64::EPSILON,
+                "age={age}: rápido={rapido} referência={referencia} erro={erro_relativo}"
+            );
+        }
+    }
+
+    /// Decays diferentes do valor especializado continuam exactamente no
+    /// caminho genérico; isto também protege configurações existentes.
+    #[test]
+    fn decay_nao_padrao_continua_bit_a_bit_igual_ao_powf() {
+        for d in [0.0, 0.1, 0.49, 0.500_000_000_000_000_1, 0.9, 1.0] {
+            let age = 12_345.0;
+            assert_eq!(decay_mass(age, d).to_bits(), age.powf(-d).to_bits());
+        }
+    }
+
+    /// Mede isoladamente o custo que aparece oito vezes por item pontuado.
+    /// Ignorado por padrão para não transformar temporização em gate de CI.
+    #[test]
+    #[ignore = "microbenchmark manual do fast path d=0.5"]
+    fn benchmark_decay_meio_sqrt_contra_powf() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const N: u64 = 5_000_000;
+        let inicio = Instant::now();
+        let mut soma_powf = 0.0;
+        for age in 1..=N {
+            soma_powf += black_box(age as f64).powf(black_box(-0.5));
+        }
+        let tempo_powf = inicio.elapsed();
+
+        let inicio = Instant::now();
+        let mut soma_sqrt = 0.0;
+        for age in 1..=N {
+            soma_sqrt += 1.0 / black_box(age as f64).sqrt();
+        }
+        let tempo_sqrt = inicio.elapsed();
+
+        let erro_relativo = ((soma_sqrt - soma_powf) / soma_powf).abs();
+        assert!(erro_relativo < 1e-12);
+        eprintln!(
+            "N={N} powf={tempo_powf:?} sqrt={tempo_sqrt:?} ganho={:.2}x",
+            tempo_powf.as_secs_f64() / tempo_sqrt.as_secs_f64()
+        );
+    }
 
     /// O buffer circular tem de continuar a saber qual e o acesso mais antigo.
     /// Foi isto que o `approximation_error_bound` apanhou quando eu troquei o

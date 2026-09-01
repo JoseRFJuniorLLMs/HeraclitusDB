@@ -108,7 +108,10 @@ pub fn router_with_sentinel(
         .route("/diff", get(diff))
         .route("/titular/:id", get(titular))
         .route("/titular/:id/acessos", get(titular_acessos))
-        .route("/titular/:id/eliminar", axum::routing::post(titular_eliminar))
+        .route(
+            "/titular/:id/eliminar",
+            axum::routing::post(titular_eliminar),
+        )
         // M20 — H-VM sovereignty ledger (SPEC-025-adjacente). KV durável no log.
         .route("/hvm/state", get(hvm_state))
         .route("/hvm/upsert", axum::routing::post(hvm_upsert))
@@ -124,7 +127,10 @@ pub fn router_with_sentinel(
         )
         .route("/sentinel/incidents", get(sentinel_incidents))
         .route("/sentinel/incidents/:id", get(sentinel_incident))
-        .route("/sentinel/incidents/:id/evidence", get(sentinel_incident_evidence))
+        .route(
+            "/sentinel/incidents/:id/evidence",
+            get(sentinel_incident_evidence),
+        )
         .route("/sentinel/incidents/:id/why", get(sentinel_incident_why))
         .route(
             "/sentinel/incidents/:id/approve",
@@ -150,9 +156,19 @@ pub fn router_with_sentinel(
         .route("/tier/demote", axum::routing::post(tier_demote))
         .route("/tier/receipts", get(tier_receipts))
         .route("/tier/fetch/:segment", get(tier_fetch));
+    // O aprovador de uma accao humana passa a ser a identidade AUTENTICADA (ver
+    // `IdentidadeRest`). Com Basic auth ha uma unica credencial partilhada, logo
+    // a identidade e o utilizador configurado; sem auth nao ha identidade
+    // nenhuma, e e ISSO que fica escrito no registo em vez de um nome bonito
+    // escolhido pelo chamador.
+    let identidade = IdentidadeRest(match basic_auth.as_deref() {
+        Some(creds) => creds.split(':').next().unwrap_or("rest").to_owned(),
+        None => "rest-sem-auth".to_owned(),
+    });
     let routes = routes
         .with_state(engine)
         .layer(Extension(sentinel))
+        .layer(Extension(identidade))
         .layer(Extension(ErasureAllowed(allow_erasure)));
 
     let protegido = aplicar_auth(routes, basic_auth);
@@ -161,6 +177,16 @@ pub fn router_with_sentinel(
     // primeiro devolveria 401 e o pedido real nem chegava a ser feito.
     aplicar_cors(protegido, cors_origins)
 }
+
+/// Quem esta a chamar o REST, segundo a AUTENTICACAO — nao segundo o corpo do
+/// pedido.
+///
+/// O Basic auth desta superficie tem uma unica credencial partilhada, portanto
+/// isto nao distingue pessoas; distingue "alguem que provou conhecer a
+/// credencial" de "ninguem provou nada". Para um registo de aprovacao humana
+/// essa distincao ja e o essencial, e e honesta sobre o que sabe.
+#[derive(Clone, Debug)]
+pub struct IdentidadeRest(pub String);
 
 fn aplicar_auth(routes: Router, basic_auth: Option<String>) -> Router {
     match basic_auth {
@@ -221,8 +247,7 @@ fn incident_filter(query: SentinelIncidentQuery) -> Result<IncidentFilter, Strin
     let state = match query.state.as_deref() {
         None => None,
         Some(value) => Some(
-            parse_incident_state(value)
-                .ok_or_else(|| "state de incidente inválido".to_string())?,
+            parse_incident_state(value).ok_or_else(|| "state de incidente inválido".to_string())?,
         ),
     };
     let subject = match (query.subject_kind, query.subject_id) {
@@ -256,9 +281,7 @@ fn sentinel_unavailable() -> Response {
         .into_response()
 }
 
-async fn sentinel_status(
-    Extension(runtime): Extension<Option<Arc<SentinelRuntime>>>,
-) -> Response {
+async fn sentinel_status(Extension(runtime): Extension<Option<Arc<SentinelRuntime>>>) -> Response {
     let Some(runtime) = runtime else {
         return sentinel_unavailable();
     };
@@ -380,33 +403,59 @@ async fn sentinel_incident_evidence(
 struct SentinelApprovalBody {
     approval_id: String,
     proposal_id: String,
-    approver: String,
+    /// Opcional, e NAO e o que fica registado. Se vier, tem de coincidir com a
+    /// identidade autenticada — um cliente que peca para registar outra pessoa
+    /// leva 403 em vez de ser silenciosamente corrigido, para que a tentativa
+    /// seja visivel.
+    #[serde(default)]
+    approver: Option<String>,
     #[serde(default)]
     reason: String,
 }
 
 async fn sentinel_approve(
     Extension(runtime): Extension<Option<Arc<SentinelRuntime>>>,
+    Extension(identidade): Extension<IdentidadeRest>,
     Path(incident_id): Path<String>,
     Json(body): Json<SentinelApprovalBody>,
 ) -> Response {
-    sentinel_approval(runtime, incident_id, body, true).await
+    sentinel_approval(runtime, identidade, incident_id, body, true).await
 }
 
 async fn sentinel_deny(
     Extension(runtime): Extension<Option<Arc<SentinelRuntime>>>,
+    Extension(identidade): Extension<IdentidadeRest>,
     Path(incident_id): Path<String>,
     Json(body): Json<SentinelApprovalBody>,
 ) -> Response {
-    sentinel_approval(runtime, incident_id, body, false).await
+    sentinel_approval(runtime, identidade, incident_id, body, false).await
 }
 
 async fn sentinel_approval(
     runtime: Option<Arc<SentinelRuntime>>,
+    identidade: IdentidadeRest,
     incident_id: String,
     body: SentinelApprovalBody,
     approved: bool,
 ) -> Response {
+    // O `approver` vinha do CORPO: qualquer chamador registava uma aprovacao
+    // humana em nome de quem quisesse, e um registo de aprovacao existe
+    // precisamente para atribuir responsabilidade. Agora o registado e sempre a
+    // identidade autenticada.
+    //
+    // Esta verificacao vem ANTES da guarda do runtime de proposito: tentar
+    // registar uma aprovacao em nome de outra pessoa e um erro do PEDIDO, e a
+    // resposta a isso nao pode depender de o sentinel estar ou nao ligado.
+    let approver = match crate::auth::vincular_aprovador(body.approver.as_deref(), &identidade.0) {
+        Ok(a) => a.to_owned(),
+        Err(erro) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": erro })),
+            )
+                .into_response();
+        }
+    };
     let Some(runtime) = runtime else {
         return sentinel_unavailable();
     };
@@ -415,7 +464,7 @@ async fn sentinel_approval(
             &incident_id,
             &body.proposal_id,
             &body.approval_id,
-            &body.approver,
+            &approver,
             approved,
             &body.reason,
         )
@@ -501,7 +550,11 @@ async fn sentinel_action(
     let result = tokio::task::spawn_blocking(move || {
         let rows = runtime.l4_events(None, None, None, 10_000)?;
         Ok::<_, heraclitus_sentinel::SentinelError>(rows.into_iter().find(|(_, episode)| {
-            episode.attrs.get("sentinel.action_proposal_id").map(String::as_str) == Some(id.as_str())
+            episode
+                .attrs
+                .get("sentinel.action_proposal_id")
+                .map(String::as_str)
+                == Some(id.as_str())
                 || episode.attrs.get("sentinel.action_id").map(String::as_str) == Some(id.as_str())
         }))
     })
@@ -602,7 +655,10 @@ async fn sentinel_dashboard(
                     )
                 })
                 .count();
-            let critical = incidents.iter().filter(|incident| incident.severity >= 8).count();
+            let critical = incidents
+                .iter()
+                .filter(|incident| incident.severity >= 8)
+                .count();
             let approvals = actions
                 .iter()
                 .filter(|(_, episode)| matches!(&episode.kind, heraclitus_core::EventKind::Custom(kind) if kind == "SecurityApproval"))
@@ -685,7 +741,10 @@ fn aplicar_cors(routes: Router, origens: Vec<String>) -> Router {
                     b = b
                         .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, o.as_str())
                         .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS")
-                        .header(header::ACCESS_CONTROL_ALLOW_HEADERS, "authorization, content-type")
+                        .header(
+                            header::ACCESS_CONTROL_ALLOW_HEADERS,
+                            "authorization, content-type",
+                        )
                         // SEM `Allow-Credentials`, deliberadamente. O painel
                         // envia `Authorization` explicitamente, portanto não
                         // precisa dele. COM ele, bastava o operador ter feito
@@ -746,8 +805,9 @@ fn aplicar_cors(routes: Router, origens: Vec<String>) -> Router {
 /// ecrã de parede tem outra exposição**. Quem o puser à vista deve pensar nisso.
 async fn live_events(
     State(engine): State<Arc<Engine>>,
-) -> axum::response::Sse<impl tokio_stream::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>>
-{
+) -> axum::response::Sse<
+    impl tokio_stream::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+> {
     use axum::response::sse::{Event, KeepAlive, Sse};
     use tokio_stream::StreamExt;
 
@@ -807,7 +867,10 @@ async fn replay(
     State(engine): State<Arc<Engine>>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
-    let executar = matches!(q.get("executar").map(|s| s.as_str()), Some("1") | Some("true"));
+    let executar = matches!(
+        q.get("executar").map(|s| s.as_str()),
+        Some("1") | Some("true")
+    );
     let out = tokio::task::spawn_blocking(move || engine.replay_prova(executar))
         .await
         .unwrap_or_else(|e| serde_json::json!({ "erro": format!("join: {e}") }));
@@ -848,8 +911,7 @@ async fn diff(
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
     let num = |k: &str| q.get(k).and_then(|v| v.parse::<u64>().ok());
-    let (de_ms, ate_ms, de_lsn, ate_lsn) =
-        (num("de_ms"), num("ate_ms"), num("de"), num("ate"));
+    let (de_ms, ate_ms, de_lsn, ate_lsn) = (num("de_ms"), num("ate_ms"), num("de"), num("ate"));
     let topo = num("topo").unwrap_or(12).clamp(1, 200) as usize;
 
     let out = tokio::task::spawn_blocking(move || {
@@ -857,15 +919,17 @@ async fn diff(
         let ate = ate_lsn
             .or_else(|| ate_ms.map(|m| engine.lsn_em(m)))
             .unwrap_or(head);
-        let de = de_lsn.or_else(|| de_ms.map(|m| engine.lsn_em(m))).unwrap_or_else(|| {
-            // Sem janela pedida: a ultima hora de INGESTAO. Cair para "desde o
-            // inicio" seria pior — num log grande devolve tudo como "novo" e da
-            // a impressao de que tudo apareceu agora.
-            match engine.ts_ms(ate.saturating_sub(1)) {
-                Some(ms) => engine.lsn_em(ms.saturating_sub(3_600_000)),
-                None => 0,
-            }
-        });
+        let de = de_lsn
+            .or_else(|| de_ms.map(|m| engine.lsn_em(m)))
+            .unwrap_or_else(|| {
+                // Sem janela pedida: a ultima hora de INGESTAO. Cair para "desde o
+                // inicio" seria pior — num log grande devolve tudo como "novo" e da
+                // a impressao de que tudo apareceu agora.
+                match engine.ts_ms(ate.saturating_sub(1)) {
+                    Some(ms) => engine.lsn_em(ms.saturating_sub(3_600_000)),
+                    None => 0,
+                }
+            });
         engine.diff(de, ate, topo)
     })
     .await
@@ -876,7 +940,10 @@ async fn diff(
 /// `GET /titular/:id` — pegada de um titular (LGPD art. 18, I e II).
 /// Devolve METADADOS: quantos eventos, de que tipos, desde quando, e se a
 /// chave dele ainda existe. Nunca devolve conteudo.
-async fn titular(State(engine): State<Arc<Engine>>, Path(id): Path<String>) -> Json<serde_json::Value> {
+async fn titular(
+    State(engine): State<Arc<Engine>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
     Json(engine.titular(&id, 50))
 }
 
@@ -1390,7 +1457,10 @@ async fn metrics(
             }
             (
                 StatusCode::OK,
-                [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+                [(
+                    header::CONTENT_TYPE,
+                    "text/plain; version=0.0.4; charset=utf-8",
+                )],
                 body,
             )
                 .into_response()
@@ -1592,9 +1662,7 @@ mod hvm_tests {
 #[cfg(all(test, feature = "tier"))]
 mod tier_tests {
     use super::*;
-    use heraclitus_core::{
-        Episode, EventKind, FsyncPolicy, HeraclitusConfig, StorageFormat,
-    };
+    use heraclitus_core::{Episode, EventKind, FsyncPolicy, HeraclitusConfig, StorageFormat};
 
     /// Demote de um segmento selado produz um recibo verificável e materializa
     /// o objeto cold (.hrkl + Parquet) — prova o wiring do `tier` ponta-a-ponta.
@@ -1901,5 +1969,138 @@ mod tier_tests {
             again.is_empty(),
             "sem lixo novo, nada a compactar: {again:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod aprovacao_tests {
+    use super::*;
+    use heraclitus_core::{FsyncPolicy, HeraclitusConfig};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serve o router NUMA porta real. Vai por HTTP de propósito: o defeito que
+    /// estes testes protegem não está só na lógica do handler — está também no
+    /// facto de o `IdentidadeRest` ter de chegar lá por uma camada
+    /// `Extension`. Chamar a função directamente passaria mesmo que a camada
+    /// não existisse no router, e nesse caso todas as aprovações respondiam 500
+    /// em produção.
+    async fn servir(basic_auth: Option<&str>) -> (std::net::SocketAddr, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            ..Default::default()
+        };
+        let engine = Arc::new(Engine::open(&cfg).unwrap());
+        let app = router_with_sentinel(
+            engine,
+            None,
+            basic_auth.map(str::to_owned),
+            Vec::new(),
+            false,
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, dir)
+    }
+
+    /// POST cru, para não puxar um cliente HTTP só para três testes.
+    async fn post(
+        addr: std::net::SocketAddr,
+        caminho: &str,
+        corpo: &str,
+        auth: Option<&str>,
+    ) -> (u16, String) {
+        let mut cabecalhos = format!(
+            "POST {caminho} HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n",
+            corpo.len()
+        );
+        if let Some(a) = auth {
+            cabecalhos.push_str(&format!("Authorization: Basic {}\r\n", b64(a.as_bytes())));
+        }
+        cabecalhos.push_str("\r\n");
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(cabecalhos.as_bytes()).await.unwrap();
+        sock.write_all(corpo.as_bytes()).await.unwrap();
+        let mut resposta = Vec::new();
+        sock.read_to_end(&mut resposta).await.unwrap();
+        let texto = String::from_utf8_lossy(&resposta).into_owned();
+        let estado = texto
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        (estado, texto)
+    }
+
+    const ROTA: &str = "/sentinel/incidents/inc-1/approve";
+
+    /// O defeito: o `approver` vinha do corpo do pedido, portanto qualquer
+    /// chamador registava uma aprovação humana em nome de outra pessoa. Um
+    /// registo de aprovação existe precisamente para atribuir responsabilidade.
+    #[tokio::test]
+    async fn aprovador_diferente_da_identidade_e_recusado() {
+        let (addr, _dir) = servir(None).await;
+        let (estado, corpo) = post(
+            addr,
+            ROTA,
+            r#"{"approval_id":"a1","proposal_id":"p1","approver":"a-directora"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(estado, 403, "forjar o aprovador tem de ser recusado: {corpo}");
+        assert!(
+            corpo.contains("rest-sem-auth"),
+            "a resposta tem de dizer QUAL é a identidade real: {corpo}"
+        );
+    }
+
+    /// A recusa é uma propriedade do PEDIDO, não do estado do serviço: sem o
+    /// sentinel ligado continua a ser 403, e não um 503 que esconderia a
+    /// tentativa. (É por isso que a verificação está antes da guarda do
+    /// runtime.)
+    #[tokio::test]
+    async fn a_recusa_nao_depende_do_sentinel_estar_ligado() {
+        let (addr, _dir) = servir(None).await;
+        let (sem_aprovador, _) = post(
+            addr,
+            ROTA,
+            r#"{"approval_id":"a1","proposal_id":"p1"}"#,
+            None,
+        )
+        .await;
+        // Sem sentinel, um pedido HONESTO chega ao 503 — o que prova que o
+        // campo deixou de ser obrigatório e que a `Extension` está mesmo
+        // montada no router (faltando, isto seria 500).
+        assert_eq!(sem_aprovador, 503, "sem `approver` o pedido é legítimo");
+    }
+
+    /// Com Basic auth há uma identidade, e é essa que vale. Coincidir passa;
+    /// não coincidir continua a ser 403.
+    #[tokio::test]
+    async fn com_basic_auth_a_identidade_e_o_utilizador_configurado() {
+        let (addr, _dir) = servir(Some("auditor:segredo")).await;
+        let (coincide, _) = post(
+            addr,
+            ROTA,
+            r#"{"approval_id":"a1","proposal_id":"p1","approver":"auditor"}"#,
+            Some("auditor:segredo"),
+        )
+        .await;
+        assert_eq!(coincide, 503, "coincidir com a identidade é legítimo");
+
+        let (difere, corpo) = post(
+            addr,
+            ROTA,
+            r#"{"approval_id":"a1","proposal_id":"p1","approver":"outra-pessoa"}"#,
+            Some("auditor:segredo"),
+        )
+        .await;
+        assert_eq!(difere, 403, "{corpo}");
+        assert!(corpo.contains("auditor"), "{corpo}");
     }
 }

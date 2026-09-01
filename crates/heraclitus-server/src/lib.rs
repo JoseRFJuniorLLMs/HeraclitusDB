@@ -178,6 +178,21 @@ pub async fn serve_with(
             "grpc_addr {grpc_addr} não é loopback mas auth_token não está definido — \
              append/shred/rebuild ficariam abertos. Defina auth_token ou use 127.0.0.1."
         )));
+    } else {
+        // O caso que faltava dizer em voz alta. Sem credenciais, o interceptor
+        // NAO e um no-op benigno: `Authenticator::authenticate` injecta um
+        // Principal com `AccessRole::Admin` em TODAS as chamadas (auth.rs). O
+        // loopback e a unica coisa entre isso e a rede — e quem conseguir
+        // qualquer execucao local, ou um proxy mal configurado, e Admin.
+        //
+        // As outras duas hipoteses imprimem uma linha; esta imprimia zero, que
+        // e exactamente ao contrario do que a gravidade pede.
+        boot.warn_line(
+            "Auth gRPC",
+            &format!(
+                "SEM AUTENTICACAO · {grpc_addr} · TODAS as chamadas correm como \n                 Admin (append/shred/rebuild) — so o loopback protege"
+            ),
+        );
     }
     let auth = move |req| authenticator.authenticate(req);
     let svc = HeraclitusServer::with_interceptor(
@@ -776,10 +791,8 @@ pub async fn serve_with(
                     // §9 — revogação, quando o operador instalou CRLs.
                     let crls = match config.compliance_crl_dir.as_ref() {
                         Some(d) => {
-                            let (crls, rel) =
-                                heraclitus_compliance::crl::CrlStore::load_dir(d).map_err(|e| {
-                                    HeraclitusError::Config(format!("CRLs: {e}"))
-                                })?;
+                            let (crls, rel) = heraclitus_compliance::crl::CrlStore::load_dir(d)
+                                .map_err(|e| HeraclitusError::Config(format!("CRLs: {e}")))?;
                             // Pedir consulta de revogação e não a poder fazer
                             // pararia toda a ancoragem no primeiro carimbo,
                             // com um erro por marco em vez de um no arranque.
@@ -827,8 +840,7 @@ pub async fn serve_with(
                                     max_staleness: Duration::from_secs(
                                         config.compliance_crl_max_staleness_secs,
                                     ),
-                                    exigir_next_update: config
-                                        .compliance_crl_exigir_next_update,
+                                    exigir_next_update: config.compliance_crl_exigir_next_update,
                                 },
                             )
                             .map_err(|e| HeraclitusError::Config(e.to_string()))?;
@@ -856,9 +868,7 @@ pub async fn serve_with(
                     "token externo SEM validação CMS/X.509/ICP-Brasil e em claro na rede".into(),
                 ),
                 _ => (
-                    std::sync::Arc::new(LocalTsa::generate(
-                        config.compliance_tsa_policy.clone(),
-                    )),
+                    std::sync::Arc::new(LocalTsa::generate(config.compliance_tsa_policy.clone())),
                     "token de desenvolvimento; não é ICP-Brasil".into(),
                 ),
             };
@@ -1026,7 +1036,11 @@ fn instalar_guarda_de_soberania(
         SovereigntyRuntime,
     };
 
-    let modo = match config.compliance_sovereignty_mode.to_ascii_lowercase().as_str() {
+    let modo = match config
+        .compliance_sovereignty_mode
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "off" | "" => return Ok(std::sync::Arc::new(cliente)),
         "controlled" | "controlled_egress" => SovereigntyMode::ControlledEgress,
         "strict" | "strict_air_gap" | "strict-air-gap" => SovereigntyMode::StrictAirGap,

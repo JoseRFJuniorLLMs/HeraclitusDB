@@ -156,7 +156,7 @@ impl FooterV6 {
                     format!(
                         "record_count {} exceeds LSN span {}",
                         self.record_count,
-                        span + 1
+                        span.saturating_add(1)
                     ),
                 ));
             }
@@ -189,7 +189,21 @@ impl FooterV6 {
     /// `true` se `max_lsn - min_lsn + 1 == record_count` de facto (SPEC-0050
     /// §5). O flag diz o que o writer afirmou; isto verifica-o.
     pub fn lsn_span_is_contiguous(&self) -> bool {
-        self.record_count > 0 && self.max_lsn - self.min_lsn + 1 == self.record_count
+        // Aritmetica VERIFICADA, e nao por escrupulo: `min_lsn = 0` com
+        // `max_lsn = u64::MAX` passa o `check_coherence` (o span nao e limitado
+        // — um segmento pode legitimamente ter buracos de LSN) e transbordava
+        // aqui. Como `raw::validate` chama isto justamente para DEVOLVER o erro
+        // de corrupcao, o `overflow-checks` transformava a rejeicao de um
+        // segmento forjado num panico ao abrir o log.
+        //
+        // Um span que nao cabe em u64 nunca pode igualar `record_count`, que e
+        // u64: `None` significa entao "nao contiguo", nao "nao sei".
+        self.record_count > 0
+            && self
+                .max_lsn
+                .checked_sub(self.min_lsn)
+                .and_then(|span| span.checked_add(1))
+                .is_some_and(|total| total == self.record_count)
     }
 }
 
@@ -222,6 +236,46 @@ mod tests {
         let f = amostra();
         assert_eq!(FooterV6::decode(&f.encode()).unwrap(), f);
         assert!(f.lsn_span_is_contiguous());
+    }
+
+    /// Um footer com `min_lsn = 0` e `max_lsn = u64::MAX` fazia
+    /// `max_lsn - min_lsn + 1` transbordar. Com `overflow-checks = true` (que
+    /// este workspace liga TAMBEM na release) isso e um PANICO — e no pior
+    /// sitio possivel: `raw::validate` chama isto para DEVOLVER o erro de
+    /// corrupcao, portanto um segmento forjado derrubava o processo ao abrir
+    /// em vez de ser rejeitado.
+    ///
+    /// O span nao e limitado por `check_coherence` de proposito (um segmento
+    /// pode legitimamente ter buracos de LSN), logo a unica defesa e a
+    /// aritmetica nao transbordar aqui.
+    #[test]
+    fn span_maximo_nao_transborda() {
+        let f = FooterV6 {
+            record_count: 2,
+            min_lsn: 0,
+            max_lsn: u64::MAX,
+            ..amostra()
+        };
+        // Passa a coerencia — e por isso que chega ao `+ 1`.
+        assert!(FooterV6::decode(&f.encode()).is_ok());
+        assert!(
+            !f.lsn_span_is_contiguous(),
+            "2 registos nao cobrem um span de 2^64"
+        );
+    }
+
+    /// O caso limite: um segmento que cobre mesmo todos os LSN. `record_count`
+    /// e u64, logo 2^64 registos sao inrepresentaveis e o span maximo nunca e
+    /// contiguo — mas tambem nao pode transbordar a caminho dessa resposta.
+    #[test]
+    fn span_maximo_com_record_count_maximo() {
+        let f = FooterV6 {
+            record_count: u64::MAX,
+            min_lsn: 0,
+            max_lsn: u64::MAX,
+            ..amostra()
+        };
+        assert!(!f.lsn_span_is_contiguous());
     }
 
     #[test]

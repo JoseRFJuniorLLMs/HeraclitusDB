@@ -8,7 +8,7 @@
 pub mod gate;
 
 use heraclitus_core::{Episode, EventId, HeraclitusError, Lsn, ProductPoint};
-use heraclitus_manifold::{PreparedQuery, ProductMetric, Signature};
+use heraclitus_manifold::{PreparedPoint, PreparedQuery, ProductMetric, Signature};
 use heraclitus_views::View;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -24,6 +24,12 @@ const DEFAULT_EF_CONSTRUCTION: usize = 200;
 #[derive(Clone, Serialize, Deserialize)]
 struct Node {
     point: ProductPoint,
+    /// Cache derivado das normas do ponto residente. `serde(skip)` e
+    /// intencional: mantem o formato binario de `vector.ckpt` identico ao
+    /// anterior e permite abrir checkpoints existentes. O cache e reconstruido
+    /// depois do decode, sob a assinatura restaurada.
+    #[serde(skip)]
+    prepared: PreparedPoint,
     level: usize,
     /// neighbors[level] = ids
     neighbors: Vec<Vec<u32>>,
@@ -109,6 +115,14 @@ thread_local! {
     /// em silêncio, que é a falha certa a ter.
     static VISITADOS: std::cell::RefCell<Visitados> =
         const { std::cell::RefCell::new(Visitados { marcas: Vec::new(), epoca: 0 }) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Instrumentacao de testes para provar que a descida dos niveis
+    /// superiores nao passa silenciosamente pelo algoritmo geral.
+    static SEARCH_LAYER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GREEDY_DESCENT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl Eq for Candidate {}
@@ -206,13 +220,10 @@ impl VectorIndex {
         self.tombstones.len()
     }
 
-    fn dist(&self, a: u32, b: &ProductPoint) -> f64 {
-        self.metric.dist(&self.nodes[a as usize].point, b)
-    }
-
     /// Distância AO QUADRADO do nó `a` à consulta preparada.
     fn dist2(&self, a: u32, q: &PreparedQuery) -> f64 {
-        q.dist2(&self.nodes[a as usize].point)
+        let node = &self.nodes[a as usize];
+        q.dist2_prepared(&node.point, &node.prepared)
     }
 
     fn random_level(&mut self) -> usize {
@@ -242,6 +253,8 @@ impl VectorIndex {
         ef: usize,
         filter: Option<&RoaringBitmap>,
     ) -> Vec<Candidate> {
+        #[cfg(test)]
+        SEARCH_LAYER_CALLS.with(|calls| calls.set(calls.get() + 1));
         // Tombstones nunca entram nos RESULTADOS mas continuam a ser
         // atravessados (visited/candidates) — remover nós do grafo partiria a
         // conectividade; excluí-los só da seleção preserva o recall.
@@ -267,39 +280,92 @@ impl VectorIndex {
         }
 
         VISITADOS.with(|v| {
-        let mut visitados = v.borrow_mut();
-        visitados.preparar(self.nodes.len());
-        visitados.marcar(entry);
-        while let Some(c) = candidates.pop() {
-            let worst = results.peek().map(|r| r.0.dist).unwrap_or(f64::MIN);
-            // Stop only once we have ef filtered hits AND cannot improve them.
-            if results.len() >= ef && c.dist > worst {
-                break;
-            }
-            for &n in &self.nodes[c.id as usize].neighbors
-                [level.min(self.nodes[c.id as usize].neighbors.len() - 1)]
-            {
-                if visitados.marcar(n) {
-                    let d = self.dist2(n, query);
-                    let worst = results.peek().map(|r| r.0.dist).unwrap_or(f64::MIN);
-                    // Keep exploring while we still need filtered hits, or while
-                    // n could improve the current frontier.
-                    if results.len() < ef || d < worst {
-                        candidates.push(Candidate { dist: d, id: n });
-                        if passes(n) {
-                            results.push(Reverse(Candidate { dist: d, id: n }));
-                            if results.len() > ef {
-                                results.pop(); // drop the worst (largest dist) filtered result
+            let mut visitados = v.borrow_mut();
+            visitados.preparar(self.nodes.len());
+            visitados.marcar(entry);
+            while let Some(c) = candidates.pop() {
+                let worst = results.peek().map(|r| r.0.dist).unwrap_or(f64::MIN);
+                // Stop only once we have ef filtered hits AND cannot improve them.
+                if results.len() >= ef && c.dist > worst {
+                    break;
+                }
+                for &n in &self.nodes[c.id as usize].neighbors
+                    [level.min(self.nodes[c.id as usize].neighbors.len() - 1)]
+                {
+                    if visitados.marcar(n) {
+                        let d = self.dist2(n, query);
+                        let worst = results.peek().map(|r| r.0.dist).unwrap_or(f64::MIN);
+                        // Keep exploring while we still need filtered hits, or while
+                        // n could improve the current frontier.
+                        if results.len() < ef || d < worst {
+                            candidates.push(Candidate { dist: d, id: n });
+                            if passes(n) {
+                                results.push(Reverse(Candidate { dist: d, id: n }));
+                                if results.len() > ef {
+                                    results.pop(); // drop the worst (largest dist) filtered result
+                                }
                             }
                         }
                     }
                 }
             }
-        }
         });
         let mut out: Vec<Candidate> = results.into_iter().map(|r| r.0).collect();
         out.sort_by(|a, b| a.dist.total_cmp(&b.dist));
         out
+    }
+
+    /// Descida HNSW especializada para os niveis superiores (`ef = 1`).
+    ///
+    /// A busca geral precisa de dois heaps e de uma ordenacao final porque
+    /// preserva ate `ef` alternativas. Nos niveis acima de zero queremos apenas
+    /// o melhor ponto de entrada para a camada seguinte: percorremos os
+    /// vizinhos do atual, movemos para o melhor que o melhora estritamente e
+    /// repetimos ate atingir um minimo local. As marcas de epoca ja existentes
+    /// sao reutilizadas apenas para nao recalcular um vizinho visto por dois
+    /// nos consecutivos; nao ha `HashSet` nem alocacao por chamada.
+    ///
+    /// Nao ha filtro aqui por desenho. Camadas superiores sao apenas rotas;
+    /// tombstones continuam atravessaveis e o bitmap/tombstone e aplicado pelo
+    /// `search_layer` completo na camada zero. A comparacao estrita (`<`) e a
+    /// ordem dos vizinhos preservam o desempate deterministico do antigo
+    /// `search_layer(ef=1)`.
+    fn search_layer_greedy(&self, query: &PreparedQuery, entry: u32, level: usize) -> Candidate {
+        #[cfg(test)]
+        GREEDY_DESCENT_CALLS.with(|calls| calls.set(calls.get() + 1));
+
+        VISITADOS.with(|visited| {
+            let mut visited = visited.borrow_mut();
+            visited.preparar(self.nodes.len());
+            visited.marcar(entry);
+            let mut current = Candidate {
+                dist: self.dist2(entry, query),
+                id: entry,
+            };
+            loop {
+                let node = &self.nodes[current.id as usize];
+                let layer = level.min(node.neighbors.len() - 1);
+                let mut best_id = current.id;
+                let mut best_dist = current.dist;
+                for &neighbor in &node.neighbors[layer] {
+                    if !visited.marcar(neighbor) {
+                        continue;
+                    }
+                    let dist = self.dist2(neighbor, query);
+                    if dist < best_dist {
+                        best_id = neighbor;
+                        best_dist = dist;
+                    }
+                }
+                if best_id == current.id {
+                    return current;
+                }
+                current = Candidate {
+                    dist: best_dist,
+                    id: best_id,
+                };
+            }
+        })
     }
 
     pub fn insert(&mut self, event_id: EventId, lsn: Lsn, point: ProductPoint) {
@@ -308,30 +374,30 @@ impl VectorIndex {
         }
         let id = self.nodes.len() as u32;
         let level = self.random_level();
+        // A consulta e as normas residentes sao preparadas antes de mover o
+        // ponto para o no. Assim nao precisamos do clone integral que existia
+        // apenas para voltar a consultar o ponto durante a ligacao HNSW.
+        let pq = PreparedQuery::new(&self.metric, &point);
+        let prepared = PreparedPoint::new(&self.metric, &point);
         // The node is inserted (with empty adjacency) BEFORE any back-links
         // are created: a search during connection may already traverse it.
         self.nodes.push(Node {
-            point: point.clone(),
+            point,
+            prepared,
             level,
             neighbors: vec![Vec::new(); level + 1],
         });
         self.by_event.insert(event_id, id);
         self.ids.push(event_id);
         self.lsns.push(lsn);
-
-        let pq = PreparedQuery::new(&self.metric, &point);
         let old_entry = self.entry;
         if let Some(mut ep) = old_entry {
             let top = self.nodes[ep as usize].level;
             // descend greedily above the new node's level
             for l in ((level + 1)..=top).rev() {
-                let best =
-                    self.search_layer(&pq, ep, l.min(self.nodes[ep as usize].level), 1, None);
-                // Com tombstones, a camada pode não devolver candidatos
-                // elegíveis: mantém o entry-point atual em vez de indexar [0].
-                if let Some(b) = best.first() {
-                    ep = b.id;
-                }
+                ep = self
+                    .search_layer_greedy(&pq, ep, l.min(self.nodes[ep as usize].level))
+                    .id;
             }
             // connect at each level from min(level, top) down to 0
             for l in (0..=level.min(top)).rev() {
@@ -348,9 +414,10 @@ impl VectorIndex {
                         self.nodes[n as usize].neighbors[l].push(id);
                         if self.nodes[n as usize].neighbors[l].len() > self.m * 2 {
                             // prune: keep the m*2 closest
-                            let np = self.nodes[n as usize].point.clone();
+                            let np =
+                                PreparedQuery::new(&self.metric, &self.nodes[n as usize].point);
                             let mut nb = std::mem::take(&mut self.nodes[n as usize].neighbors[l]);
-                            nb.sort_by(|&a, &b| self.dist(a, &np).total_cmp(&self.dist(b, &np)));
+                            nb.sort_by(|&a, &b| self.dist2(a, &np).total_cmp(&self.dist2(b, &np)));
                             nb.truncate(self.m * 2);
                             self.nodes[n as usize].neighbors[l] = nb;
                         }
@@ -388,10 +455,7 @@ impl VectorIndex {
         // Entry-point descent ignores the filter (we want the best entry into
         // level 0 regardless); the filter is pushed down only at level 0.
         for l in (1..=top).rev() {
-            let best = self.search_layer(&pq, ep, l, 1, None);
-            if let Some(b) = best.first() {
-                ep = b.id;
-            }
+            ep = self.search_layer_greedy(&pq, ep, l).id;
         }
         let ef = ef.max(k);
         let candidates =
@@ -561,6 +625,11 @@ impl VectorIndex {
         if !coherent {
             return Ok(false);
         }
+        let metric = ProductMetric { sig: snap.sig };
+        let mut nodes = snap.nodes;
+        for node in &mut nodes {
+            node.prepared = PreparedPoint::new(&metric, &node.point);
+        }
         self.by_event = snap
             .ids
             .iter()
@@ -569,12 +638,12 @@ impl VectorIndex {
             .collect();
         self.m = snap.m;
         self.ef_construction = snap.ef_construction;
-        self.nodes = snap.nodes;
+        self.nodes = nodes;
         self.entry = snap.entry;
         self.ids = snap.ids;
         self.lsns = snap.lsns;
         self.watermark = snap.watermark;
-        self.metric = ProductMetric { sig: snap.sig };
+        self.metric = metric;
         self.tombstones = snap.tombstones.into_iter().collect();
         Ok(true)
     }
@@ -622,6 +691,29 @@ impl View for VectorIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Espelho do formato de checkpoint anterior ao `PreparedPoint`. Mantido
+    /// apenas no teste para provar que o novo cache nao mudou um unico campo no
+    /// wire format.
+    #[derive(Serialize, Deserialize)]
+    struct LegacyNode {
+        point: ProductPoint,
+        level: usize,
+        neighbors: Vec<Vec<u32>>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct LegacyVectorSnapshot {
+        m: usize,
+        ef_construction: usize,
+        nodes: Vec<LegacyNode>,
+        entry: Option<u32>,
+        ids: Vec<EventId>,
+        lsns: Vec<Lsn>,
+        watermark: Lsn,
+        sig: Signature,
+        tombstones: Vec<u32>,
+    }
 
     fn pt(hyp: Vec<f32>) -> ProductPoint {
         ProductPoint {
@@ -852,6 +944,50 @@ mod tests {
         let mut fresh = VectorIndex::new(ProductMetric::default());
         assert!(!fresh.load_checkpoint(empty_dir.path()).unwrap());
     }
+
+    #[test]
+    fn prepared_point_preserva_wire_format_e_e_reconstruido_no_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = VectorIndex::new(ProductMetric::default());
+        for i in 0..80u64 {
+            idx.insert(
+                EventId(ulid::Ulid::from_parts(i, i as u128)),
+                i,
+                pt(vec![(i as f32) / 100.0, 0.1]),
+            );
+        }
+        idx.save_checkpoint(dir.path()).unwrap();
+        let path = dir.path().join(VECTOR_CKPT_FILE);
+        let bytes = std::fs::read(&path).unwrap();
+
+        // Um leitor antigo continua a descodificar exactamente todo o ficheiro:
+        // `prepared` nao foi acrescentado ao stream bincode.
+        let (legacy, consumed) = bincode::serde::decode_from_slice::<LegacyVectorSnapshot, _>(
+            &bytes,
+            bincode::config::standard(),
+        )
+        .expect("checkpoint novo deve manter o formato antigo");
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(legacy.nodes.len(), idx.nodes.len());
+
+        // E o sentido inverso: bytes emitidos pelo schema antigo entram no
+        // loader novo, que recalcula o cache derivado sob a Signature gravada.
+        let legacy_bytes =
+            bincode::serde::encode_to_vec(&legacy, bincode::config::standard()).unwrap();
+        assert_eq!(legacy_bytes, bytes, "o wire format deve ser identico");
+        std::fs::write(&path, legacy_bytes).unwrap();
+
+        let mut restored = VectorIndex::new(ProductMetric::default());
+        assert!(restored.load_checkpoint(dir.path()).unwrap());
+        assert_eq!(restored.nodes.len(), idx.nodes.len());
+        for node in &restored.nodes {
+            assert_eq!(
+                node.prepared,
+                PreparedPoint::new(&restored.metric, &node.point),
+                "restore deixou um cache de normas vazio ou obsoleto"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -951,6 +1087,154 @@ mod testes_visitados {
 }
 
 #[cfg(test)]
+mod testes_greedy_descent {
+    use super::*;
+
+    fn ponto(semente: u64) -> ProductPoint {
+        let mut x = semente.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut proximo = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            ((x % 2001) as f32 / 2000.0 - 0.5) * 0.35
+        };
+        ProductPoint {
+            hyp: (0..32).map(|_| proximo()).collect(),
+            sph: (0..8).map(|_| proximo()).collect(),
+            euc: (0..8).map(|_| proximo()).collect(),
+        }
+    }
+
+    fn indice(n: usize) -> VectorIndex {
+        let mut index = VectorIndex::new(ProductMetric::default());
+        for i in 0..n {
+            index.insert(
+                EventId(ulid::Ulid::from_parts(i as u64, i as u128)),
+                i as u64,
+                ponto(i as u64 + 1),
+            );
+        }
+        assert!(
+            index.nodes.iter().any(|node| node.level > 0),
+            "o corpus deterministico precisa exercitar camadas superiores"
+        );
+        index
+    }
+
+    /// Referencia congelada do caminho anterior: `search_layer` geral com
+    /// `ef=1`, sem filtro. Serve apenas para provar equivalencia da descida.
+    fn referencia_ef1(
+        index: &VectorIndex,
+        query: &PreparedQuery,
+        entry: u32,
+        level: usize,
+    ) -> Candidate {
+        index
+            .search_layer(query, entry, level, 1, None)
+            .into_iter()
+            .next()
+            .expect("sem tombstones, ef=1 sempre devolve o entry ou uma melhora")
+    }
+
+    fn busca_com_descida_de_referencia(
+        index: &VectorIndex,
+        query: &ProductPoint,
+        k: usize,
+        ef: usize,
+        filter: Option<&RoaringBitmap>,
+    ) -> Vec<(EventId, Lsn, u32)> {
+        let Some(mut entry) = index.entry else {
+            return Vec::new();
+        };
+        let prepared = PreparedQuery::new(&index.metric, query);
+        let top = index.nodes[entry as usize].level;
+        for level in (1..=top).rev() {
+            entry = referencia_ef1(index, &prepared, entry, level).id;
+        }
+        index
+            .search_layer(
+                &prepared,
+                entry,
+                0,
+                ef.max(k).max(index.ef_construction.min(64)),
+                filter,
+            )
+            .into_iter()
+            .take(k)
+            .map(|candidate| {
+                (
+                    index.ids[candidate.id as usize],
+                    index.lsns[candidate.id as usize],
+                    (candidate.dist.max(0.0).sqrt() as f32).to_bits(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn greedy_e_bit_a_bit_equivalente_ao_search_layer_ef1() {
+        let index = indice(700);
+        for seed in 10_000..10_100u64 {
+            let query_point = ponto(seed);
+            let query = PreparedQuery::new(&index.metric, &query_point);
+            let mut greedy_entry = index.entry.unwrap();
+            let mut reference_entry = greedy_entry;
+            let top = index.nodes[greedy_entry as usize].level;
+            for level in (1..=top).rev() {
+                let greedy = index.search_layer_greedy(&query, greedy_entry, level);
+                let reference = referencia_ef1(&index, &query, reference_entry, level);
+                assert_eq!(greedy.id, reference.id, "seed={seed}, level={level}");
+                assert_eq!(
+                    greedy.dist.to_bits(),
+                    reference.dist.to_bits(),
+                    "seed={seed}, level={level}"
+                );
+                greedy_entry = greedy.id;
+                reference_entry = reference.id;
+            }
+        }
+    }
+
+    #[test]
+    fn busca_filtrada_preserva_ranking_e_usa_um_unico_search_layer_completo() {
+        let index = indice(900);
+        let mut filter = RoaringBitmap::new();
+        for id in (0..index.len() as u32).step_by(11) {
+            filter.insert(id);
+        }
+        let query = ponto(99_999);
+        let reference = busca_com_descida_de_referencia(&index, &query, 12, 96, Some(&filter));
+
+        SEARCH_LAYER_CALLS.with(|calls| calls.set(0));
+        GREEDY_DESCENT_CALLS.with(|calls| calls.set(0));
+        let actual: Vec<(EventId, Lsn, u32)> = index
+            .search(&query, 12, 96, Some(&filter))
+            .into_iter()
+            .map(|hit| (hit.id, hit.lsn, hit.dist.to_bits()))
+            .collect();
+
+        assert_eq!(actual, reference, "filtro/ranking mudaram com a descida");
+        let top = index.nodes[index.entry.unwrap() as usize].level;
+        let greedy_calls = GREEDY_DESCENT_CALLS.with(std::cell::Cell::get);
+        let full_calls = SEARCH_LAYER_CALLS.with(std::cell::Cell::get);
+        assert_eq!(greedy_calls, top, "uma descida especializada por nivel");
+        assert_eq!(
+            full_calls, 1,
+            "somente a camada zero pode chamar o search_layer completo"
+        );
+
+        // Prova direta: o helper especializado nao delega escondido para o
+        // caminho geral.
+        let prepared = PreparedQuery::new(&index.metric, &query);
+        SEARCH_LAYER_CALLS.with(|calls| calls.set(0));
+        GREEDY_DESCENT_CALLS.with(|calls| calls.set(0));
+        index.search_layer_greedy(&prepared, index.entry.unwrap(), top);
+        assert_eq!(SEARCH_LAYER_CALLS.with(std::cell::Cell::get), 0);
+        assert_eq!(GREEDY_DESCENT_CALLS.with(std::cell::Cell::get), 1);
+    }
+}
+
+#[cfg(test)]
 mod medicao_hnsw {
     use super::*;
     use std::time::Instant;
@@ -1010,6 +1294,59 @@ mod medicao_hnsw {
             );
         }
     }
+
+    /// Mede somente a descida das camadas superiores: algoritmo geral `ef=1`
+    /// contra scan/move/repeat sem heaps. Ignorado porque tempo de parede nao e
+    /// uma assercao portavel.
+    ///
+    ///   cargo test -p heraclitus-index-vector --release --lib \
+    ///     greedy_vs_search_layer -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn greedy_vs_search_layer_ef1() {
+        let mut index = VectorIndex::new(ProductMetric::default());
+        for i in 0..10_000 {
+            index.insert(EventId::new(), i as u64, ponto_realista(i as u64));
+        }
+        let queries: Vec<PreparedQuery> = (0..2_000)
+            .map(|i| PreparedQuery::new(&index.metric, &ponto_realista(1_000_000 + i as u64)))
+            .collect();
+        let entry = index.entry.unwrap();
+        let top = index.nodes[entry as usize].level;
+        assert!(top > 0);
+
+        let started = Instant::now();
+        let mut checksum_greedy = 0u64;
+        for query in &queries {
+            let mut current = entry;
+            for level in (1..=top).rev() {
+                current = index.search_layer_greedy(query, current, level).id;
+            }
+            checksum_greedy = checksum_greedy.wrapping_add(current as u64);
+        }
+        let greedy_time = started.elapsed();
+
+        let started = Instant::now();
+        let mut checksum_reference = 0u64;
+        for query in &queries {
+            let mut current = entry;
+            for level in (1..=top).rev() {
+                current = index
+                    .search_layer(query, current, level, 1, None)
+                    .first()
+                    .expect("corpus sem tombstones")
+                    .id;
+            }
+            checksum_reference = checksum_reference.wrapping_add(current as u64);
+        }
+        let reference_time = started.elapsed();
+
+        assert_eq!(checksum_greedy, checksum_reference);
+        println!(
+            "upper descent: greedy={greedy_time:?}, search_layer(ef=1)={reference_time:?}, speedup={:.2}x, checksum={checksum_greedy}",
+            reference_time.as_secs_f64() / greedy_time.as_secs_f64()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1017,7 +1354,11 @@ mod testes_prepared_query {
     use super::*;
 
     fn pt4(hyp: Vec<f32>) -> ProductPoint {
-        ProductPoint { hyp, sph: vec![], euc: vec![] }
+        ProductPoint {
+            hyp,
+            sph: vec![],
+            euc: vec![],
+        }
     }
 
     /// A travessia passou a ordenar pela distancia AO QUADRADO. O campo

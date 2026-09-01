@@ -121,9 +121,53 @@ pub fn require<T>(req: &Request<T>, role: AccessRole) -> Result<Principal, Statu
     }
 }
 
+/// Vincula o aprovador de uma accao humana a identidade AUTENTICADA.
+///
+/// # Porque e que isto existe
+///
+/// As duas superficies recebiam o `approver` no CORPO do pedido e persistiam-no
+/// tal e qual. Um registo de aprovacao humana existe precisamente para atribuir
+/// responsabilidade — e assim qualquer chamador registava uma aprovacao em nome
+/// de outra pessoa. Pior: o gRPC ja mandava a identidade real para
+/// `audit_admin`, portanto a auditoria sabia quem era e o registo de aprovacao
+/// nao sabia.
+///
+/// # A regra
+///
+/// O aprovador registado e SEMPRE `identidade`. O campo do corpo passa a ser
+/// opcional e, quando vem, e apenas VERIFICADO: divergir e um erro, nao uma
+/// correccao silenciosa, para que a tentativa fique visivel a quem le os logs.
+///
+/// Vive aqui, e nao em cada superficie, porque uma politica escrita duas vezes
+/// diverge — foi exactamente assim que o REST e o gRPC ficaram com regras de
+/// autorizacao diferentes.
+pub fn vincular_aprovador<'a>(
+    pedido: Option<&str>,
+    identidade: &'a str,
+) -> Result<&'a str, String> {
+    match pedido {
+        Some(p) if p != identidade => Err(format!(
+            "approver '{p}' nao coincide com a identidade autenticada '{identidade}' —              uma aprovacao so pode ser registada em nome de quem a faz"
+        )),
+        _ => Ok(identidade),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aprovador_e_sempre_a_identidade_autenticada() {
+        // Ausente: fica a identidade, sem drama.
+        assert_eq!(vincular_aprovador(None, "ana"), Ok("ana"));
+        // Coincidente: idem.
+        assert_eq!(vincular_aprovador(Some("ana"), "ana"), Ok("ana"));
+        // Divergente: recusado, e a mensagem nomeia os DOIS lados — quem le o
+        // log precisa de saber quem tentou e em nome de quem.
+        let erro = vincular_aprovador(Some("a-directora"), "ana").unwrap_err();
+        assert!(erro.contains("a-directora") && erro.contains("ana"), "{erro}");
+    }
 
     #[test]
     fn authenticates_hashed_token_and_enforces_roles() {
