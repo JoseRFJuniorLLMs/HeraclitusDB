@@ -24,7 +24,7 @@
 
 ## 💼 O que é o HeraclitusDB
 
-O **HeraclitusDB** é o primeiro banco de dados de alta performance projetado de raiz para ser **matematicamente imune a adulterações retroativas**. Construído em Rust puro, combina um log *append-only* canônico baseado em árvores Merkle (BLAKE3/SHA-256), variedades geométricas aprendidas ($\mathcal{H} \times \mathcal{S} \times \mathcal{E}$), motor de grafos temporais bi-temporais, fusão de recuperação multi-canal (RRF), plano de segurança autônomo (Sentinel L0–L6) e evidência criptográfica qualificada (RFC 3161 / ICP-Brasil).
+O **HeraclitusDB** é um **banco de dados HTAP (Transacional e Analítico) distribuído, multi-modelo (relacional, grafo, texto e vetorial para IA), escrito em Rust**. Ele tem um foco fortíssimo em segurança de nível militar/governamental, conformidade legal, auditoria criptográfica e aceleração por hardware (GPU).
 
 Em bancos tradicionais (PostgreSQL, Neo4j, MongoDB), comandos `UPDATE` e `DELETE` destroem a história física. Em ambientes regulados ou na memória de agentes de IA, isso cria duas vulnerabilidades críticas: **adulteração retroativa indetectável** e **amnésia estrutural invisível**.
 
@@ -128,6 +128,137 @@ heraclitus-analytics     ← Motor SQL OLAP sobre o log via Apache Arrow / DataF
 tools/heraclitus-qualifier ← Suíte de qualificação e auditoria governamental (SPEC-0049)
 tools/heraclitus-ingestor  ← Pipeline de ingestão massiva e streaming de alta velocidade
 ```
+
+---
+
+## 🏗️ Análise Estrutural Detalhada por Módulo
+
+### 1. Motor de Armazenamento e Estruturas Core (Storage Engine)
+A base de como os dados são gravados, estruturados e recuperados.
+
+* **`heraclitus-core`**
+  * **O que faz:** Contém as primitivas e abstrações fundamentais do banco de dados.
+  * **Como faz:** Gerencia o tempo lógico do banco (`hlc.rs` - *Hybrid Logical Clock*), define o formato e versão (`format_version.rs`), implementa execução de Máquina Virtual para operações (`vm/interpreter.rs`), gerencia isolamento de processos (`sandbox.rs`) e alocação de memória considerando topologia de hardware (`numa.rs`).
+* **`heraclitus-memtable`**
+  * **O que faz:** Gerencia os dados em memória antes de serem persistidos no disco.
+  * **Como faz:** Atua como um buffer transacional rápido onde as novas escritas chegam primeiro, garantindo *Read-Your-Own-Writes* (RYOW) em $< 1\text{ ms}$.
+* **`heraclitus-log`**
+  * **O que faz:** Implementa o log canônico append-only (WAL) garantindo a durabilidade (ACID) e a imutabilidade das transações.
+  * **Como faz:** Usa formato canônico versionado **HRKL v6** (`v6/`), empacotadores otimizados (`packer.rs`), varints para compressão de inteiros, e Árvores de Merkle BLAKE3 (`merkle.rs`) para garantir que os logs não foram corrompidos ou adulterados. Possui coleta de lixo semântica (`gc.rs`) e mapeamento em disco (`mmap.rs`).
+* **`heraclitus-btree`**
+  * **O que faz:** Organização primária dos dados estruturados em disco.
+  * **Como faz:** Implementa estruturas $B^\varepsilon$-Tree (Fractal Tree) balanceadas com *CoW shadow paging*, nós de 4KB e checkpoints BLAKE3 para permitir buscas indexadas e escaneamentos (*range scans*) eficientes.
+* **`heraclitus-tier` (Tiering / Lakehouse)**
+  * **O que faz:** Move dados frios e históricos do armazenamento principal para armazenamentos analíticos em nuvem (Data Lakes / Object Storage).
+  * **Como faz:** Implementa integração com formatos modernos de Lakehouse, incluindo `parquet` v2, `delta` (Delta Lake), `iceberg` (Apache Iceberg v2) e `avro`. Possui rotinas de compactação (`compaction.rs`) e rebaixamento com recibos criptográficos (`demotion.rs`).
+
+---
+
+### 2. Multi-Indexação (Multi-Model Indexing)
+O banco não se prende a um único tipo de dado, possuindo índices dedicados e especializados para diferentes cargas de trabalho:
+
+* **`heraclitus-index-attr`**: Indexação de atributos escalares e relacionais convencionais com compressão e *range scans* em árvore balanceada sem table scans.
+* **`heraclitus-index-text`**: Indexação para busca *Full-Text* com índices invertidos BM25, busca *fuzzy* e tokenização multilíngue.
+* **`heraclitus-index-graph`**: Indexação para dados em Grafo, gerindo relacionamentos temporais, entidades (`entity.rs`), proveniência causal (`temporal.rs`), detecção de comunidades Leiden e tomadas de decisão em nós (`decision.rs`).
+* **`heraclitus-index-vector` & `heraclitus-manifold`**:
+  * **O que fazem:** Formam o motor de Banco de Dados Vetorial para Inteligência Artificial.
+  * **Como fazem:** Utilizam grafos hierárquicos navegáveis (HNSW - `hnsw_search.rs` e `gate.rs`) para busca de similaridade aproximada ($k$-NN) com suporte a *tombstones*. O módulo `manifold` gerencia cálculos complexos de distâncias em espaços multidimensionais de geometria mista $\mathcal{H} \times \mathcal{S} \times \mathcal{E}$ (`distance.rs`, `estimate.rs`).
+
+---
+
+### 3. Computação, Consultas e Analytics (Query & Compute)
+Módulos responsáveis por entender as requisições dos usuários e executá-las com altíssima performance:
+
+* **`heraclitus-query`**
+  * **O que faz:** Interpreta, otimiza e planeja a execução das consultas em dialeto Cypher/GQL.
+  * **Como faz:** Usa um parser baseado em PEG (`gql.pest`) para construir a Árvore Sintática (AST). Cria um plano de execução otimizado (`plan.rs`) com suporte a operadores temporais (`AS OF`, `VALID AT`, `WHY`, `DIST_PRODUCT`) e repassa para o backend lock-free com `ArcSwap` (`backend.rs`).
+* **`heraclitus-analytics`**
+  * **O que faz:** Motor OLAP para consultas pesadas de Business Intelligence diretamente sobre o log.
+  * **Como faz:** Execução vetorizada de consultas (`vectorized.rs`) integrada ao Apache Arrow DataFusion e interface Arrow Flight (`flight.rs`) para processamento analítico em lote.
+* **`heraclitus-gpu`**
+  * **O que faz:** Aceleração massiva por hardware.
+  * **Como faz:** Descarrega computação paralela intensa (cálculo de distâncias manifold, quantização ordinal e agregações) diretamente na GPU via *shaders* WGSL e wgpu (`benches/gpu_vs_cpu.rs`), destravando performance para IA e Analytics com fallback seguro para CPU.
+
+---
+
+### 4. Distribuição e Rede (Distributed & Networking)
+
+* **`heraclitus-raft`**
+  * **O que faz:** Garante consenso distribuído, alta disponibilidade e replicação de dados.
+  * **Como faz:** Implementa o algoritmo Raft via OpenRaft (`consensus.rs`). Gerencia eleições de nós líderes, replicação segura de logs duráveis (`durable.rs`) e comunicação gRPC entre réplicas com tolerância a partições de rede.
+* **`heraclitus-server`**
+  * **O que faz:** A porta de entrada do banco de dados para o mundo externo.
+  * **Como faz:** Inicializa a API REST (`rest.rs`) e gRPC (`grpc.rs`, `flight_grpc.rs`). Gerencia o boot narrado com suporte a ANSI/UTF-8 (`boot.rs`), autenticação RBAC de usuários (`auth.rs`) e orquestração do cluster (`cluster.rs`).
+
+---
+
+### 5. Segurança, Conformidade e Ameaças (Security & Sentinel)
+Proteção embutida de nível governamental e militar para operações críticas:
+
+* **`heraclitus-compliance`**
+  * **O que faz:** Garante obediência a regulações e provê não-repúdio (auditoria infalível).
+  * **Como faz:** Implementa carimbos de tempo seguros RFC 3161 (`rfc3161.rs`, `secure_tsa.rs`), verificador estrito ICP-Brasil X.509/CMS (`icp.rs`), verificação de revogação offline por CRL (`crl.rs`), recibos criptográficos infalsificáveis (`receipt.rs`, `verify.rs`), e controles de privacidade (`privacy.rs`) e soberania (`sovereignty.rs`).
+* **`heraclitus-sentinel`**
+  * **O que faz:** Motor de SIEM e segurança autônoma (L0–L6) integrado nativamente no banco.
+  * **Como faz:** Analisa eventos em tempo real (`event/`), executa regras Sigma (L1), calcula momentos comportamentais EWMA/Welford (L2), constrói grafos de incidentes causais (L3), realiza investigações com LLM sob contexto restrito (L4) e executa ações reversíveis (L5/L6). Processa feeds de inteligência de ameaças (`threat/feed.rs`), avalia regras de confiança (`threat/trust.rs`) e compartilha dados em conformidade com STIX 2.1 e TLP 2.0 (`threat/stix.rs`).
+
+---
+
+### 6. Ferramentas, SDKs e Verificação Formal
+
+* **Ferramentas e Interfaces:**
+  * **`heraclitus-cli`**: Linha de comando para inspeção, verificação Merkle, ancoragem de evidência, benchmarks e execução de queries.
+  * **`tools/heraclitus-ingestor`**: Ingestor de alta performance para cargas massivas de dados em lote e streaming.
+  * **`tools/heraclitus-qualifier`**: Suíte de qualificação governamental automatizada (SPEC-0049), executando testes de carga (Q1), crash-loop contra binários de release (Q2), monitoramento de *egress* e geração de SBOM CycloneDX.
+  * **SDKs Oficiais**: SDK Python em rede (`sdk/python`) e SDK Python embarcado in-process via PyO3 (`sdk/python-embedded`).
+  * **Servidor MCP Nativo**: Integração direta com *Model Context Protocol* (`mcp/heraclitus_mcp.py`) para agentes de IA operarem com memória não-volátil anti-fraude.
+* **`lean/` (Verificação Formal de Teoremas):**
+  * **O que faz:** Prova matematicamente que os algoritmos fundamentais do banco são formalmente corretos.
+  * **Como faz:** Utiliza a linguagem de prova formal *Lean 4* para garantir, via deduções matemáticas formais, as invariantes do log *append-only*, dos relógios lógicos híbridos (HLC), dos mapeamentos densos de chaves e da consistência de inclusão das Árvores de Merkle.
+
+---
+
+## 🔄 Fluxo de Vida Completo de uma Operação
+
+```
+  [Cliente / SDK / Agente IA]
+               │
+               ▼ (gRPC / REST)
+       1. heraclitus-server
+               │ (Autenticação RBAC + TLS)
+               ▼
+       2. heraclitus-query
+               │ (Parser pest GQL/Cypher -> AST -> Query Plan)
+               ▼
+       3. heraclitus-sentinel & compliance
+               │ (Avaliação de segurança L0-L6 e conformidade com políticas)
+               ▼
+       4. Execução Multi-Modelo
+          ├── Busca Relacional/Atributos  ──> heraclitus-index-attr
+          ├── Busca Vetorial / Semântica ──> heraclitus-index-vector + heraclitus-gpu
+          ├── Travessia / Grafo Temporal ──> heraclitus-index-graph
+          └── Analytics / SQL OLAP       ──> heraclitus-analytics (DataFusion / Flight)
+               │
+               ▼
+       5. heraclitus-raft
+               │ (Consenso distribuído e aprovação por quórum do cluster)
+               ▼
+       6. Persistência e Durabilidade
+          ├── Escrita Imediata (RAM)     ──> heraclitus-memtable (RYOW < 1ms)
+          └── Log Canônico em Disco      ──> heraclitus-log (HRKL v6 + BLAKE3 Merkle Tree)
+               │
+               ▼ (Políticas de Tiering em Background)
+       7. heraclitus-tier
+          └── Dados frios e históricos   ──> Object Storage (S3/GCS/MinIO) via Parquet / Iceberg v2
+```
+
+1. **Recepção**: A operação chega via **`heraclitus-server`** (gRPC ou REST) com autenticação de sessão e validação de tokens.
+2. **Planejamento**: O **`heraclitus-query`** valida a sintaxe, gera a Árvore Sintática (AST) e constrói o plano de execução físico.
+3. **Auditoria em Linha**: O **`heraclitus-sentinel`** avalia a transação contra ameaças conhecidas (L1/L2), enquanto o **`heraclitus-compliance`** garante a aplicação das regras de soberania.
+4. **Execução Especializada**: Conforme a natureza da query, a execução é delegada aos índices correspondentes (**`index-attr`**, **`index-vector`**, **`index-graph`** ou **`heraclitus-analytics`** acelerado por **`heraclitus-gpu`**).
+5. **Consenso Distribuído**: Mutações são submetidas ao **`heraclitus-raft`**, que valida o quórum de réplicas antes do *commit*.
+6. **Escrita Imutável**: O evento é refletido na **`memtable`** para leitura síncrona instantânea e registrado de forma imutável no **`heraclitus-log`** com carimbo Merkle.
+7. **Ciclo de Vida e Lakehouse**: Periodicamente, o **`heraclitus-tier`** rebaixa dados históricos para Data Lakes (S3/MinIO) nos formatos Iceberg v2, Parquet e Delta Lake, emitindo recibos de rebaixamento assinados.
 
 ---
 
