@@ -165,12 +165,7 @@ async fn ingerir_cadastro(
         lote.push(("Servidor".into(), content, attrs));
 
         if lote.len() >= batch {
-            total += enviar_lote(
-                unsafe { std::mem::transmute(client.as_deref_mut()) },
-                &lote,
-                agent_id,
-            )
-            .await;
+            total += enviar_lote(client.as_deref_mut(), &lote, agent_id).await;
             lote.clear();
             if total.is_multiple_of(50_000) {
                 info!("    ... {} servidores ingeridos", total);
@@ -179,7 +174,7 @@ async fn ingerir_cadastro(
     }
 
     if !lote.is_empty() {
-        total += enviar_lote(unsafe { std::mem::transmute(client) }, &lote, agent_id).await;
+        total += enviar_lote(client, &lote, agent_id).await;
     }
 
     info!("  Total cadastros: {}", total);
@@ -260,12 +255,7 @@ async fn ingerir_remuneracao(
         lote.push(("Remuneracao".into(), content, attrs));
 
         if lote.len() >= batch {
-            total += enviar_lote(
-                unsafe { std::mem::transmute(client.as_deref_mut()) },
-                &lote,
-                agent_id,
-            )
-            .await;
+            total += enviar_lote(client.as_deref_mut(), &lote, agent_id).await;
             lote.clear();
             if total.is_multiple_of(50_000) {
                 info!("    ... {} remunerações ingeridas", total);
@@ -274,7 +264,7 @@ async fn ingerir_remuneracao(
     }
 
     if !lote.is_empty() {
-        total += enviar_lote(unsafe { std::mem::transmute(client) }, &lote, agent_id).await;
+        total += enviar_lote(client, &lote, agent_id).await;
     }
 
     info!("  Total remunerações: {}", total);
@@ -333,12 +323,7 @@ async fn ingerir_afastamentos(
         lote.push(("Afastamento".into(), content, attrs));
 
         if lote.len() >= batch {
-            total += enviar_lote(
-                unsafe { std::mem::transmute(client.as_deref_mut()) },
-                &lote,
-                agent_id,
-            )
-            .await;
+            total += enviar_lote(client.as_deref_mut(), &lote, agent_id).await;
             lote.clear();
             if total.is_multiple_of(10_000) {
                 info!("    ... {} afastamentos ingeridos", total);
@@ -347,7 +332,7 @@ async fn ingerir_afastamentos(
     }
 
     if !lote.is_empty() {
-        total += enviar_lote(unsafe { std::mem::transmute(client) }, &lote, agent_id).await;
+        total += enviar_lote(client, &lote, agent_id).await;
     }
 
     info!("  Total afastamentos: {}", total);
@@ -402,18 +387,13 @@ async fn ingerir_observacoes(
         lote.push(("ObservacaoServidor".into(), content, attrs));
 
         if lote.len() >= batch {
-            total += enviar_lote(
-                unsafe { std::mem::transmute(client.as_deref_mut()) },
-                &lote,
-                agent_id,
-            )
-            .await;
+            total += enviar_lote(client.as_deref_mut(), &lote, agent_id).await;
             lote.clear();
         }
     }
 
     if !lote.is_empty() {
-        total += enviar_lote(unsafe { std::mem::transmute(client) }, &lote, agent_id).await;
+        total += enviar_lote(client, &lote, agent_id).await;
     }
 
     info!("  Total observações: {}", total);
@@ -475,12 +455,7 @@ async fn ingerir_csv_generico(
             lote.push((kind.to_string(), content, attrs));
 
             if lote.len() >= batch {
-                total += enviar_lote(
-                    unsafe { std::mem::transmute(client.as_deref_mut()) },
-                    &lote,
-                    agent_id,
-                )
-                .await;
+                total += enviar_lote(client.as_deref_mut(), &lote, agent_id).await;
                 lote.clear();
                 if total.is_multiple_of(10_000) {
                     info!("    ... {} registros ingeridos", total);
@@ -489,12 +464,7 @@ async fn ingerir_csv_generico(
         }
 
         if !lote.is_empty() {
-            total += enviar_lote(
-                unsafe { std::mem::transmute(client.as_deref_mut()) },
-                &lote,
-                agent_id,
-            )
-            .await;
+            total += enviar_lote(client.as_deref_mut(), &lote, agent_id).await;
         }
     }
 
