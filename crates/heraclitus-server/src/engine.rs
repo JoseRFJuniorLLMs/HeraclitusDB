@@ -190,6 +190,17 @@ impl<T: View> View for Shared<T> {
     fn reset(&mut self) {
         self.0.write().unwrap().reset();
     }
+    // Pelo mesmo motivo dos dois acima, e antes que alguém se queime: sem este
+    // forward, `Shared` devolvia o default do trait (`None`) e TODAS as views
+    // registadas apareciam a desistir do dígito de determinismo que o próprio
+    // trait descreve como acceptance gate. Hoje ninguém lê `state_hash` pelo
+    // registry — o engine pergunta ao índice concreto (`graph_state_hash`) —
+    // por isso não havia sintoma. A armadilha era para o primeiro que
+    // percorresse as views a recolher dígitos e concluísse, sem erro nenhum,
+    // que nenhuma view os suporta.
+    fn state_hash(&self) -> Option<[u8; 32]> {
+        self.0.read().unwrap().state_hash()
+    }
 }
 
 impl Engine {

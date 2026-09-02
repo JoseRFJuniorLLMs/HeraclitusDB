@@ -66,11 +66,20 @@ serviço vem de variáveis `HERACLITUS_*` de máquina — que é o mecanismo pre
 em `service.rs` — e não de um TOML. O `ImagePath` sem argumentos é o desenho
 correcto, não uma falha.
 
-Nota lateral: `HERACLITUS_CONFIG` não está definida, portanto o
-`config.carga.toml` **nunca foi lido**. As variáveis em vigor contradizem-no
-(`fsync=always` contra o `group_commit` que o ficheiro pedia; cifra ligada
-contra `false`). Foi por isso que a carga correu a 491 ev/s em vez dos 1760 do
-benchmark.
+Nota lateral, e é preciso ser exacto aqui. O `config.carga.toml` **é** lido —
+mas só pelo servidor que o `reset-e-carga.ps1` lança ele próprio, e ao qual
+passa o ficheiro como `argv[1]`. O serviço Windows não o vê: `HERACLITUS_CONFIG`
+não está definida, e a configuração dele vem toda de variáveis de máquina.
+
+A carga de 2026-09-01 correu contra o **serviço**, não contra um servidor do
+script — o processo do serviço está de pé sem interrupção desde 06:35:40 e a
+ingestão decorreu entre 06:53 e 11:44, o que só encaixa no modo `-SemReset`
+(«carrega por cima do que já está no servidor em execução»). Valeram portanto as
+variáveis de ambiente, `fsync=always` incluído, e não o `group_commit` que o
+TOML pedia. É essa a explicação dos 491 ev/s contra os ~1760 do benchmark.
+
+O ficheiro é gerado a cada corrida do script e passou a estar no `.gitignore`:
+versioná-lo só garantia que ficasse dessincronizado de quem o produz.
 
 ### 3. O Telemetry Health está implementado mas não implantado
 
