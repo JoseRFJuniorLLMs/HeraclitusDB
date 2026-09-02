@@ -20,6 +20,12 @@ jobs:
   secrets:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # A action publica o resultado no proprio PR; com contents:read apenas,
+    # falha com 403 em qualquer pull_request — e um job vermelho chamado
+    # "secrets" e exatamente o alarme que ninguem quer ver falso.
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

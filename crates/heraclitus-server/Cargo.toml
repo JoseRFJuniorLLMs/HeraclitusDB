@@ -22,6 +22,7 @@ heraclitus-compliance = { workspace = true }
 heraclitus-crypto = { workspace = true }
 heraclitus-log = { workspace = true }
 heraclitus-sentinel = { workspace = true }
+heraclitus-telemetry-health = { workspace = true }
 heraclitus-manifold = { workspace = true }
 heraclitus-memtable = { workspace = true }
 heraclitus-views = { workspace = true }
