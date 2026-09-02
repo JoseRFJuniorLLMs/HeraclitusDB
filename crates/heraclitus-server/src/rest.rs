@@ -1387,8 +1387,25 @@ async fn healthz() -> &'static str {
     "panta rhei"
 }
 
-async fn stats(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
-    Json(engine.stats())
+/// `Engine::stats` toma os sete mutexes de índice. O checkpoint segura-os
+/// enquanto serializa as views para disco — medido a 2026-09-02 com 8,6 M
+/// eventos: 70 s a escrever 1,97 GiB, e um `GET /stats` iniciado dentro dessa
+/// janela só respondeu 69,4 s depois. Fora do `spawn_blocking` cada pedido
+/// nesse estado prende um fio do reactor durante todo o checkpoint, e um punhado
+/// de scrapes de monitorização esgota o pool — os probes de saúde deixam de ser
+/// servidos. Mesma razão pela qual `verify` já saiu do reactor.
+async fn stats(State(engine): State<Arc<Engine>>) -> Response {
+    match tokio::task::spawn_blocking(move || engine.stats()).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "stats_join_failed",
+                "message": error.to_string()
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn compliance_status(State(engine): State<Arc<Engine>>) -> Response {
@@ -1510,8 +1527,22 @@ async fn metrics(
 }
 
 /// `heraclitus_state()`: head, segmentos e watermarks — diagnóstico num GET.
-async fn state(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
-    Json(engine.state())
+///
+/// Percorre o manifesto inteiro (1394 segmentos na carga de 2026-09-02) e lê as
+/// watermarks das views, portanto compete com o checkpoint pelos mesmos locks.
+/// Vale aqui o mesmo que em `stats`: nunca no reactor.
+async fn state(State(engine): State<Arc<Engine>>) -> Response {
+    match tokio::task::spawn_blocking(move || engine.state()).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "state_join_failed",
+                "message": error.to_string()
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// Verificação Merkle do log inteiro. `Log::verify` re-lê+re-hasha todos os
