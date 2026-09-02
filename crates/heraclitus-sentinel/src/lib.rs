@@ -3085,16 +3085,34 @@ detection:
             ))
             .unwrap();
         }
-        // 30 s, e nao 5: a afirmacao que interessa e "o sinal E emitido", nao
-        // "em menos de 5 s". Este runtime tem UM worker, e num
-        // `cargo test --workspace` dezenas de binarios disputam os mesmos
-        // nucleos — o worker pode ficar sem processador muito para la de 5 s
-        // sem que nada esteja errado com o pipeline. Observado a falhar 3 vezes
-        // e a passar 3 vezes com o mesmo codigo em 2026-08-31.
+        // ESTE TESTE E INSTAVEL E O PRAZO NAO O ARRANJA. Fica aqui o que ja se
+        // mediu, para nao se repetir trabalho nem se voltar a aumentar o numero.
         //
-        // Alargar o prazo NAO enfraquece o teste: se o pipeline estivesse
-        // partido, nenhum prazo o salvaria. O que se remove e uma asseveracao
-        // sobre carga da maquina, que o teste nao controla e nao devia afirmar.
+        // 2026-08-31: o prazo subiu de 5 s para 30 s, atribuindo a falha a falta
+        // de PROCESSADOR (um so worker a competir com dezenas de binarios de
+        // teste). 2026-09-02: continua a falhar em `cargo test --workspace`, aos
+        // 30 s.
+        //
+        // Tres medicoes de 2026-09-02, cada uma a correr o binario completo:
+        //
+        //   isolado, maquina livre ............. 6 corridas, 0 falhas, ~0,6 s
+        //   8 geradores a saturar os 8 nucleos . 5 corridas, 0 falhas, ~0,6 s
+        //   6 escritores com flush sincrono .... 5 corridas, 1 falha,  30,8 s
+        //
+        // A primeira e a segunda REFUTAM a explicacao pelo processador:
+        // `worker_threads` sao threads do SO e o escalonador da-lhes tempo. A
+        // terceira reproduz a falha de forma fiavel, portanto o gatilho tem a
+        // ver com I/O.
+        //
+        // Mas a correccao obvia NAO funciona: passar o log deste teste de
+        // `FsyncPolicy::Always` para `GroupCommit { interval_ms: 5 }` -- para o
+        // append do sinal deixar de esperar pelo seu proprio fsync -- deu 4
+        // falhas em 8 sob a mesma carga, ou seja pior. A causa esta mais fundo
+        // do que o fsync do append, e nao esta identificada.
+        //
+        // O que falta e diagnosticar onde o pipeline fica parado (um dump de
+        // stacks das threads `heraclitus-sentinel-*` no momento do timeout
+        // resolveria isto em minutos), nao escolher um prazo maior.
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while runtime.status().signals_emitted_total < 1 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
