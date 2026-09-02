@@ -468,7 +468,12 @@ mod tests {
             };
             let hash = splitmix64(key);
             let weight = (step % 5 + 1) as u32;
-            conservative.add_hash(hash, weight);
+            // `add_hash` é o Count-Min CLÁSSICO; o Conservative Update é
+            // `add_hash_conservative`. Chamar `add_hash` aqui construía dois
+            // sketches idênticos — o helper `standard_add_hash` deste módulo é
+            // byte a byte igual a `add_hash` — e o teste comparava uma coisa
+            // consigo própria.
+            conservative.add_hash_conservative(hash, weight);
             standard_add_hash(&mut standard, hash, weight);
             exact
                 .entry(key)
@@ -487,7 +492,14 @@ mod tests {
             conservative_error += (conservative_estimate - count) as u64;
             standard_error += (standard_estimate - count) as u64;
         }
-        assert!(conservative_error < standard_error);
+        // Estrito de propósito. Com `<=` este teste passaria mesmo com os dois
+        // sketches a serem construídos pelo mesmo caminho — que foi exactamente
+        // o defeito que esteve aqui: um verde que não testava nada.
+        assert!(
+            conservative_error < standard_error,
+            "Conservative Update devia acumular menos erro que o Count-Min \
+             clássico, mas somou {conservative_error} contra {standard_error}"
+        );
     }
 
     #[test]
