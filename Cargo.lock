@@ -3318,6 +3318,7 @@ dependencies = [
  "heraclitus-raft",
  "heraclitus-retrieval",
  "heraclitus-sentinel",
+ "heraclitus-telemetry-health",
  "heraclitus-tier",
  "heraclitus-views",
  "serde",
@@ -3343,6 +3344,18 @@ dependencies = [
  "tempfile",
  "tokio",
  "turmoil",
+]
+
+[[package]]
+name = "heraclitus-telemetry-health"
+version = "1.0.5"
+dependencies = [
+ "blake3",
+ "heraclitus-core",
+ "heraclitus-views",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

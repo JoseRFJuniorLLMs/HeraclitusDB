@@ -1,0 +1,1 @@
+{"schema":"heraclitus-telemetry-health/1.0","identity":{"tenant_id":"gov.br/orgao-a","datasource_id":"teste://fonte","sensor_id":"forge-teste"},"emitted_at_micros":1782782405000000,"event":{"type":"SensorHeartbeat","data":{"observed_at_micros":1782782405000000}}}

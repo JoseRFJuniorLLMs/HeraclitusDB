@@ -95,6 +95,7 @@ pub fn router_with_sentinel(
         .route("/metrics", get(metrics))
         .route("/state", get(state))
         .route("/compliance/status", get(compliance_status))
+        .route("/telemetry/health", get(telemetry_health))
         .route("/verify", get(verify))
         .route("/verify/:segment", get(verify_segment))
         // Fluxo ao vivo de appends (SSE). O log já emitia cada append
@@ -226,6 +227,14 @@ struct SentinelIncidentQuery {
     incident_id: Option<String>,
     as_of_lsn: Option<u64>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct TelemetryHealthQuery {
+    tenant_id: Option<String>,
+    datasource_id: Option<String>,
+    sensor_id: Option<String>,
+    as_of_lsn: Option<u64>,
 }
 
 fn parse_incident_state(value: &str) -> Option<IncidentState> {
@@ -1402,6 +1411,37 @@ async fn compliance_status(State(engine): State<Arc<Engine>>) -> Response {
         )
             .into_response(),
     }
+}
+
+async fn telemetry_health(
+    State(engine): State<Arc<Engine>>,
+    Query(query): Query<TelemetryHealthQuery>,
+) -> Json<serde_json::Value> {
+    let as_of_lsn = query.as_of_lsn.unwrap_or_else(|| engine.head());
+    let sensors: Vec<_> = engine
+        .telemetry_health_all(Some(as_of_lsn))
+        .into_iter()
+        .filter(|snapshot| {
+            query
+                .tenant_id
+                .as_ref()
+                .is_none_or(|value| &snapshot.identity.tenant_id == value)
+                && query
+                    .datasource_id
+                    .as_ref()
+                    .is_none_or(|value| &snapshot.identity.datasource_id == value)
+                && query
+                    .sensor_id
+                    .as_ref()
+                    .is_none_or(|value| &snapshot.identity.sensor_id == value)
+        })
+        .collect();
+    Json(serde_json::json!({
+        "schema": "heraclitus-telemetry-health-snapshot/1.0",
+        "as_of_lsn": as_of_lsn,
+        "count": sensors.len(),
+        "sensors": sensors,
+    }))
 }
 
 async fn metrics(

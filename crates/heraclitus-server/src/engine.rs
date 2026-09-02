@@ -25,6 +25,7 @@ use heraclitus_query::backend::{
     PrunedScanResult, QueryBackend,
 };
 use heraclitus_retrieval::{retrieve, LinearReranker, RecallInputs};
+use heraclitus_telemetry_health::{SensorIdentity, TelemetryHealthGraph, TelemetryHealthSnapshot};
 use heraclitus_views::{View, ViewRegistry};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -90,6 +91,7 @@ pub struct Engine {
     tgraph: Arc<Mutex<TemporalGraph>>,
     entity: Arc<Mutex<EntityResolver>>,
     activation: Arc<Mutex<ActivationStore>>,
+    telemetry_health: Arc<Mutex<TelemetryHealthGraph>>,
     /// Índice secundário de atributos (qualquer campo -> [LSN]). Persistido em
     /// `<data_dir>/views`; gerido diretamente pelo Engine (fora do ViewRegistry)
     /// para controlar o checkpoint/replay e o arranque rápido.
@@ -160,6 +162,7 @@ impl<T: View> View for Shared<T> {
             "tgraph" => "tgraph",
             "entity" => "entity",
             "activation" => "activation",
+            "telemetry-health" => "telemetry-health",
             _ => "view",
         }
     }
@@ -325,6 +328,12 @@ impl Engine {
             p.ok(format!("decaimento d={}", config.activation_decay));
             a
         };
+        let telemetry_health = {
+            let p = boot.phase("Telemetry Health / Sensor Trust");
+            let health = Arc::new(Mutex::new(TelemetryHealthGraph::new()));
+            p.ok("Coverage · Freshness · Completeness · Integrity · Trust");
+            health
+        };
 
         // The slow phase on a big log: replay the tail into every view. The
         // spinner moves here while millions of events stream through.
@@ -337,6 +346,7 @@ impl Engine {
             registry.register(Box::new(Shared(tgraph.clone())));
             registry.register(Box::new(Shared(entity.clone())));
             registry.register(Box::new(Shared(activation.clone())));
+            registry.register(Box::new(Shared(telemetry_health.clone())));
             if privacy_rebuild {
                 registry.rebuild(&log, None)?;
                 registry.checkpoint()?;
@@ -360,8 +370,9 @@ impl Engine {
                 // massiva de 2026-07-02: replay total não escala).
                 registry.checkpoint()?;
                 p.ok(format!(
-                    "6 views materializadas @ LSN {} · checkpoint gravado",
-                    group(wm)
+                    "{} views materializadas @ LSN {} · checkpoint gravado",
+                    registry.view_names().len(),
+                    group(wm),
                 ));
             }
             registry
@@ -438,6 +449,7 @@ impl Engine {
             tgraph,
             entity,
             activation,
+            telemetry_health,
             attr,
             attr_dir,
             metric,
@@ -1361,6 +1373,26 @@ impl Engine {
     /// O ultimo LSN escrito (exclusivo: o proximo append usa este valor).
     pub fn head(&self) -> Lsn {
         self.log.head()
+    }
+
+    /// Estado derivado de saúde de um sensor. `as_of_lsn` é exclusivo, como
+    /// nas consultas `AS OF LSN n`; sem limite usa o head atual do log.
+    pub fn telemetry_health(
+        &self,
+        identity: &SensorIdentity,
+        as_of_lsn: Option<Lsn>,
+    ) -> Option<TelemetryHealthSnapshot> {
+        let bound = as_of_lsn.unwrap_or_else(|| self.log.head());
+        self.telemetry_health
+            .lock()
+            .unwrap()
+            .snapshot_as_of(identity, bound)
+    }
+
+    /// Snapshot ordenado de todos os sensores conhecidos até o LSN exclusivo.
+    pub fn telemetry_health_all(&self, as_of_lsn: Option<Lsn>) -> Vec<TelemetryHealthSnapshot> {
+        let bound = as_of_lsn.unwrap_or_else(|| self.log.head());
+        self.telemetry_health.lock().unwrap().snapshots_as_of(bound)
     }
 
     /// O carimbo de ingestao (ms epoch) do evento em `lsn`, se legivel.
