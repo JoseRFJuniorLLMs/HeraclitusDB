@@ -204,8 +204,9 @@ mod tests {
     #[test]
     fn feedback_is_a_log_event() {
         let dir = tempfile::tempdir().unwrap();
-        let log = heraclitus_log::Log::open(dir.path(), 1 << 20, heraclitus_core::FsyncPolicy::Always)
-            .unwrap();
+        let log =
+            heraclitus_log::Log::open(dir.path(), 1 << 20, heraclitus_core::FsyncPolicy::Always)
+                .unwrap();
         let fb = RetrievalFeedback {
             query_id: "q1".into(),
             chosen: EventId::new(),

@@ -21,7 +21,6 @@ fn main() {
 
 #[cfg(feature = "gpu")]
 fn main() {
-    
     use heraclitus_gpu::{topm_product_cpu, topm_product_gpu, ProductSig};
     use std::time::Instant;
 
@@ -40,8 +39,14 @@ fn main() {
         ((estado >> 11) as f32 / (1u64 << 53) as f32) * 0.2 - 0.1
     };
 
-    println!("\nA/B busca exata Top-M — variedade H{}xS{}xE{} ({dim} dims)\n", sig.a, sig.b, sig.c);
-    println!("  {:>10}  {:>12}  {:>12}  {:>8}", "vetores", "CPU", "GPU", "ganho");
+    println!(
+        "\nA/B busca exata Top-M — variedade H{}xS{}xE{} ({dim} dims)\n",
+        sig.a, sig.b, sig.c
+    );
+    println!(
+        "  {:>10}  {:>12}  {:>12}  {:>8}",
+        "vetores", "CPU", "GPU", "ganho"
+    );
 
     const M: usize = 10;
     const SCALE: f32 = 10_000.0;

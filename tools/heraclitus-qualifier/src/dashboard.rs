@@ -14,7 +14,8 @@ use serde::Serialize;
 
 use crate::history::{self, HistoryEntry};
 use crate::manifest::{
-    QualificationLevel, QualificationManifest, QualificationResult, QualificationStatus, TrialStatus,
+    QualificationLevel, QualificationManifest, QualificationResult, QualificationStatus,
+    TrialStatus,
 };
 
 #[derive(Debug, Serialize)]

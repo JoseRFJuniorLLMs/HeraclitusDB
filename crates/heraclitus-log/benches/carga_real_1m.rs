@@ -131,7 +131,10 @@ fn escrever(log: &Log, n: u64, janela: u64, rotulo: &str) -> f64 {
             debitos[0] / debitos[debitos.len() - 1]
         );
     } else {
-        println!("    {rotulo}: {total:.0} app/s no total ({:.1?})", t_total.elapsed());
+        println!(
+            "    {rotulo}: {total:.0} app/s no total ({:.1?})",
+            t_total.elapsed()
+        );
     }
     total
 }
@@ -345,7 +348,10 @@ fn main() {
     println!("    E o tempo de indisponibilidade num restart do servico.");
     let t = Instant::now();
     let _ = log2.read(head_final / 2).expect("read pos-reabertura");
-    println!("    primeira leitura depois de reabrir: {:.2?}\n", t.elapsed());
+    println!(
+        "    primeira leitura depois de reabrir: {:.2?}\n",
+        t.elapsed()
+    );
     drop(log2);
     drop(dir);
 

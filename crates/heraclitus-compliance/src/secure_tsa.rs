@@ -142,9 +142,8 @@ impl SecureTsaClient {
         let (host, port) = match autoridade.rsplit_once(':') {
             Some((h, p)) => (
                 h.to_string(),
-                p.parse::<u16>().map_err(|_| {
-                    CompError::Tsa(format!("porto inválido em `{endpoint}`"))
-                })?,
+                p.parse::<u16>()
+                    .map_err(|_| CompError::Tsa(format!("porto inválido em `{endpoint}`")))?,
             ),
             None => (autoridade.to_string(), 443),
         };
@@ -284,12 +283,10 @@ impl SecureTsaClient {
         let mut conexao = rustls::ClientConnection::new(config, servidor)
             .map_err(|e| CompError::Tsa(format!("handshake TLS não inicia: {e}")))?;
 
-        let enderecos: Vec<_> = std::net::ToSocketAddrs::to_socket_addrs(&(
-            self.host.as_str(),
-            self.port,
-        ))
-        .map_err(|e| CompError::Tsa(format!("resolução de `{}` falhou: {e}", self.host)))?
-        .collect();
+        let enderecos: Vec<_> =
+            std::net::ToSocketAddrs::to_socket_addrs(&(self.host.as_str(), self.port))
+                .map_err(|e| CompError::Tsa(format!("resolução de `{}` falhou: {e}", self.host)))?
+                .collect();
         let endereco = enderecos
             .first()
             .ok_or_else(|| CompError::Tsa(format!("`{}` não resolve", self.host)))?;
@@ -380,11 +377,7 @@ impl SecureTsaClient {
         Ok(int.as_bytes().to_vec())
     }
 
-    fn timestamp_request(
-        &self,
-        imprint: &[u8; 32],
-        nonce: u64,
-    ) -> Result<TimeStampReq, CompError> {
+    fn timestamp_request(&self, imprint: &[u8; 32], nonce: u64) -> Result<TimeStampReq, CompError> {
         let req_policy = self
             .verifier
             .as_ref()
@@ -470,7 +463,10 @@ mod tests {
     fn store_de_teste() -> TrustStore {
         let mut store = TrustStore::new();
         store
-            .add_pem_or_der("raiz", &test_pki::self_signed_root("Raiz TLS").certificate_der)
+            .add_pem_or_der(
+                "raiz",
+                &test_pki::self_signed_root("Raiz TLS").certificate_der,
+            )
             .unwrap();
         store
     }
@@ -582,8 +578,8 @@ mod tests {
 
     #[test]
     fn o_corpo_sai_depois_do_cabecalho() {
-        let corpo =
-            SecureTsaClient::corpo_http(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc").unwrap();
+        let corpo = SecureTsaClient::corpo_http(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc")
+            .unwrap();
         assert_eq!(corpo, b"abc");
     }
 

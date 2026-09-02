@@ -303,9 +303,7 @@ fn encode_migration_receipt_file(receipt: &LegacyMigrationReceipt) -> Vec<u8> {
     out
 }
 
-fn decode_migration_receipt_file(
-    bytes: &[u8],
-) -> super::error::V6Result<LegacyMigrationReceipt> {
+fn decode_migration_receipt_file(bytes: &[u8]) -> super::error::V6Result<LegacyMigrationReceipt> {
     use super::error::corrupt;
     const CTX: &str = "hrkl v6 migration receipt file";
     const PREFIX: usize = 8;
@@ -611,10 +609,7 @@ mod tests {
 
     #[test]
     fn recibo_persistido_e_imutavel_idempotente() {
-        let dir = std::env::temp_dir().join(format!(
-            "hrkl-v6-receipts-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("hrkl-v6-receipts-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let r = receipt();
         let path = persist_pack_receipt(&dir, &r).unwrap();

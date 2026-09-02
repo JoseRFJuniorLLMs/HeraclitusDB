@@ -38,12 +38,13 @@ use super::header::FileHeaderV6;
 use super::hrki::{caminho_sidecar, construir_para_packed, Hrki, IndexPolicySet};
 use super::manifest::{
     attach_parquet, attach_sidecar, quarantine_generation as quarantine_manifest_generation,
-    record_pack, set_legal_hold,
-    register_sealed_raw, ManifestStore, HRKM_MAGIC,
+    record_pack, register_sealed_raw, set_legal_hold, ManifestStore, HRKM_MAGIC,
 };
 use super::packed::{open_packed, PackOptions, ScanCounters};
 use super::packer::{pack_segment, PackOutcome};
-use super::raw::{read_footer, repair_active_tail, scan_raw_segment, RawSegmentWriter, SegmentInit};
+use super::raw::{
+    read_footer, repair_active_tail, scan_raw_segment, RawSegmentWriter, SegmentInit,
+};
 use super::receipts::{persist_pack_receipt, physical_digest_of_file};
 use super::verify::{verify_segment as verify_segment_file, IntegrityLevel, VerifyReport};
 
@@ -272,7 +273,10 @@ impl V6Log {
         };
         let mut manifest = loaded_manifest.unwrap_or_else(|| empty_manifest(namespace));
         if manifest.storage_namespace_id != namespace {
-            return Err(corrupt("hrkl v6 boot", "manifest namespace disagrees with storage"));
+            return Err(corrupt(
+                "hrkl v6 boot",
+                "manifest namespace disagrees with storage",
+            ));
         }
 
         // RAW final é sempre selado. Se um crash aconteceu depois do rename e
@@ -293,13 +297,7 @@ impl V6Log {
                 // Este é o único RAW que precisa de varrimento: foi selado e
                 // renomeado antes de o processo conseguir publicar o HRKM.
                 // A reconciliação é recovery de órfão, não o caminho normal.
-                manifest_changed |= reconcile_raw(
-                    &mut manifest,
-                    &root,
-                    *id,
-                    path,
-                    namespace,
-                )?;
+                manifest_changed |= reconcile_raw(&mut manifest, &root, *id, path, namespace)?;
             }
         }
         validate_manifest_ranges(&manifest)?;
@@ -342,13 +340,8 @@ impl V6Log {
                     ));
                 }
                 std::fs::rename(path, &final_path)?;
-                manifest_changed |= reconcile_raw(
-                    &mut manifest,
-                    &root,
-                    *id,
-                    &final_path,
-                    namespace,
-                )?;
+                manifest_changed |=
+                    reconcile_raw(&mut manifest, &root, *id, &final_path, namespace)?;
                 active_from_disk = None;
             }
         }
@@ -369,7 +362,6 @@ impl V6Log {
 
         let mut next_lsn = next_lsn_from_manifest(&manifest)?;
         let active = match active_from_disk {
-
             Some((id, path)) => {
                 // A extensão `.active` é a autorização explícita para reparar.
                 // Um footer com magic completo mas CRC inválido é recusado pelo
@@ -391,7 +383,14 @@ impl V6Log {
                 next_lsn = writer.next_expected_lsn();
                 ActiveSegment { id, path, writer }
             }
-            None => create_active(&segments_dir, next_segment_id(&manifest), next_lsn, namespace, &hlc, manifest.manifest_generation)?,
+            None => create_active(
+                &segments_dir,
+                next_segment_id(&manifest),
+                next_lsn,
+                namespace,
+                &hlc,
+                manifest.manifest_generation,
+            )?,
         };
 
         let (tail_tx, _) = broadcast::channel(4096);
@@ -426,10 +425,7 @@ impl V6Log {
     /// Como [`V6Log::append`], devolvendo também o episódio exacto que foi
     /// persistido. O carimbo acontece sob o mesmo mutex que atribui o LSN:
     /// appends concorrentes não conseguem inverter a ordem HLC/LSN.
-    pub fn append_stamped(
-        &self,
-        mut episode: Episode,
-    ) -> Result<(Lsn, Episode), HeraclitusError> {
+    pub fn append_stamped(&self, mut episode: Episode) -> Result<(Lsn, Episode), HeraclitusError> {
         let mut state = self.lock_state()?;
         episode.ts_hlc = self.hlc.now();
         let stamped = episode.clone();
@@ -439,11 +435,7 @@ impl V6Log {
 
     /// Apêndice replicado: preserva LSN e HLC do líder. Repetir o mesmo evento
     /// já gravado é idempotente; tentar outro evento no mesmo LSN é divergência.
-    pub fn append_replicated(
-        &self,
-        lsn: Lsn,
-        episode: Episode,
-    ) -> Result<Lsn, HeraclitusError> {
+    pub fn append_replicated(&self, lsn: Lsn, episode: Episode) -> Result<Lsn, HeraclitusError> {
         self.hlc.observe(episode.ts_hlc);
         let head = self.head();
         if lsn < head {
@@ -617,9 +609,10 @@ impl V6Log {
             if lsn >= state.next_lsn {
                 return Ok(None);
             }
-            let active = state.active.as_ref().ok_or_else(|| {
-                HeraclitusError::StorageEngine("V6Log sem segmento ativo".into())
-            })?;
+            let active = state
+                .active
+                .as_ref()
+                .ok_or_else(|| HeraclitusError::StorageEngine("V6Log sem segmento ativo".into()))?;
             if lsn >= active.writer.header().first_lsn {
                 ReadSource::Active(active.path.clone())
             } else {
@@ -654,17 +647,17 @@ impl V6Log {
             ReadSource::Sealed(path, PhysicalLayout::Packed) => {
                 let reader = open_packed(&path, HARD_MAX_BLOCK_BYTES)?;
                 let mut counters = ScanCounters::default();
-                reader.get(lsn, &mut counters)?.map(|(_, payload)| (lsn, payload))
+                reader
+                    .get(lsn, &mut counters)?
+                    .map(|(_, payload)| (lsn, payload))
             }
         };
         let Some((found_lsn, payload)) = found else {
             return Ok(None);
         };
-        let mut episode = crate::decode_episode_payload_with_meta(
-            crate::format::FORMAT_VERSION,
-            &payload,
-        )?
-        .episode;
+        let mut episode =
+            crate::decode_episode_payload_with_meta(crate::format::FORMAT_VERSION, &payload)?
+                .episode;
         crate::decrypt_storage_episode_in_place(&mut episode, self.keystore.as_deref())?;
         Ok(Some((found_lsn, episode)))
     }
@@ -766,9 +759,7 @@ impl V6Log {
         let candidates: Vec<_> = manifest
             .segments_for_lsn_range(from, end.saturating_sub(1))
             .collect();
-        stats.manifest_pruned = stats
-            .segments_total
-            .saturating_sub(candidates.len() as u64);
+        stats.manifest_pruned = stats.segments_total.saturating_sub(candidates.len() as u64);
         for desc in candidates {
             if out.len() >= max {
                 break;
@@ -788,9 +779,7 @@ impl V6Log {
                     stats.blocks_read += 1;
                     stats.bytes_physical_read += std::fs::metadata(&path)?.len();
                     self.collect_builtin_matches(
-                        scan.records
-                            .iter()
-                            .map(|r| (r.lsn, r.payload.as_slice())),
+                        scan.records.iter().map(|r| (r.lsn, r.payload.as_slice())),
                         &criterio,
                         &mut out,
                     )?;
@@ -840,7 +829,8 @@ impl V6Log {
                     stats.bytes_physical_read += packed.bytes_physical_read;
                     stats.bytes_decompressed += packed.bytes_decompressed;
                     self.collect_builtin_matches(
-                        rows.iter().map(|(lsn, _, payload)| (*lsn, payload.as_slice())),
+                        rows.iter()
+                            .map(|(lsn, _, payload)| (*lsn, payload.as_slice())),
                         &criterio,
                         &mut out,
                     )?;
@@ -865,9 +855,7 @@ impl V6Log {
                     stats.bytes_physical_read += active_bytes;
                     let scan = scan_raw_segment(&active.path)?;
                     self.collect_builtin_matches(
-                        scan.records
-                            .iter()
-                            .map(|r| (r.lsn, r.payload.as_slice())),
+                        scan.records.iter().map(|r| (r.lsn, r.payload.as_slice())),
                         &criterio,
                         &mut out,
                     )?;
@@ -888,9 +876,10 @@ impl V6Log {
     pub fn verify_active_tail(&self) -> Result<u64, HeraclitusError> {
         let result: Result<u64, HeraclitusError> = (|| {
             let state = self.lock_state()?;
-            let active = state.active.as_ref().ok_or_else(|| {
-                HeraclitusError::StorageEngine("V6Log sem segmento ativo".into())
-            })?;
+            let active = state
+                .active
+                .as_ref()
+                .ok_or_else(|| HeraclitusError::StorageEngine("V6Log sem segmento ativo".into()))?;
             let expected_first = next_lsn_from_manifest(&state.manifest)?;
             let scan = scan_raw_segment(&active.path)?;
             check_header_identity(
@@ -1143,7 +1132,10 @@ impl V6Log {
     /// O mutex `state` é mantido apenas para fotografar um job e para publicar
     /// a nova geração no HRKM. Compressão, hashes e fsync acontecem sem ele;
     /// portanto appends continuam enquanto o PACKED é produzido.
-    pub fn pack_pending(&self, profile: PackingProfile) -> Result<Vec<PackOutcome>, HeraclitusError> {
+    pub fn pack_pending(
+        &self,
+        profile: PackingProfile,
+    ) -> Result<Vec<PackOutcome>, HeraclitusError> {
         let _packing = self
             .packing_lock
             .lock()
@@ -1189,14 +1181,12 @@ impl V6Log {
             self.metrics
                 .pack_nanos
                 .fetch_add(saturating_nanos(pack_started.elapsed()), Ordering::Relaxed);
-            self.metrics.pack_source_bytes.fetch_add(
-                outcome.receipt.source_physical_size,
-                Ordering::Relaxed,
-            );
-            self.metrics.pack_target_bytes.fetch_add(
-                outcome.receipt.target_physical_size,
-                Ordering::Relaxed,
-            );
+            self.metrics
+                .pack_source_bytes
+                .fetch_add(outcome.receipt.source_physical_size, Ordering::Relaxed);
+            self.metrics
+                .pack_target_bytes
+                .fetch_add(outcome.receipt.target_physical_size, Ordering::Relaxed);
 
             // §88 passo 12: a evidência imutável e fsyncada existe antes de o
             // HRKM tornar a geração PACKED ativa. Crash aqui deixa somente
@@ -1204,12 +1194,14 @@ impl V6Log {
             persist_pack_receipt(&self.root.join("receipts"), &outcome.receipt)?;
 
             let mut state = self.lock_state()?;
-            let current = state.manifest.segment(id).ok_or_else(|| {
-                HeraclitusError::Corruption {
-                    context: "hrkl v6 pack".into(),
-                    detail: format!("segmento {id} desapareceu antes do publish"),
-                }
-            })?;
+            let current =
+                state
+                    .manifest
+                    .segment(id)
+                    .ok_or_else(|| HeraclitusError::Corruption {
+                        context: "hrkl v6 pack".into(),
+                        detail: format!("segmento {id} desapareceu antes do publish"),
+                    })?;
             if current.logical_root != desc.logical_root
                 || current.record_count != desc.record_count
                 || current.generation(source_generation).is_none()
@@ -1308,7 +1300,11 @@ impl V6Log {
                     // do sidecar têm de pertencer ao layout activo.
                     continue;
                 }
-                (desc.logical_root, active.generation, active.location.clone())
+                (
+                    desc.logical_root,
+                    active.generation,
+                    active.location.clone(),
+                )
             };
             let packed = resolve_location(&self.root, &location)?;
             let decode = |payload: &[u8]| {
@@ -1528,9 +1524,9 @@ impl V6Log {
             .segments_v2
             .iter()
             .map(|segment| {
-                let hold = active_ranges.iter().any(|(start, end)| {
-                    *start <= segment.last_lsn && segment.first_lsn <= *end
-                });
+                let hold = active_ranges
+                    .iter()
+                    .any(|(start, end)| *start <= segment.last_lsn && segment.first_lsn <= *end);
                 (segment.segment_id, hold)
             })
             .collect();
@@ -1559,7 +1555,6 @@ impl V6Log {
         }
         Ok(changed)
     }
-
 
     // -----------------------------------------------------------------
     // SPEC-0050 §90–§97 — garbage collection
@@ -1626,11 +1621,7 @@ impl V6Log {
     /// Separado do [`Self::set_retention`] genérico de propósito: é a operação
     /// que alguém executa sob pressão, com um advogado ao telefone, e tem de
     /// ser impossível de confundir com «ajustar a retenção».
-    pub fn set_legal_hold(
-        &self,
-        segment_id: SegmentId,
-        hold: bool,
-    ) -> Result<(), HeraclitusError> {
+    pub fn set_legal_hold(&self, segment_id: SegmentId, hold: bool) -> Result<(), HeraclitusError> {
         let atual = self.retention(segment_id)?.ok_or_else(|| {
             corrupt(
                 "hrkm legal_hold",
@@ -1728,7 +1719,8 @@ impl V6Log {
         // §90 — manifestos antigos também são lixo, e o `keep` vem da mesma
         // opção para que um operador não tenha dois botões a dizer a mesma
         // coisa.
-        self.manifest_store.prune_old_manifests(opts.keep_manifests)?;
+        self.manifest_store
+            .prune_old_manifests(opts.keep_manifests)?;
         Ok(execution)
     }
 
@@ -1796,11 +1788,8 @@ impl V6Log {
         expected_lsn: Option<Lsn>,
     ) -> Result<Lsn, HeraclitusError> {
         let opaque_meta = episode.id.0.to_bytes();
-        let payload = crate::encode_storage_payload_v6(
-            opaque_meta,
-            &episode,
-            self.keystore.as_deref(),
-        )?;
+        let payload =
+            crate::encode_storage_payload_v6(opaque_meta, &episode, self.keystore.as_deref())?;
         if let Some(expected) = expected_lsn {
             if expected != state.next_lsn {
                 return Err(HeraclitusError::CasConflict {
@@ -1815,16 +1804,20 @@ impl V6Log {
         let needs_roll = state
             .active
             .as_ref()
-            .map(|a| a.writer.record_count() > 0 && a.writer.bytes_written() + record_len > self.segment_max_bytes)
+            .map(|a| {
+                a.writer.record_count() > 0
+                    && a.writer.bytes_written() + record_len > self.segment_max_bytes
+            })
             .unwrap_or(false);
         if needs_roll {
             self.seal_active_locked(state)?;
         }
         let sync_now = should_sync(&self.fsync, state.last_sync);
         {
-            let active = state.active.as_mut().ok_or_else(|| {
-                HeraclitusError::StorageEngine("V6Log sem segmento ativo".into())
-            })?;
+            let active = state
+                .active
+                .as_mut()
+                .ok_or_else(|| HeraclitusError::StorageEngine("V6Log sem segmento ativo".into()))?;
             if lsn != active.writer.next_expected_lsn() {
                 return Err(corrupt(
                     "hrkl v6 append",
@@ -1884,7 +1877,10 @@ impl V6Log {
             &final_path,
             namespace,
         )?;
-        if !changed || state.manifest.segment(active.id).map(|s| s.logical_root) != Some(footer.logical_root) {
+        if !changed
+            || state.manifest.segment(active.id).map(|s| s.logical_root)
+                != Some(footer.logical_root)
+        {
             state.manifest = before;
             return Err(corrupt(
                 "hrkl v6 seal",
@@ -1925,11 +1921,7 @@ fn persisted_hasher(lsn: Lsn, hlc: u64, payload: &[u8]) -> V6Result<[u8; 32]> {
 
 /// Hash canónico de um payload v6 tal como foi persistido. Exposto para que a
 /// verificação do cold tier use exactamente a mesma identidade do writer.
-pub fn persisted_record_hash(
-    lsn: Lsn,
-    hlc: u64,
-    payload: &[u8],
-) -> V6Result<[u8; 32]> {
+pub fn persisted_record_hash(lsn: Lsn, hlc: u64, payload: &[u8]) -> V6Result<[u8; 32]> {
     persisted_hasher(lsn, hlc, payload)
 }
 
@@ -2149,7 +2141,12 @@ fn next_physical_generation(
     segments_dir: &Path,
     desc: &heraclitus_core::runtime::SegmentDescriptorV2,
 ) -> V6Result<u32> {
-    let mut maximum = desc.generations.iter().map(|g| g.generation).max().unwrap_or(0);
+    let mut maximum = desc
+        .generations
+        .iter()
+        .map(|g| g.generation)
+        .max()
+        .unwrap_or(0);
     for (id, generation, _) in discover(segments_dir)?.packed {
         if id == desc.segment_id {
             maximum = maximum.max(generation);
@@ -2226,10 +2223,7 @@ fn validate_catalogued_generations(
                     ));
                 }
                 PhysicalLayout::Packed if footer.block_count == 0 => {
-                    return Err(corrupt(
-                        "hrkl v6 boot",
-                        "PACKED generation has no blocks",
-                    ));
+                    return Err(corrupt("hrkl v6 boot", "PACKED generation has no blocks"));
                 }
                 _ => {}
             }
@@ -2365,7 +2359,8 @@ fn discover(segments_dir: &Path) -> V6Result<Inventory> {
     }
     out.active.sort_by_key(|(id, _)| *id);
     out.raw.sort_by_key(|(id, _)| *id);
-    out.packed.sort_by_key(|(id, generation, _)| (*id, *generation));
+    out.packed
+        .sort_by_key(|(id, generation, _)| (*id, *generation));
     Ok(out)
 }
 
@@ -2400,7 +2395,11 @@ fn reject_legacy_root(root: &Path) -> V6Result<()> {
         }
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name.strip_suffix(".hrkl").and_then(|id| id.parse::<u64>().ok()).is_some() {
+        if name
+            .strip_suffix(".hrkl")
+            .and_then(|id| id.parse::<u64>().ok())
+            .is_some()
+        {
             // Agora que o v6 é o formato por omissão, esta é a mensagem que um
             // operador vê ao actualizar o binário sem migrar. Tem de dizer o
             // que fazer, e não apenas que se recusa: um erro que descreve o
@@ -2429,7 +2428,10 @@ fn resolve_location(root: &Path, location: &str) -> V6Result<PathBuf> {
     let relative = Path::new(location);
     if relative.is_absolute()
         || relative.components().any(|component| {
-            matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
         })
     {
         return Err(corrupt(
@@ -2493,7 +2495,10 @@ mod tests {
         let reopened = V6Log::open(dir.path(), 160, FsyncPolicy::Always).unwrap();
         assert_eq!(reopened.head(), 40);
         for i in 0..40 {
-            assert_eq!(reopened.read(i).unwrap().unwrap().1.content, format!("payload-{i}").into_bytes());
+            assert_eq!(
+                reopened.read(i).unwrap().unwrap().1.content,
+                format!("payload-{i}").into_bytes()
+            );
         }
         let reports = reopened.verify_sealed(IntegrityLevel::Logical).unwrap();
         assert!(!reports.is_empty());
@@ -2519,7 +2524,9 @@ mod tests {
 
             // 64 bytes de header + 24 do cabeçalho RAW: este byte pertence ao
             // payload do primeiro record, não ao header nem ao footer.
-            let offset = (super::super::header::FILE_HEADER_LEN + super::super::raw::RAW_RECORD_HEADER_LEN + 1) as u64;
+            let offset = (super::super::header::FILE_HEADER_LEN
+                + super::super::raw::RAW_RECORD_HEADER_LEN
+                + 1) as u64;
             let mut file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -2705,7 +2712,10 @@ mod tests {
             "a auditoria física inclui o RAW superseded e a PACKED activa"
         );
         for i in 0..50 {
-            assert_eq!(log.read(i).unwrap().unwrap().1.content, format!("payload-{i}").into_bytes());
+            assert_eq!(
+                log.read(i).unwrap().unwrap().1.content,
+                format!("payload-{i}").into_bytes()
+            );
         }
     }
 
@@ -2749,7 +2759,10 @@ mod tests {
             .unwrap();
         assert!(none.is_empty());
         assert_eq!(degraded.hrki_ignored, 1);
-        assert!(degraded.blocks_read > 0, "fallback não leu o segmento sem sidecar válido");
+        assert!(
+            degraded.blocks_read > 0,
+            "fallback não leu o segmento sem sidecar válido"
+        );
 
         let rebuilt = log.build_pending_hrki(&policy, None, 0.01).unwrap();
         assert_eq!(rebuilt.len(), 1, "o digest/CRC corrupto não entrou na fila");
@@ -2758,7 +2771,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(restored.hrki_ignored, 0);
-        assert_eq!(restored.blocks_read, 0, "todos os segmentos deviam ser podados");
+        assert_eq!(
+            restored.blocks_read, 0,
+            "todos os segmentos deviam ser podados"
+        );
     }
 
     #[test]
@@ -2809,17 +2825,17 @@ mod tests {
             "RAW foi reactivado antes de gerar o PACKED novo"
         );
         for i in 0..40 {
-            assert_eq!(log.read(i).unwrap().unwrap().1.content, format!("payload-{i}").into_bytes());
+            assert_eq!(
+                log.read(i).unwrap().unwrap().1.content,
+                format!("payload-{i}").into_bytes()
+            );
         }
         assert_eq!(log.verify_sealed(IntegrityLevel::Logical).unwrap().len(), 2);
 
         drop(log);
         let reopened = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
         assert_eq!(reopened.read(39).unwrap().unwrap().1.content, b"payload-39");
-        assert_eq!(
-            reopened.manifest().segment(0).unwrap().active_generation,
-            2
-        );
+        assert_eq!(reopened.manifest().segment(0).unwrap().active_generation, 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2856,11 +2872,9 @@ mod tests {
         let episode = event(7);
         let payload_a = crate::encode_storage_payload_v6([0x11; 16], &episode, None).unwrap();
         let payload_b = crate::encode_storage_payload_v6([0x22; 16], &episode, None).unwrap();
-        let decoded = crate::decode_episode_payload_with_meta(
-            crate::format::FORMAT_VERSION,
-            &payload_a,
-        )
-        .unwrap();
+        let decoded =
+            crate::decode_episode_payload_with_meta(crate::format::FORMAT_VERSION, &payload_a)
+                .unwrap();
         assert_eq!(decoded.opaque_meta, [0x11; 16]);
         assert_eq!(decoded.episode.id, episode.id);
         assert_ne!(

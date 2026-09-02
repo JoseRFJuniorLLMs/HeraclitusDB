@@ -17,11 +17,11 @@
 //!    pelo `physical_digest` recalculado — o `ETag` do backend nunca entra na
 //!    decisão.
 
+use heraclitus_core::config::FsyncPolicy;
 use heraclitus_core::{Episode, EventKind, Lsn};
 use heraclitus_log::v6::packed::{open_packed, PackOptions};
 use heraclitus_log::v6::packer::pack_segment;
 use heraclitus_log::v6::{physical_digest, IntegrityLevel, V6Log};
-use heraclitus_core::config::FsyncPolicy;
 use heraclitus_tier::generation::GenerationKey;
 use heraclitus_tier::receipts_v2::{decode_receipt_payload, AnyDemotionReceipt};
 use heraclitus_tier::ColdTierV6;
@@ -119,7 +119,10 @@ async fn publica_verifica_e_rele_por_intervalos() {
     assert_eq!(recibo.record_count, N);
     assert_eq!(recibo.first_lsn, 0);
     assert_eq!(recibo.last_lsn, N - 1);
-    assert_eq!(recibo.logical_root_bytes().unwrap(), local.footer.logical_root);
+    assert_eq!(
+        recibo.logical_root_bytes().unwrap(),
+        local.footer.logical_root
+    );
     assert_eq!(recibo.generation, 1);
     assert_eq!(recibo.source_generation, Some(0));
     assert_eq!(recibo.physical_layout, "PACKED");
@@ -228,11 +231,9 @@ async fn point_lookup_frio_traz_um_bloco_e_nao_o_segmento() {
 
     // O payload devolvido é o mesmo do log quente.
     let (_lsn, payload) = achado.unwrap();
-    let ep = heraclitus_log::decode_episode_payload(
-        heraclitus_log::format::FORMAT_VERSION,
-        &payload,
-    )
-    .unwrap();
+    let ep =
+        heraclitus_log::decode_episode_payload(heraclitus_log::format::FORMAT_VERSION, &payload)
+            .unwrap();
     let (_l, esperado_777) = esperado.iter().find(|(l, _)| *l == 777).unwrap();
     assert_eq!(ep.id, esperado_777.id);
     assert_eq!(ep.content, esperado_777.content);
@@ -270,7 +271,10 @@ async fn geracao_publicada_nunca_e_sobrescrita() {
     assert!(msg.contains("§83"), "erro não invoca §83: {msg}");
 
     // A geração SEGUINTE é sempre publicável — é o caminho legítimo.
-    let c = tier.publish_generation(&packed, 2, Some(1), 2).await.unwrap();
+    let c = tier
+        .publish_generation(&packed, 2, Some(1), 2)
+        .await
+        .unwrap();
     assert_ne!(c.object_path, a.object_path);
     assert_eq!(c.logical_root, a.logical_root, "o histórico é o mesmo");
     assert_eq!(c.physical_digest, a.physical_digest);
@@ -287,7 +291,14 @@ async fn objecto_adulterado_falha_pela_autoridade_do_heraclitus() {
     // certo e o backend continua a servi-lo sem se queixar.
     let store = tier.store();
     let path = ObjPath::from(recibo.object_path.clone());
-    let mut bytes = store.get(&path).await.unwrap().bytes().await.unwrap().to_vec();
+    let mut bytes = store
+        .get(&path)
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap()
+        .to_vec();
     let alvo = bytes.len() / 2;
     bytes[alvo] ^= 0xFF;
     assert_ne!(
@@ -298,11 +309,7 @@ async fn objecto_adulterado_falha_pela_autoridade_do_heraclitus() {
     store.put(&path, bytes.into()).await.unwrap();
 
     let rel = tier
-        .verify_generation(
-            &recibo,
-            IntegrityLevel::Physical,
-            None,
-        )
+        .verify_generation(&recibo, IntegrityLevel::Physical, None)
         .await
         .unwrap();
     assert!(!rel.physical_digest_ok, "digest adulterado passou: {rel:?}");
@@ -367,8 +374,14 @@ async fn sidecar_hrki_acompanha_a_geracao_quando_existe() {
     h.escrever(&packed).unwrap();
     assert!(caminho_sidecar(&packed).exists());
 
-    let com = tier.publish_generation(&packed, 2, Some(1), 2).await.unwrap();
-    let hrki = com.hrki_path.clone().expect("sidecar devia ter sido publicado");
+    let com = tier
+        .publish_generation(&packed, 2, Some(1), 2)
+        .await
+        .unwrap();
+    let hrki = com
+        .hrki_path
+        .clone()
+        .expect("sidecar devia ter sido publicado");
     assert!(hrki.ends_with("generation-2.hrki"));
     assert_eq!(
         GenerationKey::parse(&hrki).unwrap(),

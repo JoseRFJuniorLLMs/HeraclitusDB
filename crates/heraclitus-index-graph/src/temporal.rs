@@ -206,11 +206,7 @@ impl BeliefPolicy {
 
     /// A implementação anterior, guardada SÓ como referência de teste.
     #[cfg(test)]
-    pub(crate) fn aggregate_as_of_referencia(
-        &self,
-        versions: &[EdgeVersion],
-        as_of: Lsn,
-    ) -> f32 {
+    pub(crate) fn aggregate_as_of_referencia(&self, versions: &[EdgeVersion], as_of: Lsn) -> f32 {
         let mut vs: Vec<&EdgeVersion> = versions
             .iter()
             .filter(|v| v.valid_from_lsn <= as_of)
@@ -718,10 +714,7 @@ impl TemporalGraph {
         let mut community: BTreeMap<EntityId, EntityId> = BTreeMap::new();
         let mut metrics: BTreeMap<EntityId, NodeMetrics> = BTreeMap::new();
         for i in 0..n {
-            community.insert(
-                nomes[i].clone(),
-                nomes[comunidade[i] as usize].clone(),
-            );
+            community.insert(nomes[i].clone(), nomes[comunidade[i] as usize].clone());
             let deg = grau[i];
             metrics.insert(
                 nomes[i].clone(),
@@ -1700,7 +1693,11 @@ mod testes_csr {
             let a = base + (r.p() as usize % (n_nos / 8).max(1));
             let b = base + (r.p() as usize % (n_nos / 8).max(1));
             // Uma em cada 40 e uma ponte entre blocos.
-            let b = if i % 40 == 0 { r.p() as usize % n_nos } else { b };
+            let b = if i % 40 == 0 {
+                r.p() as usize % n_nos
+            } else {
+                b
+            };
             let e = edge(
                 &format!("e{i}"),
                 &format!("no-{a:05}"),
@@ -1733,9 +1730,15 @@ mod testes_csr {
                 "numero de nos divergiu"
             );
             for (no, m) in &refer.metrics {
-                let a = novo.metrics.get(no).unwrap_or_else(|| panic!("no {no} em falta"));
+                let a = novo
+                    .metrics
+                    .get(no)
+                    .unwrap_or_else(|| panic!("no {no} em falta"));
                 assert_eq!(a.degree, m.degree, "grau de {no}");
-                assert!((a.centrality - m.centrality).abs() < 1e-6, "centralidade de {no}");
+                assert!(
+                    (a.centrality - m.centrality).abs() < 1e-6,
+                    "centralidade de {no}"
+                );
                 assert!(
                     (a.anomaly_score - m.anomaly_score).abs() < 1e-5,
                     "anomaly de {no}: {} vs {}",
@@ -1751,7 +1754,10 @@ mod testes_csr {
     #[test]
     fn o_id_da_comunidade_continua_a_ser_o_menor_no() {
         let mut g = TemporalGraph::new();
-        for (i, (a, b)) in [("zebra", "melancia"), ("melancia", "abacate")].iter().enumerate() {
+        for (i, (a, b)) in [("zebra", "melancia"), ("melancia", "abacate")]
+            .iter()
+            .enumerate()
+        {
             g.upsert_edge(
                 edge(&format!("e{i}"), a, b, EdgeType::SocioDe, 0),
                 vec![ver(&format!("h{i}"), 0.9, &EdgeType::SocioDe)],
@@ -1868,7 +1874,11 @@ mod testes_belief {
         let mut r = R(semente);
         let mut v: Vec<EdgeVersion> = (0..n)
             .map(|i| {
-                let mut e = ver(&format!("h{:04}", (i * 7919) % 10_000), r.conf(), &EdgeType::SocioDe);
+                let mut e = ver(
+                    &format!("h{:04}", (i * 7919) % 10_000),
+                    r.conf(),
+                    &EdgeType::SocioDe,
+                );
                 e.valid_from_lsn = (r.p() % 1_000) as Lsn;
                 e.polarity = if r.p().is_multiple_of(3) { -1.0 } else { 1.0 };
                 e
@@ -1946,7 +1956,10 @@ mod testes_belief {
         }
         let so_agregacao = t2.elapsed();
 
-        println!("belief_at completo : {completo:>10.3?}  ({} arestas)", ids.len());
+        println!(
+            "belief_at completo : {completo:>10.3?}  ({} arestas)",
+            ids.len()
+        );
         println!("so a procura       : {so_procura:>10.3?}  ({n} versions)");
         println!("so a agregacao     : {so_agregacao:>10.3?}");
         println!(
@@ -1992,7 +2005,11 @@ mod testes_belief {
                         alguma = true;
                     }
                 }
-                b += if alguma { 1.0 / (1.0 + (-sum).exp()) } else { 0.0 };
+                b += if alguma {
+                    1.0 / (1.0 + (-sum).exp())
+                } else {
+                    0.0
+                };
             }
             let com_cache = t1.elapsed();
 

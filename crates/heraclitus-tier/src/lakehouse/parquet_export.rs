@@ -40,7 +40,9 @@ use arrow_schema::{DataType, Field, Schema};
 use heraclitus_core::{Episode, HeraclitusError, Lsn};
 use heraclitus_log::v6::canonical::CANONICAL_CODEC_V1;
 use heraclitus_log::v6::error::HARD_MAX_BLOCK_BYTES;
-use heraclitus_log::v6::{open_packed, physical_digest, BlockSource, PackedSegmentReader, ScanCounters};
+use heraclitus_log::v6::{
+    open_packed, physical_digest, BlockSource, PackedSegmentReader, ScanCounters,
+};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::file::metadata::KeyValue;
@@ -242,10 +244,16 @@ pub(crate) fn escrever_parquet(
         vec![
             Arc::new(Int64Array::from(lsns)) as ArrayRef,
             Arc::new(StringArray::from(
-                linhas.iter().map(|(_, e)| e.id.to_string()).collect::<Vec<_>>(),
+                linhas
+                    .iter()
+                    .map(|(_, e)| e.id.to_string())
+                    .collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(
-                linhas.iter().map(|(_, e)| e.agent_id.clone()).collect::<Vec<_>>(),
+                linhas
+                    .iter()
+                    .map(|(_, e)| e.agent_id.clone())
+                    .collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(
                 linhas
@@ -261,18 +269,30 @@ pub(crate) fn escrever_parquet(
                     .collect::<Vec<_>>(),
             )),
             Arc::new(BinaryArray::from(
-                linhas.iter().map(|(_, e)| e.content.as_slice()).collect::<Vec<_>>(),
+                linhas
+                    .iter()
+                    .map(|(_, e)| e.content.as_slice())
+                    .collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(
-                linhas.iter().map(|(_, e)| attrs_json(e)).collect::<Vec<_>>(),
+                linhas
+                    .iter()
+                    .map(|(_, e)| attrs_json(e))
+                    .collect::<Vec<_>>(),
             )),
             Arc::new(StringArray::from(
-                linhas.iter().map(|(_, e)| parents_json(e)).collect::<Vec<_>>(),
+                linhas
+                    .iter()
+                    .map(|(_, e)| parents_json(e))
+                    .collect::<Vec<_>>(),
             )),
             Arc::new(Int64Array::from(valid_from)),
             Arc::new(Int64Array::from(valid_to)),
             Arc::new(StringArray::from(
-                linhas.iter().map(|(_, e)| embedding_json(e)).collect::<Vec<_>>(),
+                linhas
+                    .iter()
+                    .map(|(_, e)| embedding_json(e))
+                    .collect::<Vec<_>>(),
             )),
             Arc::new(Int64Array::from(vec![segment_id; linhas.len()])),
             Arc::new(Int64Array::from(vec![generation; linhas.len()])),
@@ -294,8 +314,8 @@ pub(crate) fn escrever_parquet(
         .build();
 
     let mut buf = Vec::new();
-    let mut w = ArrowWriter::try_new(&mut buf, schema, Some(props))
-        .map_err(|e| serr(e.to_string()))?;
+    let mut w =
+        ArrowWriter::try_new(&mut buf, schema, Some(props)).map_err(|e| serr(e.to_string()))?;
     w.write(&batch).map_err(|e| serr(e.to_string()))?;
     w.close().map_err(|e| serr(e.to_string()))?;
     Ok(buf)

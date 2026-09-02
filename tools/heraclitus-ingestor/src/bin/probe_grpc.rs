@@ -119,10 +119,7 @@ fn opts(
     }
 }
 
-async fn ligar(
-    server: &str,
-    token: &Option<String>,
-) -> anyhow::Result<heraclitus_client::Client> {
+async fn ligar(server: &str, token: &Option<String>) -> anyhow::Result<heraclitus_client::Client> {
     let c = heraclitus_client::Client::connect(server.to_string()).await?;
     Ok(match token {
         Some(t) => c.with_bearer_token(t)?,

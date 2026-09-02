@@ -388,14 +388,11 @@ pub(crate) fn encode_storage_payload_v6(
 ) -> Result<Vec<u8>, HeraclitusError> {
     let (stored_content, stored_attrs, stored_embedding) = match keystore {
         Some(ks) => {
-            let key = ks.get_or_create(&episode.agent_id).map_err(|e| {
-                HeraclitusError::Crypto(format!("Keystore Isolation Fault: {e:?}"))
-            })?;
-            let stored_content = heraclitus_crypto::seal(
-                &key,
-                &episode.content,
-                episode.agent_id.as_bytes(),
-            );
+            let key = ks
+                .get_or_create(&episode.agent_id)
+                .map_err(|e| HeraclitusError::Crypto(format!("Keystore Isolation Fault: {e:?}")))?;
+            let stored_content =
+                heraclitus_crypto::seal(&key, &episode.content, episode.agent_id.as_bytes());
             let public_attrs = episode
                 .attrs
                 .iter()
@@ -413,7 +410,8 @@ pub(crate) fn encode_storage_payload_v6(
             };
             let encoded = bincode::serde::encode_to_vec(&sensitive, BINCODE_CFG)
                 .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
-            let sealed_fields = heraclitus_crypto::seal(&key, &encoded, &fields_aad(&episode.agent_id));
+            let sealed_fields =
+                heraclitus_crypto::seal(&key, &encoded, &fields_aad(&episode.agent_id));
             let mut attrs = public_attrs;
             attrs.insert(ENCRYPTED_FIELDS_ATTR.into(), hex_encode(&sealed_fields));
             (stored_content, attrs, None)
@@ -468,9 +466,9 @@ pub fn encode_storage_payload_for_version(
     opaque_meta: [u8; 16],
     episode: &Episode,
 ) -> Result<Vec<u8>, HeraclitusError> {
-    let ser = |v: Result<Vec<u8>, _>| v.map_err(|e: bincode::error::EncodeError| {
-        HeraclitusError::Serialization(e.to_string())
-    });
+    let ser = |v: Result<Vec<u8>, _>| {
+        v.map_err(|e: bincode::error::EncodeError| HeraclitusError::Serialization(e.to_string()))
+    };
     match version {
         0 => Err(HeraclitusError::Config(
             "format_version 0 não existe".into(),
@@ -567,8 +565,8 @@ pub(crate) fn decrypt_storage_episode_in_place(
                 ep.agent_id
             ))
         })?;
-        let opened = heraclitus_crypto::open(&key, &sealed, &fields_aad(&ep.agent_id))
-            .ok_or_else(|| {
+        let opened =
+            heraclitus_crypto::open(&key, &sealed, &fields_aad(&ep.agent_id)).ok_or_else(|| {
                 HeraclitusError::Crypto(format!(
                     "Assinatura inválida no envelope de atributos do agente: {}",
                     ep.agent_id
@@ -1294,7 +1292,6 @@ impl Log {
                     for flush_tx in stashed_flushes.drain(..) {
                         let _ = flush_tx.send(Ok(()));
                     }
-
                 }
             }));
         });
@@ -1656,10 +1653,8 @@ impl Log {
                         _ => {
                             let path = segment_path(&self.dir, container.meta.id);
                             let file = File::open(&path)?;
-                            active_file_handle = Some((
-                                container.meta.id,
-                                BufReader::with_capacity(1 << 20, file),
-                            ));
+                            active_file_handle =
+                                Some((container.meta.id, BufReader::with_capacity(1 << 20, file)));
                             &mut active_file_handle.as_mut().unwrap().1
                         }
                     };
@@ -1856,8 +1851,7 @@ impl Log {
                         break;
                     }
                     let p = &paths[i];
-                    let r = segment_id_from_path(p)
-                        .and_then(|id| scan_segment_file(p, id, true));
+                    let r = segment_id_from_path(p).and_then(|id| scan_segment_file(p, id, true));
                     recolhidos
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -2061,7 +2055,11 @@ impl Log {
                 // Saturado pela mesma razao que `lsn_span_is_contiguous`: os
                 // limites vem do scan de um ficheiro, e um `manifest()` que
                 // entra em panico e pior do que um `event_count` aproximado.
-                event_count: c.meta.max_lsn.saturating_sub(c.meta.base_lsn).saturating_add(1),
+                event_count: c
+                    .meta
+                    .max_lsn
+                    .saturating_sub(c.meta.base_lsn)
+                    .saturating_add(1),
                 payload_hash: c.meta.blake3_root.unwrap_or([0; 32]),
                 state: SegmentState::Frozen,
             })
@@ -2116,7 +2114,6 @@ impl Log {
         decrypt_storage_episode_in_place(ep, self.keystore.as_deref())
     }
 }
-
 
 fn new_active(
     dir: &Path,

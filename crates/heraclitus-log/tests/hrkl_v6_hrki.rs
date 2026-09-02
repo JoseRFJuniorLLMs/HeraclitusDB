@@ -18,7 +18,7 @@
 use heraclitus_core::{Episode, EventKind, Lsn};
 use heraclitus_log::v6::canonical::{canonical_record_hash, CanonicalRecordV1};
 use heraclitus_log::v6::hrki::{
-    construir_para_packed, caminho_sidecar, Hrki, IndexPolicy, IndexPolicySet,
+    caminho_sidecar, construir_para_packed, Hrki, IndexPolicy, IndexPolicySet,
 };
 use heraclitus_log::v6::packed::{open_packed, PackOptions};
 use heraclitus_log::v6::packer::pack_segment;
@@ -192,9 +192,7 @@ fn filtro_de_igualdade_serve_o_campo_publico_e_esconde_o_sensivel() {
     for i in 0..120u64 {
         let agulha = format!("cpf-{i}");
         assert!(
-            bytes
-                .windows(agulha.len())
-                .all(|w| w != agulha.as_bytes()),
+            bytes.windows(agulha.len()).all(|w| w != agulha.as_bytes()),
             "o valor sensivel '{agulha}' apareceu em claro no .hrki"
         );
     }
@@ -202,7 +200,10 @@ fn filtro_de_igualdade_serve_o_campo_publico_e_esconde_o_sensivel() {
     let h = Hrki::decode(&bytes).unwrap();
     assert!(h.talvez_contenha("uf", b"SP"));
     assert!(h.talvez_contenha("uf", b"RJ"));
-    assert!(!h.talvez_contenha("uf", b"ZZ"), "uf inexistente devia podar");
+    assert!(
+        !h.talvez_contenha("uf", b"ZZ"),
+        "uf inexistente devia podar"
+    );
 }
 
 #[test]

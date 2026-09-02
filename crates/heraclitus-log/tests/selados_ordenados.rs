@@ -29,7 +29,12 @@ fn evento(i: usize) -> Episode {
 fn selados_ficam_ordenados_por_base_lsn() {
     let dir = tempfile::tempdir().unwrap();
     // Segmento minúsculo de propósito: força dezenas de selagens.
-    let log = Log::open(dir.path(), 16 * 1024, FsyncPolicy::GroupCommit { interval_ms: 50 }).unwrap();
+    let log = Log::open(
+        dir.path(),
+        16 * 1024,
+        FsyncPolicy::GroupCommit { interval_ms: 50 },
+    )
+    .unwrap();
 
     for i in 0..2_000 {
         log.append(evento(i)).unwrap();
@@ -62,7 +67,12 @@ fn selados_ficam_ordenados_por_base_lsn() {
 fn selados_ordenados_sob_escrita_concorrente() {
     let dir = tempfile::tempdir().unwrap();
     let log = Arc::new(
-        Log::open(dir.path(), 16 * 1024, FsyncPolicy::GroupCommit { interval_ms: 50 }).unwrap(),
+        Log::open(
+            dir.path(),
+            16 * 1024,
+            FsyncPolicy::GroupCommit { interval_ms: 50 },
+        )
+        .unwrap(),
     );
 
     let hs: Vec<_> = (0..8)

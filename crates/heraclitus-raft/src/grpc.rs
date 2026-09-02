@@ -370,7 +370,15 @@ mod tests {
         let mut dirs = Vec::new();
         for id in 0..3u64 {
             let dir = tempfile::tempdir().unwrap();
-            let log = Arc::new(AnyLog::open(crate::formato_de_teste(), dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+            let log = Arc::new(
+                AnyLog::open(
+                    crate::formato_de_teste(),
+                    dir.path(),
+                    1 << 20,
+                    FsyncPolicy::Always,
+                )
+                .unwrap(),
+            );
             nodes.push(
                 spawn_node_grpc(id, log, config.clone(), "127.0.0.1:0")
                     .await

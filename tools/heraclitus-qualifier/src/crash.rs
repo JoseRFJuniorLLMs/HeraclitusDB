@@ -310,7 +310,11 @@ async fn run_cycle(
             .expect("acknowledgement ledger poisoned"),
     );
     let attempts = *attempts.lock().expect("attempt counter poisoned");
-    let max_acknowledged_lsn = acknowledged.iter().map(|entry| entry.lsn).max().unwrap_or(0);
+    let max_acknowledged_lsn = acknowledged
+        .iter()
+        .map(|entry| entry.lsn)
+        .max()
+        .unwrap_or(0);
 
     let restart_started = Instant::now();
     supervised.restart()?;
@@ -377,7 +381,9 @@ async fn run_cycle(
         ));
     }
     if restart_ok && !integrity_ok {
-        failures.push(format!("integrity verification failed: {integrity_message}"));
+        failures.push(format!(
+            "integrity verification failed: {integrity_message}"
+        ));
     }
 
     Ok(CycleReport {
@@ -578,8 +584,12 @@ mod tests {
             assert_eq!(delay, kill_delay_ms(428_931, cycle, 200, 1_200));
         }
         // Different seeds must not collapse onto the same campaign.
-        let a = (0..64).map(|c| kill_delay_ms(1, c, 200, 1_200)).collect::<Vec<_>>();
-        let b = (0..64).map(|c| kill_delay_ms(2, c, 200, 1_200)).collect::<Vec<_>>();
+        let a = (0..64)
+            .map(|c| kill_delay_ms(1, c, 200, 1_200))
+            .collect::<Vec<_>>();
+        let b = (0..64)
+            .map(|c| kill_delay_ms(2, c, 200, 1_200))
+            .collect::<Vec<_>>();
         assert_ne!(a, b);
     }
 

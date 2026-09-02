@@ -103,7 +103,10 @@ async fn repack_muda_os_bytes_e_nao_muda_o_historico() {
     let tier = ColdTierV6::open_local(&bucket).unwrap();
     let scratch = dir.path().join("scratch");
 
-    let g1 = tier.publish_generation(&g1_local, 1, Some(0), 10).await.unwrap();
+    let g1 = tier
+        .publish_generation(&g1_local, 1, Some(0), 10)
+        .await
+        .unwrap();
 
     // Blocos maiores e Zstd: é a operação de §189 — trocar densidade por CPU
     // de leitura sem tocar no histórico.
@@ -152,7 +155,10 @@ async fn repack_muda_os_bytes_e_nao_muda_o_historico() {
     // ---- §83: a geração antiga continua lá, intacta e verificável ------
     let store = tier.store();
     assert!(
-        store.head(&ObjPath::from(g1.object_path.clone())).await.is_ok(),
+        store
+            .head(&ObjPath::from(g1.object_path.clone()))
+            .await
+            .is_ok(),
         "§83: a geração de origem foi sobrescrita ou apagada pelo repack"
     );
     let rel = tier
@@ -163,7 +169,10 @@ async fn repack_muda_os_bytes_e_nao_muda_o_historico() {
         )
         .await
         .unwrap();
-    assert!(rel.is_ok(), "a geração de origem deixou de verificar: {rel:?}");
+    assert!(
+        rel.is_ok(),
+        "a geração de origem deixou de verificar: {rel:?}"
+    );
 
     // ---- as duas gerações devolvem exactamente as mesmas linhas --------
     let (linhas_g1, _) = tier
@@ -203,7 +212,10 @@ async fn output_com_outros_registos_nunca_ocupa_a_chave_canonica() {
     let dir = tempfile::tempdir().unwrap();
     let (g1_local, _) = segmento_real(dir.path());
     let tier = ColdTierV6::open_local(dir.path().join("bucket")).unwrap();
-    let g1 = tier.publish_generation(&g1_local, 1, Some(0), 10).await.unwrap();
+    let g1 = tier
+        .publish_generation(&g1_local, 1, Some(0), 10)
+        .await
+        .unwrap();
 
     let raiz_canonica = g1.logical_root_bytes().unwrap();
     // Uma raiz qualquer diferente representa qualquer output que tenha perdido
@@ -229,7 +241,10 @@ async fn output_com_outros_registos_nunca_ocupa_a_chave_canonica() {
     );
     assert_ne!(canonica.dir(), projeccao.dir());
     assert_ne!(canonica.segment_path(), projeccao.segment_path());
-    assert_ne!(projeccao.segment_path(), ObjPath::from(g1.object_path.clone()));
+    assert_ne!(
+        projeccao.segment_path(),
+        ObjPath::from(g1.object_path.clone())
+    );
 }
 
 #[tokio::test]
@@ -238,7 +253,10 @@ async fn objecto_adulterado_no_bucket_nao_e_repackado() {
     let (g1_local, _) = segmento_real(dir.path());
     let bucket = dir.path().join("bucket");
     let tier = ColdTierV6::open_local(&bucket).unwrap();
-    let g1 = tier.publish_generation(&g1_local, 1, Some(0), 10).await.unwrap();
+    let g1 = tier
+        .publish_generation(&g1_local, 1, Some(0), 10)
+        .await
+        .unwrap();
 
     // Um bit no meio dos dados, por baixo do object store: é o bit-rot que
     // §84 manda apanhar pelo digest recalculado, não pelo `ETag`.
@@ -279,7 +297,10 @@ async fn recolha_remove_a_geracao_superseded_e_deixa_a_activa() {
     let dir = tempfile::tempdir().unwrap();
     let (g1_local, _) = segmento_real(dir.path());
     let tier = ColdTierV6::open_local(dir.path().join("bucket")).unwrap();
-    let g1 = tier.publish_generation(&g1_local, 1, Some(0), 10).await.unwrap();
+    let g1 = tier
+        .publish_generation(&g1_local, 1, Some(0), 10)
+        .await
+        .unwrap();
     let out = tier
         .repack_generation(
             &g1,
@@ -303,12 +324,21 @@ async fn recolha_remove_a_geracao_superseded_e_deixa_a_activa() {
     assert!(r.is_clean());
 
     let store = tier.store();
-    assert!(store.head(&ObjPath::from(g1.object_path.clone())).await.is_err());
-    assert!(store.head(&ObjPath::from(g2.object_path.clone())).await.is_ok());
+    assert!(store
+        .head(&ObjPath::from(g1.object_path.clone()))
+        .await
+        .is_err());
+    assert!(store
+        .head(&ObjPath::from(g2.object_path.clone()))
+        .await
+        .is_ok());
 
     // A geração activa continua a servir o histórico completo depois de a
     // antiga desaparecer — que é a única razão pela qual apagá-la era seguro.
-    let (linhas, _) = tier.recall_lsn_range(&g2.key().unwrap(), 0, N - 1).await.unwrap();
+    let (linhas, _) = tier
+        .recall_lsn_range(&g2.key().unwrap(), 0, N - 1)
+        .await
+        .unwrap();
     assert_eq!(linhas.len() as u64, N);
 
     // Idempotência: repetir não é erro, e não inventa remoções.
@@ -325,7 +355,10 @@ async fn geracao_alvo_tem_de_ser_posterior() {
     let dir = tempfile::tempdir().unwrap();
     let (g1_local, _) = segmento_real(dir.path());
     let tier = ColdTierV6::open_local(dir.path().join("bucket")).unwrap();
-    let g1 = tier.publish_generation(&g1_local, 1, Some(0), 10).await.unwrap();
+    let g1 = tier
+        .publish_generation(&g1_local, 1, Some(0), 10)
+        .await
+        .unwrap();
 
     for alvo in [0, 1] {
         let erro = tier

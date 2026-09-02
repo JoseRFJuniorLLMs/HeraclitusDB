@@ -101,8 +101,12 @@ pub fn exigir_key_usage(
     let Some(ext) = exts.iter().find(|e| e.extn_id == OID_KEY_USAGE) else {
         return Ok(());
     };
-    let ku = KeyUsage::from_der(ext.extn_value.as_bytes())
-        .map_err(|e| erro(format!("keyUsage inválido em `{}`: {e}", cert.tbs_certificate.subject)))?;
+    let ku = KeyUsage::from_der(ext.extn_value.as_bytes()).map_err(|e| {
+        erro(format!(
+            "keyUsage inválido em `{}`: {e}",
+            cert.tbs_certificate.subject
+        ))
+    })?;
     if ku.0.contains(bit) {
         return Ok(());
     }
@@ -191,10 +195,7 @@ pub fn verificar_path_len(cadeia: &[Certificate], ancora: &Certificate) -> Resul
 
 /// §4.2 e §6.1.4(f) — sanidade das extensões: nenhuma repetida, e nenhuma
 /// crítica que não saibamos processar.
-pub fn verificar_criticas(
-    cert: &Certificate,
-    policy: &RestricoesPolicy,
-) -> Result<(), CompError> {
+pub fn verificar_criticas(cert: &Certificate, policy: &RestricoesPolicy) -> Result<(), CompError> {
     let Some(exts) = cert.tbs_certificate.extensions.as_ref() else {
         return Ok(());
     };
@@ -358,9 +359,7 @@ fn mesmo_tipo(a: &GeneralName, b: &GeneralName) -> bool {
 fn bate(base: &GeneralName, nome: &GeneralName) -> Result<bool, CompError> {
     match (base, nome) {
         (GeneralName::DirectoryName(b), GeneralName::DirectoryName(n)) => dn_cobre(b, n),
-        (GeneralName::DnsName(b), GeneralName::DnsName(n)) => {
-            Ok(dns_cobre(b.as_str(), n.as_str()))
-        }
+        (GeneralName::DnsName(b), GeneralName::DnsName(n)) => Ok(dns_cobre(b.as_str(), n.as_str())),
         (GeneralName::Rfc822Name(b), GeneralName::Rfc822Name(n)) => {
             Ok(rfc822_cobre(b.as_str(), n.as_str()))
         }

@@ -301,7 +301,10 @@ fn parquet_obsoleto_e_desligado_do_hrkm_mas_nao_apagado_pelo_gc() {
         "o `.hrki` obsoleto é local e devia ter sido apagado"
     );
     assert!(
-        executado.removed.iter().any(|p| p.ends_with("obsoleto.hrki")),
+        executado
+            .removed
+            .iter()
+            .any(|p| p.ends_with("obsoleto.hrki")),
         "o `.hrki` apagado devia constar em `removed`: {:?}",
         executado.removed
     );

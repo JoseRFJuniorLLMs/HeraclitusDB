@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use super::avro::{
     write_int, write_long, write_ocf, write_string, write_union_null, write_union_some, SYNC_LEN,
 };
-use super::ExportedFile;
 use super::ExportProvenance;
+use super::ExportedFile;
 
 pub const FORMAT_VERSION: u32 = 2;
 pub const SCHEMA_ID: i32 = 0;
@@ -148,12 +148,8 @@ pub fn build_snapshot_metadata(
     }
     validar_ficheiros(files)?;
 
-    let manifest_path = format!(
-        "metadata/{snapshot_id:020}-m0-{sequence_number:010}.avro"
-    );
-    let manifest_list_path = format!(
-        "metadata/snap-{snapshot_id:020}-{sequence_number:010}.avro"
-    );
+    let manifest_path = format!("metadata/{snapshot_id:020}-m0-{sequence_number:010}.avro");
+    let manifest_list_path = format!("metadata/snap-{snapshot_id:020}-{sequence_number:010}.avro");
     let metadata_path = format!("metadata/v{sequence_number:05}.metadata.json");
 
     let manifest_bytes = build_manifest(table, snapshot_id, files)?;
@@ -259,7 +255,8 @@ fn build_manifest_list(
     manifest_len: u64,
 ) -> Result<Vec<u8>, HeraclitusError> {
     let rows = files.iter().try_fold(0u64, |n, f| {
-        n.checked_add(f.rows).ok_or_else(|| overflow("added_rows_count"))
+        n.checked_add(f.rows)
+            .ok_or_else(|| overflow("added_rows_count"))
     })?;
     let mut d = Vec::new();
     write_string(&mut d, &table.absolute(manifest_path));
@@ -302,7 +299,8 @@ fn build_table_metadata(
     manifest_list_path: &str,
 ) -> Result<Vec<u8>, HeraclitusError> {
     let total_rows = files.iter().try_fold(0u64, |n, f| {
-        n.checked_add(f.rows).ok_or_else(|| overflow("total-records"))
+        n.checked_add(f.rows)
+            .ok_or_else(|| overflow("total-records"))
     })?;
     let exported_through_lsn = files
         .iter()
@@ -353,17 +351,12 @@ fn build_table_metadata(
         "default-sort-order-id": SORT_ORDER_ID,
         "refs": {"main": {"snapshot-id": snapshot_id, "type": "branch"}}
     });
-    serde_json::to_vec_pretty(&metadata)
-        .map_err(|e| HeraclitusError::Serialization(e.to_string()))
+    serde_json::to_vec_pretty(&metadata).map_err(|e| HeraclitusError::Serialization(e.to_string()))
 }
 
 fn iceberg_schema() -> serde_json::Value {
-    let required = |id: i32, name: &str, ty: &str| {
-        serde_json::json!({"id": id, "name": name, "required": true, "type": ty})
-    };
-    let optional = |id: i32, name: &str, ty: &str| {
-        serde_json::json!({"id": id, "name": name, "required": false, "type": ty})
-    };
+    let required = |id: i32, name: &str, ty: &str| serde_json::json!({"id": id, "name": name, "required": true, "type": ty});
+    let optional = |id: i32, name: &str, ty: &str| serde_json::json!({"id": id, "name": name, "required": false, "type": ty});
     serde_json::json!({
         "type": "struct",
         "schema-id": SCHEMA_ID,
@@ -495,10 +488,10 @@ fn sync_marker(domain: &[u8], snapshot_id: i64, files: &[IcebergDataFile]) -> [u
 fn uuid_valido(s: &str) -> bool {
     let bytes = s.as_bytes();
     bytes.len() == 36
-        && bytes
-            .iter()
-            .enumerate()
-            .all(|(i, b)| matches!(i, 8 | 13 | 18 | 23) && *b == b'-' || !matches!(i, 8 | 13 | 18 | 23) && b.is_ascii_hexdigit())
+        && bytes.iter().enumerate().all(|(i, b)| {
+            matches!(i, 8 | 13 | 18 | 23) && *b == b'-'
+                || !matches!(i, 8 | 13 | 18 | 23) && b.is_ascii_hexdigit()
+        })
 }
 
 fn uri_absoluta(s: &str) -> bool {
@@ -506,10 +499,10 @@ fn uri_absoluta(s: &str) -> bool {
         return false;
     };
     !scheme.is_empty()
-        && scheme
-            .bytes()
-            .enumerate()
-            .all(|(i, b)| b.is_ascii_alphabetic() || i > 0 && (b.is_ascii_digit() || b == b'+' || b == b'-' || b == b'.'))
+        && scheme.bytes().enumerate().all(|(i, b)| {
+            b.is_ascii_alphabetic()
+                || i > 0 && (b.is_ascii_digit() || b == b'+' || b == b'-' || b == b'.')
+        })
         && !rest.is_empty()
 }
 
@@ -543,11 +536,7 @@ mod tests {
     }
 
     fn table() -> IcebergTable {
-        IcebergTable::new(
-            "01010101-0101-4101-8101-010101010101",
-            "s3://lake/eventos",
-        )
-        .unwrap()
+        IcebergTable::new("01010101-0101-4101-8101-010101010101", "s3://lake/eventos").unwrap()
     }
 
     #[test]
@@ -570,7 +559,10 @@ mod tests {
         assert_eq!(metadata["format-version"], 2);
         assert_eq!(metadata["last-sequence-number"], 1);
         assert_eq!(metadata["current-snapshot-id"], 77);
-        assert_eq!(metadata["partition-specs"][0]["fields"], serde_json::json!([]));
+        assert_eq!(
+            metadata["partition-specs"][0]["fields"],
+            serde_json::json!([])
+        );
         assert_eq!(metadata["sort-orders"][0]["fields"], serde_json::json!([]));
         assert_eq!(
             metadata["snapshots"][0]["summary"]["heraclitus.exported_through_lsn"],
@@ -586,13 +578,8 @@ mod tests {
     fn iceberg_e_delta_apontam_para_o_mesmo_parquet_derivado() {
         let f = file(8, 2, 40, 49);
         let ice = build_snapshot(&table(), 88, 1, 10, None, std::slice::from_ref(&f)).unwrap();
-        let delta = crate::lakehouse::delta::commit_append(
-            1,
-            std::slice::from_ref(&f),
-            &[],
-            10,
-        )
-        .unwrap();
+        let delta =
+            crate::lakehouse::delta::commit_append(1, std::slice::from_ref(&f), &[], 10).unwrap();
         let delta_json = String::from_utf8(delta.bytes).unwrap();
         assert!(delta_json.contains(&f.path));
 
@@ -626,10 +613,8 @@ mod tests {
     #[test]
     fn location_e_uuid_sao_validados() {
         assert!(IcebergTable::new("não-é-uuid", "s3://b/t").is_err());
-        assert!(IcebergTable::new(
-            "01010101-0101-4101-8101-010101010101",
-            "caminho/relativo"
-        )
-        .is_err());
+        assert!(
+            IcebergTable::new("01010101-0101-4101-8101-010101010101", "caminho/relativo").is_err()
+        );
     }
 }

@@ -105,7 +105,10 @@ impl DatabaseManifest {
 
     /// SPEC-0050 §78 — `AS OF LSN`: o planner elimina de imediato os segmentos
     /// cujo `first_lsn` é posterior ao alvo.
-    pub fn visible_segments_v2(&self, target_lsn: Lsn) -> impl Iterator<Item = &SegmentDescriptorV2> {
+    pub fn visible_segments_v2(
+        &self,
+        target_lsn: Lsn,
+    ) -> impl Iterator<Item = &SegmentDescriptorV2> {
         self.segments_v2
             .iter()
             .filter(move |s| s.visible_at(target_lsn))
@@ -484,7 +487,9 @@ impl SegmentDescriptorV2 {
 
     /// Gerações capazes de reconstruir as `CanonicalRecord`s (§91).
     pub fn canonical_authorities(&self) -> impl Iterator<Item = &PhysicalGeneration> {
-        self.generations.iter().filter(|g| g.is_canonical_authority())
+        self.generations
+            .iter()
+            .filter(|g| g.is_canonical_authority())
     }
 
     /// `true` se existe pelo menos um layout `PACKED` autoritativo. Usado pela

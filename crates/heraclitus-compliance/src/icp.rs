@@ -72,8 +72,7 @@ use crate::CompError;
 /// RFC 5652 §5 — `id-signedData`.
 const OID_SIGNED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
 /// RFC 3161 §2.4.2 — `id-ct-TSTInfo`.
-const OID_CT_TST_INFO: ObjectIdentifier =
-    ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.1.4");
+const OID_CT_TST_INFO: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.1.4");
 /// RFC 5652 §11.1 — `id-contentType`.
 const OID_ATTR_CONTENT_TYPE: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.3");
@@ -167,9 +166,8 @@ impl GenTime {
                 resto % 60
             ),
         };
-        let unix_ms = analisar_generalized(&texto).ok_or_else(|| {
-            verify_err(format!("genTime construído inválido: `{texto}`"))
-        })?;
+        let unix_ms = analisar_generalized(&texto)
+            .ok_or_else(|| verify_err(format!("genTime construído inválido: `{texto}`")))?;
         Ok(Self {
             unix_ms,
             bruto: texto.into_bytes(),
@@ -182,15 +180,12 @@ impl der::FixedTag for GenTime {
 }
 
 impl<'a> der::DecodeValue<'a> for GenTime {
-    fn decode_value<R: der::Reader<'a>>(
-        reader: &mut R,
-        header: der::Header,
-    ) -> der::Result<Self> {
+    fn decode_value<R: der::Reader<'a>>(reader: &mut R, header: der::Header) -> der::Result<Self> {
         let bruto = reader.read_vec(header.length)?;
-        let texto = std::str::from_utf8(&bruto)
-            .map_err(|_| der::Tag::GeneralizedTime.value_error())?;
-        let unix_ms = analisar_generalized(texto)
-            .ok_or_else(|| der::Tag::GeneralizedTime.value_error())?;
+        let texto =
+            std::str::from_utf8(&bruto).map_err(|_| der::Tag::GeneralizedTime.value_error())?;
+        let unix_ms =
+            analisar_generalized(texto).ok_or_else(|| der::Tag::GeneralizedTime.value_error())?;
         Ok(Self { unix_ms, bruto })
     }
 }
@@ -259,7 +254,6 @@ fn analisar_generalized(s: &str) -> Option<u64> {
     }
     Some(ms)
 }
-
 
 /// `TSTInfo` de RFC 3161 §2.4.2.
 ///
@@ -544,16 +538,15 @@ impl IcpBrasilTimestampVerifier {
         let ancora = cadeia.anchor;
 
         // 4 — assinatura sobre os signedAttrs.
-        let attrs = signer
-            .signed_attrs
-            .as_ref()
-            .ok_or_else(|| verify_err(
+        let attrs = signer.signed_attrs.as_ref().ok_or_else(|| {
+            verify_err(
                 // RFC 5652 §5.3: quando há signedAttrs a assinatura é sobre
                 // eles; sem eles seria sobre o conteúdo. Aceitar as duas
                 // formas duplica a superfície de verificação sem ganho — um
                 // TimeStampToken traz sempre signedAttrs.
                 "SignerInfo sem signedAttrs: forma não suportada".into(),
-            ))?;
+            )
+        })?;
         let attrs_der = reencode_signed_attrs(attrs)?;
         verificar_assinatura(
             signer_cert,
@@ -581,8 +574,8 @@ impl IcpBrasilTimestampVerifier {
         }
 
         // §5.3 — o digest dos signedAttrs é o que o SignerInfo declara.
-        let digest_attrs = crate::algoritmos::Digest::do_oid(&signer.digest_alg.oid)
-            .ok_or_else(|| {
+        let digest_attrs =
+            crate::algoritmos::Digest::do_oid(&signer.digest_alg.oid).ok_or_else(|| {
                 verify_err(format!(
                     "digestAlgorithm {} do SignerInfo não suportado",
                     signer.digest_alg.oid
@@ -790,10 +783,11 @@ impl IcpBrasilTimestampVerifier {
         };
         let store = store.as_ref();
         let alg_policy = &self.policy.algoritmos;
-        let assinatura = |emissor: &Certificate,
-                          alg: &x509_cert::spki::AlgorithmIdentifierOwned,
-                          msg: &[u8],
-                          sig: &[u8]| verificar_assinatura(emissor, alg, msg, sig, alg_policy);
+        let assinatura =
+            |emissor: &Certificate,
+             alg: &x509_cert::spki::AlgorithmIdentifierOwned,
+             msg: &[u8],
+             sig: &[u8]| verificar_assinatura(emissor, alg, msg, sig, alg_policy);
         let tempo = |t: &x509_cert::time::Time| tempo_para_unix_ms(t);
         let mut validade_ate: Option<u64> = None;
 
@@ -940,7 +934,6 @@ impl IcpBrasilTimestampVerifier {
         }
         None
     }
-
 }
 
 struct Cadeia {
@@ -1058,9 +1051,7 @@ fn encontrar_signatario<'a>(
                         .unwrap_or(false)
                         && c.tbs_certificate.serial_number == ias.serial_number
                 })
-                .ok_or_else(|| {
-                    verify_err("certificado do signatário não vem no token".into())
-                })
+                .ok_or_else(|| verify_err("certificado do signatário não vem no token".into()))
         }
         cms::signed_data::SignerIdentifier::SubjectKeyIdentifier(skid) => {
             let alvo = skid.0.as_bytes();
@@ -1244,10 +1235,7 @@ fn verificar_ca(cert: &Certificate) -> Result<(), CompError> {
 /// fazia — desfaz essa reserva: um certificado emitido para TLS que por acaso
 /// também liste `id-kp-timeStamping` passava a poder assinar carimbos, e a
 /// chave que serve um servidor web passava a servir evidência legal.
-fn verificar_eku_timestamping(
-    cert: &Certificate,
-    estrito: bool,
-) -> Result<(), CompError> {
+fn verificar_eku_timestamping(cert: &Certificate, estrito: bool) -> Result<(), CompError> {
     const OID_EKU: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.37");
     let exts = cert
         .tbs_certificate
@@ -1312,9 +1300,6 @@ fn tempo_para_unix_ms(t: &Time) -> Result<u64, CompError> {
         .checked_mul(1_000)
         .ok_or_else(|| verify_err("tempo do certificado transborda em ms".into()))
 }
-
-
-
 
 #[cfg(test)]
 mod tests {
@@ -1532,10 +1517,7 @@ mod tests {
         // primeiro dos dois ramos. O outro — extensao presente sem o OID de
         // carimbo — e a mesma recusa por outra razao, e esta no corpo de
         // `verificar_eku_timestamping`.
-        assert!(
-            erro.to_string().contains("extendedKeyUsage"),
-            "{erro}"
-        );
+        assert!(erro.to_string().contains("extendedKeyUsage"), "{erro}");
     }
 
     /// A validade e aferida no instante do CARIMBO. Uma folha cuja janela ja
@@ -1684,7 +1666,13 @@ mod tests {
     }
 
     fn token_padrao(chain: &test_pki::Chain) -> Vec<u8> {
-        test_pki::token_de_teste(chain, &imprint(), AGORA_S - 60, None, OpcoesToken::default())
+        test_pki::token_de_teste(
+            chain,
+            &imprint(),
+            AGORA_S - 60,
+            None,
+            OpcoesToken::default(),
+        )
     }
 
     /// Sem CRLs instaladas nada muda — e o resultado continua a dizer que a
@@ -1976,8 +1964,10 @@ mod tests {
         let der_alterado = folha.to_der().unwrap();
         let relido = x509_cert::Certificate::from_der(&der_alterado).unwrap();
         let erro = crate::algoritmos::coerencia_de_algoritmo(&relido).unwrap_err();
-        assert!(erro.to_string().contains("4.1.1.2") || erro.to_string().contains("iguais"),
-            "{erro}");
+        assert!(
+            erro.to_string().contains("4.1.1.2") || erro.to_string().contains("iguais"),
+            "{erro}"
+        );
     }
 
     /// Um algoritmo desconhecido e recusado COM o OID, e nao ignorado.
@@ -2071,13 +2061,8 @@ mod tests {
     #[test]
     fn uma_crl_sem_next_update_e_recusada_por_nao_declarar_ate_quando_vale() {
         let chain = test_pki::chain_de_teste();
-        let sem_fim = test_pki::crl_de_teste(
-            &chain.root,
-            &chain.root_key,
-            CRL_INICIO_S,
-            None,
-            vec![],
-        );
+        let sem_fim =
+            test_pki::crl_de_teste(&chain.root, &chain.root_key, CRL_INICIO_S, None, vec![]);
         let erro = verificador_com_crls(&chain, std::slice::from_ref(&sem_fim), Default::default())
             .verify(&token_padrao(&chain), &imprint(), None, AGORA_MS)
             .unwrap_err();
@@ -2605,7 +2590,10 @@ mod tests {
         );
         let mut store = TrustStore::new();
         store
-            .add_pem_or_der("outra", &test_pki::self_signed_root("Outra").certificate_der)
+            .add_pem_or_der(
+                "outra",
+                &test_pki::self_signed_root("Outra").certificate_der,
+            )
             .unwrap();
         let erro = IcpBrasilTimestampVerifier::new(store, TimestampValidationPolicy::default())
             .verify(&token, &imprint(), None, AGORA_MS)
@@ -2682,7 +2670,10 @@ mod testes_inspect {
         );
         let mut store = TrustStore::new();
         store
-            .add_pem_or_der("outra", &test_pki::self_signed_root("Outra").certificate_der)
+            .add_pem_or_der(
+                "outra",
+                &test_pki::self_signed_root("Outra").certificate_der,
+            )
             .unwrap();
         let erro = IcpBrasilTimestampVerifier::new(store, TimestampValidationPolicy::default())
             .inspect(&token, AGORA_S * 1_000)

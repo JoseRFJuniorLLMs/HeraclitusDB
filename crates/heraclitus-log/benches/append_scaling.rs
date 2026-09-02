@@ -115,7 +115,10 @@ fn concorrente(rotulo: &str, segmento: u64, escritores: u64) -> f64 {
     });
     let dt = t.elapsed();
     let debito = (por_thread * escritores) as f64 / dt.as_secs_f64();
-    println!("  {rotulo}: {debito:>9.0} app/s  ({:.1?} para {N} registos)", dt);
+    println!(
+        "  {rotulo}: {debito:>9.0} app/s  ({:.1?} para {N} registos)",
+        dt
+    );
     debito
 }
 
@@ -125,8 +128,14 @@ fn main() {
 
     println!("── 1. A curva (1 escritor sincrono) ──────────────────────────────");
     println!("  Se o custo por append fosse constante, a linha seria plana.\n");
-    let grande = curva("segmento 1 GiB (nunca sela — quadratico corre ate ao fim)", 1 << 30);
-    let pequeno = curva("segmento 4 MiB (sela varias vezes — indice reinicia)", 4 << 20);
+    let grande = curva(
+        "segmento 1 GiB (nunca sela — quadratico corre ate ao fim)",
+        1 << 30,
+    );
+    let pequeno = curva(
+        "segmento 4 MiB (sela varias vezes — indice reinicia)",
+        4 << 20,
+    );
     // Contraprova obrigatoria: `roll_segment` (lib.rs:1936) faz
     // `(*catalog.sealed).clone()` — clona o vetor de segmentos SELADOS a cada
     // roll, que e O(segmentos) por seal e O(segmentos²) no total. Ou seja,
@@ -134,7 +143,10 @@ fn main() {
     // "entradas por segmento" para "numero de segmentos". Se assim for, esta
     // curva (~100 segmentos em vez de ~7) tem de cair. Se ficar plana, a
     // recomendacao de encolher o segmento aguenta-se.
-    let minusculo = curva("segmento 256 KiB (~100 seals — testa o quadratico DOS SEGMENTOS)", 256 << 10);
+    let minusculo = curva(
+        "segmento 256 KiB (~100 seals — testa o quadratico DOS SEGMENTOS)",
+        256 << 10,
+    );
 
     println!("── 2. Efeito das duas mitigacoes (debito total) ──────────────────\n");
     let total = |c: &Vec<f64>| N as f64 / c.iter().map(|d| JANELA as f64 / d).sum::<f64>();

@@ -498,9 +498,7 @@ impl EpisodeLog for AnyLog {
         max: usize,
     ) -> Result<Option<(Vec<(Lsn, Episode)>, PrunedScanStats)>, HeraclitusError> {
         match self {
-            Self::Legacy(log) => {
-                log.scan_builtin_eq_capped(field, value, from, to, max)
-            }
+            Self::Legacy(log) => log.scan_builtin_eq_capped(field, value, from, to, max),
             Self::V6(log) => log.scan_builtin_eq_capped(field, value, from, to, max),
         }
     }

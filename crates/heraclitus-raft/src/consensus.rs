@@ -851,7 +851,15 @@ mod tests {
         let mut dirs = Vec::new();
         for id in 0..3u64 {
             let dir = tempfile::tempdir().unwrap();
-            let log = Arc::new(AnyLog::open(crate::formato_de_teste(), dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+            let log = Arc::new(
+                AnyLog::open(
+                    crate::formato_de_teste(),
+                    dir.path(),
+                    1 << 20,
+                    FsyncPolicy::Always,
+                )
+                .unwrap(),
+            );
             nodes.push(spawn_node(id, log, &router, cfg.clone()).await.unwrap());
             dirs.push(dir);
         }
@@ -1174,7 +1182,15 @@ mod tests {
 
         // Nó fonte: aplica 10 episódios e constrói um snapshot.
         let src_dir = tempfile::tempdir().unwrap();
-        let src_log = Arc::new(AnyLog::open(crate::formato_de_teste(), src_dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        let src_log = Arc::new(
+            AnyLog::open(
+                crate::formato_de_teste(),
+                src_dir.path(),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
         let mut src = EpisodeStateMachine::new(src_log.clone());
         src.apply(mk_entries(10)).await.unwrap();
         assert_eq!(src_log.head(), 10);
@@ -1197,7 +1213,15 @@ mod tests {
         let hook_fires = Arc::new(AtomicU64::new(0));
         let hc = hook_fires.clone();
         let dst_dir = tempfile::tempdir().unwrap();
-        let dst_log = Arc::new(AnyLog::open(crate::formato_de_teste(), dst_dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        let dst_log = Arc::new(
+            AnyLog::open(
+                crate::formato_de_teste(),
+                dst_dir.path(),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
         let mut dst = EpisodeStateMachine::new(dst_log.clone()).with_apply_hook(Arc::new(
             move |_lsn, _ep| {
                 hc.fetch_add(1, Ordering::SeqCst);
@@ -1250,7 +1274,15 @@ mod tests {
         // ── Vida 1: arranca, inicializa (cluster de 1), escreve 5 episódios. ──
         let last_index = {
             let router = Router::new();
-            let log = Arc::new(AnyLog::open(crate::formato_de_teste(), &log_dir, 1 << 20, FsyncPolicy::Always).unwrap());
+            let log = Arc::new(
+                AnyLog::open(
+                    crate::formato_de_teste(),
+                    &log_dir,
+                    1 << 20,
+                    FsyncPolicy::Always,
+                )
+                .unwrap(),
+            );
             let node = spawn_node_durable(0, log.clone(), &router, cfg.clone(), &raft_dir, &sm_dir)
                 .await
                 .unwrap();
@@ -1281,7 +1313,15 @@ mod tests {
 
         // ── Vida 2: reabre do disco. Nada em memória sobreviveu. ──
         let router = Router::new();
-        let log = Arc::new(AnyLog::open(crate::formato_de_teste(), &log_dir, 1 << 20, FsyncPolicy::Always).unwrap());
+        let log = Arc::new(
+            AnyLog::open(
+                crate::formato_de_teste(),
+                &log_dir,
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
         assert_eq!(log.head(), 5, "os 5 episódios estavam duráveis no log");
         let node = spawn_node_durable(0, log.clone(), &router, cfg.clone(), &raft_dir, &sm_dir)
             .await
@@ -1322,7 +1362,15 @@ mod tests {
         let mut dirs = Vec::new();
         for id in 0..3u64 {
             let dir = tempfile::tempdir().unwrap();
-            let log = Arc::new(AnyLog::open(crate::formato_de_teste(), dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+            let log = Arc::new(
+                AnyLog::open(
+                    crate::formato_de_teste(),
+                    dir.path(),
+                    1 << 20,
+                    FsyncPolicy::Always,
+                )
+                .unwrap(),
+            );
             // Cada nó tem o seu hook; contamos os do nó 0.
             let (seen_c, last_c) = (seen.clone(), last_lsn.clone());
             let sm = if id == 0 {

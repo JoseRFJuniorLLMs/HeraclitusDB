@@ -203,7 +203,11 @@ fn verify_v6(
         });
     }
 
-    let scope = if logical { "logical + physical" } else { "physical" };
+    let scope = if logical {
+        "logical + physical"
+    } else {
+        "physical"
+    };
     let mut out = format!(
         "HRKL v6 {scope} verification passed\nsegment: {}\nlayout: {}\nrecords: {}\nlsn: {}..{}\nblocks: {}\nlogical root (declared): {}\n",
         segment.display(),
@@ -217,13 +221,19 @@ fn verify_v6(
     if logical {
         out.push_str(&format!(
             "logical root (recomputed): {}\n",
-            report.recomputed_root.as_ref().map(hex32).unwrap_or_default()
+            report
+                .recomputed_root
+                .as_ref()
+                .map(hex32)
+                .unwrap_or_default()
         ));
     }
     if report.notes.is_empty() {
         out.push_str(&format!("sealed: yes\nscope: {scope} checks"));
     } else {
-        out.push_str(&format!("sealed: incomplete\nscope: {scope} checks\nnotes:\n"));
+        out.push_str(&format!(
+            "sealed: incomplete\nscope: {scope} checks\nnotes:\n"
+        ));
         for note in report.notes {
             out.push_str(&format!("  - {note}\n"));
         }
@@ -268,8 +278,15 @@ pub fn prove_v6_lsn(
         hex32(&proof.envelope.imprint()),
     );
     for (index, step) in proof.proof.path.iter().enumerate() {
-        let side = if step.sibling_is_left { "left" } else { "right" };
-        out.push_str(&format!("  {index}: sibling {side} {}\n", hex32(&step.sibling)));
+        let side = if step.sibling_is_left {
+            "left"
+        } else {
+            "right"
+        };
+        out.push_str(&format!(
+            "  {index}: sibling {side} {}\n",
+            hex32(&step.sibling)
+        ));
     }
     out.push_str("proof verifies: true");
     Ok(out)
@@ -473,7 +490,11 @@ equivalencia verificada: {}
         relatorio.first_lsn,
         relatorio.last_lsn,
         relatorio.manifest_generation,
-        if relatorio.legacy_tail_sealed { "sim" } else { "nao havia" },
+        if relatorio.legacy_tail_sealed {
+            "sim"
+        } else {
+            "nao havia"
+        },
         if verify { "sim" } else { "NAO (--no-verify)" },
     );
     for s in &relatorio.segments {
@@ -753,8 +774,7 @@ pub fn anchor(
     use heraclitus_compliance::secure_tsa::{SecureTsaClient, TlsPolicy};
     use heraclitus_compliance::trust_store::TrustStore;
     use heraclitus_compliance::{anchor, current_watermark, HttpTsa, LocalTsa, TsaClient};
-    let log =
-        Log::open(log_dir, segmento(), FsyncPolicy::Always).map_err(|e| e.to_string())?;
+    let log = Log::open(log_dir, segmento(), FsyncPolicy::Always).map_err(|e| e.to_string())?;
     if current_watermark(&log) == 0 {
         return Ok(
             "nada selado para ancorar (sem segmentos selados); apenda mais eventos primeiro".into(),
@@ -870,8 +890,7 @@ pub fn verify_receipts(
         load_manifest, verify_receipt, verify_receipt_with_verifier, ReceiptVerification,
         TimestampValidationState,
     };
-    let log =
-        Log::open(log_dir, segmento(), FsyncPolicy::Always).map_err(|e| e.to_string())?;
+    let log = Log::open(log_dir, segmento(), FsyncPolicy::Always).map_err(|e| e.to_string())?;
     let receipts = load_manifest(receipts_dir).map_err(|e| e.to_string())?;
     if receipts.is_empty() {
         return Ok("nenhum recibo encontrado (manifest.jsonl vazio ou ausente)".into());
@@ -882,9 +901,8 @@ pub fn verify_receipts(
     // build", quando na verdade o operador PEDIU um e ele não abriu.
     let verificador = match trust_store_dir {
         Some(d) => {
-            let (store, relatorio) = TrustStore::load_dir(d).map_err(|e| {
-                format!("trust store `{}` não carrega: {e}", d.display())
-            })?;
+            let (store, relatorio) = TrustStore::load_dir(d)
+                .map_err(|e| format!("trust store `{}` não carrega: {e}", d.display()))?;
             if store.is_empty() {
                 return Err(format!(
                     "trust store `{}` não tem âncoras utilizáveis ({} ficheiro(s) vistos): sem âncoras não há cadeia contra que validar",
@@ -892,10 +910,8 @@ pub fn verify_receipts(
                     relatorio.files_seen
                 ));
             }
-            let mut v = IcpBrasilTimestampVerifier::new(
-                store,
-                timestamp_validation_policy(policy_oid)?,
-            );
+            let mut v =
+                IcpBrasilTimestampVerifier::new(store, timestamp_validation_policy(policy_oid)?);
             if let Some(cd) = crl_dir {
                 let (crls, rel) = heraclitus_compliance::crl::CrlStore::load_dir(cd)
                     .map_err(|e| format!("CRLs `{}`: {e}", cd.display()))?;
@@ -1027,9 +1043,8 @@ pub fn verify_receipts(
             "\n{autoridade_confirmada} recibo(s) com cadeia validada até uma âncora instalada."
         );
         if revogacao_nao_consultada == 0 {
-            out += &format!(
-                " Revogação consultada e confirmada em {revogacao_confirmada} recibo(s)."
-            );
+            out +=
+                &format!(" Revogação consultada e confirmada em {revogacao_confirmada} recibo(s).");
         } else {
             out += &format!(
                 " ATENÇÃO: revogação NÃO consultada em {revogacao_nao_consultada} recibo(s); \
@@ -1180,7 +1195,6 @@ pub fn bench_recall(n: usize, dim: usize, queries: usize) -> BenchReport {
         curves,
     }
 }
-
 
 /// SPEC-0050 §90–§97 — mostra o plano de GC, ou executa-o.
 ///
@@ -1373,7 +1387,10 @@ mod tests {
         let lido = novo.scan(0, novo.head()).unwrap();
         assert_eq!(lido.len(), esperado.len());
         assert_eq!(lido.first().unwrap().1.id, esperado.first().unwrap().1.id);
-        assert_eq!(lido.last().unwrap().1.content, esperado.last().unwrap().1.content);
+        assert_eq!(
+            lido.last().unwrap().1.content,
+            esperado.last().unwrap().1.content
+        );
 
         // Migrar duas vezes para o mesmo destino e um destino inexistente
         // comportam-se como devem.
@@ -1421,8 +1438,7 @@ mod tests {
         assert!(antes.contains("parquet -"), "{antes}");
 
         let destino = dir.path().join("lakehouse");
-        let saida =
-            export_lakehouse_v6(&root, &destino.to_string_lossy(), "episodios").unwrap();
+        let saida = export_lakehouse_v6(&root, &destino.to_string_lossy(), "episodios").unwrap();
         assert!(saida.contains("ligado ao HRKM"), "{saida}");
         assert!(saida.contains("export lag: 0"), "{saida}");
 
@@ -1437,8 +1453,7 @@ mod tests {
 
         // Correr de novo é um no-op: a fila vive no manifesto, portanto a
         // idempotência não depende de este processo se lembrar de nada.
-        let repetido =
-            export_lakehouse_v6(&root, &destino.to_string_lossy(), "episodios").unwrap();
+        let repetido = export_lakehouse_v6(&root, &destino.to_string_lossy(), "episodios").unwrap();
         assert!(repetido.contains("nada por exportar"), "{repetido}");
         assert_eq!(manifest_show_v6(&root).unwrap(), depois);
 
@@ -1459,10 +1474,7 @@ mod tests {
             heraclitus_compliance::TimestampValidationState::ExternalTokenUnvalidated
         }
 
-        fn stamp(
-            &self,
-            _imprint: &[u8; 32],
-        ) -> Result<Vec<u8>, heraclitus_compliance::CompError> {
+        fn stamp(&self, _imprint: &[u8; 32]) -> Result<Vec<u8>, heraclitus_compliance::CompError> {
             Ok(vec![0x30, 0x00])
         }
     }
@@ -1630,12 +1642,7 @@ mod tests {
             0.01,
         )
         .unwrap();
-        let packed = root.join(
-            &log.manifest().segments_v2[0]
-                .active()
-                .unwrap()
-                .location,
-        );
+        let packed = root.join(&log.manifest().segments_v2[0].active().unwrap().location);
         drop(log);
 
         assert!(storage_doctor_v6(&root).unwrap().contains("status: CLEAN"));
@@ -1813,8 +1820,8 @@ pub fn verify_token(
     use heraclitus_compliance::icp::IcpBrasilTimestampVerifier;
     use heraclitus_compliance::trust_store::TrustStore;
 
-    let token = std::fs::read(token_path)
-        .map_err(|e| format!("token `{}`: {e}", token_path.display()))?;
+    let token =
+        std::fs::read(token_path).map_err(|e| format!("token `{}`: {e}", token_path.display()))?;
     let (store, relatorio) = TrustStore::load_dir(trust_store_dir)
         .map_err(|e| format!("trust store `{}`: {e}", trust_store_dir.display()))?;
     if store.is_empty() {
@@ -1866,7 +1873,10 @@ pub fn verify_token(
 
     let mut out = format!("ACEITE: {}\n", token_path.display());
     out += &format!("  autoridade   : {}\n", verificado.signer_subject);
-    out += &format!("  genTime      : {} ms (época Unix)\n", verificado.gen_unix_ms);
+    out += &format!(
+        "  genTime      : {} ms (época Unix)\n",
+        verificado.gen_unix_ms
+    );
     out += &format!("  política     : {}\n", verificado.policy_oid);
     if let Some(oid) = policy_oid {
         out += &format!("  política exigida e confirmada: {oid}\n");

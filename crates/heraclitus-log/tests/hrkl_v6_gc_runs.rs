@@ -103,10 +103,10 @@ fn o_gc_recupera_o_raw_superseded_e_a_base_continua_a_ler() {
     let plano = log.gc_plan(GcRunOptions::default()).unwrap();
     assert!(plano.generations.is_empty());
     assert!(
-        plano
-            .blocked
-            .iter()
-            .any(|b| matches!(b.reason, heraclitus_log::v6::GcBlockReason::GracePeriod { .. })),
+        plano.blocked.iter().any(|b| matches!(
+            b.reason,
+            heraclitus_log::v6::GcBlockReason::GracePeriod { .. }
+        )),
         "o bloqueio devia ser o grace period: {:?}",
         plano.blocked
     );
@@ -119,7 +119,11 @@ fn o_gc_recupera_o_raw_superseded_e_a_base_continua_a_ler() {
 
     // Os bytes desapareceram mesmo — que é a afirmação toda.
     let depois = ficheiros(&segments);
-    assert_eq!(depois.len(), 2, "o RAW superseded devia ter saído: {depois:?}");
+    assert_eq!(
+        depois.len(),
+        2,
+        "o RAW superseded devia ter saído: {depois:?}"
+    );
     let bytes_depois = bytes_em_disco(&segments);
     assert!(
         bytes_depois < bytes_antes,
@@ -303,7 +307,10 @@ fn um_segmento_activo_sem_header_nao_impede_o_arranque() {
     );
     // E a base volta a aceitar escritas.
     reaberto
-        .append(Episode::new("gc", EventKind::Observation, b"depois".to_vec()))
+        .append(Episode::new(
+            "gc",
+            EventKind::Observation,
+            b"depois".to_vec(),
+        ))
         .unwrap();
 }
-

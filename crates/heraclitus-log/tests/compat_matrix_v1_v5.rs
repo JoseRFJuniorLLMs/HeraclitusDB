@@ -165,8 +165,8 @@ fn folha_e_crc_do_v1_cobrem_so_o_payload_e_do_v2_mais_a_regiao_autenticada() {
     // leitor que perdesse o despacho por versão passaria num dos lados e
     // falharia no outro.
     let e = &episodios()[0];
-    let payload = heraclitus_log::encode_storage_payload_for_version(1, e.id.0.to_bytes(), e)
-        .unwrap();
+    let payload =
+        heraclitus_log::encode_storage_payload_for_version(1, e.id.0.to_bytes(), e).unwrap();
 
     for (v, deve_detectar) in [(1u16, false), (2, true), (3, true), (4, true), (5, true)] {
         let bom = format::encode_record(v, 7, e.ts_hlc, &payload);
@@ -232,7 +232,11 @@ fn reabrir_uma_geracao_antiga_continua_a_aceitar_escritas() {
         let lsn = log
             .append(Episode::new("novo", EventKind::Action, b"depois".to_vec()))
             .unwrap();
-        assert_eq!(lsn, eps.len() as u64, "v{v}: o LSN novo continua a sequência");
+        assert_eq!(
+            lsn,
+            eps.len() as u64,
+            "v{v}: o LSN novo continua a sequência"
+        );
 
         let (_l, lido) = log.read(lsn).unwrap().unwrap();
         assert_eq!(lido.content, b"depois", "v{v}: o registo novo relê-se");

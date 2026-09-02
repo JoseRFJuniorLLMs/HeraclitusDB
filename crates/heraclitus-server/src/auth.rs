@@ -166,7 +166,10 @@ mod tests {
         // Divergente: recusado, e a mensagem nomeia os DOIS lados — quem le o
         // log precisa de saber quem tentou e em nome de quem.
         let erro = vincular_aprovador(Some("a-directora"), "ana").unwrap_err();
-        assert!(erro.contains("a-directora") && erro.contains("ana"), "{erro}");
+        assert!(
+            erro.contains("a-directora") && erro.contains("ana"),
+            "{erro}"
+        );
     }
 
     #[test]

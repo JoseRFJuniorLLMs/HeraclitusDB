@@ -26,7 +26,11 @@ use heraclitus_query::execute;
 use std::sync::Arc;
 
 fn ep(kind: &str, marca: &str) -> Episode {
-    let mut e = Episode::new("ag", EventKind::Custom(kind.into()), marca.as_bytes().to_vec());
+    let mut e = Episode::new(
+        "ag",
+        EventKind::Custom(kind.into()),
+        marca.as_bytes().to_vec(),
+    );
     e.attrs.insert("marca".into(), marca.into());
     e
 }
@@ -85,7 +89,11 @@ fn kinds_do_enum_tambem_sao_indexados() {
 
     let be = LogBackend::new(log);
     let v = execute(r#"MATCH (n) WHERE n.tipo = "Observation" RETURN n"#, &be).unwrap();
-    assert_eq!(linhas(&v), 7, "EventKind::Observation -> rotulo Observation");
+    assert_eq!(
+        linhas(&v),
+        7,
+        "EventKind::Observation -> rotulo Observation"
+    );
     let v = execute(r#"MATCH (n) WHERE n.tipo = "Action" RETURN n"#, &be).unwrap();
     assert_eq!(linhas(&v), 3);
 }
@@ -143,5 +151,9 @@ fn kind_indexado_cobre_appends_posteriores() {
         log.append(ep("Contrato", &format!("c{i}"))).unwrap();
     }
     let v = execute(r#"MATCH (n) WHERE n.tipo = "Contrato" RETURN n"#, &be).unwrap();
-    assert_eq!(linhas(&v), 15, "appends posteriores tem de entrar no indice");
+    assert_eq!(
+        linhas(&v),
+        15,
+        "appends posteriores tem de entrar no indice"
+    );
 }

@@ -60,7 +60,11 @@ fn retomar(dir: &Path) -> (u64, u64) {
     let _ = heraclitus_log::v6::raw::repair_active_tail(&p);
     match scan_raw_segment(&p) {
         Ok(s) => {
-            let proximo = s.records.last().map(|r| r.lsn + 1).unwrap_or(s.header.first_lsn);
+            let proximo = s
+                .records
+                .last()
+                .map(|r| r.lsn + 1)
+                .unwrap_or(s.header.first_lsn);
             (ultimo, proximo)
         }
         Err(_) => (ultimo + 1, 0),

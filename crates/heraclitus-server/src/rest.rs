@@ -2123,7 +2123,10 @@ mod aprovacao_tests {
             None,
         )
         .await;
-        assert_eq!(estado, 403, "forjar o aprovador tem de ser recusado: {corpo}");
+        assert_eq!(
+            estado, 403,
+            "forjar o aprovador tem de ser recusado: {corpo}"
+        );
         assert!(
             corpo.contains("rest-sem-auth"),
             "a resposta tem de dizer QUAL é a identidade real: {corpo}"

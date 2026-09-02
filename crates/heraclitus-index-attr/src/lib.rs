@@ -805,17 +805,19 @@ impl AttrIndex {
             let na_janela = ate_i.saturating_sub(de_i);
             let na_anterior = de_i.saturating_sub(ant_i);
 
-            let e = por_campo.entry(campo.to_string()).or_insert_with(|| DiffCampo {
-                campo: campo.to_string(),
-                eventos: 0,
-                eventos_anterior: 0,
-                valores_novos: 0,
-                valores_ativos: 0,
-                valores_silenciosos: 0,
-                valores_total: 0,
-                postings_total: 0,
-                topo: Vec::new(),
-            });
+            let e = por_campo
+                .entry(campo.to_string())
+                .or_insert_with(|| DiffCampo {
+                    campo: campo.to_string(),
+                    eventos: 0,
+                    eventos_anterior: 0,
+                    valores_novos: 0,
+                    valores_ativos: 0,
+                    valores_silenciosos: 0,
+                    valores_total: 0,
+                    postings_total: 0,
+                    topo: Vec::new(),
+                });
             e.valores_total += 1;
             e.postings_total += lsns.len();
 
@@ -1034,7 +1036,6 @@ fn insert_sorted(v: &mut Vec<Lsn>, lsn: Lsn) {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1113,7 +1114,10 @@ mod tests {
         let d = idx.diff(0, 2, 10);
         let f = d.iter().find(|c| c.campo == "fonte").unwrap();
         assert_eq!(f.eventos_anterior, 0);
-        assert_eq!(f.valores_silenciosos, 0, "sem janela anterior nao ha silencio");
+        assert_eq!(
+            f.valores_silenciosos, 0,
+            "sem janela anterior nao ha silencio"
+        );
         assert_eq!(f.valores_novos, 2, "tudo e novo quando se comeca do zero");
     }
 
@@ -1377,7 +1381,11 @@ mod compressao_tests {
     fn indice_com(n: u64) -> AttrIndex {
         let mut ix = AttrIndex::new();
         for lsn in 0..n {
-            let mut ep = Episode::new("a", heraclitus_core::EventKind::Custom("T".into()), b"x".to_vec());
+            let mut ep = Episode::new(
+                "a",
+                heraclitus_core::EventKind::Custom("T".into()),
+                b"x".to_vec(),
+            );
             ep.attrs.insert("campo".into(), "valor".into());
             ep.attrs.insert("seq".into(), lsn.to_string());
             ix.apply(lsn, &ep);
@@ -1391,7 +1399,10 @@ mod compressao_tests {
         let antes = indice_com(5_000);
         antes.save(dir.path()).unwrap();
         let depois = AttrIndex::open(dir.path());
-        assert_eq!(depois.lookup("campo", "valor"), antes.lookup("campo", "valor"));
+        assert_eq!(
+            depois.lookup("campo", "valor"),
+            antes.lookup("campo", "valor")
+        );
         assert_eq!(depois.lookup("campo", "valor").len(), 5_000);
     }
 
@@ -1400,7 +1411,10 @@ mod compressao_tests {
         let dir = tempfile::tempdir().unwrap();
         indice_com(10).save(dir.path()).unwrap();
         let bytes = std::fs::read(dir.path().join(SNAPSHOT_FILE)).unwrap();
-        assert!(bytes.starts_with(MAGIC_V2), "checkpoint tem de trazer o magic v2");
+        assert!(
+            bytes.starts_with(MAGIC_V2),
+            "checkpoint tem de trazer o magic v2"
+        );
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
             FORMAT_CURRENT,
@@ -1420,7 +1434,11 @@ mod compressao_tests {
         std::fs::write(dir.path().join(SNAPSHOT_FILE), &cru).unwrap();
 
         let lido = AttrIndex::open(dir.path());
-        assert_eq!(lido.lookup("campo", "valor").len(), 200, "v1 tem de continuar legivel");
+        assert_eq!(
+            lido.lookup("campo", "valor").len(),
+            200,
+            "v1 tem de continuar legivel"
+        );
     }
 
     #[test]
@@ -1450,11 +1468,9 @@ mod compressao_tests {
     fn dictionary_checkpoint_is_smaller_than_v4_for_repeated_fields() {
         let index = indice_com(20_000);
         let legacy = index.inner.to_legacy();
-        let legacy_body = bincode::serde::encode_to_vec(
-            LegacyCompressedSnapshot::from(&legacy),
-            BINCODE_CFG,
-        )
-        .unwrap();
+        let legacy_body =
+            bincode::serde::encode_to_vec(LegacyCompressedSnapshot::from(&legacy), BINCODE_CFG)
+                .unwrap();
         let current_body =
             bincode::serde::encode_to_vec(CompressedSnapshot::from(&index.inner), BINCODE_CFG)
                 .unwrap();
@@ -1488,8 +1504,13 @@ mod compressao_tests {
     fn indice_postings_longos(n: u64, valores: u64) -> AttrIndex {
         let mut ix = AttrIndex::new();
         for lsn in 0..n {
-            let mut ep = Episode::new("a", heraclitus_core::EventKind::Custom("T".into()), b"x".to_vec());
-            ep.attrs.insert("classe".into(), format!("c{}", lsn % valores));
+            let mut ep = Episode::new(
+                "a",
+                heraclitus_core::EventKind::Custom("T".into()),
+                b"x".to_vec(),
+            );
+            ep.attrs
+                .insert("classe".into(), format!("c{}", lsn % valores));
             ix.apply(lsn, &ep);
         }
         ix
@@ -1498,7 +1519,9 @@ mod compressao_tests {
     fn tamanhos(ix: &AttrIndex) -> (u64, u64) {
         let dir = tempfile::tempdir().unwrap();
         ix.save(dir.path()).unwrap();
-        let v2 = std::fs::metadata(dir.path().join(SNAPSHOT_FILE)).unwrap().len();
+        let v2 = std::fs::metadata(dir.path().join(SNAPSHOT_FILE))
+            .unwrap()
+            .len();
         let v1 = bincode::serde::encode_to_vec(ix.inner.to_legacy(), BINCODE_CFG)
             .unwrap()
             .len() as u64;
@@ -1539,8 +1562,14 @@ mod medicao_attr {
             format!("evento {i}").into_bytes(),
         );
         // Atributos realistas: alguns campos, muitos valores distintos.
-        e.attrs.insert("cpf".into(), format!("{:011}", i * 7919 % 100_000_000_000u64 as usize));
-        e.attrs.insert("tipo".into(), ["contrato", "aditivo", "rescisao"][i % 3].into());
+        e.attrs.insert(
+            "cpf".into(),
+            format!("{:011}", i * 7919 % 100_000_000_000u64 as usize),
+        );
+        e.attrs.insert(
+            "tipo".into(),
+            ["contrato", "aditivo", "rescisao"][i % 3].into(),
+        );
         e.attrs.insert("orgao".into(), format!("org-{}", i % 50));
         e.attrs.insert("valor".into(), format!("{}", i % 10_000));
         e
@@ -1607,10 +1636,7 @@ mod medicao_attr {
         let mut legacy = HashMap::<String, Vec<Lsn>>::new();
         let started = Instant::now();
         for (field, value, lsn) in &pairs {
-            insert_sorted(
-                legacy.entry(legacy_key(field, value)).or_default(),
-                *lsn,
-            );
+            insert_sorted(legacy.entry(legacy_key(field, value)).or_default(), *lsn);
         }
         let legacy_insert = started.elapsed();
 

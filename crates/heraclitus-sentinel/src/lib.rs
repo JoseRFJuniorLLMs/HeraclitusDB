@@ -32,8 +32,8 @@ pub mod policy;
 pub mod queue;
 pub mod sigma;
 pub mod state;
-pub mod threat;
 pub mod subscriber;
+pub mod threat;
 
 pub use ai::{
     ActionCapability, ActionKind, ActionProposal, AiContextBuilder, AiError, AiInvocationAudit,
@@ -88,8 +88,8 @@ pub use threat::{
     Admission, CanonicalError, ConfirmedMatch, FeedVersionState, HashAlgorithm, Indicator,
     IndicatorState, IocIndex, IpCidr, MatchKind, PrefilterOutcome, Pseudonymizer,
     SanitizationError, SanitizedThreatObject, SharingPolicy, StixImporter, ThreatFeed,
-    ThreatFeedUpdate, ThreatGateError, ThreatImportError, ThreatImporter, ThreatIntelDetector,
-    ThreatInputLimits, ThreatObject, ThreatObjectType, ThreatProvenance, ThreatSanitizer,
+    ThreatFeedUpdate, ThreatGateError, ThreatImportError, ThreatImporter, ThreatInputLimits,
+    ThreatIntelDetector, ThreatObject, ThreatObjectType, ThreatProvenance, ThreatSanitizer,
     ThreatSighting, ThreatSourcePolicy, ThreatSourceRegistry, TlpLevel, TrustLevel,
 };
 
@@ -581,7 +581,10 @@ impl SentinelRuntime {
 
     /// Quantos indicadores exactos estão no índice de IOC.
     pub fn threat_indicator_count(&self) -> usize {
-        self.inner.threat.as_ref().map_or(0, |p| p.indicator_count())
+        self.inner
+            .threat
+            .as_ref()
+            .map_or(0, |p| p.indicator_count())
     }
 
     /// Append an auditable checkpoint of the current derived-state watermarks.
@@ -1895,7 +1898,6 @@ fn remember_rule_event(inner: &RuntimeInner, source_lsn: Lsn, event: &SecurityEv
         }
     }
 }
-
 
 /// SPEC-0047 §11/§36 — correlaciona o evento contra o índice de IOC e persiste
 /// o que daí sai: **evidência**, nunca uma acção.
@@ -3304,9 +3306,18 @@ mod testes_janela_de_chaves {
     #[test]
     fn uma_chave_repetida_e_suprimida() {
         let mut j = JanelaDeChaves::nova(8);
-        assert!(j.inserir(&"t:ioc-1:domain:E1".to_string()), "a primeira e nova");
-        assert!(!j.inserir(&"t:ioc-1:domain:E1".to_string()), "a segunda e o duplicado");
-        assert!(j.inserir(&"t:ioc-1:domain:E2".to_string()), "outro evento e outra chave");
+        assert!(
+            j.inserir(&"t:ioc-1:domain:E1".to_string()),
+            "a primeira e nova"
+        );
+        assert!(
+            !j.inserir(&"t:ioc-1:domain:E1".to_string()),
+            "a segunda e o duplicado"
+        );
+        assert!(
+            j.inserir(&"t:ioc-1:domain:E2".to_string()),
+            "outro evento e outra chave"
+        );
     }
 
     /// A propriedade que faltava: a estrutura NAO cresce para sempre.
@@ -3337,7 +3348,10 @@ mod testes_janela_de_chaves {
         assert!(j.inserir(&"b".to_string()));
         assert!(!j.inserir(&"a".to_string()), "ainda esta na janela");
         j.inserir(&"c".to_string()); // expulsa "a"
-        assert!(j.inserir(&"a".to_string()), "saiu da janela, volta a ser nova");
+        assert!(
+            j.inserir(&"a".to_string()),
+            "saiu da janela, volta a ser nova"
+        );
         assert_eq!(j.len(), 2);
     }
 
@@ -3382,9 +3396,16 @@ mod testes_janela_de_lsn {
         for lsn in 0..100_000u64 {
             j.inserir(&lsn);
         }
-        assert_eq!(j.len(), 64, "cem mil eventos nao podem deixar cem mil entradas");
+        assert_eq!(
+            j.len(),
+            64,
+            "cem mil eventos nao podem deixar cem mil entradas"
+        );
         assert!(j.contem(&99_999), "os recentes continuam la");
-        assert!(!j.contem(&0), "os antigos sairam, que e o que o tecto significa");
+        assert!(
+            !j.contem(&0),
+            "os antigos sairam, que e o que o tecto significa"
+        );
     }
 
     #[test]

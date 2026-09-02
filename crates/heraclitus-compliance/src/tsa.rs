@@ -16,8 +16,8 @@
 //! (SPEC-0046 §10/§11). É o de produção. Este módulo descrevia-se como se ele
 //! não existisse — e uma descrição que envelhece manda corrigir a coisa errada.
 
-use crate::rfc3161::{MessageImprint, TimeStampReq};
 use crate::receipt::TimestampValidationState;
+use crate::rfc3161::{MessageImprint, TimeStampReq};
 use crate::{now_unix_ms, CompError};
 use der::asn1::OctetString;
 use der::{Encode, Sequence};
@@ -194,9 +194,8 @@ impl TsaClient for HttpTsa {
         // `ExternalTokenUnvalidated` diz. Mas o que ele guarda passa a ser um
         // token, e um token guardado hoje pode ser verificado amanhã, quando o
         // órgão instalar as âncoras.
-        let resp = crate::rfc3161::TimeStampResp::from_der_bytes(&resposta).map_err(|e| {
-            CompError::Tsa(format!("resposta da ACT não é uma TimeStampResp: {e}"))
-        })?;
+        let resp = crate::rfc3161::TimeStampResp::from_der_bytes(&resposta)
+            .map_err(|e| CompError::Tsa(format!("resposta da ACT não é uma TimeStampResp: {e}")))?;
         resp.granted_token()
             .map_err(|e| CompError::Tsa(e.to_string()))
     }

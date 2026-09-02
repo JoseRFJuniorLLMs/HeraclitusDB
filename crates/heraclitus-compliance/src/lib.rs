@@ -28,22 +28,22 @@
 //! externo contra uma cadeia de confiança, e não pode ser feita por este crate
 //! ainda.
 
-pub mod commit;
-pub mod dashboard;
 pub mod algoritmos;
 pub mod classification;
+pub mod commit;
 pub mod constraints;
 pub mod crl;
+pub mod dashboard;
 pub mod deferred;
+pub mod icp;
 pub mod model_bundle;
 pub mod privacy;
-pub mod regulatory;
 pub mod receipt;
+pub mod regulatory;
 pub mod rfc3161;
+pub mod secure_tsa;
 pub mod signer;
 pub mod sovereignty;
-pub mod icp;
-pub mod secure_tsa;
 pub mod trust_store;
 pub mod tsa;
 
@@ -52,22 +52,21 @@ pub(crate) mod test_pki;
 pub mod verify;
 pub mod worker;
 
-pub use commit::{commit_at, commit_now, current_watermark, Commitment};
-pub use dashboard::{
-    AnchorHealthSnapshot, ComplianceDashboardError, ComplianceDashboardSnapshot,
-    ComplianceOverallStatus, DeadlineHealthSnapshot, LegalHoldSnapshot,
-    SovereigntyHealthSnapshot,
-};
 pub use classification::{
     classify_derived_episode, ClassificationControls, ClassificationDecision,
     ClassificationDowngradeAuthorization, ClassificationError, ClassificationPolicy,
     SourceClassification,
 };
+pub use commit::{commit_at, commit_now, current_watermark, Commitment};
+pub use dashboard::{
+    AnchorHealthSnapshot, ComplianceDashboardError, ComplianceDashboardSnapshot,
+    ComplianceOverallStatus, DeadlineHealthSnapshot, LegalHoldSnapshot, SovereigntyHealthSnapshot,
+};
 pub use deferred::{
-    import_deferred_response, stamp_deferred_request, DeferredAnchorError,
-    DeferredAnchorRegistry, DeferredAnchorRequest, DeferredAnchorResponse, DeferredAnchorState,
-    DeferredSignature, DeferredTransferPolicy, EvidenceAnchor, EvidenceCommitment,
-    SignedDeferredAnchorRequest, SignedDeferredAnchorResponse,
+    import_deferred_response, stamp_deferred_request, DeferredAnchorError, DeferredAnchorRegistry,
+    DeferredAnchorRequest, DeferredAnchorResponse, DeferredAnchorState, DeferredSignature,
+    DeferredTransferPolicy, EvidenceAnchor, EvidenceCommitment, SignedDeferredAnchorRequest,
+    SignedDeferredAnchorResponse,
 };
 pub use model_bundle::{
     build_signed_model_bundle, verify_model_bundle, BundleSignature, BundleSignatureScheme,
@@ -81,6 +80,7 @@ pub use privacy::{
     PrivacySanitizationReport, PrivacyState, RegulatoryDeadline, RipdEvidenceAppendix, RiskLevel,
     SubmissionState,
 };
+pub use receipt::{load_manifest, read_token, LegalReceipt, TimestampValidationState};
 pub use regulatory::{
     ComplianceContext, CompliancePredicate, ComplianceRequirement, ConfiguredRegulatoryPolicy,
     EvidenceSelector, LegalHold, LegalHoldRecord, LegalHoldRelease, PolicyActivation,
@@ -88,12 +88,12 @@ pub use regulatory::{
     RegulatoryError, RegulatoryPolicy, RegulatoryPolicyEngine, RegulatoryRule, RegulatoryState,
     RequirementEffect, RetentionClass,
 };
-pub use receipt::{load_manifest, read_token, LegalReceipt, TimestampValidationState};
 pub use signer::{InstitutionalSignature, InstitutionalSigner, Pkcs11Signer, SoftKeySigner};
 pub use sovereignty::{
     EgressDecision, EgressEndpoint, EgressPermit, EgressPurpose, GuardedModelBackend,
-    GuardedTsaClient, ModelDecision, ModelSovereignty, SovereignModelBackend, SovereigntyAuditState,
-    SovereigntyError, SovereigntyMode, SovereigntyPolicy, SovereigntyRuntime, SovereigntyVerdict,
+    GuardedTsaClient, ModelDecision, ModelSovereignty, SovereignModelBackend,
+    SovereigntyAuditState, SovereigntyError, SovereigntyMode, SovereigntyPolicy,
+    SovereigntyRuntime, SovereigntyVerdict,
 };
 pub use tsa::{HttpTsa, LocalTsa, TsaClient};
 pub use verify::{is_dev_token, verify_dev_token, VerifiedTime};
@@ -340,8 +340,8 @@ pub fn verify_receipt_with_verifier<L: heraclitus_log::EpisodeLog + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use heraclitus_log::Log;
     use heraclitus_core::{Episode, EventKind, FsyncPolicy};
+    use heraclitus_log::Log;
 
     fn append_n(log: &Log, n: usize) {
         for i in 0..n {
@@ -439,13 +439,10 @@ mod tests {
 
         assert_eq!(
             verify_receipt(&log, receipts.path(), &receipt).unwrap(),
-            ReceiptVerification::CommitmentOnly(
-                TimestampValidationState::ExternalTokenUnvalidated
-            )
+            ReceiptVerification::CommitmentOnly(TimestampValidationState::ExternalTokenUnvalidated)
         );
     }
 }
-
 
 #[cfg(test)]
 mod testes_politica_ponta_a_ponta {
@@ -587,7 +584,10 @@ mod testes_politica_ponta_a_ponta {
             Some("ACT de Teste do Órgão"),
             "o rótulo humano não é uma política RFC 3161"
         );
-        assert_eq!(r.policy, "ACT de Teste do Órgão", "o rótulo fica no seu campo");
+        assert_eq!(
+            r.policy, "ACT de Teste do Órgão",
+            "o rótulo fica no seu campo"
+        );
     }
 
     /// Um cliente que se declara verificado e não sabe dizer a política

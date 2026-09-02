@@ -50,10 +50,7 @@ pub fn verify_evidence(root: &Path) -> Result<VerificationSummary> {
 
 /// Verify a sealed dossier and, when `binary` is supplied, re-hash it and
 /// require it to be the exact artifact the trials ran against.
-pub fn verify_evidence_against(
-    root: &Path,
-    binary: Option<&Path>,
-) -> Result<VerificationSummary> {
+pub fn verify_evidence_against(root: &Path, binary: Option<&Path>) -> Result<VerificationSummary> {
     if !root.is_dir() {
         bail!("evidence directory does not exist: {}", root.display());
     }

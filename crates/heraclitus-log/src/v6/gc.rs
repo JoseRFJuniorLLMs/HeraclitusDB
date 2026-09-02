@@ -468,13 +468,7 @@ pub fn commit_gc(
     storage_root: &Path,
     plan: &GcPlan,
 ) -> V6Result<GcExecution> {
-    commit_gc_with_observer(
-        store,
-        manifest,
-        storage_root,
-        plan,
-        &mut |_| Ok(()),
-    )
+    commit_gc_with_observer(store, manifest, storage_root, plan, &mut |_| Ok(()))
 }
 
 #[doc(hidden)]
@@ -485,8 +479,7 @@ pub fn commit_gc_with_observer(
     plan: &GcPlan,
     observer: &mut dyn FnMut(PackingStage) -> V6Result<()>,
 ) -> V6Result<GcExecution> {
-    let pending =
-        commit_gc_manifest_with_observer(store, manifest, storage_root, plan, observer)?;
+    let pending = commit_gc_manifest_with_observer(store, manifest, storage_root, plan, observer)?;
     unlink_gc_targets(pending, observer)
 }
 
@@ -634,7 +627,10 @@ fn resolve_gc_path(storage_root: &Path, location: &str) -> V6Result<PathBuf> {
     let root = std::fs::canonicalize(storage_root)?;
     let declared = Path::new(location);
     if declared.components().any(|component| {
-        matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
     }) && !declared.is_absolute()
     {
         return Err(corrupt(CTX, "relative location escapes the storage root"));

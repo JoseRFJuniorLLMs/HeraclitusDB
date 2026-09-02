@@ -54,14 +54,10 @@ use crate::CompError;
 pub const OID_ECDSA_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.2");
 pub const OID_ECDSA_SHA384: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.3");
 pub const OID_ECDSA_SHA512: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.4.3.4");
-pub const OID_SHA256_RSA: ObjectIdentifier =
-    ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
-pub const OID_SHA384_RSA: ObjectIdentifier =
-    ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.12");
-pub const OID_SHA512_RSA: ObjectIdentifier =
-    ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.13");
-pub const OID_RSASSA_PSS: ObjectIdentifier =
-    ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10");
+pub const OID_SHA256_RSA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11");
+pub const OID_SHA384_RSA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.12");
+pub const OID_SHA512_RSA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.13");
+pub const OID_RSASSA_PSS: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10");
 
 // --- chave -------------------------------------------------------------
 pub const OID_RSA_ENCRYPTION: ObjectIdentifier =

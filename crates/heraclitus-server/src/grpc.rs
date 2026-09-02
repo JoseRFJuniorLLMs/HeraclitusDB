@@ -308,14 +308,11 @@ impl pb::heraclitus_server::Heraclitus for Service {
                 op @ ("regulatory-policy-activate"
                 | "regulatory-evaluate"
                 | "regulatory-policies"
-                | "regulatory-decisions") => {
-                    crate::grpc::regulatory_policy_op(&engine, op, &r.arg)
-                }
-                op @ ("privacy-assessment"
-                | "privacy-deadline"
-                | "privacy-package"
+                | "regulatory-decisions") => crate::grpc::regulatory_policy_op(&engine, op, &r.arg),
+                op @ ("privacy-assessment" | "privacy-deadline" | "privacy-package"
                 | "privacy-state") => crate::grpc::privacy_incident_op(&engine, op, &r.arg),
-                op @ ("deferred-anchor-prepare" | "deferred-anchor-import" | "deferred-anchors") => {
+                op
+                @ ("deferred-anchor-prepare" | "deferred-anchor-import" | "deferred-anchors") => {
                     crate::grpc::deferred_anchor_op(&engine, op, &r.arg)
                 }
                 op @ ("model-bundle-activate" | "model-bundles") => {
@@ -326,12 +323,19 @@ impl pb::heraclitus_server::Heraclitus for Service {
                     Err(e) => (false, e.to_string()),
                 },
                 "sentinel-status" => match sentinel.as_ref() {
-                    Some(runtime) => (true, serde_json::to_string(&runtime.status()).unwrap_or_default()),
+                    Some(runtime) => (
+                        true,
+                        serde_json::to_string(&runtime.status()).unwrap_or_default(),
+                    ),
                     None => (false, "sentinel desabilitado".into()),
                 },
                 "sentinel-incidents" => match sentinel.as_ref() {
-                    Some(runtime) => match runtime.query_incidents(heraclitus_sentinel::IncidentFilter::default()) {
-                        Ok(incidents) => (true, serde_json::to_string(&incidents).unwrap_or_default()),
+                    Some(runtime) => match runtime
+                        .query_incidents(heraclitus_sentinel::IncidentFilter::default())
+                    {
+                        Ok(incidents) => {
+                            (true, serde_json::to_string(&incidents).unwrap_or_default())
+                        }
                         Err(error) => (false, error.to_string()),
                     },
                     None => (false, "sentinel desabilitado".into()),
@@ -339,12 +343,17 @@ impl pb::heraclitus_server::Heraclitus for Service {
                 "sentinel-actions" => match sentinel.as_ref() {
                     Some(runtime) => match runtime.l4_events(None, None, None, 10_000) {
                         Ok(rows) => {
-                            let values: Vec<_> = rows.into_iter().map(|(lsn, episode)| serde_json::json!({
-                                "lsn": lsn,
-                                "kind": episode.kind.label(),
-                                "attrs": episode.attrs,
-                                "content": crate::rest::bytes_str(&episode.content),
-                            })).collect();
+                            let values: Vec<_> = rows
+                                .into_iter()
+                                .map(|(lsn, episode)| {
+                                    serde_json::json!({
+                                        "lsn": lsn,
+                                        "kind": episode.kind.label(),
+                                        "attrs": episode.attrs,
+                                        "content": crate::rest::bytes_str(&episode.content),
+                                    })
+                                })
+                                .collect();
                             (true, serde_json::to_string(&values).unwrap_or_default())
                         }
                         Err(error) => (false, error.to_string()),
@@ -377,37 +386,41 @@ impl pb::heraclitus_server::Heraclitus for Service {
                                         .to_owned(),
                                 ))
                             })
-                            .ok_or_else(|| "arg deve conter incident_id, proposal_id e approval_id".to_string())
-                            .and_then(|(incident_id, proposal_id, approval_id, approver, reason)| {
-                                // O `approver` vinha do CORPO do pedido: quem
-                                // alcancasse esta chamada registava uma
-                                // aprovacao humana em nome de qualquer pessoa,
-                                // e um registo de aprovacao existe precisamente
-                                // para atribuir responsabilidade. Passa a ser
-                                // sempre a identidade AUTENTICADA (a mesma que
-                                // ja vai para `audit_admin` na linha de baixo —
-                                // nao fazia sentido a auditoria saber quem era
-                                // e o registo de aprovacao nao saber).
-                                //
-                                // Se o corpo indicar um aprovador, tem de
-                                // coincidir: 403 em vez de correccao silenciosa,
-                                // para que a tentativa fique visivel.
-                                let approver = crate::auth::vincular_aprovador(
-                                    approver.as_deref(),
-                                    &audit_principal,
-                                )?;
-                                runtime
-                                    .persist_human_approval_for(
-                                        &incident_id,
-                                        &proposal_id,
-                                        &approval_id,
-                                        approver,
-                                        operation == "sentinel-approve",
-                                        &reason,
-                                    )
-                                    .map(|lsn| format!("approval_lsn={lsn}"))
-                                    .map_err(|error| error.to_string())
-                            });
+                            .ok_or_else(|| {
+                                "arg deve conter incident_id, proposal_id e approval_id".to_string()
+                            })
+                            .and_then(
+                                |(incident_id, proposal_id, approval_id, approver, reason)| {
+                                    // O `approver` vinha do CORPO do pedido: quem
+                                    // alcancasse esta chamada registava uma
+                                    // aprovacao humana em nome de qualquer pessoa,
+                                    // e um registo de aprovacao existe precisamente
+                                    // para atribuir responsabilidade. Passa a ser
+                                    // sempre a identidade AUTENTICADA (a mesma que
+                                    // ja vai para `audit_admin` na linha de baixo —
+                                    // nao fazia sentido a auditoria saber quem era
+                                    // e o registo de aprovacao nao saber).
+                                    //
+                                    // Se o corpo indicar um aprovador, tem de
+                                    // coincidir: 403 em vez de correccao silenciosa,
+                                    // para que a tentativa fique visivel.
+                                    let approver = crate::auth::vincular_aprovador(
+                                        approver.as_deref(),
+                                        &audit_principal,
+                                    )?;
+                                    runtime
+                                        .persist_human_approval_for(
+                                            &incident_id,
+                                            &proposal_id,
+                                            &approval_id,
+                                            approver,
+                                            operation == "sentinel-approve",
+                                            &reason,
+                                        )
+                                        .map(|lsn| format!("approval_lsn={lsn}"))
+                                        .map_err(|error| error.to_string())
+                                },
+                            );
                         match result {
                             Ok(message) => (true, message),
                             Err(error) => (false, error),

@@ -20,13 +20,23 @@ fn partition_heals_with_zero_acked_loss() {
     let leader_dir = tempfile::tempdir().unwrap();
     let follower_dir = tempfile::tempdir().unwrap();
     let leader_log = Arc::new(
-        AnyLog::open(StorageFormat::V6, leader_dir.path(), 1 << 20, FsyncPolicy::Always).unwrap(),
+        AnyLog::open(
+            StorageFormat::V6,
+            leader_dir.path(),
+            1 << 20,
+            FsyncPolicy::Always,
+        )
+        .unwrap(),
     );
-    let follower_log =
-        Arc::new(
-            AnyLog::open(StorageFormat::V6, follower_dir.path(), 1 << 20, FsyncPolicy::Always)
-                .unwrap(),
-        );
+    let follower_log = Arc::new(
+        AnyLog::open(
+            StorageFormat::V6,
+            follower_dir.path(),
+            1 << 20,
+            FsyncPolicy::Always,
+        )
+        .unwrap(),
+    );
 
     let mut sim = turmoil::Builder::new()
         .simulation_duration(std::time::Duration::from_secs(300))

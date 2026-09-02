@@ -51,8 +51,8 @@ use std::path::Path;
 
 use heraclitus_core::{EventKind, Lsn};
 
-use super::error::{checked_len, corrupt, V6Result};
 use super::canonical::CANONICAL_CODEC_V1;
+use super::error::{checked_len, corrupt, V6Result};
 
 // ---------------------------------------------------------------------------
 // Constantes de formato
@@ -634,7 +634,10 @@ impl Hrki {
             }
             let corpo = &buf[ini..fim];
             if super::crc32c_of(corpo) != e.crc32c {
-                return Err(corrupt(CTX, format!("section {} crc mismatch", e.section_type)));
+                return Err(corrupt(
+                    CTX,
+                    format!("section {} crc mismatch", e.section_type),
+                ));
             }
 
             match e.section_type {
@@ -808,7 +811,9 @@ impl HrkiBuilder {
                 IndexPolicy::EncryptedSidecar => {
                     return Err(corrupt(
                         CTX,
-                        format!("campo '{campo}': ENCRYPTED_SIDECAR nao esta implementado nesta fase"),
+                        format!(
+                            "campo '{campo}': ENCRYPTED_SIDECAR nao esta implementado nesta fase"
+                        ),
                     ));
                 }
                 _ => {}
@@ -1160,7 +1165,10 @@ mod tests {
     #[test]
     fn hashed_equality_sem_chave_e_recusado() {
         let r = HrkiBuilder::novo(1, [0u8; 32], politica(), None);
-        assert!(r.is_err(), "declarar HashedEquality sem chave tem de falhar");
+        assert!(
+            r.is_err(),
+            "declarar HashedEquality sem chave tem de falhar"
+        );
     }
 
     #[test]
@@ -1243,7 +1251,10 @@ mod tests {
         let mut bytes = b.construir(0.01).encode();
         let n = bytes.len();
         bytes[n - 5] ^= 0xFF;
-        assert!(Hrki::decode(&bytes).is_err(), "crc de seccao tem de apanhar");
+        assert!(
+            Hrki::decode(&bytes).is_err(),
+            "crc de seccao tem de apanhar"
+        );
     }
 
     #[test]

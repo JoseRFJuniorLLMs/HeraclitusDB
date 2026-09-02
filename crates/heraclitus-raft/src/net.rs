@@ -361,7 +361,15 @@ mod tests {
         let mut dirs = Vec::new();
         for id in 0..3u64 {
             let dir = tempfile::tempdir().unwrap();
-            let log = Arc::new(AnyLog::open(crate::formato_de_teste(), dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+            let log = Arc::new(
+                AnyLog::open(
+                    crate::formato_de_teste(),
+                    dir.path(),
+                    1 << 20,
+                    FsyncPolicy::Always,
+                )
+                .unwrap(),
+            );
             tcp.push(spawn_node_tcp(id, log, config.clone()).await.unwrap());
             dirs.push(dir);
         }
@@ -434,7 +442,15 @@ mod tests {
         let mut dirs = Vec::new();
         for id in 0..3u64 {
             let dir = tempfile::tempdir().unwrap();
-            let log = Arc::new(AnyLog::open(crate::formato_de_teste(), dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+            let log = Arc::new(
+                AnyLog::open(
+                    crate::formato_de_teste(),
+                    dir.path(),
+                    1 << 20,
+                    FsyncPolicy::Always,
+                )
+                .unwrap(),
+            );
             tcp.push(spawn_node_tcp(id, log, config.clone()).await.unwrap());
             dirs.push(dir);
         }

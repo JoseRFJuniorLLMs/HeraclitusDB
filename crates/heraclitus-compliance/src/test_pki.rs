@@ -20,15 +20,15 @@
 //! superfície que não tem razão para existir.
 
 use const_oid::db::rfc5280::ID_KP_TIME_STAMPING;
+use const_oid::AssociatedOid;
 use der::asn1::OctetString;
 use der::{Any, Encode};
 use p256::ecdsa::{DerSignature, SigningKey};
-use x509_cert::spki::SubjectPublicKeyInfoOwned;
-use const_oid::AssociatedOid;
 use x509_cert::builder::{Builder, CertificateBuilder, Profile};
 use x509_cert::ext::pkix::ExtendedKeyUsage;
 use x509_cert::name::Name;
 use x509_cert::serial_number::SerialNumber;
+use x509_cert::spki::SubjectPublicKeyInfoOwned;
 use x509_cert::time::Validity;
 use x509_cert::Certificate;
 
@@ -188,7 +188,6 @@ pub fn chain_com(eku_timestamping: bool, dentro_da_validade: bool) -> Chain {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Construção de TimeStampTokens para os testes do verificador
 // ---------------------------------------------------------------------------
@@ -312,8 +311,7 @@ pub fn token_de_teste(
             },
         },
         serial_number: Int::new(&[0x2a]).expect("serial"),
-        gen_time: crate::icp::GenTime::nova(gen_unix_secs, opcoes.gen_time_milis)
-            .expect("genTime"),
+        gen_time: crate::icp::GenTime::nova(gen_unix_secs, opcoes.gen_time_milis).expect("genTime"),
         accuracy: Some(Accuracy {
             seconds: Some(1),
             millis: None,
@@ -354,21 +352,20 @@ pub fn token_de_teste(
                 // O primeiro esta CERTO. So o segundo diz outra coisa — e era
                 // o primeiro que o verificador examinava.
                 vec![
-                    Any::new(Tag::ObjectIdentifier, OID_CT_TST_INFO.as_bytes())
-                        .expect("any oid"),
+                    Any::new(Tag::ObjectIdentifier, OID_CT_TST_INFO.as_bytes()).expect("any oid"),
                     Any::new(Tag::ObjectIdentifier, OID_SHA256.as_bytes()).expect("any oid 2"),
                 ]
             } else {
-                vec![Any::new(Tag::ObjectIdentifier, OID_CT_TST_INFO.as_bytes())
-                    .expect("any oid")]
+                vec![Any::new(Tag::ObjectIdentifier, OID_CT_TST_INFO.as_bytes()).expect("any oid")]
             })
             .expect("set"),
         });
     }
     atributos.push(x509_cert::attr::Attribute {
         oid: OID_ATTR_MESSAGE_DIGEST,
-        values: SetOfVec::try_from(vec![Any::new(Tag::OctetString, digest.clone())
-            .expect("any digest")])
+        values: SetOfVec::try_from(vec![
+            Any::new(Tag::OctetString, digest.clone()).expect("any digest")
+        ])
         .expect("set"),
     });
 
@@ -391,15 +388,21 @@ pub fn token_de_teste(
             };
             let (sig, oid) = match d {
                 DigestRsa::Sha256 => (
-                    SigningKey::<sha2::Sha256>::new(chave_rsa).sign(&assinado).to_vec(),
+                    SigningKey::<sha2::Sha256>::new(chave_rsa)
+                        .sign(&assinado)
+                        .to_vec(),
                     const_oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.11"),
                 ),
                 DigestRsa::Sha384 => (
-                    SigningKey::<sha2::Sha384>::new(chave_rsa).sign(&assinado).to_vec(),
+                    SigningKey::<sha2::Sha384>::new(chave_rsa)
+                        .sign(&assinado)
+                        .to_vec(),
                     const_oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.12"),
                 ),
                 DigestRsa::Sha512 => (
-                    SigningKey::<sha2::Sha512>::new(chave_rsa).sign(&assinado).to_vec(),
+                    SigningKey::<sha2::Sha512>::new(chave_rsa)
+                        .sign(&assinado)
+                        .to_vec(),
                     const_oid::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.13"),
                 ),
             };
@@ -462,19 +465,17 @@ pub fn token_de_teste(
         // Tem de bater com o `digestAlgorithm` do SignerInfo: o envelope
         // declara os digests que o verificador vai precisar, e um SignerInfo
         // que use outro contradi-lo.
-        digest_algorithms: SetOfVec::try_from(vec![algid(if opcoes
-            .envelope_declara_outro_digest
-        {
-            const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.3")
-        } else {
-            oid_digest
-        })])
+        digest_algorithms: SetOfVec::try_from(vec![algid(
+            if opcoes.envelope_declara_outro_digest {
+                const_oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.3")
+            } else {
+                oid_digest
+            },
+        )])
         .expect("digest algs"),
         encap_content_info: EncapsulatedContentInfo {
             econtent_type,
-            econtent: Some(
-                Any::new(Tag::OctetString, tst_der.clone()).expect("econtent"),
-            ),
+            econtent: Some(Any::new(Tag::OctetString, tst_der.clone()).expect("econtent")),
         },
         certificates: certificados,
         crls: if opcoes.crls_no_token.is_empty() {
@@ -502,7 +503,6 @@ pub fn token_de_teste(
     };
     ci.to_der().expect("token der")
 }
-
 
 // ---------------------------------------------------------------------------
 // CRLs sinteticas (SPEC-0046 §9). Emitidas pela mesma raiz que emite a folha,
@@ -537,7 +537,14 @@ pub fn crl_de_teste(
     next_update_s: Option<u64>,
     revogados: Vec<Revogacao>,
 ) -> Vec<u8> {
-    crl_com(emissor, emissor_key, this_update_s, next_update_s, revogados, false)
+    crl_com(
+        emissor,
+        emissor_key,
+        this_update_s,
+        next_update_s,
+        revogados,
+        false,
+    )
 }
 
 /// Como `crl_de_teste`, mas pode marcar a CRL como DELTA.
@@ -569,7 +576,10 @@ pub fn crl_com(
                 // ENUMERATED (tag 0x0A), um octeto.
                 let valor = der::asn1::Any::new(
                     etiqueta,
-                    OctetString::new(vec![codigo]).expect("octet").as_bytes().to_vec(),
+                    OctetString::new(vec![codigo])
+                        .expect("octet")
+                        .as_bytes()
+                        .to_vec(),
                 )
                 .expect("enumerated");
                 vec![Extension {
@@ -613,7 +623,10 @@ pub fn crl_com(
                 extn_id: const_oid::ObjectIdentifier::new_unwrap("2.5.29.27"),
                 critical: true,
                 extn_value: OctetString::new(
-                    der::asn1::Uint::new(&[1u8]).expect("uint").to_der().expect("der"),
+                    der::asn1::Uint::new(&[1u8])
+                        .expect("uint")
+                        .to_der()
+                        .expect("der"),
                 )
                 .expect("octet"),
             }])
@@ -783,7 +796,8 @@ pub fn cadeia_tres_niveis(opcoes: OpcoesRestricoes) -> CadeiaTresNiveis {
     }
     if opcoes.critica_desconhecida_na_folha {
         // 1.3.6.1.4.1.99999.1 — nao esta em CRITICAS_PROCESSADAS, de proposito.
-        fb.add_extension(&CriticaDesconhecida).expect("extensao critica");
+        fb.add_extension(&CriticaDesconhecida)
+            .expect("extensao critica");
     }
     let folha: Certificate = fb.build::<DerSignature>().expect("assinar folha");
     let folha_der = folha.to_der().expect("der da folha");
@@ -850,8 +864,7 @@ pub fn sosia_do_intermedio(c: &CadeiaTresNiveis) -> Certificate {
 struct EkuNaoCritico(Vec<const_oid::ObjectIdentifier>);
 
 impl AssociatedOid for EkuNaoCritico {
-    const OID: const_oid::ObjectIdentifier =
-        const_oid::ObjectIdentifier::new_unwrap("2.5.29.37");
+    const OID: const_oid::ObjectIdentifier = const_oid::ObjectIdentifier::new_unwrap("2.5.29.37");
 }
 
 impl der::Encode for EkuNaoCritico {
@@ -1120,7 +1133,6 @@ pub fn chain_rsa(digest: DigestRsa, raiz_fraca: bool) -> Chain {
     }
 }
 
-
 #[cfg(test)]
 mod despejo_para_o_harness {
     /// Escreve uma cadeia sintetica completa em disco — ancora, token e CRL —
@@ -1167,7 +1179,11 @@ mod despejo_para_o_harness {
         std::fs::write(base.join("carimbo.tst"), &token).unwrap();
         let hex: String = imprint.iter().map(|b| format!("{b:02x}")).collect();
         std::fs::write(base.join("imprint.txt"), &hex).unwrap();
-        std::fs::write(base.join("politica.txt"), super::OID_POLITICA_TESTE.to_string()).unwrap();
+        std::fs::write(
+            base.join("politica.txt"),
+            super::OID_POLITICA_TESTE.to_string(),
+        )
+        .unwrap();
         println!("despejado em {dir}");
         println!("imprint  = {hex}");
         println!("politica = {}", super::OID_POLITICA_TESTE);

@@ -2,9 +2,7 @@
 
 use std::path::PathBuf;
 
-use heraclitus_log::v6::{
-    pack_and_commit_with_observer, ManifestStore, PackOptions, PackingStage,
-};
+use heraclitus_log::v6::{pack_and_commit_with_observer, ManifestStore, PackOptions, PackingStage};
 
 fn main() {
     let mut args = std::env::args_os().skip(1);
@@ -15,12 +13,12 @@ fn main() {
         .and_then(|value| PackingStage::parse(&value))
         .expect("valid packing stage");
     let store = ManifestStore::open_read_only(root.join("manifests")).expect("manifest store");
-    let mut loaded = store.load().expect("load manifest").expect("manifest").manifest;
-    let segment = loaded
-        .segments_v2
-        .first()
-        .cloned()
-        .expect("sealed segment");
+    let mut loaded = store
+        .load()
+        .expect("load manifest")
+        .expect("manifest")
+        .manifest;
+    let segment = loaded.segments_v2.first().cloned().expect("sealed segment");
     let source = segment
         .generations
         .iter()

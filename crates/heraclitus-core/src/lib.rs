@@ -31,8 +31,8 @@ pub use canonical::CanonicalKeyCodec;
 pub use capability::CapabilityCatalog;
 pub use config::{
     AccessCredential, AccessRole, FsyncPolicy, HeraclitusConfig, RaftTransport, ReplicationConfig,
-    SentinelConfig, SentinelL1Config, SentinelL2Config, SentinelL3Config, SentinelThreatConfig, SentinelMode,
-    StorageFormat,
+    SentinelConfig, SentinelL1Config, SentinelL2Config, SentinelL3Config, SentinelMode,
+    SentinelThreatConfig, StorageFormat,
 };
 pub use consistency::IsolationLevel;
 pub use error::HeraclitusError;

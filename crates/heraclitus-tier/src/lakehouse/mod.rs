@@ -119,7 +119,10 @@ impl ExportProvenance {
         let mut put = |k: &str, v: String| {
             m.insert(format!("{PROV_PREFIX}{k}"), v);
         };
-        put("export_format_version", self.export_format_version.to_string());
+        put(
+            "export_format_version",
+            self.export_format_version.to_string(),
+        );
         put("storage_namespace_id", self.storage_namespace_id.clone());
         put("segment_id", self.segment_id.to_string());
         put("generation", self.generation.to_string());
@@ -138,18 +141,19 @@ impl ExportProvenance {
     /// Reconstrói a proveniência a partir da metadata de um Parquet exportado.
     pub fn from_key_values(kv: &BTreeMap<String, String>) -> Result<Self, HeraclitusError> {
         let get = |k: &str| -> Result<&String, HeraclitusError> {
-            kv.get(&format!("{PROV_PREFIX}{k}")).ok_or_else(|| {
-                HeraclitusError::Corruption {
+            kv.get(&format!("{PROV_PREFIX}{k}"))
+                .ok_or_else(|| HeraclitusError::Corruption {
                     context: "proveniência de exportação".into(),
                     detail: format!("chave `{PROV_PREFIX}{k}` ausente"),
-                }
-            })
+                })
         };
         let num = |k: &str| -> Result<u64, HeraclitusError> {
-            get(k)?.parse::<u64>().map_err(|e| HeraclitusError::Corruption {
-                context: "proveniência de exportação".into(),
-                detail: format!("`{k}` não é numérico: {e}"),
-            })
+            get(k)?
+                .parse::<u64>()
+                .map_err(|e| HeraclitusError::Corruption {
+                    context: "proveniência de exportação".into(),
+                    detail: format!("`{k}` não é numérico: {e}"),
+                })
         };
         Ok(Self {
             export_format_version: num("export_format_version")? as u32,
@@ -252,13 +256,11 @@ impl ExportWatermark {
     pub const PATH: &'static str = "_heraclitus/watermark.json";
 
     pub fn encode(&self) -> Result<Vec<u8>, HeraclitusError> {
-        serde_json::to_vec_pretty(self)
-            .map_err(|e| HeraclitusError::Serialization(e.to_string()))
+        serde_json::to_vec_pretty(self).map_err(|e| HeraclitusError::Serialization(e.to_string()))
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, HeraclitusError> {
-        serde_json::from_slice(bytes)
-            .map_err(|e| HeraclitusError::Serialization(e.to_string()))
+        serde_json::from_slice(bytes).map_err(|e| HeraclitusError::Serialization(e.to_string()))
     }
 }
 
@@ -273,7 +275,10 @@ mod tests {
     #[test]
     fn proveniencia_faz_round_trip_pela_metadata() {
         let p = prov(88, 2, 100, 199);
-        assert_eq!(ExportProvenance::from_key_values(&p.key_values()).unwrap(), p);
+        assert_eq!(
+            ExportProvenance::from_key_values(&p.key_values()).unwrap(),
+            p
+        );
     }
 
     #[test]
@@ -332,6 +337,9 @@ mod tests {
         let mut w = ExportWatermark::new("eventos");
         w.record(&prov(2, 0, 50, 99), 5);
         w.record(&prov(1, 0, 0, 49), 6);
-        assert_eq!(w.last_lsn, 99, "exportar um segmento antigo recuou o watermark");
+        assert_eq!(
+            w.last_lsn, 99,
+            "exportar um segmento antigo recuou o watermark"
+        );
     }
 }
