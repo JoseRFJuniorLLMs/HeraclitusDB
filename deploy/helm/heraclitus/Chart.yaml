@@ -1,0 +1,20 @@
+apiVersion: v2
+name: heraclitus
+description: >-
+  HeraclitusDB — banco temporal event-sourced sobre um log imutável. Implantado
+  como StatefulSet porque o log É o estado: cada réplica tem a sua identidade e
+  o seu volume, e nenhum dos dois é descartável.
+type: application
+
+# `version` é a versão do chart; `appVersion` acompanha o workspace Rust. São
+# coisas distintas de propósito — uma correcção ao chart não deve fingir que há
+# um binário novo.
+version: 0.1.0
+appVersion: "1.0.5"
+
+keywords:
+  - database
+  - event-sourcing
+  - temporal
+  - audit
+home: https://github.com/JoseRFJuniorLLMs/HeraclitusDB

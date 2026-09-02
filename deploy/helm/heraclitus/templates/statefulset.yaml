@@ -1,0 +1,129 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "heraclitus.fullname" . }}
+  labels:
+    {{- include "heraclitus.labels" . | nindent 4 }}
+spec:
+  # Headless service: cada réplica tem um nome DNS estável. É o que o raft
+  # precisa para se encontrar, e é o que torna o volume reencontrável depois de
+  # um reagendamento.
+  serviceName: {{ include "heraclitus.fullname" . }}-headless
+  replicas: {{ .Values.replicas }}
+  podManagementPolicy: OrderedReady
+  selector:
+    matchLabels:
+      {{- include "heraclitus.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "heraclitus.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      # Um encerramento a meio de um checkpoint não corrompe (o log é a verdade
+      # e o snapshot é atómico: tmp + fsync + rename), mas obriga o arranque
+      # seguinte a replayar tudo o que o snapshot perdido cobria. Vale a pena
+      # esperar pelo fecho gracioso.
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: heraclitus
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.service.grpcPort }}
+            - name: rest
+              containerPort: {{ .Values.service.restPort }}
+          env:
+            - name: HERACLITUS_DATA_DIR
+              value: /var/lib/heraclitus
+            - name: HERACLITUS_LOG_DIR
+              value: /var/log/heraclitus
+            - name: HERACLITUS_GRPC_ADDR
+              value: "0.0.0.0:{{ .Values.service.grpcPort }}"
+            - name: HERACLITUS_REST_ADDR
+              value: "0.0.0.0:{{ .Values.service.restPort }}"
+            - name: HERACLITUS_FSYNC
+              value: {{ .Values.config.fsync | quote }}
+            - name: HERACLITUS_ENCRYPTION
+              value: {{ .Values.config.encryptionAtRest | quote }}
+            - name: HERACLITUS_AUDIT_QUERIES
+              value: {{ .Values.config.auditQueries | quote }}
+            {{- if .Values.config.restCorsOrigins }}
+            - name: HERACLITUS_REST_CORS_ORIGINS
+              value: {{ join "," .Values.config.restCorsOrigins | quote }}
+            {{- end }}
+          # Três sondas com papéis distintos. A de ARRANQUE é a que importa
+          # aqui: um banco a replayar a cauda de um log grande não responde
+          # depressa, e sem ela a liveness matava o pod a meio do replay — um
+          # ciclo de reinícios que parece um crash e é só impaciência.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: rest
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: rest
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          # `/healthz` e nunca `/stats`: o `/stats` percorre o manifesto e toca
+          # nos índices. Uma sonda que faz trabalho pesado transforma carga em
+          # reinícios.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: rest
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/heraclitus
+            # `readOnlyRootFilesystem: true` obriga a dar destino explícito a
+            # tudo o que se escreve fora do volume de dados.
+            - name: logs
+              mountPath: /var/log/heraclitus
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: logs
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        {{- if not .Values.persistence.enabled }}
+        # Sem persistência o log vive no ciclo de vida do pod. Só para ensaios:
+        # um reagendamento apaga o banco inteiro.
+        - name: data
+          emptyDir: {}
+        {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - {{ .Values.persistence.accessMode }}
+        {{- if .Values.persistence.storageClass }}
+        storageClassName: {{ .Values.persistence.storageClass | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size | quote }}
+  {{- end }}

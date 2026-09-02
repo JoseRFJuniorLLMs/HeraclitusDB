@@ -1,0 +1,50 @@
+# HeraclitusDB — execução local de um nó.
+#
+# ESTADO: escrito a 2026-09-02 e NUNCA EXECUTADO (a máquina onde nasceu não
+# tinha Docker). A primeira execução faz parte da revisão.
+#
+#   docker compose -f deploy/compose.yaml up --build
+#
+# Isto NÃO é uma configuração de produção: não tem TLS, não tem credenciais, e
+# expõe as portas em todas as interfaces do host. Serve para pôr um nó de pé e
+# olhar para ele.
+
+services:
+  heraclitus:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: heraclitus:1.0.5
+    restart: unless-stopped
+    ports:
+      # gRPC (escrita/leitura) e REST (diagnóstico, /healthz, /verify).
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7475:7475"
+    environment:
+      HERACLITUS_DATA_DIR: /var/lib/heraclitus
+      HERACLITUS_GRPC_ADDR: 0.0.0.0:7474
+      HERACLITUS_REST_ADDR: 0.0.0.0:7475
+      # `group_commit` e não `always`: com `always` cada append espera o seu
+      # próprio fsync. Medido a 2026-09-01 numa carga real de 8,6 M eventos,
+      # `always` deu 491 ev/s contra os 1760 ev/s do mesmo caminho com escrita
+      # agrupada. `always` só se justifica quando se aceita pagar 3,5x em débito
+      # por não perder a janela de 50 ms num corte de energia.
+      HERACLITUS_FSYNC: group_commit:50
+      # O painel forense fala com a API a partir do browser; sem origens
+      # declaradas o CORS fica DESLIGADO e o painel não consegue ler nada.
+      HERACLITUS_REST_CORS_ORIGINS: http://localhost:9337,http://127.0.0.1:9337
+    volumes:
+      - heraclitus-data:/var/lib/heraclitus
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7475/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      # Um arranque a frio replaya a cauda do log. Com milhões de eventos isto
+      # demora; um start_period curto mata o contentor a meio do replay e
+      # entra-se num ciclo de reinícios que parece um crash e não é.
+      start_period: 300s
+    stop_grace_period: 120s
+
+volumes:
+  heraclitus-data:
