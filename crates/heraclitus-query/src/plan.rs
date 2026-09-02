@@ -388,10 +388,7 @@ pub fn render(plan: &Plan) -> String {
 /// a mesma decisão de pruning que a execução usaria. O probe é somente-leitura
 /// e os contadores viajam no próprio resultado, portanto queries concorrentes
 /// não partilham um slot global de estatísticas.
-pub fn explain_with_backend(
-    plan: &Plan,
-    be: &dyn QueryBackend,
-) -> Result<String, HeraclitusError> {
+pub fn explain_with_backend(plan: &Plan, be: &dyn QueryBackend) -> Result<String, HeraclitusError> {
     let mut out = render(plan);
     let Plan::ScanFilter {
         conditions, as_of, ..

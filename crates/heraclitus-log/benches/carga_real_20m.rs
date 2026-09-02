@@ -426,7 +426,10 @@ fn main() {
     println!("    E o tempo de indisponibilidade num restart do servico.");
     let t = Instant::now();
     let _ = log2.read(head_final / 2).expect("read pos-reabertura");
-    println!("    primeira leitura depois de reabrir: {:.2?}\n", t.elapsed());
+    println!(
+        "    primeira leitura depois de reabrir: {:.2?}\n",
+        t.elapsed()
+    );
 
     // ── 7. INTEGRIDADE · verify() integral ──────────────────────────────────
     println!("-- 7. INTEGRIDADE · verify() do log inteiro ---------------------");

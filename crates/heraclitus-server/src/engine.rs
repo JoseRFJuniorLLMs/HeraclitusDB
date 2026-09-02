@@ -28,7 +28,7 @@ use heraclitus_retrieval::{retrieve, LinearReranker, RecallInputs};
 use heraclitus_telemetry_health::{SensorIdentity, TelemetryHealthGraph, TelemetryHealthSnapshot};
 use heraclitus_views::{View, ViewRegistry};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Reserved technical attributes used to make external delivery exactly-once.
 /// They remain outside the encrypted attribute envelope so retries can still be
@@ -85,17 +85,17 @@ pub struct Engine {
     pub log: Arc<AnyLog>,
     pub memtable: Arc<Memtable>,
     views: Mutex<ViewRegistry>,
-    vector: Arc<Mutex<VectorIndex>>,
-    text: Arc<Mutex<TextIndex>>,
-    graph: Arc<Mutex<GraphIndex>>,
-    tgraph: Arc<Mutex<TemporalGraph>>,
-    entity: Arc<Mutex<EntityResolver>>,
-    activation: Arc<Mutex<ActivationStore>>,
-    telemetry_health: Arc<Mutex<TelemetryHealthGraph>>,
+    vector: Arc<RwLock<VectorIndex>>,
+    text: Arc<RwLock<TextIndex>>,
+    graph: Arc<RwLock<GraphIndex>>,
+    tgraph: Arc<RwLock<TemporalGraph>>,
+    entity: Arc<RwLock<EntityResolver>>,
+    activation: Arc<RwLock<ActivationStore>>,
+    telemetry_health: Arc<RwLock<TelemetryHealthGraph>>,
     /// Índice secundário de atributos (qualquer campo -> [LSN]). Persistido em
     /// `<data_dir>/views`; gerido diretamente pelo Engine (fora do ViewRegistry)
     /// para controlar o checkpoint/replay e o arranque rápido.
-    attr: Arc<Mutex<AttrIndex>>,
+    attr: Arc<RwLock<AttrIndex>>,
     attr_dir: std::path::PathBuf,
     /// Raiz do cold tier (object store local); `demote` materializa segmentos aqui.
     #[cfg(feature = "tier")]
@@ -147,12 +147,19 @@ pub trait ReplRouter: Send + Sync {
 
 /// Wrapper so the same index object can be both registered as a View and
 /// queried by the engine (the registry owns Box<dyn View>).
-struct Shared<T>(Arc<Mutex<T>>);
+struct Shared<T>(Arc<RwLock<T>>);
 
+// `RwLock` e não `Mutex` por uma razão medida: o checkpoint segura o índice
+// enquanto serializa e escreve o snapshot — 70 s para 1,97 GiB com 8,6 M
+// eventos, a 2026-09-02 — e sob exclusão mútua isso parava todos os leitores,
+// `/stats` incluído, 23% do tempo. Mas `View::checkpoint` recebe `&self`: só
+// lê. Estava a usar-se exclusão mútua para uma operação de leitura. Com um
+// `RwLock`, o checkpoint e as leituras partilham o lock e correm ao mesmo
+// tempo; só `apply`/`restore`/`reset`, que mutam, é que excluem.
 impl<T: View> View for Shared<T> {
     fn name(&self) -> &str {
         // Names are static per index type.
-        let g = self.0.lock().unwrap();
+        let g = self.0.read().unwrap();
         // SAFETY-free trick: names are 'static string literals in all our
         // views, so returning them outlives the guard.
         match g.name() {
@@ -167,21 +174,32 @@ impl<T: View> View for Shared<T> {
         }
     }
     fn apply(&mut self, lsn: Lsn, event: &Episode) {
-        self.0.lock().unwrap().apply(lsn, event);
+        self.0.write().unwrap().apply(lsn, event);
     }
     fn watermark(&self) -> Lsn {
-        self.0.lock().unwrap().watermark()
+        self.0.read().unwrap().watermark()
     }
     // Sem estes forwards, o wrapper engolia os defaults do trait (no-op) e
     // NENHUMA view persistia/restaurava — todo o boot era replay desde 0.
     fn checkpoint(&self, dir: &std::path::Path) -> Result<(), HeraclitusError> {
-        self.0.lock().unwrap().checkpoint(dir)
+        self.0.read().unwrap().checkpoint(dir)
     }
     fn restore(&mut self, dir: &std::path::Path) -> Result<bool, HeraclitusError> {
-        self.0.lock().unwrap().restore(dir)
+        self.0.write().unwrap().restore(dir)
     }
     fn reset(&mut self) {
-        self.0.lock().unwrap().reset();
+        self.0.write().unwrap().reset();
+    }
+    // Pelo mesmo motivo dos dois acima, e antes que alguém se queime: sem este
+    // forward, `Shared` devolvia o default do trait (`None`) e TODAS as views
+    // registadas apareciam a desistir do dígito de determinismo que o próprio
+    // trait descreve como acceptance gate. Hoje ninguém lê `state_hash` pelo
+    // registry — o engine pergunta ao índice concreto (`graph_state_hash`) —
+    // por isso não havia sintoma. A armadilha era para o primeiro que
+    // percorresse as views a recolher dígitos e concluísse, sem erro nenhum,
+    // que nenhuma view os suporta.
+    fn state_hash(&self) -> Option<[u8; 32]> {
+        self.0.read().unwrap().state_hash()
     }
 }
 
@@ -294,43 +312,43 @@ impl Engine {
 
         let vector = {
             let p = boot.phase("Índice vetorial (HNSW hiperbólico)");
-            let v = Arc::new(Mutex::new(VectorIndex::new(metric.clone())));
+            let v = Arc::new(RwLock::new(VectorIndex::new(metric.clone())));
             p.ok("k-NN no espaço de produto");
             v
         };
         let text = {
             let p = boot.phase("Índice de texto (invertido)");
-            let t = Arc::new(Mutex::new(TextIndex::new()));
+            let t = Arc::new(RwLock::new(TextIndex::new()));
             p.ok("recall em duas fases");
             t
         };
         let graph = {
             let p = boot.phase("Índice de grafo (proveniência DAG)");
-            let g = Arc::new(Mutex::new(GraphIndex::new()));
+            let g = Arc::new(RwLock::new(GraphIndex::new()));
             p.ok("WHY · arestas de origem");
             g
         };
         let tgraph = {
             let p = boot.phase("Grafo temporal (consultas AS OF)");
-            let g = Arc::new(Mutex::new(TemporalGraph::new()));
+            let g = Arc::new(RwLock::new(TemporalGraph::new()));
             p.ok("arestas com intervalos de validade");
             g
         };
         let entity = {
             let p = boot.phase("Resolução de entidades");
-            let e = Arc::new(Mutex::new(EntityResolver::new()));
+            let e = Arc::new(RwLock::new(EntityResolver::new()));
             p.ok("merge/cluster por chave");
             e
         };
         let activation = {
             let p = boot.phase("Ativação ACT-R (memória cognitiva)");
-            let a = Arc::new(Mutex::new(ActivationStore::new(config.activation_decay)));
+            let a = Arc::new(RwLock::new(ActivationStore::new(config.activation_decay)));
             p.ok(format!("decaimento d={}", config.activation_decay));
             a
         };
         let telemetry_health = {
             let p = boot.phase("Telemetry Health / Sensor Trust");
-            let health = Arc::new(Mutex::new(TelemetryHealthGraph::new()));
+            let health = Arc::new(RwLock::new(TelemetryHealthGraph::new()));
             p.ok("Coverage · Freshness · Completeness · Integrity · Trust");
             health
         };
@@ -383,13 +401,13 @@ impl Engine {
         let attr_dir = config.data_dir.join("views");
         let attr = {
             let p = boot.phase("Índice de atributos (campo → LSN)");
-            let attr = Arc::new(Mutex::new(if privacy_rebuild {
+            let attr = Arc::new(RwLock::new(if privacy_rebuild {
                 AttrIndex::new()
             } else {
                 AttrIndex::open(&attr_dir)
             }));
             let keys = {
-                let mut idx = attr.lock().unwrap();
+                let mut idx = attr.write().unwrap();
                 if !skip_replay {
                     // Build PAGINADO: o log é varrido em janelas (não materializa os
                     // milhões de episódios de uma vez — limita a RAM do arranque).
@@ -467,7 +485,7 @@ impl Engine {
             distill_cursor,
         };
         if privacy_rebuild {
-            engine.attr.lock().unwrap().save(&engine.attr_dir)?;
+            engine.attr.write().unwrap().save(&engine.attr_dir)?;
             std::fs::remove_file(&privacy_rebuild_marker)?;
         }
         Ok(engine)
@@ -494,7 +512,7 @@ impl Engine {
         }
         self.memtable.apply(lsn, episode.clone());
         self.views.lock().unwrap().apply(lsn, episode);
-        self.attr.lock().unwrap().apply(lsn, episode);
+        self.attr.write().unwrap().apply(lsn, episode);
     }
 
     /// Meta-auditoria: regista a execução de uma query como EVENTO no log
@@ -541,7 +559,7 @@ impl Engine {
     /// Grava o checkpoint do índice de atributos (o servidor pode chamar
     /// periodicamente / no shutdown para o arranque seguinte só replayar a cauda).
     pub fn checkpoint_attr(&self) -> Result<(), HeraclitusError> {
-        self.attr.lock().unwrap().save(&self.attr_dir)
+        self.attr.write().unwrap().save(&self.attr_dir)
     }
 
     /// Fast boot: persiste o snapshot de TODAS as views (vector/text/graph/
@@ -709,7 +727,7 @@ impl Engine {
     /// O `state_hash` do índice de grafo — usado em testes de equivalência de
     /// consenso (deve ser idêntico entre nós que replicaram o mesmo log).
     pub fn graph_state_hash(&self) -> [u8; 32] {
-        self.graph.lock().unwrap().state_hash()
+        self.graph.write().unwrap().state_hash()
     }
 
     /// Abre o backend do cold tier a partir de `cold_tier_path` — um URL de
@@ -866,7 +884,7 @@ impl Engine {
             return Ok(Vec::new());
         }
         let tomb_lsns: Vec<Lsn> = {
-            let g = self.graph.lock().unwrap();
+            let g = self.graph.write().unwrap();
             tombstoned.iter().filter_map(|id| g.lsn_of(id)).collect()
         };
 
@@ -1237,12 +1255,12 @@ impl Engine {
     /// Sai do indice `_agent`, nao de um varrimento: duas leituras por fonte
     /// (o primeiro e o ultimo LSN, que sao as pontas dos postings ordenados).
     pub fn fontes(&self) -> serde_json::Value {
-        let vals = self.attr.lock().unwrap().field_values("_agent");
+        let vals = self.attr.write().unwrap().field_values("_agent");
         let mut fontes = Vec::with_capacity(vals.len());
         let (mut global_min, mut global_max) = (u64::MAX, 0u64);
 
         for (agente, eventos) in vals {
-            let span = self.attr.lock().unwrap().field_span("_agent", &agente);
+            let span = self.attr.write().unwrap().field_span("_agent", &agente);
             let (mut primeiro_ms, mut ultimo_ms) = (None, None);
             if let Some((a, b)) = span {
                 if let Ok(Some((_, ep))) = self.log.read(a) {
@@ -1290,7 +1308,7 @@ impl Engine {
     /// resultado diz `amostrado: true` — uma distribuicao calculada sobre parte
     /// dos dados nao pode ser apresentada como se fosse sobre todos.
     pub fn fonte_detalhe(&self, agente: &str, amostra_max: usize) -> serde_json::Value {
-        let lsns: Vec<Lsn> = self.attr.lock().unwrap().lookup("_agent", agente).to_vec();
+        let lsns: Vec<Lsn> = self.attr.write().unwrap().lookup("_agent", agente).to_vec();
         let total = lsns.len();
         // Amostra pelas pontas: os mais RECENTES importam mais para saber o que
         // a fonte faz agora, mas os primeiros mostram como comecou.
@@ -1357,7 +1375,7 @@ impl Engine {
     /// So nomes de campo e contagens: nunca valores. Listar os valores de um
     /// campo `cpf` seria despejar os CPFs todos.
     pub fn atributos(&self) -> serde_json::Value {
-        let campos = self.attr.lock().unwrap().fields();
+        let campos = self.attr.write().unwrap().fields();
         let lista: Vec<_> = campos
             .into_iter()
             .map(|(campo, distintos)| {
@@ -1384,7 +1402,7 @@ impl Engine {
     ) -> Option<TelemetryHealthSnapshot> {
         let bound = as_of_lsn.unwrap_or_else(|| self.log.head());
         self.telemetry_health
-            .lock()
+            .write()
             .unwrap()
             .snapshot_as_of(identity, bound)
     }
@@ -1392,7 +1410,10 @@ impl Engine {
     /// Snapshot ordenado de todos os sensores conhecidos até o LSN exclusivo.
     pub fn telemetry_health_all(&self, as_of_lsn: Option<Lsn>) -> Vec<TelemetryHealthSnapshot> {
         let bound = as_of_lsn.unwrap_or_else(|| self.log.head());
-        self.telemetry_health.lock().unwrap().snapshots_as_of(bound)
+        self.telemetry_health
+            .write()
+            .unwrap()
+            .snapshots_as_of(bound)
     }
 
     /// O carimbo de ingestao (ms epoch) do evento em `lsn`, se legivel.
@@ -1447,7 +1468,7 @@ impl Engine {
         let ate = ate.min(head);
         let de = de.min(ate);
 
-        let campos = self.attr.lock().unwrap().diff(de, ate, topo);
+        let campos = self.attr.write().unwrap().diff(de, ate, topo);
         let ms = |lsn: Lsn| self.ts_ms(lsn);
 
         serde_json::json!({
@@ -1483,7 +1504,7 @@ impl Engine {
     /// nenhuns sobre a pessoa. Nesse caso, `rebuild` resolve.
     pub fn titular(&self, agent_id: &str, limite: usize) -> serde_json::Value {
         let lsns: Vec<Lsn> = {
-            let attr = self.attr.lock().unwrap();
+            let attr = self.attr.write().unwrap();
             attr.lookup("_agent", agent_id).to_vec()
         };
         // O índice conhece o campo `_agent`? Se não conhecer, foi construído
@@ -1494,7 +1515,7 @@ impl Engine {
         // Nota: os frames H-VM (`hvm_isa`) são excluídos dos índices por
         // desenho (`index_applied`) — vivem no replay da VM. Um log só com
         // esses frames dá `agentes_indexados: 0` legitimamente.
-        let agentes_indexados = self.attr.lock().unwrap().field_entries("_agent");
+        let agentes_indexados = self.attr.write().unwrap().field_entries("_agent");
 
         let mut tipos: std::collections::BTreeMap<String, u64> = Default::default();
         let mut amostra = Vec::new();
@@ -1644,7 +1665,7 @@ impl Engine {
             cur = last.saturating_add(1);
         }
         rebuilt.save(&self.attr_dir)?;
-        *self.attr.lock().unwrap() = rebuilt;
+        *self.attr.write().unwrap() = rebuilt;
 
         let subject_hash = blake3::hash(agent_id.as_bytes()).to_hex().to_string();
         let mut receipt = Episode::new(
@@ -1863,7 +1884,7 @@ impl Engine {
         let _guard = self.idempotency_lock.lock().unwrap();
         let previous = self
             .attr
-            .lock()
+            .write()
             .unwrap()
             .lookup(IDEMPOTENCY_KEY_ATTR, key)
             .last()
@@ -1960,12 +1981,14 @@ impl Engine {
             "head": self.log.head(),
             "storage_format": self.log.format().as_str(),
             "memtable": self.memtable.len(),
-            "vector_indexed": self.vector.lock().unwrap().len(),
-            "text_indexed": self.text.lock().unwrap().len(),
-            "graph_nodes": self.graph.lock().unwrap().len(),
-            "tgraph_edges": self.tgraph.lock().unwrap().edges.len(),
-            "entity_keys": self.entity.lock().unwrap().mappings.len(),
-            "activation_tracked": self.activation.lock().unwrap().len(),
+            // Contagens: leitura pura. Com `.write()` cada uma esperava pelo
+            // checkpoint em curso, e era isso que punha o `/stats` a 44 s.
+            "vector_indexed": self.vector.read().unwrap().len(),
+            "text_indexed": self.text.read().unwrap().len(),
+            "graph_nodes": self.graph.read().unwrap().len(),
+            "tgraph_edges": self.tgraph.read().unwrap().edges.len(),
+            "entity_keys": self.entity.read().unwrap().mappings.len(),
+            "activation_tracked": self.activation.read().unwrap().len(),
             "views": self.views.lock().unwrap().view_names(),
             "storage_metrics": self.storage_metrics(),
         })
@@ -2254,14 +2277,14 @@ impl Engine {
             .map(|(_, e)| e.ts_hlc >> 16)
             .unwrap_or(0);
         let txt_hits: Vec<_> = {
-            let idx = self.text.lock().unwrap();
+            let idx = self.text.write().unwrap();
             idx.search(text, heraclitus_retrieval::RECALL_N)
                 .into_iter()
                 .map(|h| (h.id, h.lsn, h.score))
                 .collect()
         };
         let act_hits: Vec<_> = {
-            let act = self.activation.lock().unwrap();
+            let act = self.activation.write().unwrap();
             act.top_k(now, heraclitus_retrieval::RECALL_N)
                 .into_iter()
                 .map(|h| (h.id, h.score))
@@ -2302,7 +2325,7 @@ impl Engine {
             // grafo (id → lsn) antes de hidratar.
             let lsn = if cand.lsn == 0 {
                 self.graph
-                    .lock()
+                    .write()
                     .unwrap()
                     .lsn_of(&cand.id)
                     .unwrap_or(cand.lsn)
@@ -2341,7 +2364,7 @@ impl QueryBackend for Engine {
 
     /// Snapshot do grafo temporal materializado (a view incremental, sem replay).
     fn graph(&self) -> Result<TemporalGraph, HeraclitusError> {
-        Ok(self.tgraph.lock().unwrap().clone())
+        Ok(self.tgraph.write().unwrap().clone())
     }
 
     fn scan_range(&self, from: Lsn, to: Lsn) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
@@ -2386,7 +2409,7 @@ impl QueryBackend for Engine {
         // O índice dá os LSNs exatos; cada `log.read` é O(1) via o índice de
         // offset por-LSN do log (seek directo). Hidratação = nº de matches × O(1).
         let mut lsns: Vec<Lsn> = {
-            let idx = self.attr.lock().unwrap();
+            let idx = self.attr.write().unwrap();
             idx.lookup(field, value).to_vec()
         };
         if let Some(bound) = as_of {
@@ -2422,7 +2445,7 @@ impl QueryBackend for Engine {
             Some((v, false)) => Bound::Excluded(v),
         };
         let mut lsns: Vec<Lsn> = {
-            let idx = self.attr.lock().unwrap();
+            let idx = self.attr.write().unwrap();
             idx.lookup_range(field, to_bound(min), to_bound(max))
         };
         if let Some(bound) = as_of {
@@ -2493,7 +2516,7 @@ impl QueryBackend for Engine {
         // Audit #10: honor AS OF via LSN post-filter (over-fetch first).
         let fetch = if as_of.is_some() { k * 4 } else { k };
         let in_snapshot = |lsn: Lsn| as_of.map(|b| lsn < b).unwrap_or(true);
-        let hits = self.vector.lock().unwrap().search(&dims, fetch, 128, None);
+        let hits = self.vector.write().unwrap().search(&dims, fetch, 128, None);
         let mut out = Vec::new();
         for h in hits.into_iter().filter(|h| in_snapshot(h.lsn)) {
             if let Some((l, e)) = self.log.read(h.lsn)? {
@@ -2519,7 +2542,7 @@ impl QueryBackend for Engine {
         match parsed {
             Ok(eid) => Ok(self
                 .graph
-                .lock()
+                .write()
                 .unwrap()
                 .parents(&eid)
                 .into_iter()
@@ -2571,7 +2594,7 @@ impl QueryBackend for Engine {
     ) -> Result<Vec<NeighborRow>, HeraclitusError> {
         // Real path: read the incrementally-maintained view (no replay). The
         // M8 gate is that this matches `LogBackend`'s from-scratch replay.
-        let g = self.tgraph.lock().unwrap();
+        let g = self.tgraph.write().unwrap();
         Ok(neighbors_of(&g, node, etype, as_of, min_confidence))
     }
 
@@ -2582,7 +2605,7 @@ impl QueryBackend for Engine {
         as_of: Option<Lsn>,
         min_confidence: f32,
     ) -> Result<Vec<(String, usize)>, HeraclitusError> {
-        let g = self.tgraph.lock().unwrap();
+        let g = self.tgraph.write().unwrap();
         Ok(traverse_of(&g, start, max_depth, as_of, min_confidence))
     }
 
@@ -2593,7 +2616,7 @@ impl QueryBackend for Engine {
         dst: Option<&str>,
         as_of: Option<Lsn>,
     ) -> Result<Vec<EdgeRow>, HeraclitusError> {
-        let g = self.tgraph.lock().unwrap();
+        let g = self.tgraph.write().unwrap();
         Ok(match_edges_of(&g, src, etype, dst, as_of))
     }
 
@@ -2605,7 +2628,7 @@ impl QueryBackend for Engine {
         as_of: Option<Lsn>,
     ) -> Result<Option<EdgeHypotheses>, HeraclitusError> {
         Ok(hypotheses_of(
-            &self.tgraph.lock().unwrap(),
+            &self.tgraph.write().unwrap(),
             from,
             to,
             etype,
@@ -2618,7 +2641,7 @@ impl QueryBackend for Engine {
         node: &str,
         as_of: Option<Lsn>,
     ) -> Result<Option<CommunityResult>, HeraclitusError> {
-        Ok(community_of(&self.tgraph.lock().unwrap(), node, as_of))
+        Ok(community_of(&self.tgraph.write().unwrap(), node, as_of))
     }
 
     fn community_leiden(
@@ -2627,7 +2650,7 @@ impl QueryBackend for Engine {
         as_of: Option<Lsn>,
     ) -> Result<Option<CommunityResult>, HeraclitusError> {
         Ok(heraclitus_query::backend::community_leiden_of(
-            &self.tgraph.lock().unwrap(),
+            &self.tgraph.write().unwrap(),
             node,
             as_of,
         ))
@@ -2638,7 +2661,7 @@ impl QueryBackend for Engine {
         node: &str,
         as_of: Option<Lsn>,
     ) -> Result<Option<MetricsResult>, HeraclitusError> {
-        Ok(node_metrics_of(&self.tgraph.lock().unwrap(), node, as_of))
+        Ok(node_metrics_of(&self.tgraph.write().unwrap(), node, as_of))
     }
 
     fn resolve_entity(
@@ -2646,7 +2669,7 @@ impl QueryBackend for Engine {
         key: &str,
         as_of: Option<Lsn>,
     ) -> Result<Option<String>, HeraclitusError> {
-        let er = self.entity.lock().unwrap();
+        let er = self.entity.write().unwrap();
         Ok(resolve_of(&er, key, as_of))
     }
 
@@ -2655,7 +2678,7 @@ impl QueryBackend for Engine {
         entity_id: &str,
         as_of: Option<Lsn>,
     ) -> Result<Vec<String>, HeraclitusError> {
-        let er = self.entity.lock().unwrap();
+        let er = self.entity.write().unwrap();
         Ok(cluster_of(&er, entity_id, as_of))
     }
 
@@ -3324,12 +3347,12 @@ mod tests {
             engine.hvm_upsert(b"k1".to_vec(), b"v1".to_vec()).unwrap();
             engine.hvm_upsert(b"k2".to_vec(), b"v2".to_vec()).unwrap();
             // `let` para o guard cair ANTES do `engine` no fim do bloco.
-            let h = engine.graph.lock().unwrap().state_hash();
+            let h = engine.graph.write().unwrap().state_hash();
             h
         };
         // Reopen: o boot-replay tem de produzir o MESMO state_hash do grafo.
         let engine2 = engine_in(dir.path());
-        let reopened_hash = engine2.graph.lock().unwrap().state_hash();
+        let reopened_hash = engine2.graph.write().unwrap().state_hash();
         assert_eq!(
             live_hash, reopened_hash,
             "escritas H-VM não devem divergir o state_hash do grafo (vivo vs replay)"
@@ -3350,7 +3373,7 @@ mod tests {
         let _ids = seed_chain(&engine);
 
         let replayed = replay_graph(&engine.log).unwrap();
-        let live = engine.tgraph.lock().unwrap();
+        let live = engine.tgraph.write().unwrap();
         assert_eq!(
             live.state_hash(),
             replayed.state_hash(),
@@ -3367,11 +3390,11 @@ mod tests {
         let hash_a = {
             let engine = engine_in(dir.path());
             seed_chain(&engine);
-            let h = engine.tgraph.lock().unwrap().state_hash();
+            let h = engine.tgraph.write().unwrap().state_hash();
             h
         };
         let engine_b = engine_in(dir.path());
-        let hash_b = engine_b.tgraph.lock().unwrap().state_hash();
+        let hash_b = engine_b.tgraph.write().unwrap().state_hash();
         assert_eq!(hash_a, hash_b, "reopened engine must reconstruct the graph");
     }
 
@@ -3443,7 +3466,7 @@ mod tests {
         // Incremental view must still equal a from-scratch replay, even with the
         // valid_to mutation in play.
         let replayed = replay_graph(&engine.log).unwrap();
-        let live = engine.tgraph.lock().unwrap();
+        let live = engine.tgraph.write().unwrap();
         assert_eq!(live.state_hash(), replayed.state_hash());
         // The retracted edge is closed, not deleted.
         assert_eq!(live.edges.len(), 2);
@@ -3522,7 +3545,7 @@ mod tests {
 
         // View == replay (bit-identical).
         let replayed = replay_resolver(&engine.log).unwrap();
-        let live = engine.entity.lock().unwrap();
+        let live = engine.entity.write().unwrap();
         assert_eq!(live.state_hash(), replayed.state_hash());
         drop(live);
 
@@ -3565,7 +3588,7 @@ mod tests {
 
         // View == replay (the extra version must be in both).
         let replayed = replay_graph(&engine.log).unwrap();
-        let live = engine.tgraph.lock().unwrap();
+        let live = engine.tgraph.write().unwrap();
         assert_eq!(live.state_hash(), replayed.state_hash());
         assert_eq!(live.edges.len(), 1, "one edge, two hypotheses");
         drop(live);

@@ -93,7 +93,9 @@ fn resolver_token(
         }
         return Ok(Some(t));
     }
-    Ok(token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty()))
+    Ok(token
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty()))
 }
 
 #[tokio::main]

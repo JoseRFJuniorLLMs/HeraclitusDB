@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "heraclitus.fullname" . }}
+  labels:
+    {{- include "heraclitus.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "heraclitus.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ .Values.service.grpcPort }}
+      targetPort: grpc
+    - name: rest
+      port: {{ .Values.service.restPort }}
+      targetPort: rest
+---
+# Headless: dá a cada réplica um nome DNS estável
+# (<release>-heraclitus-0.<release>-heraclitus-headless...). O StatefulSet
+# exige-o, e é por aqui que os pares do raft se encontram quando a replicação
+# estiver ligada.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "heraclitus.fullname" . }}-headless
+  labels:
+    {{- include "heraclitus.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  # Um nó ainda a replayar o log não está `ready`, mas os pares precisam de o
+  # resolver na mesma para o consenso poder formar-se durante o arranque.
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "heraclitus.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ .Values.service.grpcPort }}
+      targetPort: grpc
+    - name: rest
+      port: {{ .Values.service.restPort }}
+      targetPort: rest

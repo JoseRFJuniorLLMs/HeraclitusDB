@@ -315,7 +315,6 @@ pub struct MigrationEquivalence {
     pub divergencia: Option<String>,
 }
 
-
 // ---------------------------------------------------------------------------
 // SPEC-0050 §129--§133 — migração de uma BASE inteira, não de um segmento
 // ---------------------------------------------------------------------------
@@ -618,7 +617,12 @@ mod tests {
             .collect()
     }
 
-    fn escrever_legado(dir: &Path, version: u16, eps: &[Episode], selar: bool) -> std::path::PathBuf {
+    fn escrever_legado(
+        dir: &Path,
+        version: u16,
+        eps: &[Episode],
+        selar: bool,
+    ) -> std::path::PathBuf {
         let p = dir.join(format!("legado-v{version}.hrkl"));
         let mut f = std::fs::File::create(&p).unwrap();
         f.write_all(
@@ -730,11 +734,8 @@ mod tests {
 
             let scan = super::super::raw::scan_raw_segment(&dst).unwrap();
             for r in &scan.records {
-                let d = crate::decode_episode_payload_with_meta(
-                    format::FORMAT_VERSION,
-                    &r.payload,
-                )
-                .unwrap();
+                let d = crate::decode_episode_payload_with_meta(format::FORMAT_VERSION, &r.payload)
+                    .unwrap();
                 assert_eq!(d.opaque_meta, [0u8; 16], "v{v}: opaque_meta inventado");
                 assert_eq!(d.episode.valid_from, None, "v{v}: valid time inventado");
                 assert_eq!(d.episode.valid_to, None, "v{v}");
@@ -753,11 +754,8 @@ mod tests {
 
             let scan = super::super::raw::scan_raw_segment(&dst).unwrap();
             for (i, r) in scan.records.iter().enumerate() {
-                let d = crate::decode_episode_payload_with_meta(
-                    format::FORMAT_VERSION,
-                    &r.payload,
-                )
-                .unwrap();
+                let d = crate::decode_episode_payload_with_meta(format::FORMAT_VERSION, &r.payload)
+                    .unwrap();
                 assert_eq!(
                     d.opaque_meta,
                     eps[i].id.0.to_bytes(),
@@ -778,10 +776,7 @@ mod tests {
 
         let dst = dir.path().join("v6.hrkl");
         let e = migrate_legacy_segment(&src, &dst, opts()).unwrap_err();
-        assert!(
-            e.to_string().contains("rasgada"),
-            "erro inesperado: {e}"
-        );
+        assert!(e.to_string().contains("rasgada"), "erro inesperado: {e}");
     }
 
     #[test]
@@ -820,7 +815,11 @@ mod tests {
         let src = escrever_legado(dir.path(), 5, &eps, true);
         let dst = dir.path().join("v6.hrkl");
         migrate_legacy_segment(&src, &dst, opts()).unwrap();
-        assert!(verify_migration_equivalence(&src, &dst).unwrap().equivalente);
+        assert!(
+            verify_migration_equivalence(&src, &dst)
+                .unwrap()
+                .equivalente
+        );
 
         // Migrar SÓ os primeiros registos para outro ficheiro: a equivalência
         // tem de recusar, mesmo que cada registo migrado esteja correcto.

@@ -30,12 +30,12 @@
 use std::sync::Arc;
 
 use heraclitus_core::HeraclitusError;
+use heraclitus_core::Lsn;
+use heraclitus_log::v6::block::BLOCK_HEADER_LEN;
 use heraclitus_log::v6::block_directory::BlockDirectory;
 use heraclitus_log::v6::error::{corrupt, V6Result};
 use heraclitus_log::v6::footer::FOOTER_LEN;
 use heraclitus_log::v6::header::FILE_HEADER_LEN;
-use heraclitus_log::v6::block::BLOCK_HEADER_LEN;
-use heraclitus_core::Lsn;
 use heraclitus_log::v6::{
     BlockSource, FileHeaderV6, FooterV6, PackedSegmentReader, PhysicalLayout, ScanCounters,
 };
@@ -185,11 +185,7 @@ impl ColdSegmentReader {
             .map_err(|e| store_err(&path, e))?;
         let object_size = res.meta.size;
         let tail_start = res.range.start;
-        let tail = res
-            .bytes()
-            .await
-            .map_err(|e| store_err(&path, e))?
-            .to_vec();
+        let tail = res.bytes().await.map_err(|e| store_err(&path, e))?.to_vec();
         stats.requests += 1;
         stats.bytes_fetched += tail.len() as u64;
         stats.object_size = object_size;
@@ -219,9 +215,8 @@ impl ColdSegmentReader {
                 "range reads exigem um segmento PACKED; RAW não tem directório de blocos",
             ));
         }
-        let footer = FooterV6::decode(
-            &prelude.read_at(object_size - FOOTER_LEN as u64, FOOTER_LEN)?,
-        )?;
+        let footer =
+            FooterV6::decode(&prelude.read_at(object_size - FOOTER_LEN as u64, FOOTER_LEN)?)?;
 
         // Pedido 3 (raro): o directório caiu fora da sonda.
         let dir_len = usize::try_from(footer.block_directory_len)
@@ -298,7 +293,10 @@ impl ColdSegmentReader {
                 .checked_add(total)
                 .ok_or_else(|| corrupt(CTX, "intervalo de bloco transborda u64"))?;
             if end > self.object_size {
-                return Err(corrupt(CTX, format!("bloco {i} aponta para fora do objecto")));
+                return Err(corrupt(
+                    CTX,
+                    format!("bloco {i} aponta para fora do objecto"),
+                ));
             }
             ranges.push(e.offset..end);
         }
@@ -323,10 +321,7 @@ impl ColdSegmentReader {
     }
 
     /// Point lookup por LSN: no máximo um bloco atravessa a rede.
-    pub async fn get(
-        &mut self,
-        lsn: Lsn,
-    ) -> Result<Option<(u64, Vec<u8>)>, HeraclitusError> {
+    pub async fn get(&mut self, lsn: Lsn) -> Result<Option<(u64, Vec<u8>)>, HeraclitusError> {
         let Some(i) = self.directory.find_block_for_lsn(lsn) else {
             self.stats.blocks_pruned += self.directory.len() as u64;
             return Ok(None);
@@ -350,7 +345,9 @@ impl ColdSegmentReader {
 
     /// Transfere o objecto inteiro — o que a verificação física e lógica exige,
     /// e o único caso em que isso é honesto.
-    pub async fn fetch_all(&mut self) -> Result<PackedSegmentReader<SparseSource>, HeraclitusError> {
+    pub async fn fetch_all(
+        &mut self,
+    ) -> Result<PackedSegmentReader<SparseSource>, HeraclitusError> {
         let all: Vec<usize> = (0..self.directory.len()).collect();
         self.fetch_blocks(&all).await
     }

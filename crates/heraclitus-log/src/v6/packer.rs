@@ -49,9 +49,7 @@ use super::packed::{
     open_packed, PackOptions, PackStats, PackedSegmentWriter, PackingStage, ScanCounters,
 };
 use super::raw::{scan_raw_segment, SegmentInit};
-use super::receipts::{
-    persist_pack_receipt, physical_digest_of_file, PackReceipt, PACKER_VERSION,
-};
+use super::receipts::{persist_pack_receipt, physical_digest_of_file, PackReceipt, PACKER_VERSION};
 
 /// Calcula o `canonical_record_hash` de um registo a partir do que está
 /// persistido.

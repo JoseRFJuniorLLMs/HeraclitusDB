@@ -174,10 +174,7 @@ impl der::FixedTag for PkiFreeText {
 }
 
 impl<'a> der::DecodeValue<'a> for PkiFreeText {
-    fn decode_value<R: der::Reader<'a>>(
-        reader: &mut R,
-        header: der::Header,
-    ) -> der::Result<Self> {
+    fn decode_value<R: der::Reader<'a>>(reader: &mut R, header: der::Header) -> der::Result<Self> {
         Ok(Self {
             raw: reader.read_vec(header.length)?,
         })
@@ -293,7 +290,9 @@ pub enum TimeStampRespError {
         motivos: Vec<&'static str>,
     },
     /// Concedeu mas não anexou o token — resposta malformada.
-    SemToken { status: PkiStatus },
+    SemToken {
+        status: PkiStatus,
+    },
     Der(der::Error),
 }
 
@@ -321,7 +320,6 @@ impl std::fmt::Display for TimeStampRespError {
 }
 
 impl std::error::Error for TimeStampRespError {}
-
 
 #[cfg(test)]
 mod tests {
@@ -428,9 +426,7 @@ mod tests {
         let free_text = der::asn1::Any::new(Tag::Sequence, texto).unwrap();
         let info = PkiStatusInfo {
             status: 2,
-            status_string: Some(
-                PkiFreeText::from_der(&free_text.to_der().unwrap()).unwrap(),
-            ),
+            status_string: Some(PkiFreeText::from_der(&free_text.to_der().unwrap()).unwrap()),
             fail_info: Some(der::asn1::BitString::from_bytes(&[0x00, 0x01]).unwrap()),
         };
         let der_bytes = TimeStampResp {

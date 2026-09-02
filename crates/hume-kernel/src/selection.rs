@@ -286,7 +286,11 @@ impl SelectionVector {
                 .filter(|&x| bitmap_contains(words, x))
                 .collect(),
             (Rep::Bitmap(a), Rep::Bitmap(b)) => {
-                let words = a.iter().zip(b).map(|(&left, &right)| left & right).collect();
+                let words = a
+                    .iter()
+                    .zip(b)
+                    .map(|(&left, &right)| left & right)
+                    .collect();
                 return Self::from_bitmap(self.len, words);
             }
         };

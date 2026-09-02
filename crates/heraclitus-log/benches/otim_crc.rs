@@ -62,7 +62,9 @@ fn main() {
 
     // Corretude primeiro: um acelerador que mude um bit invalida todo o log.
     for tam in [0usize, 1, 7, 8, 9, 63, 64, 65, 487, 4096, 65537] {
-        let dados: Vec<u8> = (0..tam).map(|i| (i.wrapping_mul(31) ^ 0xA5) as u8).collect();
+        let dados: Vec<u8> = (0..tam)
+            .map(|i| (i.wrapping_mul(31) ^ 0xA5) as u8)
+            .collect();
         assert_eq!(
             crc32c(&dados),
             crc32c_hw(&dados),
@@ -75,7 +77,9 @@ fn main() {
     // 487 B é a média medida do registo real (auditoria de 1M/10M/20M);
     // os outros tamanhos delimitam a curva.
     for tam in [487usize, 4096, 65536, 1 << 20] {
-        let dados: Vec<u8> = (0..tam).map(|i| (i.wrapping_mul(31) ^ 0xA5) as u8).collect();
+        let dados: Vec<u8> = (0..tam)
+            .map(|i| (i.wrapping_mul(31) ^ 0xA5) as u8)
+            .collect();
         let voltas = (200_000_000 / tam).max(50);
 
         let t = Instant::now();
@@ -95,7 +99,11 @@ fn main() {
         std::hint::black_box(acc);
 
         let bytes = (tam * voltas) as f64;
-        let rotulo = if tam == 487 { " (registo medio real)" } else { "" };
+        let rotulo = if tam == 487 {
+            " (registo medio real)"
+        } else {
+            ""
+        };
         println!("  bloco de {tam:>7} B{rotulo}");
         println!(
             "    tabela byte-a-byte (atual) : {:>8.0} MB/s",

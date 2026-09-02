@@ -544,7 +544,12 @@ fn medir_hume(ds: &Dataset, caso: &Caso, reps: usize) -> Option<Medida> {
     })
 }
 
-fn medir_df(rt: &tokio::runtime::Runtime, ds: &Dataset, caso: &Caso, reps: usize) -> Option<Medida> {
+fn medir_df(
+    rt: &tokio::runtime::Runtime,
+    ds: &Dataset,
+    caso: &Caso,
+    reps: usize,
+) -> Option<Medida> {
     let ctx = ds.df.ctx();
 
     // O plano físico é reconstruído a cada iteração, e não içado para fora do

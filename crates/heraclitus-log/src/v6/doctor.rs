@@ -325,7 +325,10 @@ pub fn doctor_storage(root: &Path) -> V6Result<StorageDoctorReport> {
             if !path.is_file() {
                 continue;
             }
-            let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
             if path.extension().and_then(|ext| ext.to_str()) == Some("hrki") {
                 if !referenced_sidecars.contains(&path) {
                     finding(
@@ -499,7 +502,12 @@ mod tests {
         // estado em que um repack deixa a tabela.
         let store = ManifestStore::open(root.path().join("manifests")).unwrap();
         let mut m = store.load().unwrap().unwrap().manifest;
-        m.segment_mut(segmento).unwrap().parquet.as_mut().unwrap().logical_root = [0xEE; 32];
+        m.segment_mut(segmento)
+            .unwrap()
+            .parquet
+            .as_mut()
+            .unwrap()
+            .logical_root = [0xEE; 32];
         store.commit(&mut m).unwrap();
 
         let report = doctor_storage(root.path()).unwrap();
@@ -527,12 +535,9 @@ mod tests {
             .iter()
             .any(|finding| finding.code == "CURRENT_DIVERGENCE"));
 
-        let path = root.path().join(
-            &log.manifest().segments_v2[0]
-                .active()
-                .unwrap()
-                .location,
-        );
+        let path = root
+            .path()
+            .join(&log.manifest().segments_v2[0].active().unwrap().location);
         std::fs::remove_file(path).unwrap();
         let report = doctor_storage(root.path()).unwrap();
         assert!(report.has_critical());

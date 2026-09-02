@@ -34,9 +34,7 @@ impl DurabilityMode {
     fn toml(self) -> String {
         match self {
             Self::Always => "[fsync]\nmode = \"always\"\n".to_owned(),
-            Self::GroupCommit => {
-                "[fsync]\nmode = \"group_commit\"\ninterval_ms = 5\n".to_owned()
-            }
+            Self::GroupCommit => "[fsync]\nmode = \"group_commit\"\ninterval_ms = 5\n".to_owned(),
         }
     }
 }
@@ -157,7 +155,9 @@ impl Supervised {
                             .spec
                             .root
                             .join("logs")
-                            .join(format!("heraclitus-attempt-{attempt}-generation-0001.stderr.log"))
+                            .join(format!(
+                                "heraclitus-attempt-{attempt}-generation-0001.stderr.log"
+                            ))
                             .display()
                     );
                     // Drop the failed supervisor before the next attempt so its
@@ -182,8 +182,14 @@ impl Supervised {
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_else(|| "heraclitus".to_owned());
         let logs = self.spec.root.join("logs");
-        let stdout_path = logs.join(format!("{prefix}-generation-{:04}.stdout.log", self.generation));
-        let stderr_path = logs.join(format!("{prefix}-generation-{:04}.stderr.log", self.generation));
+        let stdout_path = logs.join(format!(
+            "{prefix}-generation-{:04}.stdout.log",
+            self.generation
+        ));
+        let stderr_path = logs.join(format!(
+            "{prefix}-generation-{:04}.stderr.log",
+            self.generation
+        ));
         if let Some(parent) = stdout_path.parent() {
             fs::create_dir_all(parent)?;
         }

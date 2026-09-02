@@ -150,12 +150,12 @@ impl LakehousePublisher {
             next_live.remove(old);
         }
         next_live.insert(file.path.clone());
-        let data_files = self
-            .load_live_metadata(&next_live, Some(file))
-            .await?;
+        let data_files = self.load_live_metadata(&next_live, Some(file)).await?;
 
-        let (last_iceberg_sequence, parent_snapshot, _) =
-            self.latest_iceberg_state().await?.unwrap_or((0, None, String::new()));
+        let (last_iceberg_sequence, parent_snapshot, _) = self
+            .latest_iceberg_state()
+            .await?
+            .unwrap_or((0, None, String::new()));
         let sequence = last_iceberg_sequence
             .checked_add(1)
             .ok_or_else(|| HeraclitusError::StorageEngine("sequência Iceberg esgotada".into()))?;
@@ -187,9 +187,10 @@ impl LakehousePublisher {
             )?;
             self.put_immutable(&initial.path, &initial.bytes).await?;
         }
-        let delta_version = last_delta.unwrap_or(0).checked_add(1).ok_or_else(|| {
-            HeraclitusError::StorageEngine("versão do log Delta esgotada".into())
-        })?;
+        let delta_version = last_delta
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| HeraclitusError::StorageEngine("versão do log Delta esgotada".into()))?;
         let removed = old_path.into_iter().collect::<Vec<_>>();
         let commit = delta::commit_append(
             delta_version,
@@ -384,10 +385,13 @@ impl LakehousePublisher {
                 out.push(IcebergDataFile::from(file));
                 continue;
             }
-            let bytes = self.get(path).await?.ok_or_else(|| HeraclitusError::Corruption {
-                context: "catálogo lakehouse".into(),
-                detail: format!("Parquet vivo `{path}` está ausente"),
-            })?;
+            let bytes = self
+                .get(path)
+                .await?
+                .ok_or_else(|| HeraclitusError::Corruption {
+                    context: "catálogo lakehouse".into(),
+                    detail: format!("Parquet vivo `{path}` está ausente"),
+                })?;
             let provenance = read_provenance(&bytes)?;
             let lsns = read_lsns(&bytes)?;
             if lsns.len() as u64 != provenance.record_count {
@@ -437,12 +441,13 @@ impl LakehousePublisher {
         })?;
         let json: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
-        let sequence = json["last-sequence-number"].as_i64().ok_or_else(|| {
-            HeraclitusError::Corruption {
-                context: "metadata Iceberg".into(),
-                detail: "last-sequence-number ausente".into(),
-            }
-        })?;
+        let sequence =
+            json["last-sequence-number"]
+                .as_i64()
+                .ok_or_else(|| HeraclitusError::Corruption {
+                    context: "metadata Iceberg".into(),
+                    detail: "last-sequence-number ausente".into(),
+                })?;
         if sequence != version {
             return Err(HeraclitusError::Corruption {
                 context: "metadata Iceberg".into(),
@@ -479,9 +484,9 @@ mod tests {
     use heraclitus_core::{Episode, EventKind};
     use object_store::memory::InMemory;
 
+    use crate::lakehouse::delta::Action;
     use crate::lakehouse::parquet_export;
     use crate::lakehouse::ExportProvenance;
-    use crate::lakehouse::delta::Action;
 
     fn exported(segment: u64, generation: u32, first: u64) -> ExportedFile {
         let prov = ExportProvenance::new(
@@ -499,8 +504,7 @@ mod tests {
         a.ts_hlc = 10;
         let mut b = Episode::new("agent", EventKind::Observation, b"b".to_vec());
         b.ts_hlc = 11;
-        let bytes = parquet_export::escrever_parquet(&[(first, a), (first + 1, b)], &prov)
-            .unwrap();
+        let bytes = parquet_export::escrever_parquet(&[(first, a), (first + 1, b)], &prov).unwrap();
         ExportedFile {
             path: data_path(segment, generation),
             bytes,
@@ -544,7 +548,10 @@ mod tests {
         assert_eq!(second.delta_version, Some(2));
         assert_eq!(second.watermark.last_lsn, 3);
         assert_eq!(second.watermark.segments.len(), 2);
-        assert_eq!(second.iceberg_metadata_path.as_deref(), Some("metadata/v00002.metadata.json"));
+        assert_eq!(
+            second.iceberg_metadata_path.as_deref(),
+            Some("metadata/v00002.metadata.json")
+        );
 
         let commits = reopened.load_delta_commits().await.unwrap();
         assert_eq!(

@@ -246,7 +246,6 @@ fn parse_proc_endpoint(field: &str) -> Option<(IpAddr, u16)> {
     }
 }
 
-
 pub fn run(config: EgressConfig) -> Result<EgressSummary> {
     if config.report.exists() {
         bail!(

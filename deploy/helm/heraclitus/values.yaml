@@ -1,0 +1,89 @@
+# ESTADO: chart escrito a 2026-09-02 e NUNCA INSTALADO nem passado por
+# `helm lint` — a máquina onde nasceu não tinha helm nem kubectl. A primeira
+# instalação faz parte da revisão.
+
+image:
+  repository: heraclitus
+  tag: ""            # vazio ⇒ usa o appVersion do Chart.yaml
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# Uma réplica por omissão. Subir este número SEM a feature `replication` (raft)
+# não dá um cluster: dá N bancos independentes a divergir em silêncio, cada um
+# com o seu log. Ver crates/heraclitus-raft.
+replicas: 1
+
+service:
+  type: ClusterIP
+  grpcPort: 7474
+  restPort: 7475
+
+persistence:
+  enabled: true
+  # O log é append-only e cresce sem encolher: a carga de referência de 8,6 M
+  # eventos ocupou 8,84 GiB em disco. Dimensione com folga — encher o volume de
+  # um banco append-only não degrada, pára.
+  size: 100Gi
+  storageClass: ""   # vazio ⇒ a classe por omissão do cluster
+  accessMode: ReadWriteOnce
+
+config:
+  # fsync: "always" | "group_commit:<ms>".
+  # Medido a 2026-09-01 sobre 8,6 M eventos reais: `always` deu 491 ev/s onde a
+  # escrita agrupada dá ~1760 ev/s no mesmo caminho. `always` é a escolha certa
+  # quando não se pode perder a janela num corte de energia; é 3,5x mais lento.
+  fsync: "group_commit:50"
+  encryptionAtRest: false
+  auditQueries: false
+  # Origens que podem falar com a API a partir de um browser. Vazio ⇒ CORS
+  # DESLIGADO (e o painel forense não lê nada). Nunca use "*": esta superfície
+  # REST tem rotas de escrita.
+  restCorsOrigins: []
+  # Segundos entre checkpoints das views. O checkpoint serializa os índices para
+  # disco; na carga de referência isso foram 1,97 GiB em ~70 s. Desde a mudança
+  # para RwLock (2026-09-02) o checkpoint deixou de excluir os leitores, mas
+  # continua a gastar I/O — baixar muito este valor troca débito por arranques
+  # mais rápidos.
+  checkpointIntervalSecs: 300
+
+resources:
+  requests:
+    cpu: "1"
+    # Os índices vivem em RAM e são reconstruídos/restaurados no arranque. Um
+    # limite apertado não degrada: mata o pod a meio do replay.
+    memory: 4Gi
+  limits:
+    memory: 8Gi
+
+# A sonda de arranque é a que protege o replay: enquanto ela não passar, as
+# outras duas nem correm. failureThreshold * periodSeconds é o tempo máximo de
+# arranque tolerado — aqui 30 * 20 s = 10 minutos.
+probes:
+  startup:
+    periodSeconds: 20
+    failureThreshold: 30
+  liveness:
+    periodSeconds: 20
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readiness:
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+# O contentor corre como não-root (uid 10001, criado no Dockerfile).
+podSecurityContext:
+  fsGroup: 10001
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}

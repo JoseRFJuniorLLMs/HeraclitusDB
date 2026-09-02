@@ -23,17 +23,17 @@
 
 pub mod compaction;
 pub mod demotion;
-pub mod lakehouse;
 pub mod generation;
+pub mod lakehouse;
 pub mod object_source;
 pub mod receipts_v2;
 
 pub use compaction::{ColdCollectReport, ColdRepackOutcome};
 pub use demotion::{ColdTierV6, ColdVerifyReport};
 pub use generation::GenerationKey;
+pub use lakehouse::worker::{ExportOutcome, LakehouseWorker};
 pub use object_source::{ColdReadStats, ColdSegmentReader, SparseSource};
 pub use receipts_v2::{AnyDemotionReceipt, DemotionReceiptV2};
-pub use lakehouse::worker::{ExportOutcome, LakehouseWorker};
 
 use arrow_array::{ArrayRef, BinaryArray, RecordBatch, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};

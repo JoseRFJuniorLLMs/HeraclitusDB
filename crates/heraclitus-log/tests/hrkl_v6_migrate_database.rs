@@ -117,8 +117,12 @@ fn uma_base_legada_migra_e_abre_como_v6_com_a_mesma_historia() {
 
     // E continua a ser um banco vivo: aceita escritas novas em v6.
     let antes = novo.head();
-    novo.append(Episode::new("pos-migracao", EventKind::Action, b"novo".to_vec()))
-        .unwrap();
+    novo.append(Episode::new(
+        "pos-migracao",
+        EventKind::Action,
+        b"novo".to_vec(),
+    ))
+    .unwrap();
     assert_eq!(novo.head(), antes + 1);
 }
 
@@ -158,7 +162,11 @@ fn a_base_legada_fica_byte_a_byte_intacta() {
         })
         .collect();
 
-    assert_eq!(antes.len(), depois.len(), "o número de ficheiros legados mudou");
+    assert_eq!(
+        antes.len(),
+        depois.len(),
+        "o número de ficheiros legados mudou"
+    );
     let mut a = antes;
     let mut b = depois;
     a.sort();
@@ -238,8 +246,16 @@ fn o_banco_migrado_tem_um_namespace_proprio() {
         "duas migrações da mesma origem produziram bancos com a mesma identidade"
     );
     // Mas a HISTÓRIA é a mesma: as raízes lógicas por segmento têm de bater.
-    let raizes_a: Vec<_> = a.segments.iter().map(|s| s.receipt.v6_logical_root).collect();
-    let raizes_b: Vec<_> = b.segments.iter().map(|s| s.receipt.v6_logical_root).collect();
+    let raizes_a: Vec<_> = a
+        .segments
+        .iter()
+        .map(|s| s.receipt.v6_logical_root)
+        .collect();
+    let raizes_b: Vec<_> = b
+        .segments
+        .iter()
+        .map(|s| s.receipt.v6_logical_root)
+        .collect();
     assert_eq!(
         raizes_a, raizes_b,
         "a raiz lógica canónica não pode depender do namespace do banco"

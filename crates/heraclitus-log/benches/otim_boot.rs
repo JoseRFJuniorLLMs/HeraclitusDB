@@ -57,7 +57,11 @@ fn varrer(path: &Path, modo: Modo) -> Resultado {
 
     let mut hdr = [0u8; format::HEADER_LEN];
     if reader.read_exact(&mut hdr).is_err() {
-        return Resultado { registos: 0, bytes: file_len, selado: false };
+        return Resultado {
+            registos: 0,
+            bytes: file_len,
+            selado: false,
+        };
     }
     let version = format::SegmentHeader::decode(&hdr).expect("header").version;
 
@@ -79,7 +83,8 @@ fn varrer(path: &Path, modo: Modo) -> Resultado {
             break;
         }
         let len = u32::from_le_bytes(magic) as usize;
-        if len > 512 * 1024 * 1024 || offset + format::RECORD_HEADER_LEN as u64 + len as u64 > file_len
+        if len > 512 * 1024 * 1024
+            || offset + format::RECORD_HEADER_LEN as u64 + len as u64 > file_len
         {
             break;
         }
@@ -134,7 +139,11 @@ fn varrer(path: &Path, modo: Modo) -> Resultado {
 
     std::hint::black_box(&hashes);
     std::hint::black_box(&locs);
-    Resultado { registos, bytes: file_len, selado }
+    Resultado {
+        registos,
+        bytes: file_len,
+        selado,
+    }
 }
 
 fn segmentos(dir: &Path) -> Vec<PathBuf> {
@@ -194,7 +203,9 @@ fn main() {
         }
     };
     let segs = segmentos(&dir);
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
 
     println!("\n=== Sonda: custo do arranque a frio / verify() ===\n");
     println!("diretorio : {}", dir.display());
@@ -259,10 +270,22 @@ fn main() {
     linha("1. como esta (bincode completo + blake3)", d0, n0, b0, None);
 
     let (d1, n1, b1) = correr_serial(&segs, Modo::SemBincode);
-    linha("2. sem desserializar o Episode (16 B crus)", d1, n1, b1, Some(d0));
+    linha(
+        "2. sem desserializar o Episode (16 B crus)",
+        d1,
+        n1,
+        b1,
+        Some(d0),
+    );
 
     let (d2, n2, b2) = correr_serial(&segs, Modo::SemBlake3EmSelados);
-    linha("3. + sem blake3 (raiz ja esta no rodape)", d2, n2, b2, Some(d0));
+    linha(
+        "3. + sem blake3 (raiz ja esta no rodape)",
+        d2,
+        n2,
+        b2,
+        Some(d0),
+    );
 
     let (d3, n3, b3) = correr_paralelo(&segs, Modo::SemBlake3EmSelados, threads);
     linha(
@@ -287,6 +310,9 @@ fn main() {
     println!("  SELADOS, cuja raiz Merkle esta no rodape e e re-verificavel por");
     println!("  `verify()` a pedido. O segmento ATIVO continua a precisar dos");
     println!("  leaf hashes para a selagem seguinte. A sonda trata todos como");
-    println!("  selados — no log real, 1 em ~{} nao e.", segs.len().max(1));
+    println!(
+        "  selados — no log real, 1 em ~{} nao e.",
+        segs.len().max(1)
+    );
     println!();
 }

@@ -599,8 +599,9 @@ fn motivo_de(entrada: &x509_cert::crl::RevokedCert) -> Result<RevocationReason, 
         )));
     }
     let bytes = any.value();
-    let v = bytes.last().copied().ok_or_else(|| {
-        CompError::Verify("reasonCode ENUMERATED vazio".into())
-    })?;
+    let v = bytes
+        .last()
+        .copied()
+        .ok_or_else(|| CompError::Verify("reasonCode ENUMERATED vazio".into()))?;
     Ok(RevocationReason::from_u8(v))
 }

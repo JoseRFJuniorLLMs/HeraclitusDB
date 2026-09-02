@@ -204,7 +204,11 @@ impl TrustStore {
     /// Add one anchor from DER or PEM bytes. Exposed so a deployment that
     /// keeps its anchors somewhere other than a directory (a secret manager, a
     /// config blob) is not forced through the filesystem.
-    pub fn add_pem_or_der(&mut self, source: impl Into<PathBuf>, bytes: &[u8]) -> Result<(), CompError> {
+    pub fn add_pem_or_der(
+        &mut self,
+        source: impl Into<PathBuf>,
+        bytes: &[u8],
+    ) -> Result<(), CompError> {
         let certificate = Self::parse_certificate(bytes)?;
         self.insert(source.into(), certificate)
     }
@@ -289,8 +293,6 @@ pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
     *blake3_sha256(bytes)
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,7 +317,11 @@ mod tests {
     fn um_ficheiro_partido_nao_impede_os_outros() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("boa.der"), raiz_de_teste("Raiz A")).unwrap();
-        std::fs::write(dir.path().join("ma.pem"), b"-----BEGIN CERTIFICATE-----\nlixo\n").unwrap();
+        std::fs::write(
+            dir.path().join("ma.pem"),
+            b"-----BEGIN CERTIFICATE-----\nlixo\n",
+        )
+        .unwrap();
         let (store, report) = TrustStore::load_dir(dir.path()).unwrap();
         assert_eq!(store.len(), 1);
         assert_eq!(report.anchors_loaded, 1);
@@ -344,7 +350,11 @@ mod tests {
         let mut store = TrustStore::new();
         store.add_pem_or_der("a", &der).unwrap();
         store.add_pem_or_der("b", &der).unwrap();
-        assert_eq!(store.len(), 1, "a contagem que o operador vê tem de ser real");
+        assert_eq!(
+            store.len(),
+            1,
+            "a contagem que o operador vê tem de ser real"
+        );
     }
 
     #[test]
@@ -368,8 +378,11 @@ mod tests {
     #[test]
     fn um_ficheiro_grande_demais_e_recusado_sem_o_ler() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("enorme.der"), vec![0u8; (MAX_ANCHOR_BYTES + 1) as usize])
-            .unwrap();
+        std::fs::write(
+            dir.path().join("enorme.der"),
+            vec![0u8; (MAX_ANCHOR_BYTES + 1) as usize],
+        )
+        .unwrap();
         let (store, report) = TrustStore::load_dir(dir.path()).unwrap();
         assert!(store.is_empty());
         assert_eq!(report.rejected.len(), 1);

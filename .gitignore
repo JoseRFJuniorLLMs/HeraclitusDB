@@ -55,3 +55,9 @@ sdk/python/*.egg-info/
 .target-codex*/
 target-codex*/
 /target-codex/
+
+# Gerado pelo reset-e-carga.ps1 a cada corrida (o script escreve-o e passa-o
+# como argv[1] ao heraclitus-server que ele proprio lanca). E um artefacto de
+# execucao com caminhos absolutos da maquina: versiona-lo so garante que fica
+# dessincronizado do script que o produz.
+config.carga.toml

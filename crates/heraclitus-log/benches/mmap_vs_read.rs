@@ -159,7 +159,10 @@ fn medir(rotulo: &str, n: u64, tamanho: usize) {
     }
     let t_quente = t0.elapsed() / REPS;
 
-    assert_eq!(chk_r, chk_m, "os dois caminhos têm de ler os mesmos registos");
+    assert_eq!(
+        chk_r, chk_m,
+        "os dois caminhos têm de ler os mesmos registos"
+    );
     assert_eq!(chk_m, chk_q);
     let mbs = |d: std::time::Duration| bytes_ficheiro as f64 / d.as_secs_f64() / 1e6;
 
@@ -178,7 +181,10 @@ fn medir(rotulo: &str, n: u64, tamanho: usize) {
 }
 
 fn main() {
-    println!("\nA/B varredura de segmento selado — cache quente, {} repetições\n", 5);
+    println!(
+        "\nA/B varredura de segmento selado — cache quente, {} repetições\n",
+        5
+    );
     medir("registos pequenos", 200_000, 64);
     medir("registos medios", 50_000, 1_024);
     medir("registos grandes", 5_000, 16_384);

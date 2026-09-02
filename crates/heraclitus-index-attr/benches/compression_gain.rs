@@ -25,7 +25,8 @@ fn postings_longos(n: u64, valores: u64) -> AttrIndex {
     let mut ix = AttrIndex::new();
     for lsn in 0..n {
         let mut ep = Episode::new("a", EventKind::Custom("T".into()), b"x".to_vec());
-        ep.attrs.insert("classe".into(), format!("c{}", lsn % valores));
+        ep.attrs
+            .insert("classe".into(), format!("c{}", lsn % valores));
         ix.apply(lsn, &ep);
     }
     ix
@@ -57,10 +58,19 @@ fn medir(rotulo: &str, ix: &AttrIndex) {
 
 fn main() {
     println!("\nGanho da compressão de postings (checkpoint do índice de atributos)\n");
-    println!("  {:<42} {:>9}    {:>9}  {:>6}", "perfil", "sem", "com", "ganho");
+    println!(
+        "  {:<42} {:>9}    {:>9}  {:>6}",
+        "perfil", "sem", "com", "ganho"
+    );
 
-    medir("postings longos (10 valores x 50k)", &postings_longos(50_000, 10));
-    medir("postings medios (500 valores x 50k)", &postings_longos(50_000, 500));
+    medir(
+        "postings longos (10 valores x 50k)",
+        &postings_longos(50_000, 10),
+    );
+    medir(
+        "postings medios (500 valores x 50k)",
+        &postings_longos(50_000, 500),
+    );
     medir("quase unicos (20k distintos)", &quase_unicos(20_000));
 
     // O número que decide de facto: o checkpoint REAL, se existir.

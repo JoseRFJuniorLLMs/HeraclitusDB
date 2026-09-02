@@ -117,20 +117,17 @@ pub use canonical::{
     CANONICAL_CODEC_V1,
 };
 pub use compress::{CompressionCodec, PackingProfile};
-pub use doctor::{
-    doctor_storage, DoctorFinding, DoctorSeverity, StorageDoctorReport,
+pub use doctor::{doctor_storage, DoctorFinding, DoctorSeverity, StorageDoctorReport};
+pub use engine::{
+    persisted_record_hash, GcRunOptions, HrkiBuildOutcome, LakehousePending,
+    PackedGenerationSource, V6Log, V6MetricsSnapshot,
 };
 pub use error::V6Result;
-pub use engine::{
-    persisted_record_hash, GcRunOptions, HrkiBuildOutcome, LakehousePending, PackedGenerationSource,
-    V6Log,
-    V6MetricsSnapshot,
-};
 pub use footer::FooterV6;
 pub use gc::{
     apply_gc, assert_gc_invariant, classify_compaction, commit_gc, commit_gc_manifest,
-    commit_gc_manifest_with_observer, commit_gc_with_observer, unlink_gc_targets, PendingGcUnlink,
-    plan_gc, GcBlockReason, GcExecution, GcOptions, GcPlan, PinRegistry,
+    commit_gc_manifest_with_observer, commit_gc_with_observer, plan_gc, unlink_gc_targets,
+    GcBlockReason, GcExecution, GcOptions, GcPlan, PendingGcUnlink, PinRegistry,
 };
 pub use header::{FileHeaderV6, PhysicalLayout, FORMAT_VERSION_V6};
 pub use heraclitus_core::runtime::{DatabaseManifest, GenerationState, PhysicalGeneration};

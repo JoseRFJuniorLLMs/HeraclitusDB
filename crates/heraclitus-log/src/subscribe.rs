@@ -11,8 +11,8 @@
 
 use crate::EpisodeLog;
 use heraclitus_core::{NotificationEvent, StreamSubscriber};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 
 /// Liga `sub` ao tail do log. Devolve o handle da thread; ela termina sozinha
@@ -47,7 +47,10 @@ fn attach_subscriber_inner<L: EpisodeLog + ?Sized>(
         // `last_seen + 1 = 1` perdia o LSN 0 para sempre).
         let mut last_seen: Option<u64> = None;
         loop {
-            if stop.as_ref().is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            if stop
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+            {
                 break;
             }
             let received = if stop.is_some() {

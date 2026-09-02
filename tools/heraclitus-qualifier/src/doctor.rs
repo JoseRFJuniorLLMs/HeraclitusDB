@@ -54,7 +54,12 @@ pub struct DoctorReport {
     pub safe_to_start: bool,
 }
 
-fn finding(area: &'static str, severity: Severity, message: String, remedy: &'static str) -> Finding {
+fn finding(
+    area: &'static str,
+    severity: Severity,
+    message: String,
+    remedy: &'static str,
+) -> Finding {
     Finding {
         area,
         severity,
@@ -209,7 +214,10 @@ pub fn diagnose(config: &Value, config_dir: &Path) -> Vec<Finding> {
                 findings.push(finding(
                     "tls",
                     Severity::Blocking,
-                    format!("{label} points at {} which does not exist", resolved.display()),
+                    format!(
+                        "{label} points at {} which does not exist",
+                        resolved.display()
+                    ),
                     "install the PEM material before starting the server",
                 ));
             }
@@ -305,7 +313,8 @@ pub fn diagnose(config: &Value, config_dir: &Path) -> Vec<Finding> {
         findings.push(finding(
             "rbac",
             Severity::Warning,
-            "rest_allow_erasure exposes irreversible crypto-shred behind Basic auth only".to_owned(),
+            "rest_allow_erasure exposes irreversible crypto-shred behind Basic auth only"
+                .to_owned(),
             "leave it false and perform erasure over gRPC with an Admin credential",
         ));
     }
@@ -367,9 +376,7 @@ pub fn diagnose(config: &Value, config_dir: &Path) -> Vec<Finding> {
             findings.push(finding(
                 "storage",
                 Severity::Warning,
-                format!(
-                    "segment_max_bytes = {segment} is outside the measured 4-16 MiB window"
-                ),
+                format!("segment_max_bytes = {segment} is outside the measured 4-16 MiB window"),
                 "outside this window append throughput degrades or sealing overhead dominates; \
                  keep the measurement that justified the value",
             ));
@@ -549,7 +556,10 @@ pub fn diagnose(config: &Value, config_dir: &Path) -> Vec<Finding> {
 
     // ---- Sentinel ---------------------------------------------------------
     if let Some(sentinel) = config.get("sentinel") {
-        let enabled = sentinel.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+        let enabled = sentinel
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let mode = sentinel
             .get("mode")
             .and_then(Value::as_str)
@@ -654,9 +664,21 @@ mod tests {
             "production_mode = true\ngrpc_addr = \"0.0.0.0:7474\"\nrest_addr = \"127.0.0.1:7475\"\n",
         );
         assert!(has(&findings, Severity::Blocking, "no TLS material"));
-        assert!(has(&findings, Severity::Blocking, "neither access_credentials"));
-        assert!(has(&findings, Severity::Blocking, "encryption_at_rest = false"));
-        assert!(has(&findings, Severity::Blocking, "without TLS in production_mode"));
+        assert!(has(
+            &findings,
+            Severity::Blocking,
+            "neither access_credentials"
+        ));
+        assert!(has(
+            &findings,
+            Severity::Blocking,
+            "encryption_at_rest = false"
+        ));
+        assert!(has(
+            &findings,
+            Severity::Blocking,
+            "without TLS in production_mode"
+        ));
     }
 
     #[test]
@@ -698,8 +720,7 @@ mod tests {
 
     #[test]
     fn a_contradictory_sentinel_block_is_blocked_and_autonomy_is_refused() {
-        let contradictory =
-            diagnose_text("[sentinel]\nenabled = false\nmode = \"observe\"\n");
+        let contradictory = diagnose_text("[sentinel]\nenabled = false\nmode = \"observe\"\n");
         assert!(has(&contradictory, Severity::Blocking, "contradicts mode"));
         let autonomous = diagnose_text("[sentinel]\nenabled = true\nmode = \"autonomous\"\n");
         assert!(has(&autonomous, Severity::Blocking, "without a human"));
@@ -707,9 +728,7 @@ mod tests {
 
     #[test]
     fn an_even_cluster_is_flagged_because_it_cannot_survive_one_loss() {
-        let findings = diagnose_text(
-            "[replication]\nnode_id = 1\npeers = [\"a\"]\n",
-        );
+        let findings = diagnose_text("[replication]\nnode_id = 1\npeers = [\"a\"]\n");
         assert!(has(&findings, Severity::Warning, "cannot hold quorum"));
     }
 

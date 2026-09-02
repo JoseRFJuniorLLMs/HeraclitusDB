@@ -331,19 +331,34 @@ mod testes_sweep {
     fn os_casos_degenerados_tambem_concordam() {
         let casos: Vec<Vec<LabeledFlag>> = vec![
             vec![],
-            vec![LabeledFlag { score: 1.0, confirmed: true }],
-            vec![LabeledFlag { score: 1.0, confirmed: false }],
+            vec![LabeledFlag {
+                score: 1.0,
+                confirmed: true,
+            }],
+            vec![LabeledFlag {
+                score: 1.0,
+                confirmed: false,
+            }],
             // Todos o mesmo score: um unico candidato.
             (0..10u32)
-                .map(|i| LabeledFlag { score: 2.0, confirmed: i.is_multiple_of(2) })
+                .map(|i| LabeledFlag {
+                    score: 2.0,
+                    confirmed: i.is_multiple_of(2),
+                })
                 .collect(),
             // Nenhum positivo: F1 e zero em todo o lado, ganha o mais baixo.
             (0..10)
-                .map(|i| LabeledFlag { score: i as f32, confirmed: false })
+                .map(|i| LabeledFlag {
+                    score: i as f32,
+                    confirmed: false,
+                })
                 .collect(),
             // Todos positivos: F1 maximo no threshold mais baixo.
             (0..10)
-                .map(|i| LabeledFlag { score: i as f32, confirmed: true })
+                .map(|i| LabeledFlag {
+                    score: i as f32,
+                    confirmed: true,
+                })
                 .collect(),
             // NaNs nunca sao previstos; confirmados ainda contam no recall.
             vec![
@@ -414,7 +429,10 @@ mod testes_sweep {
             .collect();
         let t = learn_threshold(&samples, 1.5);
         let aval = evaluate_threshold(&samples, t);
-        assert!(aval.f1 > 0.0, "o threshold aprendido tem de ter F1 positivo");
+        assert!(
+            aval.f1 > 0.0,
+            "o threshold aprendido tem de ter F1 positivo"
+        );
         assert!(t.is_finite());
     }
 

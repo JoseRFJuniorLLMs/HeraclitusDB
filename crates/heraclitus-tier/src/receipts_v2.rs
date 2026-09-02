@@ -196,8 +196,8 @@ impl DemotionReceiptV2 {
     /// O episódio que entra no log. Quem appenda é o host (via `Engine::append`
     /// — indexação viva + consenso), como no v1.
     pub fn episode(&self) -> Result<Episode, HeraclitusError> {
-        let payload = serde_json::to_vec(self)
-            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+        let payload =
+            serde_json::to_vec(self).map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
         Ok(Episode::new("tier", EventKind::DemotionReceipt, payload))
     }
 }

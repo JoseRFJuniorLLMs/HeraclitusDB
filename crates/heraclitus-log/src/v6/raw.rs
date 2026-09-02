@@ -503,7 +503,8 @@ fn validate_raw_footer(footer: &FooterV6, records: &[RawRecord]) -> V6Result<()>
         ));
     }
     if records.is_empty() {
-        if footer.min_lsn != 0 || footer.max_lsn != 0 || footer.min_hlc != 0 || footer.max_hlc != 0 {
+        if footer.min_lsn != 0 || footer.max_lsn != 0 || footer.min_hlc != 0 || footer.max_hlc != 0
+        {
             return Err(corrupt(CTX, "empty RAW footer has non-zero ranges"));
         }
         return Ok(());
@@ -513,8 +514,12 @@ fn validate_raw_footer(footer: &FooterV6, records: &[RawRecord]) -> V6Result<()>
     let max_lsn = records.iter().map(|r| r.lsn).max().unwrap();
     let min_hlc = records.iter().map(|r| r.hlc).min().unwrap();
     let max_hlc = records.iter().map(|r| r.hlc).max().unwrap();
-    if (footer.min_lsn, footer.max_lsn, footer.min_hlc, footer.max_hlc)
-        != (min_lsn, max_lsn, min_hlc, max_hlc)
+    if (
+        footer.min_lsn,
+        footer.max_lsn,
+        footer.min_hlc,
+        footer.max_hlc,
+    ) != (min_lsn, max_lsn, min_hlc, max_hlc)
     {
         return Err(corrupt(
             CTX,
@@ -609,8 +614,6 @@ pub fn read_footer(path: &Path) -> V6Result<Option<FooterV6>> {
         Err(_) => Ok(None),
     }
 }
-
-
 
 /// Torna durável a **entrada de directório** de um ficheiro acabado de criar.
 ///

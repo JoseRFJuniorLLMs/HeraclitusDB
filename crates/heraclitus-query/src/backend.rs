@@ -1213,13 +1213,10 @@ impl QueryBackend for LogBackend {
             }
         }
         let t0 = std::time::Instant::now();
-        if let Some((mut hits, stats)) = self.log.scan_builtin_eq_capped(
-            field,
-            value,
-            0,
-            bound,
-            QUERY_SCAN_CAP,
-        )? {
+        if let Some((mut hits, stats)) =
+            self.log
+                .scan_builtin_eq_capped(field, value, 0, bound, QUERY_SCAN_CAP)?
+        {
             self.observe_access_path("skip", t0.elapsed().as_nanos() as f64);
             *self.last_pruned_scan.lock().unwrap() = Some(stats);
             hits.retain(|(l, _)| *l < bound);
@@ -1248,8 +1245,8 @@ impl QueryBackend for LogBackend {
             segments_total: legacy_stats.segments_considered as u64,
             segments_candidate: legacy_stats.segments_considered as u64,
             segments_pruned: legacy_stats.segments_skipped as u64,
-            segments_read: (legacy_stats.segments_considered
-                - legacy_stats.segments_skipped) as u64,
+            segments_read: (legacy_stats.segments_considered - legacy_stats.segments_skipped)
+                as u64,
             ..Default::default()
         };
         *self.last_pruned_scan.lock().unwrap() = Some(stats);

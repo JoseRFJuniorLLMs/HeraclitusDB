@@ -84,9 +84,9 @@ pub async fn run_worker<L: heraclitus_log::EpisodeLog + ?Sized + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use heraclitus_log::Log;
     use crate::{load_manifest, verify_receipt, LocalTsa};
     use heraclitus_core::{Episode, EventKind, FsyncPolicy};
+    use heraclitus_log::Log;
     use std::time::Duration;
 
     fn append_n(log: &Log, n: usize) {

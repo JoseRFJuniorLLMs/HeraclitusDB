@@ -69,7 +69,11 @@ impl GenerationKey {
     }
 
     fn with_ext(&self, ext: &str) -> ObjPath {
-        ObjPath::from(format!("{}/generation-{}.{ext}", self.dir(), self.generation))
+        ObjPath::from(format!(
+            "{}/generation-{}.{ext}",
+            self.dir(),
+            self.generation
+        ))
     }
 
     /// O `.hrkl` — a verdade física da geração.
@@ -215,9 +219,21 @@ mod tests {
             "cold/0000000088.hrkl",
             "canonical/xx/segment-88/yy/generation-1.hrkl",
             "canonical/ab/segment-88/cd/generation-1.hrkl",
-            &format!("canonical/{}/segment-x/{}/generation-1.hrkl", "ab".repeat(16), "cd".repeat(32)),
-            &format!("canonical/{}/segment-88/{}/generation-.hrkl", "ab".repeat(16), "cd".repeat(32)),
-            &format!("canonical/{}/segment-88/{}/generation-1", "ab".repeat(16), "cd".repeat(32)),
+            &format!(
+                "canonical/{}/segment-x/{}/generation-1.hrkl",
+                "ab".repeat(16),
+                "cd".repeat(32)
+            ),
+            &format!(
+                "canonical/{}/segment-88/{}/generation-.hrkl",
+                "ab".repeat(16),
+                "cd".repeat(32)
+            ),
+            &format!(
+                "canonical/{}/segment-88/{}/generation-1",
+                "ab".repeat(16),
+                "cd".repeat(32)
+            ),
         ] {
             assert!(GenerationKey::parse(mau).is_err(), "aceitou `{mau}`");
         }

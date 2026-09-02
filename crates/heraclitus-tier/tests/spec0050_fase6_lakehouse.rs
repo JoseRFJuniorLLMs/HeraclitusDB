@@ -315,12 +315,15 @@ async fn iceberg_e_delta_descrevem_os_mesmos_ficheiros() {
     // Metadata Iceberg v2 a sério: os três níveis (metadata JSON, manifest
     // list, manifest) têm de existir como ficheiros próprios.
     assert!(
-        nomes.iter().any(|n| n.starts_with("metadata/")
-            && n.ends_with(".metadata.json")),
+        nomes
+            .iter()
+            .any(|n| n.starts_with("metadata/") && n.ends_with(".metadata.json")),
         "sem metadata JSON Iceberg em {nomes:?}"
     );
     assert!(
-        nomes.iter().any(|n| n.contains("snap-") && n.ends_with(".avro")),
+        nomes
+            .iter()
+            .any(|n| n.contains("snap-") && n.ends_with(".avro")),
         "sem manifest list Iceberg em {nomes:?}"
     );
     assert!(
@@ -336,7 +339,10 @@ async fn iceberg_e_delta_descrevem_os_mesmos_ficheiros() {
         let texto = String::from_utf8(ler(&store, nome).await).unwrap();
         for linha in texto.lines().filter(|l| !l.trim().is_empty()) {
             let v: serde_json::Value = serde_json::from_str(linha).unwrap();
-            if let Some(caminho) = v.get("add").and_then(|a| a.get("path")).and_then(|p| p.as_str())
+            if let Some(caminho) = v
+                .get("add")
+                .and_then(|a| a.get("path"))
+                .and_then(|p| p.as_str())
             {
                 delta.insert(caminho.to_string());
             }
@@ -440,7 +446,11 @@ async fn o_log_continua_a_aceitar_escritas_com_o_lakehouse_partido() {
         ))
         .unwrap();
     }
-    assert_eq!(log.head(), cabeca + 50, "o append parou por causa do export");
+    assert_eq!(
+        log.head(),
+        cabeca + 50,
+        "o append parou por causa do export"
+    );
     let lidos = log.scan(cabeca, cabeca + 50).unwrap();
     assert_eq!(lidos.len(), 50);
     assert_eq!(

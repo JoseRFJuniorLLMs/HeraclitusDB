@@ -97,12 +97,7 @@ pub async fn ingerir(
         lote.push(("Transferencia".into(), content, attrs));
 
         if lote.len() >= batch {
-            total += enviar_lote(
-                unsafe { std::mem::transmute(client.as_deref_mut()) },
-                &lote,
-                agent_id,
-            )
-            .await;
+            total += enviar_lote(client.as_deref_mut(), &lote, agent_id).await;
             lote.clear();
             if total.is_multiple_of(50_000) {
                 info!("    ... {} transferências ingeridas", total);
@@ -111,7 +106,7 @@ pub async fn ingerir(
     }
 
     if !lote.is_empty() {
-        total += enviar_lote(unsafe { std::mem::transmute(client) }, &lote, agent_id).await;
+        total += enviar_lote(client, &lote, agent_id).await;
     }
 
     info!("  Total transferências: {}", total);

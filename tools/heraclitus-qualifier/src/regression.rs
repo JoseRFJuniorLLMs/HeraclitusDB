@@ -128,7 +128,10 @@ pub fn compare(
         .iter()
         .map(|budget| (budget.metric.as_str(), budget))
         .collect::<BTreeMap<_, _>>();
-    let mut names = baseline.keys().cloned().collect::<std::collections::BTreeSet<_>>();
+    let mut names = baseline
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
     names.extend(candidate.keys().cloned());
     names.extend(by_metric.keys().map(|name| (*name).to_owned()));
 
@@ -141,9 +144,7 @@ pub fn compare(
             let (verdict, change, note) = match (base, cand, budget) {
                 (Some(base), Some(cand), Some(budget)) => {
                     match relative_change(base, cand, budget.direction) {
-                        Some(change) if change <= 0.0 => {
-                            (Verdict::Improved, Some(change), None)
-                        }
+                        Some(change) if change <= 0.0 => (Verdict::Improved, Some(change), None),
                         Some(change) if change <= budget.tolerance => {
                             (Verdict::WithinBudget, Some(change), None)
                         }
@@ -298,8 +299,14 @@ mod tests {
     #[test]
     fn a_small_move_inside_tolerance_passes_and_an_improvement_is_named() {
         let comparisons = compare(
-            &map(&[("q1_load.p99_ms", 10.0), ("q1_load.throughput_ops_s", 100.0)]),
-            &map(&[("q1_load.p99_ms", 10.5), ("q1_load.throughput_ops_s", 130.0)]),
+            &map(&[
+                ("q1_load.p99_ms", 10.0),
+                ("q1_load.throughput_ops_s", 100.0),
+            ]),
+            &map(&[
+                ("q1_load.p99_ms", 10.5),
+                ("q1_load.throughput_ops_s", 130.0),
+            ]),
             &budgets(),
         );
         let by = |name: &str| {

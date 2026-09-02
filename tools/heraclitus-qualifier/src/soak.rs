@@ -480,7 +480,9 @@ async fn run_async(config: &SoakConfig) -> Result<SoakSummary> {
         failures.push(format!("{total_errors} operations failed during the soak"));
     }
     if !integrity_ok {
-        failures.push(format!("post-soak integrity check failed: {integrity_message}"));
+        failures.push(format!(
+            "post-soak integrity check failed: {integrity_message}"
+        ));
     }
     if final_head < initial_head {
         failures.push(format!(
@@ -520,9 +522,8 @@ async fn run_async(config: &SoakConfig) -> Result<SoakSummary> {
         ));
     }
     if config.pid.is_none() {
-        limitations.push(
-            "no --pid was supplied, so no process resource series was sampled".to_owned(),
-        );
+        limitations
+            .push("no --pid was supplied, so no process resource series was sampled".to_owned());
     } else {
         let incomplete = samples
             .iter()
@@ -669,7 +670,6 @@ mod tests {
         assert_eq!(gate.samples_in_window, 3);
     }
 
-
     #[test]
     fn a_single_step_that_then_goes_flat_is_not_a_leak() {
         // Measured, not invented: a real server settled its thread pool from 13
@@ -757,7 +757,9 @@ mod tests {
         // The tool that looks for unbounded growth must not grow without bound.
         let mut reservoir = LatencyReservoir::new();
         for chunk in 0..64 {
-            let batch = (0..100_000_u64).map(|i| chunk * 100_000 + i).collect::<Vec<_>>();
+            let batch = (0..100_000_u64)
+                .map(|i| chunk * 100_000 + i)
+                .collect::<Vec<_>>();
             reservoir.extend(&batch);
             assert!(
                 reservoir.kept.len() <= LATENCY_RESERVOIR_CAP,
@@ -791,7 +793,8 @@ mod tests {
 
     #[test]
     fn shipped_soak_profiles_parse_and_declare_their_level() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../qa/qualification/soak");
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../qa/qualification/soak");
         for name in ["6h.json", "24h.json", "72h.json", "168h.json"] {
             let profile = load_profile(&root.join(name)).unwrap();
             assert!(profile.duration_seconds > profile.stabilization_seconds);
@@ -804,10 +807,12 @@ mod tests {
     fn the_profiles_agree_with_the_soak_matrix_on_hours_per_level() {
         // Two files describing the same policy drift, and the one that drifts
         // is the one nobody reads until a laboratory runs the wrong duration.
-        let qa = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../qa/qualification");
-        let matrix: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(qa.join("matrices/soak-profiles.json")).unwrap())
-                .unwrap();
+        let qa =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../qa/qualification");
+        let matrix: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(qa.join("matrices/soak-profiles.json")).unwrap(),
+        )
+        .unwrap();
         for (level, spec) in matrix["profiles"].as_object().unwrap() {
             let hours = spec["hours"].as_u64().unwrap();
             let profile = load_profile(&qa.join(format!("soak/{hours}h.json"))).unwrap();

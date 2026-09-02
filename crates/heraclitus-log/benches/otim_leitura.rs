@@ -45,7 +45,9 @@ fn offsets(path: &std::path::Path) -> (u16, Vec<u64>) {
     let mut f = BufReader::with_capacity(1 << 20, File::open(path).expect("abrir segmento"));
     let mut hdr = [0u8; format::HEADER_LEN];
     f.read_exact(&mut hdr).expect("cabecalho");
-    let version = format::SegmentHeader::decode(&hdr).expect("decode header").version;
+    let version = format::SegmentHeader::decode(&hdr)
+        .expect("decode header")
+        .version;
 
     let mut offs = Vec::new();
     let mut pos = format::HEADER_LEN as u64;
@@ -78,7 +80,8 @@ fn leitura_atual(path: &std::path::Path, off: u64) -> usize {
     let len = u32::from_le_bytes(rh[..4].try_into().unwrap()) as usize;
     let mut buf = vec![0u8; format::RECORD_HEADER_LEN + len];
     buf[..format::RECORD_HEADER_LEN].copy_from_slice(&rh);
-    f.read_exact(&mut buf[format::RECORD_HEADER_LEN..]).expect("read body");
+    f.read_exact(&mut buf[format::RECORD_HEADER_LEN..])
+        .expect("read body");
     // O desperdício: volta ao início do ficheiro só para ler 22 bytes.
     let mut sh = [0u8; format::HEADER_LEN];
     f.seek(SeekFrom::Start(0)).expect("seek 0");
@@ -99,7 +102,8 @@ fn leitura_sem_reler_header(path: &std::path::Path, off: u64, version: u16) -> u
     let len = u32::from_le_bytes(rh[..4].try_into().unwrap()) as usize;
     let mut buf = vec![0u8; format::RECORD_HEADER_LEN + len];
     buf[..format::RECORD_HEADER_LEN].copy_from_slice(&rh);
-    f.read_exact(&mut buf[format::RECORD_HEADER_LEN..]).expect("read body");
+    f.read_exact(&mut buf[format::RECORD_HEADER_LEN..])
+        .expect("read body");
     match format::decode_record(version, &buf) {
         Decoded::Record(_, _, p, _) => p.len(),
         _ => 0,
@@ -114,7 +118,8 @@ fn leitura_handle_quente(f: &mut File, off: u64, version: u16, buf: &mut Vec<u8>
     let len = u32::from_le_bytes(rh[..4].try_into().unwrap()) as usize;
     buf.resize(format::RECORD_HEADER_LEN + len, 0);
     buf[..format::RECORD_HEADER_LEN].copy_from_slice(&rh);
-    f.read_exact(&mut buf[format::RECORD_HEADER_LEN..]).expect("read body");
+    f.read_exact(&mut buf[format::RECORD_HEADER_LEN..])
+        .expect("read body");
     match format::decode_record(version, buf) {
         Decoded::Record(_, _, p, _) => p.len(),
         _ => 0,
@@ -133,12 +138,18 @@ fn main() {
     let (version, offs) = offsets(&path);
     println!("\n=== Sonda de otimizacao da LEITURA ===\n");
     println!("segmento : {}", path.display());
-    println!("tamanho  : {:.1} MB · {} registos · FORMAT v{version}\n", tam as f64 / 1e6, offs.len());
+    println!(
+        "tamanho  : {:.1} MB · {} registos · FORMAT v{version}\n",
+        tam as f64 / 1e6,
+        offs.len()
+    );
 
     // ── LEITURA PONTUAL ─────────────────────────────────────────────────────
     let amostras = 20_000usize.min(offs.len());
     let passo = (offs.len() / amostras).max(1);
-    let alvos: Vec<u64> = (0..amostras).map(|i| offs[(i * passo) % offs.len()]).collect();
+    let alvos: Vec<u64> = (0..amostras)
+        .map(|i| offs[(i * passo) % offs.len()])
+        .collect();
 
     println!("-- LEITURA PONTUAL · {amostras} registos do MESMO segmento -------");
 
@@ -199,7 +210,8 @@ fn main() {
     let mut bytes4 = 0usize;
     {
         let mut f = File::open(&path).expect("open");
-        f.seek(SeekFrom::Start(format::HEADER_LEN as u64)).expect("seek");
+        f.seek(SeekFrom::Start(format::HEADER_LEN as u64))
+            .expect("seek");
         let mut rh = [0u8; format::RECORD_HEADER_LEN];
         let mut rb = Vec::with_capacity(65536);
         loop {

@@ -29,11 +29,11 @@ use heraclitus_core::{Episode, HeraclitusError, Lsn};
 use heraclitus_log::v6::canonical::CANONICAL_CODEC_V1;
 use heraclitus_log::v6::error::HARD_MAX_BLOCK_BYTES;
 use heraclitus_log::v6::hrki::caminho_sidecar;
+use heraclitus_log::v6::packer::CanonicalHasher;
 use heraclitus_log::v6::{
     open_packed, physical_digest, verify_packed_reader, CompressionCodec, IntegrityLevel,
     MemorySource, PackedSegmentReader, ScanCounters, VerifyReport,
 };
-use heraclitus_log::v6::packer::CanonicalHasher;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
@@ -216,7 +216,10 @@ impl ColdTierV6 {
     }
 
     /// Abre um segmento frio para leitura por intervalos (§85).
-    pub async fn open_cold(&self, key: &GenerationKey) -> Result<ColdSegmentReader, HeraclitusError> {
+    pub async fn open_cold(
+        &self,
+        key: &GenerationKey,
+    ) -> Result<ColdSegmentReader, HeraclitusError> {
         ColdSegmentReader::open(
             Arc::clone(&self.store),
             key.segment_path(),

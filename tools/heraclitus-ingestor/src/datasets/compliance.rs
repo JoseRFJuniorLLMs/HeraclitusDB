@@ -134,18 +134,13 @@ async fn ingerir_punicoes(
         lote.push((kind.to_string(), content, attrs));
 
         if lote.len() >= batch {
-            total += enviar_lote(
-                unsafe { std::mem::transmute(client.as_deref_mut()) },
-                &lote,
-                &agent_id,
-            )
-            .await;
+            total += enviar_lote(client.as_deref_mut(), &lote, &agent_id).await;
             lote.clear();
         }
     }
 
     if !lote.is_empty() {
-        total += enviar_lote(unsafe { std::mem::transmute(client) }, &lote, &agent_id).await;
+        total += enviar_lote(client, &lote, &agent_id).await;
     }
 
     Ok(total)
@@ -203,23 +198,13 @@ async fn ingerir_cepim(
         lote.push(("ImpedimentoCEPIM".into(), content, attrs));
 
         if lote.len() >= batch {
-            total += enviar_lote(
-                unsafe { std::mem::transmute(client.as_deref_mut()) },
-                &lote,
-                "ingestor-cepim",
-            )
-            .await;
+            total += enviar_lote(client.as_deref_mut(), &lote, "ingestor-cepim").await;
             lote.clear();
         }
     }
 
     if !lote.is_empty() {
-        total += enviar_lote(
-            unsafe { std::mem::transmute(client) },
-            &lote,
-            "ingestor-cepim",
-        )
-        .await;
+        total += enviar_lote(client, &lote, "ingestor-cepim").await;
     }
 
     Ok(total)
@@ -279,23 +264,13 @@ async fn ingerir_ceaf(
         lote.push(("ExpulsaoCEAF".into(), content, attrs));
 
         if lote.len() >= batch {
-            total += enviar_lote(
-                unsafe { std::mem::transmute(client.as_deref_mut()) },
-                &lote,
-                "ingestor-ceaf",
-            )
-            .await;
+            total += enviar_lote(client.as_deref_mut(), &lote, "ingestor-ceaf").await;
             lote.clear();
         }
     }
 
     if !lote.is_empty() {
-        total += enviar_lote(
-            unsafe { std::mem::transmute(client) },
-            &lote,
-            "ingestor-ceaf",
-        )
-        .await;
+        total += enviar_lote(client, &lote, "ingestor-ceaf").await;
     }
 
     Ok(total)
@@ -364,23 +339,13 @@ async fn ingerir_cpgf(
         lote.push(("GastoCartaoCPGF".into(), content, attrs));
 
         if lote.len() >= batch {
-            total += enviar_lote(
-                unsafe { std::mem::transmute(client.as_deref_mut()) },
-                &lote,
-                "ingestor-cpgf",
-            )
-            .await;
+            total += enviar_lote(client.as_deref_mut(), &lote, "ingestor-cpgf").await;
             lote.clear();
         }
     }
 
     if !lote.is_empty() {
-        total += enviar_lote(
-            unsafe { std::mem::transmute(client) },
-            &lote,
-            "ingestor-cpgf",
-        )
-        .await;
+        total += enviar_lote(client, &lote, "ingestor-cpgf").await;
     }
 
     Ok(total)

@@ -1,0 +1,43 @@
+# O contexto de build é o workspace inteiro (ver o COPY . . no Dockerfile), por
+# isso o que fica de fora aqui é o que decide se o contexto tem 40 MB ou 40 GB.
+
+# Artefactos de compilação — locais e o CARGO_TARGET_DIR alternativo do projeto.
+target/
+target-codex/
+
+# Dados de um banco em execução. NUNCA devem entrar numa imagem: são o log
+# imutável de alguém, podem ter dados pessoais, e pesam gigabytes.
+data/
+*.hrkl
+*.hrki
+*.hrpr
+*.hrkm
+*.ckpt
+*.hdb
+watermarks.json
+
+# Segredos. O ficheiro de credenciais e as chaves do keystore vivem fora da
+# imagem, montados em runtime.
+secrets-v1/
+*.key
+*.pem
+writer.token
+
+# Git, worktrees e ferramentas locais.
+.git/
+.github/
+.claude/
+
+# Documentação e auditorias: não afectam a build e são metade do repositório.
+docs/
+*.md
+!README.md
+
+# Ambientes e caches de Python (SDK).
+sdk/python/.venv/
+**/__pycache__/
+**/*.pyc
+
+# Scripts de operação Windows — irrelevantes numa imagem Linux.
+windows/
+*.ps1

@@ -33,7 +33,7 @@ use std::collections::BTreeMap;
 use heraclitus_core::HeraclitusError;
 use serde::{Deserialize, Serialize};
 
-use super::{ExportedFile, ExportProvenance};
+use super::{ExportProvenance, ExportedFile};
 
 /// Versões do protocolo. `(1, 2)` é o par mínimo que cobre `metaData` com
 /// `configuration` — subir sem necessidade excluiria leitores antigos por
@@ -269,8 +269,8 @@ pub fn commit_append(
 fn render(version: u64, actions: Vec<Action>) -> Result<DeltaCommit, HeraclitusError> {
     let mut bytes = Vec::new();
     for a in &actions {
-        let linha = serde_json::to_vec(a)
-            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+        let linha =
+            serde_json::to_vec(a).map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
         bytes.extend_from_slice(&linha);
         bytes.push(b'\n');
     }
@@ -416,7 +416,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(estado_dos_ficheiros(&[c0.clone(), c1.clone()]), vec![g1.path.clone()]);
+        assert_eq!(
+            estado_dos_ficheiros(&[c0.clone(), c1.clone()]),
+            vec![g1.path.clone()]
+        );
         let final_ = estado_dos_ficheiros(&[c0, c1, c2]);
         assert_eq!(final_, vec![g2.path.clone()]);
         assert!(

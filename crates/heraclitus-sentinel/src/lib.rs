@@ -32,8 +32,8 @@ pub mod policy;
 pub mod queue;
 pub mod sigma;
 pub mod state;
-pub mod threat;
 pub mod subscriber;
+pub mod threat;
 
 pub use ai::{
     ActionCapability, ActionKind, ActionProposal, AiContextBuilder, AiError, AiInvocationAudit,
@@ -88,8 +88,8 @@ pub use threat::{
     Admission, CanonicalError, ConfirmedMatch, FeedVersionState, HashAlgorithm, Indicator,
     IndicatorState, IocIndex, IpCidr, MatchKind, PrefilterOutcome, Pseudonymizer,
     SanitizationError, SanitizedThreatObject, SharingPolicy, StixImporter, ThreatFeed,
-    ThreatFeedUpdate, ThreatGateError, ThreatImportError, ThreatImporter, ThreatIntelDetector,
-    ThreatInputLimits, ThreatObject, ThreatObjectType, ThreatProvenance, ThreatSanitizer,
+    ThreatFeedUpdate, ThreatGateError, ThreatImportError, ThreatImporter, ThreatInputLimits,
+    ThreatIntelDetector, ThreatObject, ThreatObjectType, ThreatProvenance, ThreatSanitizer,
     ThreatSighting, ThreatSourcePolicy, ThreatSourceRegistry, TlpLevel, TrustLevel,
 };
 
@@ -581,7 +581,10 @@ impl SentinelRuntime {
 
     /// Quantos indicadores exactos estão no índice de IOC.
     pub fn threat_indicator_count(&self) -> usize {
-        self.inner.threat.as_ref().map_or(0, |p| p.indicator_count())
+        self.inner
+            .threat
+            .as_ref()
+            .map_or(0, |p| p.indicator_count())
     }
 
     /// Append an auditable checkpoint of the current derived-state watermarks.
@@ -1896,7 +1899,6 @@ fn remember_rule_event(inner: &RuntimeInner, source_lsn: Lsn, event: &SecurityEv
     }
 }
 
-
 /// SPEC-0047 §11/§36 — correlaciona o evento contra o índice de IOC e persiste
 /// o que daí sai: **evidência**, nunca uma acção.
 ///
@@ -3083,16 +3085,34 @@ detection:
             ))
             .unwrap();
         }
-        // 30 s, e nao 5: a afirmacao que interessa e "o sinal E emitido", nao
-        // "em menos de 5 s". Este runtime tem UM worker, e num
-        // `cargo test --workspace` dezenas de binarios disputam os mesmos
-        // nucleos — o worker pode ficar sem processador muito para la de 5 s
-        // sem que nada esteja errado com o pipeline. Observado a falhar 3 vezes
-        // e a passar 3 vezes com o mesmo codigo em 2026-08-31.
+        // ESTE TESTE E INSTAVEL E O PRAZO NAO O ARRANJA. Fica aqui o que ja se
+        // mediu, para nao se repetir trabalho nem se voltar a aumentar o numero.
         //
-        // Alargar o prazo NAO enfraquece o teste: se o pipeline estivesse
-        // partido, nenhum prazo o salvaria. O que se remove e uma asseveracao
-        // sobre carga da maquina, que o teste nao controla e nao devia afirmar.
+        // 2026-08-31: o prazo subiu de 5 s para 30 s, atribuindo a falha a falta
+        // de PROCESSADOR (um so worker a competir com dezenas de binarios de
+        // teste). 2026-09-02: continua a falhar em `cargo test --workspace`, aos
+        // 30 s.
+        //
+        // Tres medicoes de 2026-09-02, cada uma a correr o binario completo:
+        //
+        //   isolado, maquina livre ............. 6 corridas, 0 falhas, ~0,6 s
+        //   8 geradores a saturar os 8 nucleos . 5 corridas, 0 falhas, ~0,6 s
+        //   6 escritores com flush sincrono .... 5 corridas, 1 falha,  30,8 s
+        //
+        // A primeira e a segunda REFUTAM a explicacao pelo processador:
+        // `worker_threads` sao threads do SO e o escalonador da-lhes tempo. A
+        // terceira reproduz a falha de forma fiavel, portanto o gatilho tem a
+        // ver com I/O.
+        //
+        // Mas a correccao obvia NAO funciona: passar o log deste teste de
+        // `FsyncPolicy::Always` para `GroupCommit { interval_ms: 5 }` -- para o
+        // append do sinal deixar de esperar pelo seu proprio fsync -- deu 4
+        // falhas em 8 sob a mesma carga, ou seja pior. A causa esta mais fundo
+        // do que o fsync do append, e nao esta identificada.
+        //
+        // O que falta e diagnosticar onde o pipeline fica parado (um dump de
+        // stacks das threads `heraclitus-sentinel-*` no momento do timeout
+        // resolveria isto em minutos), nao escolher um prazo maior.
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while runtime.status().signals_emitted_total < 1 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
@@ -3304,9 +3324,18 @@ mod testes_janela_de_chaves {
     #[test]
     fn uma_chave_repetida_e_suprimida() {
         let mut j = JanelaDeChaves::nova(8);
-        assert!(j.inserir(&"t:ioc-1:domain:E1".to_string()), "a primeira e nova");
-        assert!(!j.inserir(&"t:ioc-1:domain:E1".to_string()), "a segunda e o duplicado");
-        assert!(j.inserir(&"t:ioc-1:domain:E2".to_string()), "outro evento e outra chave");
+        assert!(
+            j.inserir(&"t:ioc-1:domain:E1".to_string()),
+            "a primeira e nova"
+        );
+        assert!(
+            !j.inserir(&"t:ioc-1:domain:E1".to_string()),
+            "a segunda e o duplicado"
+        );
+        assert!(
+            j.inserir(&"t:ioc-1:domain:E2".to_string()),
+            "outro evento e outra chave"
+        );
     }
 
     /// A propriedade que faltava: a estrutura NAO cresce para sempre.
@@ -3337,7 +3366,10 @@ mod testes_janela_de_chaves {
         assert!(j.inserir(&"b".to_string()));
         assert!(!j.inserir(&"a".to_string()), "ainda esta na janela");
         j.inserir(&"c".to_string()); // expulsa "a"
-        assert!(j.inserir(&"a".to_string()), "saiu da janela, volta a ser nova");
+        assert!(
+            j.inserir(&"a".to_string()),
+            "saiu da janela, volta a ser nova"
+        );
         assert_eq!(j.len(), 2);
     }
 
@@ -3382,9 +3414,16 @@ mod testes_janela_de_lsn {
         for lsn in 0..100_000u64 {
             j.inserir(&lsn);
         }
-        assert_eq!(j.len(), 64, "cem mil eventos nao podem deixar cem mil entradas");
+        assert_eq!(
+            j.len(),
+            64,
+            "cem mil eventos nao podem deixar cem mil entradas"
+        );
         assert!(j.contem(&99_999), "os recentes continuam la");
-        assert!(!j.contem(&0), "os antigos sairam, que e o que o tecto significa");
+        assert!(
+            !j.contem(&0),
+            "os antigos sairam, que e o que o tecto significa"
+        );
     }
 
     #[test]

@@ -122,7 +122,9 @@ pub fn read_long(buf: &[u8]) -> Result<(i64, usize), HeraclitusError> {
 pub fn read_bytes(buf: &[u8]) -> Result<(&[u8], usize), HeraclitusError> {
     let (len, n) = read_long(buf)?;
     let len = usize::try_from(len).map_err(|_| erro("comprimento negativo"))?;
-    let fim = n.checked_add(len).ok_or_else(|| erro("comprimento transborda"))?;
+    let fim = n
+        .checked_add(len)
+        .ok_or_else(|| erro("comprimento transborda"))?;
     let s = buf.get(n..fim).ok_or_else(|| erro("bytes truncados"))?;
     Ok((s, fim))
 }
@@ -324,7 +326,18 @@ mod tests {
 
     #[test]
     fn varint_faz_round_trip_nos_extremos() {
-        for v in [0, 1, -1, 63, 64, -64, -65, i32::MAX as i64, i64::MAX, i64::MIN] {
+        for v in [
+            0,
+            1,
+            -1,
+            63,
+            64,
+            -64,
+            -65,
+            i32::MAX as i64,
+            i64::MAX,
+            i64::MIN,
+        ] {
             rt(v);
         }
     }

@@ -93,7 +93,11 @@ fn obter_token(cli_token: Option<String>) -> Option<String> {
             if linha_limpa.starts_with("auth_token") {
                 let partes: Vec<&str> = linha_limpa.split('=').collect();
                 if partes.len() >= 2 {
-                    let token = partes[1].trim().trim_matches('"').trim_matches('\'').to_string();
+                    let token = partes[1]
+                        .trim()
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .to_string();
                     if !token.is_empty() {
                         return Some(token);
                     }
@@ -115,7 +119,10 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     info!("╔══════════════════════════════════════════════════════════╗");
-    info!("║  HeraclitusDB — Carga Realista de {} Registros         ║", cli.n);
+    info!(
+        "║  HeraclitusDB — Carga Realista de {} Registros         ║",
+        cli.n
+    );
     info!("╚══════════════════════════════════════════════════════════╝");
     info!("  Servidor  : {}", cli.server);
 
@@ -125,10 +132,11 @@ async fn main() -> anyhow::Result<()> {
     let mut client = heraclitus_client::Client::connect(cli.server.clone())
         .await
         .map_err(|e| anyhow::anyhow!("Falha ao conectar em {}: {e}", cli.server))?;
-    
+
     if let Some(ref t) = token {
         info!("Autenticação configurada com bearer token (origem detectada).");
-        client = client.with_bearer_token(t)
+        client = client
+            .with_bearer_token(t)
             .map_err(|e| anyhow::anyhow!("Token inválido: {e}"))?;
     } else {
         warn!("Nenhum token de autenticação detectado. A chamada pode falhar se o servidor exigir autenticação.");

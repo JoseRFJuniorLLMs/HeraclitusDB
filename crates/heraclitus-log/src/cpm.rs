@@ -192,8 +192,12 @@ mod tests {
     fn hardware_e_tabela_concordam() {
         // Tamanhos escolhidos para exercitar as pontas desalinhadas do
         // `align_to::<u64>` e o registo médio real (487 B).
-        for tam in [0usize, 1, 3, 7, 8, 9, 15, 16, 17, 63, 64, 65, 487, 4096, 65_537] {
-            let dados: Vec<u8> = (0..tam).map(|i| (i.wrapping_mul(31) ^ 0xA5) as u8).collect();
+        for tam in [
+            0usize, 1, 3, 7, 8, 9, 15, 16, 17, 63, 64, 65, 487, 4096, 65_537,
+        ] {
+            let dados: Vec<u8> = (0..tam)
+                .map(|i| (i.wrapping_mul(31) ^ 0xA5) as u8)
+                .collect();
             let tabela = !update_tabela(0xFFFF_FFFF, &dados);
             assert_eq!(
                 tabela,

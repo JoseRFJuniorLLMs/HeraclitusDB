@@ -255,8 +255,9 @@ fn main() {
             source,
             destination,
             no_verify,
-        } => heraclitus_cli::migrate_v6(&source, &destination, !no_verify)
-            .map_err(|e| e.to_string()),
+        } => {
+            heraclitus_cli::migrate_v6(&source, &destination, !no_verify).map_err(|e| e.to_string())
+        }
         Cmd::Export { target, to, table } => {
             heraclitus_cli::export_lakehouse_v6(&target, &to, &table).map_err(|e| e.to_string())
         }
@@ -265,13 +266,8 @@ fn main() {
             fpr,
             no_agent_id,
             no_session_id,
-        } => heraclitus_cli::rebuild_index_v6(
-            &target,
-            fpr,
-            !no_agent_id,
-            !no_session_id,
-        )
-        .map_err(|e| e.to_string()),
+        } => heraclitus_cli::rebuild_index_v6(&target, fpr, !no_agent_id, !no_session_id)
+            .map_err(|e| e.to_string()),
         Cmd::Storage {
             command: StorageCmd::Doctor { dir },
         } => heraclitus_cli::storage_doctor_v6(&dir).map_err(|e| e.to_string()),

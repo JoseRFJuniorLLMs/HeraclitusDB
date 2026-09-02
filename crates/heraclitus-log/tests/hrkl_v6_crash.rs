@@ -252,7 +252,10 @@ fn bit_rot_num_registo_completo_e_tratado_como_cauda() {
     let inicio_do_quarto = tamanho_bom;
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         f.write_all(&rec).unwrap();
     }
     {
@@ -271,7 +274,11 @@ fn bit_rot_num_registo_completo_e_tratado_como_cauda() {
     }
 
     let scan = scan_raw_segment(&path).unwrap();
-    assert_eq!(scan.records.len(), 3, "o registo corrompido nao pode ser lido");
+    assert_eq!(
+        scan.records.len(),
+        3,
+        "o registo corrompido nao pode ser lido"
+    );
     assert_eq!(
         scan.torn_at,
         Some(inicio_do_quarto),
@@ -309,8 +316,12 @@ fn footer_parcial_nao_conta_como_selado() {
     // Metade de um footer: o magic está lá, o resto não.
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-        f.write_all(&heraclitus_log::v6::footer::FOOTER_MAGIC).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        f.write_all(&heraclitus_log::v6::footer::FOOTER_MAGIC)
+            .unwrap();
         f.write_all(&[0u8; 20]).unwrap();
     }
 

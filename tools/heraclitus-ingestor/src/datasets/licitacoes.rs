@@ -184,18 +184,13 @@ async fn ingerir_licitacoes(
         lote.push(("Licitacao".into(), content, attrs));
 
         if lote.len() >= batch {
-            total += enviar_lote(
-                unsafe { std::mem::transmute(client.as_deref_mut()) },
-                &lote,
-                agent_id,
-            )
-            .await;
+            total += enviar_lote(client.as_deref_mut(), &lote, agent_id).await;
             lote.clear();
         }
     }
 
     if !lote.is_empty() {
-        total += enviar_lote(unsafe { std::mem::transmute(client) }, &lote, agent_id).await;
+        total += enviar_lote(client, &lote, agent_id).await;
     }
 
     info!("  Total licitações: {}", total);
@@ -243,12 +238,7 @@ async fn ingerir_csv_generico(
         lote.push((kind.to_string(), content, attrs));
 
         if lote.len() >= batch {
-            total += enviar_lote(
-                unsafe { std::mem::transmute(client.as_deref_mut()) },
-                &lote,
-                agent_id,
-            )
-            .await;
+            total += enviar_lote(client.as_deref_mut(), &lote, agent_id).await;
             lote.clear();
             if total.is_multiple_of(50_000) {
                 info!("    ... {} registros '{}' ingeridos", total, kind);
@@ -257,7 +247,7 @@ async fn ingerir_csv_generico(
     }
 
     if !lote.is_empty() {
-        total += enviar_lote(unsafe { std::mem::transmute(client) }, &lote, agent_id).await;
+        total += enviar_lote(client, &lote, agent_id).await;
     }
 
     info!("  Total {}: {}", kind, total);

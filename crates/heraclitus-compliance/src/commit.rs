@@ -112,7 +112,10 @@ pub fn aggregate_root(segment_roots: &[[u8; 32]]) -> [u8; 32] {
 ///
 /// Só entram segmentos **selados**: o tail é mutável, e ancorá-lo produziria
 /// um compromisso que deixa de reproduzir no instante seguinte.
-fn sealed_roots(manifest: &DatabaseManifest, watermark_lsn: Lsn) -> (Vec<[u8; 32]>, CommitmentDomain) {
+fn sealed_roots(
+    manifest: &DatabaseManifest,
+    watermark_lsn: Lsn,
+) -> (Vec<[u8; 32]>, CommitmentDomain) {
     if !manifest.segments_v2.is_empty() {
         let mut segs: Vec<_> = manifest
             .segments_v2
