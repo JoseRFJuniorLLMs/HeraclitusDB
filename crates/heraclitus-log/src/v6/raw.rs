@@ -560,6 +560,15 @@ fn validate_raw_footer(footer: &FooterV6, records: &[RawRecord]) -> V6Result<()>
 ///
 /// Um ficheiro com header completo mas bytes errados **não** entra aqui: isso é
 /// corrupção e tem de falhar alto.
+///
+/// # Pré-condição
+/// Esta regra só é válida para a cauda **activa** (`{id}.active.hrkl`), e é
+/// isso que a torna segura. Um RAW selado chega ao disco por rename atómico de
+/// um ficheiro já completo, portanto nunca nasce curto; se um deles aparecer
+/// curto, encolheu — o que é corrupção, e é apanhado por
+/// `validate_catalogued_generations`, que compara o tamanho físico e a contagem
+/// de registos contra o manifesto. Aplicar este predicado a um segmento selado
+/// trocaria essa verificação apertada por um descarte silencioso.
 pub fn is_crash_stub(path: &Path) -> V6Result<bool> {
     Ok(std::fs::metadata(path)?.len() < FILE_HEADER_LEN as u64)
 }
