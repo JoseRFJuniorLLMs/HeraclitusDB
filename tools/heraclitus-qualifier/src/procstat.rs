@@ -5,8 +5,6 @@
 //! measurement as a result, and a zeroed resident-set series would make a leak
 //! look like perfect stability.
 
-use std::process::Command;
-
 use serde::Serialize;
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -69,7 +67,11 @@ pub fn sample(pid: u32) -> ProcessSample {
         pid,
         ..Default::default()
     };
-    let Ok(output) = Command::new("powershell")
+    // Caminho qualificado em vez de `use std::process::Command`: em Linux este
+    // ramo e codigo morto e o import ficava por usar — com `-D warnings` isso
+    // e erro. Era o que o `let _ = Command::new("true")` do ramo generico
+    // existia para tapar, sem lancar processo nenhum.
+    let Ok(output) = std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
     else {
@@ -88,7 +90,6 @@ pub fn sample(pid: u32) -> ProcessSample {
 
 #[cfg(not(any(target_os = "linux", windows)))]
 pub fn sample(pid: u32) -> ProcessSample {
-    let _ = Command::new("true");
     ProcessSample {
         pid,
         ..Default::default()

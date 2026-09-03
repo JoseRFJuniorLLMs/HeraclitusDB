@@ -695,7 +695,7 @@ impl V6Log {
             })?;
             let path = resolve_location(&self.root, &generation.location)?;
             let seg_from = from.max(desc.first_lsn);
-            let seg_to = end.min(desc.first_lsn.saturating_add(desc.record_count as u64));
+            let seg_to = end.min(desc.first_lsn.saturating_add(desc.record_count));
 
             match generation.layout {
                 PhysicalLayout::Raw => {
@@ -744,11 +744,10 @@ impl V6Log {
         if out.len() < max {
             let active_info = {
                 let state = self.lock_state()?;
-                if let Some(active) = &state.active {
-                    Some((active.path.clone(), active.writer.header().first_lsn))
-                } else {
-                    None
-                }
+                state
+                    .active
+                    .as_ref()
+                    .map(|active| (active.path.clone(), active.writer.header().first_lsn))
             };
             if let Some((path, active_first_lsn)) = active_info {
                 if end > active_first_lsn {
