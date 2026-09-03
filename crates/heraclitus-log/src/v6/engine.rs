@@ -316,8 +316,9 @@ impl V6Log {
         // A condição é deliberadamente só o comprimento. Um header completo com
         // bytes errados NÃO entra aqui: isso é corrupção e tem de falhar alto.
         if let Some((id, path)) = active_from_disk.as_ref() {
-            let curto = std::fs::metadata(path).map(|m| m.len()).unwrap_or(u64::MAX)
-                < super::header::FILE_HEADER_LEN as u64;
+            // A regra vive em `v6::raw::is_crash_stub`, junto do `create` que
+            // abre a janela — aqui só se decide o que fazer com o toco.
+            let curto = super::raw::is_crash_stub(path).unwrap_or(false);
             if curto {
                 tracing::warn!(
                     segment = id,

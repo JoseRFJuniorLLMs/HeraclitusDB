@@ -25,12 +25,12 @@
 //!
 //! `CRASH_ITERS_V6=200` para correr a versão longa.
 
-use heraclitus_core::Episode;
+use heraclitus_core::{Episode, EventKind};
 use heraclitus_log::v6::canonical::{canonical_record_hash, CanonicalRecordV1};
 use heraclitus_log::v6::merkle::MerkleAccumulatorV1;
 use heraclitus_log::v6::raw::{
-    encode_raw_record, read_footer, repair_active_tail, scan_raw_segment, RawSegmentWriter,
-    SegmentInit,
+    encode_raw_record, is_crash_stub, read_footer, repair_active_tail, scan_raw_segment,
+    RawSegmentWriter, SegmentInit,
 };
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -107,6 +107,15 @@ fn recuperar(dir: &Path) -> u64 {
             );
             let scan = scan_raw_segment(&p).expect("scan selado");
             total += scan.records.len() as u64;
+        } else if is_crash_stub(&p).expect("metadata do segmento") {
+            // Toco de crash: o kill calhou entre o `create_new` e o header
+            // chegar ao ficheiro. Não tem header, logo não pode conter nenhum
+            // registo (os registos vêm depois dele) e não há nada a contar.
+            // O motor faz exactamente isto no arranque — remove-o e segue —
+            // e este helper existe para imitar o motor. Enquanto não o fazia,
+            // o `repair_active_tail` devolvia "short header" e o teste
+            // acusava de corrupção aquilo que é a janela normal de um kill.
+            continue;
         } else {
             // Activo: repara a cauda e conta o que sobrou.
             repair_active_tail(&p).unwrap_or_else(|e| {
@@ -172,6 +181,62 @@ fn sobrevive_a_kills_repetidos_a_meio_do_append() {
     }
 
     assert!(ultimo > 0, "o escritor nunca chegou a gravar nada");
+}
+
+/// Regressão determinística do que o CI apanhou por sorte.
+///
+/// `sobrevive_a_kills_repetidos_a_meio_do_append` falhou com
+/// `corruption detected in hrkl v6 file header: short header` num segmento
+/// chamado `00000000000000000081.hrkl`: o kill calhou entre o `create_new` e o
+/// header chegar ao ficheiro. Não é corrupção — é a janela normal de um kill, e
+/// um ficheiro sem header não pode conter nenhum registo committed porque os
+/// registos vêm depois dele.
+///
+/// Esse teste só expõe a janela quando o relógio ajuda, o que a fez passar por
+/// flakiness durante meses. Este fabrica-a directamente: um toco ao lado de um
+/// segmento selado, e a exigência de que a recuperação conte o segmento bom em
+/// vez de abortar em cima do toco.
+#[test]
+fn um_toco_de_crash_nao_impede_a_recuperacao_dos_segmentos_bons() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Um segmento real, selado, com registos que TÊM de sobreviver.
+    let bom = dir.path().join(format!("{:020}.hrkl", 0));
+    let mut w = RawSegmentWriter::create(
+        &bom,
+        SegmentInit {
+            segment_id: 0,
+            created_hlc: 1,
+            first_lsn: 0,
+            writer_epoch: 1,
+            storage_namespace_id: [7u8; 16],
+        },
+    )
+    .unwrap();
+    for i in 0..4u64 {
+        let ep = Episode::new("crash-agent-v6", EventKind::Observation, vec![i as u8]);
+        let payload = serde_json::to_vec(&ep).unwrap();
+        let hash = canonical_record_hash(&CanonicalRecordV1 {
+            lsn: i,
+            record_hlc: i,
+            opaque_meta: ep.id.0.to_bytes(),
+            episode: &ep,
+        });
+        w.append(i, i, &payload, &hash).unwrap();
+    }
+    w.seal().unwrap();
+
+    // O toco: exactamente o que o `create_new` deixa quando o processo morre
+    // antes do `write_all` do header.
+    let toco = dir.path().join(format!("{:020}.hrkl", 1));
+    std::fs::write(&toco, b"").unwrap();
+    assert!(is_crash_stub(&toco).unwrap());
+
+    assert_eq!(
+        recuperar(dir.path()),
+        4,
+        "o toco fez perder os registos duraveis do segmento selado"
+    );
 }
 
 /// A recusa que o nome do teste unitário promete mas não exercita.
