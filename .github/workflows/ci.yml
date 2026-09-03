@@ -44,8 +44,6 @@ jobs:
           toolchain: 1.96.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
-      - name: fmt
-        run: cargo fmt --all --check
       - name: clippy — workspace, targets e features (deny warnings)
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: tests — workspace e todas as features
@@ -58,6 +56,14 @@ jobs:
           CRASH_ITERS: "1000"
       - name: format compat gate (v2/v3/v4 read-path)
         run: cargo test -p heraclitus-log --test v2_compat --locked
+      # O `fmt` corre por ULTIMO e com `!cancelled()` de proposito. Enquanto foi
+      # o primeiro passo, uma divergencia de formatacao abortava o job antes do
+      # clippy — e um `error[E0433]` real ficou 12 dias invisivel atras de um
+      # vermelho cosmetico. Um gate mecanico nunca pode mascarar um gate
+      # semantico: continua a reprovar o job, mas so depois de compilar e testar.
+      - name: fmt (nao mascara os gates acima)
+        if: '!cancelled()'
+        run: cargo fmt --all --check
 
   supply-chain:
     runs-on: ubuntu-latest
@@ -76,12 +82,37 @@ jobs:
             echo "rkyv entrou no grafo compilado; a exceção RustSec não é mais válida"
             exit 1
           fi
+      - name: prove the RSA private-key path stays out of production builds
+        shell: bash
+        run: |
+          # RUSTSEC-2023-0071 (Marvin) e um sidechannel de temporizacao nas
+          # operacoes com a chave PRIVADA. Nao ha upgrade: o `rsa` 0.9.10 e a
+          # ultima versao publicada. A excecao so e legitima enquanto o binario
+          # de producao nunca tocar numa chave privada RSA — hoje so verifica
+          # assinaturas (RsaPublicKey + SignatureScheme::verify) e a unica
+          # chave privada vive no `test_pki`, atras de `#[cfg(test)]`.
+          #
+          # Estes dois testes transformam essa afirmacao em algo que a maquina
+          # confere. Se alguem acrescentar assinatura RSA ao servidor, o gate
+          # cai aqui em vez de a excecao envelhecer em silencio.
+          if ! grep -A1 '^#\[cfg(test)\]$' crates/heraclitus-compliance/src/lib.rs | grep -q 'mod test_pki;'; then
+            echo "test_pki deixou de estar atras de #[cfg(test)]: chave privada RSA pode entrar em producao"
+            exit 1
+          fi
+          fora=$(grep -rln -E 'RsaPrivateKey|rsa::pkcs1v15::SigningKey|rsa::pss::SigningKey|rsa::pkcs8::DecodePrivateKey' \
+                   crates tools --include='*.rs' | grep -v '^crates/heraclitus-compliance/src/test_pki.rs$' || true)
+          if [ -n "$fora" ]; then
+            echo "API de chave privada RSA fora do test_pki; RUSTSEC-2023-0071 passa a ser exploravel:"
+            echo "$fora"
+            exit 1
+          fi
       - name: RustSec — deny every finding except documented risk acceptances
         run: >-
           cargo audit --deny warnings
           --ignore RUSTSEC-2026-0235
           --ignore RUSTSEC-2025-0141
           --ignore RUSTSEC-2024-0436
+          --ignore RUSTSEC-2023-0071
 
   python-sdk:
     runs-on: ubuntu-latest
