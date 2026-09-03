@@ -226,7 +226,10 @@ impl ViewRegistry {
         view_name: Option<&str>,
     ) -> Result<(), HeraclitusError> {
         for (i, v) in self.views.iter_mut().enumerate() {
-            if view_name.map(|n| n == self.names[i].as_str()).unwrap_or(true) {
+            if view_name
+                .map(|n| n == self.names[i].as_str())
+                .unwrap_or(true)
+            {
                 v.reset();
                 self.watermarks_vec[i] = 0;
                 self.watermarks.remove(&self.names[i]);
@@ -244,7 +247,10 @@ impl ViewRegistry {
                     continue;
                 }
                 for (i, v) in self.views.iter_mut().enumerate() {
-                    if view_name.map(|n| n == self.names[i].as_str()).unwrap_or(true) {
+                    if view_name
+                        .map(|n| n == self.names[i].as_str())
+                        .unwrap_or(true)
+                    {
                         v.apply(*lsn, ep);
                         self.watermarks_vec[i] = *lsn;
                     }
