@@ -43,7 +43,9 @@ use super::manifest::{
 };
 use super::packed::{open_packed, PackOptions, ScanCounters};
 use super::packer::{pack_segment, PackOutcome};
-use super::raw::{read_footer, repair_active_tail, scan_raw_segment, RawSegmentWriter, SegmentInit};
+use super::raw::{
+    read_footer, repair_active_tail, scan_raw_segment, RawSegmentWriter, SegmentInit, TailRepair,
+};
 use super::receipts::{persist_pack_receipt, physical_digest_of_file};
 use super::verify::{verify_segment as verify_segment_file, IntegrityLevel, VerifyReport};
 
@@ -258,7 +260,38 @@ impl V6Log {
         let hlc = Arc::new(Hlc::new());
         let loaded = manifest_store.load()?;
         let loaded_manifest = loaded.as_ref().map(|l| l.manifest.clone());
-        let inventory = discover(&segments_dir)?;
+        let mut inventory = discover(&segments_dir)?;
+        // Um ficheiro activo curto demais para conter um header é um toco de
+        // crash, não um segmento (ver `raw::segment_stub_len`): os registos vêm
+        // DEPOIS do header, portanto ele não pode conter um único registo
+        // committed. Removê-lo não perde nada; não o remover impede o arranque.
+        //
+        // A varredura TEM de acontecer aqui, antes de tudo o que lê headers.
+        // Era esta a metade que faltava ao arranjo de 2026-08: a remoção do
+        // toco existia, mas ~50 linhas adiante, e `discover_namespace` — que
+        // corre ANTES dela e lê cada header com `read_exact` — rebentava com
+        // "failed to fill whole buffer". Só corre quando não há HRKM, ou seja
+        // numa base recém-criada: exactamente o caso em que ainda não houve
+        // selagem nenhuma e o toco é mais provável.
+        //
+        // Varrer antes do teste de ambiguidade abaixo também é deliberado: um
+        // toco não é uma cauda. Dois activos em que um deles está vazio não é
+        // recuperação ambígua, é uma cauda só.
+        let mut activos = Vec::with_capacity(inventory.active.len());
+        for (id, path) in std::mem::take(&mut inventory.active) {
+            if let Some(len) = super::raw::segment_stub_len(&path)? {
+                tracing::warn!(
+                    segment = id,
+                    path = %path.display(),
+                    len,
+                    "segmento activo sem header completo: toco de um crash durante a criação; removido"
+                );
+                std::fs::remove_file(&path)?;
+                continue;
+            }
+            activos.push((id, path));
+        }
+        inventory.active = activos;
         if inventory.active.len() > 1 {
             return Err(corrupt(
                 "hrkl v6 boot",
@@ -307,29 +340,12 @@ impl V6Log {
 
         // Um active com footer válido caiu entre seal e rename. Promovê-lo
         // para RAW final antes do manifesto fecha essa janela sem truncamento.
-        let mut active_from_disk = inventory.active.into_iter().next();
-        // Um ficheiro activo demasiado curto para conter um header é um toco de
-        // crash, não um segmento: os registos vêm DEPOIS do header, portanto um
-        // ficheiro sem header completo não pode conter um único registo
-        // committed. Removê-lo não perde nada; não o remover parava o arranque
-        // — era o que acontecia antes de o `RawSegmentWriter::create` passar a
-        // sincronizar o header, e foi o que o crash-test apanhou.
         //
-        // A condição é deliberadamente só o comprimento. Um header completo com
-        // bytes errados NÃO entra aqui: isso é corrupção e tem de falhar alto.
-        if let Some((id, path)) = active_from_disk.as_ref() {
-            let curto = std::fs::metadata(path).map(|m| m.len()).unwrap_or(u64::MAX)
-                < super::header::FILE_HEADER_LEN as u64;
-            if curto {
-                tracing::warn!(
-                    segment = id,
-                    path = %path.display(),
-                    "segmento activo sem header completo: toco de um crash durante a criação; removido"
-                );
-                std::fs::remove_file(path)?;
-                active_from_disk = None;
-            }
-        }
+        // A varredura dos tocos NÃO está aqui de propósito: tem de correr antes
+        // de `discover_namespace`, lá em cima, antes da primeira leitura de
+        // header. Chegado a este ponto, todo o ficheiro no inventário tem pelo
+        // menos um header completo.
+        let mut active_from_disk = inventory.active.into_iter().next();
         if let Some((id, path)) = active_from_disk.as_ref() {
             let header = read_v6_header(path)?;
             check_header_identity(&header, *id, namespace, PhysicalLayout::Raw)?;
@@ -374,7 +390,19 @@ impl V6Log {
                 // A extensão `.active` é a autorização explícita para reparar.
                 // Um footer com magic completo mas CRC inválido é recusado pelo
                 // helper; ele é possível bit rot de uma geração selada.
-                repair_active_tail(&path)?;
+                match repair_active_tail(&path)? {
+                    TailRepair::Intact | TailRepair::Truncated(_) => {}
+                    // Impossível por construção: a varredura no início do boot
+                    // já removeu os tocos. Chegar aqui significa que alguém
+                    // criou o ficheiro por baixo de nós durante o arranque, e
+                    // continuar seria adivinhar de quem é a cauda.
+                    TailRepair::Stub { len } => {
+                        return Err(corrupt(
+                            "hrkl v6 boot",
+                            format!("um toco de {len} bytes apareceu no activo depois da varredura"),
+                        ));
+                    }
+                }
                 let scan = scan_raw_segment(&path)?;
                 check_header_identity(&scan.header, id, namespace, PhysicalLayout::Raw)?;
                 validate_active_records(&scan, next_lsn)?;

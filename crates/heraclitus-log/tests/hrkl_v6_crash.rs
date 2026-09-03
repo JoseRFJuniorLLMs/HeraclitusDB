@@ -30,7 +30,7 @@ use heraclitus_log::v6::canonical::{canonical_record_hash, CanonicalRecordV1};
 use heraclitus_log::v6::merkle::MerkleAccumulatorV1;
 use heraclitus_log::v6::raw::{
     encode_raw_record, read_footer, repair_active_tail, scan_raw_segment, RawSegmentWriter,
-    SegmentInit,
+    SegmentInit, TailRepair,
 };
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -109,9 +109,24 @@ fn recuperar(dir: &Path) -> u64 {
             total += scan.records.len() as u64;
         } else {
             // Activo: repara a cauda e conta o que sobrou.
-            repair_active_tail(&p).unwrap_or_else(|e| {
+            let desfecho = repair_active_tail(&p).unwrap_or_else(|e| {
                 panic!("reparacao falhou em {}: {e}", p.display());
             });
+            if let TailRepair::Stub { .. } = desfecho {
+                // O kill calhou entre o `create_new` e o header chegar ao
+                // disco. Isto NÃO é uma falha do formato: o ficheiro existe
+                // porque criar é publicar a entrada no directório, e nenhum
+                // fsync fecha essa janela. Como os registos vêm depois do
+                // header, o toco não pode conter nada — contribui zero para a
+                // contagem e o invariante de monotonia aguenta-se.
+                //
+                // Removê-lo é o que o motor faz no arranque (§v6::engine), e é
+                // por isso que se faz aqui também: esta função existe para
+                // modelar o boot, e um boot que deixasse o toco para trás
+                // deixaria o escritor seguinte a retomar do ficheiro errado.
+                std::fs::remove_file(&p).expect("remover toco");
+                continue;
+            }
             let scan = scan_raw_segment(&p).expect("scan activo");
             assert!(
                 scan.torn_at.is_none(),
@@ -277,7 +292,10 @@ fn bit_rot_num_registo_completo_e_tratado_como_cauda() {
         Some(inicio_do_quarto),
         "torn_at tem de apontar para o inicio do registo corrompido"
     );
-    assert_eq!(repair_active_tail(&path).unwrap(), Some(inicio_do_quarto));
+    assert_eq!(
+        repair_active_tail(&path).unwrap(),
+        TailRepair::Truncated(inicio_do_quarto)
+    );
     assert_eq!(std::fs::metadata(&path).unwrap().len(), tamanho_bom);
 }
 
@@ -321,5 +339,8 @@ fn footer_parcial_nao_conta_como_selado() {
     let scan = scan_raw_segment(&path).unwrap();
     assert!(scan.footer.is_none(), "scan nao pode ver footer valido");
     assert_eq!(scan.records.len(), 3);
-    assert_eq!(repair_active_tail(&path).unwrap(), Some(tamanho_bom));
+    assert_eq!(
+        repair_active_tail(&path).unwrap(),
+        TailRepair::Truncated(tamanho_bom)
+    );
 }

@@ -47,6 +47,24 @@ fn retomar(dir: &Path) -> (u64, u64) {
         .unwrap_or_default();
     ids.sort_unstable();
 
+    // Um toco (ficheiro curto demais para ter header, deixado por um kill entre
+    // o `create_new` e o header chegar ao disco) não é o segmento a retomar: é
+    // um ficheiro sem um único registo. Descarta-se e olha-se para o anterior,
+    // que é o que o motor faz no arranque. Retomar A PARTIR do toco reiniciava
+    // o LSN em zero e o harness passava a reescrever história já selada.
+    while let Some(&ultimo) = ids.last() {
+        if heraclitus_log::v6::raw::segment_stub_len(&caminho(dir, ultimo))
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            let _ = std::fs::remove_file(caminho(dir, ultimo));
+            ids.pop();
+            continue;
+        }
+        break;
+    }
+
     let Some(&ultimo) = ids.last() else {
         return (0, 0);
     };

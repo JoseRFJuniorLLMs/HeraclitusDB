@@ -178,10 +178,18 @@ impl RawSegmentWriter {
         // header". Resultado: a base recusava abrir e só saía dali com
         // intervenção manual.
         //
-        // O invariante que este `sync_data` estabelece é o que a recuperação
-        // pode assumir: **um ficheiro de segmento que existe tem um header
-        // completo**. Custa um fsync por rolagem de segmento (8 MiB+), o que
-        // não se mede.
+        // O invariante que este `sync_data` estabelece é preciso: **um segmento
+        // que este construtor DEVOLVEU tem header durável**. Custa um fsync por
+        // rolagem de segmento (8 MiB+), o que não se mede.
+        //
+        // O que ele NÃO estabelece — e ler isto ao contrário custou a segunda
+        // metade do mesmo bug — é que todo o ficheiro no directório tenha
+        // header. Morrer AQUI DENTRO, entre o `create_new` e o `write_all`,
+        // deixa um ficheiro curto na mesma: criar é publicar a entrada no
+        // directório, e não há fsync que se ponha antes disso. A janela é
+        // irredutível; mede-se em ~1,5% dos kills que lhe são apontados.
+        // Quem varre o directório no arranque TEM de a tratar antes de ler
+        // headers — ver `segment_stub_len` e a varredura no `V6Log::open`.
         file.sync_data()?;
         sync_parent_dir(path)?;
         Ok(Self {
@@ -535,11 +543,60 @@ fn validate_raw_footer(footer: &FooterV6, records: &[RawRecord]) -> V6Result<()>
     Ok(())
 }
 
+/// O que a recuperação encontrou na cauda do segmento activo.
+///
+/// É um enum e não um `Option<u64>` porque há **três** desfechos, não dois, e
+/// o terceiro (`Stub`) já foi esquecido uma vez por um chamador que só
+/// distinguia os outros dois. Obrigar a um `match` exaustivo é o que impede
+/// que os caminhos de recuperação voltem a divergir.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailRepair {
+    /// A cauda termina num limite de registo: nada a fazer.
+    Intact,
+    /// Havia cauda rasgada; o ficheiro foi truncado neste offset.
+    Truncated(u64),
+    /// O ficheiro é curto demais para conter sequer o header — é um toco de
+    /// um crash durante a criação, não um segmento. Não foi tocado; a decisão
+    /// (remover, ignorar, reportar) é do chamador.
+    Stub { len: u64 },
+}
+
+/// `Some(len)` se `path` é um **toco**: um ficheiro curto demais para conter o
+/// `FileHeaderV6`.
+///
+/// Porque é que isto não é corrupção, e porque é que a definição vive aqui e
+/// não em cada chamador:
+///
+/// * Um toco não pode ter perdido história. Os registos vêm DEPOIS do header,
+///   portanto um ficheiro sem header completo não contém um único registo
+///   committed. Ignorá-lo ou removê-lo não perde nada — é uma propriedade do
+///   formato, e por isso pertence à camada do formato.
+/// * A janela que o produz é irredutível. `RawSegmentWriter::create` já
+///   sincroniza o header antes de devolver (foi o que fechou o bug de
+///   disponibilidade de 2026-08), mas o `create_new` publica a entrada no
+///   directório ANTES de qualquer byte poder ser escrito. Morrer nesse
+///   intervalo deixa um ficheiro de zero bytes e nenhum fsync o evita. Medido:
+///   ~1,5% dos kills apontados a essa janela deixam um toco.
+/// * A condição é deliberadamente **só o comprimento**. Um header completo com
+///   bytes errados NÃO é um toco: isso é corrupção e tem de falhar alto.
+pub fn segment_stub_len(path: &Path) -> V6Result<Option<u64>> {
+    let len = std::fs::metadata(path)?.len();
+    Ok((len < FILE_HEADER_LEN as u64).then_some(len))
+}
+
 /// Trunca a cauda rasgada de um segmento **activo** (§123).
 ///
 /// Recusa-se a tocar num segmento selado: corrupção interna num ficheiro que já
 /// tem footer é falha dura, não é "truncar e fingir que nada aconteceu".
-pub fn repair_active_tail(path: &Path) -> V6Result<Option<u64>> {
+///
+/// Um toco (ver [`segment_stub_len`]) é devolvido como [`TailRepair::Stub`] e
+/// não como erro: "short header" é um diagnóstico de corrupção, e um toco é
+/// ausência, não corrupção. Confundir os dois era o que tirava ao chamador a
+/// informação de que precisava para decidir.
+pub fn repair_active_tail(path: &Path) -> V6Result<TailRepair> {
+    if let Some(len) = segment_stub_len(path)? {
+        return Ok(TailRepair::Stub { len });
+    }
     // Não basta confiar no resultado da varredura abaixo. Se um bit rodado em
     // um registo anterior fizer `scan_raw_segment` parar antes do fim, ela não
     // chega a observar o footer que continua válido no EOF. Nesse caso o
@@ -568,9 +625,9 @@ pub fn repair_active_tail(path: &Path) -> V6Result<Option<u64>> {
             let file = OpenOptions::new().write(true).open(path)?;
             file.set_len(at)?;
             file.sync_all()?;
-            Ok(Some(at))
+            Ok(TailRepair::Truncated(at))
         }
-        None => Ok(None),
+        None => Ok(TailRepair::Intact),
     }
 }
 
@@ -634,6 +691,7 @@ fn sync_parent_dir(path: &Path) -> V6Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::header::HRKL_MAGIC;
     use super::*;
 
     fn h(i: u8) -> [u8; 32] {
@@ -771,10 +829,64 @@ mod tests {
         assert_eq!(scan.records.len(), 5);
         assert_eq!(scan.torn_at, Some(bom));
 
-        assert_eq!(repair_active_tail(&path).unwrap(), Some(bom));
+        assert_eq!(
+            repair_active_tail(&path).unwrap(),
+            TailRepair::Truncated(bom)
+        );
         assert_eq!(std::fs::metadata(&path).unwrap().len(), bom);
-        assert!(repair_active_tail(&path).unwrap().is_none());
+        assert_eq!(repair_active_tail(&path).unwrap(), TailRepair::Intact);
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Um toco é um desfecho, não um erro.
+    ///
+    /// Antes disto, `repair_active_tail` devolvia "short header" — o mesmo
+    /// diagnóstico que dá a um header completo mas adulterado. O chamador não
+    /// tinha por onde distinguir "não há nada aqui" de "há aqui algo partido",
+    /// e cada um resolveu à sua maneira: o motor duplicava o teste do
+    /// comprimento, o crash-test entrava em pânico.
+    #[test]
+    fn toco_e_reportado_como_desfecho_e_nao_como_corrupcao() {
+        let dir = std::env::temp_dir().join(format!("hrkl6-toco-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Zero bytes é o que um kill entre o `create_new` e o `write_all` deixa.
+        for len in [0usize, 1, FILE_HEADER_LEN - 1] {
+            let path = dir.join(format!("toco-{len}.hrkl"));
+            let _ = std::fs::remove_file(&path);
+            // Com o magic certo, para que nem sequer isso o transforme em
+            // corrupção: o que decide é só o comprimento.
+            let mut bytes = vec![0u8; len];
+            let header = HRKL_MAGIC;
+            for (i, b) in header.iter().enumerate().take(len.min(4)) {
+                bytes[i] = *b;
+            }
+            std::fs::write(&path, &bytes).unwrap();
+
+            assert_eq!(segment_stub_len(&path).unwrap(), Some(len as u64));
+            assert_eq!(
+                repair_active_tail(&path).unwrap(),
+                TailRepair::Stub { len: len as u64 },
+                "toco de {len} bytes tem de ser Stub, nao erro"
+            );
+            // Não lhe tocou: quem decide o que fazer é o chamador.
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), len as u64);
+            std::fs::remove_file(&path).ok();
+        }
+
+        // A fronteira do outro lado: header COMPLETO mas com bytes errados não
+        // é toco nenhum. Isso é corrupção e continua a falhar alto.
+        let path = dir.join("header-partido.hrkl");
+        let _ = std::fs::remove_file(&path);
+        let mut bytes = vec![0u8; FILE_HEADER_LEN];
+        bytes[0..4].copy_from_slice(&HRKL_MAGIC);
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(segment_stub_len(&path).unwrap(), None);
+        assert!(
+            repair_active_tail(&path).is_err(),
+            "header completo e adulterado nao pode passar por toco"
+        );
         std::fs::remove_file(&path).ok();
     }
 

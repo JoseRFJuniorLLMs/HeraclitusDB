@@ -307,3 +307,62 @@ fn um_segmento_activo_sem_header_nao_impede_o_arranque() {
         .unwrap();
 }
 
+/// Regressão: o teste acima passava e a base continuava a não abrir.
+///
+/// O arranjo de 2026-08 removia o toco, mas ~50 linhas DEPOIS de
+/// `discover_namespace`, que lê o header de cada ficheiro do inventário com
+/// `read_exact` e rebenta com "failed to fill whole buffer" num ficheiro de
+/// zero bytes. Só que `discover_namespace` só corre quando **não há HRKM** — e
+/// o teste irmão usa `banco_empacotado`, que commita um manifesto. Ou seja: a
+/// regressão cobria o caminho em que o bug não estava.
+///
+/// O caso descoberto é o mais banal que há: base criada, o processo morre antes
+/// de selar/empacotar o que quer que seja (nenhum HRKM commitado ainda), e o
+/// kill calhou dentro do `RawSegmentWriter::create`. Reabrir era impossível.
+///
+/// Nota sobre a janela: ela é IRREDUTÍVEL. O `create` já sincroniza o header
+/// antes de devolver, mas o `create_new` publica a entrada no directório antes
+/// de existir um único byte para escrever. Medido no `crash_writer_v6`: ~1,5%
+/// dos kills apontados a essa janela deixam um ficheiro de zero bytes. Não há
+/// fsync que a feche — só há tratá-la no arranque.
+#[test]
+fn toco_num_banco_sem_manifesto_ainda_abre() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Uma base acabada de criar: activo aberto, nada selado, HRKM por commitar.
+    let log = V6Log::open(dir.path(), 1 << 30, FsyncPolicy::Always).unwrap();
+    log.append(Episode::new(
+        "boot",
+        EventKind::Observation,
+        b"antes".to_vec(),
+    ))
+    .unwrap();
+    drop(log);
+
+    let manifests = ficheiros(&dir.path().join("manifests"));
+    assert!(
+        manifests.is_empty(),
+        "este teste só vale se ainda NÃO houver HRKM; encontrou {manifests:?}"
+    );
+
+    // O toco: exactamente o que o kill dentro do `create` deixa.
+    let segments = dir.path().join("segments");
+    let activo = ficheiros(&segments)
+        .into_iter()
+        .find(|p| p.to_string_lossy().contains(".active."))
+        .expect("segmento activo");
+    std::fs::write(&activo, b"").unwrap();
+
+    let reaberto = V6Log::open(dir.path(), 1 << 30, FsyncPolicy::Always)
+        .expect("um toco de crash nao pode impedir o arranque de um banco sem manifesto");
+    // O que estava no activo não era durável (morreu com o toco); o que tem de
+    // sobreviver é a capacidade de continuar a escrever.
+    reaberto
+        .append(Episode::new(
+            "boot",
+            EventKind::Observation,
+            b"depois".to_vec(),
+        ))
+        .unwrap();
+    assert!(!reaberto.scan(0, N).unwrap().is_empty());
+}
