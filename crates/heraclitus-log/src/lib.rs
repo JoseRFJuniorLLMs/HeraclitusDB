@@ -2235,9 +2235,22 @@ fn check_and_recover_truncate_intent(dir: &Path) -> Result<(), HeraclitusError> 
             let valid_len = u64::from_le_bytes(buf[8..16].try_into().unwrap_or([0u8; 8]));
             let seg_p = segment_path(dir, seg_id);
             if seg_p.exists() {
-                let target_f = OpenOptions::new().write(true).open(&seg_p)?;
-                target_f.set_len(valid_len)?;
-                target_f.sync_all()?;
+                // `set_len` em bruto era um bug de recuperação: ele também
+                // ESTENDE. Um segmento criado e morto antes de o cabeçalho lá
+                // chegar é um ficheiro de zero bytes, e o `valid_len` de um
+                // segmento sem registos é exactamente HEADER_LEN — portanto o
+                // `set_len` fabricava 22 bytes de zeros. Na abertura seguinte
+                // esse ficheiro já passava o guard de comprimento e ia morrer
+                // no `SegmentHeader::decode` com "bad magic or short header",
+                // deixando o log impossível de abrir. Precisou de duas
+                // passagens para se manifestar, o que o fez parecer aleatório:
+                // o crash-test apanhava-o lá pela iteração ~887 de 1000.
+                //
+                // `execute_physical_repair` já sabe distinguir os dois casos —
+                // para HEADER_LEN reescreve um cabeçalho válido em vez de
+                // encher de zeros — e é a mesma função que o resto da
+                // recuperação usa. Reutilizá-la elimina a divergência.
+                execute_physical_repair(&seg_p, valid_len)?;
             }
             // R5: o intent (formato novo) lista também os segmentos seguintes a
             // remover — completa a remoção que um crash interrompeu, para que os
@@ -2573,8 +2586,15 @@ fn execute_physical_repair(path: &Path, valid_offset: u64) -> Result<(), Heracli
         f.sync_all()?;
     } else {
         let f = OpenOptions::new().write(true).open(path)?;
-        f.set_len(valid_offset)?;
-        f.sync_all()?;
+        // Só ENCOLHE. `set_len` estende com zeros quando o alvo é maior que o
+        // ficheiro, e a recuperação nunca pode fabricar bytes que ninguém
+        // escreveu: seriam indistinguíveis de dados no varrimento seguinte.
+        // Um ficheiro mais curto do que o intent afirma significa que o disco
+        // tem menos do que se julgava — o que lá está é o que se recupera.
+        if f.metadata()?.len() > valid_offset {
+            f.set_len(valid_offset)?;
+            f.sync_all()?;
+        }
     }
     sync_parent_dir(path.parent().unwrap_or(path))?;
     Ok(())
