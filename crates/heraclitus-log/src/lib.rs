@@ -748,9 +748,43 @@ impl Log {
             let path = segment_path(&dir, *id);
             let is_last = Some(*id) == ids.last().copied();
 
-            let scan = scans[idx]
+            let mut scan = scans[idx]
                 .take()
                 .expect("cada segmento é varrido exatamente uma vez");
+
+            // Um ficheiro mais curto que o cabeçalho é um TOCO DE CRASH: o
+            // `create` publica a entrada de directório antes de escrever o
+            // header, e um kill nessa janela deixa zero bytes no disco.
+            //
+            // Tem de ser materializado AQUI, antes de qualquer decisão a
+            // jusante, porque o `SegmentScan` de um toco declara
+            // `valid_len: HEADER_LEN` — um cabeçalho que não está lá — e todos
+            // os consumidores confiam nesse número e fazem `seek` para ele: o
+            // `seal_file` escreve o rodapé no offset 22, e a retoma da cauda
+            // acrescenta registos a partir de 22. Qualquer um deles deixa um
+            // buraco de 22 zeros à cabeça, e a abertura seguinte morre em
+            // `SegmentHeader::decode` com "bad magic or short header" — a base
+            // deixa de abrir e só sai dali com alguém a apagar o ficheiro.
+            //
+            // O caso do cabeçalho PARCIAL (1..21 bytes) já era tratado, porque
+            // `corruption_detected` é `file_len > 0`. O de ZERO bytes escapava
+            // entre as duas condições: `corruption_detected` é falso e a guarda
+            // `valid_len < file_len` é `22 < 0`, também falsa. Precisou de
+            // ~740 iterações do crash-test para o kill calhar nessa janela.
+            //
+            // `execute_physical_repair` com `HEADER_LEN` é exactamente a
+            // operação certa: trunca e escreve um cabeçalho válido, deixando um
+            // segmento legítimo com zero registos. Não se perde nada, porque os
+            // registos vêm depois do cabeçalho.
+            if scan.file_len < HEADER_LEN as u64 {
+                tracing::warn!(
+                    segmento = id,
+                    bytes = scan.file_len,
+                    "segmento sem cabeçalho completo: toco de um crash durante a criação; cabeçalho reposto"
+                );
+                execute_physical_repair(&path, HEADER_LEN as u64)?;
+                scan.file_len = HEADER_LEN as u64;
+            }
             // O relógio HLC nunca arranca ATRÁS do que já está persistido:
             // sem isto, um wall clock que recuasse entre execuções quebraria
             // a monotonicidade de ts por LSN (o contrato do AS OF TIMESTAMP).

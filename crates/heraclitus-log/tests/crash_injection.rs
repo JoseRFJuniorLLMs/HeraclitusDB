@@ -79,6 +79,86 @@ fn survives_repeated_mid_append_kills() {
     assert!(last_count > 0, "writer never managed to append anything");
 }
 
+/// Deterministic regression for the zero-byte segment that slipped between two
+/// guards and then poisoned itself.
+///
+/// A segment file shorter than the header is a crash stub: `create` publishes
+/// the directory entry before writing the header, and a kill in that window
+/// leaves nothing behind. Its `SegmentScan` reports `valid_len: HEADER_LEN` —
+/// a header that is not on disk — and every consumer trusts that number and
+/// seeks to it. Re-sealing writes the footer at offset 22; resuming the tail
+/// appends from 22. Either way the file ends up with a 22-byte hole of zeros,
+/// and the *next* open dies in `SegmentHeader::decode` with "bad magic or short
+/// header" — the database stops opening.
+///
+/// The partial-header case (1..21 bytes) was already handled, because
+/// `corruption_detected` is `file_len > 0`. Zero bytes escaped between the two
+/// conditions: `corruption_detected` is false and the `valid_len < file_len`
+/// guard reads `22 < 0`, also false. The crash loop needed ~740 iterations for
+/// the kill to land in that window, so it read as flakiness.
+///
+/// Two stubs on purpose: the lower id is not the last segment and therefore
+/// goes through the re-sealing branch, the higher one is the tail.
+#[test]
+fn um_segmento_de_zero_bytes_nao_impede_o_arranque() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let log = Log::open(dir.path(), 64 * 1024, FsyncPolicy::Always).unwrap();
+    for i in 0..8u8 {
+        log.append(heraclitus_core::Episode::new(
+            "crash-agent",
+            heraclitus_core::EventKind::Observation,
+            vec![i],
+        ))
+        .unwrap();
+    }
+    let esperado = log.verify().unwrap().records;
+    drop(log);
+    assert!(esperado >= 8);
+
+    for id in [9_000u64, 9_001u64] {
+        std::fs::write(dir.path().join(format!("{id:020}.hrkl")), b"").unwrap();
+    }
+
+    // Duas aberturas: a primeira é a que reparava mal e envenenava o ficheiro,
+    // a segunda é a que morria por causa disso.
+    for passagem in 0..2 {
+        let log = Log::open(dir.path(), 64 * 1024, FsyncPolicy::Always)
+            .unwrap_or_else(|e| panic!("abertura falhou na passagem {passagem}: {e}"));
+        let report = log
+            .verify()
+            .unwrap_or_else(|e| panic!("verify falhou na passagem {passagem}: {e}"));
+        assert!(
+            report.records >= esperado,
+            "passagem {passagem}: registos duraveis desapareceram ({esperado} -> {})",
+            report.records
+        );
+        // O log tem de continuar utilizável, não só legível.
+        log.append(heraclitus_core::Episode::new(
+            "crash-agent",
+            heraclitus_core::EventKind::Observation,
+            vec![passagem as u8],
+        ))
+        .unwrap_or_else(|e| panic!("append falhou na passagem {passagem}: {e}"));
+        drop(log);
+    }
+
+    // Nenhum segmento pode ficar com bytes suficientes para parecer ter
+    // cabeçalho sem o ter.
+    for entrada in std::fs::read_dir(dir.path()).unwrap().flatten() {
+        let p = entrada.path();
+        if p.extension().map(|x| x == "hrkl").unwrap_or(false) {
+            let bytes = std::fs::read(&p).unwrap();
+            assert!(
+                bytes.len() >= 22 && &bytes[..4] == b"HRKL",
+                "{} ficou com {} bytes sem cabecalho valido",
+                p.display(),
+                bytes.len()
+            );
+        }
+    }
+}
+
 /// Deterministic regression for the `truncate.intent` replay that used to
 /// *extend* a crash stub instead of repairing it.
 ///
