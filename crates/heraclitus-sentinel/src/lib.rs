@@ -3110,17 +3110,54 @@ detection:
         // falhas em 8 sob a mesma carga, ou seja pior. A causa esta mais fundo
         // do que o fsync do append, e nao esta identificada.
         //
-        // O que falta e diagnosticar onde o pipeline fica parado (um dump de
-        // stacks das threads `heraclitus-sentinel-*` no momento do timeout
-        // resolveria isto em minutos), nao escolher um prazo maior.
+        // 2026-09-03: o que faltava era diagnostico, e o diagnostico nao
+        // precisa de stacks de threads — o `SentinelStatus` ja publica os
+        // contadores de cada estagio. O timeout passa a imprimi-los, o que
+        // transforma a proxima falha numa resposta em vez de mais uma medicao.
+        // A arvore de decisao esta no `panic!` abaixo.
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while runtime.status().signals_emitted_total < 1 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(
-            runtime.status().signals_emitted_total >= 1,
-            "o pipeline L2 nao emitiu sinal nenhum em 30 s"
-        );
+        let s = runtime.status();
+        if s.signals_emitted_total < 1 {
+            // Onde e que o pipeline parou? Cada contador a zero acusa o
+            // estagio anterior; o primeiro zero da cadeia e o culpado.
+            let estagio = if s.events_seen_total == 0 {
+                "a ponte log->subscritor nunca notificou (attach_subscriber_with_stop / tail_subscribe)"
+            } else if s.events_processed_total == 0 {
+                "o subscritor viu, mas o worker nunca processou (fila ou worker_loop)"
+            } else if s.events_normalized_total == 0 {
+                "o worker processou, mas nada foi normalizado (normalize_l0)"
+            } else {
+                "normalizou mas o L2 nao emitiu (evaluate_l2 / promocao do shadow)"
+            };
+            panic!(
+                "o pipeline L2 nao emitiu sinal nenhum em 30 s.\n\
+                 ESTAGIO SUSPEITO: {estagio}\n\
+                 log:    head={} next={} lag={} ({:?})\n\
+                 fila:   profundidade={}/{} overflows={} catch_up_from={:?} passagens={}\n\
+                 cadeia: vistos={} processados={} normalizados={} saltados={} erros={}\n\
+                 latencias: l0={}us l1={}ms l2={}ms",
+                s.head_lsn,
+                s.next_lsn,
+                s.detection_lag_lsn,
+                s.lag_state,
+                s.queue_depth,
+                s.queue_capacity,
+                s.queue_overflow_total,
+                s.catch_up_from_lsn,
+                s.catchup_passes_total,
+                s.events_seen_total,
+                s.events_processed_total,
+                s.events_normalized_total,
+                s.normalization_skipped_total,
+                s.normalization_errors_total,
+                s.l0_latency_us,
+                s.l1_latency_ms,
+                s.l2_latency_ms,
+            );
+        }
         assert!(log.scan(0, log.head()).unwrap().iter().any(|(_, episode)| {
             matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecuritySignal")
                 && episode
