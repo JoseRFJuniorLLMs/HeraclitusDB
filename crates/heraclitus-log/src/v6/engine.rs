@@ -259,7 +259,52 @@ impl V6Log {
         let hlc = Arc::new(Hlc::new());
         let loaded = manifest_store.load()?;
         let loaded_manifest = loaded.as_ref().map(|l| l.manifest.clone());
-        let inventory = discover(&segments_dir)?;
+        let mut inventory = discover(&segments_dir)?;
+
+        // Um ficheiro activo demasiado curto para conter um header é um toco de
+        // crash, não um segmento: os registos vêm DEPOIS do header, portanto um
+        // ficheiro sem header completo não pode conter um único registo
+        // committed. Removê-lo não perde nada; não o remover para o arranque.
+        //
+        // Isto TEM de acontecer aqui — antes da guarda de ambiguidade e antes
+        // da primeira leitura de cabeçalho — por duas razões que a primeira
+        // versão desta correcção falhou, por a ter posto 40 linhas abaixo:
+        //
+        //  1. Um toco não é uma cauda activa, logo não pode contar para o
+        //     "more than one active RAW tail". A contar, um toco ao lado de um
+        //     activo legítimo fazia o arranque recusar por ambiguidade.
+        //  2. Quando não há manifesto — uma base nova antes do primeiro seal,
+        //     ou uma cujas gerações se perderam — o `discover_namespace` logo
+        //     a seguir lê o header de cada segmento do inventário, e num
+        //     ficheiro de zero bytes o `read_exact` devolve `UnexpectedEof` e
+        //     aborta o arranque. O sintoma era o de sempre (a base não abre)
+        //     com diagnóstico pior: um erro de I/O cru, sem o "short header".
+        //     É o caminho onde o `reconcile_raw` reconstrói o catálogo a partir
+        //     dos RAW selados, portanto era também onde se perdia acesso a
+        //     dados duráveis.
+        //
+        // A condição é deliberadamente só o comprimento. Um header completo com
+        // bytes errados NÃO entra aqui: isso é corrupção e tem de falhar alto.
+        let mut tocos = Vec::new();
+        for (id, path) in &inventory.active {
+            if super::raw::is_crash_stub(path).unwrap_or(false) {
+                tocos.push((*id, path.clone()));
+            }
+        }
+        for (id, path) in &tocos {
+            tracing::warn!(
+                segment = id,
+                path = %path.display(),
+                "segmento activo sem header completo: toco de um crash durante a criação; removido"
+            );
+            std::fs::remove_file(path)?;
+        }
+        if !tocos.is_empty() {
+            inventory
+                .active
+                .retain(|(id, _)| !tocos.iter().any(|(toco, _)| toco == id));
+        }
+
         if inventory.active.len() > 1 {
             return Err(corrupt(
                 "hrkl v6 boot",
@@ -305,30 +350,9 @@ impl V6Log {
 
         // Um active com footer válido caiu entre seal e rename. Promovê-lo
         // para RAW final antes do manifesto fecha essa janela sem truncamento.
+        // O toco de crash já saiu do inventário lá em cima, antes da primeira
+        // leitura de cabeçalho; aqui o activo, se existir, tem header completo.
         let mut active_from_disk = inventory.active.into_iter().next();
-        // Um ficheiro activo demasiado curto para conter um header é um toco de
-        // crash, não um segmento: os registos vêm DEPOIS do header, portanto um
-        // ficheiro sem header completo não pode conter um único registo
-        // committed. Removê-lo não perde nada; não o remover parava o arranque
-        // — era o que acontecia antes de o `RawSegmentWriter::create` passar a
-        // sincronizar o header, e foi o que o crash-test apanhou.
-        //
-        // A condição é deliberadamente só o comprimento. Um header completo com
-        // bytes errados NÃO entra aqui: isso é corrupção e tem de falhar alto.
-        if let Some((id, path)) = active_from_disk.as_ref() {
-            // A regra vive em `v6::raw::is_crash_stub`, junto do `create` que
-            // abre a janela — aqui só se decide o que fazer com o toco.
-            let curto = super::raw::is_crash_stub(path).unwrap_or(false);
-            if curto {
-                tracing::warn!(
-                    segment = id,
-                    path = %path.display(),
-                    "segmento activo sem header completo: toco de um crash durante a criação; removido"
-                );
-                std::fs::remove_file(path)?;
-                active_from_disk = None;
-            }
-        }
         if let Some((id, path)) = active_from_disk.as_ref() {
             let header = read_v6_header(path)?;
             check_header_identity(&header, *id, namespace, PhysicalLayout::Raw)?;
@@ -2972,6 +2996,66 @@ mod tests {
             persisted_hasher(9, 10, &payload_a).unwrap(),
             persisted_hasher(9, 10, &payload_b).unwrap(),
             "opaque_meta tem de fazer parte da identidade canónica"
+        );
+    }
+
+    /// O toco de crash tem de sair do inventário ANTES da primeira leitura de
+    /// cabeçalho — e o caminho que prova isso é o que não tem manifesto.
+    ///
+    /// Com manifesto, o `open` toma o ramo `Some(m)` e nunca chama
+    /// `discover_namespace`. Sem manifesto — uma base nova antes do primeiro
+    /// seal — chama, e o `discover_namespace` lê o header de cada segmento do
+    /// inventário. Num ficheiro de zero bytes isso é um `UnexpectedEof` que
+    /// aborta o arranque dezenas de linhas antes de qualquer filtro de toco.
+    #[test]
+    fn um_toco_sem_manifesto_nao_impede_o_arranque() {
+        let dir = tempfile::tempdir().unwrap();
+        let segments = dir.path().join(SEGMENTS_DIR);
+        std::fs::create_dir_all(&segments).unwrap();
+
+        // Exactamente o que o `create_new` deixa quando o processo morre antes
+        // do `write_all` do cabeçalho, e sem uma única geração no disco.
+        std::fs::write(active_path(&segments, 0), b"").unwrap();
+        assert!(!dir.path().join(MANIFESTS_DIR).join("CURRENT").exists());
+
+        let log = V6Log::open(dir.path(), 4096, FsyncPolicy::Always)
+            .expect("um toco de crash nao pode impedir o arranque sem manifesto");
+        assert_eq!(log.head(), 0);
+        assert_eq!(log.append(event(0)).unwrap(), 0);
+    }
+
+    /// A variante que perde dados: gerações seladas no disco, o manifesto
+    /// desaparecido, e um toco ao lado. O `reconcile_raw` existe precisamente
+    /// para reconstruir o catálogo a partir dos RAW selados — mas só corre se o
+    /// arranque chegar lá, e o toco matava-o antes.
+    #[test]
+    fn um_toco_nao_bloqueia_a_reconstrucao_do_catalogo() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = V6Log::open(dir.path(), 160, FsyncPolicy::Always).unwrap();
+        for i in 0..12 {
+            log.append(event(i)).unwrap();
+        }
+        log.flush().unwrap();
+        log.seal_active().unwrap();
+        drop(log);
+
+        // O manifesto perde-se (restauro parcial, disco, migração falhada).
+        std::fs::remove_dir_all(dir.path().join(MANIFESTS_DIR)).unwrap();
+
+        // E um toco fica ao lado dos segmentos selados.
+        let segments = dir.path().join(SEGMENTS_DIR);
+        std::fs::write(active_path(&segments, 999), b"").unwrap();
+
+        let log = V6Log::open(dir.path(), 160, FsyncPolicy::Always)
+            .expect("o toco bloqueou a reconstrucao do catalogo a partir dos RAW selados");
+        assert_eq!(
+            log.head(),
+            12,
+            "registos duraveis ficaram inacessiveis por causa do toco"
+        );
+        assert_eq!(
+            log.read(0).unwrap().unwrap().1.content,
+            b"payload-0".to_vec()
         );
     }
 }

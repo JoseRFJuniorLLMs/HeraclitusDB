@@ -168,20 +168,21 @@ impl RawSegmentWriter {
             storage_namespace_id: init.storage_namespace_id,
         };
         file.write_all(&header.encode())?;
-        // O header TEM de ser durável antes de esta função devolver, e a
-        // ausência deste fsync era um bug de disponibilidade: o
+        // O header TEM de ser durável antes de esta função devolver: o
         // `create_new` publica a entrada no directório imediatamente, mas o
-        // `write_all` fica em buffers do SO. Um crash nessa janela deixava um
-        // ficheiro de segmento com zero bytes (ou meio header) no disco, e o
-        // arranque seguinte parava nele — `repair_active_tail` chama
-        // `scan_raw_segment`, que faz `FileHeaderV6::decode` e devolve "short
-        // header". Resultado: a base recusava abrir e só saía dali com
-        // intervenção manual.
+        // `write_all` fica em buffers do SO, e sem este fsync uma falha de
+        // energia deixava um ficheiro de segmento sem header no disco. Custa um
+        // fsync por rolagem de segmento (8 MiB+), o que não se mede.
         //
-        // O invariante que este `sync_data` estabelece é o que a recuperação
-        // pode assumir: **um ficheiro de segmento que existe tem um header
-        // completo**. Custa um fsync por rolagem de segmento (8 MiB+), o que
-        // não se mede.
+        // ATENÇÃO ao que este fsync NÃO compra. Ele fecha a janela contra
+        // perda de energia, não contra a morte do processo: um SIGKILL entre o
+        // `create_new` acima e o `write_all` deixa na mesma um ficheiro de zero
+        // bytes. Portanto a recuperação **não pode** assumir que um ficheiro de
+        // segmento que existe tem header completo — uma versão anterior deste
+        // comentário afirmava exactamente isso, e foi essa suposição que pôs o
+        // crash-test a acusar de corrupção o que é a janela normal de um kill.
+        // Quem escrever um leitor novo (replicação, restauro, doctor) tem de
+        // filtrar o toco com `is_crash_stub` antes de ler o cabeçalho.
         file.sync_data()?;
         sync_parent_dir(path)?;
         Ok(Self {
