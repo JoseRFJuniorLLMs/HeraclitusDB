@@ -79,6 +79,51 @@ fn is_sentinel_reserved(episode: &Episode) -> bool {
         )
 }
 
+/// Kinds que o `heraclitus-compliance` escreve e cujo replay reconstrói o
+/// estado regulatório. Como o do Sentinel, é território interno.
+/// Retirados das constantes dos próprios módulos — `regulatory.rs:17-20`,
+/// `privacy.rs:16-18`, `sovereignty.rs:17-18`, `deferred.rs:26` e
+/// `model_bundle.rs:15` — e não de memória: é a lista que os `replay` casam.
+const COMPLIANCE_DERIVED_KINDS: &[&str] = &[
+    "CompliancePolicyActivation",
+    "ComplianceAssessment",
+    "LegalHold",
+    "LegalHoldRelease",
+    "PrivacyIncidentAssessment",
+    "RegulatoryDeadline",
+    "ComplianceExport",
+    "ComplianceEgressDecision",
+    "ComplianceModelDecision",
+    "ComplianceEvidenceAnchor",
+    "SecurityModelActivation",
+];
+
+/// O mesmo contrato de `is_sentinel_reserved`, para o domínio regulatório.
+///
+/// Sem isto, o append externo — que só exige `AccessRole::Writer` — deixava
+/// forjar prova de compliance: o replay confia no atributo
+/// `compliance.generated` e no `kind`, e ambos vinham do cliente. Um Writer
+/// podia libertar um `LegalHold` que só o Admin devia libertar (abrindo o
+/// crypto-shred sobre dados retidos), ou colocar um hold de âmbito total e
+/// travar o GC para sempre.
+///
+/// O caso pior não era sequer a falsificação: repetir um `hold_id` faz
+/// `RegulatoryState::replay` devolver `Err`, e como o log é append-only esse
+/// episódio não se apaga. O estado regulatório ficava inválido de forma
+/// **permanente** — e com ele o crypto-shred e o GC, que falham fechado. Era a
+/// única falha do lote sem reparação possível depois de acontecer.
+fn is_compliance_reserved(episode: &Episode) -> bool {
+    episode.agent_id == "gov-compliance"
+        || episode
+            .attrs
+            .keys()
+            .any(|key| key.starts_with("compliance."))
+        || matches!(
+            &episode.kind,
+            EventKind::Custom(kind) if COMPLIANCE_DERIVED_KINDS.contains(&kind.as_str())
+        )
+}
+
 pub struct Engine {
     /// Backend append-only selecionado explicitamente na configuração.
     /// `legacy` continua sendo o default; `v6` nunca é inferido nem migrado.
@@ -1789,6 +1834,11 @@ impl Engine {
                     .into(),
             ));
         }
+        if is_compliance_reserved(&episode) {
+            return Err(HeraclitusError::Query(
+                "tipos, agente e atributos compliance.* são reservados ao motor regulatório".into(),
+            ));
+        }
         if episode.attrs.contains_key(IDEMPOTENCY_KEY_ATTR)
             || episode.attrs.contains_key(IDEMPOTENCY_HASH_ATTR)
         {
@@ -1815,6 +1865,11 @@ impl Engine {
             return Err(HeraclitusError::Query(
                 "tipos, agente e atributos sentinel.* / sec.* são reservados ao pipeline interno"
                     .into(),
+            ));
+        }
+        if is_compliance_reserved(&episode) {
+            return Err(HeraclitusError::Query(
+                "tipos, agente e atributos compliance.* são reservados ao motor regulatório".into(),
             ));
         }
         if key.is_empty() {
@@ -2797,6 +2852,64 @@ mod tests {
             0
         );
         assert_eq!(engine.log.head(), 1);
+    }
+
+    /// O append externo so exige `AccessRole::Writer`, e os replays de
+    /// compliance confiam no `kind` e no atributo `compliance.generated` — dois
+    /// sinais que vinham do cliente. Sem esta reserva, um Writer podia libertar
+    /// um `LegalHold` que so o Admin devia libertar (abrindo o crypto-shred
+    /// sobre dados retidos), pôr um hold de âmbito total e travar o GC, ou —
+    /// pior — repetir um `hold_id` e deixar o estado regulatorio invalido para
+    /// sempre, porque o log e append-only e o episodio nunca se apaga.
+    #[test]
+    fn compliance_namespaces_are_reserved_to_the_regulatory_engine() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = engine_in(temp.path());
+
+        // Um release forjado levantaria uma retencao judicial.
+        let forjado = Episode::new(
+            "attacker",
+            EventKind::Custom("LegalHoldRelease".into()),
+            b"{}".to_vec(),
+        );
+        assert!(
+            engine.append(forjado).is_err(),
+            "um Writer nao pode forjar um LegalHoldRelease"
+        );
+
+        // O hold em si trava o GC e a eliminacao enquanto existir.
+        let hold = Episode::new(
+            "attacker",
+            EventKind::Custom("LegalHold".into()),
+            b"{}".to_vec(),
+        );
+        assert!(
+            engine.append_idempotent(hold, "forjado-hold").is_err(),
+            "um Writer nao pode forjar um LegalHold"
+        );
+
+        // O atributo de proveniencia e o que os replays leem para decidir se a
+        // linha e prova regulatoria; tem de ser tao reservado como o kind.
+        let mut atributo = Episode::new("attacker", EventKind::Observation, b"{}".to_vec());
+        atributo
+            .attrs
+            .insert("compliance.generated".into(), "true".into());
+        assert!(
+            engine.append(atributo).is_err(),
+            "compliance.* nao pode vir de fora"
+        );
+
+        // E o agente do motor regulatorio tambem nao se pode personificar.
+        let agente = Episode::new("gov-compliance", EventKind::Observation, b"{}".to_vec());
+        assert!(
+            engine.append(agente).is_err(),
+            "o agent_id do motor regulatorio e reservado"
+        );
+
+        // Telemetria normal continua a passar — a reserva nao pode ser um
+        // bloqueio geral a palavra "compliance".
+        let normal = Episode::new("app", EventKind::Observation, b"{\"ok\":1}".to_vec());
+        assert!(engine.append(normal).is_ok());
     }
 
     #[test]

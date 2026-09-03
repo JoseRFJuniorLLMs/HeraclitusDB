@@ -1673,13 +1673,32 @@ fn worker_loop(inner: Arc<RuntimeInner>) {
                 .catchup_passes_total
                 .fetch_add(1, Ordering::Relaxed);
             if let Err(error) = process_until(&inner) {
-                inner
+                let falhas = inner
                     .metrics
                     .normalization_errors_total
-                    .fetch_add(1, Ordering::Relaxed);
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
                 // Retry after a short pause; a malformed single event must not
                 // terminate the worker and silently stop catch-up forever.
-                let _ = error;
+                //
+                // Mas o erro TEM de ser dito. Ele era descartado aqui com um
+                // `let _ = error;`, e foi isso que tornou a instabilidade do L2
+                // indiagnosticavel durante semanas: o worker entrava em
+                // retentativa infinita sobre um erro deterministico e a unica
+                // pista era um contador a subir. Um erro que se repete no mesmo
+                // LSN nao e transitorio — e um evento envenenado, e quem opera
+                // precisa de saber qual e e porque.
+                let posicao = {
+                    let cursor = inner.cursor.lock().unwrap_or_else(|e| e.into_inner());
+                    cursor.next_lsn
+                };
+                tracing::warn!(
+                    error = %error,
+                    next_lsn = posicao,
+                    head = inner.log.head(),
+                    falhas_acumuladas = falhas,
+                    "passagem de catch-up do Sentinel falhou; a repetir"
+                );
                 std::thread::sleep(Duration::from_millis(20));
             }
             continue;
@@ -1688,11 +1707,22 @@ fn worker_loop(inner: Arc<RuntimeInner>) {
         match inner.queue.recv_timeout(Duration::from_millis(100)) {
             Ok(_notification_lsn) => {
                 if let Err(error) = process_until(&inner) {
-                    inner
+                    let falhas = inner
                         .metrics
                         .normalization_errors_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    let _ = error;
+                        .fetch_add(1, Ordering::Relaxed)
+                        + 1;
+                    let posicao = {
+                        let cursor = inner.cursor.lock().unwrap_or_else(|e| e.into_inner());
+                        cursor.next_lsn
+                    };
+                    tracing::warn!(
+                        error = %error,
+                        next_lsn = posicao,
+                        head = inner.log.head(),
+                        falhas_acumuladas = falhas,
+                        "processamento de notificacao do Sentinel falhou"
+                    );
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {

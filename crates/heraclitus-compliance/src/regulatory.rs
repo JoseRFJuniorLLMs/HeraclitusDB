@@ -501,11 +501,19 @@ impl RegulatoryState {
                 LEGAL_HOLD_EVENT => {
                     let hold: LegalHold = serde_json::from_slice(&episode.content)?;
                     hold.validate()?;
+                    // Um duplicado NAO pode abortar o replay. O log e
+                    // append-only: o episodio ofensor nunca desaparece, logo um
+                    // `Err` aqui tornava o estado regulatorio irrecuperavel
+                    // para sempre — e com ele o crypto-shred e o GC, que falham
+                    // fechado. Fica o PRIMEIRO hold, que e a escolha
+                    // conservadora: manter a retencao em vez de a levantar.
                     if state.legal_holds.contains_key(&hold.hold_id) {
-                        return Err(RegulatoryError::Invalid(format!(
-                            "hold_id repetido no log: {}",
-                            hold.hold_id
-                        )));
+                        tracing::warn!(
+                            hold_id = %hold.hold_id,
+                            lsn,
+                            "hold_id repetido no log; mantido o primeiro e ignorado este"
+                        );
+                        continue;
                     }
                     state.legal_holds.insert(
                         hold.hold_id.clone(),
@@ -519,17 +527,25 @@ impl RegulatoryState {
                 LEGAL_HOLD_RELEASE_EVENT => {
                     let release: LegalHoldRelease = serde_json::from_slice(&episode.content)?;
                     release.validate()?;
-                    let record = state.legal_holds.get_mut(&release.hold_id).ok_or_else(|| {
-                        RegulatoryError::Invalid(format!(
-                            "release sem LegalHold anterior: {}",
-                            release.hold_id
-                        ))
-                    })?;
+                    // Mesma razao do duplicado acima: um release orfao ou
+                    // repetido e um episodio que ja esta no log para sempre.
+                    // Ignora-se com aviso, e mantem-se o PRIMEIRO release —
+                    // nunca se levanta uma retencao por causa de um segundo.
+                    let Some(record) = state.legal_holds.get_mut(&release.hold_id) else {
+                        tracing::warn!(
+                            hold_id = %release.hold_id,
+                            lsn,
+                            "release sem LegalHold anterior; ignorado"
+                        );
+                        continue;
+                    };
                     if record.released.is_some() {
-                        return Err(RegulatoryError::Invalid(format!(
-                            "LegalHold liberado duas vezes: {}",
-                            release.hold_id
-                        )));
+                        tracing::warn!(
+                            hold_id = %release.hold_id,
+                            lsn,
+                            "LegalHold libertado duas vezes; mantido o primeiro release"
+                        );
+                        continue;
                     }
                     record.released = Some((lsn, release));
                 }

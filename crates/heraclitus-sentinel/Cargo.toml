@@ -14,9 +14,14 @@ crossbeam-channel = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Sem um subscritor, o `tracing::warn!` do `worker_loop` nao chega a lado
+# nenhum durante os testes — e era exactamente o erro desse warn que faltava
+# para explicar a instabilidade do L2.
+tracing-subscriber = { workspace = true }
 
 [[bench]]
 name = "sentinel"
