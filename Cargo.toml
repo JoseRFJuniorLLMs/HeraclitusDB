@@ -30,6 +30,7 @@ members = [
     "crates/heraclitus-sentinel",
     "crates/heraclitus-telemetry-health",
     "crates/heraclitus-analytics",
+    "crates/heraclitus-platform",
     # HUME: `hume-ir` e `hume-sketches` não têm consumidor HOJE, mas não são
     # código morto — são infraestrutura para a SPEC-0043 (MATH-15 "JIT
     # vectorization" e a camada de hash/HLL dos sketches, ambos P1 com
@@ -79,6 +80,7 @@ heraclitus-analytics = { path = "crates/heraclitus-analytics" }
 heraclitus-raft = { path = "crates/heraclitus-raft" }
 heraclitus-server = { path = "crates/heraclitus-server" }
 heraclitus-sentinel = { path = "crates/heraclitus-sentinel" }
+heraclitus-platform = { path = "crates/heraclitus-platform" }
 heraclitus-telemetry-health = { path = "crates/heraclitus-telemetry-health" }
 # HUME (SPEC-0040.1) — kernel primitivo de execução
 hume-kernel = { path = "crates/hume-kernel" }

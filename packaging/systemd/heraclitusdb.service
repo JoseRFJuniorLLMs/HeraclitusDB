@@ -1,0 +1,41 @@
+﻿[Unit]
+Description=HeraclitusDB Event-Sourced Memory & Security Engine
+Documentation=https://github.com/JoseRFJuniorLLMs/HeraclitusDB
+After=network.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=heraclitus
+Group=heraclitus
+
+# O servidor aceita o caminho do arquivo de configuração como primeiro argumento posicional
+ExecStart=/usr/bin/heraclitus-server /etc/heraclitusdb/heraclitus.toml
+
+# Sinal padrão de término enviado pelo systemctl stop é SIGTERM
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=30s
+
+# Reinicialização automática em caso de crash (SIGSEGV, SIGKILL externo, etc.)
+Restart=on-failure
+RestartSec=2s
+
+# Limites de recursos para operação de alta volumetria (I/O, sockets, mmap e descritores de arquivo)
+LimitNOFILE=1048576
+LimitMEMLOCK=infinity
+TasksMax=65536
+
+# Proteções de sandbox recomendadas para servidores governamentais
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+# Diretórios padrão gerenciados pelo systemd
+RuntimeDirectory=heraclitusdb
+StateDirectory=heraclitusdb
+LogsDirectory=heraclitusdb
+
+[Install]
+WantedBy=multi-user.target

@@ -56,6 +56,10 @@ pub async fn serve_with(
         "Memtable",
         &format!("{} eventos", group(config.memtable_cap as u64)),
     );
+    boot.info_line(
+        "Plataforma",
+        &heraclitus_platform::detect_capabilities().summary_line(),
+    );
 
     let engine = Arc::new(Engine::open_with_boot(&config, &boot)?);
 
@@ -940,6 +944,7 @@ pub async fn serve_with(
         ),
     );
     boot.ready(&grpc_addr.to_string(), &rest_addr.to_string());
+    let _ = heraclitus_platform::notify_ready();
     grpc_server
         .add_service(svc)
         .serve_with_shutdown(grpc_addr, shutdown)

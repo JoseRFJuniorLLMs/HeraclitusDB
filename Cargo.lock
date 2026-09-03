@@ -3200,6 +3200,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "heraclitus-platform"
+version = "1.0.5"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "heraclitus-proto"
 version = "1.0.5"
 dependencies = [
@@ -3313,6 +3326,7 @@ dependencies = [
  "heraclitus-log",
  "heraclitus-manifold",
  "heraclitus-memtable",
+ "heraclitus-platform",
  "heraclitus-proto",
  "heraclitus-query",
  "heraclitus-raft",
