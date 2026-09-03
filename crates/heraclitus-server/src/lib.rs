@@ -199,8 +199,20 @@ pub async fn serve_with(
         );
     }
     let auth = move |req| authenticator.authenticate(req);
-    let svc = HeraclitusServer::with_interceptor(
-        grpc::Service::new_with_sentinel(engine.clone(), sentinel_runtime.clone()),
+    // O cliente (heraclitus-client/src/lib.rs:102) e o transporte do raft
+    // (heraclitus-raft/src/grpc.rs:145) assumem 256 MiB nos dois sentidos, mas
+    // o SERVIDOR nunca declarava limite nenhum — ficava com o default do tonic
+    // de um lado e com um cliente a assumir outro. Declarar o mesmo tecto dos
+    // dois lados torna o contrato explícito em vez de implícito, e impede que
+    // uma mensagem enorme seja aceite antes de alguém decidir se cabe.
+    const MAX_MSG: usize = 256 * 1024 * 1024;
+    let svc = tonic::service::interceptor::InterceptedService::new(
+        HeraclitusServer::new(grpc::Service::new_with_sentinel(
+            engine.clone(),
+            sentinel_runtime.clone(),
+        ))
+        .max_decoding_message_size(MAX_MSG)
+        .max_encoding_message_size(MAX_MSG),
         auth,
     );
     if config.rest_basic_auth.is_some() {

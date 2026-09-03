@@ -494,11 +494,21 @@ impl Engine {
         // §3.9: recupera o cursor do distill persistido (0 se ausente/ilegível).
         // Antes do struct literal porque `attr_dir` é movido para o campo.
         #[cfg(feature = "distill")]
+        // Formato novo: valor + complemento (16 B), que distingue um ficheiro a
+        // zeros de um cursor 0 legítimo. Formato antigo: 8 B crus, ainda aceite
+        // para uma actualização não forçar a re-derivação de toda a base.
         let distill_cursor = std::sync::atomic::AtomicU64::new(
             std::fs::read(attr_dir.join("distill.cursor"))
                 .ok()
-                .filter(|b| b.len() == 8)
-                .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                .and_then(|b| match b.len() {
+                    16 => {
+                        let valor = u64::from_le_bytes(b[..8].try_into().ok()?);
+                        let inverso = u64::from_le_bytes(b[8..].try_into().ok()?);
+                        (inverso == !valor).then_some(valor)
+                    }
+                    8 => Some(u64::from_le_bytes(b.try_into().ok()?)),
+                    _ => None,
+                })
                 .unwrap_or(0),
         );
 
@@ -1239,12 +1249,38 @@ impl Engine {
         }
 
         self.distill_cursor.store(next_cursor, Ordering::Release);
-        // Persistência best-effort do cursor (tmp + rename atómico). Falhar aqui
-        // só arrisca re-agrupar uma janela num restart — nunca perde dados.
+        // Persistência do cursor: tmp + fsync + rename + fsync do directório.
+        //
+        // O comentário anterior dizia "nunca perde dados", e isso é verdade
+        // pela metade: um cursor perdido não apaga nada, mas volta a appendar
+        // os `FactDerived` de uma janela já derivada — e num log append-only
+        // esses duplicados ficam lá para sempre. Sem fsync, uma falha de
+        // energia deixava 8 bytes a zeros, que o leitor aceitava como cursor 0
+        // (é um valor legítimo) e re-derivava a base inteira.
+        //
+        // Guardam-se 16 bytes: o valor e o seu complemento. Um ficheiro a
+        // zeros deixa de ser indistinguível de um cursor válido, sem precisar
+        // de checksum para oito bytes. O formato antigo de 8 bytes continua a
+        // ser lido, para uma actualização não forçar uma re-derivação.
         let path = self.attr_dir.join("distill.cursor");
         let tmp = self.attr_dir.join("distill.cursor.tmp");
-        if std::fs::write(&tmp, next_cursor.to_le_bytes()).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&next_cursor.to_le_bytes());
+        bytes[8..].copy_from_slice(&(!next_cursor).to_le_bytes());
+        let gravado = (|| -> std::io::Result<()> {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+            Ok(())
+        })();
+        if gravado.is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+            #[cfg(unix)]
+            if let Ok(d) = std::fs::File::open(&self.attr_dir) {
+                let _ = d.sync_all();
+            }
+        } else {
+            let _ = std::fs::remove_file(&tmp);
         }
         Ok(out)
     }
@@ -1688,6 +1724,17 @@ impl Engine {
             let mut f = std::fs::File::create(&marker)?;
             f.write_all(b"rebuild all derived state before serving\n")?;
             f.sync_all()?;
+            // O `sync_all` torna o CONTEÚDO durável, não a existência do
+            // ficheiro. Sem o fsync do directório, uma falha de energia entre
+            // criar o marcador e destruir a chave deixava o shred feito e o
+            // marcador desaparecido — o arranque seguinte não sabia que tinha
+            // de reconstruir, e o plaintext dessa agente ficava nas views e
+            // nos índices depois de a chave ter sido destruída. É precisamente
+            // a janela que este marcador existe para cobrir.
+            #[cfg(unix)]
+            if let Ok(d) = std::fs::File::open(&self.attr_dir) {
+                d.sync_all()?;
+            }
         }
 
         let destroyed = ks.shred(agent_id)?;

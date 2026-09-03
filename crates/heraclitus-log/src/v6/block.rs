@@ -613,7 +613,14 @@ pub fn decode_block_records<'a>(
     header: &'a BlockHeaderV1,
     body: &'a [u8],
 ) -> V6Result<Vec<BlockRecord<'a>>> {
-    let mut out = Vec::with_capacity(header.record_count as usize);
+    // `record_count` vem do cabeçalho lido do DISCO. Reservar cegamente a
+    // partir dele deixava um bloco corrompido pedir gigabytes, e em Rust uma
+    // falha de alocação aborta o processo — não devolve erro. O corpo do bloco
+    // é o limite honesto: cada registo consome pelo menos um byte, logo não
+    // podem existir mais registos do que bytes. A verificação de coerência
+    // continua a ser feita no fim; isto só impede que o caminho lá chegue
+    // através de um `abort`.
+    let mut out = Vec::with_capacity((header.record_count as usize).min(body.len()));
     let mut cur = RecordCursor::start(header, body)?;
     while let Some(r) = cur.next_record()? {
         out.push(r);

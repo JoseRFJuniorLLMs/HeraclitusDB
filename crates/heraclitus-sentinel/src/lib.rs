@@ -295,6 +295,50 @@ struct SecurityState {
     l4_ids: BTreeMap<String, Lsn>,
 }
 
+/// Guarda RAII da permissão do circuit breaker do plano L4.
+///
+/// O `begin_request` incrementa `in_flight`; só o `record_success` ou o
+/// `record_failure` o decrementavam. Se a future do pedido fosse **cancelada**
+/// no `await` do backend — um timeout do lado de fora, um `select!` que perde a
+/// corrida, o desligar do runtime — nenhum dos dois corria, e a contagem ficava
+/// permanentemente inflacionada. Ao fim de `max_concurrent_requests`
+/// cancelamentos o `begin_request` passava a recusar sempre e o plano L4 ficava
+/// fechado até ao próximo reinício, sem nada o assinalar.
+///
+/// O `Drop` corre mesmo em cancelamento, que é precisamente a propriedade que
+/// faltava.
+struct PermissaoAi {
+    inner: Arc<RuntimeInner>,
+    resolvido: bool,
+}
+
+impl PermissaoAi {
+    fn nova(inner: Arc<RuntimeInner>) -> Self {
+        Self {
+            inner,
+            resolvido: false,
+        }
+    }
+
+    /// Desarma o guarda: o resultado é conhecido e vai ser registado como
+    /// sucesso ou falha, que já decrementam a contagem.
+    fn resolvida(&mut self) {
+        self.resolvido = true;
+    }
+}
+
+impl Drop for PermissaoAi {
+    fn drop(&mut self) {
+        if !self.resolvido {
+            self.inner
+                .ai_breaker
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .release_cancelled();
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct FusionAccumulator {
     subject: EntityRef,
@@ -757,6 +801,14 @@ impl SentinelRuntime {
                 .into());
             }
         }
+        // A permissão tem de ser devolvida mesmo que esta future seja
+        // CANCELADA no `await` do backend, mais abaixo. Sem o guarda, nem o
+        // sucesso nem a falha chegavam a ser registados nesse caso e o
+        // `in_flight` ficava por decrementar; ao fim de
+        // `max_concurrent_requests` cancelamentos o plano L4 fechava-se até ao
+        // próximo reinício. O guarda é desarmado assim que o resultado é
+        // conhecido, para não contar duas vezes.
+        let mut permissao = PermissaoAi::nova(self.inner.clone());
         self.inner
             .metrics
             .ai_requests_total
@@ -770,6 +822,7 @@ impl SentinelRuntime {
         let result = match backend_result {
             Ok(result) => result,
             Err(error) => {
+                permissao.resolvida();
                 self.inner
                     .ai_breaker
                     .lock()
@@ -783,6 +836,7 @@ impl SentinelRuntime {
             }
         };
         if let Err(error) = result.validate_for(&context) {
+            permissao.resolvida();
             self.inner
                 .ai_breaker
                 .lock()
@@ -794,6 +848,7 @@ impl SentinelRuntime {
                 .fetch_add(1, Ordering::Relaxed);
             return Err(error.into());
         }
+        permissao.resolvida();
         self.inner
             .ai_breaker
             .lock()
@@ -1764,6 +1819,31 @@ fn process_until(inner: &RuntimeInner) -> Result<(), SentinelError> {
         .filter(|(_, episode)| matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecurityEvent"))
         .filter_map(|(_, episode)| episode.attrs.get("sec.source_lsn").and_then(|value| value.parse().ok()))
         .collect();
+
+    // CAUSA RAIZ DA INSTABILIDADE DO L2, diagnosticada a 2026-09-03 e ainda
+    // POR CORRIGIR — fica escrita aqui porque custou meses a encontrar e a
+    // correccao exige uma decisao que nao e trivial.
+    //
+    // `evaluate_l2` tem uma guarda de monotonicidade por sujeito
+    // (behavior.rs:702): uma observacao com LSN inferior ao ultimo visto para a
+    // mesma entidade e recusada com OutOfOrder. E esta funcao MUTA o estado do
+    // L2 em memoria a medida que percorre as linhas, mas em erro nao avanca o
+    // cursor NEM desfaz o que ja aplicou. A retentativa reprocessa as mesmas
+    // linhas, volta a observar um LSN que o L2 ja ultrapassou, e a guarda
+    // recusa outra vez. O `worker_loop` repete sem limite: o pipeline nao esta
+    // parado, esta a girar.
+    //
+    // Sintoma reproduzido sob carga de I/O, com o diagnostico do teste:
+    //   next=2 head=5 vistos=5 processados=2 erros=252 passagens=249
+    //   "observacao para 4:user:5:alice voltou de LSN 4 para 2"
+    //
+    // O que falta decidir: ou `process_until` passa a ser transaccional (as
+    // mutacoes de L2/L3 so se aplicam depois de o lote inteiro correr bem), ou
+    // a guarda passa a tratar um LSN ja visto como no-op idempotente em vez de
+    // erro. A primeira e mais correcta; a segunda e mais barata. Nenhuma deve
+    // ser escolhida sem medir, porque ambas mexem em deteccao.
+    //
+    // NAO aumentar o prazo do teste. O prazo nunca foi o problema.
 
     for (lsn, episode) in rows {
         if lsn < cursor.next_lsn {
@@ -3071,6 +3151,15 @@ detection:
 
     #[test]
     fn l2_behavioral_adapter_emits_replayable_signal_after_shadow_promotion() {
+        // O `worker_loop` regista o erro que o faz repetir a passagem de
+        // catch-up, mas sem subscritor esse aviso não chega a lado nenhum — e
+        // era exactamente esse texto que faltava para explicar a instabilidade.
+        // `try_init` porque o subscritor é global e outros testes do mesmo
+        // binário podem já o ter instalado.
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::WARN)
+            .try_init();
         let temp = tempfile::tempdir().unwrap();
         let log = Arc::new(
             AnyLog::open(

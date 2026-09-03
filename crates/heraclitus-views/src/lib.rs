@@ -105,9 +105,26 @@ impl ViewRegistry {
         let dir = data_dir.into().join("views");
         std::fs::create_dir_all(&dir)?;
         let wm_path = dir.join("watermarks.json");
+        // Um `watermarks.json` ilegível NÃO pode matar o arranque. As
+        // watermarks são estado derivado — dizem só até onde as views já foram
+        // materializadas — e perdê-las custa um rebuild, que é lento mas
+        // correcto. A assimetria era o defeito: o ficheiro ausente dava mapa
+        // vazio e arrancava, um checkpoint corrompido degradava para rebuild,
+        // mas um JSON malformado propagava o erro e o servidor não abria de
+        // todo, exigindo intervenção manual para apagar um ficheiro
+        // reconstruível.
         let watermarks = match std::fs::read_to_string(&wm_path) {
-            Ok(raw) => serde_json::from_str(&raw)
-                .map_err(|e| HeraclitusError::Serialization(e.to_string()))?,
+            Ok(raw) => match serde_json::from_str(&raw) {
+                Ok(mapa) => mapa,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        path = %wm_path.display(),
+                        "watermarks.json ilegível; as views vão ser reconstruídas do LSN 0"
+                    );
+                    HashMap::new()
+                }
+            },
             Err(_) => HashMap::new(),
         };
         Ok(Self {
