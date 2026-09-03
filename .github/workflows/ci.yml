@@ -180,10 +180,19 @@ jobs:
               throw 'views restaurado: a exclusao de estado derivado deixou de valer'
           }
 
+  # Este job pedia 50 minutos de fuzzing (10+10+10+10+5+5) dentro de um
+  # `timeout-minutes: 35`, mais o `cargo install cargo-fuzz` e seis builds de
+  # target. Nunca podia passar: era vermelho por aritmética, não por defeito
+  # encontrado — e um gate que nunca fica verde deixa de ser lido, que é a
+  # única coisa pior do que não ter gate nenhum. O budget longo mudou-se para
+  # o job `fuzz-deep` do qualification-nightly, onde tem tempo a sério; aqui
+  # fica o passe de fumo que cabe no tempo e apanha a regressão óbvia por PR.
   fuzz:
     runs-on: ubuntu-latest
     timeout-minutes: 35
     continue-on-error: false
+    env:
+      FUZZ_SMOKE_SECS: "60"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly action
@@ -192,24 +201,18 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: install cargo-fuzz
         run: cargo install cargo-fuzz --locked
-      - name: fuzz log decode (10 min budget)
-        run: cargo +nightly-2026-02-17 fuzz run log_decode -- -max_total_time=600
-        working-directory: .
-      - name: fuzz query parser (10 min budget, M4 gate)
-        run: cargo +nightly-2026-02-17 fuzz run query_parser -- -max_total_time=600
-        working-directory: .
-      - name: fuzz manifold operations (10 min budget)
-        run: cargo +nightly-2026-02-17 fuzz run manifold_ops -- -max_total_time=600
-        working-directory: .
-      - name: fuzz HRKL v6 decoders (10 min budget)
-        run: cargo +nightly-2026-02-17 fuzz run v6_decode -- -max_total_time=600
-        working-directory: .
-      - name: fuzz configuration parser (5 min budget, SPEC-0049 §39)
-        run: cargo +nightly-2026-02-17 fuzz run config_parse -- -max_total_time=300
-        working-directory: .
-      - name: fuzz RFC 3161 timestamp material (5 min budget, SPEC-0049 §39)
-        run: cargo +nightly-2026-02-17 fuzz run rfc3161_decode -- -max_total_time=300
-        working-directory: .
+      - name: fuzz log decode (smoke)
+        run: cargo +nightly-2026-02-17 fuzz run log_decode -- -max_total_time=$FUZZ_SMOKE_SECS
+      - name: fuzz query parser (smoke, M4 gate)
+        run: cargo +nightly-2026-02-17 fuzz run query_parser -- -max_total_time=$FUZZ_SMOKE_SECS
+      - name: fuzz manifold operations (smoke)
+        run: cargo +nightly-2026-02-17 fuzz run manifold_ops -- -max_total_time=$FUZZ_SMOKE_SECS
+      - name: fuzz HRKL v6 decoders (smoke)
+        run: cargo +nightly-2026-02-17 fuzz run v6_decode -- -max_total_time=$FUZZ_SMOKE_SECS
+      - name: fuzz configuration parser (smoke, SPEC-0049 §39)
+        run: cargo +nightly-2026-02-17 fuzz run config_parse -- -max_total_time=$FUZZ_SMOKE_SECS
+      - name: fuzz RFC 3161 timestamp material (smoke, SPEC-0049 §39)
+        run: cargo +nightly-2026-02-17 fuzz run rfc3161_decode -- -max_total_time=$FUZZ_SMOKE_SECS
       - name: preserve any crash as regression corpus (SPEC-0049 §41)
         if: failure()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0

@@ -1,4 +1,4 @@
-﻿[Unit]
+[Unit]
 Description=HeraclitusDB Event-Sourced Memory & Security Engine
 Documentation=https://github.com/JoseRFJuniorLLMs/HeraclitusDB
 After=network.target local-fs.target

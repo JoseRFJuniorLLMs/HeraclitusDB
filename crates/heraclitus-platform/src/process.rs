@@ -1,4 +1,4 @@
-﻿//! Process lifecycle, signal orchestration, and service manager integration.
+//! Process lifecycle, signal orchestration, and service manager integration.
 //!
 //! Handles asynchronous shutdown triggers (SIGINT, SIGTERM) across operating
 //! systems and provides lightweight systemd notification primitives.

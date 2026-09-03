@@ -115,3 +115,38 @@ jobs:
           path: |
             ${{ runner.temp }}/crash-report.json
             ${{ runner.temp }}/soak/report.json
+
+  # O budget de fuzzing longo que estava no CI por PR. La pedia 50 minutos
+  # dentro de um timeout de 35 e nunca podia terminar; aqui tem tempo a serio,
+  # corre uma vez por noite e preserva o corpus de crash como artefacto.
+  # O CI por PR ficou com um passe de fumo de 60s por target.
+  fuzz-deep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly action
+        with:
+          toolchain: nightly-2026-02-17
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: fuzz log decode (10 min budget)
+        run: cargo +nightly-2026-02-17 fuzz run log_decode -- -max_total_time=600
+      - name: fuzz query parser (10 min budget, M4 gate)
+        run: cargo +nightly-2026-02-17 fuzz run query_parser -- -max_total_time=600
+      - name: fuzz manifold operations (10 min budget)
+        run: cargo +nightly-2026-02-17 fuzz run manifold_ops -- -max_total_time=600
+      - name: fuzz HRKL v6 decoders (10 min budget)
+        run: cargo +nightly-2026-02-17 fuzz run v6_decode -- -max_total_time=600
+      - name: fuzz configuration parser (5 min budget, SPEC-0049)
+        run: cargo +nightly-2026-02-17 fuzz run config_parse -- -max_total_time=300
+      - name: fuzz RFC 3161 timestamp material (5 min budget, SPEC-0049)
+        run: cargo +nightly-2026-02-17 fuzz run rfc3161_decode -- -max_total_time=300
+      - name: preserve any crash as regression corpus (SPEC-0049)
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: fuzz-deep-crash-artifacts
+          if-no-files-found: ignore
+          path: fuzz/artifacts/
