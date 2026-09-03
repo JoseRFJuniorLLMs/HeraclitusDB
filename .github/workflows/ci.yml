@@ -133,10 +133,20 @@ jobs:
           & .\windows\heraclitus-backup.ps1 verify -BackupPath $backup.FullName -Offline
           & .\windows\heraclitus-backup.ps1 restore -BackupPath $backup.FullName -Destination $restore -Offline
 
-          foreach ($relative in @('log\segment.bin', 'views\state.chk')) {
+          # O log tem de voltar byte a byte.
+          foreach ($relative in @('log\segment.bin')) {
               $expected = (Get-FileHash -LiteralPath (Join-Path $source $relative) -Algorithm SHA256).Hash
               $actual = (Get-FileHash -LiteralPath (Join-Path $restore $relative) -Algorithm SHA256).Hash
               if ($expected -ne $actual) { throw "restore divergiu: $relative" }
+          }
+
+          # As views NAO voltam, e e isso que se quer: sao estado derivado com
+          # atributos em claro e reconstroem-se do log por replay determinista.
+          # O passo exigia `views\state.chk` restaurado, o que contradizia a
+          # politica do proprio script (heraclitus-backup.ps1: $excluded).
+          # Passar a exigir a AUSENCIA prova a exclusao em vez de a negar.
+          if (Test-Path -LiteralPath (Join-Path $restore 'views\state.chk')) {
+              throw 'views restaurado: a exclusao de estado derivado deixou de valer'
           }
 
   fuzz:

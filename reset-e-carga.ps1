@@ -36,6 +36,10 @@ param(
     # quase linearmente com este numero. Medido a 2026-08-19 sobre esta carga:
     #     1 -> 86 ev/s (28 h) | 16 -> 274 (9 h) | 64 -> 748 (3.3 h) | 256 -> 1760 (1.4 h)
     [int]    $InFlight = 256,
+    # Numero de repeticoes/passadas da carga para multiplicar o volume de dados acumulado na base
+    [int]    $Repeticoes = 1,
+    # Meta em GB para acumulação de dados no banco (ex: -AlvoGB 20)
+    [int]    $AlvoGB = 0,
     [switch] $SkipBuild,
     [switch] $SkipEdges,
     [switch] $DryRun,
@@ -199,7 +203,7 @@ $Servidor = "http://127.0.0.1:$GrpcPort"
 $tInicio = Get-Date
 
 # --- 5. INGESTOR (nos) -----------------------------------------------------
-Write-Host "[5/8] Ingestor Rust - carregando nos ($InFlight appends em voo)..." -ForegroundColor Green
+Write-Host "[5/8] Ingestor Rust - carregando nos ($InFlight appends em voo | $Repeticoes repeticoes)..." -ForegroundColor Green
 $env:HERACLITUS_INGEST_INFLIGHT = "$InFlight"
 $argsIngest = @("--server", $Servidor, "--dir", $DadosDir, "--batch", "$Batch")
 if (Test-Path $TokenFile) {
@@ -208,8 +212,34 @@ if (Test-Path $TokenFile) {
     Write-Host "      aviso: $TokenFile nao existe - a tentar sem auth" -ForegroundColor Yellow
 }
 if ($DryRun) { $argsIngest += "--dry-run" }
-& $BinIngest @argsIngest
-if ($LASTEXITCODE -ne 0) { throw "ingestor falhou com exit $LASTEXITCODE" }
+
+if ($AlvoGB -gt 0) {
+    Write-Host "      --> MODO META EM VOLUME ATIVO: Alvo de $AlvoGB GB..." -ForegroundColor Yellow
+    $AlvoBytes = [int64]$AlvoGB * 1GB
+    $passada = 1
+    while ($true) {
+        $logPath = Join-Path $DataDir "log"
+        $tamanhoAtual = 0
+        if (Test-Path $logPath) {
+            $tamanhoAtual = (Get-ChildItem -Path $logPath -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+        }
+        $tamanhoGB = [math]::Round($tamanhoAtual / 1GB, 2)
+        Write-Host "      --> Passada ${passada}: Tamanho atual do log em disco = $tamanhoGB GB / $AlvoGB GB..." -ForegroundColor Cyan
+        if ($tamanhoAtual -ge $AlvoBytes) {
+            Write-Host "      ✅ Meta de $AlvoGB GB atingida! ($tamanhoGB GB acumulados)" -ForegroundColor Green
+            break
+        }
+        & $BinIngest @argsIngest
+        if ($LASTEXITCODE -ne 0) { throw "ingestor falhou na passada $passada com exit $LASTEXITCODE" }
+        $passada++
+    }
+} else {
+    for ($r = 1; $r -le $Repeticoes; $r++) {
+        Write-Host "      --> Iniciando repeticao $r de $Repeticoes..." -ForegroundColor Cyan
+        & $BinIngest @argsIngest
+        if ($LASTEXITCODE -ne 0) { throw "ingestor falhou na repeticao $r com exit $LASTEXITCODE" }
+    }
+}
 
 # --- 6. EDGE-BUILDER (arestas + entity resolution) -------------------------
 if ($SkipEdges) {

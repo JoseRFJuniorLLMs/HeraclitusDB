@@ -709,8 +709,11 @@ fn write_and_sync(path: &Path, bytes: &[u8]) -> V6Result<()> {
 fn sync_dir(dir: &Path) -> V6Result<()> {
     // No Windows não é possível abrir um directório como ficheiro; o `rename`
     // do NTFS é atómico e o `sync_all` do ficheiro já cobriu os dados.
+    // Caminho qualificado em vez de `use std::fs::File`: em Windows este ramo
+    // e codigo morto e o import ficaria por usar — com `-D warnings` isso
+    // trocava um vermelho por outro noutra plataforma.
     #[cfg(unix)]
-    File::open(dir)?.sync_all()?;
+    std::fs::File::open(dir)?.sync_all()?;
     #[cfg(not(unix))]
     let _ = dir;
     Ok(())

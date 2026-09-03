@@ -95,7 +95,9 @@ pub trait View: Send + Sync {
 pub struct ViewRegistry {
     dir: PathBuf,
     views: Vec<Box<dyn View>>,
+    names: Vec<String>,
     watermarks: HashMap<String, Lsn>,
+    watermarks_vec: Vec<Lsn>,
 }
 
 impl ViewRegistry {
@@ -111,90 +113,83 @@ impl ViewRegistry {
         Ok(Self {
             dir,
             views: Vec::new(),
+            names: Vec::new(),
             watermarks,
+            watermarks_vec: Vec::new(),
         })
     }
 
     pub fn register(&mut self, view: Box<dyn View>) {
+        let name = view.name().to_string();
+        let wm = self.watermarks.get(&name).copied().unwrap_or(0);
+        self.names.push(name);
+        self.watermarks_vec.push(wm);
         self.views.push(view);
     }
 
     pub fn view_names(&self) -> Vec<String> {
-        self.views.iter().map(|v| v.name().to_string()).collect()
+        self.names.clone()
     }
 
-    /// Apply one live tail event to every view.
+    /// Sincroniza o vetor de watermarks rápido com o HashMap interno para persistência.
+    fn sync_watermarks_map(&mut self) {
+        for (i, name) in self.names.iter().enumerate() {
+            self.watermarks.insert(name.clone(), self.watermarks_vec[i]);
+        }
+    }
+
+    /// Apply one live tail event to every view sem alocações no hot path.
     pub fn apply(&mut self, lsn: Lsn, event: &Episode) {
-        // Frames H-VM (`hvm_isa`) são bytecode do ledger soberano — vivem no
-        // replay determinístico do VM, NÃO nas views derivadas. Excluí-los aqui
-        // e nos replays de boot (`catch_up`/`rebuild`) mantém as views (e o
-        // `state_hash`) idênticas quer sejam construídas ao vivo quer por replay.
         if heraclitus_log::vm_bridge::is_hvm(event) {
             return;
         }
-        for v in self.views.iter_mut() {
+        for (i, v) in self.views.iter_mut().enumerate() {
             v.apply(lsn, event);
-            // Avanço-só (max): dois appends concorrentes podem aplicar 6 antes
-            // de 5; um insert cru regredia o watermark para 5, e um checkpoint
-            // nesse estado fazia o restart re-replayar o 6 (duplicação em views
-            // não-idempotentes). O max preserva "tudo ≤ wm foi aplicado".
-            let w = self.watermarks.entry(v.name().to_string()).or_insert(0);
-            *w = (*w).max(lsn);
+            if lsn > self.watermarks_vec[i] {
+                self.watermarks_vec[i] = lsn;
+            }
         }
     }
 
     /// Watermarks por view (introspecção: `heraclitus_state()`).
-    pub fn watermarks(&self) -> &HashMap<String, Lsn> {
+    pub fn watermarks(&mut self) -> &HashMap<String, Lsn> {
+        self.sync_watermarks_map();
         &self.watermarks
     }
 
-    /// Descarta os watermarks carregados do disco — OBRIGATÓRIO quando as views
-    /// ficam VAZIAS por se saltar o replay (`HERACLITUS_SKIP_VIEW_REPLAY` /
-    /// `LOG_ONLY`). Sem isto o registo fica a afirmar "tudo ≤ W já foi
-    /// aplicado" com as views vazias; um checkpoint (periódico ou de shutdown)
-    /// grava então snapshots VAZIOS sob esses watermarks altos, e como
-    /// `restore()` devolve `true` para um snapshot vazio-mas-presente, o
-    /// arranque seguinte mantinha o watermark e replayava só `(W, head]` —
-    /// TODOS os eventos ≤ W ficavam permanentemente invisíveis às views.
     pub fn reset_watermarks(&mut self) {
         self.watermarks.clear();
+        for wm in self.watermarks_vec.iter_mut() {
+            *wm = 0;
+        }
     }
 
     /// Minimum watermark across views (safe prune point for the memtable).
     pub fn min_watermark(&self) -> Lsn {
-        self.views
-            .iter()
-            .map(|v| self.watermarks.get(v.name()).copied().unwrap_or(0))
-            .min()
-            .unwrap_or(0)
+        self.watermarks_vec.iter().copied().min().unwrap_or(0)
     }
 
-    /// On startup: replay `(watermark, head]` for each view.
+    /// On startup: replay `(watermark, head]` for each view com vetores diretos.
     pub fn catch_up<L: EpisodeLog + ?Sized>(&mut self, log: &L) -> Result<u64, HeraclitusError> {
-        // Correção de correção (não só perf): um watermark persistido só é válido
-        // se o ESTADO da view também tiver sido restaurado. Views que nascem vazias
-        // (restore()==false, o default) têm o watermark forçado a 0 aqui, senão o
-        // replay `(watermark, head]` deixá-las-ia sem `(0, watermark]` no restart.
         let dir = self.dir.clone();
-        let mut to_reset = Vec::new();
-        for v in self.views.iter_mut() {
+        for (i, v) in self.views.iter_mut().enumerate() {
             if !v.restore(&dir)? {
-                to_reset.push(v.name().to_string());
+                self.watermarks_vec[i] = 0;
+                self.watermarks.remove(&self.names[i]);
+            } else {
+                let name = &self.names[i];
+                self.watermarks_vec[i] = self.watermarks.get(name).copied().unwrap_or(0);
             }
-        }
-        for name in to_reset {
-            self.watermarks.remove(&name);
         }
 
         let from = self
-            .views
+            .watermarks_vec
             .iter()
-            .map(|v| self.watermarks.get(v.name()).map(|w| w + 1).unwrap_or(0))
+            .copied()
+            .map(|w| if w > 0 { w + 1 } else { 0 })
             .min()
             .unwrap_or(0);
-        // Paginado: varre o log em janelas de 100k (NÃO materializa milhões de
-        // episódios num único Vec — limita o pico de RAM do arranque, que era o
-        // `alloc` gigante que estourava em logs grandes).
+
         let head = log.head();
         let mut applied = 0u64;
         let mut cur = from;
@@ -206,19 +201,20 @@ impl ViewRegistry {
             let last = batch.last().unwrap().0;
             for (lsn, ep) in &batch {
                 if heraclitus_log::vm_bridge::is_hvm(ep) {
-                    continue; // H-VM frame — não indexar nas views (ver `apply`).
+                    continue;
                 }
-                for v in self.views.iter_mut() {
-                    let wm = self.watermarks.get(v.name()).copied();
-                    if wm.is_none() || *lsn > wm.unwrap() {
+                for (i, v) in self.views.iter_mut().enumerate() {
+                    let wm = self.watermarks_vec[i];
+                    if wm == 0 || *lsn > wm {
                         v.apply(*lsn, ep);
-                        self.watermarks.insert(v.name().to_string(), *lsn);
+                        self.watermarks_vec[i] = *lsn;
                         applied += 1;
                     }
                 }
             }
             cur = last + 1;
         }
+        self.sync_watermarks_map();
         self.persist_watermarks()?;
         Ok(applied)
     }
@@ -229,15 +225,13 @@ impl ViewRegistry {
         log: &L,
         view_name: Option<&str>,
     ) -> Result<(), HeraclitusError> {
-        for v in self.views.iter_mut() {
-            if view_name.map(|n| n == v.name()).unwrap_or(true) {
+        for (i, v) in self.views.iter_mut().enumerate() {
+            if view_name.map(|n| n == self.names[i].as_str()).unwrap_or(true) {
                 v.reset();
-                self.watermarks.remove(v.name());
+                self.watermarks_vec[i] = 0;
+                self.watermarks.remove(&self.names[i]);
             }
         }
-        // R10: paginado como o `catch_up` — o scan sem teto materializava o log
-        // INTEIRO num único Vec (o alloc gigante que estourava em logs grandes),
-        // e o rebuild é justamente o fluxo oficial pós bulk-ingest.
         let head = log.head();
         let mut cur = 0u64;
         while cur < head {
@@ -247,33 +241,33 @@ impl ViewRegistry {
             };
             for (lsn, ep) in &batch {
                 if heraclitus_log::vm_bridge::is_hvm(ep) {
-                    continue; // H-VM frame — não indexar nas views (ver `apply`).
+                    continue;
                 }
-                for v in self.views.iter_mut() {
-                    if view_name.map(|n| n == v.name()).unwrap_or(true) {
+                for (i, v) in self.views.iter_mut().enumerate() {
+                    if view_name.map(|n| n == self.names[i].as_str()).unwrap_or(true) {
                         v.apply(*lsn, ep);
-                        self.watermarks.insert(v.name().to_string(), *lsn);
+                        self.watermarks_vec[i] = *lsn;
                     }
                 }
             }
             cur = last + 1;
         }
+        self.sync_watermarks_map();
         self.persist_watermarks()?;
         Ok(())
     }
 
-    pub fn checkpoint(&self) -> Result<(), HeraclitusError> {
+    pub fn checkpoint(&mut self) -> Result<(), HeraclitusError> {
         for v in &self.views {
             v.checkpoint(&self.dir)?;
         }
+        self.sync_watermarks_map();
         self.persist_watermarks()
     }
 
     fn persist_watermarks(&self) -> Result<(), HeraclitusError> {
         let raw = serde_json::to_string_pretty(&self.watermarks)
             .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
-        // Audit #8: atomic write — tmp + fsync + rename. A power cut can
-        // never leave a half-written watermarks.json behind.
         let tmp = self.dir.join("watermarks.json.tmp");
         {
             use std::io::Write as _;

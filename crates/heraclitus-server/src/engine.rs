@@ -2177,7 +2177,7 @@ impl Engine {
                 })
                 .collect(),
         };
-        let views = self.views.lock().unwrap();
+        let mut views = self.views.lock().unwrap();
         let mut out = serde_json::json!({
             "head_lsn": self.log.head(),
             "storage_format": self.log.format().as_str(),

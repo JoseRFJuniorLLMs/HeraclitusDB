@@ -666,8 +666,8 @@ impl V6Log {
         self.scan_capped(from, to, usize::MAX)
     }
 
-    /// Varredura correcta e limitada; o optimizador de range pode substituir
-    /// esta implementação sem alterar a semântica pública.
+    /// Varredura sequencial otimizada por lote de segmentos; lê blocos sequencialmente
+    /// sem transformar a faixa de LSNs em point lookups individuais.
     pub fn scan_capped(
         &self,
         from: Lsn,
@@ -678,16 +678,107 @@ impl V6Log {
         if from >= end || max == 0 {
             return Ok(Vec::new());
         }
+        let manifest = self.manifest();
+        let candidates: Vec<_> = manifest
+            .segments_for_lsn_range(from, end.saturating_sub(1))
+            .collect();
         let mut out = Vec::with_capacity(max.min(1024));
-        let mut lsn = from;
-        while lsn < end && out.len() < max {
-            let record = self.read(lsn)?.ok_or_else(|| HeraclitusError::Corruption {
-                context: "hrkl v6 scan".into(),
-                detail: format!("LSN contíguo {lsn} ausente"),
+        let mut counters = ScanCounters::default();
+
+        for desc in candidates {
+            if out.len() >= max {
+                break;
+            }
+            let generation = desc.active().ok_or_else(|| HeraclitusError::Corruption {
+                context: "hrkl v6 scan_capped".into(),
+                detail: format!("segmento {} sem geração ativa", desc.segment_id),
             })?;
-            out.push(record);
-            lsn = lsn.saturating_add(1);
+            let path = resolve_location(&self.root, &generation.location)?;
+            let seg_from = from.max(desc.first_lsn);
+            let seg_to = end.min(desc.first_lsn.saturating_add(desc.record_count as u64));
+
+            match generation.layout {
+                PhysicalLayout::Raw => {
+                    let scan = scan_raw_segment(&path)?;
+                    for r in scan.records {
+                        if r.lsn >= seg_from && r.lsn < seg_to {
+                            let mut episode = crate::decode_episode_payload_with_meta(
+                                crate::format::FORMAT_VERSION,
+                                &r.payload,
+                            )?
+                            .episode;
+                            crate::decrypt_storage_episode_in_place(
+                                &mut episode,
+                                self.keystore.as_deref(),
+                            )?;
+                            out.push((r.lsn, episode));
+                            if out.len() >= max {
+                                break;
+                            }
+                        }
+                    }
+                }
+                PhysicalLayout::Packed => {
+                    let reader = open_packed(&path, HARD_MAX_BLOCK_BYTES)?;
+                    let rows = reader.scan_lsn_range(seg_from, seg_to, &mut counters)?;
+                    for (lsn, _timestamp, payload) in rows {
+                        let mut episode = crate::decode_episode_payload_with_meta(
+                            crate::format::FORMAT_VERSION,
+                            &payload,
+                        )?
+                        .episode;
+                        crate::decrypt_storage_episode_in_place(
+                            &mut episode,
+                            self.keystore.as_deref(),
+                        )?;
+                        out.push((lsn, episode));
+                        if out.len() >= max {
+                            break;
+                        }
+                    }
+                }
+            }
         }
+
+        // Se ainda não atingiu o limite max e o intervalo se estende para o segmento ativo (raw)
+        if out.len() < max {
+            let active_info = {
+                let state = self.lock_state()?;
+                if let Some(active) = &state.active {
+                    Some((active.path.clone(), active.writer.header().first_lsn))
+                } else {
+                    None
+                }
+            };
+            if let Some((path, active_first_lsn)) = active_info {
+                if end > active_first_lsn {
+                    let seg_from = from.max(active_first_lsn);
+                    let scan = scan_raw_segment(&path)?;
+                    for r in scan.records {
+                        if r.lsn >= seg_from && r.lsn < end {
+                            // Evitar duplicados caso já tenha sido incluído por um candidato selado
+                            if out.last().map(|(l, _)| *l >= r.lsn).unwrap_or(false) {
+                                continue;
+                            }
+                            let mut episode = crate::decode_episode_payload_with_meta(
+                                crate::format::FORMAT_VERSION,
+                                &r.payload,
+                            )?
+                            .episode;
+                            crate::decrypt_storage_episode_in_place(
+                                &mut episode,
+                                self.keystore.as_deref(),
+                            )?;
+                            out.push((r.lsn, episode));
+                            if out.len() >= max {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(out)
     }
 
