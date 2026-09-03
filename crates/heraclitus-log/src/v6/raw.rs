@@ -660,7 +660,15 @@ pub fn read_footer(path: &Path) -> V6Result<Option<FooterV6>> {
 /// `File`, portanto isto é no-op e a durabilidade do nome fica pela
 /// atomicidade do NTFS — o mesmo compromisso, declarado, que o
 /// `heraclitus-raft::fsync_dir` já assume.
-fn sync_parent_dir(path: &Path) -> V6Result<()> {
+/// Torna durável a entrada de directório de `path`.
+///
+/// `pub(super)` de propósito: existiam TRÊS cópias privadas disto no v6
+/// (`raw`, `packer`, `receipts`) e o `engine` não tinha nenhuma — foi
+/// exactamente por isso que o `rename` que publica um RAW selado ficou sem
+/// fsync do directório, enquanto o manifesto que o referencia é publicado com
+/// `fsync` + rename. O manifesto podia assim apontar para um nome de ficheiro
+/// que uma falha de energia ainda não tinha tornado visível.
+pub(super) fn sync_parent_dir(path: &Path) -> V6Result<()> {
     #[cfg(unix)]
     if let Some(dir) = path.parent() {
         if let Ok(f) = File::open(dir) {

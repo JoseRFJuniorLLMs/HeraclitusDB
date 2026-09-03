@@ -746,10 +746,20 @@ impl Engine {
                 && value
                     .chars()
                     .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+                // O ponto está no allowlist, e sem esta linha `".."` passava:
+                // é não-vazio, é curto, e todos os seus caracteres são
+                // permitidos. Como o valor vira UM componente do caminho, isso
+                // bastava para sair do directório de exportações do servidor —
+                // o comentário acima promete "never an arbitrary host path" e
+                // não era verdade. Recusar qualquer nome só de pontos fecha o
+                // caso sem restringir nomes legítimos.
+                && !value.chars().all(|ch| ch == '.')
         };
         if !safe(category) || !safe(export_id) {
             return Err(HeraclitusError::Config(
-                "category/export_id deve conter apenas ASCII alfanumérico, '-', '_' ou '.'".into(),
+                "category/export_id deve conter apenas ASCII alfanumérico, '-', '_' ou '.', \
+                 e não pode ser só pontos"
+                    .into(),
             ));
         }
         let data_dir = self.attr_dir.parent().unwrap_or(self.attr_dir.as_path());

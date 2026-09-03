@@ -21,9 +21,76 @@ pub struct EffectiveResourceLimits {
     pub cgroups_v2_active: bool,
 }
 
-/// Detects cgroups v2 limits from the default path /sys/fs/cgroup.
+/// Detects cgroups v2 limits for **this process**.
+///
+/// Lê `/proc/self/cgroup` para descobrir onde o processo vive e percorre a
+/// hierarquia até à raiz, ficando com o limite mais apertado que encontrar.
+///
+/// A versão anterior lia `/sys/fs/cgroup` directamente, e isso é a raiz da
+/// hierarquia — onde, em cgroups v2, `memory.max` e `cpu.max` **não existem**
+/// (só os cgroups não-raiz os têm). Funcionava em Docker por acidente, porque o
+/// namespace de cgroup faz o cgroup do contentor aparecer como raiz; sob
+/// systemd, onde o processo vive em `system.slice/heraclitusdb.service`,
+/// devolvia sempre "sem limites". É o pior modo de falha possível para esta
+/// função: dimensionar caches contra a RAM da máquina inteira dentro de uma
+/// unidade com `MemoryMax=` termina no OOM-killer.
 pub fn detect_cgroup_limits() -> EffectiveResourceLimits {
-    detect_cgroup_limits_at(Path::new("/sys/fs/cgroup"))
+    #[cfg(target_os = "linux")]
+    {
+        let raiz = Path::new("/sys/fs/cgroup");
+        let Some(relativo) = cgroup_relativo_do_processo() else {
+            return detect_cgroup_limits_at(raiz);
+        };
+        // O limite efectivo é o mínimo ao longo da cadeia: um ancestral pode
+        // ser mais apertado que a folha.
+        let mut efectivo = EffectiveResourceLimits::default();
+        let mut actual = raiz.join(relativo.trim_start_matches('/'));
+        loop {
+            let neste = detect_cgroup_limits_at(&actual);
+            efectivo.cgroups_v2_active |= neste.cgroups_v2_active;
+            efectivo.memory_limit_bytes =
+                minimo(efectivo.memory_limit_bytes, neste.memory_limit_bytes);
+            efectivo.cpu_quota_millicores =
+                minimo(efectivo.cpu_quota_millicores, neste.cpu_quota_millicores);
+            if efectivo.memory_current_bytes.is_none() {
+                efectivo.memory_current_bytes = neste.memory_current_bytes;
+            }
+            if actual == raiz {
+                break;
+            }
+            match actual.parent() {
+                Some(pai) if pai.starts_with(raiz) => actual = pai.to_path_buf(),
+                _ => break,
+            }
+        }
+        efectivo
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        detect_cgroup_limits_at(Path::new("/sys/fs/cgroup"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn minimo<T: Ord>(a: Option<T>, b: Option<T>) -> Option<T> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (Some(x), None) => Some(x),
+        (None, y) => y,
+    }
+}
+
+/// O caminho do cgroup v2 deste processo, relativo à raiz da hierarquia.
+///
+/// `/proc/self/cgroup` na v2 tem uma única linha da forma `0::/caminho`.
+#[cfg(target_os = "linux")]
+fn cgroup_relativo_do_processo() -> Option<String> {
+    let conteudo = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    conteudo
+        .lines()
+        .find_map(|linha| linha.strip_prefix("0::"))
+        .map(|caminho| caminho.trim().to_string())
+        .filter(|caminho| !caminho.is_empty())
 }
 
 /// Detects cgroups v2 limits at a specific root path (useful for testing).

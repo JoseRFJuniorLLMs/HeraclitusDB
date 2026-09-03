@@ -5,7 +5,13 @@ After=network.target local-fs.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# Type=notify e nao simple: o servidor chama sd_notify(READY=1) quando esta
+# mesmo a servir. Com Type=simple o systemd nem define NOTIFY_SOCKET, portanto
+# esse READY=1 nao ia a lado nenhum e o erro era engolido — a unidade era dada
+# como activa no instante em que o processo arrancava, muito antes de o gRPC
+# aceitar ligacoes. Qualquer unidade com After= sobre esta arrancava cedo demais.
+Type=notify
+NotifyAccess=main
 User=heraclitus
 Group=heraclitus
 
@@ -16,6 +22,19 @@ ExecStart=/usr/bin/heraclitus-server /etc/heraclitusdb/heraclitus.toml
 KillSignal=SIGTERM
 KillMode=mixed
 TimeoutStopSec=30s
+
+# O arranque replaya as views e reconstroi indices a partir do log, e isso
+# cresce com o tamanho da base — foram medidos mais de 16 minutos numa base
+# real. O default de 90s matava o servico a meio da recuperacao, e a politica
+# de Restart recomecava-a do zero: um ciclo que nunca fecha.
+#
+# 30 minutos, e nao `infinity`: com Type=notify um prazo infinito transforma um
+# READY=1 que nunca chega num servico pendurado para sempre, o que e pior do
+# que falhar. O valor certo a prazo NAO e um numero maior — e o daemon mandar
+# EXTEND_TIMEOUT_USEC enquanto progride no replay (ver
+# heraclitus_platform::notify_extend_timeout, ainda por ligar ao boot). Ate la,
+# quem tiver bases muito grandes sobe este numero conscientemente.
+TimeoutStartSec=30min
 
 # Reinicialização automática em caso de crash (SIGSEGV, SIGKILL externo, etc.)
 Restart=on-failure

@@ -1983,6 +1983,11 @@ impl V6Log {
             ));
         }
         std::fs::rename(&active.path, &final_path)?;
+        // O rename só é durável depois de a entrada de directório o ser. Sem
+        // isto, o manifesto — que É publicado com fsync + rename logo a seguir
+        // — podia apontar para um nome que uma falha de energia ainda não
+        // tinha tornado visível: catálogo válido, ficheiro inexistente.
+        super::raw::sync_parent_dir(&final_path)?;
         let before = state.manifest.clone();
         let namespace = state.manifest.storage_namespace_id;
         let changed = reconcile_raw(

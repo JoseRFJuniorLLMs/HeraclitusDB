@@ -73,12 +73,30 @@ impl CursorStore {
         // POSIX rename replaces atomically.  Windows refuses replacement, so
         // retry with the documented remove+rename fallback; the temporary file
         // is always complete and durable before this point.
-        if let Err(error) = std::fs::rename(&temp, &self.path) {
-            if self.path.exists() {
-                std::fs::remove_file(&self.path)?;
-                std::fs::rename(&temp, &self.path)?;
-            } else {
-                return Err(error.into());
+        //
+        // O fallback TEM de ser exclusivo do Windows. Não estava gated, e em
+        // Linux isso era destrutivo: aqui o `rename` substitui sempre, logo só
+        // falha por uma razão real — ENOSPC, EACCES, EIO. Nessas condições o
+        // ramo apagava o cursor VIVO e tentava outra vez, falhando pelo mesmo
+        // motivo. Um erro de I/O transitório passava a perda do cursor, e com
+        // ele o Sentinel perde a posição e reprocessa a base do início.
+        match std::fs::rename(&temp, &self.path) {
+            Ok(()) => {}
+            Err(error) => {
+                #[cfg(windows)]
+                {
+                    if self.path.exists() {
+                        std::fs::remove_file(&self.path)?;
+                        std::fs::rename(&temp, &self.path)?;
+                    } else {
+                        return Err(error.into());
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = std::fs::remove_file(&temp);
+                    return Err(error.into());
+                }
             }
         }
         if let Ok(dir) = std::fs::File::open(parent) {
