@@ -17,6 +17,7 @@
 
 pub mod cpm;
 pub mod format;
+pub mod io_backend; // SPEC-0073 §7: contrato de I/O do log (PortableFileIo default)
 pub mod mmap;
 pub mod skip_scan; // SPEC-010: segment-level skip-I/O scan wired on zone maps
 pub mod store; // SPEC-0050: fachada explícita e neutra entre HRKL legado/v6
@@ -33,6 +34,7 @@ use heraclitus_core::{
     Episode, EventId, EventKind, FsyncPolicy, HeraclitusError, Hlc, Lsn, ProductPoint, SegmentId,
 };
 use heraclitus_crypto::KeyStore;
+use crate::io_backend::{LogIoBackend, PortableFileIo};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -147,7 +149,14 @@ pub struct LogCatalog {
 }
 
 struct Active {
-    file: File,
+    /// SPEC-0073 §7 — a escrita passa pelo contrato `LogIoBackend`.
+    ///
+    /// `PortableFileIo` e o baseline e continua a ser o default; a §7 e
+    /// explicita em que "o atual writer SHALL permanecer como baseline". As
+    /// chamadas de sistema sao as mesmas, na mesma ordem — o que muda e haver
+    /// agora um sitio onde um backend Linux se pode ligar sem mexer no ciclo
+    /// do writer.
+    io: crate::io_backend::PortableFileIo,
     segment_id: SegmentId,
     bytes_written: u64,
     record_hashes: Vec<[u8; 32]>,
@@ -671,10 +680,11 @@ fn sync_parent_dir(dir: &Path) -> Result<(), HeraclitusError> {
     Ok(())
 }
 
-fn rollback_active_file(file: &mut File, bytes_written: u64) {
-    let _ = file.set_len(bytes_written);
-    let _ = file.seek(SeekFrom::Start(bytes_written));
-    let _ = file.sync_data();
+fn rollback_active_file(io: &mut crate::io_backend::PortableFileIo, bytes_written: u64) {
+    use crate::io_backend::LogIoBackend;
+    let _ = io.truncar(bytes_written);
+    let _ = io.ficheiro().seek(SeekFrom::Start(bytes_written));
+    let _ = io.sync();
 }
 
 impl Log {
@@ -901,7 +911,7 @@ impl Log {
                 });
 
                 let state = Active {
-                    file,
+                    io: PortableFileIo::new(file),
                     segment_id: id,
                     bytes_written: scan.valid_len,
                     record_hashes: scan.record_hashes,
@@ -1198,7 +1208,7 @@ impl Log {
                                 // RESOLUÇÃO DE DRIFT: Captura do offset físico EXATO antes do write_all
                                 let record_offset = active.bytes_written;
 
-                                if let Err(e) = active.file.write_all(&record) {
+                                if let Err(e) = active.io.append_batch(&record) {
                                     physical_io_error = true;
                                     let _ = resp_tx.send(Err(e.into()));
                                     break;
@@ -1241,7 +1251,7 @@ impl Log {
 
                     // RECOVERY TRANSACIONAL DE MEMÓRIA: Restaura o alinhamento em falhas físicas parciais
                     if physical_io_error {
-                        rollback_active_file(&mut active.file, initial_bytes_written);
+                        rollback_active_file(&mut active.io, initial_bytes_written);
                         active.bytes_written = initial_bytes_written;
                         active.record_hashes.truncate(initial_hashes_len);
                         active.max_lsn = initial_max_lsn;
@@ -1251,8 +1261,8 @@ impl Log {
 
                     // PIPELINE — FASE 3: FS DATA HARDWARE BARRIER
                     if sync_required {
-                        if active.file.sync_data().is_err() {
-                            rollback_active_file(&mut active.file, initial_bytes_written);
+                        if active.io.sync().is_err() {
+                            rollback_active_file(&mut active.io, initial_bytes_written);
                             active.bytes_written = initial_bytes_written;
                             active.record_hashes.truncate(initial_hashes_len);
                             active.max_lsn = initial_max_lsn;
@@ -2213,7 +2223,7 @@ fn new_active(
     sync_parent_dir(dir)?;
 
     Ok(Active {
-        file,
+        io: PortableFileIo::new(file),
         segment_id: id,
         bytes_written: HEADER_LEN as u64,
         record_hashes: Vec::new(),
@@ -2230,15 +2240,15 @@ fn roll_segment(
     next_base_lsn: Lsn,
     hlc: &Hlc,
 ) -> Result<(), HeraclitusError> {
-    active.file.sync_data()?;
+    active.io.sync()?;
     let footer = SegmentFooter {
         record_count: active.record_hashes.len() as u64,
         min_lsn: active.base_lsn,
         max_lsn: active.max_lsn,
         blake3_root: merkle_root(&active.record_hashes),
     };
-    active.file.write_all(&footer.encode())?;
-    active.file.sync_data()?;
+    active.io.append_batch(&footer.encode())?;
+    active.io.sync()?;
 
     let next_id = active.segment_id + 1;
     let old_base_lsn = active.base_lsn;

@@ -32,6 +32,8 @@ RAIZ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EVENTOS="${HERACLITUS_L7_EVENTOS:-200000}"
 DIR_DADOS="${HERACLITUS_L7_DIR:-}"
 FALHAS=0
+SERVIDOR_PID=""
+MED_WALL=""; MED_CPU=""; MED_PICO=""; MED_LER=""; MED_ESCREVER=""
 
 REST_PORT=18100
 GRPC_PORT=18101
@@ -105,32 +107,41 @@ print(alvo.get('$1', ''))
 " 2>/dev/null
 }
 
-# Arranca e mede: devolve "wall_ms cpu_ms peak_rss_kib io_read io_write".
+# Arranca e mede, deixando o resultado em MED_*.
+#
+# NAO devolve por stdout, e a razao custou uma corrida inteira a descobrir:
+# `M=$(arrancar_medindo)` corre a funcao numa SUBSHELL, portanto o
+# `SERVIDOR_PID` que ela atribui morre com a subshell. O `parar` do processo
+# principal via a variavel vazia, nao parava nada, e o servidor do primeiro
+# cenario ficava vivo o tempo todo. Os arranques seguintes falhavam a ligar-se
+# ao porto, mas o `healthz` respondia — era o PRIMEIRO servidor a responder — e
+# o gate media cinco vezes o mesmo processo, com wall=5ms e o mesmo
+# `rebuild_canonical` em todos os cenarios. Verde nenhum, mas quase.
 arrancar_medindo() {
   local prazo="${1:-900}"
   local t0 t1
+  MED_WALL=""; MED_CPU=""; MED_PICO=""; MED_LER=""; MED_ESCREVER=""
   t0=$(date +%s%3N)
   "$RAIZ/target/release/heraclitus-server" "$DIR_DADOS/heraclitus.toml" \
     > "$DIR_DADOS/stdout.log" 2> "$DIR_DADOS/stderr.log" &
   SERVIDOR_PID=$!
   local fim=$((SECONDS + prazo))
   while (( SECONDS < fim )); do
-    kill -0 "$SERVIDOR_PID" 2>/dev/null || { echo ""; return 1; }
+    kill -0 "$SERVIDOR_PID" 2>/dev/null || return 1
     if curl -sf "http://127.0.0.1:$REST_PORT/healthz" >/dev/null 2>&1; then
       t1=$(date +%s%3N)
-      local cpu hz pico ler escrever
+      local hz
       hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
-      cpu=$(awk -v hz="$hz" '{print int(($14 + $15) * 1000 / hz)}' \
+      MED_WALL=$((t1 - t0))
+      MED_CPU=$(awk -v hz="$hz" '{print int(($14 + $15) * 1000 / hz)}' \
         "/proc/$SERVIDOR_PID/stat" 2>/dev/null)
-      pico=$(awk '/^VmHWM:/{print $2}' "/proc/$SERVIDOR_PID/status" 2>/dev/null)
-      ler=$(awk '/^read_bytes:/{print $2}' "/proc/$SERVIDOR_PID/io" 2>/dev/null)
-      escrever=$(awk '/^write_bytes:/{print $2}' "/proc/$SERVIDOR_PID/io" 2>/dev/null)
-      echo "$((t1 - t0)) ${cpu:-0} ${pico:-0} ${ler:-0} ${escrever:-0}"
+      MED_PICO=$(awk '/^VmHWM:/{print $2}' "/proc/$SERVIDOR_PID/status" 2>/dev/null)
+      MED_LER=$(awk '/^read_bytes:/{print $2}' "/proc/$SERVIDOR_PID/io" 2>/dev/null)
+      MED_ESCREVER=$(awk '/^write_bytes:/{print $2}' "/proc/$SERVIDOR_PID/io" 2>/dev/null)
       return 0
     fi
     sleep 0.1
   done
-  echo ""
   return 1
 }
 
@@ -158,13 +169,13 @@ esperar_catchup() {
 }
 
 relatar() {
-  local nome="$1" medida="$2"
-  read -r WALL CPU PICO LER ESCREVER <<< "$medida"
+  local nome="$1"
   local resultado cauda lidos wm
   resultado=$(campo outcome boot); cauda=$(campo tail_events boot)
   lidos=$(campo events_scanned_total boot); wm=$(campo watermark_lsn boot)
   printf '  %-18s wall=%sms cpu=%sms pico_rss=%sKiB io_r=%s io_w=%s\n' \
-    "$nome" "$WALL" "$CPU" "$PICO" "$LER" "$ESCREVER"
+    "$nome" "${MED_WALL:-?}" "${MED_CPU:-0}" "${MED_PICO:-0}" \
+    "${MED_LER:-0}" "${MED_ESCREVER:-0}"
   printf '  %-18s outcome=%s tail=%s lidos=%s watermark=%s\n' \
     "" "$resultado" "$cauda" "$lidos" "$wm"
   ULTIMO_RESULTADO="$resultado"; ULTIMA_CAUDA="$cauda"; ULTIMOS_LIDOS="$lidos"
@@ -174,9 +185,11 @@ relatar() {
 
 echo
 echo "=== L7 — build ==="
-(cd "$RAIZ" && cargo build --release -p heraclitus-server --bin probe_grpc --locked) \
-  || (cd "$RAIZ" && cargo build --release -p heraclitus-server --locked && \
-      cd "$RAIZ" && cargo build --release --bin probe_grpc --locked) || exit 1
+# Dois comandos e nao um: o `probe_grpc` vive no `heraclitus-ingestor`, e
+# `-p heraclitus-server --bin probe_grpc` falha com "no bin target named
+# probe_grpc in heraclitus-server".
+(cd "$RAIZ" && cargo build --release -p heraclitus-server --locked) || exit 1
+(cd "$RAIZ" && cargo build --release --bin probe_grpc --locked) || exit 1
 SONDA="$RAIZ/target/release/probe_grpc"
 ok "binarios prontos"
 
@@ -185,8 +198,8 @@ ok "binarios prontos"
 echo
 echo "=== Cenario 1 — cold boot (sem snapshot) ==="
 escrever_config
-M=$(arrancar_medindo) || { falha "cold boot nao arrancou"; exit 1; }
-relatar "cold" "$M"
+arrancar_medindo || { falha "cold boot nao arrancou"; exit 1; }
+relatar "cold"
 [[ "$ULTIMO_RESULTADO" == "rebuild_canonical" ]] \
   && ok "primeiro arranque reconstroi do log" \
   || falha "esperava rebuild_canonical, veio '$ULTIMO_RESULTADO'"
@@ -207,8 +220,8 @@ ok "base com $BASE episodios (inclui derivados do Sentinel)"
 echo
 echo "=== Cenario 2 — warm clean boot (cauda zero) ==="
 parar || falha "SIGTERM nao desligou"
-M=$(arrancar_medindo) || { falha "warm clean nao arrancou"; exit 1; }
-relatar "warm-clean" "$M"
+arrancar_medindo || { falha "warm clean nao arrancou"; exit 1; }
+relatar "warm-clean"
 [[ "$ULTIMO_RESULTADO" == "synchronized" || "$ULTIMO_RESULTADO" == "catch_up_tail" ]] \
   && ok "arranque a quente" \
   || falha "esperava synchronized/catch_up_tail, veio '$ULTIMO_RESULTADO'"
@@ -227,8 +240,8 @@ echo "=== Cenario 3 — warm dirty boot (cauda pendente) ==="
 # De proposito SEM esperar catch-up: e o que faz a cauda existir.
 parar
 ANTES=$(( BASE ))
-M=$(arrancar_medindo) || { falha "warm dirty nao arrancou"; exit 1; }
-relatar "warm-dirty" "$M"
+arrancar_medindo || { falha "warm dirty nao arrancou"; exit 1; }
+relatar "warm-dirty"
 [[ "$ULTIMO_RESULTADO" == "catch_up_tail" || "$ULTIMO_RESULTADO" == "synchronized" ]] \
   && ok "cauda pendente reproduzida" \
   || falha "veio '$ULTIMO_RESULTADO'"
@@ -245,8 +258,8 @@ sleep 2
 kill -9 "$SERVIDOR_PID" 2>/dev/null; wait "$SERVIDOR_PID" 2>/dev/null; SERVIDOR_PID=""
 kill -9 "$SONDA_PID" 2>/dev/null; wait "$SONDA_PID" 2>/dev/null
 ok "servidor morto com SIGKILL a meio da ingestao"
-M=$(arrancar_medindo) || { falha "nao recuperou do SIGKILL"; exit 1; }
-relatar "crash" "$M"
+arrancar_medindo || { falha "nao recuperou do SIGKILL"; exit 1; }
+relatar "crash"
 HEAD=$(campo head_lsn status); WM=$(campo watermark_lsn boot)
 [[ -n "$WM" && -n "$HEAD" && "$WM" -le "$HEAD" ]] \
   && ok "watermark=$WM <= head=$HEAD" \
@@ -261,8 +274,8 @@ parar
 CURSOR="$DIR_DADOS/data/log/sentinel/cursor.json"
 if [[ -f "$CURSOR" ]]; then
   printf '{"next_lsn": 999999999, "pipeline_version": 1}' > "$CURSOR"
-  M=$(arrancar_medindo) || { falha "nao arrancou com cursor divergente"; exit 1; }
-  relatar "divergent" "$M"
+  arrancar_medindo || { falha "nao arrancou com cursor divergente"; exit 1; }
+  relatar "divergent"
   DIV=$(campo divergence_total boot)
   [[ "$ULTIMO_RESULTADO" == "rebuild_canonical" ]] \
     && ok "divergencia reconstroi" || falha "veio '$ULTIMO_RESULTADO'"
