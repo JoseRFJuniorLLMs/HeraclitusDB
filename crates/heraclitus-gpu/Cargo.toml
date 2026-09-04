@@ -9,7 +9,7 @@ description = "Heterogeneous (GPU) batch distance + quantized Top-M for RECALL/F
 [dependencies]
 heraclitus-core = { workspace = true }
 wgpu = { version = "24", optional = true }
-pollster = { version = "0.4", optional = true }
+pollster = { version = "1.0", optional = true }
 bytemuck = { version = "1", optional = true }
 
 [features]
