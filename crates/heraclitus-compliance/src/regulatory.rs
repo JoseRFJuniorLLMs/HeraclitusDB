@@ -470,88 +470,96 @@ impl RegulatoryState {
         as_of_lsn: Lsn,
     ) -> Result<Self, RegulatoryError> {
         let end = log.head().min(as_of_lsn.saturating_add(1));
-        let rows = log
-            .scan(0, end)
-            .map_err(|error| RegulatoryError::Storage(error.to_string()))?;
         let mut state = Self::default();
-        for (lsn, episode) in rows {
-            if episode
-                .attrs
-                .get("compliance.generated")
-                .map(String::as_str)
-                != Some("true")
-            {
-                continue;
-            }
-            match episode.kind.label().as_str() {
-                POLICY_EVENT => {
-                    let activation: PolicyActivation = serde_json::from_slice(&episode.content)?;
-                    activation.validate()?;
-                    state
-                        .policy_activations
-                        .push(PolicyActivationRecord { lsn, activation });
+        // Janelado: o `scan(0, end)` anterior materializava o log inteiro em
+        // RAM antes de olhar para a primeira linha, e este replay corre no
+        // arranque do servidor E em cada chamada dos RPCs de compliance.
+        crate::varrimento::por_episodio(
+            log,
+            end,
+            |error| RegulatoryError::Storage(error.to_string()),
+            |lsn, episode| {
+                if episode
+                    .attrs
+                    .get("compliance.generated")
+                    .map(String::as_str)
+                    != Some("true")
+                {
+                    return Ok(());
                 }
-                ASSESSMENT_EVENT => {
-                    let decision: RegulatoryDecision = serde_json::from_slice(&episode.content)?;
-                    decision.context.validate()?;
-                    state
-                        .decisions
-                        .push(RegulatoryDecisionRecord { lsn, decision });
-                }
-                LEGAL_HOLD_EVENT => {
-                    let hold: LegalHold = serde_json::from_slice(&episode.content)?;
-                    hold.validate()?;
-                    // Um duplicado NAO pode abortar o replay. O log e
-                    // append-only: o episodio ofensor nunca desaparece, logo um
-                    // `Err` aqui tornava o estado regulatorio irrecuperavel
-                    // para sempre — e com ele o crypto-shred e o GC, que falham
-                    // fechado. Fica o PRIMEIRO hold, que e a escolha
-                    // conservadora: manter a retencao em vez de a levantar.
-                    if state.legal_holds.contains_key(&hold.hold_id) {
-                        tracing::warn!(
-                            hold_id = %hold.hold_id,
-                            lsn,
-                            "hold_id repetido no log; mantido o primeiro e ignorado este"
-                        );
-                        continue;
+                match episode.kind.label().as_str() {
+                    POLICY_EVENT => {
+                        let activation: PolicyActivation =
+                            serde_json::from_slice(&episode.content)?;
+                        activation.validate()?;
+                        state
+                            .policy_activations
+                            .push(PolicyActivationRecord { lsn, activation });
                     }
-                    state.legal_holds.insert(
-                        hold.hold_id.clone(),
-                        LegalHoldRecord {
-                            lsn,
-                            hold,
-                            released: None,
-                        },
-                    );
-                }
-                LEGAL_HOLD_RELEASE_EVENT => {
-                    let release: LegalHoldRelease = serde_json::from_slice(&episode.content)?;
-                    release.validate()?;
-                    // Mesma razao do duplicado acima: um release orfao ou
-                    // repetido e um episodio que ja esta no log para sempre.
-                    // Ignora-se com aviso, e mantem-se o PRIMEIRO release —
-                    // nunca se levanta uma retencao por causa de um segundo.
-                    let Some(record) = state.legal_holds.get_mut(&release.hold_id) else {
-                        tracing::warn!(
-                            hold_id = %release.hold_id,
-                            lsn,
-                            "release sem LegalHold anterior; ignorado"
-                        );
-                        continue;
-                    };
-                    if record.released.is_some() {
-                        tracing::warn!(
-                            hold_id = %release.hold_id,
-                            lsn,
-                            "LegalHold libertado duas vezes; mantido o primeiro release"
-                        );
-                        continue;
+                    ASSESSMENT_EVENT => {
+                        let decision: RegulatoryDecision =
+                            serde_json::from_slice(&episode.content)?;
+                        decision.context.validate()?;
+                        state
+                            .decisions
+                            .push(RegulatoryDecisionRecord { lsn, decision });
                     }
-                    record.released = Some((lsn, release));
+                    LEGAL_HOLD_EVENT => {
+                        let hold: LegalHold = serde_json::from_slice(&episode.content)?;
+                        hold.validate()?;
+                        // Um duplicado NAO pode abortar o replay. O log e
+                        // append-only: o episodio ofensor nunca desaparece, logo um
+                        // `Err` aqui tornava o estado regulatorio irrecuperavel
+                        // para sempre — e com ele o crypto-shred e o GC, que falham
+                        // fechado. Fica o PRIMEIRO hold, que e a escolha
+                        // conservadora: manter a retencao em vez de a levantar.
+                        if state.legal_holds.contains_key(&hold.hold_id) {
+                            tracing::warn!(
+                                hold_id = %hold.hold_id,
+                                lsn,
+                                "hold_id repetido no log; mantido o primeiro e ignorado este"
+                            );
+                            return Ok(());
+                        }
+                        state.legal_holds.insert(
+                            hold.hold_id.clone(),
+                            LegalHoldRecord {
+                                lsn,
+                                hold,
+                                released: None,
+                            },
+                        );
+                    }
+                    LEGAL_HOLD_RELEASE_EVENT => {
+                        let release: LegalHoldRelease = serde_json::from_slice(&episode.content)?;
+                        release.validate()?;
+                        // Mesma razao do duplicado acima: um release orfao ou
+                        // repetido e um episodio que ja esta no log para sempre.
+                        // Ignora-se com aviso, e mantem-se o PRIMEIRO release —
+                        // nunca se levanta uma retencao por causa de um segundo.
+                        let Some(record) = state.legal_holds.get_mut(&release.hold_id) else {
+                            tracing::warn!(
+                                hold_id = %release.hold_id,
+                                lsn,
+                                "release sem LegalHold anterior; ignorado"
+                            );
+                            return Ok(());
+                        };
+                        if record.released.is_some() {
+                            tracing::warn!(
+                                hold_id = %release.hold_id,
+                                lsn,
+                                "LegalHold libertado duas vezes; mantido o primeiro release"
+                            );
+                            return Ok(());
+                        }
+                        record.released = Some((lsn, release));
+                    }
+                    _ => {}
                 }
-                _ => {}
-            }
-        }
+                Ok(())
+            },
+        )?;
         state.policy_activations.sort_by_key(|record| record.lsn);
         state.decisions.sort_by_key(|record| record.lsn);
         Ok(state)

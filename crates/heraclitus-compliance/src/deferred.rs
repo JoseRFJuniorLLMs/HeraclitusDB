@@ -738,31 +738,35 @@ impl DeferredAnchorState {
         log: &L,
         as_of_lsn: Lsn,
     ) -> Result<Self, DeferredAnchorError> {
-        let rows = log
-            .scan(0, log.head().min(as_of_lsn.saturating_add(1)))
-            .map_err(|error| DeferredAnchorError::Storage(error.to_string()))?;
         let mut state = Self::default();
         let mut previous = None;
-        for (lsn, episode) in rows {
-            if episode.kind.label() != ANCHOR_EVENT
-                || episode
-                    .attrs
-                    .get("compliance.generated")
-                    .map(String::as_str)
-                    != Some("true")
-            {
-                continue;
-            }
-            let anchor: EvidenceAnchor = serde_json::from_slice(&episode.content)?;
-            anchor.validate()?;
-            if anchor.previous_anchor_digest != previous {
-                return Err(DeferredAnchorError::Invalid(format!(
-                    "cadeia de anchors quebrada no LSN {lsn}"
-                )));
-            }
-            previous = Some(anchor.anchor_digest);
-            state.anchors.push((lsn, anchor));
-        }
+        // Janelado — ver `crate::varrimento`.
+        crate::varrimento::por_episodio(
+            log,
+            log.head().min(as_of_lsn.saturating_add(1)),
+            |error| DeferredAnchorError::Storage(error.to_string()),
+            |lsn, episode| {
+                if episode.kind.label() != ANCHOR_EVENT
+                    || episode
+                        .attrs
+                        .get("compliance.generated")
+                        .map(String::as_str)
+                        != Some("true")
+                {
+                    return Ok(());
+                }
+                let anchor: EvidenceAnchor = serde_json::from_slice(&episode.content)?;
+                anchor.validate()?;
+                if anchor.previous_anchor_digest != previous {
+                    return Err(DeferredAnchorError::Invalid(format!(
+                        "cadeia de anchors quebrada no LSN {lsn}"
+                    )));
+                }
+                previous = Some(anchor.anchor_digest);
+                state.anchors.push((lsn, anchor));
+                Ok(())
+            },
+        )?;
         Ok(state)
     }
 

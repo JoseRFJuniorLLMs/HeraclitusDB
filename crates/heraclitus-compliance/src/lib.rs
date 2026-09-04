@@ -46,6 +46,7 @@ pub mod signer;
 pub mod sovereignty;
 pub mod trust_store;
 pub mod tsa;
+pub(crate) mod varrimento;
 
 #[cfg(test)]
 pub(crate) mod test_pki;

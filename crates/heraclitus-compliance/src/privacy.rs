@@ -906,35 +906,39 @@ pub struct PrivacyState {
 impl PrivacyState {
     pub fn replay<L: EpisodeLog + ?Sized>(log: &L, as_of_lsn: Lsn) -> Result<Self, PrivacyError> {
         let end = log.head().min(as_of_lsn.saturating_add(1));
-        let rows = log
-            .scan(0, end)
-            .map_err(|error| PrivacyError::Storage(error.to_string()))?;
         let mut state = Self::default();
-        for (lsn, episode) in rows {
-            if episode
-                .attrs
-                .get("compliance.generated")
-                .map(String::as_str)
-                != Some("true")
-            {
-                continue;
-            }
-            match episode.kind.label().as_str() {
-                ASSESSMENT_EVENT => {
-                    let value: PrivacyIncidentAssessment =
-                        serde_json::from_slice(&episode.content)?;
-                    value.validate()?;
-                    state.assessments.push((lsn, value));
+        // Janelado — ver `crate::varrimento`.
+        crate::varrimento::por_episodio(
+            log,
+            end,
+            |error| PrivacyError::Storage(error.to_string()),
+            |lsn, episode| {
+                if episode
+                    .attrs
+                    .get("compliance.generated")
+                    .map(String::as_str)
+                    != Some("true")
+                {
+                    return Ok(());
                 }
-                DEADLINE_EVENT => state
-                    .deadlines
-                    .push((lsn, serde_json::from_slice(&episode.content)?)),
-                EXPORT_EVENT => state
-                    .exports
-                    .push((lsn, serde_json::from_slice(&episode.content)?)),
-                _ => {}
-            }
-        }
+                match episode.kind.label().as_str() {
+                    ASSESSMENT_EVENT => {
+                        let value: PrivacyIncidentAssessment =
+                            serde_json::from_slice(&episode.content)?;
+                        value.validate()?;
+                        state.assessments.push((lsn, value));
+                    }
+                    DEADLINE_EVENT => state
+                        .deadlines
+                        .push((lsn, serde_json::from_slice(&episode.content)?)),
+                    EXPORT_EVENT => state
+                        .exports
+                        .push((lsn, serde_json::from_slice(&episode.content)?)),
+                    _ => {}
+                }
+                Ok(())
+            },
+        )?;
         Ok(state)
     }
 }

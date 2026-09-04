@@ -436,28 +436,32 @@ pub struct SovereigntyAuditState {
 impl SovereigntyAuditState {
     pub fn replay<L: EpisodeLog + ?Sized>(log: &L) -> Result<Self, SovereigntyError> {
         let mut state = Self::default();
-        let rows = log
-            .scan(0, log.head())
-            .map_err(|error| SovereigntyError::Audit(error.to_string()))?;
-        for (lsn, episode) in rows {
-            if episode
-                .attrs
-                .get("compliance.generated")
-                .map(String::as_str)
-                != Some("true")
-            {
-                continue;
-            }
-            match episode.kind.label().as_str() {
-                EGRESS_EVENT => state
-                    .egress
-                    .push((lsn, serde_json::from_slice(&episode.content)?)),
-                MODEL_EVENT => state
-                    .models
-                    .push((lsn, serde_json::from_slice(&episode.content)?)),
-                _ => {}
-            }
-        }
+        // Janelado — ver `crate::varrimento`.
+        crate::varrimento::por_episodio(
+            log,
+            log.head(),
+            |error| SovereigntyError::Audit(error.to_string()),
+            |lsn, episode| {
+                if episode
+                    .attrs
+                    .get("compliance.generated")
+                    .map(String::as_str)
+                    != Some("true")
+                {
+                    return Ok(());
+                }
+                match episode.kind.label().as_str() {
+                    EGRESS_EVENT => state
+                        .egress
+                        .push((lsn, serde_json::from_slice(&episode.content)?)),
+                    MODEL_EVENT => state
+                        .models
+                        .push((lsn, serde_json::from_slice(&episode.content)?)),
+                    _ => {}
+                }
+                Ok(())
+            },
+        )?;
         Ok(state)
     }
 }

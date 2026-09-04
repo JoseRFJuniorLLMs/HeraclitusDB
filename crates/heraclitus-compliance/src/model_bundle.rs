@@ -436,20 +436,32 @@ impl ModelBundleRegistry {
     }
 
     pub fn activate(&self, verified: VerifiedModelBundle) -> Result<Lsn, ModelBundleError> {
-        let existing = self
-            .log
-            .scan(0, self.log.head())
-            .map_err(|error| ModelBundleError::Storage(error.to_string()))?
-            .into_iter()
-            .find_map(|(lsn, episode)| {
-                (episode.kind.label() == ACTIVATION_EVENT)
-                    .then(|| serde_json::from_slice::<VerifiedModelBundle>(&episode.content).ok())
-                    .flatten()
-                    .filter(|value| value.bundle_digest == verified.bundle_digest)
-                    .map(|_| lsn)
-            });
-        if let Some(lsn) = existing {
-            return Ok(lsn);
+        // Procura de idempotência: o `scan(0, head)` anterior materializava o
+        // log inteiro em RAM e só depois fazia `find_map` — que pára no
+        // primeiro achado. Janelado, além de limitar a memória, sai assim que
+        // encontra, em vez de ler tudo para descobrir que a resposta estava na
+        // primeira linha.
+        let head = self.log.head();
+        let mut cursor: Lsn = 0;
+        while cursor < head {
+            let janela = self
+                .log
+                .scan_capped(cursor, head, crate::varrimento::JANELA)
+                .map_err(|error| ModelBundleError::Storage(error.to_string()))?;
+            let Some(&(ultimo, _)) = janela.last() else {
+                break;
+            };
+            for (lsn, episode) in &janela {
+                if episode.kind.label() != ACTIVATION_EVENT {
+                    continue;
+                }
+                if let Ok(value) = serde_json::from_slice::<VerifiedModelBundle>(&episode.content) {
+                    if value.bundle_digest == verified.bundle_digest {
+                        return Ok(*lsn);
+                    }
+                }
+            }
+            cursor = ultimo.saturating_add(1);
         }
         self.log
             .append(verified.to_episode()?)

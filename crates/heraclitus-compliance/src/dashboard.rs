@@ -201,12 +201,22 @@ impl ComplianceDashboardSnapshot {
                 SovereigntyVerdict::Deny => sovereignty_health.model_denied += 1,
             }
         }
-        sovereignty_health.verified_model_activations = log
-            .scan(0, as_of_lsn)
-            .map_err(|error| ComplianceDashboardError::Storage(error.to_string()))?
-            .iter()
-            .filter(|(_, episode)| episode.kind.label() == "SecurityModelActivation")
-            .count();
+        // Janelado — ver `crate::varrimento`. Esta contagem é a quinta
+        // varredura completa do log dentro de UM pedido a
+        // `GET /compliance/status`, cuja autenticação é opcional em loopback.
+        let mut activations = 0usize;
+        crate::varrimento::por_episodio(
+            log,
+            as_of_lsn,
+            |error| ComplianceDashboardError::Storage(error.to_string()),
+            |_, episode| {
+                if episode.kind.label() == "SecurityModelActivation" {
+                    activations += 1;
+                }
+                Ok(())
+            },
+        )?;
+        sovereignty_health.verified_model_activations = activations;
 
         let has_production_trust = anchor_health.last_icp_brasil_valid_anchor_lsn.is_some();
         let status = if !has_production_trust {
