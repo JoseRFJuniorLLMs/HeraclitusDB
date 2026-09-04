@@ -111,6 +111,19 @@ pub fn serve(listener: TcpListener, raft: HeraclitusRaft) -> tokio::task::JoinHa
                     continue;
                 }
             };
+            // SPEC-0073 §31 — TCP_NODELAY no RPC do Raft.
+            //
+            // A §31 nomeia este caminho: "aplicar/qualificar TCP_NODELAY
+            // especialmente em Raft RPC, small control RPCs". São mensagens
+            // pequenas com resposta esperada, e o algoritmo de Nagle atrasa
+            // precisamente essas — segura o pacote à espera de mais dados que
+            // nunca vêm, até 40 ms. Num heartbeat de Raft isso é latência de
+            // consenso pura; num AppendEntries é latência de commit.
+            //
+            // O erro é ignorado de propósito: uma ligação que não aceita a
+            // opção continua a servir, só mais devagar. Recusá-la por causa de
+            // uma optimização seria trocar latência por indisponibilidade.
+            let _ = sock.set_nodelay(true);
             let raft = raft.clone();
             tokio::spawn(async move {
                 loop {
@@ -173,6 +186,11 @@ impl TcpConnection {
         let mut sock = TcpStream::connect(&self.addr)
             .await
             .map_err(|e| Unreachable::new(&e))?;
+        // SPEC-0073 §31 — o lado que INICIA também tem de o pedir. O
+        // `TCP_NODELAY` é por socket e não por ligação: desligar o Nagle só no
+        // servidor deixaria os pedidos a sofrê-lo na ida, que é metade da
+        // latência de ida-e-volta que se está a tentar poupar.
+        let _ = sock.set_nodelay(true);
         let req = bincode::serde::encode_to_vec(&rpc, BINCODE_CFG)
             .map_err(|e| Unreachable::new(&io_err(e)))?;
         write_frame(&mut sock, &req)

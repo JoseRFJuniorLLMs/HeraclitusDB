@@ -14,6 +14,7 @@ pub mod memory;
 pub mod numa;
 pub mod odirect;
 pub mod process;
+pub mod simd;
 
 pub use capabilities::{detect_capabilities, PlatformCapabilities};
 pub use cgroup::{detect_cgroup_limits, EffectiveResourceLimits};
@@ -25,3 +26,4 @@ pub use memory::{advise, advise_slice, page_size, MemoryAdvice};
 pub use numa::{detect_numa_topology, NumaNode, NumaTopology};
 pub use odirect::{abrir_bulk, alinhado, BufferAlinhado, FicheiroBulk, ModoBulk};
 pub use process::{notify_extend_timeout, notify_ready, notify_watchdog, wait_for_shutdown_signal};
+pub use simd::{dot, dot_scalar, SimdLevel};

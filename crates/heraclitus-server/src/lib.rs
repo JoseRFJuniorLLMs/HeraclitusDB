@@ -990,7 +990,13 @@ pub async fn serve_with(
         None
     };
 
-    let mut grpc_server = tonic::transport::Server::builder();
+    // SPEC-0073 §31 — TCP_NODELAY tambem no gRPC publico.
+    //
+    // A §31 fala de "small control RPCs", e a maioria do trafego desta
+    // superficie e isso: um `Append` unario com um episodio pequeno, um
+    // `Query` com uma resposta curta. O tonic expoe a opcao no builder, e o
+    // default do sistema deixa o Nagle ligado.
+    let mut grpc_server = tonic::transport::Server::builder().tcp_nodelay(true);
     if let (Some(cert_path), Some(key_path)) = (&config.tls_cert_path, &config.tls_key_path) {
         let cert = std::fs::read(cert_path).map_err(|e| {
             HeraclitusError::Config(format!("TLS cert {}: {e}", cert_path.display()))
