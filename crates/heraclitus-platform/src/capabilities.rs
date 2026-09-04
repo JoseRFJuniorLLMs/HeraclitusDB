@@ -13,6 +13,12 @@ pub struct PlatformCapabilities {
     pub arch: String,
     pub kernel_version: Option<String>,
     pub numa_nodes: usize,
+    /// SPEC-0073 §22 — a topologia NUMA real, não só a contagem de nós.
+    ///
+    /// `numa_nodes` responde "quantos"; isto responde "quais CPUs" e "quanta
+    /// memória", que é o que a §24 precisa para decidir onde correr um worker.
+    #[serde(default = "crate::numa::NumaTopology::uniforme")]
+    pub numa: crate::numa::NumaTopology,
     /// SPEC-0073 §46/§47 — os CPUs que este processo pode **realmente** usar.
     ///
     /// É o mínimo entre o que o SO reporta e o que o cgroup permite (cpuset e
@@ -46,21 +52,24 @@ pub fn detect_capabilities() -> PlatformCapabilities {
     // SPEC-0073 §46 — "o runtime MUST preferir limites efetivos do cgroup
     // quando mais restritivos que recursos fisicos".
     let logical_cpus = effective_limits.effective_cpus(host_cpus);
+    // SPEC-0073 §22 — topologia real, nao so a contagem.
+    let numa = crate::numa::detect_numa_topology();
 
     #[cfg(target_os = "linux")]
-    let (kernel_version, numa_nodes, io_uring_available) = {
-        let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+    let (kernel_version, io_uring_available) = (
+        std::fs::read_to_string("/proc/sys/kernel/osrelease")
             .ok()
-            .map(|s| s.trim().to_string());
-
-        let numa = detect_linux_numa_nodes();
-        let uring = check_linux_io_uring();
-
-        (kernel, numa, uring)
-    };
+            .map(|s| s.trim().to_string()),
+        check_linux_io_uring(),
+    );
 
     #[cfg(not(target_os = "linux"))]
-    let (kernel_version, numa_nodes, io_uring_available) = (None, 1, false);
+    let (kernel_version, io_uring_available) = (None, false);
+
+    // Derivado da topologia e nao contado outra vez. Contar de novo seria criar
+    // duas fontes para o mesmo facto, que foi exactamente o erro dos dois
+    // catalogos de capacidades (§6) — e que divergiam.
+    let numa_nodes = numa.nodes.len();
 
     #[cfg(target_arch = "x86_64")]
     let (avx2, avx512f) = (
@@ -80,6 +89,7 @@ pub fn detect_capabilities() -> PlatformCapabilities {
         arch,
         kernel_version,
         numa_nodes,
+        numa,
         logical_cpus,
         host_cpus,
         io_uring_available,
@@ -89,25 +99,6 @@ pub fn detect_capabilities() -> PlatformCapabilities {
         avx512f,
         neon,
     }
-}
-
-#[cfg(target_os = "linux")]
-fn detect_linux_numa_nodes() -> usize {
-    if let Ok(entries) = std::fs::read_dir("/sys/devices/system/node") {
-        let count = entries
-            .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_str()
-                    .map(|s| s.starts_with("node") && s[4..].chars().all(|c| c.is_ascii_digit()))
-                    .unwrap_or(false)
-            })
-            .count();
-        if count > 0 {
-            return count;
-        }
-    }
-    1
 }
 
 #[cfg(target_os = "linux")]
@@ -173,13 +164,28 @@ impl PlatformCapabilities {
     /// Produces a compact 1-line log string suitable for server boot.
     pub fn summary_line(&self) -> String {
         format!(
-            "OS: {}/{} | Kernel: {} | CPUs: {} (host {}) | NUMA: {} | cgroups_v2: {} | io_uring: {} | simd: {}",
+            "OS: {}/{} | Kernel: {} | CPUs: {} (host {}) | NUMA: {}{} | cgroups_v2: {} | io_uring: {} | simd: {}",
             self.os,
             self.arch,
             self.kernel_version.as_deref().unwrap_or("unknown"),
             self.logical_cpus,
             self.host_cpus,
             self.numa_nodes,
+            if self.numa.e_multi_no() {
+                // Num host multi-NUMA os detalhes deixam de ser curiosidade:
+                // e o que decide onde correm os workers (§24).
+                format!(
+                    " ({})",
+                    self.numa
+                        .nodes
+                        .iter()
+                        .map(|n| format!("n{}:{}cpu", n.id, n.cpus.len()))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+            } else {
+                String::new()
+            },
             if self.cgroups_v2_active { "yes" } else { "no" },
             if self.io_uring_available {
                 "available"
@@ -282,5 +288,39 @@ mod testes_spec0073 {
         assert_eq!(caps.simd_line(), "avx2");
         caps.avx512f = true;
         assert_eq!(caps.simd_line(), "avx2+avx512f");
+    }
+}
+
+#[cfg(test)]
+mod testes_numa_no_catalogo {
+    use super::*;
+
+    /// SPEC-0073 §22 — a contagem de nos e DERIVADA da topologia.
+    ///
+    /// Contar directorios em sysfs e depois ler a topologia noutro sitio daria
+    /// duas fontes para o mesmo facto, e duas fontes divergem. E o mesmo erro
+    /// dos dois catalogos de capacidades da §6, que ja divergiam em producao.
+    #[test]
+    fn a_contagem_de_nos_nao_pode_divergir_da_topologia() {
+        let caps = detect_capabilities();
+        assert_eq!(
+            caps.numa_nodes,
+            caps.numa.nodes.len(),
+            "numa_nodes e numa.nodes discordam — sao duas fontes para o mesmo facto"
+        );
+        assert!(caps.numa_nodes >= 1, "uma maquina tem pelo menos um no");
+    }
+
+    #[test]
+    fn a_linha_de_arranque_so_detalha_numa_quando_ha_o_que_detalhar() {
+        let caps = detect_capabilities();
+        let linha = caps.summary_line();
+        assert!(linha.contains("NUMA:"));
+        if !caps.numa.e_multi_no() {
+            assert!(
+                !linha.contains("n0:"),
+                "numa uniforme nao tem detalhe util a dar: {linha}"
+            );
+        }
     }
 }
