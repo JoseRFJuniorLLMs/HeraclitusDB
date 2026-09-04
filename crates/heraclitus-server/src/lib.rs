@@ -59,7 +59,11 @@ pub async fn serve_with(
     );
     boot.info_line(
         "Plataforma",
-        &heraclitus_platform::detect_capabilities().summary_line(),
+        &format!(
+            "{} | allocator: {}",
+            heraclitus_platform::detect_capabilities().summary_line(),
+            crate::boot::allocator_em_uso()
+        ),
     );
 
     let engine = Arc::new(Engine::open_with_boot(&config, &boot)?);

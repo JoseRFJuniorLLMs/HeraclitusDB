@@ -57,6 +57,16 @@ tracing-subscriber = { workspace = true }
 # self-checks `gpu_matches_cpu_on_hardware` / `product_gpu_matches_cpu_on_hardware`
 # (the CPU f64 rescore always has the final say, so results stay exact).
 gpu = ["heraclitus-index-vector/gpu"]
+# SPEC-0073 §20 — jemalloc como allocator global do EXECUTAVEL servidor.
+#
+# Experimental e off por default: a §21 exige benchmark A/B (write-heavy,
+# query-heavy, mixed, Sentinel/HNSW/analytics ligados, 64+ clientes) e so
+# permite promover a default "se houver ganho comprovado". Ligar por teoria
+# seria exactamente o que o I-5 proibe.
+#
+# So o binario o define; a §20 e explicita em que crates de biblioteca NAO
+# podem declarar um allocator global — quem embebe o motor escolhe o seu.
+linux-jemalloc = ["dep:tikv-jemallocator"]
 # SQL analytics over the log (DataFusion). Off by default — DataFusion is a
 # heavy dependency and the default server/service stays lean. Enables
 # `Embedded::analytics()` and the REST `POST /sql` route.
@@ -78,6 +88,11 @@ distill = ["dep:heraclitus-distill"]
 # servidor de nó único é o caminho normal; ligar forma um cluster e faz as
 # escritas passarem pelo líder. Puxa heraclitus-raft com a sua feature própria.
 replication = ["dep:heraclitus-raft", "heraclitus-raft/replication"]
+
+# SPEC-0073 §20 — o allocator alternativo só existe em Linux, e só quando
+# pedido pela feature `linux-jemalloc`.
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
 
 # Only the service binary needs these, and only on Windows.
 [target.'cfg(windows)'.dependencies]
