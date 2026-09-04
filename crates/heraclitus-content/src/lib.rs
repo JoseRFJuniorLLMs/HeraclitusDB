@@ -39,6 +39,10 @@ use heraclitus_core::{Episode, EventKind, Lsn};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub mod playbook;
+
+pub use playbook::{PlaybookIr, PlaybookStep, RequiredTelemetry, PLAYBOOK_SCHEMA};
+
 pub const CONTENT_SCHEMA: &str = "heraclitus-content/1.0";
 pub const CONTENT_KIND: &str = "ContentLifecycle";
 
