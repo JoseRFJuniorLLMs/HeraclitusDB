@@ -72,17 +72,22 @@ pub use execution::{
 pub use governance::{
     FeedbackLabel, GovernanceError, SecurityFeedback, SecurityModelUpdate, SecurityRulesetUpdate,
 };
-pub use metrics::{SecurityLagState, SentinelMetrics, SentinelStatus};
+pub use metrics::{BootReport, SecurityLagState, SentinelMetrics, SentinelStatus};
 pub use normalize::{GenericNormalizer, NormalizedSecurityEvent};
 pub use policy::{
     ActionResult, ActionRule, AuthorizedAction, DeterministicPolicyEngine, ExecutionConstraints,
-    HumanApproval, PolicyConfig, PolicyDecision, PolicyEngine, PolicyError, SecurityActionExecutor,
+    HumanApproval, PolicyConfig, PolicyDecision, PolicyEngine, PolicyError, RequiredTelemetry,
+    SecurityActionExecutor, TelemetryHealthProbe, TelemetryHealthReading,
 };
 pub use queue::{EnqueueOutcome, QueueSnapshot, SecurityQueue};
 pub use sigma::{
     compile_sigma, compile_sigma_file, compile_sigma_path, compile_sigma_rules, parse_sigma,
 };
-pub use state::{replay, CursorStore, ReplayReport, SentinelCheckpoint};
+pub use state::{
+    reconcile_startup_state, replay, snapshot::FusionAccumulatorState, CursorStore, RebuildReason,
+    ReplayReport, SentinelCheckpoint, SentinelStateSnapshot, SnapshotLoad, SnapshotStore,
+    StartupReconciliation, StateDivergenceReason,
+};
 pub use subscriber::SecuritySubscriber;
 pub use threat::{
     Admission, CanonicalError, ConfirmedMatch, FeedVersionState, HashAlgorithm, Indicator,
@@ -193,6 +198,12 @@ impl<T: std::hash::Hash + Eq + Clone> JanelaRecente<T> {
     pub(crate) fn len(&self) -> usize {
         self.ordem.len()
     }
+
+    /// As chaves por ordem de insercao — a ordem em que a janela as larga.
+    /// Usado para capturar a janela num snapshot sem lhe mudar a semantica.
+    pub(crate) fn em_ordem(&self) -> impl Iterator<Item = &T> {
+        self.ordem.iter()
+    }
 }
 
 /// Nome antigo, mantido para o sitio que so lida com chaves de texto.
@@ -278,21 +289,58 @@ struct RuntimeInner {
     ai_breaker: Mutex<AiCircuitBreaker>,
     ownership: Option<Arc<dyn LeaderOwnership>>,
     stop: Arc<AtomicBool>,
+    /// SPEC-0072 §6 — `<data_dir>/sentinel/state.snapshot`.
+    snapshot_store: SnapshotStore,
+    /// SPEC-0072 §44 — quantos eventos foram processados desde a ultima
+    /// publicacao. E a cadencia do snapshot; zero logo a seguir a publicar.
+    eventos_desde_snapshot: std::sync::atomic::AtomicU64,
+    /// SPEC-0072 §44 — quando saiu o ultimo snapshot. O `try_lock` sobre isto
+    /// e tambem o rate limiting entre workers.
+    ultimo_snapshot: Mutex<Instant>,
 }
 
-#[derive(Default)]
-struct SecurityState {
-    rule_history: Vec<(Lsn, SecurityEvent)>,
-    behavior_history: Vec<(Lsn, SecurityEvent)>,
-    graph_history: Vec<(Lsn, SecurityEvent)>,
-    signal_ids: HashSet<String>,
-    derived_sources: HashSet<Lsn>,
-    signals: Vec<(Lsn, SecuritySignal)>,
-    incident_revision_ids: HashSet<String>,
-    risk_revision_ids: HashSet<String>,
-    checkpoint_ids: HashSet<String>,
-    last_checkpoint_lsn: Option<Lsn>,
-    l4_ids: BTreeMap<String, Lsn>,
+/// Guarda RAII da permissão do circuit breaker do plano L4.
+///
+/// O `begin_request` incrementa `in_flight`; só o `record_success` ou o
+/// `record_failure` o decrementavam. Se a future do pedido fosse **cancelada**
+/// no `await` do backend — um timeout do lado de fora, um `select!` que perde a
+/// corrida, o desligar do runtime — nenhum dos dois corria, e a contagem ficava
+/// permanentemente inflacionada. Ao fim de `max_concurrent_requests`
+/// cancelamentos o `begin_request` passava a recusar sempre e o plano L4 ficava
+/// fechado até ao próximo reinício, sem nada o assinalar.
+///
+/// O `Drop` corre mesmo em cancelamento, que é precisamente a propriedade que
+/// faltava.
+struct PermissaoAi {
+    inner: Arc<RuntimeInner>,
+    resolvido: bool,
+}
+
+impl PermissaoAi {
+    fn nova(inner: Arc<RuntimeInner>) -> Self {
+        Self {
+            inner,
+            resolvido: false,
+        }
+    }
+
+    /// Desarma o guarda: o resultado é conhecido e vai ser registado como
+    /// sucesso ou falha, que já decrementam a contagem.
+    fn resolvida(&mut self) {
+        self.resolvido = true;
+    }
+}
+
+impl Drop for PermissaoAi {
+    fn drop(&mut self) {
+        if !self.resolvido {
+            self.inner
+                .ai_breaker
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .release_cancelled();
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -313,6 +361,14 @@ pub struct SentinelRuntime {
     inner: Arc<RuntimeInner>,
     tail_handle: Mutex<Option<JoinHandle<()>>>,
     worker_handles: Mutex<Vec<JoinHandle<()>>>,
+    /// SPEC-0071 §9.1 — a sonda de saúde da telemetria, quando o hospedeiro a
+    /// liga. `None` deixa a política com o comportamento anterior, porque
+    /// nenhuma regra declara requisitos por omissão.
+    ///
+    /// Vive aqui e não no `RuntimeInner` porque só a política a consulta, e o
+    /// `RuntimeInner` é partilhado com os workers, que não têm nada a ver com
+    /// isto.
+    telemetry_probe: Mutex<Option<Arc<dyn crate::policy::TelemetryHealthProbe>>>,
 }
 
 impl SentinelRuntime {
@@ -350,14 +406,159 @@ impl SentinelRuntime {
         );
         let metrics = Arc::new(SentinelMetrics::default());
         let cursor_store = CursorStore::new(log.dir().join("sentinel").join("cursor.json"));
-        let cursor = cursor_store.load(config.pipeline_version)?;
-        if cursor.next_lsn > log.head() {
-            return Err(SentinelError::Cursor(format!(
-                "cursor next_lsn={} está além do head={}",
-                cursor.next_lsn,
-                log.head()
-            )));
+        // SPEC-0072 §6 — o snapshot vive ao lado do cursor, no mesmo directorio
+        // derivado. Nenhum dos dois e source of truth (INV-4).
+        let snapshot_store = SnapshotStore::new(log.dir().join("sentinel").join("state.snapshot"));
+        // SPEC-0072 §9 — o algoritmo de arranque. Ler o head, ler o cursor, ler
+        // o snapshot, e reconciliar os três ANTES de decidir o que reconstruir.
+        let boot_comecou = Instant::now();
+        let cabeca = log.head();
+        metrics
+            .boot
+            .head_at_boot_lsn
+            .store(cabeca, Ordering::Release);
+
+        let relogio = Instant::now();
+        let (mut cursor, cursor_rejeitado) =
+            cursor_store.carregar_tolerante(config.pipeline_version)?;
+        metrics
+            .boot
+            .cursor_load_ms
+            .store(relogio.elapsed().as_millis() as u64, Ordering::Release);
+        if let Some(rejeicao) = &cursor_rejeitado {
+            // §35 — nunca silencioso.
+            tracing::warn!(
+                motivo = %rejeicao.motivo,
+                preservado_em = ?rejeicao.preservado_em,
+                "cursor do Sentinel rejeitado; o estado vai ser reconstruído do log"
+            );
         }
+
+        let relogio = Instant::now();
+        let snapshot_lido = snapshot_store.carregar(config.pipeline_version)?;
+        metrics
+            .boot
+            .snapshot_load_ms
+            .store(relogio.elapsed().as_millis() as u64, Ordering::Release);
+        let (snapshot, motivo_sem_snapshot) = match snapshot_lido {
+            SnapshotLoad::Utilizavel(snapshot) => (Some(*snapshot), RebuildReason::SnapshotAusente),
+            SnapshotLoad::Descartado(motivo) => {
+                metrics
+                    .boot
+                    .snapshot_rejected_total
+                    .fetch_add(1, Ordering::Relaxed);
+                match &motivo {
+                    RebuildReason::DigestInvalido | RebuildReason::Ilegivel(_) => {
+                        metrics
+                            .boot
+                            .snapshot_corrupt_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    RebuildReason::FormatoDesconhecido { .. }
+                    | RebuildReason::PipelineDiferente { .. } => {
+                        metrics
+                            .boot
+                            .snapshot_version_mismatch_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+                if !matches!(motivo, RebuildReason::SnapshotAusente) {
+                    tracing::warn!(
+                        motivo = motivo.etiqueta(),
+                        "snapshot do Sentinel descartado; rebuild canónico a partir do log"
+                    );
+                }
+                (None, motivo)
+            }
+        };
+
+        let decisao = reconcile_startup_state(
+            cabeca,
+            cursor.next_lsn,
+            snapshot.as_ref().map(|s| s.applied_until_exclusive),
+            motivo_sem_snapshot,
+        );
+        if let StartupReconciliation::DivergenceDetected { reason, .. } = &decisao {
+            // §15 caso 4 — a divergência é sempre registada, seja qual for a
+            // política que a seguir a trate.
+            metrics
+                .boot
+                .divergence_total
+                .fetch_add(1, Ordering::Relaxed);
+            if matches!(reason, StateDivergenceReason::CursorAlemDoHead { .. }) {
+                metrics
+                    .boot
+                    .cursor_ahead_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            tracing::error!(
+                divergencia = reason.etiqueta(),
+                detalhe = %reason,
+                cursor_next_lsn = cursor.next_lsn,
+                snapshot_watermark = snapshot.as_ref().map(|s| s.applied_until_exclusive),
+                canonical_head = cabeca,
+                pipeline_version = config.pipeline_version,
+                data_dir = %log.dir().display(),
+                "divergência de estado do Sentinel detectada"
+            );
+            // §16 passo 1 — preservar antes de qualquer recuperação.
+            match cursor_store.preservar_divergente(cursor, cabeca) {
+                Ok(caminho) => tracing::warn!(
+                    caminho = %caminho.display(),
+                    "cursor divergente preservado para auditoria"
+                ),
+                Err(erro) => tracing::warn!(
+                    erro = %erro,
+                    "não foi possível preservar o cursor divergente"
+                ),
+            }
+        }
+        let decisao = decisao.aplicar_politica(config.recovery.cursor_policy)?;
+
+        // O snapshot só é usado quando a reconciliação o aceitou. Sob
+        // `RebuildCanonical` — incluindo o caso em que a política converteu uma
+        // divergência — o estado vem todo do log, e o snapshot que existisse
+        // não é de confiança.
+        let snapshot = match &decisao {
+            StartupReconciliation::Synchronized { .. }
+            | StartupReconciliation::CatchUpTail { .. } => snapshot,
+            _ => {
+                metrics
+                    .boot
+                    .full_rebuild_total
+                    .fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        };
+        let motivo_do_rebuild = match &decisao {
+            StartupReconciliation::RebuildCanonical { reason, .. } => Some(reason.etiqueta()),
+            _ => None,
+        };
+        metrics
+            .boot
+            .registar_decisao(decisao.etiqueta(), motivo_do_rebuild);
+
+        // §18 — o cursor não é mexido aqui, nem para a frente nem para trás,
+        // exceptuando o caso em que ele PRÓPRIO é o artefacto inválido.
+        //
+        // A tentação era comitar `cursor.next_lsn = head` no fim de um rebuild
+        // canónico, como a §15 caso 3 sugere. Seria errado: o rebuild replaya
+        // os episódios DERIVADOS para reconstruir o estado em memória, e não
+        // corre a normalização sobre os brutos. Os eventos entre o cursor e o
+        // head continuam por processar, e dá-los por processados perderia
+        // evidência em silêncio — o inverso exacto do que a reconstrução
+        // existe para fazer. A cauda fica para o `process_until`, que é o único
+        // caminho com direito a comitar o cursor.
+        //
+        // Um cursor divergente é outra coisa: aponta para além do log, portanto
+        // não pode ser respeitado. Volta a zero, que é o único valor que não
+        // afirma nada. Um cursor rejeitado já vem a zero de
+        // `carregar_tolerante`.
+        if cursor.next_lsn > cabeca {
+            cursor.next_lsn = 0;
+        }
+
         let stop = Arc::new(AtomicBool::new(false));
         // SPEC-0047 — os feeds são lidos uma vez, no arranque. Recarregar a
         // quente é outra coisa (§40/§41 querem versionamento e rollback), e
@@ -396,25 +597,50 @@ impl SentinelRuntime {
         } else {
             None
         };
-        let SecurityState {
-            rule_history,
-            behavior_history,
-            graph_history,
+        // SPEC-0072 §10/§11 — o intervalo do replay vem da reconciliação, e o
+        // head foi fixado UMA vez lá em cima. Reler `log.head()` dentro de cada
+        // passagem faria uma passagem posterior ver eventos que a anterior não
+        // viu — e a segunda passagem ESCREVE no log que varre, portanto
+        // consumiria a sua própria saída. Tudo o que aparecer daqui para a
+        // frente é da conta do `process_until`.
+        //
+        // É aqui que o INV-5 se paga: com snapshot válido o par é
+        // `(watermark, head)` e não `(0, head)`.
+        let (desde, ate_exclusivo) = decisao.intervalo_de_replay().unwrap_or((cabeca, cabeca));
+        let lote = config.replay_batch_events;
+        let fusion_enabled = rule_engine.is_some() || config.l2.enabled || config.l3.enabled;
+        metrics
+            .boot
+            .tail_events
+            .store(ate_exclusivo.saturating_sub(desde), Ordering::Release);
+        metrics.boot.watermark_lsn.store(desde, Ordering::Release);
+
+        // Primeira passagem: só os conjuntos de deduplicação. Tem de estar
+        // COMPLETA antes de qualquer replay — as funções `evaluate_*` apendem
+        // ao log quando não reconhecem o que estão a produzir, e é este
+        // conjunto que as impede de reapresentar o que já lá está. Com
+        // snapshot, os conjuntos até ao watermark vêm de lá e esta passagem só
+        // cobre a cauda.
+        let relogio = Instant::now();
+        let (ids, derived_sources) = passagem_de_ids(
+            &log,
+            desde,
+            ate_exclusivo,
+            lote,
+            config.l3.enabled,
+            fusion_enabled,
+            snapshot.as_ref(),
+            &metrics.boot.events_scanned_total,
+        )?;
+        let IdsDerivados {
             signal_ids,
-            derived_sources,
-            signals,
             incident_revision_ids,
             risk_revision_ids,
             checkpoint_ids,
             last_checkpoint_lsn,
             l4_ids,
-        } = load_security_state(
-            &log,
-            rule_engine.is_some(),
-            config.l2.enabled,
-            config.l3.enabled,
-            rule_engine.is_some() || config.l2.enabled || config.l3.enabled,
-        )?;
+            suspeitos_persistidos,
+        } = ids;
         let behavior_engine = if config.l2.enabled {
             let policy = BaselinePolicy {
                 minimum_support: config.l2.minimum_support,
@@ -422,16 +648,24 @@ impl SentinelRuntime {
                 shadow_only: config.l2.shadow_only,
                 ..BaselinePolicy::default()
             };
-            Some(Mutex::new(BehavioralEngine::new(policy)?))
+            // Restaurado do snapshot quando há um; senão, vazio e reconstruído
+            // pela terceira passagem.
+            match snapshot.as_ref().and_then(|s| s.behavior_state.clone()) {
+                Some(estado) => Some(Mutex::new(BehavioralEngine::from_snapshot(estado)?)),
+                None => Some(Mutex::new(BehavioralEngine::new(policy)?)),
+            }
         } else {
             None
         };
+        // Sem snapshot o grafo nasce VAZIO e é a segunda passagem que o enche.
+        // Era construído aqui a partir de um `Vec` com a base inteira.
         let security_graph = if config.l3.enabled {
-            let mut graph = TemporalSecurityGraph::new();
-            for (episode_lsn, event) in &graph_history {
-                graph.apply_security_event(*episode_lsn, event)?;
-            }
-            Some(Mutex::new(graph))
+            Some(Mutex::new(
+                snapshot
+                    .as_ref()
+                    .and_then(|s| s.graph_state.clone())
+                    .unwrap_or_else(TemporalSecurityGraph::new),
+            ))
         } else {
             None
         };
@@ -440,23 +674,55 @@ impl SentinelRuntime {
                 graph_path_depth: config.l3.max_graph_hops,
                 ..IncidentPolicy::default()
             };
-            Some(Mutex::new(IncidentEngine::new(policy)))
+            Some(Mutex::new(
+                snapshot
+                    .as_ref()
+                    .and_then(|s| s.incident_state.clone())
+                    .unwrap_or_else(|| IncidentEngine::new(policy)),
+            ))
         } else {
             None
         };
-        let fusion = if rule_engine.is_some() || config.l2.enabled || config.l3.enabled {
-            Some(Mutex::new(EvidenceFusion::new(
-                FusionWeights::default(),
-                "sentinel-fusion-v1",
-            )?))
+        let fusion = if fusion_enabled {
+            Some(Mutex::new(
+                match snapshot.as_ref().and_then(|s| s.fusion_state.clone()) {
+                    Some(estado) => estado,
+                    None => EvidenceFusion::new(FusionWeights::default(), "sentinel-fusion-v1")?,
+                },
+            ))
         } else {
             None
         };
-        let runtime_rule_history = if rule_engine.is_some() {
-            rule_history
-        } else {
-            Vec::new()
-        };
+        let acumuladores_de_fusao: BTreeMap<String, FusionAccumulator> = snapshot
+            .as_ref()
+            .map(|s| {
+                s.fusion_accumulators
+                    .iter()
+                    .map(|(chave, estado)| {
+                        (
+                            chave.clone(),
+                            FusionAccumulator {
+                                subject: estado.subject.clone(),
+                                rule_score: estado.rule_score,
+                                behavioral_score: estado.behavioral_score,
+                                graph_score: estado.graph_score,
+                                threat_intel_score: estado.threat_intel_score,
+                                evidence: estado.evidence.clone(),
+                                detectors: estado.detectors.clone(),
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let historico_de_regras = snapshot
+            .as_ref()
+            .map(|s| s.rule_history.clone())
+            .unwrap_or_default();
+        metrics
+            .boot
+            .state_restore_ms
+            .store(relogio.elapsed().as_millis() as u64, Ordering::Release);
         let inner = Arc::new(RuntimeInner {
             log: log.clone(),
             derived_sink,
@@ -469,19 +735,19 @@ impl SentinelRuntime {
             normalizer: GenericNormalizer::default(),
             rule_engine,
             threat,
-            rule_history: Mutex::new(runtime_rule_history),
+            // Do snapshot quando ha um; senao vazio, e a segunda passagem
+            // enche-o com poda a cada lote.
+            rule_history: Mutex::new(historico_de_regras),
             behavior_engine,
             fusion,
-            fusion_state: Mutex::new(BTreeMap::new()),
+            fusion_state: Mutex::new(acumuladores_de_fusao),
             signal_ids: Mutex::new(signal_ids),
             sighting_keys: Mutex::new(JanelaDeChaves::nova(TECTO_CHAVES_SIGHTING)),
-            derived_sources: Mutex::new({
-                let mut j = JanelaRecente::nova(TECTO_LSN_DERIVADOS);
-                for lsn in derived_sources {
-                    j.inserir(&lsn);
-                }
-                j
-            }),
+            // A janela já vem cheia e com tecto da primeira passagem. O código
+            // anterior construía um `HashSet<Lsn>` com uma entrada por evento
+            // derivado da base inteira e só aqui o despejava nela: o tecto
+            // existia, mas chegava tarde de mais para servir para alguma coisa.
+            derived_sources: Mutex::new(derived_sources),
             security_graph,
             incident_engine,
             incident_revision_ids: Mutex::new(incident_revision_ids),
@@ -495,30 +761,86 @@ impl SentinelRuntime {
             ),
             ownership,
             stop: stop.clone(),
+            snapshot_store,
+            eventos_desde_snapshot: std::sync::atomic::AtomicU64::new(0),
+            ultimo_snapshot: Mutex::new(Instant::now()),
         });
+
+        let relogio = Instant::now();
+
+        // Segunda passagem: grafo (L3) e histórico de regras (L1). O grafo
+        // fica pronto antes de o L2 correr, que é a ordem que existia; o
+        // histórico fica podado ao horizonte do ruleset, que é o que o torna
+        // limitado numa base grande.
+        passagem_de_grafo_e_regras(&inner, desde, ate_exclusivo, lote)?;
 
         // Re-evaluate L1 before L2 so events classified by a deterministic
         // rule are never incorporated into an active behavioral baseline.
-        let l1_suspicious = evaluate_l1(&inner)?;
+        //
+        // O conjunto de suspeitos é a UNIÃO de duas fontes, e a segunda é
+        // nova. `evaluate_l1` só vê o histórico que cabe no horizonte, e um
+        // evento marcado por uma regra cuja âncora ficou para trás desse
+        // horizonte deixaria de constar — o L2 tratá-lo-ia como normal e
+        // incorporá-lo-ia numa baseline activa, que é exactamente o que este
+        // comentário diz que não pode acontecer. Os sinais persistidos são a
+        // memória dessa suspeita: a evidência de cada um nomeia os eventos que
+        // ela marcou, e está no log desde que o sinal saiu.
+        let mut l1_suspicious = evaluate_l1(&inner)?;
+        l1_suspicious.extend(suspeitos_persistidos);
 
-        // Rebuild L2 from canonical SecurityEvent episodes in transaction-LSN
-        // order. Stable signal IDs make enabling L2 on an existing database
-        // and replaying after a crash safe and idempotent.
-        for (episode_lsn, event) in behavior_history {
-            evaluate_l2(
-                &inner,
-                episode_lsn,
-                &event,
-                l1_suspicious.contains(&event.raw_event_id),
-            )?;
-        }
+        // Terceira passagem: rebuild do L2 a partir dos episódios canónicos
+        // `SecurityEvent`, em ordem de LSN de transacção. Ids de sinal estáveis
+        // tornam seguro ligar o L2 numa base existente e reproduzir após crash.
+        passagem_de_l2(&inner, desde, ate_exclusivo, lote, &l1_suspicious)?;
 
-        // Replay persisted signals in transaction (episode-LSN) order.  This
-        // reproduces live append-only revisions even when their event-time LSNs
-        // arrive out of order and trigger canonical incident re-keying.
-        for (signal_lsn, signal) in signals {
-            evaluate_fusion(&inner, signal_lsn, &signal)?;
-            evaluate_l3(&inner, signal_lsn, &signal)?;
+        // Quarta passagem: reproduz os sinais persistidos em ordem de LSN de
+        // transacção. É isto que reproduz as revisões append-only tal como
+        // saíram ao vivo, mesmo quando os LSN de tempo de evento chegaram fora
+        // de ordem e provocaram re-keying canónico de incidentes.
+        passagem_de_sinais(&inner, desde, ate_exclusivo, lote)?;
+
+        metrics
+            .boot
+            .tail_replay_ms
+            .store(relogio.elapsed().as_millis() as u64, Ordering::Release);
+        metrics
+            .boot
+            .total_boot_ms
+            .store(boot_comecou.elapsed().as_millis() as u64, Ordering::Release);
+
+        // §25 — logging obrigatório. "Nunca apenas `starting sentinel...` por
+        // minutos sem informar a fase responsável." Uma linha, com os números
+        // que distinguem um arranque instantâneo de uma reconstrução da base
+        // inteira — que é a pergunta que o operador tem quando o serviço
+        // demora.
+        let relatorio = metrics.boot.relatorio();
+        tracing::info!(
+            resultado = %relatorio.outcome,
+            motivo = ?relatorio.rebuild_reason,
+            watermark = relatorio.watermark_lsn,
+            head = relatorio.head_at_boot_lsn,
+            cauda = relatorio.tail_events,
+            cursor_ms = relatorio.cursor_load_ms,
+            snapshot_ms = relatorio.snapshot_load_ms,
+            restauro_ms = relatorio.state_restore_ms,
+            replay_ms = relatorio.tail_replay_ms,
+            total_ms = relatorio.total_boot_ms,
+            "arranque do Sentinel concluído"
+        );
+
+        // §15 caso 3 — depois de um rebuild canónico, publica o snapshot. Sem
+        // isto a §47 (migração) nunca sairia do primeiro passo: uma base que só
+        // tem `cursor.json` reconstruiria do zero a CADA arranque, para sempre,
+        // e o snapshot que a spec inteira existe para permitir nunca chegaria a
+        // ser escrito.
+        if matches!(decisao, StartupReconciliation::RebuildCanonical { .. }) {
+            if let Err(erro) = publicar_snapshot(&inner) {
+                tracing::warn!(
+                    erro = %erro,
+                    "rebuild canónico concluído mas o snapshot não foi publicado; \
+                     o próximo arranque volta a reconstruir"
+                );
+            }
         }
 
         let subscriber = Arc::new(SecuritySubscriber::new(queue.clone(), metrics));
@@ -541,7 +863,22 @@ impl SentinelRuntime {
             inner,
             tail_handle: Mutex::new(Some(tail_handle)),
             worker_handles: Mutex::new(worker_handles),
+            telemetry_probe: Mutex::new(None),
         }))
+    }
+
+    /// SPEC-0071 §9.1 — liga a sonda de saude da telemetria.
+    ///
+    /// O hospedeiro chama isto depois de arrancar: e ele que tem a view
+    /// `heraclitus-telemetry-health`, e o Sentinel nao depende desse crate.
+    /// Sem esta chamada, uma regra que DECLARE `required_telemetry` nao pode
+    /// ser satisfeita — e assim tem de ser, porque declarar uma dependencia e
+    /// depois nao a verificar nao e razao para aprovar.
+    pub fn set_telemetry_probe(&self, probe: Arc<dyn crate::policy::TelemetryHealthProbe>) {
+        *self
+            .telemetry_probe
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(probe);
     }
 
     pub fn status(&self) -> SentinelStatus {
@@ -757,6 +1094,14 @@ impl SentinelRuntime {
                 .into());
             }
         }
+        // A permissão tem de ser devolvida mesmo que esta future seja
+        // CANCELADA no `await` do backend, mais abaixo. Sem o guarda, nem o
+        // sucesso nem a falha chegavam a ser registados nesse caso e o
+        // `in_flight` ficava por decrementar; ao fim de
+        // `max_concurrent_requests` cancelamentos o plano L4 fechava-se até ao
+        // próximo reinício. O guarda é desarmado assim que o resultado é
+        // conhecido, para não contar duas vezes.
+        let mut permissao = PermissaoAi::nova(self.inner.clone());
         self.inner
             .metrics
             .ai_requests_total
@@ -770,6 +1115,7 @@ impl SentinelRuntime {
         let result = match backend_result {
             Ok(result) => result,
             Err(error) => {
+                permissao.resolvida();
                 self.inner
                     .ai_breaker
                     .lock()
@@ -783,6 +1129,7 @@ impl SentinelRuntime {
             }
         };
         if let Err(error) = result.validate_for(&context) {
+            permissao.resolvida();
             self.inner
                 .ai_breaker
                 .lock()
@@ -794,6 +1141,7 @@ impl SentinelRuntime {
                 .fetch_add(1, Ordering::Relaxed);
             return Err(error.into());
         }
+        permissao.resolvida();
         self.inner
             .ai_breaker
             .lock()
@@ -871,7 +1219,16 @@ impl SentinelRuntime {
             ));
         }
         proposal.action.validate()?;
-        let policy = DeterministicPolicyEngine::new(PolicyConfig::default())?;
+        let mut policy = DeterministicPolicyEngine::new(PolicyConfig::default())?;
+        // SPEC-0071 §9.1 — o health gate so tem fonte quando o hospedeiro a liga.
+        if let Some(probe) = self
+            .telemetry_probe
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            policy = policy.with_telemetry_probe(probe);
+        }
         let decision = PolicyEngine::evaluate(&policy, incident, assessment, proposal);
         let decision_id =
             PolicyDecision::decision_id(policy.policy_version(), proposal, &decision)?;
@@ -1384,15 +1741,38 @@ impl SentinelRuntime {
     ) -> Result<Vec<SecurityIncident>, SentinelError> {
         let to_exclusive = self.inner.log.head().min(as_of_lsn.saturating_add(1));
         let mut revisions = BTreeMap::new();
-        for (_, episode) in self.inner.log.scan(0, to_exclusive)? {
-            if !episode_is_generated(&episode)
-                || !matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecurityIncident")
-            {
-                continue;
+        // Janelado, e DE PROPÓSITO desde o LSN 0.
+        //
+        // A sugestão era arrancar do último checkpoint em vez de 0, mas isso
+        // mudaria o que este método devolve: o `SentinelCheckpoint` guarda
+        // metadados (watermarks, contadores), NÃO o estado dos incidentes —
+        // um incidente criado antes do checkpoint e nunca revisto depois
+        // desapareceria da resposta. A promessa é "todos os incidentes tal
+        // como estavam no LSN pedido", e mantém-se.
+        //
+        // O que se corrige é a materialização: o `scan(0, to)` anterior
+        // carregava o log inteiro para RAM antes de filtrar uma fracção
+        // minúscula dele, e este método é disparável por um `GET` de leitura.
+        // A memória passa a ser limitada pela janela mais o resultado; o tempo
+        // é o mesmo, porque as linhas a percorrer são as mesmas.
+        const JANELA: usize = 20_000;
+        let mut cursor: Lsn = 0;
+        while cursor < to_exclusive {
+            let lote = self.inner.log.scan_capped(cursor, to_exclusive, JANELA)?;
+            let Some(&(ultimo, _)) = lote.last() else {
+                break;
+            };
+            for (_, episode) in lote {
+                if !episode_is_generated(&episode)
+                    || !matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecurityIncident")
+                {
+                    continue;
+                }
+                if let Ok(incident) = serde_json::from_slice::<SecurityIncident>(&episode.content) {
+                    revisions.insert(incident.incident_id.clone(), incident);
+                }
             }
-            if let Ok(incident) = serde_json::from_slice::<SecurityIncident>(&episode.content) {
-                revisions.insert(incident.incident_id.clone(), incident);
-            }
+            cursor = ultimo.saturating_add(1);
         }
         Ok(revisions.into_values().collect())
     }
@@ -1499,7 +1879,537 @@ impl SentinelRuntime {
         for handle in workers.drain(..) {
             let _ = handle.join();
         }
+        drop(workers);
+
+        // SPEC-0072 §45 — snapshot no shutdown.
+        //
+        // Depois de os workers terem juntado, e só depois: enquanto uma thread
+        // ainda pudesse mutar um motor, o snapshot capturaria um estado a meio
+        // de um lote e o watermark seria uma mentira.
+        //
+        // Um erro aqui NÃO pode impedir o desligar. O snapshot é derivado
+        // (INV-4): falhar a escrevê-lo custa um arranque frio da próxima vez,
+        // que é exactamente o comportamento que existia antes desta SPEC.
+        // Falhar a desligar custa o SIGKILL do systemd a meio de I/O.
+        if let Err(erro) = self.publicar_snapshot() {
+            tracing::warn!(
+                erro = %erro,
+                "não foi possível publicar o snapshot do Sentinel no shutdown; \
+                 o próximo arranque reconstrói a partir do log"
+            );
+        }
     }
+
+    /// Captura o estado derivado em memória (SPEC-0072 §5).
+    pub fn capturar_snapshot(&self) -> SentinelStateSnapshot {
+        capturar_snapshot(&self.inner)
+    }
+
+    /// Captura e publica atomicamente (§7). Devolve o watermark publicado.
+    pub fn publicar_snapshot(&self) -> Result<Lsn, SentinelError> {
+        publicar_snapshot(&self.inner)
+    }
+}
+
+/// Captura o estado derivado em memória (SPEC-0072 §5).
+///
+/// **Segura o mutex do cursor durante a captura inteira.** Não é um detalhe de
+/// implementação: `process_until` segura o mesmo mutex do princípio ao fim de
+/// um lote, portanto enquanto este estiver na mão nenhum worker pode estar a
+/// meio de aplicar eventos. Sem isso o snapshot apanharia o grafo já com o
+/// evento N e o histórico L1 ainda sem ele, e o watermark seria uma afirmação
+/// falsa sobre um estado que nunca existiu.
+///
+/// A ordem de aquisição é cursor → motores, a mesma de `process_until`. É o
+/// que impede o abraço mortal.
+///
+/// O `watermark` é o `cursor.next_lsn` — o único número que o Sentinel pode
+/// provar ter aplicado. Usar o head do log seria o `cursor.next_lsn = head`
+/// que a §18 proíbe: inventar progresso que não foi feito.
+fn capturar_snapshot(inner: &RuntimeInner) -> SentinelStateSnapshot {
+    let cursor = inner.cursor.lock().unwrap_or_else(|e| e.into_inner());
+    let watermark = cursor.next_lsn;
+    {
+        let mut snapshot = SentinelStateSnapshot::vazio(inner.config.pipeline_version);
+        snapshot.applied_until_exclusive = watermark;
+        snapshot.canonical_head_at_snapshot = inner.log.head();
+
+        snapshot.rule_history = inner
+            .rule_history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        snapshot.behavior_state = inner
+            .behavior_engine
+            .as_ref()
+            .map(|engine| engine.lock().unwrap_or_else(|e| e.into_inner()).snapshot());
+        snapshot.graph_state = inner
+            .security_graph
+            .as_ref()
+            .map(|graph| graph.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        snapshot.incident_state = inner
+            .incident_engine
+            .as_ref()
+            .map(|engine| engine.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        snapshot.fusion_state = inner
+            .fusion
+            .as_ref()
+            .map(|fusion| fusion.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        snapshot.fusion_accumulators = inner
+            .fusion_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(chave, acc)| {
+                (
+                    chave.clone(),
+                    FusionAccumulatorState {
+                        subject: acc.subject.clone(),
+                        rule_score: acc.rule_score,
+                        behavioral_score: acc.behavioral_score,
+                        graph_score: acc.graph_score,
+                        threat_intel_score: acc.threat_intel_score,
+                        evidence: acc.evidence.clone(),
+                        detectors: acc.detectors.clone(),
+                    },
+                )
+            })
+            .collect();
+        snapshot.signal_ids = inner
+            .signal_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        snapshot.derived_sources = inner
+            .derived_sources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .em_ordem()
+            .copied()
+            .collect();
+        snapshot.incident_revision_ids = inner
+            .incident_revision_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        snapshot.risk_revision_ids = inner
+            .risk_revision_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        snapshot.checkpoint_ids = inner
+            .checkpoint_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        snapshot.last_checkpoint_lsn = *inner
+            .last_checkpoint_lsn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        snapshot.l4_ids = inner
+            .l4_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        drop(cursor);
+        snapshot
+    }
+}
+
+/// Captura e publica atomicamente (§7). Devolve o watermark publicado.
+fn publicar_snapshot(inner: &RuntimeInner) -> Result<Lsn, SentinelError> {
+    let snapshot = capturar_snapshot(inner);
+    let watermark = snapshot.applied_until_exclusive;
+    inner.snapshot_store.publicar(&snapshot)?;
+    inner
+        .eventos_desde_snapshot
+        .store(0, std::sync::atomic::Ordering::Release);
+    *inner
+        .ultimo_snapshot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    tracing::info!(
+        watermark,
+        head = snapshot.canonical_head_at_snapshot,
+        "snapshot do Sentinel publicado"
+    );
+    Ok(watermark)
+}
+
+/// SPEC-0072 §44 — publica se algum dos dois limiares foi atingido.
+///
+/// "Não é necessário obedecer aos dois simultaneamente": basta um. São
+/// limiares de riscos diferentes — o de eventos limita quanto trabalho um
+/// crash desfaz, o de tempo garante que uma base com pouco tráfego não fica
+/// indefinidamente sem snapshot.
+///
+/// Com vários workers, só um publica de cada vez: o `try_lock` sobre o relógio
+/// é o rate limiting. Quem não consegue o lock não espera — já há um snapshot
+/// a sair, e o dele seria redundante.
+fn talvez_publicar_snapshot(inner: &RuntimeInner, processados: u64) {
+    let desde = inner
+        .eventos_desde_snapshot
+        .fetch_add(processados, std::sync::atomic::Ordering::AcqRel)
+        + processados;
+
+    let por_eventos =
+        inner.config.snapshot_interval_events > 0 && desde >= inner.config.snapshot_interval_events;
+    let por_tempo = inner.config.snapshot_interval_secs > 0 && {
+        let Ok(ultimo) = inner.ultimo_snapshot.try_lock() else {
+            return;
+        };
+        ultimo.elapsed().as_secs() >= inner.config.snapshot_interval_secs
+    };
+    if !por_eventos && !por_tempo {
+        return;
+    }
+    if let Err(erro) = publicar_snapshot(inner) {
+        // Um snapshot que não sai não é uma falha de consistência (§45): custa
+        // um arranque mais lento, não correcção. O que não pode é ser mudo.
+        tracing::warn!(erro = %erro, "falha ao publicar o snapshot periódico do Sentinel");
+    }
+}
+
+/// SPEC-0072 §10/§11 — percorre `[de, ate)` em lotes, sem nunca materializar
+/// a base inteira.
+///
+/// `ate` é FIXO pelo chamador e nunca relido de `log.head()` aqui dentro. A
+/// diferença não é estética: se cada passagem visse um head diferente, uma
+/// passagem posterior poderia observar eventos que a anterior não viu, e as
+/// duas ficariam a falar de bases diferentes. Tudo o que aparecer em ou além
+/// dessa marca fica para o `process_until`, que é o único caminho com cursor
+/// para comitar.
+fn por_lotes(
+    log: &AnyLog,
+    contador: &std::sync::atomic::AtomicU64,
+    de: Lsn,
+    ate: Lsn,
+    lote: usize,
+    mut visitar: impl FnMut(Lsn, Episode) -> Result<(), SentinelError>,
+) -> Result<(), SentinelError> {
+    let lote = lote.max(1);
+    let mut cursor = de;
+    while cursor < ate {
+        let linhas = log.scan_capped(cursor, ate, lote)?;
+        if linhas.is_empty() {
+            break;
+        }
+        let ultimo = linhas.last().map(|(lsn, _)| *lsn).unwrap_or(cursor);
+        contador.fetch_add(linhas.len() as u64, Ordering::Relaxed);
+        for (lsn, episodio) in linhas {
+            visitar(lsn, episodio)?;
+        }
+        cursor = ultimo.saturating_add(1);
+    }
+    Ok(())
+}
+
+/// Os conjuntos de deduplicação, reconstruídos na primeira passagem.
+///
+/// Nenhum deles guarda eventos: são ids e LSNs. É o que a §11 quer dizer com
+/// "memória limitada pelo estado materializado" — o estado é isto, e não a
+/// base de que foi derivado.
+#[derive(Default)]
+struct IdsDerivados {
+    signal_ids: HashSet<String>,
+    incident_revision_ids: HashSet<String>,
+    risk_revision_ids: HashSet<String>,
+    checkpoint_ids: HashSet<String>,
+    last_checkpoint_lsn: Option<Lsn>,
+    l4_ids: BTreeMap<String, Lsn>,
+    /// Os `event_id` que os sinais JÁ PERSISTIDOS apontam como evidência.
+    ///
+    /// É a suspeita do L1 tal como aconteceu em produção, recuperada do log em
+    /// vez de recalculada. Recalcular exigiria o histórico inteiro de regras em
+    /// memória — precisamente o que a §11 proíbe — e daria, na melhor das
+    /// hipóteses, a mesma resposta.
+    suspeitos_persistidos: HashSet<EventId>,
+}
+
+/// Primeira passagem: só ids (SPEC-0072 §12).
+///
+/// `derived_sources` é escrito DIRECTAMENTE na janela com tecto, pela ordem do
+/// scan. A versão anterior enchia um `HashSet<Lsn>` com uma entrada por evento
+/// derivado — 8 bytes por evento numa base de 100M — e só depois o despejava na
+/// janela de 262 144. O tecto existia, mas chegava tarde de mais para servir
+/// para alguma coisa.
+#[allow(clippy::too_many_arguments)]
+fn passagem_de_ids(
+    log: &AnyLog,
+    desde: Lsn,
+    ate: Lsn,
+    lote: usize,
+    l3_enabled: bool,
+    fusion_enabled: bool,
+    snapshot: Option<&SentinelStateSnapshot>,
+    contador: &std::sync::atomic::AtomicU64,
+) -> Result<(IdsDerivados, JanelaRecente<Lsn>), SentinelError> {
+    let mut ids = IdsDerivados::default();
+    let mut derived_sources = JanelaRecente::nova(TECTO_LSN_DERIVADOS);
+    // Com snapshot, os conjuntos até ao watermark vêm de lá e a passagem só
+    // varre a cauda. É o INV-5 aplicado também aos ids: sem isto, o "warm boot"
+    // continuaria a ler a base inteira só para reconstruir conjuntos que o
+    // snapshot já traz.
+    if let Some(s) = snapshot {
+        ids.signal_ids.extend(s.signal_ids.iter().cloned());
+        ids.incident_revision_ids
+            .extend(s.incident_revision_ids.iter().cloned());
+        ids.risk_revision_ids
+            .extend(s.risk_revision_ids.iter().cloned());
+        ids.checkpoint_ids.extend(s.checkpoint_ids.iter().cloned());
+        ids.last_checkpoint_lsn = s.last_checkpoint_lsn;
+        ids.l4_ids
+            .extend(s.l4_ids.iter().map(|(chave, lsn)| (chave.clone(), *lsn)));
+        // Já vem por ordem de scan do snapshot que a capturou; reinserir
+        // preserva essa ordem, e com ela a semântica de evicção da janela.
+        for lsn in &s.derived_sources {
+            derived_sources.inserir(lsn);
+        }
+    }
+    por_lotes(log, contador, desde, ate, lote, |lsn, episode| {
+        // Attribute names alone are not an authenticity boundary.  Only rows
+        // emitted by the internal Sentinel sink are restored as derived state.
+        if !episode_is_generated(&episode) {
+            return Ok(());
+        }
+        let EventKind::Custom(kind) = &episode.kind else {
+            return Ok(());
+        };
+        match kind.as_str() {
+            "SecurityEvent" => {
+                let source_lsn = episode
+                    .attrs
+                    .get("sec.source_lsn")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(lsn);
+                derived_sources.inserir(&source_lsn);
+            }
+            "SecuritySignal" => {
+                if let Some(signal_id) = episode.attrs.get("sentinel.signal_id") {
+                    ids.signal_ids.insert(signal_id.clone());
+                }
+                // O corpo do sinal é desserializado; o do evento não. Os sinais
+                // são ordens de grandeza menos numerosos que os eventos, e é
+                // deles que sai a evidência — que nenhum atributo carrega.
+                if let Ok(signal) = serde_json::from_slice::<SecuritySignal>(&episode.content) {
+                    ids.signal_ids.insert(signal.signal_id.clone());
+                    ids.suspeitos_persistidos
+                        .extend(signal.evidence.iter().map(|e| e.event_id));
+                }
+            }
+            "SecurityIncident" if l3_enabled => {
+                if let Some(revision_id) =
+                    episode.attrs.get("sentinel.incident_revision_id").cloned()
+                {
+                    ids.incident_revision_ids.insert(revision_id);
+                } else if let Ok(incident) =
+                    serde_json::from_slice::<SecurityIncident>(&episode.content)
+                {
+                    ids.incident_revision_ids.insert(incident.revision_id()?);
+                }
+            }
+            "SecurityRiskAssessment" if fusion_enabled => {
+                if let Some(revision_id) = episode.attrs.get("sentinel.risk_revision_id") {
+                    ids.risk_revision_ids.insert(revision_id.clone());
+                } else if let Ok(assessment) =
+                    serde_json::from_slice::<RiskAssessment>(&episode.content)
+                {
+                    ids.risk_revision_ids.insert(assessment.revision_id()?);
+                }
+            }
+            "SentinelCheckpoint" => {
+                if let Some(checkpoint_id) = episode.attrs.get("sentinel.checkpoint_id") {
+                    ids.checkpoint_ids.insert(checkpoint_id.clone());
+                } else if let Ok(checkpoint) =
+                    serde_json::from_slice::<SentinelCheckpoint>(&episode.content)
+                {
+                    ids.checkpoint_ids.insert(checkpoint.checkpoint_id()?);
+                }
+                ids.last_checkpoint_lsn = Some(lsn);
+            }
+            outro if L4_KINDS.contains(&outro) => {
+                let (prefix, attr) = l4_prefixo_e_atributo(outro);
+                if let Some(id) = episode.attrs.get(attr) {
+                    ids.l4_ids.insert(format!("{prefix}:{id}"), lsn);
+                }
+                if outro == "SecurityInvestigation" {
+                    if let Some(digest) = episode.attrs.get("sentinel.context_digest") {
+                        ids.l4_ids.insert(format!("investigation:{digest}"), lsn);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })?;
+    Ok((ids, derived_sources))
+}
+
+const L4_KINDS: [&str; 9] = [
+    "SecurityInvestigation",
+    "SecurityActionProposal",
+    "SecurityPolicyDecision",
+    "SecurityActionResult",
+    "SecurityAiInvocation",
+    "SecurityApproval",
+    "SecurityModelUpdate",
+    "SecurityRulesetUpdate",
+    "SecurityFeedback",
+];
+
+fn l4_prefixo_e_atributo(kind: &str) -> (&'static str, &'static str) {
+    match kind {
+        "SecurityInvestigation" => ("investigation", "sentinel.investigation_id"),
+        "SecurityActionProposal" => ("proposal", "sentinel.action_proposal_id"),
+        "SecurityPolicyDecision" => ("decision", "sentinel.policy_decision_id"),
+        "SecurityActionResult" => ("result", "sentinel.action_id"),
+        "SecurityAiInvocation" => ("invocation", "sentinel.invocation_id"),
+        "SecurityApproval" => ("approval", "sentinel.approval_id"),
+        "SecurityModelUpdate" => ("model-update", "sentinel.model_update_id"),
+        "SecurityRulesetUpdate" => ("ruleset-update", "sentinel.ruleset_update_id"),
+        "SecurityFeedback" => ("feedback", "sentinel.feedback_id"),
+        _ => ("desconhecido", "sentinel.desconhecido"),
+    }
+}
+
+/// Desserializa um `SecurityEvent` derivado, devolvendo também o LSN de origem.
+fn evento_derivado(lsn: Lsn, episode: &Episode) -> Option<(Lsn, SecurityEvent)> {
+    if !episode_is_generated(episode) {
+        return None;
+    }
+    let EventKind::Custom(kind) = &episode.kind else {
+        return None;
+    };
+    if kind != "SecurityEvent" {
+        return None;
+    }
+    let event = serde_json::from_slice::<SecurityEvent>(&episode.content).ok()?;
+    let source_lsn = episode
+        .attrs
+        .get("sec.source_lsn")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(lsn);
+    Some((source_lsn, event))
+}
+
+/// Segunda passagem: grafo (L3) e histórico de regras (L1).
+///
+/// O grafo é aplicado por LSN de episódio; o histórico de regras é acumulado
+/// por LSN de origem e podado a cada lote, ao horizonte que o ruleset exige.
+/// Sem essa poda esta passagem seria o `Vec` sem tecto que a §11 proíbe — o
+/// histórico é a única estrutura aqui cujo tamanho seguiria o da base.
+fn passagem_de_grafo_e_regras(
+    inner: &RuntimeInner,
+    desde: Lsn,
+    ate: Lsn,
+    lote: usize,
+) -> Result<(), SentinelError> {
+    let l3 = inner.security_graph.is_some();
+    let l1 = inner.rule_engine.is_some();
+    if !l3 && !l1 {
+        return Ok(());
+    }
+    por_lotes(
+        &inner.log,
+        &inner.metrics.boot.events_scanned_total,
+        desde,
+        ate,
+        lote,
+        |lsn, episode| {
+            let Some((source_lsn, event)) = evento_derivado(lsn, &episode) else {
+                return Ok(());
+            };
+            if l3 {
+                apply_security_graph(inner, lsn, &event)?;
+            }
+            if l1 {
+                remember_rule_event(inner, source_lsn, &event);
+            }
+            Ok(())
+        },
+    )
+}
+
+/// Terceira passagem: replay do L2 por LSN de transacção.
+///
+/// `suspeitos` vem dos sinais já persistidos (ver [`IdsDerivados`]). É a
+/// suspeita que de facto ocorreu, não uma recalculada sobre um histórico
+/// truncado — e é o que impede que um rebuild frio construa baselines
+/// diferentes das que a instância viva construiu.
+fn passagem_de_l2(
+    inner: &RuntimeInner,
+    desde: Lsn,
+    ate: Lsn,
+    lote: usize,
+    suspeitos: &HashSet<EventId>,
+) -> Result<(), SentinelError> {
+    if inner.behavior_engine.is_none() {
+        return Ok(());
+    }
+    por_lotes(
+        &inner.log,
+        &inner.metrics.boot.events_scanned_total,
+        desde,
+        ate,
+        lote,
+        |lsn, episode| {
+            let Some((_, event)) = evento_derivado(lsn, &episode) else {
+                return Ok(());
+            };
+            evaluate_l2(inner, lsn, &event, suspeitos.contains(&event.raw_event_id))
+        },
+    )
+}
+
+/// Quarta passagem: replay dos sinais persistidos pela fusão e pelo L3.
+///
+/// Em ordem de LSN de transacção, que é o que reproduz as revisões de
+/// incidente tal como saíram ao vivo, mesmo quando os LSN de tempo de evento
+/// chegaram fora de ordem.
+fn passagem_de_sinais(
+    inner: &RuntimeInner,
+    desde: Lsn,
+    ate: Lsn,
+    lote: usize,
+) -> Result<(), SentinelError> {
+    if inner.fusion.is_none() && inner.incident_engine.is_none() {
+        return Ok(());
+    }
+    let mut vistos: HashSet<String> = HashSet::new();
+    por_lotes(
+        &inner.log,
+        &inner.metrics.boot.events_scanned_total,
+        desde,
+        ate,
+        lote,
+        |lsn, episode| {
+            if !episode_is_generated(&episode) {
+                return Ok(());
+            }
+            let EventKind::Custom(kind) = &episode.kind else {
+                return Ok(());
+            };
+            if kind != "SecuritySignal" {
+                return Ok(());
+            }
+            let Ok(signal) = serde_json::from_slice::<SecuritySignal>(&episode.content) else {
+                return Ok(());
+            };
+            if !vistos.insert(signal.signal_id.clone()) {
+                return Ok(());
+            }
+            evaluate_fusion(inner, lsn, &signal)?;
+            evaluate_l3(inner, lsn, &signal)
+        },
+    )
 }
 
 impl Sentinel for SentinelRuntime {
@@ -1522,149 +2432,6 @@ impl Drop for SentinelRuntime {
     }
 }
 
-fn load_security_state(
-    log: &AnyLog,
-    l1_enabled: bool,
-    l2_enabled: bool,
-    l3_enabled: bool,
-    fusion_enabled: bool,
-) -> Result<SecurityState, SentinelError> {
-    let rows = log.scan(0, log.head())?;
-    let mut state = SecurityState::default();
-    for (lsn, episode) in rows {
-        // Attribute names alone are not an authenticity boundary.  Only rows
-        // emitted by the internal Sentinel sink are restored as derived state;
-        // external lookalikes remain ordinary raw telemetry.
-        if !episode_is_generated(&episode) {
-            continue;
-        }
-        if let EventKind::Custom(kind) = &episode.kind {
-            if kind == "SecurityEvent" {
-                if let Ok(event) = serde_json::from_slice::<SecurityEvent>(&episode.content) {
-                    let source_lsn = episode
-                        .attrs
-                        .get("sec.source_lsn")
-                        .and_then(|value| value.parse().ok())
-                        .unwrap_or(lsn);
-                    state.derived_sources.insert(source_lsn);
-                    if l1_enabled {
-                        state.rule_history.push((source_lsn, event.clone()));
-                    }
-                    if l2_enabled {
-                        state.behavior_history.push((lsn, event.clone()));
-                    }
-                    if l3_enabled {
-                        state.graph_history.push((lsn, event));
-                    }
-                }
-            } else if kind == "SecuritySignal" {
-                if let Some(signal_id) = episode.attrs.get("sentinel.signal_id") {
-                    state.signal_ids.insert(signal_id.clone());
-                }
-                if let Ok(signal) = serde_json::from_slice::<SecuritySignal>(&episode.content) {
-                    state.signal_ids.insert(signal.signal_id.clone());
-                    if l3_enabled || fusion_enabled {
-                        state.signals.push((lsn, signal));
-                    }
-                }
-            } else if kind == "SecurityIncident" && l3_enabled {
-                if let Some(revision_id) =
-                    episode.attrs.get("sentinel.incident_revision_id").cloned()
-                {
-                    state.incident_revision_ids.insert(revision_id);
-                } else if let Ok(incident) =
-                    serde_json::from_slice::<SecurityIncident>(&episode.content)
-                {
-                    state.incident_revision_ids.insert(incident.revision_id()?);
-                }
-            } else if kind == "SecurityRiskAssessment" && fusion_enabled {
-                if let Some(revision_id) = episode.attrs.get("sentinel.risk_revision_id") {
-                    state.risk_revision_ids.insert(revision_id.clone());
-                } else if let Ok(assessment) =
-                    serde_json::from_slice::<RiskAssessment>(&episode.content)
-                {
-                    state.risk_revision_ids.insert(assessment.revision_id()?);
-                }
-            } else if kind == "SentinelCheckpoint" {
-                if let Some(checkpoint_id) = episode.attrs.get("sentinel.checkpoint_id") {
-                    state.checkpoint_ids.insert(checkpoint_id.clone());
-                } else if let Ok(checkpoint) =
-                    serde_json::from_slice::<SentinelCheckpoint>(&episode.content)
-                {
-                    state.checkpoint_ids.insert(checkpoint.checkpoint_id()?);
-                }
-                state.last_checkpoint_lsn = Some(lsn);
-            } else if matches!(
-                kind.as_str(),
-                "SecurityInvestigation"
-                    | "SecurityActionProposal"
-                    | "SecurityPolicyDecision"
-                    | "SecurityActionResult"
-                    | "SecurityAiInvocation"
-                    | "SecurityApproval"
-                    | "SecurityModelUpdate"
-                    | "SecurityRulesetUpdate"
-                    | "SecurityFeedback"
-            ) {
-                let (prefix, attr) = match kind.as_str() {
-                    "SecurityInvestigation" => ("investigation", "sentinel.investigation_id"),
-                    "SecurityActionProposal" => ("proposal", "sentinel.action_proposal_id"),
-                    "SecurityPolicyDecision" => ("decision", "sentinel.policy_decision_id"),
-                    "SecurityActionResult" => ("result", "sentinel.action_id"),
-                    "SecurityAiInvocation" => ("invocation", "sentinel.invocation_id"),
-                    "SecurityApproval" => ("approval", "sentinel.approval_id"),
-                    "SecurityModelUpdate" => ("model-update", "sentinel.model_update_id"),
-                    "SecurityRulesetUpdate" => ("ruleset-update", "sentinel.ruleset_update_id"),
-                    "SecurityFeedback" => ("feedback", "sentinel.feedback_id"),
-                    _ => unreachable!(),
-                };
-                if let Some(id) = episode.attrs.get(attr) {
-                    state.l4_ids.insert(format!("{prefix}:{id}"), lsn);
-                }
-                if kind == "SecurityInvestigation" {
-                    if let Some(digest) = episode.attrs.get("sentinel.context_digest") {
-                        state.l4_ids.insert(format!("investigation:{digest}"), lsn);
-                    }
-                }
-            }
-        }
-    }
-    state.rule_history.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.1.raw_event_id.cmp(&right.1.raw_event_id))
-    });
-    state
-        .rule_history
-        .dedup_by(|left, right| left.0 == right.0 && left.1.raw_event_id == right.1.raw_event_id);
-    state.behavior_history.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.1.raw_event_id.cmp(&right.1.raw_event_id))
-    });
-    state
-        .behavior_history
-        .dedup_by(|left, right| left.0 == right.0 && left.1.raw_event_id == right.1.raw_event_id);
-    state.graph_history.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.1.raw_event_id.cmp(&right.1.raw_event_id))
-    });
-    state
-        .graph_history
-        .dedup_by(|left, right| left.0 == right.0 && left.1.raw_event_id == right.1.raw_event_id);
-    state.signals.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.1.signal_id.cmp(&right.1.signal_id))
-    });
-    let mut seen_signals = HashSet::new();
-    state
-        .signals
-        .retain(|(_, signal)| seen_signals.insert(signal.signal_id.clone()));
-    Ok(state)
-}
-
 fn worker_loop(inner: Arc<RuntimeInner>) {
     while !inner.stop.load(Ordering::Acquire) {
         if inner.queue.take_catch_up().is_some() {
@@ -1673,13 +2440,32 @@ fn worker_loop(inner: Arc<RuntimeInner>) {
                 .catchup_passes_total
                 .fetch_add(1, Ordering::Relaxed);
             if let Err(error) = process_until(&inner) {
-                inner
+                let falhas = inner
                     .metrics
                     .normalization_errors_total
-                    .fetch_add(1, Ordering::Relaxed);
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
                 // Retry after a short pause; a malformed single event must not
                 // terminate the worker and silently stop catch-up forever.
-                let _ = error;
+                //
+                // Mas o erro TEM de ser dito. Ele era descartado aqui com um
+                // `let _ = error;`, e foi isso que tornou a instabilidade do L2
+                // indiagnosticavel durante semanas: o worker entrava em
+                // retentativa infinita sobre um erro deterministico e a unica
+                // pista era um contador a subir. Um erro que se repete no mesmo
+                // LSN nao e transitorio — e um evento envenenado, e quem opera
+                // precisa de saber qual e e porque.
+                let posicao = {
+                    let cursor = inner.cursor.lock().unwrap_or_else(|e| e.into_inner());
+                    cursor.next_lsn
+                };
+                tracing::warn!(
+                    error = %error,
+                    next_lsn = posicao,
+                    head = inner.log.head(),
+                    falhas_acumuladas = falhas,
+                    "passagem de catch-up do Sentinel falhou; a repetir"
+                );
                 std::thread::sleep(Duration::from_millis(20));
             }
             continue;
@@ -1688,11 +2474,22 @@ fn worker_loop(inner: Arc<RuntimeInner>) {
         match inner.queue.recv_timeout(Duration::from_millis(100)) {
             Ok(_notification_lsn) => {
                 if let Err(error) = process_until(&inner) {
-                    inner
+                    let falhas = inner
                         .metrics
                         .normalization_errors_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    let _ = error;
+                        .fetch_add(1, Ordering::Relaxed)
+                        + 1;
+                    let posicao = {
+                        let cursor = inner.cursor.lock().unwrap_or_else(|e| e.into_inner());
+                        cursor.next_lsn
+                    };
+                    tracing::warn!(
+                        error = %error,
+                        next_lsn = posicao,
+                        head = inner.log.head(),
+                        falhas_acumuladas = falhas,
+                        "processamento de notificacao do Sentinel falhou"
+                    );
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -1723,6 +2520,9 @@ fn process_until(inner: &RuntimeInner) -> Result<(), SentinelError> {
     if rows.is_empty() {
         return Ok(());
     }
+    // Onde este lote começou, para a cadência da §44 saber quanto avançou. O
+    // cursor é a medida certa: conta o que ficou COMMITADO, não o que se leu.
+    let inicio_do_lote = cursor.next_lsn;
 
     // If a crash occurred after appending a derived event but before committing
     // the cursor, the derived row is visible either in this replay window or in
@@ -1734,6 +2534,31 @@ fn process_until(inner: &RuntimeInner) -> Result<(), SentinelError> {
         .filter(|(_, episode)| matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecurityEvent"))
         .filter_map(|(_, episode)| episode.attrs.get("sec.source_lsn").and_then(|value| value.parse().ok()))
         .collect();
+
+    // A INSTABILIDADE DO L2 foi diagnosticada e corrigida a 2026-09-04. A
+    // correccao esta em `evaluate_l2`; fica aqui o mecanismo, porque e este
+    // ciclo que o produz e quem o ler a seguir vai comecar por aqui.
+    //
+    // Um lote deste ciclo contem episodios BRUTOS (LSN baixo) e episodios
+    // DERIVADOS de passagens anteriores (LSN alto), e ambos chegam ao L2. Ao
+    // processar o bruto do LSN 21 o pipeline apende o `SecurityEvent` derivado
+    // no FIM do log e chama o L2 com ESSE LSN. Mais a frente no mesmo lote
+    // aparece um derivado antigo, de LSN mais baixo, e o L2 ve uma observacao
+    // regredida. A guarda de ordem recusava-a com erro, o erro subia ate ao
+    // `worker_loop`, o cursor nao avancava, e a retentativa reapresentava a
+    // mesma sequencia. O pipeline nao ficava parado: ficava a girar.
+    //
+    // Durante meses isto pareceu depender de carga de I/O. Nao dependia: a
+    // carga so mudava a probabilidade de um lote conter as duas coisas ao mesmo
+    // tempo. Aumentar o prazo do teste nunca podia funcionar, e nao funcionou.
+    //
+    // Das duas saidas que estavam escritas aqui — tornar este ciclo
+    // transaccional, ou tratar um LSN ja visto como no-op idempotente —
+    // escolheu-se a segunda, e a razao nao foi ser mais barata: uma observacao
+    // com LSN ja ultrapassado e, por definicao, uma que o motor ja incorporou.
+    // Salta-la e o que a §22 chama replay idempotente. A guarda do
+    // `BehavioralEngine` fica como esta, porque ela esta certa; o que estava
+    // errado era transformar a recusa dela numa falha do lote inteiro.
 
     for (lsn, episode) in rows {
         if lsn < cursor.next_lsn {
@@ -1860,6 +2685,13 @@ fn process_until(inner: &RuntimeInner) -> Result<(), SentinelError> {
     if cursor.next_lsn < inner.log.head() {
         inner.queue.request_catch_up(cursor.next_lsn);
     }
+    let processados = cursor.next_lsn.saturating_sub(inicio_do_lote);
+
+    // O guard TEM de cair antes da cadência: `capturar_snapshot` volta a
+    // pegar neste mesmo mutex — é assim que garante que nenhum worker está a
+    // meio de um lote — e um `Mutex` não é reentrante.
+    drop(cursor);
+    talvez_publicar_snapshot(inner, processados);
     Ok(())
 }
 
@@ -1881,22 +2713,60 @@ fn normalize_l0(
 }
 
 fn remember_rule_event(inner: &RuntimeInner, source_lsn: Lsn, event: &SecurityEvent) {
-    if inner.rule_engine.is_some() {
-        let mut history = inner
-            .rule_history
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !history.iter().any(|(lsn, existing)| {
-            *lsn == source_lsn && existing.raw_event_id == event.raw_event_id
-        }) {
-            history.push((source_lsn, event.clone()));
-            history.sort_by(|left, right| {
-                left.0
-                    .cmp(&right.0)
-                    .then_with(|| left.1.raw_event_id.cmp(&right.1.raw_event_id))
-            });
-        }
+    let Some(engine) = inner.rule_engine.as_ref() else {
+        return;
+    };
+    let mut history = inner
+        .rule_history
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !history
+        .iter()
+        .any(|(lsn, existing)| *lsn == source_lsn && existing.raw_event_id == event.raw_event_id)
+    {
+        history.push((source_lsn, event.clone()));
+        history.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.raw_event_id.cmp(&right.1.raw_event_id))
+        });
+        // O histórico deixa de ser ilimitado. O horizonte não é arbitrário:
+        // é a maior janela que o ruleset consulta, mais a tolerância a atraso
+        // configurada — ver `DetectionExpr::max_window_ms`.
+        let horizonte = engine
+            .required_window_ms()
+            .saturating_add(inner.config.l1.max_lateness_ms);
+        podar_historico_l1(&mut history, horizonte, inner.config.l1.history_capacity);
     }
+}
+
+/// Poda o histórico L1 ao horizonte temporal e ao tecto de linhas. Devolve
+/// quantas linhas saíram.
+///
+/// A fronteira é medida a partir do evento **mais recente** em tempo de
+/// evento (`observed_at`), não em LSN: é o tempo de evento que os operadores
+/// temporais comparam. Um evento com `observed_at` mais antigo do que
+/// `mais_recente − horizonte` não pode participar em nenhuma correspondência
+/// de `Count`, `Sequence` ou `DistinctCount` — e os restantes nós são pontuais.
+///
+/// O tecto em linhas é a segunda linha de defesa: um ruleset com janelas de
+/// dias devolveria o histórico ao ilimitado só pelo tempo. Quando dispara,
+/// saem os LSN mais antigos, que é a ordem em que o vector está.
+fn podar_historico_l1(
+    history: &mut Vec<(Lsn, SecurityEvent)>,
+    horizonte_ms: u64,
+    capacidade: usize,
+) -> usize {
+    let antes = history.len();
+    if let Some(mais_recente) = history.iter().map(|(_, e)| e.observed_at).max() {
+        let limite = mais_recente.saturating_sub(horizonte_ms);
+        history.retain(|(_, e)| e.observed_at >= limite);
+    }
+    if capacidade > 0 && history.len() > capacidade {
+        let excesso = history.len() - capacidade;
+        history.drain(0..excesso);
+    }
+    antes - history.len()
 }
 
 /// SPEC-0047 §11/§36 — correlaciona o evento contra o índice de IOC e persiste
@@ -2041,12 +2911,55 @@ fn evaluate_l2(
     let mut derived = Vec::new();
     for mut input in security_event_inputs(event, inner.config.l2.suspicious_severity)? {
         input.suspicious |= rule_suspicious;
-        let observation = candidate.observe(
+        let observation = match candidate.observe(
             security_event_lsn,
             input.entity.clone(),
             input.features,
             input.suspicious,
-        )?;
+        ) {
+            Ok(observation) => observation,
+            // ISTO ERA A CAUSA DO IMPASSE DO L2, diagnosticada a 2026-09-04.
+            //
+            // Sintoma: o worker parava num LSN e repetia para sempre, com
+            // `observação para <entidade> voltou de LSN 54 para 21` a cada
+            // volta. O contador de erros subia, o cursor não avançava, e a
+            // instabilidade parecia depender de carga de I/O — parecia, porque
+            // a carga só mudava a probabilidade de o lote conter as duas
+            // coisas ao mesmo tempo.
+            //
+            // Mecanismo: um lote de `process_until` contém episódios BRUTOS
+            // (LSN baixo) e episódios DERIVADOS de passagens anteriores (LSN
+            // alto), e ambos chegam aqui. Ao processar o bruto do LSN 21 o
+            // pipeline apende o `SecurityEvent` derivado no fim do log — LSN
+            // 63, digamos — e é COM ESSE que chama o L2. Mais à frente no
+            // mesmo lote aparece um derivado antigo, do LSN 41, e o L2 vê 41
+            // depois de 63. A guarda de ordem dispara, o erro sobe até ao
+            // `worker_loop`, o cursor não avança, e a repetição volta a
+            // apresentar a mesma sequência. Determinístico, não uma corrida.
+            //
+            // A guarda de `BehavioralEngine` está certa e fica: o motor tem de
+            // recusar uma observação regredida, senão a baseline deixa de ser
+            // determinística. O que estava errado era tratar isso como falha
+            // do LOTE. Uma observação com LSN já ultrapassado é, por
+            // definição, uma que este motor já incorporou — é replay, e a §22
+            // exige que o replay seja idempotente. Saltá-la é a resposta
+            // correcta; abortar o lote é o que tornava o pipeline incapaz de
+            // progredir.
+            Err(BehaviorError::OutOfOrder {
+                entity,
+                last,
+                current,
+            }) => {
+                tracing::debug!(
+                    %entity,
+                    ultimo_lsn = last,
+                    lsn_actual = current,
+                    "L2: observação já incorporada; a saltar (replay idempotente)"
+                );
+                continue;
+            }
+            Err(outro) => return Err(outro.into()),
+        };
         if !observation.score.anomalous {
             continue;
         }
@@ -2141,9 +3054,12 @@ fn evaluate_l1(inner: &RuntimeInner) -> Result<HashSet<EventId>, SentinelError> 
     // previous deep clone duplicated every SecurityEvent (including strings
     // and attribute maps) for every invocation and briefly doubled L1 memory.
     //
-    // We intentionally do not discard rows based on observed_at: Sentinel
-    // accepts late/out-of-order event time, so no finite time horizon is safe
-    // until the configuration has an explicit lateness contract.
+    // O histórico já vem podado de `remember_rule_event`: ao horizonte que o
+    // ruleset exige (`RuleEngine::required_window_ms`) mais o
+    // `max_lateness_ms` configurado, e a um tecto de linhas. Este comentário
+    // dizia antes que nenhum horizonte finito era seguro "até haver um
+    // contrato de lateness" — o contrato passou a existir, e o horizonte
+    // revelou-se derivável do próprio ruleset em vez de arbitrário.
     let window = inner
         .rule_history
         .lock()
@@ -2436,6 +3352,7 @@ mod tests {
                 max_graph_hops: 6,
             },
             threat: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -2534,6 +3451,7 @@ mod tests {
                 l2: SentinelL2Config::default(),
                 l3: SentinelL3Config::default(),
                 threat: Default::default(),
+                ..Default::default()
             },
         )
         .unwrap()
@@ -2593,6 +3511,7 @@ mod tests {
                 l2: SentinelL2Config::default(),
                 l3: SentinelL3Config::default(),
                 threat: Default::default(),
+                ..Default::default()
             },
         )
         .unwrap()
@@ -2666,6 +3585,7 @@ mod tests {
                 l2: SentinelL2Config::default(),
                 l3: SentinelL3Config::default(),
                 threat: Default::default(),
+                ..Default::default()
             },
         )
         .unwrap()
@@ -2730,6 +3650,7 @@ mod tests {
                 l2: SentinelL2Config::default(),
                 l3: SentinelL3Config::default(),
                 threat: Default::default(),
+                ..Default::default()
             },
         )
         .unwrap()
@@ -2905,6 +3826,7 @@ mod tests {
             l2: SentinelL2Config::default(),
             l3: SentinelL3Config::default(),
             threat: Default::default(),
+            ..Default::default()
         };
         let runtime = SentinelRuntime::start(log.clone(), config)
             .unwrap()
@@ -2967,10 +3889,12 @@ detection:
             l1: SentinelL1Config {
                 enabled: true,
                 rules_path: Some(rules),
+                ..Default::default()
             },
             l2: SentinelL2Config::default(),
             l3: SentinelL3Config::default(),
             threat: Default::default(),
+            ..Default::default()
         };
         let runtime = SentinelRuntime::start(log.clone(), config)
             .unwrap()
@@ -3025,10 +3949,12 @@ detection:
                 l1: SentinelL1Config {
                     enabled: true,
                     rules_path: Some(temp.path().join("failed-login.yml")),
+                    ..Default::default()
                 },
                 l2: SentinelL2Config::default(),
                 l3: SentinelL3Config::default(),
                 threat: Default::default(),
+                ..Default::default()
             },
         )
         .unwrap()
@@ -3041,6 +3967,15 @@ detection:
 
     #[test]
     fn l2_behavioral_adapter_emits_replayable_signal_after_shadow_promotion() {
+        // O `worker_loop` regista o erro que o faz repetir a passagem de
+        // catch-up, mas sem subscritor esse aviso não chega a lado nenhum — e
+        // era exactamente esse texto que faltava para explicar a instabilidade.
+        // `try_init` porque o subscritor é global e outros testes do mesmo
+        // binário podem já o ter instalado.
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_max_level(tracing::Level::WARN)
+            .try_init();
         let temp = tempfile::tempdir().unwrap();
         let log = Arc::new(
             AnyLog::open(
@@ -3070,6 +4005,7 @@ detection:
                 },
                 l3: SentinelL3Config::default(),
                 threat: Default::default(),
+                ..Default::default()
             },
         )
         .unwrap()
@@ -3085,42 +4021,72 @@ detection:
             ))
             .unwrap();
         }
-        // ESTE TESTE E INSTAVEL E O PRAZO NAO O ARRANJA. Fica aqui o que ja se
-        // mediu, para nao se repetir trabalho nem se voltar a aumentar o numero.
+        // ESTE TESTE FOI INSTAVEL DURANTE MESES E O PRAZO NUNCA FOI O PROBLEMA.
+        // Fica o historico das medicoes, porque foi o que levou ao diagnostico.
         //
-        // 2026-08-31: o prazo subiu de 5 s para 30 s, atribuindo a falha a falta
-        // de PROCESSADOR (um so worker a competir com dezenas de binarios de
-        // teste). 2026-09-02: continua a falhar em `cargo test --workspace`, aos
-        // 30 s.
+        //   2026-08-31: prazo de 5 s para 30 s, atribuindo a falha a falta de
+        //               PROCESSADOR. Nao era.
+        //   2026-09-02: tres medicoes, cada uma a correr o binario completo:
+        //                 isolado, maquina livre .......... 6 corridas, 0 falhas
+        //                 8 geradores nos 8 nucleos ....... 5 corridas, 0 falhas
+        //                 6 escritores com flush sincrono . 5 corridas, 1 falha
+        //               As duas primeiras refutam o processador; a terceira
+        //               aponta para I/O, e a correccao obvia (GroupCommit em vez
+        //               de Always) piorou: 4 falhas em 8.
+        //   2026-09-03: o timeout passa a imprimir os contadores de cada estagio,
+        //               o que transforma a proxima falha numa resposta.
+        //   2026-09-04: resolvido. A carga de I/O nunca foi a causa — so mudava a
+        //               probabilidade de um lote conter ao mesmo tempo um
+        //               episodio bruto e um derivado antigo, que era a condicao
+        //               real. Ver o comentario em `process_until` e a correccao
+        //               em `evaluate_l2`.
         //
-        // Tres medicoes de 2026-09-02, cada uma a correr o binario completo:
-        //
-        //   isolado, maquina livre ............. 6 corridas, 0 falhas, ~0,6 s
-        //   8 geradores a saturar os 8 nucleos . 5 corridas, 0 falhas, ~0,6 s
-        //   6 escritores com flush sincrono .... 5 corridas, 1 falha,  30,8 s
-        //
-        // A primeira e a segunda REFUTAM a explicacao pelo processador:
-        // `worker_threads` sao threads do SO e o escalonador da-lhes tempo. A
-        // terceira reproduz a falha de forma fiavel, portanto o gatilho tem a
-        // ver com I/O.
-        //
-        // Mas a correccao obvia NAO funciona: passar o log deste teste de
-        // `FsyncPolicy::Always` para `GroupCommit { interval_ms: 5 }` -- para o
-        // append do sinal deixar de esperar pelo seu proprio fsync -- deu 4
-        // falhas em 8 sob a mesma carga, ou seja pior. A causa esta mais fundo
-        // do que o fsync do append, e nao esta identificada.
-        //
-        // O que falta e diagnosticar onde o pipeline fica parado (um dump de
-        // stacks das threads `heraclitus-sentinel-*` no momento do timeout
-        // resolveria isto em minutos), nao escolher um prazo maior.
+        // O prazo de 30 s fica: ja nao e onde a falha mora, e um prazo generoso
+        // num teste que passa em 0,06 s nao custa nada.
+        // A arvore de decisao esta no `panic!` abaixo.
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while runtime.status().signals_emitted_total < 1 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(
-            runtime.status().signals_emitted_total >= 1,
-            "o pipeline L2 nao emitiu sinal nenhum em 30 s"
-        );
+        let s = runtime.status();
+        if s.signals_emitted_total < 1 {
+            // Onde e que o pipeline parou? Cada contador a zero acusa o
+            // estagio anterior; o primeiro zero da cadeia e o culpado.
+            let estagio = if s.events_seen_total == 0 {
+                "a ponte log->subscritor nunca notificou (attach_subscriber_with_stop / tail_subscribe)"
+            } else if s.events_processed_total == 0 {
+                "o subscritor viu, mas o worker nunca processou (fila ou worker_loop)"
+            } else if s.events_normalized_total == 0 {
+                "o worker processou, mas nada foi normalizado (normalize_l0)"
+            } else {
+                "normalizou mas o L2 nao emitiu (evaluate_l2 / promocao do shadow)"
+            };
+            panic!(
+                "o pipeline L2 nao emitiu sinal nenhum em 30 s.\n\
+                 ESTAGIO SUSPEITO: {estagio}\n\
+                 log:    head={} next={} lag={} ({:?})\n\
+                 fila:   profundidade={}/{} overflows={} catch_up_from={:?} passagens={}\n\
+                 cadeia: vistos={} processados={} normalizados={} saltados={} erros={}\n\
+                 latencias: l0={}us l1={}ms l2={}ms",
+                s.head_lsn,
+                s.next_lsn,
+                s.detection_lag_lsn,
+                s.lag_state,
+                s.queue_depth,
+                s.queue_capacity,
+                s.queue_overflow_total,
+                s.catch_up_from_lsn,
+                s.catchup_passes_total,
+                s.events_seen_total,
+                s.events_processed_total,
+                s.events_normalized_total,
+                s.normalization_skipped_total,
+                s.normalization_errors_total,
+                s.l0_latency_us,
+                s.l1_latency_ms,
+                s.l2_latency_ms,
+            );
+        }
         assert!(log.scan(0, log.head()).unwrap().iter().any(|(_, episode)| {
             matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecuritySignal")
                 && episode
@@ -3429,5 +4395,897 @@ mod testes_janela_de_lsn {
     #[test]
     fn o_tecto_de_producao_e_o_declarado() {
         assert_eq!(TECTO_LSN_DERIVADOS, 262_144);
+    }
+}
+
+#[cfg(test)]
+mod poda_l1_tests {
+    use super::podar_historico_l1;
+    use crate::detection::{DetectionExpr, DetectionRule, Field, RuleEngine, Value};
+    use crate::event::{Outcome, SecurityCategory, SecurityEvent, SecuritySource};
+    use heraclitus_core::EventId;
+
+    fn falha(lsn: u64, observed_at: u64) -> (u64, SecurityEvent) {
+        let mut e = SecurityEvent::unmapped(EventId::new(), SecuritySource::Auditd);
+        e.category = SecurityCategory::Authentication;
+        e.activity = "login".into();
+        e.outcome = Outcome::Failure;
+        e.observed_at = observed_at;
+        (lsn, e)
+    }
+
+    #[test]
+    fn a_fronteira_e_medida_do_evento_mais_recente_em_tempo_de_evento() {
+        let mut h = vec![
+            falha(1, 0),
+            falha(2, 5_000),
+            falha(3, 10_000),
+            falha(4, 20_000),
+        ];
+        assert_eq!(podar_historico_l1(&mut h, 10_000, 0), 2);
+        let restantes: Vec<u64> = h.iter().map(|(l, _)| *l).collect();
+        assert_eq!(
+            restantes,
+            vec![3, 4],
+            "20_000 - 10_000 = 10_000 e inclusivo"
+        );
+    }
+
+    #[test]
+    fn o_tecto_de_linhas_solta_os_lsn_mais_antigos() {
+        let mut h: Vec<_> = (1..=10).map(|i| falha(i, 1_000 * i)).collect();
+        assert_eq!(podar_historico_l1(&mut h, u64::MAX, 4), 6);
+        let restantes: Vec<u64> = h.iter().map(|(l, _)| *l).collect();
+        assert_eq!(restantes, vec![7, 8, 9, 10]);
+
+        let mut sem_tecto: Vec<_> = (1..=10).map(|i| falha(i, 1_000 * i)).collect();
+        assert_eq!(
+            podar_historico_l1(&mut sem_tecto, u64::MAX, 0),
+            0,
+            "zero desliga o tecto"
+        );
+    }
+
+    /// O `RuleEngine::evaluate` reporta a PRIMEIRA correspondencia de cada
+    /// regra, e o `signal_ids` suprime o que ja foi emitido. Enquanto o
+    /// historico crescia sem tecto, essa primeira correspondencia ficava la
+    /// para sempre: a rajada #1 era emitida uma vez e a rajada #2,
+    /// genuinamente distinta e 48 segundos depois, NUNCA chegava a ser
+    /// emitida. Nao era um throttle — era fome permanente.
+    ///
+    /// A poda ao horizonte derivado do ruleset e o que fecha esse buraco: a
+    /// rajada #1 cai fora da janela, a #2 passa a ser a primeira, e sai.
+    #[test]
+    fn sem_poda_a_segunda_rajada_nunca_e_emitida_e_com_poda_e() {
+        let rule = DetectionRule::new(
+            "failed-logins",
+            "1.0.0",
+            DetectionExpr::Count {
+                predicate: Box::new(DetectionExpr::Eq(
+                    Field::Outcome,
+                    Value::String("failure".into()),
+                )),
+                window_ms: 10_000,
+                threshold: 2,
+            },
+            7,
+        );
+        let engine = RuleEngine::new([rule]).unwrap();
+        let rajada_1 = [falha(1, 1_000), falha(2, 2_000)];
+        let rajada_2 = [falha(3, 50_000), falha(4, 51_000)];
+
+        let so_a_segunda = engine.evaluate(&rajada_2);
+        assert_eq!(so_a_segunda.len(), 1, "a rajada #2 e por si so um sinal");
+
+        let mut historico: Vec<_> = rajada_1.iter().chain(rajada_2.iter()).cloned().collect();
+        let sem_poda = engine.evaluate(&historico);
+        assert_eq!(sem_poda.len(), 1);
+        assert_ne!(
+            sem_poda[0].signal_id, so_a_segunda[0].signal_id,
+            "com historico ilimitado so a rajada #1 e reportada; a #2 fica presa atras dela"
+        );
+
+        podar_historico_l1(&mut historico, engine.required_window_ms(), 0);
+        assert_eq!(
+            historico.len(),
+            2,
+            "o horizonte de 10s deixa passar exactamente a rajada #2"
+        );
+        assert_eq!(
+            engine.evaluate(&historico),
+            so_a_segunda,
+            "podado ao horizonte; o sinal da rajada #2 e exactamente o que ela produz sozinha"
+        );
+    }
+}
+
+#[cfg(test)]
+mod testes_snapshot_spec0072 {
+    use super::*;
+    use heraclitus_core::FsyncPolicy;
+
+    fn evento_bruto(utilizador: &str) -> Episode {
+        Episode::new(
+            "collector",
+            EventKind::Observation,
+            format!(
+                r#"{{"source":"auditd","category":"authentication","activity":"login","outcome":"failure","user":"{utilizador}"}}"#
+            )
+            .into_bytes(),
+        )
+    }
+
+    fn config_de_teste() -> SentinelConfig {
+        SentinelConfig {
+            enabled: true,
+            mode: SentinelMode::Observe,
+            queue_capacity: 16,
+            worker_threads: 1,
+            pipeline_version: 7,
+            catch_up_batch: 32,
+            l3: SentinelL3Config {
+                enabled: true,
+                max_graph_hops: 6,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn esperar_normalizados(runtime: &SentinelRuntime, quantos: u64) {
+        let prazo = Instant::now() + Duration::from_secs(30);
+        while runtime.status().events_normalized_total < quantos && Instant::now() < prazo {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            runtime.status().events_normalized_total,
+            quantos,
+            "o pipeline nao chegou ao fim dentro do prazo"
+        );
+    }
+
+    #[test]
+    fn o_snapshot_de_um_runtime_vivo_atravessa_o_disco_intacto() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let runtime = SentinelRuntime::start(log.clone(), config_de_teste())
+            .unwrap()
+            .unwrap();
+        for utilizador in ["alice", "bob", "carol"] {
+            log.append(evento_bruto(utilizador)).unwrap();
+        }
+        esperar_normalizados(&runtime, 3);
+
+        let capturado = runtime.capturar_snapshot();
+        assert!(
+            capturado.applied_until_exclusive > 0,
+            "o watermark tem de ser o que o cursor prova ter aplicado"
+        );
+        assert!(
+            capturado.graph_state.is_some(),
+            "com L3 ligado o grafo tem de entrar no snapshot"
+        );
+        runtime.publicar_snapshot().unwrap();
+
+        let store = SnapshotStore::new(log.dir().join("sentinel").join("state.snapshot"));
+        match store.carregar(7).unwrap() {
+            SnapshotLoad::Utilizavel(lido) => {
+                assert_eq!(
+                    lido.applied_until_exclusive,
+                    capturado.applied_until_exclusive
+                );
+                assert_eq!(lido.graph_state, capturado.graph_state);
+                assert_eq!(lido.signal_ids, capturado.signal_ids);
+                assert_eq!(lido.derived_sources, capturado.derived_sources);
+                assert_eq!(lido.l4_ids, capturado.l4_ids);
+            }
+            outro => panic!("o snapshot publicado tinha de voltar utilizável: {outro:?}"),
+        }
+    }
+
+    #[test]
+    fn o_watermark_nunca_ultrapassa_o_que_o_cursor_prova() {
+        // §18 — "recovery nunca pode fazer cursor.next_lsn = head". A captura
+        // é o outro lado da mesma regra: um snapshot com watermark = head
+        // afirmaria estado aplicado sobre eventos que ninguém processou, e o
+        // arranque seguinte saltava-os por acreditar nele.
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let mut config = config_de_teste();
+        // Sem workers a processar, o cursor fica atras do head de propósito.
+        config.enabled = true;
+        let runtime = SentinelRuntime::start(log.clone(), config)
+            .unwrap()
+            .unwrap();
+        esperar_normalizados(&runtime, 0);
+        runtime.shutdown();
+
+        for utilizador in ["dave", "erin"] {
+            log.append(evento_bruto(utilizador)).unwrap();
+        }
+        let capturado = runtime.capturar_snapshot();
+        assert!(
+            capturado.applied_until_exclusive <= capturado.canonical_head_at_snapshot,
+            "watermark={} head={}",
+            capturado.applied_until_exclusive,
+            capturado.canonical_head_at_snapshot
+        );
+        assert!(
+            capturado.applied_until_exclusive < log.head(),
+            "com o pipeline parado e eventos novos no log, o watermark TEM de \
+             ficar atrás do head — se igualasse, estaria a inventar progresso"
+        );
+    }
+
+    #[test]
+    fn o_shutdown_publica_o_snapshot_final() {
+        // §45 — "em shutdown limpo, SHOULD tentar publicar snapshot final".
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let caminho = log.dir().join("sentinel").join("state.snapshot");
+        let watermark_do_arranque;
+        {
+            let runtime = SentinelRuntime::start(log.clone(), config_de_teste())
+                .unwrap()
+                .unwrap();
+            // O arranque a frio já publica (§15 caso 3): sem isso a §47 nunca
+            // sairia do primeiro passo e uma base só com `cursor.json`
+            // reconstruiria do zero a cada arranque, para sempre.
+            assert!(
+                caminho.exists(),
+                "o rebuild canónico tem de deixar um snapshot em {}",
+                caminho.display()
+            );
+            watermark_do_arranque = match SnapshotStore::new(&caminho).carregar(7).unwrap() {
+                SnapshotLoad::Utilizavel(s) => s.applied_until_exclusive,
+                outro => panic!("{outro:?}"),
+            };
+
+            log.append(evento_bruto("frank")).unwrap();
+            esperar_normalizados(&runtime, 1);
+            runtime.shutdown();
+        }
+        let store = SnapshotStore::new(&caminho);
+        match store.carregar(7).unwrap() {
+            SnapshotLoad::Utilizavel(s) => assert!(
+                s.applied_until_exclusive > watermark_do_arranque,
+                "o shutdown limpo tem de publicar um snapshot MAIS ADIANTADO \
+                 que o do arranque ({} vs {watermark_do_arranque}); senão o \
+                 trabalho feito nesta vida perde-se",
+                s.applied_until_exclusive
+            ),
+            outro => panic!("o snapshot do shutdown tinha de ser utilizável: {outro:?}"),
+        }
+    }
+
+    #[test]
+    fn a_cadencia_por_eventos_publica_sozinha() {
+        // §44 — o limiar por eventos. Posto a 1 para o teste não ter de
+        // escrever 100k eventos; o que se fixa é que o limiar dispara sem
+        // ninguém chamar `publicar_snapshot` à mão.
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let mut config = config_de_teste();
+        config.snapshot_interval_events = 1;
+        config.snapshot_interval_secs = 0;
+        let caminho = log.dir().join("sentinel").join("state.snapshot");
+
+        let runtime = SentinelRuntime::start(log.clone(), config)
+            .unwrap()
+            .unwrap();
+        log.append(evento_bruto("grace")).unwrap();
+        esperar_normalizados(&runtime, 1);
+
+        let prazo = Instant::now() + Duration::from_secs(30);
+        while !caminho.exists() && Instant::now() < prazo {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            caminho.exists(),
+            "com snapshot_interval_events=1 o worker tinha de publicar sozinho"
+        );
+    }
+}
+
+#[cfg(test)]
+mod testes_rebuild_janelado_spec0072 {
+    use super::*;
+    use heraclitus_core::FsyncPolicy;
+
+    /// SPEC-0072 §39 — o gate de regressão.
+    ///
+    /// Este teste existe para uma coisa só: falhar se alguém voltar a pôr o
+    /// arranque a varrer a base inteira. Mede EPISÓDIOS LIDOS, não tempo de
+    /// parede — o tempo varia com a máquina e faria o CI intermitente; o
+    /// número de episódios é determinista.
+    ///
+    /// A relação que fixa é a que interessa: o custo do arranque a quente tem
+    /// de ficar preso à cauda e não ao tamanho da base. Por isso a base cresce
+    /// entre as duas medições e o orçamento NÃO cresce com ela.
+    #[test]
+    fn um_arranque_a_quente_nao_pode_varrer_a_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = log_novo(&temp);
+        {
+            let runtime = SentinelRuntime::start(log.clone(), config(64))
+                .unwrap()
+                .unwrap();
+            semear(&log, 120);
+            esperar_estabilizar(&runtime, &log);
+            runtime.shutdown();
+        }
+        let base = log.head();
+        assert!(
+            base > 120,
+            "base pequena de mais para o teste valer: {base}"
+        );
+
+        // Arranque a quente, sem nada de novo.
+        let runtime = SentinelRuntime::start(log.clone(), config(64))
+            .unwrap()
+            .unwrap();
+        let quente = runtime.status().boot;
+        runtime.shutdown();
+        assert_eq!(
+            quente.events_scanned_total, 0,
+            "com snapshot no head não há cauda nenhuma para ler; \
+             ler {} episódios significa que o arranque voltou a varrer",
+            quente.events_scanned_total
+        );
+
+        // Agora com cauda: 6 eventos novos. O que é lido tem de ser da ordem
+        // da cauda, não da base.
+        semear(&log, 6);
+        let cauda_esperada = log.head() - base;
+        let runtime = SentinelRuntime::start(log.clone(), config(64))
+            .unwrap()
+            .unwrap();
+        let com_cauda = runtime.status().boot;
+        esperar_estabilizar(&runtime, &log);
+        runtime.shutdown();
+
+        // Quatro passagens sobre a mesma cauda: o tecto é 4x, com folga.
+        let tecto = cauda_esperada * 5;
+        assert!(
+            com_cauda.events_scanned_total <= tecto,
+            "o arranque leu {} episódios para uma cauda de {cauda_esperada} \
+             (base={base}); orçamento={tecto}. O arranque voltou a ser \
+             proporcional à base — é exactamente o que o INV-5 proíbe.",
+            com_cauda.events_scanned_total
+        );
+        assert!(
+            com_cauda.events_scanned_total < base,
+            "ler {} de uma base de {base} já é varrer a base",
+            com_cauda.events_scanned_total
+        );
+    }
+
+    /// SPEC-0072 §22 — idempotência do replay.
+    ///
+    /// "Executar o mesmo replay 10 vezes deve resultar nos mesmos SecurityEvent
+    /// IDs, SecuritySignal IDs, incident revision IDs, risk revision IDs, graph
+    /// state, fusion state, cursor e snapshot digest, quando o estado lógico
+    /// não muda."
+    ///
+    /// Dez arranques seguidos sobre a mesma base, sem nada de novo no log. O
+    /// que se compara não é só o estado em memória: é o LOG, que não pode
+    /// crescer, e o snapshot, que não pode mudar de conteúdo.
+    #[test]
+    fn dez_replays_do_mesmo_intervalo_dao_o_mesmo_estado() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = log_novo(&temp);
+        {
+            let runtime = SentinelRuntime::start(log.clone(), config(16))
+                .unwrap()
+                .unwrap();
+            semear(&log, 35);
+            esperar_estabilizar(&runtime, &log);
+            runtime.shutdown();
+        }
+        let head_estavel = log.head();
+        let caminho = log.dir().join("sentinel").join("state.snapshot");
+
+        let mut referencia: Option<SentinelStateSnapshot> = None;
+        for volta in 1..=10 {
+            // Metade das voltas parte de um rebuild frio, para que a
+            // idempotência não seja só a do caminho a quente: apagar o
+            // snapshot obriga a reconstruir tudo do log.
+            if volta % 2 == 0 {
+                let _ = std::fs::remove_file(&caminho);
+            }
+            let runtime = SentinelRuntime::start(log.clone(), config(16))
+                .unwrap()
+                .unwrap();
+            esperar_estabilizar(&runtime, &log);
+            let capturado = runtime.capturar_snapshot();
+            runtime.shutdown();
+
+            assert_eq!(
+                log.head(),
+                head_estavel,
+                "volta {volta}: o replay acrescentou {} episódios ao log",
+                log.head() - head_estavel
+            );
+            match &referencia {
+                None => referencia = Some(capturado),
+                Some(esperado) => {
+                    assert_eq!(
+                        capturado.signal_ids, esperado.signal_ids,
+                        "volta {volta}: outros SecuritySignal IDs"
+                    );
+                    assert_eq!(
+                        capturado.incident_revision_ids, esperado.incident_revision_ids,
+                        "volta {volta}: outras revisões de incidente"
+                    );
+                    assert_eq!(
+                        capturado.risk_revision_ids, esperado.risk_revision_ids,
+                        "volta {volta}: outras revisões de risco"
+                    );
+                    assert_eq!(
+                        capturado.graph_state, esperado.graph_state,
+                        "volta {volta}: outro grafo"
+                    );
+                    assert_eq!(
+                        capturado.fusion_state, esperado.fusion_state,
+                        "volta {volta}: outro estado de fusão"
+                    );
+                    assert_eq!(
+                        capturado.applied_until_exclusive, esperado.applied_until_exclusive,
+                        "volta {volta}: outro cursor"
+                    );
+                    assert_eq!(
+                        capturado.derived_sources, esperado.derived_sources,
+                        "volta {volta}: outra janela de origens derivadas — \
+                         é o sintoma de a janela estar a ser preenchida por \
+                         uma ordem que não é a do scan"
+                    );
+                }
+            }
+        }
+    }
+
+    /// INV-5, medido: com snapshot válido o arranque lê a CAUDA, não a base.
+    ///
+    /// É este o teste que justifica a SPEC-0072 inteira. Tudo o resto —
+    /// digest, publicação atómica, reconciliação — existe para tornar este
+    /// número verdadeiro e seguro.
+    #[test]
+    fn um_arranque_a_quente_le_a_cauda_e_nao_a_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = log_novo(&temp);
+        {
+            let runtime = SentinelRuntime::start(log.clone(), config(8))
+                .unwrap()
+                .unwrap();
+            semear(&log, 60);
+            esperar_estabilizar(&runtime, &log);
+            runtime.shutdown();
+        }
+        let head_depois = log.head();
+        assert!(head_depois > 60);
+
+        // Segundo arranque, sem nada de novo no log: o snapshot do shutdown
+        // cobre tudo, logo a cauda tem de ser ZERO.
+        let runtime = SentinelRuntime::start(log.clone(), config(8))
+            .unwrap()
+            .unwrap();
+        let boot = runtime.status().boot;
+        runtime.shutdown();
+        assert_eq!(
+            boot.outcome, "synchronized",
+            "com snapshot no head e cursor no head o arranque tem de ser \
+             instantâneo; veio {boot:?}"
+        );
+        assert_eq!(boot.tail_events, 0, "não havia cauda para reproduzir");
+        assert_eq!(
+            boot.full_rebuild_total, 0,
+            "um snapshot válido não pode desencadear rebuild"
+        );
+
+        // Terceiro arranque, com 5 eventos novos: a cauda é a diferença, e
+        // NUNCA a base inteira.
+        semear(&log, 5);
+        let head_com_novos = log.head();
+        let runtime = SentinelRuntime::start(log.clone(), config(8))
+            .unwrap()
+            .unwrap();
+        let boot = runtime.status().boot;
+        esperar_estabilizar(&runtime, &log);
+        runtime.shutdown();
+        assert_eq!(boot.outcome, "catch_up_tail", "veio {boot:?}");
+        assert_eq!(
+            boot.tail_events,
+            head_com_novos - head_depois,
+            "a cauda tem de ser exactamente os eventos novos"
+        );
+        assert!(
+            boot.tail_events < head_com_novos / 4,
+            "a cauda ({}) não pode ser da ordem da base ({head_com_novos})",
+            boot.tail_events
+        );
+    }
+
+    /// §36 — snapshot corrompido: rejeitado, rebuild derivado, log preservado.
+    #[test]
+    fn um_snapshot_corrompido_faz_rebuild_sem_tocar_no_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = log_novo(&temp);
+        {
+            let runtime = SentinelRuntime::start(log.clone(), config(8))
+                .unwrap()
+                .unwrap();
+            semear(&log, 30);
+            esperar_estabilizar(&runtime, &log);
+            runtime.shutdown();
+        }
+        let head_antes = log.head();
+        let caminho = log.dir().join("sentinel").join("state.snapshot");
+        let mut bytes = std::fs::read(&caminho).unwrap();
+        let ultimo = bytes.len() - 1;
+        bytes[ultimo] ^= 0xFF;
+        std::fs::write(&caminho, &bytes).unwrap();
+
+        let runtime = SentinelRuntime::start(log.clone(), config(8))
+            .unwrap()
+            .unwrap();
+        let boot = runtime.status().boot;
+        esperar_estabilizar(&runtime, &log);
+        runtime.shutdown();
+
+        assert_eq!(boot.outcome, "rebuild_canonical", "veio {boot:?}");
+        assert_eq!(boot.snapshot_rejected_total, 1);
+        assert_eq!(boot.snapshot_corrupt_total, 1);
+        assert_eq!(boot.full_rebuild_total, 1);
+        assert_eq!(
+            log.head(),
+            head_antes,
+            "um snapshot corrompido não pode fazer o rebuild acrescentar \
+             nada ao log canónico"
+        );
+    }
+
+    /// §15 caso 4 + §16 + §17 — cursor além do head.
+    #[test]
+    fn um_cursor_alem_do_head_e_registado_preservado_e_reconstruido() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = log_novo(&temp);
+        {
+            let runtime = SentinelRuntime::start(log.clone(), config(8))
+                .unwrap()
+                .unwrap();
+            semear(&log, 20);
+            esperar_estabilizar(&runtime, &log);
+            runtime.shutdown();
+        }
+        let head_antes = log.head();
+
+        // Um cursor que aponta para além do log é a assinatura de cauda
+        // perdida: restauro de backup, ou truncagem por corrupção.
+        let cursor_path = log.dir().join("sentinel").join("cursor.json");
+        std::fs::write(
+            &cursor_path,
+            serde_json::to_vec_pretty(&SentinelCursor {
+                next_lsn: head_antes + 500,
+                pipeline_version: 1,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        // O snapshot também deixa de servir: foi capturado noutra realidade.
+        let _ = std::fs::remove_file(log.dir().join("sentinel").join("state.snapshot"));
+
+        let runtime = SentinelRuntime::start(log.clone(), config(8))
+            .unwrap()
+            .unwrap();
+        let boot = runtime.status().boot;
+        esperar_estabilizar(&runtime, &log);
+        runtime.shutdown();
+
+        assert_eq!(
+            boot.outcome, "rebuild_canonical",
+            "sob a política `rebuild` (default) a divergência reconstrói em \
+             vez de recusar o arranque; veio {boot:?}"
+        );
+        assert_eq!(boot.divergence_total, 1, "a divergência TEM de ser contada");
+        assert_eq!(boot.cursor_ahead_total, 1);
+        assert!(
+            log.dir()
+                .join("sentinel")
+                .join(format!(
+                    "cursor.divergent.next{}.head{head_antes}.json",
+                    head_antes + 500
+                ))
+                .exists(),
+            "§16: o cursor divergente tem de ficar preservado para auditoria"
+        );
+        assert_eq!(
+            log.head(),
+            head_antes,
+            "recuperar de um cursor divergente não pode alterar o log"
+        );
+    }
+
+    /// §17 — a política `strict` recusa em vez de recuperar.
+    #[test]
+    fn a_politica_strict_recusa_arrancar_com_cursor_divergente() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = log_novo(&temp);
+        {
+            let runtime = SentinelRuntime::start(log.clone(), config(8))
+                .unwrap()
+                .unwrap();
+            semear(&log, 10);
+            esperar_estabilizar(&runtime, &log);
+            runtime.shutdown();
+        }
+        std::fs::write(
+            log.dir().join("sentinel").join("cursor.json"),
+            serde_json::to_vec_pretty(&SentinelCursor {
+                next_lsn: log.head() + 1,
+                pipeline_version: 1,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut cfg = config(8);
+        cfg.recovery.cursor_policy = heraclitus_core::CursorPolicy::Strict;
+        let erro = match SentinelRuntime::start(log.clone(), cfg) {
+            Err(erro) => erro,
+            Ok(_) => panic!("strict tinha de recusar o arranque"),
+        };
+        assert!(
+            erro.to_string().contains("strict"),
+            "a mensagem tem de dizer que foi a política que recusou: {erro}"
+        );
+    }
+
+    fn log_novo(temp: &tempfile::TempDir) -> Arc<AnyLog> {
+        Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn config(lote: usize) -> SentinelConfig {
+        SentinelConfig {
+            enabled: true,
+            mode: SentinelMode::Observe,
+            queue_capacity: 64,
+            worker_threads: 1,
+            pipeline_version: 1,
+            catch_up_batch: 16,
+            l2: SentinelL2Config {
+                enabled: true,
+                minimum_support: 1,
+                learning_delay_events: 1,
+                shadow_only: false,
+                suspicious_severity: 9,
+            },
+            l3: SentinelL3Config {
+                enabled: true,
+                max_graph_hops: 6,
+            },
+            replay_batch_events: lote,
+            // Sem publicacao automatica: estes testes medem o rebuild, nao a
+            // cadencia, e um snapshot pelo meio mudaria o que se esta a medir.
+            snapshot_interval_events: 0,
+            snapshot_interval_secs: 0,
+            ..Default::default()
+        }
+    }
+
+    fn semear(log: &AnyLog, quantos: usize) {
+        for i in 0..quantos {
+            let corpo = format!(
+                concat!(
+                    r#"{{"source":"auditd","category":"authentication","#,
+                    r#""activity":"login","outcome":"success","user":"u{}","severity":{}}}"#
+                ),
+                i % 7,
+                if i % 5 == 0 { 10 } else { 1 }
+            );
+            log.append(Episode::new(
+                "auditd",
+                EventKind::Observation,
+                corpo.into_bytes(),
+            ))
+            .unwrap();
+        }
+    }
+
+    fn esperar_estabilizar(runtime: &SentinelRuntime, log: &AnyLog) {
+        let prazo = Instant::now() + Duration::from_secs(60);
+        loop {
+            let s = runtime.status();
+            if s.next_lsn >= log.head() {
+                // Mais uma volta curta para o pipeline assentar os derivados
+                // que ele proprio acabou de acrescentar ao log.
+                std::thread::sleep(Duration::from_millis(50));
+                if runtime.status().next_lsn >= log.head() {
+                    return;
+                }
+            }
+            if Instant::now() >= prazo {
+                panic!(
+                    "o pipeline nao estabilizou: next={} head={}",
+                    s.next_lsn,
+                    log.head()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// O teste que fecha o perigo central do rebuild janelado.
+    ///
+    /// A primeira passagem tem de encher os conjuntos de deduplicacao ANTES de
+    /// qualquer replay. Se nao os encher — ou se os encher a meio — a segunda,
+    /// terceira e quarta passagens nao reconhecem o que ja produziram e
+    /// APENDEM outra vez ao log canonico. O sintoma seria o log a crescer a
+    /// cada reinicio, para sempre.
+    #[test]
+    fn reiniciar_nao_acrescenta_nada_ao_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = log_novo(&temp);
+        {
+            let runtime = SentinelRuntime::start(log.clone(), config(8))
+                .unwrap()
+                .unwrap();
+            semear(&log, 40);
+            esperar_estabilizar(&runtime, &log);
+            runtime.shutdown();
+        }
+        let depois_do_primeiro = log.head();
+        assert!(
+            depois_do_primeiro > 40,
+            "o pipeline tem de ter derivado alguma coisa; head={depois_do_primeiro}"
+        );
+
+        // Lotes propositadamente pequenos e diferentes entre reinicios: se
+        // alguma passagem dependesse da fronteira do lote, aqui partia.
+        for lote in [1usize, 3, 8, 4096] {
+            let runtime = SentinelRuntime::start(log.clone(), config(lote))
+                .unwrap()
+                .unwrap();
+            esperar_estabilizar(&runtime, &log);
+            runtime.shutdown();
+            assert_eq!(
+                log.head(),
+                depois_do_primeiro,
+                "reinicio com replay_batch_events={lote} acrescentou {} episodios ao log",
+                log.head() - depois_do_primeiro
+            );
+        }
+    }
+
+    /// O tamanho do lote e uma decisao de memoria, nunca de semantica.
+    #[test]
+    fn o_estado_reconstruido_nao_depende_do_tamanho_do_lote() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = log_novo(&temp);
+        {
+            let runtime = SentinelRuntime::start(log.clone(), config(16))
+                .unwrap()
+                .unwrap();
+            semear(&log, 30);
+            esperar_estabilizar(&runtime, &log);
+            runtime.shutdown();
+        }
+
+        let mut referencia: Option<SentinelStateSnapshot> = None;
+        for lote in [1usize, 2, 7, 64, 100_000] {
+            let runtime = SentinelRuntime::start(log.clone(), config(lote))
+                .unwrap()
+                .unwrap();
+            esperar_estabilizar(&runtime, &log);
+            let capturado = runtime.capturar_snapshot();
+            runtime.shutdown();
+            match &referencia {
+                None => referencia = Some(capturado),
+                Some(esperado) => {
+                    assert_eq!(
+                        capturado.graph_state, esperado.graph_state,
+                        "lote={lote} reconstruiu um grafo diferente"
+                    );
+                    assert_eq!(
+                        capturado.signal_ids, esperado.signal_ids,
+                        "lote={lote} reconstruiu outro conjunto de sinais"
+                    );
+                    assert_eq!(
+                        capturado.incident_state, esperado.incident_state,
+                        "lote={lote} reconstruiu outros incidentes"
+                    );
+                    assert_eq!(
+                        capturado.behavior_state, esperado.behavior_state,
+                        "lote={lote} reconstruiu outras baselines"
+                    );
+                    assert_eq!(
+                        capturado.l4_ids, esperado.l4_ids,
+                        "lote={lote} reconstruiu outros ids L4"
+                    );
+                }
+            }
+        }
+    }
+
+    /// SPEC-0072 §10 — a marca de agua e fixada uma vez.
+    ///
+    /// Se cada passagem relesse `log.head()`, uma passagem posterior veria
+    /// eventos que a anterior nao viu. O caso concreto e este: eventos a
+    /// entrar no log enquanto o arranque decorre.
+    #[test]
+    fn eventos_que_chegam_com_o_sentinel_parado_nao_sao_duplicados() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = log_novo(&temp);
+        {
+            let runtime = SentinelRuntime::start(log.clone(), config(4))
+                .unwrap()
+                .unwrap();
+            semear(&log, 20);
+            esperar_estabilizar(&runtime, &log);
+            runtime.shutdown();
+        }
+        let estavel = log.head();
+
+        // Acrescenta ao log com o Sentinel PARADO: no proximo arranque estes
+        // eventos estao abaixo do head fixado e entram no rebuild; os que o
+        // worker acrescentar depois entram pelo `process_until`. Nenhum dos
+        // dois caminhos pode duplicar o outro.
+        semear(&log, 10);
+        let runtime = SentinelRuntime::start(log.clone(), config(4))
+            .unwrap()
+            .unwrap();
+        esperar_estabilizar(&runtime, &log);
+        let head_final = log.head();
+        runtime.shutdown();
+
+        let runtime = SentinelRuntime::start(log.clone(), config(4))
+            .unwrap()
+            .unwrap();
+        esperar_estabilizar(&runtime, &log);
+        runtime.shutdown();
+        assert_eq!(
+            log.head(),
+            head_final,
+            "o arranque seguinte duplicou derivados dos eventos que chegaram \
+             com o Sentinel parado (estavel={estavel})"
+        );
     }
 }

@@ -57,7 +57,15 @@ use crate::generation::hex;
 /// Versão do contrato de exportação. Sobe quando o esquema Parquet ou o
 /// conjunto de chaves de proveniência muda — é o que permite a um consumidor
 /// saber se pode confiar no que lê sem adivinhar.
-pub const EXPORT_FORMAT_VERSION: u32 = 1;
+///
+/// `2` (SPEC-0073 §15/§16): o Parquet passou de **um** row group para row
+/// groups de `export_batch_rows` linhas. O esquema e as chaves de proveniência
+/// não mudaram, e o conteúdo lógico é o mesmo — mas os BYTES mudam, e a §209
+/// promete idempotência ao byte. Um consumidor que tenha guardado o digest de
+/// um ficheiro da v1 tem de conseguir distinguir "mudou porque os dados
+/// mudaram" de "mudou porque o produtor mudou de layout"; é para isso que este
+/// número existe.
+pub const EXPORT_FORMAT_VERSION: u32 = 2;
 
 /// Prefixo de todas as chaves de proveniência na metadata do Parquet.
 pub const PROV_PREFIX: &str = "heraclitus.";

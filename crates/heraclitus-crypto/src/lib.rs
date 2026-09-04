@@ -96,6 +96,28 @@ fn restrict_file_perms(path: &Path) {
 #[cfg(not(unix))]
 fn restrict_file_perms(_path: &Path) {}
 
+/// Torna durável a *entrada de directório*, não só o conteúdo do ficheiro.
+///
+/// Sem isto o keystore tinha dois modos de falha simétricos e ambos graves:
+/// uma chave criada com `sync_all` podia perder a sua entrada de directório
+/// numa falha de energia — e com a chave desaparece tudo o que ela cifra; e um
+/// `remove_file` do crypto-shred podia não ser durável — o ficheiro voltava, e
+/// **um apagamento que reverte não é um apagamento**, o que numa base que
+/// promete erasure por crypto-shred é falha de conformidade, não um detalhe.
+fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        // Em Windows não é possível abrir um directório como ficheiro; o NTFS
+        // torna a operação de metadados durável por outra via.
+        let _ = dir;
+        Ok(())
+    }
+}
+
 impl KeyStore {
     /// Open (or create) the key directory.
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<Arc<Self>> {
@@ -153,6 +175,12 @@ impl KeyStore {
                         rand::thread_rng().fill_bytes(&mut k);
                         f.write_all(&k)?;
                         f.sync_all()?;
+                        // A chave só existe de verdade quando a ENTRADA DE
+                        // DIRECTÓRIO for durável. Sem isto, uma falha de
+                        // energia entre o `sync_all` e o flush dos metadados
+                        // levava a chave — e com ela todos os episódios que
+                        // ela cifra, de forma irrecuperável.
+                        sync_dir(&self.dir)?;
                         k
                     }
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -222,11 +250,23 @@ impl KeyStore {
         if !path.exists() {
             return Ok(false);
         }
-        // Best-effort overwrite so the raw key bytes do not linger on disk.
+        // Sobrescrever antes de remover, para os bytes da chave não ficarem no
+        // disco. O `sync_all` a seguir não é zelo: sem ele os zeros ficam em
+        // buffers e o bloco original pode sobreviver à falha.
         if let Ok(meta) = std::fs::metadata(&path) {
-            let _ = std::fs::write(&path, vec![0u8; meta.len() as usize]);
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&path) {
+                use std::io::Write as _;
+                let mut f = f;
+                let _ = f.write_all(&vec![0u8; meta.len() as usize]);
+                let _ = f.sync_all();
+            }
         }
         std::fs::remove_file(&path)?;
+        // O apagamento só conta depois de a remoção ser durável. Sem este
+        // fsync do directório, um crash logo a seguir ressuscitava a chave —
+        // e um crypto-shred que reverte devolve acesso a dados que foram
+        // declarados apagados.
+        sync_dir(&self.dir)?;
         Ok(true)
     }
 

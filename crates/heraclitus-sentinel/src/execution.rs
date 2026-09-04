@@ -387,6 +387,20 @@ impl AiCircuitBreaker {
         self.opened_at_ms = None;
     }
 
+    /// Devolve a permissão sem a contar como sucesso nem como falha.
+    ///
+    /// Existe para o caso em que a future do pedido é **cancelada** antes de
+    /// terminar: sem isto, nem `record_success` nem `record_failure` chegavam a
+    /// correr e o `in_flight` nunca descia. Ao fim de
+    /// `max_concurrent_requests` cancelamentos o `begin_request` passava a
+    /// recusar sempre, e o plano L4 ficava fechado até ao próximo reinício.
+    ///
+    /// Um cancelamento não é um voto sobre a saúde do backend, por isso não
+    /// toca no contador de falhas consecutivas.
+    pub fn release_cancelled(&mut self) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+    }
+
     pub fn record_failure(&mut self, now_ms: u64) {
         self.in_flight = self.in_flight.saturating_sub(1);
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);

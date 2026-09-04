@@ -17,6 +17,7 @@
 
 pub mod cpm;
 pub mod format;
+pub mod io_backend; // SPEC-0073 §7: contrato de I/O do log (PortableFileIo default)
 pub mod mmap;
 pub mod skip_scan; // SPEC-010: segment-level skip-I/O scan wired on zone maps
 pub mod store; // SPEC-0050: fachada explícita e neutra entre HRKL legado/v6
@@ -27,6 +28,7 @@ pub mod zone_map; // SPEC-010: per-segment min/max skip-I/O primitive
 
 pub use store::{AnyLog, EpisodeLog, PrunedScanStats};
 
+use crate::io_backend::{LogIoBackend, PortableFileIo};
 use arc_swap::ArcSwap;
 use format::{Decoded, SegmentFooter, SegmentHeader, HEADER_LEN};
 use heraclitus_core::{
@@ -147,7 +149,14 @@ pub struct LogCatalog {
 }
 
 struct Active {
-    file: File,
+    /// SPEC-0073 §7 — a escrita passa pelo contrato `LogIoBackend`.
+    ///
+    /// `PortableFileIo` e o baseline e continua a ser o default; a §7 e
+    /// explicita em que "o atual writer SHALL permanecer como baseline". As
+    /// chamadas de sistema sao as mesmas, na mesma ordem — o que muda e haver
+    /// agora um sitio onde um backend Linux se pode ligar sem mexer no ciclo
+    /// do writer.
+    io: crate::io_backend::PortableFileIo,
     segment_id: SegmentId,
     bytes_written: u64,
     record_hashes: Vec<[u8; 32]>,
@@ -671,10 +680,11 @@ fn sync_parent_dir(dir: &Path) -> Result<(), HeraclitusError> {
     Ok(())
 }
 
-fn rollback_active_file(file: &mut File, bytes_written: u64) {
-    let _ = file.set_len(bytes_written);
-    let _ = file.seek(SeekFrom::Start(bytes_written));
-    let _ = file.sync_data();
+fn rollback_active_file(io: &mut crate::io_backend::PortableFileIo, bytes_written: u64) {
+    use crate::io_backend::LogIoBackend;
+    let _ = io.truncar(bytes_written);
+    let _ = io.ficheiro().seek(SeekFrom::Start(bytes_written));
+    let _ = io.sync();
 }
 
 impl Log {
@@ -748,9 +758,43 @@ impl Log {
             let path = segment_path(&dir, *id);
             let is_last = Some(*id) == ids.last().copied();
 
-            let scan = scans[idx]
+            let mut scan = scans[idx]
                 .take()
                 .expect("cada segmento é varrido exatamente uma vez");
+
+            // Um ficheiro mais curto que o cabeçalho é um TOCO DE CRASH: o
+            // `create` publica a entrada de directório antes de escrever o
+            // header, e um kill nessa janela deixa zero bytes no disco.
+            //
+            // Tem de ser materializado AQUI, antes de qualquer decisão a
+            // jusante, porque o `SegmentScan` de um toco declara
+            // `valid_len: HEADER_LEN` — um cabeçalho que não está lá — e todos
+            // os consumidores confiam nesse número e fazem `seek` para ele: o
+            // `seal_file` escreve o rodapé no offset 22, e a retoma da cauda
+            // acrescenta registos a partir de 22. Qualquer um deles deixa um
+            // buraco de 22 zeros à cabeça, e a abertura seguinte morre em
+            // `SegmentHeader::decode` com "bad magic or short header" — a base
+            // deixa de abrir e só sai dali com alguém a apagar o ficheiro.
+            //
+            // O caso do cabeçalho PARCIAL (1..21 bytes) já era tratado, porque
+            // `corruption_detected` é `file_len > 0`. O de ZERO bytes escapava
+            // entre as duas condições: `corruption_detected` é falso e a guarda
+            // `valid_len < file_len` é `22 < 0`, também falsa. Precisou de
+            // ~740 iterações do crash-test para o kill calhar nessa janela.
+            //
+            // `execute_physical_repair` com `HEADER_LEN` é exactamente a
+            // operação certa: trunca e escreve um cabeçalho válido, deixando um
+            // segmento legítimo com zero registos. Não se perde nada, porque os
+            // registos vêm depois do cabeçalho.
+            if scan.file_len < HEADER_LEN as u64 {
+                tracing::warn!(
+                    segmento = id,
+                    bytes = scan.file_len,
+                    "segmento sem cabeçalho completo: toco de um crash durante a criação; cabeçalho reposto"
+                );
+                execute_physical_repair(&path, HEADER_LEN as u64)?;
+                scan.file_len = HEADER_LEN as u64;
+            }
             // O relógio HLC nunca arranca ATRÁS do que já está persistido:
             // sem isto, um wall clock que recuasse entre execuções quebraria
             // a monotonicidade de ts por LSN (o contrato do AS OF TIMESTAMP).
@@ -867,7 +911,7 @@ impl Log {
                 });
 
                 let state = Active {
-                    file,
+                    io: PortableFileIo::new(file),
                     segment_id: id,
                     bytes_written: scan.valid_len,
                     record_hashes: scan.record_hashes,
@@ -1164,7 +1208,7 @@ impl Log {
                                 // RESOLUÇÃO DE DRIFT: Captura do offset físico EXATO antes do write_all
                                 let record_offset = active.bytes_written;
 
-                                if let Err(e) = active.file.write_all(&record) {
+                                if let Err(e) = active.io.append_batch(&record) {
                                     physical_io_error = true;
                                     let _ = resp_tx.send(Err(e.into()));
                                     break;
@@ -1207,7 +1251,7 @@ impl Log {
 
                     // RECOVERY TRANSACIONAL DE MEMÓRIA: Restaura o alinhamento em falhas físicas parciais
                     if physical_io_error {
-                        rollback_active_file(&mut active.file, initial_bytes_written);
+                        rollback_active_file(&mut active.io, initial_bytes_written);
                         active.bytes_written = initial_bytes_written;
                         active.record_hashes.truncate(initial_hashes_len);
                         active.max_lsn = initial_max_lsn;
@@ -1217,8 +1261,8 @@ impl Log {
 
                     // PIPELINE — FASE 3: FS DATA HARDWARE BARRIER
                     if sync_required {
-                        if active.file.sync_data().is_err() {
-                            rollback_active_file(&mut active.file, initial_bytes_written);
+                        if active.io.sync().is_err() {
+                            rollback_active_file(&mut active.io, initial_bytes_written);
                             active.bytes_written = initial_bytes_written;
                             active.record_hashes.truncate(initial_hashes_len);
                             active.max_lsn = initial_max_lsn;
@@ -1997,7 +2041,7 @@ impl Log {
     /// resposta fica DE FORA, para não serializar as escritas.
     fn enqueue_append_inner(
         &self,
-        mut episode: Episode,
+        episode: Episode,
         expected_lsn: Option<Lsn>,
         ctx: &str,
         stamp: bool,
@@ -2005,28 +2049,70 @@ impl Log {
         self.check_poison()?;
         let (tx, rx) = crossbeam_channel::bounded(1);
         let opaque_meta = episode.id.0.to_bytes();
+        // O `stamp_lock` NUNCA é segurado enquanto se espera por espaço na fila.
+        //
+        // A atomicidade de carimbo+enfileiramento tem de ser mantida — o
+        // comentário acima regista a medição que a justifica: 69 inversões em
+        // 1200 registos quando o carimbo ficava fora, o que partia a busca
+        // binária do AS OF TIMESTAMP. Mas o `send_timeout` de 10 s estava
+        // DENTRO do lock, e quando o canal enchia cada escritor ficava atrás de
+        // outro bloqueado até dez segundos: um comboio, exactamente sob a carga
+        // em que menos se pode dar ao luxo de um.
+        //
+        // Cada tentativa continua atómica (carimba e enfileira sob o lock, com
+        // `try_send`, que não bloqueia). Se a fila estiver cheia, o lock é
+        // LARGADO antes de esperar, e a tentativa seguinte volta a carimbar —
+        // o que está certo, porque também volta a enfileirar mais tarde. A
+        // ordem dos carimbos bem-sucedidos continua igual à ordem de entrada na
+        // fila, que é o invariante que interessa.
         let ts;
-        {
-            let _ordem = self.stamp_lock.lock().unwrap_or_else(|e| e.into_inner());
-            if stamp {
-                episode.ts_hlc = self.hlc.now();
+        let prazo = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut pendente = Some((episode, tx));
+        loop {
+            let Some((mut ep, resp_tx)) = pendente.take() else {
+                unreachable!("o par só é retirado para ser reposto ou consumido");
+            };
+            let devolvido = {
+                let _ordem = self.stamp_lock.lock().unwrap_or_else(|e| e.into_inner());
+                if stamp {
+                    ep.ts_hlc = self.hlc.now();
+                }
+                let carimbo = ep.ts_hlc;
+                match self.cmd_tx.try_send(LogCommand::Append {
+                    opaque_meta,
+                    episode: Arc::new(ep),
+                    expected_lsn,
+                    resp_tx,
+                }) {
+                    Ok(()) => {
+                        ts = carimbo;
+                        break;
+                    }
+                    Err(crossbeam_channel::TrySendError::Full(cmd)) => cmd,
+                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                        return Err(HeraclitusError::StorageEngine(format!(
+                            "Worker do log encerrado ({ctx})"
+                        )))
+                    }
+                }
+            };
+            // Fora do lock a partir daqui.
+            let LogCommand::Append {
+                episode: arc,
+                resp_tx,
+                ..
+            } = devolvido
+            else {
+                unreachable!("o comando devolvido é o mesmo que foi enviado");
+            };
+            let ep = Arc::try_unwrap(arc).unwrap_or_else(|partilhado| (*partilhado).clone());
+            if std::time::Instant::now() >= prazo {
+                return Err(HeraclitusError::StorageEngine(format!(
+                    "Timeout de canal: pipeline saturado ({ctx})"
+                )));
             }
-            ts = episode.ts_hlc;
-            self.cmd_tx
-                .send_timeout(
-                    LogCommand::Append {
-                        opaque_meta,
-                        episode: Arc::new(episode),
-                        expected_lsn,
-                        resp_tx: tx,
-                    },
-                    std::time::Duration::from_secs(10),
-                )
-                .map_err(|_| {
-                    HeraclitusError::StorageEngine(format!(
-                        "Timeout de canal: pipeline saturado ({ctx})"
-                    ))
-                })?;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            pendente = Some((ep, resp_tx));
         }
         let lsn = rx.recv().map_err(|_| {
             HeraclitusError::StorageEngine(format!("Worker interrompido no {ctx}"))
@@ -2137,7 +2223,7 @@ fn new_active(
     sync_parent_dir(dir)?;
 
     Ok(Active {
-        file,
+        io: PortableFileIo::new(file),
         segment_id: id,
         bytes_written: HEADER_LEN as u64,
         record_hashes: Vec::new(),
@@ -2154,15 +2240,15 @@ fn roll_segment(
     next_base_lsn: Lsn,
     hlc: &Hlc,
 ) -> Result<(), HeraclitusError> {
-    active.file.sync_data()?;
+    active.io.sync()?;
     let footer = SegmentFooter {
         record_count: active.record_hashes.len() as u64,
         min_lsn: active.base_lsn,
         max_lsn: active.max_lsn,
         blake3_root: merkle_root(&active.record_hashes),
     };
-    active.file.write_all(&footer.encode())?;
-    active.file.sync_data()?;
+    active.io.append_batch(&footer.encode())?;
+    active.io.sync()?;
 
     let next_id = active.segment_id + 1;
     let old_base_lsn = active.base_lsn;
@@ -2235,9 +2321,22 @@ fn check_and_recover_truncate_intent(dir: &Path) -> Result<(), HeraclitusError> 
             let valid_len = u64::from_le_bytes(buf[8..16].try_into().unwrap_or([0u8; 8]));
             let seg_p = segment_path(dir, seg_id);
             if seg_p.exists() {
-                let target_f = OpenOptions::new().write(true).open(&seg_p)?;
-                target_f.set_len(valid_len)?;
-                target_f.sync_all()?;
+                // `set_len` em bruto era um bug de recuperação: ele também
+                // ESTENDE. Um segmento criado e morto antes de o cabeçalho lá
+                // chegar é um ficheiro de zero bytes, e o `valid_len` de um
+                // segmento sem registos é exactamente HEADER_LEN — portanto o
+                // `set_len` fabricava 22 bytes de zeros. Na abertura seguinte
+                // esse ficheiro já passava o guard de comprimento e ia morrer
+                // no `SegmentHeader::decode` com "bad magic or short header",
+                // deixando o log impossível de abrir. Precisou de duas
+                // passagens para se manifestar, o que o fez parecer aleatório:
+                // o crash-test apanhava-o lá pela iteração ~887 de 1000.
+                //
+                // `execute_physical_repair` já sabe distinguir os dois casos —
+                // para HEADER_LEN reescreve um cabeçalho válido em vez de
+                // encher de zeros — e é a mesma função que o resto da
+                // recuperação usa. Reutilizá-la elimina a divergência.
+                execute_physical_repair(&seg_p, valid_len)?;
             }
             // R5: o intent (formato novo) lista também os segmentos seguintes a
             // remover — completa a remoção que um crash interrompeu, para que os
@@ -2573,8 +2672,15 @@ fn execute_physical_repair(path: &Path, valid_offset: u64) -> Result<(), Heracli
         f.sync_all()?;
     } else {
         let f = OpenOptions::new().write(true).open(path)?;
-        f.set_len(valid_offset)?;
-        f.sync_all()?;
+        // Só ENCOLHE. `set_len` estende com zeros quando o alvo é maior que o
+        // ficheiro, e a recuperação nunca pode fabricar bytes que ninguém
+        // escreveu: seriam indistinguíveis de dados no varrimento seguinte.
+        // Um ficheiro mais curto do que o intent afirma significa que o disco
+        // tem menos do que se julgava — o que lá está é o que se recupera.
+        if f.metadata()?.len() > valid_offset {
+            f.set_len(valid_offset)?;
+            f.sync_all()?;
+        }
     }
     sync_parent_dir(path.parent().unwrap_or(path))?;
     Ok(())

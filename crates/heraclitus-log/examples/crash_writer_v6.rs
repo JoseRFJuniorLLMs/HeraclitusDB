@@ -47,6 +47,13 @@ fn retomar(dir: &Path) -> (u64, u64) {
         .unwrap_or_default();
     ids.sort_unstable();
 
+    // Um toco de crash — ficheiro criado mas morto antes de o header lá chegar
+    // — não tem header e portanto não tem registos. Retomar a partir dele
+    // levaria o `scan_raw_segment` a devolver "short header", e o ramo de erro
+    // abaixo reiniciaria o LSN em 0, gerando LSNs duplicados entre segmentos.
+    // Saltá-lo é o que o motor faz no arranque.
+    ids.retain(|&id| !heraclitus_log::v6::raw::is_crash_stub(&caminho(dir, id)).unwrap_or(false));
+
     let Some(&ultimo) = ids.last() else {
         return (0, 0);
     };

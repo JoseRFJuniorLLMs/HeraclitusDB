@@ -249,8 +249,20 @@ pub fn generate(output: &Path) -> Result<SbomSummary> {
     }
     let current = std::env::current_dir()?;
     let repo = repository_root(&current)?;
+    // `--filter-platform` restringe o grafo resolvido ao alvo que está a ser
+    // empacotado. Sem ele o SBOM assinado declarava as dependências de TODAS
+    // as plataformas — 25 crates `windows-*` dentro de um bundle
+    // `linux-x86_64`. Um SBOM é a lista do que está no artefacto; declarar
+    // componentes que lá não estão estraga exactamente aquilo para que ele
+    // serve, que é responder a "esta CVE afecta-me?".
+    let alvo = alvo_do_host();
+    let mut argumentos = vec!["metadata", "--locked", "--offline", "--format-version", "1"];
+    if let Some(triplo) = alvo.as_deref() {
+        argumentos.push("--filter-platform");
+        argumentos.push(triplo);
+    }
     let metadata_output = Command::new("cargo")
-        .args(["metadata", "--locked", "--offline", "--format-version", "1"])
+        .args(&argumentos)
         .current_dir(&repo)
         .output()
         .context("execute cargo metadata for SBOM")?;
@@ -263,6 +275,27 @@ pub fn generate(output: &Path) -> Result<SbomSummary> {
         let (bom, components) = lock_bom(&repo)?;
         finish(output, &bom, components, "cargo-lock-fallback")
     }
+}
+
+/// O triplo do host, tirado do `rustc -vV`.
+///
+/// É a forma canónica de o descobrir em tempo de execução — não há uma
+/// constante da biblioteca padrão para isto. Devolve `None` se o `rustc` não
+/// responder, caso em que o SBOM volta ao comportamento anterior (sem filtro)
+/// em vez de falhar: um SBOM demasiado abrangente é mau, não ter SBOM é pior.
+fn alvo_do_host() -> Option<String> {
+    let saida = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+        .arg("-vV")
+        .output()
+        .ok()?;
+    if !saida.status.success() {
+        return None;
+    }
+    String::from_utf8(saida.stdout).ok()?.lines().find_map(|l| {
+        l.strip_prefix("host: ")
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+    })
 }
 
 fn url_escape(value: &str) -> String {

@@ -24,6 +24,14 @@ const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
 const RED: &str = "\x1b[31m";
+/// Quanto tempo o arranque pede ao systemd de cada vez que uma fase
+/// comeca (SPEC-0073 §44). Cinco minutos: generoso para a fase mais lenta
+/// medida ate hoje (o replay de views, ~5 min numa base de 7M eventos) e curto
+/// o suficiente para que um arranque REALMENTE encravado seja morto em vez de
+/// ficar pendurado. O prazo estica enquanto houver progresso; e a distincao
+/// entre "demora" e "encravou" que um TimeoutStartSec fixo nao sabe fazer.
+const JANELA_DE_PROGRESSO_US: u64 = 5 * 60 * 1_000_000;
+
 const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
 const BLUE: &str = "\x1b[34m";
@@ -110,6 +118,26 @@ impl Boot {
     /// Begin a phase. Returns a guard; call `.ok(detail)` (or `.fail(..)`) when
     /// it finishes. In console mode a spinner animates the phase line until then.
     pub fn phase(&self, label: &str) -> Phase {
+        // SPEC-0073 §44 / SPEC-0072 §27 — cada fase que começa diz ao systemd
+        // que o arranque PROGREDIU.
+        //
+        // `heraclitus_platform::notify_extend_timeout` existia sem chamador
+        // nenhum, e a unit dizia-o por escrito: "ainda por ligar ao boot". Sem
+        // isto, a única defesa contra o `TimeoutStartSec` era o número na unit,
+        // que hoje está em 30 minutos porque uma base real levou mais de 16 a
+        // replayar. Um número maior não é a solução — é adiar o mesmo problema
+        // e, com `Type=notify`, um prazo infinito transforma um READY=1 que
+        // nunca chega num serviço pendurado para sempre.
+        //
+        // Este é o mecanismo certo: o prazo estica enquanto houver progresso, e
+        // expira quando não houver. É a diferença entre "demora" e "encravou",
+        // que um prazo fixo não sabe distinguir.
+        //
+        // Fora do systemd não há `NOTIFY_SOCKET` e a chamada não faz nada; o
+        // resultado é descartado porque não conseguir avisar o supervisor não é
+        // razão para falhar um arranque que está a correr bem.
+        let _ = heraclitus_platform::notify_extend_timeout(JANELA_DE_PROGRESSO_US);
+
         match self.mode {
             Mode::Console { color } => {
                 let stop = Arc::new(AtomicBool::new(false));
@@ -430,6 +458,20 @@ pub fn enable_ansi() -> bool {
     true
 }
 
+/// SPEC-0073 §54 — qual allocator este binário está mesmo a usar.
+///
+/// Não é uma string escrita à mão: é derivada da MESMA condição de compilação
+/// que instala o `#[global_allocator]` em `main.rs`, portanto não pode divergir
+/// dele. Uma linha de arranque que dissesse "glibc" por convenção seria uma
+/// afirmação sem fonte — e a §20 é explícita em que só o executável define o
+/// allocator, pelo que a biblioteca só o pode REPORTAR, nunca escolher.
+pub fn allocator_em_uso() -> &'static str {
+    if cfg!(all(target_os = "linux", feature = "linux-jemalloc")) {
+        "jemalloc"
+    } else {
+        "system"
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,21 +1,72 @@
-﻿[Unit]
+[Unit]
 Description=HeraclitusDB Event-Sourced Memory & Security Engine
 Documentation=https://github.com/JoseRFJuniorLLMs/HeraclitusDB
 After=network.target local-fs.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+# Type=notify e nao simple: o servidor chama sd_notify(READY=1) quando esta
+# mesmo a servir. Com Type=simple o systemd nem define NOTIFY_SOCKET, portanto
+# esse READY=1 nao ia a lado nenhum e o erro era engolido — a unidade era dada
+# como activa no instante em que o processo arrancava, muito antes de o gRPC
+# aceitar ligacoes. Qualquer unidade com After= sobre esta arrancava cedo demais.
+Type=notify
+NotifyAccess=main
 User=heraclitus
 Group=heraclitus
 
-# O servidor aceita o caminho do arquivo de configuração como primeiro argumento posicional
-ExecStart=/usr/bin/heraclitus-server /etc/heraclitusdb/heraclitus.toml
+# O servidor arranca com as variáveis HERACLITUS_* abaixo e NÃO precisa de um
+# ficheiro de configuração. A unit apontava para
+# /etc/heraclitusdb/heraclitus.toml, que o repositório nunca distribuiu — tal
+# como era enviada, não arrancava. Quem preferir TOML tem uma referência em
+# packaging/heraclitus.toml; instale-a e acrescente o caminho como argumento:
+#   ExecStart=/usr/bin/heraclitus-server /etc/heraclitusdb/heraclitus.toml
+ExecStart=/usr/bin/heraclitus-server
+
+# Sem isto o CWD é `/`, e o default de `data_dir` é RELATIVO (`./data`): o
+# servidor tentava criar `/data`, que com ProtectSystem=full não existe nem é
+# gravável. O `%S` resolve para a base de estado do systemd (/var/lib), e o
+# `StateDirectory` abaixo garante que o directório existe e pertence ao serviço.
+WorkingDirectory=%S/heraclitusdb
+Environment=HERACLITUS_DATA_DIR=%S/heraclitusdb
+Environment=HERACLITUS_COLD_TIER_PATH=%S/heraclitusdb/cold
+Environment=HERACLITUS_LOG_DIR=%L/heraclitusdb
 
 # Sinal padrão de término enviado pelo systemctl stop é SIGTERM
 KillSignal=SIGTERM
 KillMode=mixed
 TimeoutStopSec=30s
+
+# O arranque replaya as views e reconstroi indices a partir do log, e isso
+# cresce com o tamanho da base — foram medidos mais de 16 minutos numa base
+# real. O default de 90s matava o servico a meio da recuperacao, e a politica
+# de Restart recomecava-a do zero: um ciclo que nunca fecha.
+#
+# 30 minutos, e nao `infinity`: com Type=notify um prazo infinito transforma um
+# READY=1 que nunca chega num servico pendurado para sempre, o que e pior do
+# que falhar.
+#
+# Este numero deixou de ser a unica defesa. O daemon manda agora
+# EXTEND_TIMEOUT_USEC a cada fase do arranque que comeca (Boot::phase ->
+# heraclitus_platform::notify_extend_timeout), portanto o prazo estica enquanto
+# houver PROGRESSO e expira quando nao houver — que e a distincao entre
+# "demora" e "encravou" que um prazo fixo nao sabe fazer. Este valor passa a ser
+# o tecto de uma fase individual, nao do arranque inteiro.
+TimeoutStartSec=30min
+
+# WatchdogSec= esta DELIBERADAMENTE ausente.
+#
+# A SPEC-0073 §44 admite-o ("MAY ser implementado ... somente apos existir
+# health model apropriado") e impoe a condicao que o torna util: "o watchdog
+# SHALL NOT considerar o processo saudavel apenas porque existe um PID". Um
+# WATCHDOG=1 enviado por um temporizador afirma exactamente isso — que o
+# processo esta vivo — e nada mais. Um servidor com o Sentinel encravado, o log
+# a recusar appends ou uma view parada continuaria a responder ao watchdog e o
+# systemd continuaria a da-lo por saudavel.
+#
+# Ligar isto antes de haver uma sonda que exercite mesmo o caminho de dados
+# seria pior do que nao ter: transformaria "sem supervisao" em "supervisao que
+# mente".
 
 # Reinicialização automática em caso de crash (SIGSEGV, SIGKILL externo, etc.)
 Restart=on-failure

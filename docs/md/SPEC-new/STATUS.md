@@ -501,9 +501,16 @@ por eu o ter classificado como ruído que ele sobreviveu duas auditorias.
 Corrigido nos dois lados:
 
 1. **Prevenir** — o `create` sincroniza o header e a entrada de directório
-   antes de devolver. O invariante que isso estabelece é o que a recuperação
-   pode assumir: *um ficheiro de segmento que existe tem um header completo*.
-   Custa um fsync por rolagem de segmento (8 MiB+), que não se mede.
+   antes de devolver. Custa um fsync por rolagem de segmento (8 MiB+), que não
+   se mede.
+
+   > **Correcção de 2026-09-03.** Este ponto afirmava que o fsync estabelece o
+   > invariante *"um ficheiro de segmento que existe tem um header completo"*, e
+   > que a recuperação o podia assumir. É falso, e a suposição custou caro: um
+   > fsync fecha a janela contra perda de energia, **não** contra a morte do
+   > processo entre duas syscalls. Um SIGKILL entre o `create_new` e o
+   > `write_all` deixa na mesma um ficheiro de zero bytes. A recuperação tem de
+   > filtrar o toco — é o ponto 2 que fecha o problema, não o ponto 1.
 2. **Recuperar** — bases já partidas por uma build anterior voltam a abrir: um
    ficheiro activo mais curto que `FILE_HEADER_LEN` é tratado como o que é, um
    toco de crash, e removido com um aviso. Não pode conter nenhum registo

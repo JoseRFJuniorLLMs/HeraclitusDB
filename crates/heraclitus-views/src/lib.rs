@@ -105,9 +105,26 @@ impl ViewRegistry {
         let dir = data_dir.into().join("views");
         std::fs::create_dir_all(&dir)?;
         let wm_path = dir.join("watermarks.json");
+        // Um `watermarks.json` ilegível NÃO pode matar o arranque. As
+        // watermarks são estado derivado — dizem só até onde as views já foram
+        // materializadas — e perdê-las custa um rebuild, que é lento mas
+        // correcto. A assimetria era o defeito: o ficheiro ausente dava mapa
+        // vazio e arrancava, um checkpoint corrompido degradava para rebuild,
+        // mas um JSON malformado propagava o erro e o servidor não abria de
+        // todo, exigindo intervenção manual para apagar um ficheiro
+        // reconstruível.
         let watermarks = match std::fs::read_to_string(&wm_path) {
-            Ok(raw) => serde_json::from_str(&raw)
-                .map_err(|e| HeraclitusError::Serialization(e.to_string()))?,
+            Ok(raw) => match serde_json::from_str(&raw) {
+                Ok(mapa) => mapa,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        path = %wm_path.display(),
+                        "watermarks.json ilegível; as views vão ser reconstruídas do LSN 0"
+                    );
+                    HashMap::new()
+                }
+            },
             Err(_) => HashMap::new(),
         };
         Ok(Self {
@@ -176,10 +193,43 @@ impl ViewRegistry {
             if !v.restore(&dir)? {
                 self.watermarks_vec[i] = 0;
                 self.watermarks.remove(&self.names[i]);
-            } else {
-                let name = &self.names[i];
-                self.watermarks_vec[i] = self.watermarks.get(name).copied().unwrap_or(0);
+                continue;
             }
+            // A AUTORIDADE É O SNAPSHOT, não o `watermarks.json`.
+            //
+            // O par (snapshot, watermarks.json) é escrito em dois passos: o
+            // `checkpoint` grava primeiro o snapshot de cada view e só depois o
+            // JSON. Não há atomicidade entre eles, e o JSON era quem mandava —
+            // o lado errado, porque descreve o snapshot em vez de fazer parte
+            // dele. As duas formas de divergir têm consequências opostas e
+            // ambas más:
+            //
+            //   JSON atrasado (crash entre os dois passos) → reaplicavam-se
+            //     eventos que o snapshot já absorveu. Uma view idempotente
+            //     aguenta; uma que CONTE soma duas vezes, em silêncio.
+            //   JSON adiantado (restauro parcial, cópia de um dir mais novo)
+            //     → saltavam-se eventos que o snapshot não tem. Perda de dados
+            //     derivados, também em silêncio.
+            //
+            // `View::watermark()` é, por contrato, "o LSN mais alto aplicado" —
+            // vem do próprio estado restaurado, portanto não pode discordar
+            // dele. Usá-lo elimina o modo de falha em vez de escolher o menos
+            // mau: não há par a coordenar.
+            //
+            // O JSON fica como cache e introspecção (é o que `min_watermark` e
+            // as ferramentas lêem), e é reescrito a partir da verdade logo
+            // abaixo.
+            let do_snapshot = v.watermark();
+            let do_json = self.watermarks.get(&self.names[i]).copied().unwrap_or(0);
+            if do_json != do_snapshot {
+                tracing::warn!(
+                    view = %self.names[i],
+                    snapshot = do_snapshot,
+                    json = do_json,
+                    "watermarks.json diverge do snapshot restaurado; vale o snapshot"
+                );
+            }
+            self.watermarks_vec[i] = do_snapshot;
         }
 
         let from = self
@@ -282,6 +332,15 @@ impl ViewRegistry {
             f.sync_all()?;
         }
         std::fs::rename(&tmp, self.dir.join("watermarks.json"))?;
+        // O `sync_all` acima torna o CONTEÚDO durável; sem este fsync do
+        // directório, o `rename` pode não sobreviver a uma falha de energia e
+        // o arranque seguinte lê o watermark ANTIGO — reaplicando eventos que
+        // as views já materializaram. Uma view idempotente absorve isso; uma
+        // que conte, soma duas vezes.
+        #[cfg(unix)]
+        if let Ok(d) = std::fs::File::open(&self.dir) {
+            d.sync_all()?;
+        }
         Ok(())
     }
 
@@ -329,6 +388,112 @@ mod tests {
             *self.state.lock().unwrap() = (0, 0);
             self.wm = 0;
         }
+    }
+
+    /// View que PERSISTE — é o caso que expõe o par (snapshot, watermarks.json).
+    /// Conta aplicações e não é idempotente, de propósito: é assim que se vê
+    /// uma reaplicação em vez de a deixar passar despercebida.
+    struct SnapshotView {
+        state: Arc<Mutex<(u64, u64)>>,
+        wm: Lsn,
+    }
+
+    impl View for SnapshotView {
+        fn name(&self) -> &str {
+            "snap"
+        }
+        fn apply(&mut self, lsn: Lsn, _e: &Episode) {
+            let mut s = self.state.lock().unwrap();
+            s.0 += 1;
+            s.1 = s.1.wrapping_mul(31).wrapping_add(lsn);
+            self.wm = lsn;
+        }
+        fn watermark(&self) -> Lsn {
+            self.wm
+        }
+        fn checkpoint(&self, dir: &Path) -> Result<(), HeraclitusError> {
+            let s = self.state.lock().unwrap();
+            std::fs::write(
+                dir.join("snap.ckpt"),
+                format!("{} {} {}", s.0, s.1, self.wm),
+            )?;
+            Ok(())
+        }
+        fn restore(&mut self, dir: &Path) -> Result<bool, HeraclitusError> {
+            let Ok(raw) = std::fs::read_to_string(dir.join("snap.ckpt")) else {
+                return Ok(false);
+            };
+            let campos: Vec<u64> = raw
+                .split_whitespace()
+                .filter_map(|v| v.parse().ok())
+                .collect();
+            if campos.len() != 3 {
+                return Ok(false);
+            }
+            *self.state.lock().unwrap() = (campos[0], campos[1]);
+            self.wm = campos[2];
+            Ok(true)
+        }
+        fn reset(&mut self) {
+            *self.state.lock().unwrap() = (0, 0);
+            self.wm = 0;
+        }
+    }
+
+    /// O `watermarks.json` não pode mandar sobre o snapshot restaurado.
+    ///
+    /// O `checkpoint` grava primeiro o snapshot de cada view e só depois o
+    /// JSON; não há atomicidade entre os dois passos. Um crash no meio deixa o
+    /// JSON ATRASADO, e enquanto era ele a decidir de onde retomar, os eventos
+    /// entre os dois watermarks eram reaplicados — o que numa view que conta é
+    /// contar a dobrar, em silêncio.
+    #[test]
+    fn um_watermarks_json_atrasado_nao_faz_a_view_contar_a_dobrar() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = heraclitus_log::Log::open(dir.path().join("log"), 1 << 20, FsyncPolicy::Always)
+            .unwrap();
+        for i in 0..10u8 {
+            log.append(Episode::new("a", EventKind::Observation, vec![i]))
+                .unwrap();
+        }
+
+        let estado = Arc::new(Mutex::new((0u64, 0u64)));
+        {
+            let mut reg = ViewRegistry::open(dir.path()).unwrap();
+            reg.register(Box::new(SnapshotView {
+                state: estado.clone(),
+                wm: 0,
+            }));
+            reg.catch_up(&log).unwrap();
+            reg.checkpoint().unwrap();
+        }
+        let aplicados = estado.lock().unwrap().0;
+        assert_eq!(aplicados, 10, "as dez linhas tinham de ter sido aplicadas");
+
+        // O crash entre os dois passos: o snapshot tem os 10, o JSON ficou nos 4.
+        let wm_path = dir.path().join("views").join("watermarks.json");
+        std::fs::write(&wm_path, r#"{"snap":4}"#).unwrap();
+
+        let estado2 = Arc::new(Mutex::new((0u64, 0u64)));
+        let mut reg = ViewRegistry::open(dir.path()).unwrap();
+        reg.register(Box::new(SnapshotView {
+            state: estado2.clone(),
+            wm: 0,
+        }));
+        reg.catch_up(&log).unwrap();
+
+        // Com o JSON a mandar, os LSN 5..9 eram reaplicados por cima do
+        // snapshot que já os tinha: 15 em vez de 10.
+        assert_eq!(
+            estado2.lock().unwrap().0,
+            10,
+            "o watermarks.json atrasado fez reaplicar eventos que o snapshot ja tinha"
+        );
+        assert_eq!(
+            estado.lock().unwrap().1,
+            estado2.lock().unwrap().1,
+            "o estado restaurado tem de ser identico ao original"
+        );
     }
 
     #[test]

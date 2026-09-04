@@ -33,6 +33,10 @@ use std::sync::{Arc, Mutex, RwLock};
 /// Reserved technical attributes used to make external delivery exactly-once.
 /// They remain outside the encrypted attribute envelope so retries can still be
 /// identified after a subject has been crypto-shredded.
+/// Shards do lock de idempotência. Chaves distintas nunca precisaram de
+/// esperar umas pelas outras; o lock único fazia-o na mesma.
+const IDEMPOTENCY_SHARDS: usize = 64;
+
 pub const IDEMPOTENCY_KEY_ATTR: &str = "__heraclitus_idempotency_key";
 pub const IDEMPOTENCY_HASH_ATTR: &str = "__heraclitus_idempotency_hash";
 
@@ -76,6 +80,51 @@ fn is_sentinel_reserved(episode: &Episode) -> bool {
         || matches!(
             &episode.kind,
             EventKind::Custom(kind) if SENTINEL_DERIVED_KINDS.contains(&kind.as_str())
+        )
+}
+
+/// Kinds que o `heraclitus-compliance` escreve e cujo replay reconstrói o
+/// estado regulatório. Como o do Sentinel, é território interno.
+/// Retirados das constantes dos próprios módulos — `regulatory.rs:17-20`,
+/// `privacy.rs:16-18`, `sovereignty.rs:17-18`, `deferred.rs:26` e
+/// `model_bundle.rs:15` — e não de memória: é a lista que os `replay` casam.
+const COMPLIANCE_DERIVED_KINDS: &[&str] = &[
+    "CompliancePolicyActivation",
+    "ComplianceAssessment",
+    "LegalHold",
+    "LegalHoldRelease",
+    "PrivacyIncidentAssessment",
+    "RegulatoryDeadline",
+    "ComplianceExport",
+    "ComplianceEgressDecision",
+    "ComplianceModelDecision",
+    "ComplianceEvidenceAnchor",
+    "SecurityModelActivation",
+];
+
+/// O mesmo contrato de `is_sentinel_reserved`, para o domínio regulatório.
+///
+/// Sem isto, o append externo — que só exige `AccessRole::Writer` — deixava
+/// forjar prova de compliance: o replay confia no atributo
+/// `compliance.generated` e no `kind`, e ambos vinham do cliente. Um Writer
+/// podia libertar um `LegalHold` que só o Admin devia libertar (abrindo o
+/// crypto-shred sobre dados retidos), ou colocar um hold de âmbito total e
+/// travar o GC para sempre.
+///
+/// O caso pior não era sequer a falsificação: repetir um `hold_id` faz
+/// `RegulatoryState::replay` devolver `Err`, e como o log é append-only esse
+/// episódio não se apaga. O estado regulatório ficava inválido de forma
+/// **permanente** — e com ele o crypto-shred e o GC, que falham fechado. Era a
+/// única falha do lote sem reparação possível depois de acontecer.
+fn is_compliance_reserved(episode: &Episode) -> bool {
+    episode.agent_id == "gov-compliance"
+        || episode
+            .attrs
+            .keys()
+            .any(|key| key.starts_with("compliance."))
+        || matches!(
+            &episode.kind,
+            EventKind::Custom(kind) if COMPLIANCE_DERIVED_KINDS.contains(&kind.as_str())
         )
 }
 
@@ -131,7 +180,25 @@ pub struct Engine {
     /// Serializa check+append de uma chave externa. O índice de atributos é
     /// persistente/reconstruível pelo log, portanto isto fecha tanto corridas
     /// concorrentes quanto retries depois de crash/restart.
-    idempotency_lock: Mutex<()>,
+    /// Serialização da verificação-e-append idempotente, **por chave**.
+    ///
+    /// Era um único `Mutex<()>` global: cada append idempotente esperava por
+    /// todos os outros, mesmo de chaves sem relação nenhuma — e a secção
+    /// crítica inclui o append durável inteiro, com o round-trip de consenso
+    /// quando há replicação. Um cliente a escrever com a chave `a` ficava atrás
+    /// de outro a escrever com a chave `b`, sem qualquer razão.
+    ///
+    /// A correcção é sharding e não uma reserva em memória, de propósito. A
+    /// reserva (bloquear → reservar → libertar → escrever → confirmar) tira
+    /// mais latência, mas inventa um estado intermédio que pode sobreviver a um
+    /// crash entre reservar e confirmar — um modo de falha novo num caminho que
+    /// existe precisamente para garantir exactly-once. O sharding não muda
+    /// semântica nenhuma: duas chaves distintas nunca interagem, portanto
+    /// serializá-las juntas nunca foi um requisito, era um acidente.
+    idempotency_locks: Vec<Mutex<()>>,
+    /// Estado regulatório dobrado uma vez e estendido pela cauda desde então.
+    /// Vive aqui porque o `RegulatoryPolicyEngine` nasce e morre em cada RPC.
+    pub regulatory_cache: Arc<heraclitus_compliance::RegulatoryStateCache>,
 }
 
 /// Contrato de encaminhamento de escritas pelo consenso. Implementado pelo
@@ -449,11 +516,21 @@ impl Engine {
         // §3.9: recupera o cursor do distill persistido (0 se ausente/ilegível).
         // Antes do struct literal porque `attr_dir` é movido para o campo.
         #[cfg(feature = "distill")]
+        // Formato novo: valor + complemento (16 B), que distingue um ficheiro a
+        // zeros de um cursor 0 legítimo. Formato antigo: 8 B crus, ainda aceite
+        // para uma actualização não forçar a re-derivação de toda a base.
         let distill_cursor = std::sync::atomic::AtomicU64::new(
             std::fs::read(attr_dir.join("distill.cursor"))
                 .ok()
-                .filter(|b| b.len() == 8)
-                .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+                .and_then(|b| match b.len() {
+                    16 => {
+                        let valor = u64::from_le_bytes(b[..8].try_into().ok()?);
+                        let inverso = u64::from_le_bytes(b[8..].try_into().ok()?);
+                        (inverso == !valor).then_some(valor)
+                    }
+                    8 => Some(u64::from_le_bytes(b.try_into().ok()?)),
+                    _ => None,
+                })
                 .unwrap_or(0),
         );
 
@@ -476,7 +553,8 @@ impl Engine {
             audit_queries: config.audit_queries,
             replication: std::sync::OnceLock::new(),
             hvm_lock: Mutex::new(()),
-            idempotency_lock: Mutex::new(()),
+            idempotency_locks: (0..IDEMPOTENCY_SHARDS).map(|_| Mutex::new(())).collect(),
+            regulatory_cache: Arc::new(heraclitus_compliance::RegulatoryStateCache::default()),
             cold_range_reads: std::sync::atomic::AtomicU64::new(0),
             cold_bytes_downloaded: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "tier")]
@@ -485,7 +563,7 @@ impl Engine {
             distill_cursor,
         };
         if privacy_rebuild {
-            engine.attr.write().unwrap().save(&engine.attr_dir)?;
+            engine.attr.read().unwrap().save(&engine.attr_dir)?;
             std::fs::remove_file(&privacy_rebuild_marker)?;
         }
         Ok(engine)
@@ -559,7 +637,7 @@ impl Engine {
     /// Grava o checkpoint do índice de atributos (o servidor pode chamar
     /// periodicamente / no shutdown para o arranque seguinte só replayar a cauda).
     pub fn checkpoint_attr(&self) -> Result<(), HeraclitusError> {
-        self.attr.write().unwrap().save(&self.attr_dir)
+        self.attr.read().unwrap().save(&self.attr_dir)
     }
 
     /// Fast boot: persiste o snapshot de TODAS as views (vector/text/graph/
@@ -701,10 +779,20 @@ impl Engine {
                 && value
                     .chars()
                     .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+                // O ponto está no allowlist, e sem esta linha `".."` passava:
+                // é não-vazio, é curto, e todos os seus caracteres são
+                // permitidos. Como o valor vira UM componente do caminho, isso
+                // bastava para sair do directório de exportações do servidor —
+                // o comentário acima promete "never an arbitrary host path" e
+                // não era verdade. Recusar qualquer nome só de pontos fecha o
+                // caso sem restringir nomes legítimos.
+                && !value.chars().all(|ch| ch == '.')
         };
         if !safe(category) || !safe(export_id) {
             return Err(HeraclitusError::Config(
-                "category/export_id deve conter apenas ASCII alfanumérico, '-', '_' ou '.'".into(),
+                "category/export_id deve conter apenas ASCII alfanumérico, '-', '_' ou '.', \
+                 e não pode ser só pontos"
+                    .into(),
             ));
         }
         let data_dir = self.attr_dir.parent().unwrap_or(self.attr_dir.as_path());
@@ -727,7 +815,7 @@ impl Engine {
     /// O `state_hash` do índice de grafo — usado em testes de equivalência de
     /// consenso (deve ser idêntico entre nós que replicaram o mesmo log).
     pub fn graph_state_hash(&self) -> [u8; 32] {
-        self.graph.write().unwrap().state_hash()
+        self.graph.read().unwrap().state_hash()
     }
 
     /// Abre o backend do cold tier a partir de `cold_tier_path` — um URL de
@@ -884,7 +972,7 @@ impl Engine {
             return Ok(Vec::new());
         }
         let tomb_lsns: Vec<Lsn> = {
-            let g = self.graph.write().unwrap();
+            let g = self.graph.read().unwrap();
             tombstoned.iter().filter_map(|id| g.lsn_of(id)).collect()
         };
 
@@ -1184,12 +1272,38 @@ impl Engine {
         }
 
         self.distill_cursor.store(next_cursor, Ordering::Release);
-        // Persistência best-effort do cursor (tmp + rename atómico). Falhar aqui
-        // só arrisca re-agrupar uma janela num restart — nunca perde dados.
+        // Persistência do cursor: tmp + fsync + rename + fsync do directório.
+        //
+        // O comentário anterior dizia "nunca perde dados", e isso é verdade
+        // pela metade: um cursor perdido não apaga nada, mas volta a appendar
+        // os `FactDerived` de uma janela já derivada — e num log append-only
+        // esses duplicados ficam lá para sempre. Sem fsync, uma falha de
+        // energia deixava 8 bytes a zeros, que o leitor aceitava como cursor 0
+        // (é um valor legítimo) e re-derivava a base inteira.
+        //
+        // Guardam-se 16 bytes: o valor e o seu complemento. Um ficheiro a
+        // zeros deixa de ser indistinguível de um cursor válido, sem precisar
+        // de checksum para oito bytes. O formato antigo de 8 bytes continua a
+        // ser lido, para uma actualização não forçar uma re-derivação.
         let path = self.attr_dir.join("distill.cursor");
         let tmp = self.attr_dir.join("distill.cursor.tmp");
-        if std::fs::write(&tmp, next_cursor.to_le_bytes()).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&next_cursor.to_le_bytes());
+        bytes[8..].copy_from_slice(&(!next_cursor).to_le_bytes());
+        let gravado = (|| -> std::io::Result<()> {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+            Ok(())
+        })();
+        if gravado.is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+            #[cfg(unix)]
+            if let Ok(d) = std::fs::File::open(&self.attr_dir) {
+                let _ = d.sync_all();
+            }
+        } else {
+            let _ = std::fs::remove_file(&tmp);
         }
         Ok(out)
     }
@@ -1255,12 +1369,12 @@ impl Engine {
     /// Sai do indice `_agent`, nao de um varrimento: duas leituras por fonte
     /// (o primeiro e o ultimo LSN, que sao as pontas dos postings ordenados).
     pub fn fontes(&self) -> serde_json::Value {
-        let vals = self.attr.write().unwrap().field_values("_agent");
+        let vals = self.attr.read().unwrap().field_values("_agent");
         let mut fontes = Vec::with_capacity(vals.len());
         let (mut global_min, mut global_max) = (u64::MAX, 0u64);
 
         for (agente, eventos) in vals {
-            let span = self.attr.write().unwrap().field_span("_agent", &agente);
+            let span = self.attr.read().unwrap().field_span("_agent", &agente);
             let (mut primeiro_ms, mut ultimo_ms) = (None, None);
             if let Some((a, b)) = span {
                 if let Ok(Some((_, ep))) = self.log.read(a) {
@@ -1308,7 +1422,7 @@ impl Engine {
     /// resultado diz `amostrado: true` — uma distribuicao calculada sobre parte
     /// dos dados nao pode ser apresentada como se fosse sobre todos.
     pub fn fonte_detalhe(&self, agente: &str, amostra_max: usize) -> serde_json::Value {
-        let lsns: Vec<Lsn> = self.attr.write().unwrap().lookup("_agent", agente).to_vec();
+        let lsns: Vec<Lsn> = self.attr.read().unwrap().lookup("_agent", agente).to_vec();
         let total = lsns.len();
         // Amostra pelas pontas: os mais RECENTES importam mais para saber o que
         // a fonte faz agora, mas os primeiros mostram como comecou.
@@ -1375,7 +1489,7 @@ impl Engine {
     /// So nomes de campo e contagens: nunca valores. Listar os valores de um
     /// campo `cpf` seria despejar os CPFs todos.
     pub fn atributos(&self) -> serde_json::Value {
-        let campos = self.attr.write().unwrap().fields();
+        let campos = self.attr.read().unwrap().fields();
         let lista: Vec<_> = campos
             .into_iter()
             .map(|(campo, distintos)| {
@@ -1407,6 +1521,14 @@ impl Engine {
             .snapshot_as_of(identity, bound)
     }
 
+    /// A view de saúde, partilhada.
+    ///
+    /// SPEC-0071 §9.1 — o health gate da política lê daqui, através do
+    /// [`crate::telemetry_probe::ViewTelemetryProbe`].
+    pub fn telemetry_health_graph(&self) -> Arc<RwLock<TelemetryHealthGraph>> {
+        self.telemetry_health.clone()
+    }
+
     /// Snapshot ordenado de todos os sensores conhecidos até o LSN exclusivo.
     pub fn telemetry_health_all(&self, as_of_lsn: Option<Lsn>) -> Vec<TelemetryHealthSnapshot> {
         let bound = as_of_lsn.unwrap_or_else(|| self.log.head());
@@ -1414,6 +1536,75 @@ impl Engine {
             .write()
             .unwrap()
             .snapshots_as_of(bound)
+    }
+
+    /// SPEC-0071 §3/§4.1 — os eventos canónicos de segurança, `AS OF LSN`.
+    ///
+    /// É uma projecção **derivada** dos atributos `security_*` que o
+    /// `bridge.py` já escreve no log; não há estado persistido nem índice
+    /// próprio, e é por isso que reconstruir com um `as_of_lsn` mais antigo dá
+    /// exactamente o que estava lá nesse ponto.
+    ///
+    /// Varre em janelas em vez de materializar o log: o mesmo padrão de todas
+    /// as outras varreduras deste ficheiro, e pela mesma razão — uma consulta
+    /// que traz a base inteira para RAM deixa de ser uma consulta e passa a ser
+    /// um incidente.
+    pub fn security_events(
+        &self,
+        filtro: &heraclitus_telemetry_health::SecurityEventFilter,
+        as_of_lsn: Option<Lsn>,
+        limite: usize,
+    ) -> Result<Vec<heraclitus_telemetry_health::SecurityEventView>, HeraclitusError> {
+        use heraclitus_telemetry_health::SecurityEventView;
+        const JANELA: usize = 20_000;
+        let ate = as_of_lsn.unwrap_or_else(|| self.log.head());
+        let mut encontrados = Vec::new();
+        let mut cursor = 0u64;
+        while cursor < ate && encontrados.len() < limite {
+            let linhas = self.log.scan_capped(cursor, ate, JANELA)?;
+            if linhas.is_empty() {
+                break;
+            }
+            let ultimo = linhas.last().map(|(lsn, _)| *lsn).unwrap_or(cursor);
+            for (lsn, episode) in linhas {
+                if encontrados.len() >= limite {
+                    break;
+                }
+                if let Some(v) = SecurityEventView::projectar(lsn, &episode) {
+                    if filtro.aceita(&v) {
+                        encontrados.push(v);
+                    }
+                }
+            }
+            cursor = ultimo.saturating_add(1);
+        }
+        Ok(encontrados)
+    }
+
+    /// Contagens por categoria, datasource e outcome, `AS OF LSN`.
+    pub fn security_event_counts(
+        &self,
+        as_of_lsn: Option<Lsn>,
+    ) -> Result<heraclitus_telemetry_health::SecurityEventCounts, HeraclitusError> {
+        use heraclitus_telemetry_health::{SecurityEventCounts, SecurityEventView};
+        const JANELA: usize = 20_000;
+        let ate = as_of_lsn.unwrap_or_else(|| self.log.head());
+        let mut contagens = SecurityEventCounts::default();
+        let mut cursor = 0u64;
+        while cursor < ate {
+            let linhas = self.log.scan_capped(cursor, ate, JANELA)?;
+            if linhas.is_empty() {
+                break;
+            }
+            let ultimo = linhas.last().map(|(lsn, _)| *lsn).unwrap_or(cursor);
+            for (lsn, episode) in linhas {
+                if let Some(v) = SecurityEventView::projectar(lsn, &episode) {
+                    contagens.contar(&v);
+                }
+            }
+            cursor = ultimo.saturating_add(1);
+        }
+        Ok(contagens)
     }
 
     /// O carimbo de ingestao (ms epoch) do evento em `lsn`, se legivel.
@@ -1468,7 +1659,7 @@ impl Engine {
         let ate = ate.min(head);
         let de = de.min(ate);
 
-        let campos = self.attr.write().unwrap().diff(de, ate, topo);
+        let campos = self.attr.read().unwrap().diff(de, ate, topo);
         let ms = |lsn: Lsn| self.ts_ms(lsn);
 
         serde_json::json!({
@@ -1504,7 +1695,7 @@ impl Engine {
     /// nenhuns sobre a pessoa. Nesse caso, `rebuild` resolve.
     pub fn titular(&self, agent_id: &str, limite: usize) -> serde_json::Value {
         let lsns: Vec<Lsn> = {
-            let attr = self.attr.write().unwrap();
+            let attr = self.attr.read().unwrap();
             attr.lookup("_agent", agent_id).to_vec()
         };
         // O índice conhece o campo `_agent`? Se não conhecer, foi construído
@@ -1515,7 +1706,7 @@ impl Engine {
         // Nota: os frames H-VM (`hvm_isa`) são excluídos dos índices por
         // desenho (`index_applied`) — vivem no replay da VM. Um log só com
         // esses frames dá `agentes_indexados: 0` legitimamente.
-        let agentes_indexados = self.attr.write().unwrap().field_entries("_agent");
+        let agentes_indexados = self.attr.read().unwrap().field_entries("_agent");
 
         let mut tipos: std::collections::BTreeMap<String, u64> = Default::default();
         let mut amostra = Vec::new();
@@ -1633,6 +1824,17 @@ impl Engine {
             let mut f = std::fs::File::create(&marker)?;
             f.write_all(b"rebuild all derived state before serving\n")?;
             f.sync_all()?;
+            // O `sync_all` torna o CONTEÚDO durável, não a existência do
+            // ficheiro. Sem o fsync do directório, uma falha de energia entre
+            // criar o marcador e destruir a chave deixava o shred feito e o
+            // marcador desaparecido — o arranque seguinte não sabia que tinha
+            // de reconstruir, e o plaintext dessa agente ficava nas views e
+            // nos índices depois de a chave ter sido destruída. É precisamente
+            // a janela que este marcador existe para cobrir.
+            #[cfg(unix)]
+            if let Ok(d) = std::fs::File::open(&self.attr_dir) {
+                d.sync_all()?;
+            }
         }
 
         let destroyed = ks.shred(agent_id)?;
@@ -1789,6 +1991,11 @@ impl Engine {
                     .into(),
             ));
         }
+        if is_compliance_reserved(&episode) {
+            return Err(HeraclitusError::Query(
+                "tipos, agente e atributos compliance.* são reservados ao motor regulatório".into(),
+            ));
+        }
         if episode.attrs.contains_key(IDEMPOTENCY_KEY_ATTR)
             || episode.attrs.contains_key(IDEMPOTENCY_HASH_ATTR)
         {
@@ -1817,6 +2024,11 @@ impl Engine {
                     .into(),
             ));
         }
+        if is_compliance_reserved(&episode) {
+            return Err(HeraclitusError::Query(
+                "tipos, agente e atributos compliance.* são reservados ao motor regulatório".into(),
+            ));
+        }
         if key.is_empty() {
             // O `EventId` é gerado por `Episode::new` ANTES de chegar aqui, e
             // `append_internal` nunca lhe toca (só o `ts_hlc` é carimbado pelo
@@ -1831,6 +2043,17 @@ impl Engine {
             return Ok((lsn, false, id));
         }
         self.append_idempotent_validated(episode, key)
+    }
+
+    /// O shard que serializa esta chave. Chaves diferentes que caiam no mesmo
+    /// shard partilham lock — é contenção residual, não um erro: a correcção
+    /// só precisa que a MESMA chave nunca corra em paralelo consigo própria.
+    fn idempotency_shard(&self, key: &str) -> &Mutex<()> {
+        let digest = blake3::hash(key.as_bytes());
+        let indice = u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap_or_default())
+            as usize
+            % self.idempotency_locks.len();
+        &self.idempotency_locks[indice]
     }
 
     fn append_idempotent_validated(
@@ -1881,10 +2104,13 @@ impl Engine {
         .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
         let payload_hash = blake3::hash(&canonical).to_hex().to_string();
 
-        let _guard = self.idempotency_lock.lock().unwrap();
+        let _guard = self.idempotency_shard(key).lock().unwrap();
+        // `.read()` e não `.write()`: `lookup` é `&self`. Tomar o lock de
+        // escrita aqui bloqueava o indexador durante toda a secção crítica —
+        // que inclui o append durável — por causa de uma consulta.
         let previous = self
             .attr
-            .write()
+            .read()
             .unwrap()
             .lookup(IDEMPOTENCY_KEY_ATTR, key)
             .last()
@@ -2277,14 +2503,14 @@ impl Engine {
             .map(|(_, e)| e.ts_hlc >> 16)
             .unwrap_or(0);
         let txt_hits: Vec<_> = {
-            let idx = self.text.write().unwrap();
+            let idx = self.text.read().unwrap();
             idx.search(text, heraclitus_retrieval::RECALL_N)
                 .into_iter()
                 .map(|h| (h.id, h.lsn, h.score))
                 .collect()
         };
         let act_hits: Vec<_> = {
-            let act = self.activation.write().unwrap();
+            let act = self.activation.read().unwrap();
             act.top_k(now, heraclitus_retrieval::RECALL_N)
                 .into_iter()
                 .map(|h| (h.id, h.score))
@@ -2364,7 +2590,7 @@ impl QueryBackend for Engine {
 
     /// Snapshot do grafo temporal materializado (a view incremental, sem replay).
     fn graph(&self) -> Result<TemporalGraph, HeraclitusError> {
-        Ok(self.tgraph.write().unwrap().clone())
+        Ok(self.tgraph.read().unwrap().clone())
     }
 
     fn scan_range(&self, from: Lsn, to: Lsn) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
@@ -2409,7 +2635,7 @@ impl QueryBackend for Engine {
         // O índice dá os LSNs exatos; cada `log.read` é O(1) via o índice de
         // offset por-LSN do log (seek directo). Hidratação = nº de matches × O(1).
         let mut lsns: Vec<Lsn> = {
-            let idx = self.attr.write().unwrap();
+            let idx = self.attr.read().unwrap();
             idx.lookup(field, value).to_vec()
         };
         if let Some(bound) = as_of {
@@ -2445,7 +2671,7 @@ impl QueryBackend for Engine {
             Some((v, false)) => Bound::Excluded(v),
         };
         let mut lsns: Vec<Lsn> = {
-            let idx = self.attr.write().unwrap();
+            let idx = self.attr.read().unwrap();
             idx.lookup_range(field, to_bound(min), to_bound(max))
         };
         if let Some(bound) = as_of {
@@ -2516,7 +2742,7 @@ impl QueryBackend for Engine {
         // Audit #10: honor AS OF via LSN post-filter (over-fetch first).
         let fetch = if as_of.is_some() { k * 4 } else { k };
         let in_snapshot = |lsn: Lsn| as_of.map(|b| lsn < b).unwrap_or(true);
-        let hits = self.vector.write().unwrap().search(&dims, fetch, 128, None);
+        let hits = self.vector.read().unwrap().search(&dims, fetch, 128, None);
         let mut out = Vec::new();
         for h in hits.into_iter().filter(|h| in_snapshot(h.lsn)) {
             if let Some((l, e)) = self.log.read(h.lsn)? {
@@ -2594,7 +2820,7 @@ impl QueryBackend for Engine {
     ) -> Result<Vec<NeighborRow>, HeraclitusError> {
         // Real path: read the incrementally-maintained view (no replay). The
         // M8 gate is that this matches `LogBackend`'s from-scratch replay.
-        let g = self.tgraph.write().unwrap();
+        let g = self.tgraph.read().unwrap();
         Ok(neighbors_of(&g, node, etype, as_of, min_confidence))
     }
 
@@ -2605,7 +2831,7 @@ impl QueryBackend for Engine {
         as_of: Option<Lsn>,
         min_confidence: f32,
     ) -> Result<Vec<(String, usize)>, HeraclitusError> {
-        let g = self.tgraph.write().unwrap();
+        let g = self.tgraph.read().unwrap();
         Ok(traverse_of(&g, start, max_depth, as_of, min_confidence))
     }
 
@@ -2616,7 +2842,7 @@ impl QueryBackend for Engine {
         dst: Option<&str>,
         as_of: Option<Lsn>,
     ) -> Result<Vec<EdgeRow>, HeraclitusError> {
-        let g = self.tgraph.write().unwrap();
+        let g = self.tgraph.read().unwrap();
         Ok(match_edges_of(&g, src, etype, dst, as_of))
     }
 
@@ -2628,7 +2854,7 @@ impl QueryBackend for Engine {
         as_of: Option<Lsn>,
     ) -> Result<Option<EdgeHypotheses>, HeraclitusError> {
         Ok(hypotheses_of(
-            &self.tgraph.write().unwrap(),
+            &self.tgraph.read().unwrap(),
             from,
             to,
             etype,
@@ -2641,7 +2867,7 @@ impl QueryBackend for Engine {
         node: &str,
         as_of: Option<Lsn>,
     ) -> Result<Option<CommunityResult>, HeraclitusError> {
-        Ok(community_of(&self.tgraph.write().unwrap(), node, as_of))
+        Ok(community_of(&self.tgraph.read().unwrap(), node, as_of))
     }
 
     fn community_leiden(
@@ -2650,7 +2876,7 @@ impl QueryBackend for Engine {
         as_of: Option<Lsn>,
     ) -> Result<Option<CommunityResult>, HeraclitusError> {
         Ok(heraclitus_query::backend::community_leiden_of(
-            &self.tgraph.write().unwrap(),
+            &self.tgraph.read().unwrap(),
             node,
             as_of,
         ))
@@ -2661,7 +2887,7 @@ impl QueryBackend for Engine {
         node: &str,
         as_of: Option<Lsn>,
     ) -> Result<Option<MetricsResult>, HeraclitusError> {
-        Ok(node_metrics_of(&self.tgraph.write().unwrap(), node, as_of))
+        Ok(node_metrics_of(&self.tgraph.read().unwrap(), node, as_of))
     }
 
     fn resolve_entity(
@@ -2797,6 +3023,64 @@ mod tests {
             0
         );
         assert_eq!(engine.log.head(), 1);
+    }
+
+    /// O append externo so exige `AccessRole::Writer`, e os replays de
+    /// compliance confiam no `kind` e no atributo `compliance.generated` — dois
+    /// sinais que vinham do cliente. Sem esta reserva, um Writer podia libertar
+    /// um `LegalHold` que so o Admin devia libertar (abrindo o crypto-shred
+    /// sobre dados retidos), pôr um hold de âmbito total e travar o GC, ou —
+    /// pior — repetir um `hold_id` e deixar o estado regulatorio invalido para
+    /// sempre, porque o log e append-only e o episodio nunca se apaga.
+    #[test]
+    fn compliance_namespaces_are_reserved_to_the_regulatory_engine() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = engine_in(temp.path());
+
+        // Um release forjado levantaria uma retencao judicial.
+        let forjado = Episode::new(
+            "attacker",
+            EventKind::Custom("LegalHoldRelease".into()),
+            b"{}".to_vec(),
+        );
+        assert!(
+            engine.append(forjado).is_err(),
+            "um Writer nao pode forjar um LegalHoldRelease"
+        );
+
+        // O hold em si trava o GC e a eliminacao enquanto existir.
+        let hold = Episode::new(
+            "attacker",
+            EventKind::Custom("LegalHold".into()),
+            b"{}".to_vec(),
+        );
+        assert!(
+            engine.append_idempotent(hold, "forjado-hold").is_err(),
+            "um Writer nao pode forjar um LegalHold"
+        );
+
+        // O atributo de proveniencia e o que os replays leem para decidir se a
+        // linha e prova regulatoria; tem de ser tao reservado como o kind.
+        let mut atributo = Episode::new("attacker", EventKind::Observation, b"{}".to_vec());
+        atributo
+            .attrs
+            .insert("compliance.generated".into(), "true".into());
+        assert!(
+            engine.append(atributo).is_err(),
+            "compliance.* nao pode vir de fora"
+        );
+
+        // E o agente do motor regulatorio tambem nao se pode personificar.
+        let agente = Episode::new("gov-compliance", EventKind::Observation, b"{}".to_vec());
+        assert!(
+            engine.append(agente).is_err(),
+            "o agent_id do motor regulatorio e reservado"
+        );
+
+        // Telemetria normal continua a passar — a reserva nao pode ser um
+        // bloqueio geral a palavra "compliance".
+        let normal = Episode::new("app", EventKind::Observation, b"{\"ok\":1}".to_vec());
+        assert!(engine.append(normal).is_ok());
     }
 
     #[test]
@@ -4552,5 +4836,162 @@ mod regulatory_entrypoint_tests {
                 .len(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod testes_security_events_spec0071 {
+    use super::*;
+    use heraclitus_telemetry_health::{SecurityEventFilter, SECURITY_EVENT_SCHEMA};
+
+    fn motor() -> (tempfile::TempDir, Engine) {
+        let temp = tempfile::tempdir().unwrap();
+        let config = HeraclitusConfig {
+            data_dir: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let engine = Engine::open(&config).unwrap();
+        (temp, engine)
+    }
+
+    fn facto_de_seguranca(categoria: &str, outcome: &str, severidade: u8) -> Episode {
+        let mut e = Episode::new(
+            "forge-bridge",
+            EventKind::Observation,
+            b"{\"operational\":true}".to_vec(),
+        );
+        for (k, v) in [
+            ("security_schema", SECURITY_EVENT_SCHEMA.to_string()),
+            ("security_category", categoria.to_string()),
+            ("security_event_type", "login".to_string()),
+            ("security_outcome", outcome.to_string()),
+            ("security_severity", severidade.to_string()),
+            ("security_tenant_id", "tenant-a".to_string()),
+            ("security_datasource_id", "identity".to_string()),
+        ] {
+            e.attrs.insert(k.to_string(), v);
+        }
+        e
+    }
+
+    /// SPEC-0071 §3 — o evento canonico passa a ser consultavel do lado do
+    /// banco, tipado e filtravel. Antes disto os attrs `security_*` estavam no
+    /// log e nao havia como perguntar nada sobre eles.
+    #[test]
+    fn os_eventos_canonicos_sao_filtraveis_e_um_facto_legado_nao_entra() {
+        let (_t, engine) = motor();
+        engine
+            .append(facto_de_seguranca("authentication", "failure", 7))
+            .unwrap();
+        engine
+            .append(facto_de_seguranca("authentication", "success", 2))
+            .unwrap();
+        engine
+            .append(facto_de_seguranca("network", "failure", 9))
+            .unwrap();
+        // Um facto legado, sem bloco `security`: nao pode entrar na vista.
+        engine
+            .append(Episode::new(
+                "collector",
+                EventKind::Observation,
+                b"sem seguranca".to_vec(),
+            ))
+            .unwrap();
+
+        let todos = engine
+            .security_events(&SecurityEventFilter::default(), None, 100)
+            .unwrap();
+        assert_eq!(todos.len(), 3, "o facto legado nao devia projectar");
+
+        let falhas_de_auth = engine
+            .security_events(
+                &SecurityEventFilter {
+                    category: Some("authentication".into()),
+                    outcome: Some("failure".into()),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(falhas_de_auth.len(), 1);
+        assert_eq!(falhas_de_auth[0].severity, Some(7));
+
+        let graves = engine
+            .security_events(
+                &SecurityEventFilter {
+                    severidade_minima: Some(8),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(graves.len(), 1);
+        assert_eq!(graves[0].category, "network");
+    }
+
+    /// A vista e DERIVADA: reconstruir `AS OF LSN n` da o que estava la nesse
+    /// ponto, e nao o que se acrescentou depois.
+    #[test]
+    fn a_vista_e_reconstruivel_as_of_lsn() {
+        let (_t, engine) = motor();
+        let primeiro = engine
+            .append(facto_de_seguranca("authentication", "failure", 7))
+            .unwrap();
+        engine
+            .append(facto_de_seguranca("network", "failure", 9))
+            .unwrap();
+
+        let ate_ao_primeiro = engine
+            .security_events(&SecurityEventFilter::default(), Some(primeiro + 1), 100)
+            .unwrap();
+        assert_eq!(
+            ate_ao_primeiro.len(),
+            1,
+            "AS OF nao pode ver o que veio depois"
+        );
+        assert_eq!(ate_ao_primeiro[0].lsn, primeiro);
+
+        let agora = engine
+            .security_events(&SecurityEventFilter::default(), None, 100)
+            .unwrap();
+        assert_eq!(agora.len(), 2);
+    }
+
+    #[test]
+    fn as_contagens_agrupam_por_dimensao() {
+        let (_t, engine) = motor();
+        engine
+            .append(facto_de_seguranca("authentication", "failure", 7))
+            .unwrap();
+        engine
+            .append(facto_de_seguranca("authentication", "failure", 5))
+            .unwrap();
+        engine
+            .append(facto_de_seguranca("network", "success", 1))
+            .unwrap();
+
+        let c = engine.security_event_counts(None).unwrap();
+        assert_eq!(c.total, 3);
+        assert_eq!(c.por_categoria["authentication"], 2);
+        assert_eq!(c.por_categoria["network"], 1);
+        assert_eq!(c.por_outcome["failure"], 2);
+        assert_eq!(c.por_datasource["identity"], 3);
+        assert_eq!(c.esquema_desconhecido, 0);
+    }
+
+    #[test]
+    fn o_limite_e_respeitado() {
+        let (_t, engine) = motor();
+        for _ in 0..10 {
+            engine
+                .append(facto_de_seguranca("authentication", "failure", 7))
+                .unwrap();
+        }
+        let poucos = engine
+            .security_events(&SecurityEventFilter::default(), None, 3)
+            .unwrap();
+        assert_eq!(poucos.len(), 3);
     }
 }

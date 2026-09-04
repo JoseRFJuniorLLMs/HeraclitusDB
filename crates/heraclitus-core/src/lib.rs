@@ -30,9 +30,9 @@ pub mod vm;
 pub use canonical::CanonicalKeyCodec;
 pub use capability::CapabilityCatalog;
 pub use config::{
-    AccessCredential, AccessRole, FsyncPolicy, HeraclitusConfig, RaftTransport, ReplicationConfig,
-    SentinelConfig, SentinelL1Config, SentinelL2Config, SentinelL3Config, SentinelMode,
-    SentinelThreatConfig, StorageFormat,
+    AccessCredential, AccessRole, CursorPolicy, FsyncPolicy, HeraclitusConfig, RaftTransport,
+    ReplicationConfig, SentinelConfig, SentinelL1Config, SentinelL2Config, SentinelL3Config,
+    SentinelMode, SentinelRecoveryConfig, SentinelThreatConfig, StorageFormat,
 };
 pub use consistency::IsolationLevel;
 pub use error::HeraclitusError;

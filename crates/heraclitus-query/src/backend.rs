@@ -750,7 +750,13 @@ pub trait QueryBackend {
         k: usize,
         as_of: Option<Lsn>,
     ) -> Result<Vec<FusedHit>, HeraclitusError> {
-        let fetch = (k * 4).max(8);
+        // `k` vem do pedido. `k * 4` transbordava em `usize` para valores
+        // grandes, e o `HashMap::with_capacity(fetch * 3)` mais abaixo pedia
+        // uma alocação proporcional — que em Rust falha com `abort`, não com
+        // erro. O tecto é generoso o suficiente para qualquer consulta real e
+        // fecha o caminho de um pedido derrubar o servidor.
+        const FETCH_MAXIMO: usize = 100_000;
+        let fetch = k.saturating_mul(4).clamp(8, FETCH_MAXIMO);
         let head_lsn = self.head()?;
 
         let mut graph_ch: Vec<(String, u64, f32)> = self

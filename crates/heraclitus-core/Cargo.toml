@@ -7,6 +7,7 @@ repository.workspace = true
 description = "Shared types, IDs, errors and config for HeraclitusDB"
 
 [dependencies]
+heraclitus-platform = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

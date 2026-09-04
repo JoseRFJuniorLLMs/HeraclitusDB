@@ -37,6 +37,116 @@ pub struct SentinelMetrics {
     pub(crate) actions_denied_total: AtomicU64,
     pub(crate) actions_executed_total: AtomicU64,
     pub(crate) action_failures_total: AtomicU64,
+    /// SPEC-0072 §24 — instrumentação do arranque.
+    ///
+    /// O arranque era uma caixa preta: a linha era `starting sentinel...` e a
+    /// seguir, minutos depois, o serviço respondia. Sem estes números não há
+    /// como distinguir "está a ler o cursor" de "está a reconstruir 20M de
+    /// eventos", que é precisamente a diferença que o operador precisa de ver.
+    pub(crate) boot: BootMetrics,
+}
+
+/// SPEC-0072 §24 — fases do arranque, medidas separadamente.
+///
+/// Escrito uma vez, no arranque, e depois só lido. Fica atómico na mesma
+/// porque o `SentinelStatus` é servido por outra thread.
+#[derive(Debug, Default)]
+pub struct BootMetrics {
+    pub(crate) cursor_load_ms: AtomicU64,
+    pub(crate) snapshot_load_ms: AtomicU64,
+    pub(crate) snapshot_verify_ms: AtomicU64,
+    pub(crate) state_restore_ms: AtomicU64,
+    pub(crate) tail_replay_ms: AtomicU64,
+    pub(crate) total_boot_ms: AtomicU64,
+    pub(crate) full_rebuild_total: AtomicU64,
+    pub(crate) cursor_ahead_total: AtomicU64,
+    pub(crate) snapshot_corrupt_total: AtomicU64,
+    pub(crate) snapshot_version_mismatch_total: AtomicU64,
+    pub(crate) snapshot_rejected_total: AtomicU64,
+    pub(crate) divergence_total: AtomicU64,
+    /// Watermark do snapshot restaurado, ou 0 quando houve rebuild.
+    pub(crate) watermark_lsn: AtomicU64,
+    /// Head do log no momento do arranque.
+    pub(crate) head_at_boot_lsn: AtomicU64,
+    /// Quantos eventos a cauda teve de reproduzir.
+    pub(crate) tail_events: AtomicU64,
+    /// SPEC-0072 §39 — quantos episodios o arranque LEU do log, somando as
+    /// quatro passagens.
+    ///
+    /// E o numero que tranca a regressao. O tempo de parede nao serve: varia
+    /// com a maquina e faria o CI intermitente. Este e determinista, e um
+    /// arranque a quente que volte a varrer a base inteira di-lo aqui.
+    pub(crate) events_scanned_total: AtomicU64,
+    /// `(outcome, motivo_do_rebuild)`. `OnceLock` diz exactamente o que isto
+    /// é: escrito uma vez, no arranque, e a partir daí só lido.
+    pub(crate) decisao: std::sync::OnceLock<(String, Option<String>)>,
+}
+
+impl BootMetrics {
+    /// Regista a decisão do arranque. A segunda chamada é ignorada — não há
+    /// dois arranques no mesmo runtime, e uma sobreposição silenciosa seria
+    /// pior do que a perda.
+    pub(crate) fn registar_decisao(&self, outcome: &str, motivo: Option<&str>) {
+        let _ = self
+            .decisao
+            .set((outcome.to_owned(), motivo.map(str::to_owned)));
+    }
+
+    pub(crate) fn relatorio(&self) -> BootReport {
+        let (outcome, rebuild_reason) = self
+            .decisao
+            .get()
+            .cloned()
+            .unwrap_or_else(|| ("nao_arrancado".to_owned(), None));
+        BootReport {
+            outcome,
+            rebuild_reason,
+            watermark_lsn: self.watermark_lsn.load(Ordering::Acquire),
+            head_at_boot_lsn: self.head_at_boot_lsn.load(Ordering::Acquire),
+            tail_events: self.tail_events.load(Ordering::Acquire),
+            events_scanned_total: self.events_scanned_total.load(Ordering::Acquire),
+            cursor_load_ms: self.cursor_load_ms.load(Ordering::Acquire),
+            snapshot_load_ms: self.snapshot_load_ms.load(Ordering::Acquire),
+            snapshot_verify_ms: self.snapshot_verify_ms.load(Ordering::Acquire),
+            state_restore_ms: self.state_restore_ms.load(Ordering::Acquire),
+            tail_replay_ms: self.tail_replay_ms.load(Ordering::Acquire),
+            total_boot_ms: self.total_boot_ms.load(Ordering::Acquire),
+            full_rebuild_total: self.full_rebuild_total.load(Ordering::Acquire),
+            cursor_ahead_total: self.cursor_ahead_total.load(Ordering::Acquire),
+            snapshot_corrupt_total: self.snapshot_corrupt_total.load(Ordering::Acquire),
+            snapshot_version_mismatch_total: self
+                .snapshot_version_mismatch_total
+                .load(Ordering::Acquire),
+            snapshot_rejected_total: self.snapshot_rejected_total.load(Ordering::Acquire),
+            divergence_total: self.divergence_total.load(Ordering::Acquire),
+        }
+    }
+}
+
+/// A decisão que o arranque tomou, exposta para `/sentinel/status`.
+#[derive(Debug, Clone, Serialize)]
+pub struct BootReport {
+    /// `synchronized` | `catch_up_tail` | `rebuild_canonical` | `divergence_detected`.
+    pub outcome: String,
+    /// Porque é que houve rebuild, quando houve. `None` nos outros casos.
+    pub rebuild_reason: Option<String>,
+    pub watermark_lsn: u64,
+    pub head_at_boot_lsn: u64,
+    pub tail_events: u64,
+    /// Episodios lidos do log durante o arranque, somando as quatro passagens.
+    pub events_scanned_total: u64,
+    pub cursor_load_ms: u64,
+    pub snapshot_load_ms: u64,
+    pub snapshot_verify_ms: u64,
+    pub state_restore_ms: u64,
+    pub tail_replay_ms: u64,
+    pub total_boot_ms: u64,
+    pub full_rebuild_total: u64,
+    pub cursor_ahead_total: u64,
+    pub snapshot_corrupt_total: u64,
+    pub snapshot_version_mismatch_total: u64,
+    pub snapshot_rejected_total: u64,
+    pub divergence_total: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -91,6 +201,8 @@ pub struct SentinelStatus {
     pub actions_denied_total: u64,
     pub actions_executed_total: u64,
     pub action_failures_total: u64,
+    /// SPEC-0072 §24/§25 — o que o arranque fez, e quanto tempo levou cada fase.
+    pub boot: BootReport,
 }
 
 impl SentinelMetrics {
@@ -163,6 +275,7 @@ impl SentinelMetrics {
             actions_denied_total: self.actions_denied_total.load(Ordering::Acquire),
             actions_executed_total: self.actions_executed_total.load(Ordering::Acquire),
             action_failures_total: self.action_failures_total.load(Ordering::Acquire),
+            boot: self.boot.relatorio(),
         }
     }
 }

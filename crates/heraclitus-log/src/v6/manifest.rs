@@ -523,13 +523,25 @@ impl ManifestStore {
     /// inutilizável, varre o directório e usa a geração mais alta que
     /// descodifique — nunca inventa um manifesto vazio por cima de dados.
     pub fn load(&self) -> V6Result<Option<LoadedManifest>> {
-        if let Some(loaded) = self.load_from_current()? {
+        let (do_current, rejeitado) = self.load_from_current()?;
+        if let Some(loaded) = do_current {
             return Ok(Some(loaded));
         }
         let mut gens = self.generations()?;
         gens.reverse();
         for g in gens {
             let path = self.path_for(g);
+            // Se o `CURRENT` rejeitou ESTA geração por divergência de digest,
+            // o varrimento não a pode aceitar a seguir. A verificação de
+            // digest existe para recusar bytes que não são os que foram
+            // committed — um ficheiro truncado que passe CRC por acaso, um
+            // restauro parcial — e como o varrimento percorre as gerações por
+            // ordem decrescente, a primeira que experimentava era justamente a
+            // que acabara de ser recusada. Ela descodifica (só o digest é que
+            // divergia), portanto era aceite: a guarda anulava-se a si própria.
+            if rejeitado.as_deref() == Some(path.as_path()) {
+                continue;
+            }
             if let Ok(bytes) = std::fs::read(&path) {
                 if let Ok(manifest) = decode_manifest(&bytes) {
                     return Ok(Some(LoadedManifest {
@@ -545,21 +557,24 @@ impl ManifestStore {
         Ok(None)
     }
 
-    fn load_from_current(&self) -> V6Result<Option<LoadedManifest>> {
+    /// Devolve o manifesto do `CURRENT` e, quando o recusa por divergencia de
+    /// digest, o caminho recusado — para o varrimento de recuperacao o poder
+    /// saltar em vez de o aceitar logo a seguir.
+    fn load_from_current(&self) -> V6Result<(Option<LoadedManifest>, Option<PathBuf>)> {
         let raw = match std::fs::read_to_string(self.current_path()) {
             Ok(s) => s,
-            Err(_) => return Ok(None),
+            Err(_) => return Ok((None, None)),
         };
         let mut lines = raw.lines();
         let Some(name) = lines.next().map(str::trim) else {
-            return Ok(None);
+            return Ok((None, None));
         };
         if name.is_empty() || name.contains('/') || name.contains('\\') {
-            return Ok(None);
+            return Ok((None, None));
         }
         let path = self.dir.join(name);
         let Ok(bytes) = std::fs::read(&path) else {
-            return Ok(None);
+            return Ok((None, None));
         };
         let digest = manifest_digest(&bytes);
         if let Some(expected) = lines.next().map(str::trim) {
@@ -568,19 +583,26 @@ impl ManifestStore {
                 // committed. Cair para o varrimento é mais seguro do que
                 // aceitar — pode ser um ficheiro truncado que ainda passa CRC
                 // por acaso, ou um restauro parcial de backup.
-                return Ok(None);
+                //
+                // O caminho recusado vai com a resposta, porque sem isso o
+                // varrimento aceitava-o na primeira tentativa e esta guarda
+                // não valia nada.
+                return Ok((None, Some(path)));
             }
         }
         let Ok(manifest) = decode_manifest(&bytes) else {
-            return Ok(None);
+            return Ok((None, None));
         };
-        Ok(Some(LoadedManifest {
-            generation: manifest.manifest_generation,
-            digest,
-            manifest,
-            path,
-            recovered_by_scan: false,
-        }))
+        Ok((
+            Some(LoadedManifest {
+                generation: manifest.manifest_generation,
+                digest,
+                manifest,
+                path,
+                recovered_by_scan: false,
+            }),
+            None,
+        ))
     }
 
     /// A próxima geração livre: uma acima da mais alta em disco.
@@ -660,7 +682,7 @@ impl ManifestStore {
     /// Nunca remove a geração para que `CURRENT` aponta, mesmo que `keep` seja
     /// pequeno: o ponteiro tem de continuar a resolver.
     pub fn prune_old_manifests(&self, keep: usize) -> V6Result<Vec<PathBuf>> {
-        let corrente = self.load_from_current()?.map(|l| l.generation);
+        let corrente = self.load_from_current()?.0.map(|l| l.generation);
         let gens = self.generations()?;
         let manter_a_partir = gens.len().saturating_sub(keep.max(1));
         let mut removed = Vec::new();

@@ -115,3 +115,70 @@ jobs:
           path: |
             ${{ runner.temp }}/crash-report.json
             ${{ runner.temp }}/soak/report.json
+
+  # O budget de fuzzing longo que estava no CI por PR. La pedia 50 minutos
+  # dentro de um timeout de 35 e nunca podia terminar; aqui tem tempo a serio,
+  # corre uma vez por noite e preserva o corpus de crash como artefacto.
+  # O CI por PR ficou com um passe de fumo de 60s por target.
+  fuzz-deep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb # nightly action
+        with:
+          toolchain: nightly-2026-02-17
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: fuzz log decode (10 min budget)
+        run: cargo +nightly-2026-02-17 fuzz run log_decode -- -max_total_time=600
+      - name: fuzz query parser (10 min budget, M4 gate)
+        run: cargo +nightly-2026-02-17 fuzz run query_parser -- -max_total_time=600
+      - name: fuzz manifold operations (10 min budget)
+        run: cargo +nightly-2026-02-17 fuzz run manifold_ops -- -max_total_time=600
+      - name: fuzz HRKL v6 decoders (10 min budget)
+        run: cargo +nightly-2026-02-17 fuzz run v6_decode -- -max_total_time=600
+      - name: fuzz configuration parser (5 min budget, SPEC-0049)
+        run: cargo +nightly-2026-02-17 fuzz run config_parse -- -max_total_time=300
+      - name: fuzz RFC 3161 timestamp material (5 min budget, SPEC-0049)
+        run: cargo +nightly-2026-02-17 fuzz run rfc3161_decode -- -max_total_time=300
+      - name: preserve any crash as regression corpus (SPEC-0049)
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: fuzz-deep-crash-artifacts
+          if-no-files-found: ignore
+          path: fuzz/artifacts/
+
+  # SPEC-0072 §37 — Gate Linux L7: qualificação de escala.
+  #
+  # Os L0-L6 correm por PR (ci.yml, job `linux-gates`) porque são gates de
+  # CORRECÇÃO. Este é de ESCALA: enche uma base, encadeia os cinco cenários de
+  # restart da §37 sobre o mesmo directório persistente e mede wall_time,
+  # cpu_time, peak RSS, io_bytes e events_scanned em cada arranque.
+  #
+  # O dataset do nightly é menor do que os 20M que a §37 pede para a
+  # qualificação formal — 20M por gRPC unário são horas num runner. As relações
+  # que o gate verifica (warm boot lê a CAUDA e não a base) são as mesmas nas
+  # duas escalas, e o script imprime qual correu. Para a corrida formal, num
+  # host a sério: HERACLITUS_L7_EVENTOS=20000000.
+  linux-gate-l7:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable action
+        with:
+          toolchain: 1.96.0
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      - name: L7 — escala e cenários de restart encadeados
+        env:
+          # O runner monta o workspace em disco persistente; `mktemp -d` cairia
+          # em /tmp, que em alguns runners é tmpfs — e o script recusa correr em
+          # RAM, com razão: medir replay em RAM não mede replay.
+          HERACLITUS_L7_DIR: ${{ github.workspace }}/l7-dados
+          HERACLITUS_L7_EVENTOS: "60000"
+        run: |
+          mkdir -p "$HERACLITUS_L7_DIR"
+          bash scripts/linux-gate-l7.sh

@@ -24,6 +24,50 @@ use std::sync::{Arc, Mutex};
 
 const BINCODE_CFG: bincode::config::Configuration = bincode::config::standard();
 
+/// Cabeçalho do sidecar `.zmap`: magic, versão e digest do payload.
+///
+/// O sidecar é uma **cache** — pode sempre ser reconstruído a partir do
+/// segmento — mas é uma cache que decide o que a query NÃO lê. Era gravado com
+/// um `fs::write` + `rename` sem um único fsync, e lido com um
+/// `decode_from_slice` sem validação nenhuma. Um ficheiro a zeros deixado por
+/// uma falha de energia descodifica para um `ZoneMap` com intervalos todos a
+/// zero, e a partir daí o `scan_pruned` salta segmentos que contêm mesmo os
+/// dados procurados: resultado errado, sem erro nenhum.
+///
+/// Como é cache, mudar o formato não precisa de migração: um sidecar antigo
+/// falha a validação e é reconstruído.
+const ZMAP_MAGIC: &[u8; 4] = b"ZMAP";
+const ZMAP_VERSION: u16 = 1;
+const ZMAP_HEADER_LEN: usize = 4 + 2 + 8 + 32;
+
+fn zmap_encode(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ZMAP_HEADER_LEN + payload.len());
+    out.extend_from_slice(ZMAP_MAGIC);
+    out.extend_from_slice(&ZMAP_VERSION.to_le_bytes());
+    out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    out.extend_from_slice(blake3::hash(payload).as_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Devolve o payload só quando magic, versão, comprimento e digest batem
+/// todos. Qualquer divergência é tratada como sidecar ausente — nunca como
+/// erro, porque reconstruir é sempre correcto.
+fn zmap_decode(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.len() < ZMAP_HEADER_LEN || &bytes[..4] != ZMAP_MAGIC {
+        return None;
+    }
+    if u16::from_le_bytes(bytes[4..6].try_into().ok()?) != ZMAP_VERSION {
+        return None;
+    }
+    let len = u64::from_le_bytes(bytes[6..14].try_into().ok()?) as usize;
+    let payload = bytes.get(ZMAP_HEADER_LEN..ZMAP_HEADER_LEN + len)?;
+    if blake3::hash(payload).as_bytes() != &bytes[14..46] {
+        return None;
+    }
+    Some(payload)
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PruneStats {
     pub segments_considered: usize,
@@ -91,13 +135,15 @@ impl SkipScanner {
         // Try the persisted sidecar first (avoids the full-segment warm read).
         let path = self.sidecar_path(meta.id);
         if let Ok(bytes) = std::fs::read(&path) {
-            if let Ok((zm, _)) =
-                bincode::serde::decode_from_slice::<ZoneMap, _>(&bytes, BINCODE_CFG)
-            {
-                let zm = Arc::new(zm);
-                self.cache.lock().unwrap().insert(meta.id, zm.clone());
-                self.loaded.fetch_add(1, Ordering::Relaxed);
-                return Ok(zm);
+            if let Some(payload) = zmap_decode(&bytes) {
+                if let Ok((zm, _)) =
+                    bincode::serde::decode_from_slice::<ZoneMap, _>(payload, BINCODE_CFG)
+                {
+                    let zm = Arc::new(zm);
+                    self.cache.lock().unwrap().insert(meta.id, zm.clone());
+                    self.loaded.fetch_add(1, Ordering::Relaxed);
+                    return Ok(zm);
+                }
             }
             // Corrupt/old sidecar: fall through and rebuild (never fatal).
         }
@@ -112,11 +158,36 @@ impl SkipScanner {
     /// Atomically write the sidecar (tmp + rename). Best-effort: a write failure
     /// is non-fatal (the zone map stays in RAM; next run just rebuilds it).
     fn persist_sidecar(&self, path: &std::path::Path, zm: &ZoneMap) {
-        if let Ok(bytes) = bincode::serde::encode_to_vec(zm, BINCODE_CFG) {
-            let tmp = path.with_extension("zmap.tmp");
-            if std::fs::write(&tmp, &bytes).is_ok() {
-                let _ = std::fs::rename(&tmp, path);
+        let Ok(payload) = bincode::serde::encode_to_vec(zm, BINCODE_CFG) else {
+            return;
+        };
+        let bytes = zmap_encode(&payload);
+        let tmp = path.with_extension("zmap.tmp");
+        // tmp + fsync + rename + fsync do directório. O `rename` sozinho
+        // publica o NOME de forma atómica, não o CONTEÚDO: sem o fsync do
+        // ficheiro, o que fica visível a seguir a uma falha de energia pode
+        // ser o tamanho certo cheio de zeros — e um zone map a zeros faz a
+        // query saltar segmentos que devia ler.
+        let escrito = (|| -> std::io::Result<()> {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+            Ok(())
+        })();
+        if escrito.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        if std::fs::rename(&tmp, path).is_ok() {
+            #[cfg(unix)]
+            if let Some(dir) = path.parent() {
+                if let Ok(d) = std::fs::File::open(dir) {
+                    let _ = d.sync_all();
+                }
             }
+        } else {
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 
@@ -260,5 +331,61 @@ mod tests {
         // Still correct: bob lives in every segment here, so nothing is skipped,
         // but the mechanism resolved purely from sidecars.
         assert_eq!(stats.segments_considered, n_sealed);
+    }
+
+    /// Um sidecar corrompido tem de ser IGNORADO, nunca acreditado.
+    ///
+    /// O sidecar decide o que a query **não lê**. Era gravado sem um único
+    /// fsync e lido sem validação: um ficheiro a zeros deixado por uma falha de
+    /// energia descodificava para um `ZoneMap` com intervalos a zero, e a
+    /// partir daí o `scan_pruned` saltava segmentos que continham mesmo os
+    /// dados — resposta errada, sem erro nenhum. O cabeçalho com digest fecha
+    /// isso: um sidecar que não valida é reconstruído.
+    #[test]
+    fn um_sidecar_corrompido_e_reconstruido_e_nunca_acreditado() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = std::sync::Arc::new(Log::open(dir.path(), 2048, FsyncPolicy::Always).unwrap());
+        for i in 0..60 {
+            log.append(ep("alice", i)).unwrap();
+        }
+        for i in 0..60 {
+            log.append(ep("bob", i)).unwrap();
+        }
+        log.flush().unwrap();
+
+        let s1 = SkipScanner::new(log.clone());
+        let (esperado, _) = s1.scan_pruned(|z| z.may_contain_agent("bob")).unwrap();
+        assert!(!esperado.is_empty(), "o teste precisa de encontrar algo");
+
+        // Zerar TODOS os sidecars, que e o que uma falha de energia entre o
+        // rename e o flush dos dados deixava.
+        let mut zerados = 0;
+        for entrada in std::fs::read_dir(dir.path()).unwrap().flatten() {
+            let p = entrada.path();
+            if p.extension().map(|x| x == "zmap").unwrap_or(false) {
+                let n = std::fs::metadata(&p).unwrap().len() as usize;
+                std::fs::write(&p, vec![0u8; n]).unwrap();
+                zerados += 1;
+            }
+        }
+        assert!(zerados > 0, "nao havia sidecars para corromper");
+
+        // Cache fria + sidecars a zeros: tem de reconstruir e devolver o mesmo.
+        let s2 = SkipScanner::new(log.clone());
+        let (obtido, _) = s2.scan_pruned(|z| z.may_contain_agent("bob")).unwrap();
+        let (construidos, carregados) = s2.build_stats();
+        assert_eq!(
+            carregados, 0,
+            "um sidecar a zeros nao pode ser aceite como valido"
+        );
+        assert!(
+            construidos > 0,
+            "devia ter reconstruido a partir do segmento"
+        );
+        assert_eq!(
+            obtido.len(),
+            esperado.len(),
+            "o sidecar corrompido fez a query perder registos"
+        );
     }
 }

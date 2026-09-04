@@ -302,7 +302,13 @@ pub fn prove_lsn(
         PhysicalLayout::Packed => {
             let reader = open_packed(path, max_block_bytes)?;
             let mut counters = ScanCounters::default();
-            let mut hashes = Vec::with_capacity(reader.footer.record_count as usize);
+            // Mesmo motivo do `decode_block_records`: o `record_count` vem do
+            // rodapé no disco e uma reserva cega a partir dele transforma um
+            // ficheiro corrompido num `abort` do processo. O tecto é só uma
+            // dica — o vector cresce na mesma se os registos existirem mesmo.
+            const DICA_MAXIMA: usize = 1 << 20;
+            let mut hashes =
+                Vec::with_capacity((reader.footer.record_count as usize).min(DICA_MAXIMA));
             let mut index = None;
             reader.for_each_record(&mut counters, |r| {
                 if r.lsn == lsn {

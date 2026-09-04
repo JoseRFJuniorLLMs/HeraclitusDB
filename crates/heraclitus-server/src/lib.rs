@@ -11,6 +11,7 @@ pub mod engine;
 pub mod flight_grpc; // SPEC-016: protocolo Arrow Flight real (gRPC, tonic 0.14)
 pub mod grpc;
 pub mod rest;
+pub mod telemetry_probe;
 
 pub use embedded::Embedded;
 pub use engine::Engine;
@@ -58,7 +59,11 @@ pub async fn serve_with(
     );
     boot.info_line(
         "Plataforma",
-        &heraclitus_platform::detect_capabilities().summary_line(),
+        &format!(
+            "{} | allocator: {}",
+            heraclitus_platform::detect_capabilities().summary_line(),
+            crate::boot::allocator_em_uso()
+        ),
     );
 
     let engine = Arc::new(Engine::open_with_boot(&config, &boot)?);
@@ -141,9 +146,41 @@ pub async fn serve_with(
                         config.sentinel.worker_threads
                     ),
                 );
+                // SPEC-0071 §9.1 — liga a view de Telemetry Health ao health
+                // gate da política. Sem isto o gate é mecanismo sem fonte: uma
+                // regra que declare `required_telemetry` nunca poderia ser
+                // satisfeita, e a acção automática ficaria bloqueada por falta
+                // de sonda em vez de por falta de saúde.
+                if let Some(tenant) = config.sentinel.health_gate_tenant_id.clone() {
+                    runtime.set_telemetry_probe(Arc::new(
+                        crate::telemetry_probe::ViewTelemetryProbe::new(
+                            engine.log.clone(),
+                            engine.telemetry_health_graph(),
+                            tenant,
+                        ),
+                    ));
+                }
                 Some(Arc::new(runtime))
             }
             Ok(None) => None,
+            // SPEC-0072 §17/§34 — sob `strict` a recusa do Sentinel é FATAL.
+            //
+            // Todo o outro erro do Sentinel é degradação aceitável: o banco
+            // continua a servir sem plano de segurança, com um aviso. Mas
+            // `cursor_policy = "strict"` é uma escolha declarada para
+            // ambientes forenses, e o que ela declara é "nenhuma recuperação
+            // automática pode ocorrer sem um humano". Arrancar na mesma, com a
+            // detecção desligada e um aviso na consola, seria conceder
+            // exactamente o que o operador pediu para não acontecer — e da
+            // maneira mais silenciosa possível, porque o serviço fica verde.
+            Err(error)
+                if config.sentinel.recovery.cursor_policy
+                    == heraclitus_core::CursorPolicy::Strict =>
+            {
+                return Err(HeraclitusError::Config(format!(
+                    "Sentinel recusou arrancar sob cursor_policy=strict: {error}"
+                )));
+            }
             Err(error) => {
                 boot.warn_line(
                     "Heraclitus Sentinel",
@@ -199,8 +236,20 @@ pub async fn serve_with(
         );
     }
     let auth = move |req| authenticator.authenticate(req);
-    let svc = HeraclitusServer::with_interceptor(
-        grpc::Service::new_with_sentinel(engine.clone(), sentinel_runtime.clone()),
+    // O cliente (heraclitus-client/src/lib.rs:102) e o transporte do raft
+    // (heraclitus-raft/src/grpc.rs:145) assumem 256 MiB nos dois sentidos, mas
+    // o SERVIDOR nunca declarava limite nenhum — ficava com o default do tonic
+    // de um lado e com um cliente a assumir outro. Declarar o mesmo tecto dos
+    // dois lados torna o contrato explícito em vez de implícito, e impede que
+    // uma mensagem enorme seja aceite antes de alguém decidir se cabe.
+    const MAX_MSG: usize = 256 * 1024 * 1024;
+    let svc = tonic::service::interceptor::InterceptedService::new(
+        HeraclitusServer::new(grpc::Service::new_with_sentinel(
+            engine.clone(),
+            sentinel_runtime.clone(),
+        ))
+        .max_decoding_message_size(MAX_MSG)
+        .max_encoding_message_size(MAX_MSG),
         auth,
     );
     if config.rest_basic_auth.is_some() {
@@ -358,26 +407,27 @@ pub async fn serve_with(
         // O mesmo log visto como `AnyLog`, que e o que o motor regulatorio
         // aceita: a reconciliacao de §94 corre neste mesmo ciclo.
         let log_regulatorio = engine.log.clone();
-        // SPEC-0046 §94 — reconciliar TAMBEM no arranque, e nao so antes de
-        // cada GC. O bit `legal_hold` vive no HRKM; os holds vivem no log. Um
-        // restauro de manifesto, uma migracao, ou um arranque sobre um HRKM
-        // mais antigo que o log deixam os dois a discordar — e quem perde e o
-        // hold, porque o default de `RetentionPolicy` e `legal_hold: false`.
-        // O log e a autoridade; o HRKM e derivado. Reconciliar aqui repoe essa
-        // ordem antes de a primeira passagem de GC sequer poder correr.
-        match heraclitus_compliance::RegulatoryPolicyEngine::new(log_regulatorio.clone())
-            .reconcile_legal_holds()
-        {
-            Ok(0) => {}
-            Ok(marcados) => boot.ok_line(
-                "Legal holds (§94)",
-                &format!("{marcados} segmento(s) reconciliado(s) a partir do log"),
-            ),
-            Err(error) => boot.warn_line(
-                "Legal holds (§94)",
-                &format!("reconciliação falhou no arranque: {error}"),
-            ),
-        }
+        // SPEC-0046 §94 — o bit `legal_hold` vive no HRKM; os holds vivem no
+        // log. Um restauro de manifesto, uma migração, ou um arranque sobre um
+        // HRKM mais antigo que o log deixam os dois a discordar — e quem perde
+        // é o hold, porque o default de `RetentionPolicy` é `legal_hold: false`.
+        // O log é a autoridade; o HRKM é derivado.
+        //
+        // Esta reconciliação corria aqui, SÍNCRONA e na thread do reactor, e
+        // custava um replay do log inteiro. Não escrevia linha nenhuma quando
+        // não encontrava nada (`Ok(0) => {}`), portanto era um custo invisível
+        // — num arranque medido, o vão sem log entre a linha do Packer e o bind
+        // do gRPC foi de 6m46s, 41% do arranque.
+        //
+        // Sai do caminho de arranque sem perder a garantia: o ciclo do GC
+        // reconcilia ANTES de cada colheita e, se a reconciliação falhar, salta
+        // a colheita dessa passagem (`continue`). Nenhuma coleta pode acontecer
+        // sem uma reconciliação fresca imediatamente antes — que é a
+        // propriedade que interessa. Correr também no arranque era cinto e
+        // suspensórios, pagos na latência de abertura da base.
+        //
+        // Fica na tarefa periódica, executada uma vez à entrada e em
+        // `spawn_blocking`, para não bloquear o reactor como bloqueava aqui.
         let every = std::time::Duration::from_secs(config.v6_gc_interval_secs);
         let opts = heraclitus_log::v6::GcRunOptions {
             keep_manifests: config.v6_gc_keep_manifests,
@@ -400,7 +450,38 @@ pub async fn serve_with(
                 &format!("background a cada {}s", config.v6_gc_interval_secs),
             ),
         }
+        // A cache do estado regulatório vive no Engine; as reconciliações
+        // desta tarefa estendem-na pela cauda em vez de replayar o log inteiro.
+        let cache_regulatoria = engine.regulatory_cache.clone();
         Some(tokio::spawn(async move {
+            // A reconciliação que corria no arranque passa para aqui: acontece
+            // logo, sem esperar pelo primeiro tick, mas em `spawn_blocking` e
+            // fora do caminho que a base tem de percorrer para abrir.
+            {
+                let inicial = log_regulatorio.clone();
+                let cache = cache_regulatoria.clone();
+                match tokio::task::spawn_blocking(move || {
+                    heraclitus_compliance::RegulatoryPolicyEngine::new(inicial)
+                        .with_cache(cache)
+                        .reconcile_legal_holds()
+                })
+                .await
+                {
+                    Ok(Ok(marcados)) if marcados > 0 => tracing::info!(
+                        segmentos = marcados,
+                        "legal holds reconciliados no arranque (§94)"
+                    ),
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => tracing::warn!(
+                        error = %error,
+                        "reconciliacao inicial de legal holds falhou; o GC volta a tentar antes de coletar"
+                    ),
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        "worker da reconciliacao inicial de legal holds falhou"
+                    ),
+                }
+            }
             let mut tick = tokio::time::interval(every);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             tick.tick().await;
@@ -423,8 +504,10 @@ pub async fn serve_with(
                 // aplicar seria trocar prova por espaco em disco.
                 let reconciliado = {
                     let gc_log = log_regulatorio.clone();
+                    let cache = cache_regulatoria.clone();
                     tokio::task::spawn_blocking(move || {
                         heraclitus_compliance::RegulatoryPolicyEngine::new(gc_log)
+                            .with_cache(cache)
                             .reconcile_legal_holds()
                     })
                     .await

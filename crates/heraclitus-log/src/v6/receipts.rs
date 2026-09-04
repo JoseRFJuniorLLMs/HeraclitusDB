@@ -643,3 +643,31 @@ mod tests {
         assert_ne!(physical_digest(b"abc"), physical_digest(b"abd"));
     }
 }
+
+#[cfg(test)]
+mod testes_digest_em_streaming {
+    use super::*;
+
+    /// O `physical_digest` ja esta publicado em `DerivedArtifactRef`. Trocar
+    /// quem o calcula so e seguro se o valor for BYTE A BYTE o mesmo — senao a
+    /// idempotencia da SPEC-0050 §209 quebra em silencio, e o sintoma seria
+    /// reexportacoes a parecerem artefactos novos.
+    ///
+    /// O tamanho de 3 MiB nao e arbitrario: o buffer do streaming e de 1 MiB,
+    /// portanto isto forca varias iteracoes e um ultimo bloco parcial, que e
+    /// onde um erro de fronteira apareceria.
+    #[test]
+    fn o_digest_em_streaming_e_identico_ao_digest_em_memoria() {
+        let temp = tempfile::tempdir().unwrap();
+        for tamanho in [0usize, 1, 1 << 20, (1 << 20) + 1, 3 * (1 << 20) + 7] {
+            let caminho = temp.path().join(format!("seg-{tamanho}.bin"));
+            let bytes: Vec<u8> = (0..tamanho).map(|i| (i % 251) as u8).collect();
+            std::fs::write(&caminho, &bytes).unwrap();
+            assert_eq!(
+                physical_digest_of_file(&caminho).unwrap(),
+                physical_digest(&bytes),
+                "tamanho={tamanho}: o digest em streaming divergiu do digest em memoria"
+            );
+        }
+    }
+}

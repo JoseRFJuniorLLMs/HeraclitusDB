@@ -12,6 +12,12 @@ use heraclitus_core::{Episode, EventKind, HeraclitusError, Lsn};
 use heraclitus_views::View;
 use serde::{Deserialize, Serialize};
 
+pub mod security_event;
+
+pub use security_event::{
+    SecurityEventCounts, SecurityEventFilter, SecurityEventView, SECURITY_EVENT_SCHEMA,
+};
+
 pub const TELEMETRY_HEALTH_SCHEMA: &str = "heraclitus-telemetry-health/1.0";
 pub const TELEMETRY_HEALTH_KIND: &str = "TelemetryHealth";
 
@@ -836,6 +842,82 @@ impl TelemetryHealthGraph {
             .collect()
     }
 
+    /// SPEC-0071 §6.3a/§9.1 — a saúde agregada de um datasource inteiro.
+    ///
+    /// O health gate da política pergunta por um **datasource**, não por um
+    /// sensor: `required_telemetry: [{datasource_class: identity, ...}]`. Um
+    /// datasource tem tipicamente vários sensores, e agregar exige uma regra.
+    ///
+    /// **A regra é: o PIOR sensor decide.** Não a média, não a maioria.
+    ///
+    /// O critério é adversarial, não estatístico. Quem ataca não degrada o
+    /// sensor médio — silencia o sensor que o veria. Uma média deixaria oito
+    /// sensores saudáveis a esconder o nono, que é exactamente o que ficou
+    /// cego. A §6.3 diz o mesmo por outras palavras: "zero ataques +
+    /// datasource Silent ≠ ambiente seguro".
+    ///
+    /// Um datasource **sem sensores conhecidos** devolve `None`, que o
+    /// chamador tem de tratar como `Unknown` — nunca como saudável. A §9.1
+    /// põe `Unknown` ao lado de `Silent` de propósito.
+    ///
+    /// `now_micros` é passado de fora e não lido do relógio: mantém a função
+    /// determinística e reconstrutível `AS OF LSN`, como tudo o resto nesta
+    /// view.
+    pub fn datasource_health_as_of(
+        &self,
+        tenant_id: &str,
+        datasource_id: &str,
+        exclusive_lsn: Lsn,
+        now_micros: u64,
+    ) -> Option<DatasourceHealth> {
+        let sensores: Vec<TelemetryHealthSnapshot> = self
+            .snapshots_as_of(exclusive_lsn)
+            .into_iter()
+            .filter(|s| {
+                s.identity.tenant_id == tenant_id && s.identity.datasource_id == datasource_id
+            })
+            .collect();
+        if sensores.is_empty() {
+            return None;
+        }
+
+        let saudavel = sensores
+            .iter()
+            .all(|s| s.status == SensorHealthStatus::Healthy);
+        // A confiança é a do sensor menos confiável. `None` conta como zero:
+        // um sensor sem confiança apurada não é um sensor de confiança.
+        let confianca_basis_points = sensores
+            .iter()
+            .map(|s| s.trust.basis_points.unwrap_or(0))
+            .min()
+            .unwrap_or(0);
+        // A idade é a do sensor MAIS ATRASADO: o instante a partir do qual
+        // deixámos de ter cobertura completa deste datasource.
+        let idade_micros = sensores
+            .iter()
+            .map(|s| match ultima_observacao(s) {
+                Some(quando) => now_micros.saturating_sub(quando),
+                // Um sensor que nunca foi observado é infinitamente velho.
+                None => u64::MAX,
+            })
+            .max()
+            .unwrap_or(u64::MAX);
+
+        Some(DatasourceHealth {
+            tenant_id: tenant_id.to_string(),
+            datasource_id: datasource_id.to_string(),
+            as_of_lsn: exclusive_lsn,
+            saudavel,
+            confianca_basis_points,
+            idade_micros,
+            sensores: sensores.len(),
+            pior_sensor: sensores
+                .iter()
+                .min_by_key(|s| ordem_de_gravidade(s.status))
+                .map(|s| s.identity.sensor_id.clone()),
+        })
+    }
+
     pub fn state_hash_as_of(&self, exclusive_lsn: Lsn) -> [u8; 32] {
         let state = self.reduce_as_of(exclusive_lsn);
         // JSON only accepts string map keys. A sorted vector preserves the
@@ -1306,5 +1388,202 @@ mod tests {
         );
         graph.apply(7, &episode);
         assert!(graph.rejected_payload_lsns().contains(&7));
+    }
+}
+
+/// SPEC-0071 §6.3a — a saúde de um datasource inteiro, agregada dos seus
+/// sensores.
+///
+/// A regra de agregação está documentada em
+/// [`TelemetryHealthGraph::datasource_health_as_of`]: o pior sensor decide.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatasourceHealth {
+    pub tenant_id: String,
+    pub datasource_id: String,
+    /// Limite exclusivo, como em `AS OF LSN n`.
+    pub as_of_lsn: Lsn,
+    /// Todos os sensores conhecidos estão `Healthy`.
+    pub saudavel: bool,
+    /// Confiança do sensor MENOS confiável, em basis points (0..=10_000).
+    pub confianca_basis_points: u16,
+    /// Idade do sensor MAIS atrasado, em microssegundos.
+    pub idade_micros: u64,
+    /// Quantos sensores entraram no agregado.
+    pub sensores: usize,
+    /// Qual deles puxou o agregado para baixo — o que se vai investigar.
+    pub pior_sensor: Option<String>,
+}
+
+impl DatasourceHealth {
+    /// A confiança em [0, 1], que é como a política a declara
+    /// (`minimum_trust: 0.90`).
+    pub fn confianca(&self) -> f32 {
+        f32::from(self.confianca_basis_points) / 10_000.0
+    }
+
+    /// A idade em segundos, que é como a política a declara
+    /// (`maximum_age_secs: 300`).
+    pub fn idade_secs(&self) -> u64 {
+        self.idade_micros / 1_000_000
+    }
+}
+
+/// O instante da observação mais recente de um sensor.
+///
+/// A janela de ingestão é preferida ao heartbeat: um heartbeat prova que o
+/// processo do conector está vivo, e uma janela fechada prova que DADOS
+/// chegaram. É a segunda que a §9.1 quer saber — um conector vivo que não
+/// entrega nada é precisamente o `Silent` que o gate existe para apanhar.
+fn ultima_observacao(s: &TelemetryHealthSnapshot) -> Option<u64> {
+    s.last_window_end_micros.or(s.last_heartbeat_micros)
+}
+
+/// Ordem de gravidade, do pior para o melhor. Só serve para escolher qual o
+/// sensor a nomear no agregado.
+fn ordem_de_gravidade(status: SensorHealthStatus) -> u8 {
+    match status {
+        SensorHealthStatus::Silent => 0,
+        SensorHealthStatus::Unknown => 1,
+        SensorHealthStatus::Degraded => 2,
+        SensorHealthStatus::Drifted => 3,
+        SensorHealthStatus::Delayed => 4,
+        SensorHealthStatus::Healthy => 5,
+    }
+}
+
+#[cfg(test)]
+mod testes_agregado_spec0071 {
+    use super::*;
+
+    fn sensor(nome: &str) -> SensorIdentity {
+        SensorIdentity::new("tenant-a", "identity", nome)
+    }
+
+    fn expectativa() -> TelemetryHealthEvent {
+        TelemetryHealthEvent::ExpectationConfigured(ExpectationConfigured {
+            heartbeat_cadence_micros: Some(60_000_000),
+            max_lateness_micros: 30_000_000,
+            minimum_events_per_window: Some(1),
+            duplicate_storm_basis_points: 2_000,
+        })
+    }
+
+    fn janela(fim: u64) -> TelemetryHealthEvent {
+        TelemetryHealthEvent::IngestionWindowClosed(IngestionWindowClosed {
+            window_start_micros: fim.saturating_sub(1_000_000),
+            window_end_micros: fim,
+            received: 10,
+            parsed: 10,
+            normalized: 10,
+            duplicated: 0,
+            dropped: 0,
+            quarantined: 0,
+            parser_errors: 0,
+            max_observed_lateness_millis: 1,
+            connector_digest: "ab".repeat(32),
+        })
+    }
+
+    fn grafo(eventos: Vec<(SensorIdentity, u64, TelemetryHealthEvent)>) -> TelemetryHealthGraph {
+        let mut g = TelemetryHealthGraph::new();
+        for (lsn, (identity, at, evento)) in eventos.into_iter().enumerate() {
+            g.apply_envelope(
+                lsn as u64,
+                TelemetryHealthEnvelope::new(identity, at, evento),
+            )
+            .unwrap();
+        }
+        g
+    }
+
+    #[test]
+    fn um_datasource_sem_sensores_e_none_e_nunca_saudavel() {
+        let g = grafo(vec![]);
+        assert!(g
+            .datasource_health_as_of("tenant-a", "identity", 100, 1_000_000)
+            .is_none());
+    }
+
+    #[test]
+    fn o_pior_sensor_decide_a_confianca_e_a_idade() {
+        // A regra de agregacao, e a razao dela: quem ataca nao degrada o sensor
+        // medio — silencia o que o veria. Uma media deixaria o sensor saudavel
+        // a esconder o que ficou cego.
+        let bom = sensor("okta");
+        let mau = sensor("ad");
+        let g = grafo(vec![
+            (bom.clone(), 1, expectativa()),
+            (mau.clone(), 1, expectativa()),
+            // O bom entregou agora; o mau ha muito tempo.
+            (bom.clone(), 900_000_000, janela(900_000_000)),
+            (mau.clone(), 100_000_000, janela(100_000_000)),
+        ]);
+        let agora = 1_000_000_000;
+        let saude = g
+            .datasource_health_as_of("tenant-a", "identity", 100, agora)
+            .expect("dois sensores conhecidos");
+
+        assert_eq!(saude.sensores, 2);
+        assert_eq!(
+            saude.idade_micros,
+            agora - 100_000_000,
+            "a idade tem de ser a do sensor MAIS atrasado, nao a media nem a do melhor"
+        );
+        let confianca_isolada = |s: &SensorIdentity| {
+            g.snapshot_as_of(s, 100)
+                .unwrap()
+                .trust
+                .basis_points
+                .unwrap_or(0)
+        };
+        assert_eq!(
+            saude.confianca_basis_points,
+            confianca_isolada(&bom).min(confianca_isolada(&mau)),
+            "a confianca tem de ser a do sensor MENOS confiavel"
+        );
+    }
+
+    #[test]
+    fn um_sensor_nao_saudavel_arrasta_o_datasource() {
+        let bom = sensor("okta");
+        let calado = sensor("ad");
+        let g = grafo(vec![
+            (bom.clone(), 1, expectativa()),
+            (calado.clone(), 1, expectativa()),
+            (bom.clone(), 900_000_000, janela(900_000_000)),
+            // O `calado` nunca entregou nada depois da expectativa.
+            (
+                calado.clone(),
+                900_000_000,
+                TelemetryHealthEvent::HealthEvaluationTick(HealthEvaluationTick {
+                    evaluated_at_micros: 900_000_000,
+                }),
+            ),
+        ]);
+        let saude = g
+            .datasource_health_as_of("tenant-a", "identity", 100, 1_000_000_000)
+            .unwrap();
+        assert!(
+            !saude.saudavel,
+            "com um sensor calado o datasource nao pode ser dado por saudavel"
+        );
+        assert_eq!(saude.pior_sensor.as_deref(), Some("ad"));
+    }
+
+    #[test]
+    fn a_conversao_para_a_unidade_da_politica_e_a_esperada() {
+        // A politica declara `minimum_trust: 0.90` e `maximum_age_secs: 300`.
+        let saude = DatasourceHealth {
+            tenant_id: "t".into(),
+            datasource_id: "d".into(),
+            as_of_lsn: 1,
+            saudavel: true,
+            confianca_basis_points: 9_000,
+            idade_micros: 300_000_000,
+            sensores: 1,
+            pior_sensor: None,
+        };
+        assert_eq!(saude.confianca(), 0.90);
+        assert_eq!(saude.idade_secs(), 300);
     }
 }

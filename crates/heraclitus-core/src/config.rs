@@ -22,11 +22,39 @@ pub enum SentinelMode {
 
 /// Configuration for the deterministic L1 rule plane.  The path is explicit:
 /// no globbing or implicit rules are loaded by the server.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SentinelL1Config {
     pub enabled: bool,
     pub rules_path: Option<PathBuf>,
+    /// O contrato de lateness (SPEC-0072, pré-requisito do snapshot).
+    ///
+    /// O histórico L1 retém, a partir do evento mais recente, a maior janela
+    /// que o ruleset consulta MAIS esta tolerância. Um evento que chegue com
+    /// `observed_at` mais atrasado do que isso não participa em nenhuma
+    /// correlação — é a promessa que torna o histórico limitável, e que antes
+    /// não existia: sem ela o `rule_history` crescia sem tecto e cada evento
+    /// ingerido custava Θ(regras × N).
+    pub max_lateness_ms: u64,
+    /// Tecto duro em linhas, independente do tempo. Zero desliga o tecto.
+    pub history_capacity: usize,
+}
+
+impl Default for SentinelL1Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rules_path: None,
+            // Cinco minutos: a mesma cadência que a SPEC-0072 §44 usa para o
+            // snapshot, e generosa para qualquer fonte de telemetria real. Não
+            // é o default por ser certo para todos — é por ser um número
+            // EXPLÍCITO em vez de nenhum.
+            max_lateness_ms: 300_000,
+            // A mesma escala do `memtable_cap`: o tecto existe para que um
+            // ruleset com janelas de dias não devolva o histórico ao ilimitado.
+            history_capacity: 100_000,
+        }
+    }
 }
 
 /// Configuration for the deterministic L2 behavioral adapter.  Numeric
@@ -154,6 +182,35 @@ pub struct SentinelConfig {
     pub l3: SentinelL3Config,
     /// SPEC-0047 — plano de threat intelligence (opt-in).
     pub threat: SentinelThreatConfig,
+    /// SPEC-0072 §10 — tamanho do lote do replay janelado no arranque.
+    ///
+    /// O arranque materializava a base inteira num `Vec` (`log.scan(0, head)`).
+    /// A §11 proíbe-o: a memória do replay tem de ficar limitada ao estado
+    /// materializado mais o lote corrente. Este é o lote.
+    pub replay_batch_events: usize,
+    /// SPEC-0072 §17 — o que fazer quando o cursor diverge do log canónico.
+    pub recovery: SentinelRecoveryConfig,
+    /// SPEC-0072 §44 — publica um snapshot ao fim deste número de eventos
+    /// processados. Zero desliga o limiar por eventos.
+    pub snapshot_interval_events: u64,
+    /// SPEC-0071 §9.1 — o inquilino cuja telemetria o health gate interroga.
+    ///
+    /// `None` (o default) significa que não há sonda ligada, e uma regra que
+    /// declare `required_telemetry` passa a exigir aprovação humana.
+    ///
+    /// É explícito e não inferido do pedido de propósito. A decisão de política
+    /// é tomada pelo Sentinel, que corre em nome do sistema e não de um
+    /// utilizador; deixar o inquilino ser escolhido pelo caminho de dados
+    /// permitiria satisfazer um requisito de saúde com a telemetria de outro,
+    /// que faria do gate um teatro.
+    pub health_gate_tenant_id: Option<String>,
+    /// SPEC-0072 §44 — e ao fim deste tempo. Zero desliga o limiar por tempo.
+    ///
+    /// Basta um dos dois ser atingido. São limiares diferentes porque medem
+    /// riscos diferentes: o de eventos limita quanto trabalho um crash desfaz,
+    /// o de tempo garante que uma base parada não fica indefinidamente sem
+    /// snapshot só por não ter tráfego.
+    pub snapshot_interval_secs: u64,
 }
 
 impl Default for SentinelConfig {
@@ -169,8 +226,42 @@ impl Default for SentinelConfig {
             l2: SentinelL2Config::default(),
             l3: SentinelL3Config::default(),
             threat: SentinelThreatConfig::default(),
+            // SPEC-0072 §10: "Default inicial 8192. O valor final deve ser
+            // definido por benchmark." Fica o valor da spec até haver medida.
+            replay_batch_events: 8_192,
+            recovery: SentinelRecoveryConfig::default(),
+            // Os valores da §44. "Valores finais definidos por benchmark" —
+            // ficam os da spec ate haver medida.
+            health_gate_tenant_id: None,
+            snapshot_interval_events: 100_000,
+            snapshot_interval_secs: 300,
         }
     }
+}
+
+/// SPEC-0072 §17 — política de recuperação quando o cursor persistido está à
+/// frente do log canónico.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CursorPolicy {
+    /// `cursor > head` aborta o arranque. Para ambientes forenses em que
+    /// nenhuma recuperação automática pode ocorrer sem um humano.
+    Strict,
+    /// `cursor > head` reconstrói o estado derivado a partir do log canónico.
+    ///
+    /// É o default recomendado pela spec, e a razão está no INV-4: nada do que
+    /// o Sentinel persiste fora do log é source of truth. Recusar arrancar por
+    /// causa de um artefacto derivado seria deixar a base indisponível para
+    /// proteger uma cópia.
+    #[default]
+    Rebuild,
+}
+
+/// SPEC-0072 §17 — `[sentinel.recovery]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SentinelRecoveryConfig {
+    pub cursor_policy: CursorPolicy,
 }
 
 /// Papéis de acesso aplicados por RPC. `Writer` inclui leitura; `Auditor`
@@ -351,6 +442,16 @@ pub struct HeraclitusConfig {
     pub v6_lakehouse_path: String,
     /// Nome da tabela publicada nos catálogos Iceberg/Delta.
     pub v6_lakehouse_table: String,
+    /// SPEC-0073 §16 — linhas por lote de exportação, e por row group.
+    ///
+    /// Governa duas coisas ao mesmo tempo, de propósito: quantos `Episode`
+    /// ficam em RAM de cada vez durante a exportação, e onde o Parquet corta os
+    /// row groups. Serem o mesmo número é o que mantém a saída determinística —
+    /// o corte depende do índice da linha e de mais nada.
+    ///
+    /// Subir troca memória por menos row groups (ficheiros marginalmente
+    /// menores, leitura selectiva pior). Zero é tratado como 1.
+    pub v6_lakehouse_export_batch_rows: usize,
     /// §3.9 (distill) — intervalo (segundos) da task de consolidação: a cada
     /// tick, os episódios de Observação novos (desde o cursor) são agrupados
     /// na variedade e cada cluster estável vira um `Fact` (`FactDerived`) no
@@ -597,6 +698,8 @@ impl Default for HeraclitusConfig {
             v6_lakehouse_interval_secs: 0,
             v6_lakehouse_path: String::new(),
             v6_lakehouse_table: "episodios".to_string(),
+            // O valor da SPEC-0073 §16.
+            v6_lakehouse_export_batch_rows: 8_192,
             v6_packing_interval_secs: 30,
             v6_gc_interval_secs: 300,
             v6_gc_keep_manifests: 3,
@@ -1648,6 +1751,37 @@ max_graph_hops = 6
         assert!(oid_decimal_valido("1.2.840.113549.1.9.16.1.4"));
         for invalido in ["", "1", ".1.2", "3.1", "1.40", "1..2", "1.02.3", "a.b"] {
             assert!(!oid_decimal_valido(invalido), "{invalido}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod testes_config_de_referencia {
+    /// A configuracao de referencia que o repositorio DISTRIBUI tem de parsear.
+    ///
+    /// Descoberto pelo gate operacional de Linux (SPEC-0072 §31), que arrancou
+    /// um servidor a serio com uma config escrita a partir do exemplo e recebeu:
+    ///
+    ///   invalid type: string "always", expected internally tagged enum FsyncPolicy
+    ///
+    /// O `packaging/heraclitus.toml` tinha `fsync = "always"`. O `FsyncPolicy` e
+    /// `#[serde(tag = "mode")]`, portanto a forma correcta e uma tabela. O
+    /// ficheiro estava errado desde que foi escrito, e nada o lia: nenhum teste
+    /// carregava o exemplo, e a unit do systemd nem sequer passa um ficheiro de
+    /// configuracao ao servidor. Um exemplo que nao parseia e pior do que
+    /// nenhum — quem o copia perde tempo a descobrir que a culpa nao e dele.
+    #[test]
+    fn o_exemplo_distribuido_parseia() {
+        let caminho = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packaging/heraclitus.toml");
+        let texto = std::fs::read_to_string(&caminho)
+            .unwrap_or_else(|e| panic!("{}: {e}", caminho.display()));
+        match toml::from_str::<crate::config::HeraclitusConfig>(&texto) {
+            Ok(_) => {}
+            Err(erro) => panic!(
+                "packaging/heraclitus.toml nao parseia: {erro}\n\
+                 Um exemplo que nao carrega e pior do que nenhum."
+            ),
         }
     }
 }

@@ -88,13 +88,26 @@ impl Inner {
         Ok(out)
     }
 
-    fn append_record(&mut self, rec: &LogRecord) -> Result<(), StorageError<NodeId>> {
+    /// Escreve sem sincronizar. O `fsync` fica a cargo de quem fecha o lote.
+    fn write_record(&mut self, rec: &LogRecord) -> Result<(), StorageError<NodeId>> {
         let framed = Self::encode_record(rec)?;
         self.wal
             .write_all(&framed)
-            .and_then(|_| self.wal.sync_all()) // fsync ANTES do ack — durabilidade real
             .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
         Ok(())
+    }
+
+    /// Um `fsync` do WAL. Tem de correr ANTES do ack — é o que torna a
+    /// durabilidade real e não uma promessa.
+    fn sync_wal(&mut self) -> Result<(), StorageError<NodeId>> {
+        self.wal
+            .sync_all()
+            .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))
+    }
+
+    fn append_record(&mut self, rec: &LogRecord) -> Result<(), StorageError<NodeId>> {
+        self.write_record(rec)?;
+        self.sync_wal()
     }
 
     /// R23: reescreve o WAL COMPACTADO (um `Purge(last_purged)` + os Inserts
@@ -238,7 +251,24 @@ impl FileRaftLog {
 
         let file = match File::open(wal_path) {
             Ok(f) => f,
-            Err(_) => return Ok((entries, last_purged, 0, false)), // WAL ainda não existe
+            // WAL ainda não existe: primeiro arranque legítimo.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((entries, last_purged, 0, false))
+            }
+            // Qualquer OUTRO erro tem de falhar alto, e aqui a consequência de
+            // não o fazer é pior do que perder o voto. Este `valid_len` volta
+            // ao chamador, que faz `wal.set_len(valid_len)` para cortar a cauda
+            // meia-escrita — logo devolver 0 por causa de um EACCES, um EIO ou
+            // descritores esgotados mandava truncar o WAL a ZERO. Um erro
+            // transitório de permissões apagava todas as entradas do Raft.
+            Err(e) => {
+                return Err(StorageError::from(StorageIOError::read_logs(io_err(
+                    format!(
+                        "entries.wal existe mas não pôde ser aberto ({e}); recuso \
+                         arrancar em vez de o truncar a zero"
+                    ),
+                ))))
+            }
         };
         let file_size = file
             .metadata()
@@ -324,9 +354,25 @@ impl FileRaftLog {
         I: IntoIterator<Item = Entry<TypeConfig>>,
     {
         let mut inner = self.inner.lock().unwrap();
+        // UM fsync por lote, não um por entrada.
+        //
+        // Antes, cada `append_record` fazia `write_all` + `sync_all`, portanto
+        // um lote de N entradas custava N fsyncs — todos com o mutex do WAL
+        // segurado, o que serializa cada escritor do cluster atrás da latência
+        // do disco multiplicada pelo tamanho do lote.
+        //
+        // A durabilidade é a mesma: o que a garante é o fsync acontecer ANTES
+        // do ack, e o ack só existe depois desta função retornar. Um crash a
+        // meio do lote deixa uma cauda meia-escrita, que é exactamente o que o
+        // `replay` já trata — e nenhuma dessas entradas foi reconhecida.
+        let mut escreveu = false;
         for e in entries {
-            inner.append_record(&LogRecord::Insert(e.clone()))?;
+            inner.write_record(&LogRecord::Insert(e.clone()))?;
             inner.entries.insert(e.log_id.index, e);
+            escreveu = true;
+        }
+        if escreveu {
+            inner.sync_wal()?;
         }
         Ok(())
     }
@@ -349,7 +395,26 @@ impl FileRaftLog {
                         ))))
                     })
             }
-            Err(_) => Ok(Meta::default()), // primeiro arranque: ainda não há meta
+            // SÓ `NotFound` é "primeiro arranque". O ramo anterior era
+            // `Err(_) => Ok(Meta::default())`, e isso apanhava TODOS os erros
+            // de I/O: permissões, EIO de um disco a falhar, descritores
+            // esgotados. Qualquer um deles fazia o nó arrancar como se nunca
+            // tivesse votado — que é exactamente o split-brain contra o qual o
+            // comentário acima argumenta com todo o cuidado. A defesa estava
+            // escrita para o decode e faltava no caminho de abertura.
+            //
+            // Um voto perdido não é uma degradação: é uma violação da
+            // segurança do Raft. Um nó que vote duas vezes no mesmo termo pode
+            // eleger dois líderes, e dois líderes escrevem histórias
+            // divergentes no log que é a fonte da verdade. Recusar arrancar é
+            // sempre preferível.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Meta::default()),
+            Err(e) => Err(StorageError::from(StorageIOError::read_vote(io_err(
+                format!(
+                    "meta.bin existe mas não pôde ser lido ({e}); recuso arrancar \
+                     em vez de esquecer o voto persistido"
+                ),
+            )))),
         }
     }
 }
@@ -616,5 +681,53 @@ mod tests {
         );
         // E o ficheiro NÃO foi truncado (os dados ficam para forense/recuperação).
         assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), before);
+    }
+
+    /// Um erro de I/O que NÃO seja `NotFound` não pode ser lido como
+    /// "primeiro arranque".
+    ///
+    /// Os dois caminhos de abertura faziam `Err(_) => estado vazio`, e isso
+    /// apanhava permissões, EIO e descritores esgotados. As consequências não
+    /// são degradações:
+    ///
+    /// - no `meta.bin`, o nó arrancava como se nunca tivesse votado, e um nó
+    ///   que vote duas vezes no mesmo termo pode eleger dois líderes;
+    /// - no `entries.wal` é pior, porque o `valid_len` devolvido vai para um
+    ///   `set_len` — devolver 0 mandava truncar o WAL inteiro a zero.
+    ///
+    /// Testado só em Unix porque é onde as permissões de ficheiro se comportam
+    /// como o teste precisa (e é a plataforma alvo).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn um_meta_ilegivel_recusa_arrancar_em_vez_de_esquecer_o_voto() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut log = FileRaftLog::open(dir.path()).unwrap();
+            log.save_vote(&Vote::new(7, 2)).await.unwrap();
+        }
+        let meta_path = dir.path().join("meta.bin");
+        assert!(meta_path.exists(), "o voto tinha de ter sido persistido");
+
+        std::fs::set_permissions(&meta_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Se o teste correr como root, as permissões não travam a leitura e não
+        // há erro nenhum a simular. Saltar é honesto; um falso verde não é.
+        let bloqueou = std::fs::File::open(&meta_path).is_err();
+        let resultado = FileRaftLog::open(dir.path());
+        std::fs::set_permissions(&meta_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        if !bloqueou {
+            eprintln!("a correr com privilégios que ignoram permissões; teste saltado");
+            return;
+        }
+        // Antes da correcção o `Err(_)` devolvia `Meta::default()` e o nó
+        // arrancava como se nunca tivesse votado — e um nó que vote duas vezes
+        // no mesmo termo pode eleger dois líderes. Só `NotFound` é primeiro
+        // arranque; tudo o resto tem de recusar.
+        assert!(
+            resultado.is_err(),
+            "um meta.bin ilegível tem de recusar arrancar em vez de esquecer o voto"
+        );
     }
 }

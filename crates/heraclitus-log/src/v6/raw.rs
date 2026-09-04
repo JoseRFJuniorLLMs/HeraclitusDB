@@ -168,20 +168,21 @@ impl RawSegmentWriter {
             storage_namespace_id: init.storage_namespace_id,
         };
         file.write_all(&header.encode())?;
-        // O header TEM de ser durável antes de esta função devolver, e a
-        // ausência deste fsync era um bug de disponibilidade: o
+        // O header TEM de ser durável antes de esta função devolver: o
         // `create_new` publica a entrada no directório imediatamente, mas o
-        // `write_all` fica em buffers do SO. Um crash nessa janela deixava um
-        // ficheiro de segmento com zero bytes (ou meio header) no disco, e o
-        // arranque seguinte parava nele — `repair_active_tail` chama
-        // `scan_raw_segment`, que faz `FileHeaderV6::decode` e devolve "short
-        // header". Resultado: a base recusava abrir e só saía dali com
-        // intervenção manual.
+        // `write_all` fica em buffers do SO, e sem este fsync uma falha de
+        // energia deixava um ficheiro de segmento sem header no disco. Custa um
+        // fsync por rolagem de segmento (8 MiB+), o que não se mede.
         //
-        // O invariante que este `sync_data` estabelece é o que a recuperação
-        // pode assumir: **um ficheiro de segmento que existe tem um header
-        // completo**. Custa um fsync por rolagem de segmento (8 MiB+), o que
-        // não se mede.
+        // ATENÇÃO ao que este fsync NÃO compra. Ele fecha a janela contra
+        // perda de energia, não contra a morte do processo: um SIGKILL entre o
+        // `create_new` acima e o `write_all` deixa na mesma um ficheiro de zero
+        // bytes. Portanto a recuperação **não pode** assumir que um ficheiro de
+        // segmento que existe tem header completo — uma versão anterior deste
+        // comentário afirmava exactamente isso, e foi essa suposição que pôs o
+        // crash-test a acusar de corrupção o que é a janela normal de um kill.
+        // Quem escrever um leitor novo (replicação, restauro, doctor) tem de
+        // filtrar o toco com `is_crash_stub` antes de ler o cabeçalho.
         file.sync_data()?;
         sync_parent_dir(path)?;
         Ok(Self {
@@ -540,10 +541,46 @@ fn validate_raw_footer(footer: &FooterV6, records: &[RawRecord]) -> V6Result<()>
     Ok(())
 }
 
+/// Um ficheiro curto demais para conter sequer o header é um **toco de crash**,
+/// não um segmento.
+///
+/// `RawSegmentWriter::create` publica a entrada de directório com `create_new`
+/// e só depois escreve o header. O `sync_data` que se segue torna o header
+/// durável contra falha de energia, mas **não fecha esta janela contra a morte
+/// do processo**: um `SIGKILL` entre as duas syscalls deixa no disco um
+/// ficheiro de zero bytes (ou com meio header). A recuperação não pode, por
+/// isso, assumir que "um ficheiro que existe tem header completo" — foi essa
+/// suposição que pôs o crash-test a falhar com `short header`.
+///
+/// A fronteira é deliberadamente só o **comprimento**, e é segura porque os
+/// registos começam *depois* do header: um ficheiro com menos de
+/// [`FILE_HEADER_LEN`] bytes não pode conter um único registo committed, logo
+/// descartá-lo não perde nada. Isto não colide com §123 ("não truncar e fingir
+/// que nada aconteceu") justamente porque não há nada a truncar.
+///
+/// Um ficheiro com header completo mas bytes errados **não** entra aqui: isso é
+/// corrupção e tem de falhar alto.
+///
+/// # Pré-condição
+/// Esta regra só é válida para a cauda **activa** (`{id}.active.hrkl`), e é
+/// isso que a torna segura. Um RAW selado chega ao disco por rename atómico de
+/// um ficheiro já completo, portanto nunca nasce curto; se um deles aparecer
+/// curto, encolheu — o que é corrupção, e é apanhado por
+/// `validate_catalogued_generations`, que compara o tamanho físico e a contagem
+/// de registos contra o manifesto. Aplicar este predicado a um segmento selado
+/// trocaria essa verificação apertada por um descarte silencioso.
+pub fn is_crash_stub(path: &Path) -> V6Result<bool> {
+    Ok(std::fs::metadata(path)?.len() < FILE_HEADER_LEN as u64)
+}
+
 /// Trunca a cauda rasgada de um segmento **activo** (§123).
 ///
 /// Recusa-se a tocar num segmento selado: corrupção interna num ficheiro que já
 /// tem footer é falha dura, não é "truncar e fingir que nada aconteceu".
+///
+/// Pressupõe um segmento com header. Um toco de crash (ver [`is_crash_stub`])
+/// não é reparável — não há prefixo válido para preservar — e o chamador deve
+/// filtrá-lo antes, como o motor faz no arranque.
 pub fn repair_active_tail(path: &Path) -> V6Result<Option<u64>> {
     // Não basta confiar no resultado da varredura abaixo. Se um bit rodado em
     // um registo anterior fizer `scan_raw_segment` parar antes do fim, ela não
@@ -623,7 +660,15 @@ pub fn read_footer(path: &Path) -> V6Result<Option<FooterV6>> {
 /// `File`, portanto isto é no-op e a durabilidade do nome fica pela
 /// atomicidade do NTFS — o mesmo compromisso, declarado, que o
 /// `heraclitus-raft::fsync_dir` já assume.
-fn sync_parent_dir(path: &Path) -> V6Result<()> {
+/// Torna durável a entrada de directório de `path`.
+///
+/// `pub(super)` de propósito: existiam TRÊS cópias privadas disto no v6
+/// (`raw`, `packer`, `receipts`) e o `engine` não tinha nenhuma — foi
+/// exactamente por isso que o `rename` que publica um RAW selado ficou sem
+/// fsync do directório, enquanto o manifesto que o referencia é publicado com
+/// `fsync` + rename. O manifesto podia assim apontar para um nome de ficheiro
+/// que uma falha de energia ainda não tinha tornado visível.
+pub(super) fn sync_parent_dir(path: &Path) -> V6Result<()> {
     #[cfg(unix)]
     if let Some(dir) = path.parent() {
         if let Ok(f) = File::open(dir) {
@@ -880,5 +925,61 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
 
         assert!(scan_raw_segment(&path).is_err());
+    }
+
+    /// A fronteira entre "toco de crash" e corrupção, fixada por teste.
+    ///
+    /// O crash-test apanhava isto de forma probabilística — só quando o kill
+    /// calhava entre o `create_new` e o header chegar ao ficheiro — e por isso
+    /// era lido como flakiness. Aqui fabrica-se a condição directamente, para
+    /// a prova deixar de depender de o relógio ajudar.
+    #[test]
+    fn ficheiro_curto_demais_para_ter_header_e_um_toco_de_crash() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Zero bytes: o `create_new` publicou a entrada de directório e o
+        // processo morreu antes do `write_all`.
+        let vazio = dir.path().join("toco-vazio.hrkl");
+        std::fs::write(&vazio, b"").unwrap();
+        assert!(is_crash_stub(&vazio).unwrap());
+
+        // Header a meio: o `write_all` foi interrompido. Continua sem poder
+        // conter registo nenhum, porque os registos vêm depois do header.
+        let meio = dir.path().join("toco-meio.hrkl");
+        std::fs::write(&meio, vec![0u8; FILE_HEADER_LEN - 1]).unwrap();
+        assert!(is_crash_stub(&meio).unwrap());
+    }
+
+    #[test]
+    fn header_completo_nao_e_toco_mesmo_estando_corrompido() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("header-corrupto.hrkl");
+        let init = SegmentInit {
+            segment_id: 9,
+            created_hlc: 1,
+            first_lsn: 0,
+            writer_epoch: 1,
+            storage_namespace_id: [0u8; 16],
+        };
+        let mut w = RawSegmentWriter::create(&path, init).unwrap();
+        w.append(0, 1, b"a", &h(1)).unwrap();
+        w.sync().unwrap();
+        drop(w);
+
+        // Um segmento legítimo, com header completo, não é um toco.
+        assert!(!is_crash_stub(&path).unwrap());
+
+        // Estragar um byte do header mantém o comprimento — e é exactamente
+        // por isso que a regra é só o comprimento. Isto é corrupção e tem de
+        // falhar alto (§123), não ser silenciosamente descartado como toco.
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[20] ^= 0xFF;
+        std::fs::write(&path, bytes).unwrap();
+
+        assert!(!is_crash_stub(&path).unwrap());
+        assert!(
+            repair_active_tail(&path).is_err(),
+            "header corrompido tem de falhar alto, nao ser tratado como toco"
+        );
     }
 }

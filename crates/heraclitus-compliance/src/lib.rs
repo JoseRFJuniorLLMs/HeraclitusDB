@@ -46,6 +46,7 @@ pub mod signer;
 pub mod sovereignty;
 pub mod trust_store;
 pub mod tsa;
+pub(crate) mod varrimento;
 
 #[cfg(test)]
 pub(crate) mod test_pki;
@@ -86,7 +87,7 @@ pub use regulatory::{
     EvidenceSelector, LegalHold, LegalHoldRecord, LegalHoldRelease, PolicyActivation,
     PolicyActivationRecord, PolicyIdentity, RegulatoryDecision, RegulatoryDecisionRecord,
     RegulatoryError, RegulatoryPolicy, RegulatoryPolicyEngine, RegulatoryRule, RegulatoryState,
-    RequirementEffect, RetentionClass,
+    RegulatoryStateCache, RequirementEffect, RetentionClass,
 };
 pub use signer::{InstitutionalSignature, InstitutionalSigner, Pkcs11Signer, SoftKeySigner};
 pub use sovereignty::{
