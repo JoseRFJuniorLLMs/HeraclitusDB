@@ -370,26 +370,27 @@ pub async fn serve_with(
         // O mesmo log visto como `AnyLog`, que e o que o motor regulatorio
         // aceita: a reconciliacao de §94 corre neste mesmo ciclo.
         let log_regulatorio = engine.log.clone();
-        // SPEC-0046 §94 — reconciliar TAMBEM no arranque, e nao so antes de
-        // cada GC. O bit `legal_hold` vive no HRKM; os holds vivem no log. Um
-        // restauro de manifesto, uma migracao, ou um arranque sobre um HRKM
-        // mais antigo que o log deixam os dois a discordar — e quem perde e o
-        // hold, porque o default de `RetentionPolicy` e `legal_hold: false`.
-        // O log e a autoridade; o HRKM e derivado. Reconciliar aqui repoe essa
-        // ordem antes de a primeira passagem de GC sequer poder correr.
-        match heraclitus_compliance::RegulatoryPolicyEngine::new(log_regulatorio.clone())
-            .reconcile_legal_holds()
-        {
-            Ok(0) => {}
-            Ok(marcados) => boot.ok_line(
-                "Legal holds (§94)",
-                &format!("{marcados} segmento(s) reconciliado(s) a partir do log"),
-            ),
-            Err(error) => boot.warn_line(
-                "Legal holds (§94)",
-                &format!("reconciliação falhou no arranque: {error}"),
-            ),
-        }
+        // SPEC-0046 §94 — o bit `legal_hold` vive no HRKM; os holds vivem no
+        // log. Um restauro de manifesto, uma migração, ou um arranque sobre um
+        // HRKM mais antigo que o log deixam os dois a discordar — e quem perde
+        // é o hold, porque o default de `RetentionPolicy` é `legal_hold: false`.
+        // O log é a autoridade; o HRKM é derivado.
+        //
+        // Esta reconciliação corria aqui, SÍNCRONA e na thread do reactor, e
+        // custava um replay do log inteiro. Não escrevia linha nenhuma quando
+        // não encontrava nada (`Ok(0) => {}`), portanto era um custo invisível
+        // — num arranque medido, o vão sem log entre a linha do Packer e o bind
+        // do gRPC foi de 6m46s, 41% do arranque.
+        //
+        // Sai do caminho de arranque sem perder a garantia: o ciclo do GC
+        // reconcilia ANTES de cada colheita e, se a reconciliação falhar, salta
+        // a colheita dessa passagem (`continue`). Nenhuma coleta pode acontecer
+        // sem uma reconciliação fresca imediatamente antes — que é a
+        // propriedade que interessa. Correr também no arranque era cinto e
+        // suspensórios, pagos na latência de abertura da base.
+        //
+        // Fica na tarefa periódica, executada uma vez à entrada e em
+        // `spawn_blocking`, para não bloquear o reactor como bloqueava aqui.
         let every = std::time::Duration::from_secs(config.v6_gc_interval_secs);
         let opts = heraclitus_log::v6::GcRunOptions {
             keep_manifests: config.v6_gc_keep_manifests,
@@ -413,6 +414,32 @@ pub async fn serve_with(
             ),
         }
         Some(tokio::spawn(async move {
+            // A reconciliação que corria no arranque passa para aqui: acontece
+            // logo, sem esperar pelo primeiro tick, mas em `spawn_blocking` e
+            // fora do caminho que a base tem de percorrer para abrir.
+            {
+                let inicial = log_regulatorio.clone();
+                match tokio::task::spawn_blocking(move || {
+                    heraclitus_compliance::RegulatoryPolicyEngine::new(inicial)
+                        .reconcile_legal_holds()
+                })
+                .await
+                {
+                    Ok(Ok(marcados)) if marcados > 0 => tracing::info!(
+                        segmentos = marcados,
+                        "legal holds reconciliados no arranque (§94)"
+                    ),
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => tracing::warn!(
+                        error = %error,
+                        "reconciliacao inicial de legal holds falhou; o GC volta a tentar antes de coletar"
+                    ),
+                    Err(error) => tracing::warn!(
+                        error = %error,
+                        "worker da reconciliacao inicial de legal holds falhou"
+                    ),
+                }
+            }
             let mut tick = tokio::time::interval(every);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             tick.tick().await;
