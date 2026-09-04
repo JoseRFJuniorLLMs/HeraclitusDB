@@ -12,6 +12,12 @@ use heraclitus_core::{Episode, EventKind, HeraclitusError, Lsn};
 use heraclitus_views::View;
 use serde::{Deserialize, Serialize};
 
+pub mod security_event;
+
+pub use security_event::{
+    SecurityEventCounts, SecurityEventFilter, SecurityEventView, SECURITY_EVENT_SCHEMA,
+};
+
 pub const TELEMETRY_HEALTH_SCHEMA: &str = "heraclitus-telemetry-health/1.0";
 pub const TELEMETRY_HEALTH_KIND: &str = "TelemetryHealth";
 

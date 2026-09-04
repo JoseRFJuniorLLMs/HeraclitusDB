@@ -1538,6 +1538,75 @@ impl Engine {
             .snapshots_as_of(bound)
     }
 
+    /// SPEC-0071 §3/§4.1 — os eventos canónicos de segurança, `AS OF LSN`.
+    ///
+    /// É uma projecção **derivada** dos atributos `security_*` que o
+    /// `bridge.py` já escreve no log; não há estado persistido nem índice
+    /// próprio, e é por isso que reconstruir com um `as_of_lsn` mais antigo dá
+    /// exactamente o que estava lá nesse ponto.
+    ///
+    /// Varre em janelas em vez de materializar o log: o mesmo padrão de todas
+    /// as outras varreduras deste ficheiro, e pela mesma razão — uma consulta
+    /// que traz a base inteira para RAM deixa de ser uma consulta e passa a ser
+    /// um incidente.
+    pub fn security_events(
+        &self,
+        filtro: &heraclitus_telemetry_health::SecurityEventFilter,
+        as_of_lsn: Option<Lsn>,
+        limite: usize,
+    ) -> Result<Vec<heraclitus_telemetry_health::SecurityEventView>, HeraclitusError> {
+        use heraclitus_telemetry_health::SecurityEventView;
+        const JANELA: usize = 20_000;
+        let ate = as_of_lsn.unwrap_or_else(|| self.log.head());
+        let mut encontrados = Vec::new();
+        let mut cursor = 0u64;
+        while cursor < ate && encontrados.len() < limite {
+            let linhas = self.log.scan_capped(cursor, ate, JANELA)?;
+            if linhas.is_empty() {
+                break;
+            }
+            let ultimo = linhas.last().map(|(lsn, _)| *lsn).unwrap_or(cursor);
+            for (lsn, episode) in linhas {
+                if encontrados.len() >= limite {
+                    break;
+                }
+                if let Some(v) = SecurityEventView::projectar(lsn, &episode) {
+                    if filtro.aceita(&v) {
+                        encontrados.push(v);
+                    }
+                }
+            }
+            cursor = ultimo.saturating_add(1);
+        }
+        Ok(encontrados)
+    }
+
+    /// Contagens por categoria, datasource e outcome, `AS OF LSN`.
+    pub fn security_event_counts(
+        &self,
+        as_of_lsn: Option<Lsn>,
+    ) -> Result<heraclitus_telemetry_health::SecurityEventCounts, HeraclitusError> {
+        use heraclitus_telemetry_health::{SecurityEventCounts, SecurityEventView};
+        const JANELA: usize = 20_000;
+        let ate = as_of_lsn.unwrap_or_else(|| self.log.head());
+        let mut contagens = SecurityEventCounts::default();
+        let mut cursor = 0u64;
+        while cursor < ate {
+            let linhas = self.log.scan_capped(cursor, ate, JANELA)?;
+            if linhas.is_empty() {
+                break;
+            }
+            let ultimo = linhas.last().map(|(lsn, _)| *lsn).unwrap_or(cursor);
+            for (lsn, episode) in linhas {
+                if let Some(v) = SecurityEventView::projectar(lsn, &episode) {
+                    contagens.contar(&v);
+                }
+            }
+            cursor = ultimo.saturating_add(1);
+        }
+        Ok(contagens)
+    }
+
     /// O carimbo de ingestao (ms epoch) do evento em `lsn`, se legivel.
     pub fn ts_ms(&self, lsn: Lsn) -> Option<u64> {
         match self.log.read(lsn) {
@@ -4767,5 +4836,162 @@ mod regulatory_entrypoint_tests {
                 .len(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod testes_security_events_spec0071 {
+    use super::*;
+    use heraclitus_telemetry_health::{SecurityEventFilter, SECURITY_EVENT_SCHEMA};
+
+    fn motor() -> (tempfile::TempDir, Engine) {
+        let temp = tempfile::tempdir().unwrap();
+        let config = HeraclitusConfig {
+            data_dir: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let engine = Engine::open(&config).unwrap();
+        (temp, engine)
+    }
+
+    fn facto_de_seguranca(categoria: &str, outcome: &str, severidade: u8) -> Episode {
+        let mut e = Episode::new(
+            "forge-bridge",
+            EventKind::Observation,
+            b"{\"operational\":true}".to_vec(),
+        );
+        for (k, v) in [
+            ("security_schema", SECURITY_EVENT_SCHEMA.to_string()),
+            ("security_category", categoria.to_string()),
+            ("security_event_type", "login".to_string()),
+            ("security_outcome", outcome.to_string()),
+            ("security_severity", severidade.to_string()),
+            ("security_tenant_id", "tenant-a".to_string()),
+            ("security_datasource_id", "identity".to_string()),
+        ] {
+            e.attrs.insert(k.to_string(), v);
+        }
+        e
+    }
+
+    /// SPEC-0071 §3 — o evento canonico passa a ser consultavel do lado do
+    /// banco, tipado e filtravel. Antes disto os attrs `security_*` estavam no
+    /// log e nao havia como perguntar nada sobre eles.
+    #[test]
+    fn os_eventos_canonicos_sao_filtraveis_e_um_facto_legado_nao_entra() {
+        let (_t, engine) = motor();
+        engine
+            .append(facto_de_seguranca("authentication", "failure", 7))
+            .unwrap();
+        engine
+            .append(facto_de_seguranca("authentication", "success", 2))
+            .unwrap();
+        engine
+            .append(facto_de_seguranca("network", "failure", 9))
+            .unwrap();
+        // Um facto legado, sem bloco `security`: nao pode entrar na vista.
+        engine
+            .append(Episode::new(
+                "collector",
+                EventKind::Observation,
+                b"sem seguranca".to_vec(),
+            ))
+            .unwrap();
+
+        let todos = engine
+            .security_events(&SecurityEventFilter::default(), None, 100)
+            .unwrap();
+        assert_eq!(todos.len(), 3, "o facto legado nao devia projectar");
+
+        let falhas_de_auth = engine
+            .security_events(
+                &SecurityEventFilter {
+                    category: Some("authentication".into()),
+                    outcome: Some("failure".into()),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(falhas_de_auth.len(), 1);
+        assert_eq!(falhas_de_auth[0].severity, Some(7));
+
+        let graves = engine
+            .security_events(
+                &SecurityEventFilter {
+                    severidade_minima: Some(8),
+                    ..Default::default()
+                },
+                None,
+                100,
+            )
+            .unwrap();
+        assert_eq!(graves.len(), 1);
+        assert_eq!(graves[0].category, "network");
+    }
+
+    /// A vista e DERIVADA: reconstruir `AS OF LSN n` da o que estava la nesse
+    /// ponto, e nao o que se acrescentou depois.
+    #[test]
+    fn a_vista_e_reconstruivel_as_of_lsn() {
+        let (_t, engine) = motor();
+        let primeiro = engine
+            .append(facto_de_seguranca("authentication", "failure", 7))
+            .unwrap();
+        engine
+            .append(facto_de_seguranca("network", "failure", 9))
+            .unwrap();
+
+        let ate_ao_primeiro = engine
+            .security_events(&SecurityEventFilter::default(), Some(primeiro + 1), 100)
+            .unwrap();
+        assert_eq!(
+            ate_ao_primeiro.len(),
+            1,
+            "AS OF nao pode ver o que veio depois"
+        );
+        assert_eq!(ate_ao_primeiro[0].lsn, primeiro);
+
+        let agora = engine
+            .security_events(&SecurityEventFilter::default(), None, 100)
+            .unwrap();
+        assert_eq!(agora.len(), 2);
+    }
+
+    #[test]
+    fn as_contagens_agrupam_por_dimensao() {
+        let (_t, engine) = motor();
+        engine
+            .append(facto_de_seguranca("authentication", "failure", 7))
+            .unwrap();
+        engine
+            .append(facto_de_seguranca("authentication", "failure", 5))
+            .unwrap();
+        engine
+            .append(facto_de_seguranca("network", "success", 1))
+            .unwrap();
+
+        let c = engine.security_event_counts(None).unwrap();
+        assert_eq!(c.total, 3);
+        assert_eq!(c.por_categoria["authentication"], 2);
+        assert_eq!(c.por_categoria["network"], 1);
+        assert_eq!(c.por_outcome["failure"], 2);
+        assert_eq!(c.por_datasource["identity"], 3);
+        assert_eq!(c.esquema_desconhecido, 0);
+    }
+
+    #[test]
+    fn o_limite_e_respeitado() {
+        let (_t, engine) = motor();
+        for _ in 0..10 {
+            engine
+                .append(facto_de_seguranca("authentication", "failure", 7))
+                .unwrap();
+        }
+        let poucos = engine
+            .security_events(&SecurityEventFilter::default(), None, 3)
+            .unwrap();
+        assert_eq!(poucos.len(), 3);
     }
 }

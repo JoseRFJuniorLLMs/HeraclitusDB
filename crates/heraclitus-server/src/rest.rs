@@ -96,6 +96,9 @@ pub fn router_with_sentinel(
         .route("/state", get(state))
         .route("/compliance/status", get(compliance_status))
         .route("/telemetry/health", get(telemetry_health))
+        // SPEC-0071 §3 — o evento canonico de seguranca, do lado do banco.
+        .route("/security/events", get(security_events))
+        .route("/security/events/counts", get(security_event_counts))
         .route("/verify", get(verify))
         .route("/verify/:segment", get(verify_segment))
         // Fluxo ao vivo de appends (SSE). O log já emitia cada append
@@ -235,6 +238,18 @@ struct TelemetryHealthQuery {
     datasource_id: Option<String>,
     sensor_id: Option<String>,
     as_of_lsn: Option<u64>,
+}
+
+/// SPEC-0071 §3 — filtro dos eventos canonicos de seguranca.
+#[derive(Debug, Deserialize)]
+struct SecurityEventQuery {
+    tenant_id: Option<String>,
+    datasource_id: Option<String>,
+    category: Option<String>,
+    outcome: Option<String>,
+    min_severity: Option<u8>,
+    as_of_lsn: Option<u64>,
+    limit: Option<usize>,
 }
 
 fn parse_incident_state(value: &str) -> Option<IncidentState> {
@@ -2269,5 +2284,81 @@ mod aprovacao_tests {
         .await;
         assert_eq!(difere, 403, "{corpo}");
         assert!(corpo.contains("auditor"), "{corpo}");
+    }
+}
+
+/// SPEC-0071 §3/§4.1 — os eventos canónicos de segurança, tipados e
+/// filtráveis, `AS OF LSN`.
+///
+/// A vista é DERIVADA dos atributos `security_*` que o `bridge.py` escreve; o
+/// log continua a ser o único canónico. Reconstruir com `as_of_lsn` dá o que
+/// estava lá nesse ponto.
+async fn security_events(
+    State(engine): State<Arc<Engine>>,
+    Query(query): Query<SecurityEventQuery>,
+) -> Response {
+    let as_of_lsn = query.as_of_lsn.unwrap_or_else(|| engine.head());
+    // Tecto: sem ele, um pedido sem `limit` varreria a base inteira para dentro
+    // de uma resposta HTTP. 1000 é generoso para um painel e finito para o
+    // servidor.
+    let limite = query.limit.unwrap_or(200).min(1_000);
+    let filtro = heraclitus_telemetry_health::SecurityEventFilter {
+        tenant_id: query.tenant_id,
+        datasource_id: query.datasource_id,
+        category: query.category,
+        outcome: query.outcome,
+        severidade_minima: query.min_severity,
+    };
+    // `spawn_blocking`: a projecção varre o log em janelas. Ver o comentário do
+    // `/sentinel/checkpoint` — uma varredura no reactor bloqueia uma thread que
+    // o tokio tem em número fixo.
+    match tokio::task::spawn_blocking(move || {
+        engine.security_events(&filtro, Some(as_of_lsn), limite)
+    })
+    .await
+    {
+        Ok(Ok(eventos)) => Json(serde_json::json!({
+            "schema": heraclitus_telemetry_health::SECURITY_EVENT_SCHEMA,
+            "as_of_lsn": as_of_lsn,
+            "count": eventos.len(),
+            "limit": limite,
+            "events": eventos,
+        }))
+        .into_response(),
+        Ok(Err(erro)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": erro.to_string() })),
+        )
+            .into_response(),
+        Err(erro) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": erro.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Contagens por categoria, datasource e outcome — o agregado do painel.
+async fn security_event_counts(
+    State(engine): State<Arc<Engine>>,
+    Query(query): Query<TelemetryHealthQuery>,
+) -> Response {
+    let as_of_lsn = query.as_of_lsn.unwrap_or_else(|| engine.head());
+    match tokio::task::spawn_blocking(move || engine.security_event_counts(Some(as_of_lsn))).await {
+        Ok(Ok(contagens)) => Json(serde_json::json!({
+            "as_of_lsn": as_of_lsn,
+            "counts": contagens,
+        }))
+        .into_response(),
+        Ok(Err(erro)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": erro.to_string() })),
+        )
+            .into_response(),
+        Err(erro) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": erro.to_string() })),
+        )
+            .into_response(),
     }
 }

@@ -458,6 +458,20 @@ pub fn enable_ansi() -> bool {
     true
 }
 
+/// SPEC-0073 §54 — qual allocator este binário está mesmo a usar.
+///
+/// Não é uma string escrita à mão: é derivada da MESMA condição de compilação
+/// que instala o `#[global_allocator]` em `main.rs`, portanto não pode divergir
+/// dele. Uma linha de arranque que dissesse "glibc" por convenção seria uma
+/// afirmação sem fonte — e a §20 é explícita em que só o executável define o
+/// allocator, pelo que a biblioteca só o pode REPORTAR, nunca escolher.
+pub fn allocator_em_uso() -> &'static str {
+    if cfg!(all(target_os = "linux", feature = "linux-jemalloc")) {
+        "jemalloc"
+    } else {
+        "system"
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -498,20 +512,5 @@ mod tests {
         b.info_line("x", "y");
         b.phase("z").ok("done");
         b.ready("127.0.0.1:1", "127.0.0.1:2");
-    }
-}
-
-/// SPEC-0073 §54 — qual allocator este binário está mesmo a usar.
-///
-/// Não é uma string escrita à mão: é derivada da MESMA condição de compilação
-/// que instala o `#[global_allocator]` em `main.rs`, portanto não pode divergir
-/// dele. Uma linha de arranque que dissesse "glibc" por convenção seria uma
-/// afirmação sem fonte — e a §20 é explícita em que só o executável define o
-/// allocator, pelo que a biblioteca só o pode REPORTAR, nunca escolher.
-pub fn allocator_em_uso() -> &'static str {
-    if cfg!(all(target_os = "linux", feature = "linux-jemalloc")) {
-        "jemalloc"
-    } else {
-        "system"
     }
 }
