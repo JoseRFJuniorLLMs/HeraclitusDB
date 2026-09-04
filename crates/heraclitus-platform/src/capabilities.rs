@@ -13,7 +13,18 @@ pub struct PlatformCapabilities {
     pub arch: String,
     pub kernel_version: Option<String>,
     pub numa_nodes: usize,
+    /// SPEC-0073 §46/§47 — os CPUs que este processo pode **realmente** usar.
+    ///
+    /// É o mínimo entre o que o SO reporta e o que o cgroup permite (cpuset e
+    /// quota). Era o número do HOST, e é este campo que alimenta o
+    /// dimensionamento de workers no `heraclitus-analytics` — num container
+    /// com `cpu.max` a valer 2 cores num host de 64, abriam-se 64 workers para
+    /// uma fatia de 2. O host continua visível em [`Self::host_cpus`].
     pub logical_cpus: usize,
+    /// Os CPUs lógicos da máquina, sem descontar limites. Só para relatório:
+    /// dimensionar por este número é o erro que o `logical_cpus` corrige.
+    #[serde(default)]
+    pub host_cpus: usize,
     pub io_uring_available: bool,
     pub cgroups_v2_active: bool,
     pub effective_limits: EffectiveResourceLimits,
@@ -26,12 +37,15 @@ pub struct PlatformCapabilities {
 pub fn detect_capabilities() -> PlatformCapabilities {
     let os = std::env::consts::OS.to_string();
     let arch = std::env::consts::ARCH.to_string();
-    let logical_cpus = std::thread::available_parallelism()
+    let host_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
 
     let effective_limits = detect_cgroup_limits();
     let cgroups_v2_active = effective_limits.cgroups_v2_active;
+    // SPEC-0073 §46 — "o runtime MUST preferir limites efetivos do cgroup
+    // quando mais restritivos que recursos fisicos".
+    let logical_cpus = effective_limits.effective_cpus(host_cpus);
 
     #[cfg(target_os = "linux")]
     let (kernel_version, numa_nodes, io_uring_available) = {
@@ -67,6 +81,7 @@ pub fn detect_capabilities() -> PlatformCapabilities {
         kernel_version,
         numa_nodes,
         logical_cpus,
+        host_cpus,
         io_uring_available,
         cgroups_v2_active,
         effective_limits,
@@ -158,11 +173,12 @@ impl PlatformCapabilities {
     /// Produces a compact 1-line log string suitable for server boot.
     pub fn summary_line(&self) -> String {
         format!(
-            "OS: {}/{} | Kernel: {} | CPUs: {} | NUMA: {} | cgroups_v2: {} | io_uring: {} | simd: {}",
+            "OS: {}/{} | Kernel: {} | CPUs: {} (host {}) | NUMA: {} | cgroups_v2: {} | io_uring: {} | simd: {}",
             self.os,
             self.arch,
             self.kernel_version.as_deref().unwrap_or("unknown"),
             self.logical_cpus,
+            self.host_cpus,
             self.numa_nodes,
             if self.cgroups_v2_active { "yes" } else { "no" },
             if self.io_uring_available {

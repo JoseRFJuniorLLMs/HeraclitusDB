@@ -44,11 +44,29 @@ TimeoutStopSec=30s
 #
 # 30 minutos, e nao `infinity`: com Type=notify um prazo infinito transforma um
 # READY=1 que nunca chega num servico pendurado para sempre, o que e pior do
-# que falhar. O valor certo a prazo NAO e um numero maior — e o daemon mandar
-# EXTEND_TIMEOUT_USEC enquanto progride no replay (ver
-# heraclitus_platform::notify_extend_timeout, ainda por ligar ao boot). Ate la,
-# quem tiver bases muito grandes sobe este numero conscientemente.
+# que falhar.
+#
+# Este numero deixou de ser a unica defesa. O daemon manda agora
+# EXTEND_TIMEOUT_USEC a cada fase do arranque que comeca (Boot::phase ->
+# heraclitus_platform::notify_extend_timeout), portanto o prazo estica enquanto
+# houver PROGRESSO e expira quando nao houver — que e a distincao entre
+# "demora" e "encravou" que um prazo fixo nao sabe fazer. Este valor passa a ser
+# o tecto de uma fase individual, nao do arranque inteiro.
 TimeoutStartSec=30min
+
+# WatchdogSec= esta DELIBERADAMENTE ausente.
+#
+# A SPEC-0073 §44 admite-o ("MAY ser implementado ... somente apos existir
+# health model apropriado") e impoe a condicao que o torna util: "o watchdog
+# SHALL NOT considerar o processo saudavel apenas porque existe um PID". Um
+# WATCHDOG=1 enviado por um temporizador afirma exactamente isso — que o
+# processo esta vivo — e nada mais. Um servidor com o Sentinel encravado, o log
+# a recusar appends ou uma view parada continuaria a responder ao watchdog e o
+# systemd continuaria a da-lo por saudavel.
+#
+# Ligar isto antes de haver uma sonda que exercite mesmo o caminho de dados
+# seria pior do que nao ter: transformaria "sem supervisao" em "supervisao que
+# mente".
 
 # Reinicialização automática em caso de crash (SIGSEGV, SIGKILL externo, etc.)
 Restart=on-failure
