@@ -182,6 +182,14 @@ pub struct SentinelConfig {
     pub l3: SentinelL3Config,
     /// SPEC-0047 — plano de threat intelligence (opt-in).
     pub threat: SentinelThreatConfig,
+    /// SPEC-0072 §10 — tamanho do lote do replay janelado no arranque.
+    ///
+    /// O arranque materializava a base inteira num `Vec` (`log.scan(0, head)`).
+    /// A §11 proíbe-o: a memória do replay tem de ficar limitada ao estado
+    /// materializado mais o lote corrente. Este é o lote.
+    pub replay_batch_events: usize,
+    /// SPEC-0072 §17 — o que fazer quando o cursor diverge do log canónico.
+    pub recovery: SentinelRecoveryConfig,
 }
 
 impl Default for SentinelConfig {
@@ -197,8 +205,37 @@ impl Default for SentinelConfig {
             l2: SentinelL2Config::default(),
             l3: SentinelL3Config::default(),
             threat: SentinelThreatConfig::default(),
+            // SPEC-0072 §10: "Default inicial 8192. O valor final deve ser
+            // definido por benchmark." Fica o valor da spec até haver medida.
+            replay_batch_events: 8_192,
+            recovery: SentinelRecoveryConfig::default(),
         }
     }
+}
+
+/// SPEC-0072 §17 — política de recuperação quando o cursor persistido está à
+/// frente do log canónico.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CursorPolicy {
+    /// `cursor > head` aborta o arranque. Para ambientes forenses em que
+    /// nenhuma recuperação automática pode ocorrer sem um humano.
+    Strict,
+    /// `cursor > head` reconstrói o estado derivado a partir do log canónico.
+    ///
+    /// É o default recomendado pela spec, e a razão está no INV-4: nada do que
+    /// o Sentinel persiste fora do log é source of truth. Recusar arrancar por
+    /// causa de um artefacto derivado seria deixar a base indisponível para
+    /// proteger uma cópia.
+    #[default]
+    Rebuild,
+}
+
+/// SPEC-0072 §17 — `[sentinel.recovery]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SentinelRecoveryConfig {
+    pub cursor_policy: CursorPolicy,
 }
 
 /// Papéis de acesso aplicados por RPC. `Writer` inclui leitura; `Auditor`

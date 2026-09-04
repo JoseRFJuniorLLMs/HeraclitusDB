@@ -82,7 +82,11 @@ pub use queue::{EnqueueOutcome, QueueSnapshot, SecurityQueue};
 pub use sigma::{
     compile_sigma, compile_sigma_file, compile_sigma_path, compile_sigma_rules, parse_sigma,
 };
-pub use state::{replay, CursorStore, ReplayReport, SentinelCheckpoint};
+pub use state::{
+    reconcile_startup_state, replay, CursorStore, RebuildReason, ReplayReport, SentinelCheckpoint,
+    SentinelStateSnapshot, SnapshotLoad, SnapshotStore, StartupReconciliation,
+    StateDivergenceReason,
+};
 pub use subscriber::SecuritySubscriber;
 pub use threat::{
     Admission, CanonicalError, ConfirmedMatch, FeedVersionState, HashAlgorithm, Indicator,
@@ -2609,6 +2613,7 @@ mod tests {
                 max_graph_hops: 6,
             },
             threat: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -2707,6 +2712,7 @@ mod tests {
                 l2: SentinelL2Config::default(),
                 l3: SentinelL3Config::default(),
                 threat: Default::default(),
+                ..Default::default()
             },
         )
         .unwrap()
@@ -2766,6 +2772,7 @@ mod tests {
                 l2: SentinelL2Config::default(),
                 l3: SentinelL3Config::default(),
                 threat: Default::default(),
+                ..Default::default()
             },
         )
         .unwrap()
@@ -2839,6 +2846,7 @@ mod tests {
                 l2: SentinelL2Config::default(),
                 l3: SentinelL3Config::default(),
                 threat: Default::default(),
+                ..Default::default()
             },
         )
         .unwrap()
@@ -2903,6 +2911,7 @@ mod tests {
                 l2: SentinelL2Config::default(),
                 l3: SentinelL3Config::default(),
                 threat: Default::default(),
+                ..Default::default()
             },
         )
         .unwrap()
@@ -3078,6 +3087,7 @@ mod tests {
             l2: SentinelL2Config::default(),
             l3: SentinelL3Config::default(),
             threat: Default::default(),
+            ..Default::default()
         };
         let runtime = SentinelRuntime::start(log.clone(), config)
             .unwrap()
@@ -3145,6 +3155,7 @@ detection:
             l2: SentinelL2Config::default(),
             l3: SentinelL3Config::default(),
             threat: Default::default(),
+            ..Default::default()
         };
         let runtime = SentinelRuntime::start(log.clone(), config)
             .unwrap()
@@ -3204,6 +3215,7 @@ detection:
                 l2: SentinelL2Config::default(),
                 l3: SentinelL3Config::default(),
                 threat: Default::default(),
+                ..Default::default()
             },
         )
         .unwrap()
@@ -3254,6 +3266,7 @@ detection:
                 },
                 l3: SentinelL3Config::default(),
                 threat: Default::default(),
+                ..Default::default()
             },
         )
         .unwrap()
