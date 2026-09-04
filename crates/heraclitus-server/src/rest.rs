@@ -102,7 +102,7 @@ pub fn router_with_sentinel(
         // confirmado num broadcast interno; faltava só quem o expusesse.
         .route("/live/events", get(live_events))
         // LGPD art. 18: pegada do titular, acessos aos dados dele, e eliminacao.
-        .route("/replay", get(replay))
+        .route("/replay", get(replay).post(replay_post))
         .route("/fontes", get(fontes))
         .route("/fontes/:id", get(fonte_detalhe))
         .route("/atributos", get(atributos))
@@ -307,8 +307,18 @@ async fn sentinel_checkpoint(
     let Some(runtime) = runtime else {
         return sentinel_unavailable();
     };
-    match runtime.checkpoint() {
-        Ok(lsn) => Json(serde_json::json!({ "checkpoint_lsn": lsn })).into_response(),
+    // `spawn_blocking`: o `checkpoint()` varre o log e escreve em disco. Corrido
+    // directamente no handler, bloqueava uma thread do reactor do tokio — e o
+    // reactor tem um número fixo delas, portanto bastam alguns pedidos destes em
+    // paralelo para o servidor deixar de aceitar QUALQUER pedido, incluindo os
+    // que não tocam no disco. O vizinho `sentinel_incident_why` já fazia isto.
+    match tokio::task::spawn_blocking(move || runtime.checkpoint()).await {
+        Ok(Ok(lsn)) => Json(serde_json::json!({ "checkpoint_lsn": lsn })).into_response(),
+        Ok(Err(error)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": error.to_string() })),
@@ -334,7 +344,12 @@ async fn sentinel_incidents(
                 .into_response()
         }
     };
-    match runtime.query_incidents(filter) {
+    // `spawn_blocking` pela mesma razão do `/sentinel/checkpoint`: esta consulta
+    // percorre o log e não pode correr no reactor.
+    match tokio::task::spawn_blocking(move || runtime.query_incidents(filter))
+        .await
+        .unwrap_or_else(|erro| Err(heraclitus_sentinel::SentinelError::Config(erro.to_string())))
+    {
         Ok(incidents) => Json(serde_json::json!({
             "incidents": incidents,
             "count": incidents.len()
@@ -356,11 +371,17 @@ async fn sentinel_incident(
     let Some(runtime) = runtime else {
         return sentinel_unavailable();
     };
-    let result = if let Some(as_of_lsn) = query.as_of_lsn {
-        runtime.incident_as_of(&id, as_of_lsn)
-    } else {
-        Ok(runtime.get_incident(&id))
-    };
+    // `spawn_blocking`: o ramo `as_of` replaya o log. Ver o comentário do
+    // `/sentinel/checkpoint`.
+    let result = tokio::task::spawn_blocking(move || {
+        if let Some(as_of_lsn) = query.as_of_lsn {
+            runtime.incident_as_of(&id, as_of_lsn)
+        } else {
+            Ok(runtime.get_incident(&id))
+        }
+    })
+    .await
+    .unwrap_or_else(|erro| Err(heraclitus_sentinel::SentinelError::Config(erro.to_string())));
     match result {
         Ok(Some(incident)) => Json(incident).into_response(),
         Ok(None) => (
@@ -384,11 +405,16 @@ async fn sentinel_incident_evidence(
     let Some(runtime) = runtime else {
         return sentinel_unavailable();
     };
-    let result = if let Some(as_of_lsn) = query.as_of_lsn {
-        runtime.incident_as_of(&id, as_of_lsn)
-    } else {
-        Ok(runtime.get_incident(&id))
-    };
+    // `spawn_blocking` pela mesma razão do handler acima.
+    let result = tokio::task::spawn_blocking(move || {
+        if let Some(as_of_lsn) = query.as_of_lsn {
+            runtime.incident_as_of(&id, as_of_lsn)
+        } else {
+            Ok(runtime.get_incident(&id))
+        }
+    })
+    .await
+    .unwrap_or_else(|erro| Err(heraclitus_sentinel::SentinelError::Config(erro.to_string())));
     match result {
         Ok(Some(incident)) => Json(serde_json::json!({
             "incident_id": incident.incident_id,
@@ -875,15 +901,50 @@ fn rotulo_kind(k: &heraclitus_core::EventKind) -> String {
 async fn replay(
     State(engine): State<Arc<Engine>>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Json<serde_json::Value> {
+) -> Response {
+    // Um GET NÃO muta estado. `GET /replay?executar=1` disparava um rebuild
+    // completo desde o LSN 0 — trabalho pesado e destrutivo de estado derivado,
+    // alcançável por uma simples navegação: uma tag `<img>` numa página
+    // qualquer bastava, porque um GET não é protegido por CORS (o browser
+    // envia-o e só esconde a resposta) e a auth REST é opcional em loopback.
+    //
+    // O GET fica com a prova em seco. Quem quer executar usa POST — e recusar
+    // explicitamente é melhor do que ignorar o parâmetro em silêncio, porque
+    // quem já dependia disto fica a saber, em vez de deixar de reconstruir sem
+    // reparar.
+    if matches!(
+        q.get("executar").map(|s| s.as_str()),
+        Some("1") | Some("true")
+    ) {
+        return (
+            StatusCode::METHOD_NOT_ALLOWED,
+            Json(serde_json::json!({
+                "error": "executar=1 muta estado e exige POST /replay",
+                "hint": "GET /replay devolve a prova sem reconstruir"
+            })),
+        )
+            .into_response();
+    }
+    replay_executar(State(engine), false).await
+}
+
+/// `POST /replay[?executar=1]` — o mesmo, com autorização para reconstruir.
+async fn replay_post(
+    State(engine): State<Arc<Engine>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
     let executar = matches!(
         q.get("executar").map(|s| s.as_str()),
         Some("1") | Some("true")
     );
+    replay_executar(State(engine), executar).await
+}
+
+async fn replay_executar(State(engine): State<Arc<Engine>>, executar: bool) -> Response {
     let out = tokio::task::spawn_blocking(move || engine.replay_prova(executar))
         .await
         .unwrap_or_else(|e| serde_json::json!({ "erro": format!("join: {e}") }));
-    Json(out)
+    Json(out).into_response()
 }
 
 /// `GET /fontes` — quem escreve neste log, quanto, e desde/ate quando.

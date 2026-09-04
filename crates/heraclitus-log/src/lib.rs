@@ -2031,7 +2031,7 @@ impl Log {
     /// resposta fica DE FORA, para não serializar as escritas.
     fn enqueue_append_inner(
         &self,
-        mut episode: Episode,
+        episode: Episode,
         expected_lsn: Option<Lsn>,
         ctx: &str,
         stamp: bool,
@@ -2039,28 +2039,70 @@ impl Log {
         self.check_poison()?;
         let (tx, rx) = crossbeam_channel::bounded(1);
         let opaque_meta = episode.id.0.to_bytes();
+        // O `stamp_lock` NUNCA é segurado enquanto se espera por espaço na fila.
+        //
+        // A atomicidade de carimbo+enfileiramento tem de ser mantida — o
+        // comentário acima regista a medição que a justifica: 69 inversões em
+        // 1200 registos quando o carimbo ficava fora, o que partia a busca
+        // binária do AS OF TIMESTAMP. Mas o `send_timeout` de 10 s estava
+        // DENTRO do lock, e quando o canal enchia cada escritor ficava atrás de
+        // outro bloqueado até dez segundos: um comboio, exactamente sob a carga
+        // em que menos se pode dar ao luxo de um.
+        //
+        // Cada tentativa continua atómica (carimba e enfileira sob o lock, com
+        // `try_send`, que não bloqueia). Se a fila estiver cheia, o lock é
+        // LARGADO antes de esperar, e a tentativa seguinte volta a carimbar —
+        // o que está certo, porque também volta a enfileirar mais tarde. A
+        // ordem dos carimbos bem-sucedidos continua igual à ordem de entrada na
+        // fila, que é o invariante que interessa.
         let ts;
-        {
-            let _ordem = self.stamp_lock.lock().unwrap_or_else(|e| e.into_inner());
-            if stamp {
-                episode.ts_hlc = self.hlc.now();
+        let prazo = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut pendente = Some((episode, tx));
+        loop {
+            let Some((mut ep, resp_tx)) = pendente.take() else {
+                unreachable!("o par só é retirado para ser reposto ou consumido");
+            };
+            let devolvido = {
+                let _ordem = self.stamp_lock.lock().unwrap_or_else(|e| e.into_inner());
+                if stamp {
+                    ep.ts_hlc = self.hlc.now();
+                }
+                let carimbo = ep.ts_hlc;
+                match self.cmd_tx.try_send(LogCommand::Append {
+                    opaque_meta,
+                    episode: Arc::new(ep),
+                    expected_lsn,
+                    resp_tx,
+                }) {
+                    Ok(()) => {
+                        ts = carimbo;
+                        break;
+                    }
+                    Err(crossbeam_channel::TrySendError::Full(cmd)) => cmd,
+                    Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                        return Err(HeraclitusError::StorageEngine(format!(
+                            "Worker do log encerrado ({ctx})"
+                        )))
+                    }
+                }
+            };
+            // Fora do lock a partir daqui.
+            let LogCommand::Append {
+                episode: arc,
+                resp_tx,
+                ..
+            } = devolvido
+            else {
+                unreachable!("o comando devolvido é o mesmo que foi enviado");
+            };
+            let ep = Arc::try_unwrap(arc).unwrap_or_else(|partilhado| (*partilhado).clone());
+            if std::time::Instant::now() >= prazo {
+                return Err(HeraclitusError::StorageEngine(format!(
+                    "Timeout de canal: pipeline saturado ({ctx})"
+                )));
             }
-            ts = episode.ts_hlc;
-            self.cmd_tx
-                .send_timeout(
-                    LogCommand::Append {
-                        opaque_meta,
-                        episode: Arc::new(episode),
-                        expected_lsn,
-                        resp_tx: tx,
-                    },
-                    std::time::Duration::from_secs(10),
-                )
-                .map_err(|_| {
-                    HeraclitusError::StorageEngine(format!(
-                        "Timeout de canal: pipeline saturado ({ctx})"
-                    ))
-                })?;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            pendente = Some((ep, resp_tx));
         }
         let lsn = rx.recv().map_err(|_| {
             HeraclitusError::StorageEngine(format!("Worker interrompido no {ctx}"))
