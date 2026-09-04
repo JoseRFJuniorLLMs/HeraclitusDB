@@ -949,7 +949,13 @@ async fn replay_executar(State(engine): State<Arc<Engine>>, executar: bool) -> R
 
 /// `GET /fontes` — quem escreve neste log, quanto, e desde/ate quando.
 async fn fontes(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
-    Json(engine.fontes())
+    // `spawn_blocking`: percorre o indice de atributos e o catalogo. Ver o
+    // comentario do `/sentinel/checkpoint`.
+    Json(
+        tokio::task::spawn_blocking(move || engine.fontes())
+            .await
+            .unwrap_or_else(|e| serde_json::json!({ "error": format!("join: {e}") })),
+    )
 }
 
 /// `GET /fontes/:id` — características de uma fonte: tipos, campos, principais.
@@ -965,7 +971,12 @@ async fn fonte_detalhe(
 
 /// `GET /atributos` — campos indexados e cardinalidade (matéria-prima do ROPA).
 async fn atributos(State(engine): State<Arc<Engine>>) -> Json<serde_json::Value> {
-    Json(engine.atributos())
+    // `spawn_blocking` pela mesma razao do `/fontes`.
+    Json(
+        tokio::task::spawn_blocking(move || engine.atributos())
+            .await
+            .unwrap_or_else(|e| serde_json::json!({ "error": format!("join: {e}") })),
+    )
 }
 
 /// `GET /diff?de=&ate=` — o que mudou entre dois instantes do log.
@@ -1496,24 +1507,31 @@ async fn telemetry_health(
     Query(query): Query<TelemetryHealthQuery>,
 ) -> Json<serde_json::Value> {
     let as_of_lsn = query.as_of_lsn.unwrap_or_else(|| engine.head());
-    let sensors: Vec<_> = engine
-        .telemetry_health_all(Some(as_of_lsn))
-        .into_iter()
-        .filter(|snapshot| {
-            query
-                .tenant_id
-                .as_ref()
-                .is_none_or(|value| &snapshot.identity.tenant_id == value)
-                && query
-                    .datasource_id
+    // `spawn_blocking`: `telemetry_health_all` toma os locks dos índices e, com
+    // `as_of`, reconstrói o estado a partir do log. Ver o comentário do
+    // `/sentinel/checkpoint`.
+    let sensors: Vec<_> = tokio::task::spawn_blocking(move || {
+        engine
+            .telemetry_health_all(Some(as_of_lsn))
+            .into_iter()
+            .filter(|snapshot| {
+                query
+                    .tenant_id
                     .as_ref()
-                    .is_none_or(|value| &snapshot.identity.datasource_id == value)
-                && query
-                    .sensor_id
-                    .as_ref()
-                    .is_none_or(|value| &snapshot.identity.sensor_id == value)
-        })
-        .collect();
+                    .is_none_or(|value| &snapshot.identity.tenant_id == value)
+                    && query
+                        .datasource_id
+                        .as_ref()
+                        .is_none_or(|value| &snapshot.identity.datasource_id == value)
+                    && query
+                        .sensor_id
+                        .as_ref()
+                        .is_none_or(|value| &snapshot.identity.sensor_id == value)
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
     Json(serde_json::json!({
         "schema": "heraclitus-telemetry-health-snapshot/1.0",
         "as_of_lsn": as_of_lsn,
@@ -1526,7 +1544,21 @@ async fn metrics(
     State(engine): State<Arc<Engine>>,
     Extension(sentinel): Extension<Option<Arc<SentinelRuntime>>>,
 ) -> Response {
-    match engine.prometheus_metrics() {
+    // `spawn_blocking`: o `prometheus_metrics` percorre o manifesto e conta
+    // blocos por segmento. Ver o comentário do `/sentinel/checkpoint` — e este
+    // é o handler que um scraper chama de quinze em quinze segundos, para
+    // sempre, portanto é o pior de todos para deixar no reactor.
+    let metricas = tokio::task::spawn_blocking({
+        let engine = engine.clone();
+        move || engine.prometheus_metrics()
+    })
+    .await
+    .unwrap_or_else(|erro| {
+        Err(heraclitus_core::HeraclitusError::StorageEngine(
+            erro.to_string(),
+        ))
+    });
+    match metricas {
         Ok(mut body) => {
             if let Some(runtime) = sentinel {
                 let status = runtime.status();
