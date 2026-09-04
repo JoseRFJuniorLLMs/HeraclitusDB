@@ -115,7 +115,8 @@ try:
     d = json.load(sys.stdin)
 except Exception:
     print(''); raise SystemExit
-b = d.get('boot') or {}
+s = d.get('status') or {}
+b = s.get('boot') or {}
 print(b.get('$1', ''))
 " 2>/dev/null
 }
@@ -229,7 +230,7 @@ if arrancar "$D4"; then
   appendar 10 || falha "appends falharam"
   sleep 1
   parar
-  CURSOR="$D4/data/sentinel/cursor.json"
+  CURSOR="$D4/data/log/sentinel/cursor.json"
   if [[ -f "$CURSOR" ]]; then
     printf '{"next_lsn": 100000, "pipeline_version": 1}' > "$CURSOR"
     if arrancar "$D4"; then
@@ -242,7 +243,7 @@ if arrancar "$D4"; then
         || falha "esperava rebuild_canonical, veio '$RESULTADO'"
       [[ "$DIVERG" == "1" ]] && ok "divergencia contada" || falha "divergence_total=$DIVERG"
       [[ "$AHEAD" == "1" ]] && ok "cursor_ahead contado" || falha "cursor_ahead_total=$AHEAD"
-      ls "$D4"/data/sentinel/cursor.divergent.*.json >/dev/null 2>&1 \
+      ls "$D4"/data/log/sentinel/cursor.divergent.*.json >/dev/null 2>&1 \
         && ok "artefacto divergente preservado" \
         || falha "o cursor divergente nao foi preservado"
       parar
@@ -276,8 +277,8 @@ if arrancar "$D5"; then
   appendar 10 || falha "appends falharam"
   sleep 1
   parar
-  CURSOR="$D5/data/sentinel/cursor.json"
-  SNAP="$D5/data/sentinel/state.snapshot"
+  CURSOR="$D5/data/log/sentinel/cursor.json"
+  SNAP="$D5/data/log/sentinel/state.snapshot"
 
   for caso in vazio truncado invalido mismatch; do
     case "$caso" in
