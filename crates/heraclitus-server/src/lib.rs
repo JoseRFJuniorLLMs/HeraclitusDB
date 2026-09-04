@@ -11,6 +11,7 @@ pub mod engine;
 pub mod flight_grpc; // SPEC-016: protocolo Arrow Flight real (gRPC, tonic 0.14)
 pub mod grpc;
 pub mod rest;
+pub mod telemetry_probe;
 
 pub use embedded::Embedded;
 pub use engine::Engine;
@@ -141,6 +142,20 @@ pub async fn serve_with(
                         config.sentinel.worker_threads
                     ),
                 );
+                // SPEC-0071 §9.1 — liga a view de Telemetry Health ao health
+                // gate da política. Sem isto o gate é mecanismo sem fonte: uma
+                // regra que declare `required_telemetry` nunca poderia ser
+                // satisfeita, e a acção automática ficaria bloqueada por falta
+                // de sonda em vez de por falta de saúde.
+                if let Some(tenant) = config.sentinel.health_gate_tenant_id.clone() {
+                    runtime.set_telemetry_probe(Arc::new(
+                        crate::telemetry_probe::ViewTelemetryProbe::new(
+                            engine.log.clone(),
+                            engine.telemetry_health_graph(),
+                            tenant,
+                        ),
+                    ));
+                }
                 Some(Arc::new(runtime))
             }
             Ok(None) => None,

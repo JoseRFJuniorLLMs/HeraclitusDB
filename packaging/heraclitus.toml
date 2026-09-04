@@ -55,3 +55,55 @@ v6_gc_interval_secs = 300
 # Checkpoint periódico das views. Limita a cauda que um arranque pós-crash tem
 # de replayar — sem isto só há checkpoint no arranque e no encerramento limpo.
 checkpoint_interval_secs = 300
+
+# ── Sentinel: arranque rápido (SPEC-0072) ────────────────────────────────────
+#
+# O Sentinel está desligado por omissão. O que segue só tem efeito com
+# `[sentinel] enabled = true`.
+#
+# [sentinel]
+# enabled = true
+#
+# Lote do replay janelado do arranque. Existe porque o arranque deixou de
+# materializar a base inteira em memória: a memória do replay fica limitada ao
+# estado materializado mais este lote.
+# replay_batch_events = 8192
+#
+# Cadência do snapshot de estado. Basta um dos dois limiares ser atingido — são
+# riscos diferentes: o de eventos limita quanto trabalho um crash desfaz, o de
+# tempo garante que uma base com pouco tráfego não fica indefinidamente sem
+# snapshot. Zero desliga o limiar respectivo.
+# snapshot_interval_events = 100000
+# snapshot_interval_secs = 300
+#
+# Contrato de lateness do histórico L1. O histórico retém a maior janela que o
+# ruleset consulta MAIS esta tolerância; um evento que chegue mais atrasado do
+# que isto não participa em correlações. Subir se alguma fonte entregar com
+# atraso maior — o custo é memória, e ela cresce com o valor.
+# [sentinel.l1]
+# max_lateness_ms = 300000
+# history_capacity = 100000
+#
+# O que fazer quando o cursor persistido está À FRENTE do log canónico, o que
+# significa que se perdeu cauda (restauro de backup, truncagem por corrupção).
+#
+#   rebuild  reconstrói o estado derivado a partir do log. É o default, porque
+#            nada do que o Sentinel persiste fora do log é fonte da verdade e
+#            recusar arrancar por causa de uma cópia deixaria a base indisponível.
+#            A divergência é contada em telemetria e o cursor divergente fica
+#            preservado em `sentinel/cursor.divergent.*.json`.
+#   strict   recusa o arranque. Para ambientes forenses onde nenhuma recuperação
+#            automática pode ocorrer sem um humano.
+# [sentinel.recovery]
+# cursor_policy = "rebuild"
+
+# ── Sentinel: health gate da telemetria (SPEC-0071 §9.1) ─────────────────────
+#
+# O inquilino cuja saúde de telemetria a política de resposta interroga antes de
+# aprovar uma acção automática. Sem isto não há sonda ligada, e uma regra que
+# declare `required_telemetry` passa a exigir aprovação humana em vez de aprovar.
+#
+# É explícito de propósito: deixar o inquilino ser escolhido pelo caminho de
+# dados permitiria satisfazer um requisito de saúde com a telemetria de outro.
+# [sentinel]
+# health_gate_tenant_id = "o-teu-tenant"

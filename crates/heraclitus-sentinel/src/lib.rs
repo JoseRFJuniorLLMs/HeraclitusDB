@@ -361,6 +361,14 @@ pub struct SentinelRuntime {
     inner: Arc<RuntimeInner>,
     tail_handle: Mutex<Option<JoinHandle<()>>>,
     worker_handles: Mutex<Vec<JoinHandle<()>>>,
+    /// SPEC-0071 §9.1 — a sonda de saúde da telemetria, quando o hospedeiro a
+    /// liga. `None` deixa a política com o comportamento anterior, porque
+    /// nenhuma regra declara requisitos por omissão.
+    ///
+    /// Vive aqui e não no `RuntimeInner` porque só a política a consulta, e o
+    /// `RuntimeInner` é partilhado com os workers, que não têm nada a ver com
+    /// isto.
+    telemetry_probe: Mutex<Option<Arc<dyn crate::policy::TelemetryHealthProbe>>>,
 }
 
 impl SentinelRuntime {
@@ -855,7 +863,22 @@ impl SentinelRuntime {
             inner,
             tail_handle: Mutex::new(Some(tail_handle)),
             worker_handles: Mutex::new(worker_handles),
+            telemetry_probe: Mutex::new(None),
         }))
+    }
+
+    /// SPEC-0071 §9.1 — liga a sonda de saude da telemetria.
+    ///
+    /// O hospedeiro chama isto depois de arrancar: e ele que tem a view
+    /// `heraclitus-telemetry-health`, e o Sentinel nao depende desse crate.
+    /// Sem esta chamada, uma regra que DECLARE `required_telemetry` nao pode
+    /// ser satisfeita — e assim tem de ser, porque declarar uma dependencia e
+    /// depois nao a verificar nao e razao para aprovar.
+    pub fn set_telemetry_probe(&self, probe: Arc<dyn crate::policy::TelemetryHealthProbe>) {
+        *self
+            .telemetry_probe
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(probe);
     }
 
     pub fn status(&self) -> SentinelStatus {
@@ -1196,7 +1219,16 @@ impl SentinelRuntime {
             ));
         }
         proposal.action.validate()?;
-        let policy = DeterministicPolicyEngine::new(PolicyConfig::default())?;
+        let mut policy = DeterministicPolicyEngine::new(PolicyConfig::default())?;
+        // SPEC-0071 §9.1 — o health gate so tem fonte quando o hospedeiro a liga.
+        if let Some(probe) = self
+            .telemetry_probe
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            policy = policy.with_telemetry_probe(probe);
+        }
         let decision = PolicyEngine::evaluate(&policy, incident, assessment, proposal);
         let decision_id =
             PolicyDecision::decision_id(policy.policy_version(), proposal, &decision)?;

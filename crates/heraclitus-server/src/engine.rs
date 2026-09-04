@@ -1521,6 +1521,14 @@ impl Engine {
             .snapshot_as_of(identity, bound)
     }
 
+    /// A view de saúde, partilhada.
+    ///
+    /// SPEC-0071 §9.1 — o health gate da política lê daqui, através do
+    /// [`crate::telemetry_probe::ViewTelemetryProbe`].
+    pub fn telemetry_health_graph(&self) -> Arc<RwLock<TelemetryHealthGraph>> {
+        self.telemetry_health.clone()
+    }
+
     /// Snapshot ordenado de todos os sensores conhecidos até o LSN exclusivo.
     pub fn telemetry_health_all(&self, as_of_lsn: Option<Lsn>) -> Vec<TelemetryHealthSnapshot> {
         let bound = as_of_lsn.unwrap_or_else(|| self.log.head());

@@ -193,6 +193,17 @@ pub struct SentinelConfig {
     /// SPEC-0072 §44 — publica um snapshot ao fim deste número de eventos
     /// processados. Zero desliga o limiar por eventos.
     pub snapshot_interval_events: u64,
+    /// SPEC-0071 §9.1 — o inquilino cuja telemetria o health gate interroga.
+    ///
+    /// `None` (o default) significa que não há sonda ligada, e uma regra que
+    /// declare `required_telemetry` passa a exigir aprovação humana.
+    ///
+    /// É explícito e não inferido do pedido de propósito. A decisão de política
+    /// é tomada pelo Sentinel, que corre em nome do sistema e não de um
+    /// utilizador; deixar o inquilino ser escolhido pelo caminho de dados
+    /// permitiria satisfazer um requisito de saúde com a telemetria de outro,
+    /// que faria do gate um teatro.
+    pub health_gate_tenant_id: Option<String>,
     /// SPEC-0072 §44 — e ao fim deste tempo. Zero desliga o limiar por tempo.
     ///
     /// Basta um dos dois ser atingido. São limiares diferentes porque medem
@@ -221,6 +232,7 @@ impl Default for SentinelConfig {
             recovery: SentinelRecoveryConfig::default(),
             // Os valores da §44. "Valores finais definidos por benchmark" —
             // ficam os da spec ate haver medida.
+            health_gate_tenant_id: None,
             snapshot_interval_events: 100_000,
             snapshot_interval_secs: 300,
         }
