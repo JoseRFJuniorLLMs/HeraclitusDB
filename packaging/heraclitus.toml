@@ -44,7 +44,7 @@ rest_addr = "127.0.0.1:7475"
 #
 # `always` faz fsync por append. É o default e é o que se quer numa base que
 # promete durabilidade; as alternativas trocam segurança por débito.
-fsync = "always"
+fsync = { mode = "always" }
 
 # ── Manutenção em background ─────────────────────────────────────────────────
 #

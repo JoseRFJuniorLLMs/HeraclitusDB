@@ -1742,3 +1742,34 @@ max_graph_hops = 6
         }
     }
 }
+
+#[cfg(test)]
+mod testes_config_de_referencia {
+    /// A configuracao de referencia que o repositorio DISTRIBUI tem de parsear.
+    ///
+    /// Descoberto pelo gate operacional de Linux (SPEC-0072 §31), que arrancou
+    /// um servidor a serio com uma config escrita a partir do exemplo e recebeu:
+    ///
+    ///   invalid type: string "always", expected internally tagged enum FsyncPolicy
+    ///
+    /// O `packaging/heraclitus.toml` tinha `fsync = "always"`. O `FsyncPolicy` e
+    /// `#[serde(tag = "mode")]`, portanto a forma correcta e uma tabela. O
+    /// ficheiro estava errado desde que foi escrito, e nada o lia: nenhum teste
+    /// carregava o exemplo, e a unit do systemd nem sequer passa um ficheiro de
+    /// configuracao ao servidor. Um exemplo que nao parseia e pior do que
+    /// nenhum — quem o copia perde tempo a descobrir que a culpa nao e dele.
+    #[test]
+    fn o_exemplo_distribuido_parseia() {
+        let caminho = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packaging/heraclitus.toml");
+        let texto = std::fs::read_to_string(&caminho)
+            .unwrap_or_else(|e| panic!("{}: {e}", caminho.display()));
+        match toml::from_str::<crate::config::HeraclitusConfig>(&texto) {
+            Ok(_) => {}
+            Err(erro) => panic!(
+                "packaging/heraclitus.toml nao parseia: {erro}\n\
+                 Um exemplo que nao carrega e pior do que nenhum."
+            ),
+        }
+    }
+}

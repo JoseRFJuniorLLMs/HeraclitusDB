@@ -47,7 +47,7 @@ escrever_config() {
 data_dir = "$dir/data"
 rest_addr = "127.0.0.1:$REST_PORT"
 grpc_addr = "127.0.0.1:$GRPC_PORT"
-fsync = "always"
+fsync = { mode = "always" }
 
 [sentinel]
 enabled = true
