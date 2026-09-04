@@ -299,6 +299,15 @@ impl ViewRegistry {
             f.sync_all()?;
         }
         std::fs::rename(&tmp, self.dir.join("watermarks.json"))?;
+        // O `sync_all` acima torna o CONTEÚDO durável; sem este fsync do
+        // directório, o `rename` pode não sobreviver a uma falha de energia e
+        // o arranque seguinte lê o watermark ANTIGO — reaplicando eventos que
+        // as views já materializaram. Uma view idempotente absorve isso; uma
+        // que conte, soma duas vezes.
+        #[cfg(unix)]
+        if let Ok(d) = std::fs::File::open(&self.dir) {
+            d.sync_all()?;
+        }
         Ok(())
     }
 
