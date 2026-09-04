@@ -3294,7 +3294,6 @@ dependencies = [
 name = "heraclitus-sentinel"
 version = "1.0.5"
 dependencies = [
- "bincode",
  "blake3",
  "crossbeam-channel",
  "heraclitus-core",

@@ -28,8 +28,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Versão do formato em disco. Sobe quando a representação muda de maneira
-/// que um binário antigo leria mal — o que, com bincode, é qualquer alteração
-/// à ordem ou ao tipo dos campos.
+/// que um binário antigo leria mal: um campo que muda de tipo ou de
+/// significado. Acrescentar um campo opcional não obriga a subir — o corpo é
+/// JSON, e o `serde` ignora o que não conhece.
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 
 /// `HRKSNAP1`. Distingue um snapshot de qualquer outro ficheiro que apareça no
@@ -39,7 +40,24 @@ const MAGIC: [u8; 8] = *b"HRKSNAP1";
 /// `MAGIC || format_version(4) || digest(32) || body_len(8)`.
 const HEADER_LEN: usize = 8 + 4 + 32 + 8;
 
-const BINCODE_CFG: bincode::config::Configuration = bincode::config::standard();
+// O corpo é JSON, e a escolha custou um teste a descobrir.
+//
+// A primeira versão usava bincode, que é o que o resto do repositório usa para
+// artefactos binários e é muito mais compacto. Round-trip do struct sozinho:
+// perfeito. Round-trip de um snapshot capturado de um runtime VIVO:
+// `Utf8Error { valid_up_to: 17 }` — nunca voltava a carregar.
+//
+// A causa é o `EventId`, que é `#[serde(transparent)]` sobre `ulid::Ulid`, e a
+// serialização do `ulid` não é simétrica num formato não auto-descritivo. Um
+// snapshot escrito assim seria aceite na escrita, rejeitado na leitura, e o
+// sintoma em produção seria "o warm boot nunca acontece" — silencioso, porque
+// o código está escrito para descartar um snapshot ilegível e reconstruir.
+// Teria passado despercebido indefinidamente.
+//
+// JSON é maior, e é o preço. Em troca: é auto-descritivo, é EXACTAMENTE o
+// formato em que estes mesmos tipos já atravessam o log em cada episódio —
+// portanto está provado para eles — e não tem esta classe de assimetria. Para
+// um artefacto derivado, versionado e verificado por digest, é a troca certa.
 
 /// Estado do acumulador de fusão, na forma que atravessa o disco.
 ///
@@ -115,7 +133,7 @@ impl SentinelStateSnapshot {
     }
 
     fn corpo(&self) -> Result<Vec<u8>, SentinelError> {
-        bincode::serde::encode_to_vec(self, BINCODE_CFG)
+        serde_json::to_vec(self)
             .map_err(|error| SentinelError::Cursor(format!("snapshot encode: {error}")))
     }
 }
@@ -221,15 +239,14 @@ impl SnapshotStore {
         // digest cobre `pipeline_version` e `applied_until_exclusive`, que
         // vivem lá dentro. Desserializar não é confiar: nada é usado antes de
         // o digest bater.
-        let (snapshot, _): (SentinelStateSnapshot, usize) =
-            match bincode::serde::decode_from_slice(corpo, BINCODE_CFG) {
-                Ok(valor) => valor,
-                Err(error) => {
-                    return SnapshotLoad::Descartado(RebuildReason::Ilegivel(format!(
-                        "decode: {error}"
-                    )));
-                }
-            };
+        let snapshot: SentinelStateSnapshot = match serde_json::from_slice(corpo) {
+            Ok(valor) => valor,
+            Err(error) => {
+                return SnapshotLoad::Descartado(RebuildReason::Ilegivel(format!(
+                    "decode: {error}"
+                )));
+            }
+        };
         let obtido = digest(
             formato,
             snapshot.pipeline_version,

@@ -400,14 +400,156 @@ impl SentinelRuntime {
         // SPEC-0072 §6 — o snapshot vive ao lado do cursor, no mesmo directorio
         // derivado. Nenhum dos dois e source of truth (INV-4).
         let snapshot_store = SnapshotStore::new(log.dir().join("sentinel").join("state.snapshot"));
-        let cursor = cursor_store.load(config.pipeline_version)?;
-        if cursor.next_lsn > log.head() {
-            return Err(SentinelError::Cursor(format!(
-                "cursor next_lsn={} está além do head={}",
-                cursor.next_lsn,
-                log.head()
-            )));
+        // SPEC-0072 §9 — o algoritmo de arranque. Ler o head, ler o cursor, ler
+        // o snapshot, e reconciliar os três ANTES de decidir o que reconstruir.
+        let boot_comecou = Instant::now();
+        let cabeca = log.head();
+        metrics
+            .boot
+            .head_at_boot_lsn
+            .store(cabeca, Ordering::Release);
+
+        let relogio = Instant::now();
+        let (mut cursor, cursor_rejeitado) =
+            cursor_store.carregar_tolerante(config.pipeline_version)?;
+        metrics
+            .boot
+            .cursor_load_ms
+            .store(relogio.elapsed().as_millis() as u64, Ordering::Release);
+        if let Some(rejeicao) = &cursor_rejeitado {
+            // §35 — nunca silencioso.
+            tracing::warn!(
+                motivo = %rejeicao.motivo,
+                preservado_em = ?rejeicao.preservado_em,
+                "cursor do Sentinel rejeitado; o estado vai ser reconstruído do log"
+            );
         }
+
+        let relogio = Instant::now();
+        let snapshot_lido = snapshot_store.carregar(config.pipeline_version)?;
+        metrics
+            .boot
+            .snapshot_load_ms
+            .store(relogio.elapsed().as_millis() as u64, Ordering::Release);
+        let (snapshot, motivo_sem_snapshot) = match snapshot_lido {
+            SnapshotLoad::Utilizavel(snapshot) => (Some(*snapshot), RebuildReason::SnapshotAusente),
+            SnapshotLoad::Descartado(motivo) => {
+                metrics
+                    .boot
+                    .snapshot_rejected_total
+                    .fetch_add(1, Ordering::Relaxed);
+                match &motivo {
+                    RebuildReason::DigestInvalido | RebuildReason::Ilegivel(_) => {
+                        metrics
+                            .boot
+                            .snapshot_corrupt_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    RebuildReason::FormatoDesconhecido { .. }
+                    | RebuildReason::PipelineDiferente { .. } => {
+                        metrics
+                            .boot
+                            .snapshot_version_mismatch_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+                if !matches!(motivo, RebuildReason::SnapshotAusente) {
+                    tracing::warn!(
+                        motivo = motivo.etiqueta(),
+                        "snapshot do Sentinel descartado; rebuild canónico a partir do log"
+                    );
+                }
+                (None, motivo)
+            }
+        };
+
+        let decisao = reconcile_startup_state(
+            cabeca,
+            cursor.next_lsn,
+            snapshot.as_ref().map(|s| s.applied_until_exclusive),
+            motivo_sem_snapshot,
+        );
+        if let StartupReconciliation::DivergenceDetected { reason, .. } = &decisao {
+            // §15 caso 4 — a divergência é sempre registada, seja qual for a
+            // política que a seguir a trate.
+            metrics
+                .boot
+                .divergence_total
+                .fetch_add(1, Ordering::Relaxed);
+            if matches!(reason, StateDivergenceReason::CursorAlemDoHead { .. }) {
+                metrics
+                    .boot
+                    .cursor_ahead_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            tracing::error!(
+                divergencia = reason.etiqueta(),
+                detalhe = %reason,
+                cursor_next_lsn = cursor.next_lsn,
+                snapshot_watermark = snapshot.as_ref().map(|s| s.applied_until_exclusive),
+                canonical_head = cabeca,
+                pipeline_version = config.pipeline_version,
+                data_dir = %log.dir().display(),
+                "divergência de estado do Sentinel detectada"
+            );
+            // §16 passo 1 — preservar antes de qualquer recuperação.
+            match cursor_store.preservar_divergente(cursor, cabeca) {
+                Ok(caminho) => tracing::warn!(
+                    caminho = %caminho.display(),
+                    "cursor divergente preservado para auditoria"
+                ),
+                Err(erro) => tracing::warn!(
+                    erro = %erro,
+                    "não foi possível preservar o cursor divergente"
+                ),
+            }
+        }
+        let decisao = decisao.aplicar_politica(config.recovery.cursor_policy)?;
+
+        // O snapshot só é usado quando a reconciliação o aceitou. Sob
+        // `RebuildCanonical` — incluindo o caso em que a política converteu uma
+        // divergência — o estado vem todo do log, e o snapshot que existisse
+        // não é de confiança.
+        let snapshot = match &decisao {
+            StartupReconciliation::Synchronized { .. }
+            | StartupReconciliation::CatchUpTail { .. } => snapshot,
+            _ => {
+                metrics
+                    .boot
+                    .full_rebuild_total
+                    .fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        };
+        let motivo_do_rebuild = match &decisao {
+            StartupReconciliation::RebuildCanonical { reason, .. } => Some(reason.etiqueta()),
+            _ => None,
+        };
+        metrics
+            .boot
+            .registar_decisao(decisao.etiqueta(), motivo_do_rebuild);
+
+        // §18 — o cursor não é mexido aqui, nem para a frente nem para trás,
+        // exceptuando o caso em que ele PRÓPRIO é o artefacto inválido.
+        //
+        // A tentação era comitar `cursor.next_lsn = head` no fim de um rebuild
+        // canónico, como a §15 caso 3 sugere. Seria errado: o rebuild replaya
+        // os episódios DERIVADOS para reconstruir o estado em memória, e não
+        // corre a normalização sobre os brutos. Os eventos entre o cursor e o
+        // head continuam por processar, e dá-los por processados perderia
+        // evidência em silêncio — o inverso exacto do que a reconstrução
+        // existe para fazer. A cauda fica para o `process_until`, que é o único
+        // caminho com direito a comitar o cursor.
+        //
+        // Um cursor divergente é outra coisa: aponta para além do log, portanto
+        // não pode ser respeitado. Volta a zero, que é o único valor que não
+        // afirma nada. Um cursor rejeitado já vem a zero de
+        // `carregar_tolerante`.
+        if cursor.next_lsn > cabeca {
+            cursor.next_lsn = 0;
+        }
+
         let stop = Arc::new(AtomicBool::new(false));
         // SPEC-0047 — os feeds são lidos uma vez, no arranque. Recarregar a
         // quente é outra coisa (§40/§41 querem versionamento e rollback), e
@@ -446,21 +588,40 @@ impl SentinelRuntime {
         } else {
             None
         };
-        // SPEC-0072 §10/§11 — o head é fixado UMA vez, aqui, e é o mesmo para
-        // todas as passagens do rebuild. Reler `log.head()` dentro de cada
+        // SPEC-0072 §10/§11 — o intervalo do replay vem da reconciliação, e o
+        // head foi fixado UMA vez lá em cima. Reler `log.head()` dentro de cada
         // passagem faria uma passagem posterior ver eventos que a anterior não
-        // viu, e as duas ficariam a falar de bases diferentes. Tudo o que
-        // aparecer daqui para a frente é da conta do `process_until`.
-        let ate_exclusivo = log.head();
+        // viu — e a segunda passagem ESCREVE no log que varre, portanto
+        // consumiria a sua própria saída. Tudo o que aparecer daqui para a
+        // frente é da conta do `process_until`.
+        //
+        // É aqui que o INV-5 se paga: com snapshot válido o par é
+        // `(watermark, head)` e não `(0, head)`.
+        let (desde, ate_exclusivo) = decisao.intervalo_de_replay().unwrap_or((cabeca, cabeca));
         let lote = config.replay_batch_events;
         let fusion_enabled = rule_engine.is_some() || config.l2.enabled || config.l3.enabled;
+        metrics
+            .boot
+            .tail_events
+            .store(ate_exclusivo.saturating_sub(desde), Ordering::Release);
+        metrics.boot.watermark_lsn.store(desde, Ordering::Release);
 
         // Primeira passagem: só os conjuntos de deduplicação. Tem de estar
         // COMPLETA antes de qualquer replay — as funções `evaluate_*` apendem
         // ao log quando não reconhecem o que estão a produzir, e é este
-        // conjunto que as impede de reapresentar o que já lá está.
-        let (ids, derived_sources) =
-            passagem_de_ids(&log, ate_exclusivo, lote, config.l3.enabled, fusion_enabled)?;
+        // conjunto que as impede de reapresentar o que já lá está. Com
+        // snapshot, os conjuntos até ao watermark vêm de lá e esta passagem só
+        // cobre a cauda.
+        let relogio = Instant::now();
+        let (ids, derived_sources) = passagem_de_ids(
+            &log,
+            desde,
+            ate_exclusivo,
+            lote,
+            config.l3.enabled,
+            fusion_enabled,
+            snapshot.as_ref(),
+        )?;
         let IdsDerivados {
             signal_ids,
             incident_revision_ids,
@@ -477,16 +638,24 @@ impl SentinelRuntime {
                 shadow_only: config.l2.shadow_only,
                 ..BaselinePolicy::default()
             };
-            Some(Mutex::new(BehavioralEngine::new(policy)?))
+            // Restaurado do snapshot quando há um; senão, vazio e reconstruído
+            // pela terceira passagem.
+            match snapshot.as_ref().and_then(|s| s.behavior_state.clone()) {
+                Some(estado) => Some(Mutex::new(BehavioralEngine::from_snapshot(estado)?)),
+                None => Some(Mutex::new(BehavioralEngine::new(policy)?)),
+            }
         } else {
             None
         };
-        // O grafo nasce VAZIO. Era construído aqui a partir de um `Vec` com a
-        // base inteira; agora é a segunda passagem que o enche, já com o
-        // `inner` montado. Ordem preservada: a passagem corre antes de
-        // qualquer replay do L2 ou dos sinais.
+        // Sem snapshot o grafo nasce VAZIO e é a segunda passagem que o enche.
+        // Era construído aqui a partir de um `Vec` com a base inteira.
         let security_graph = if config.l3.enabled {
-            Some(Mutex::new(TemporalSecurityGraph::new()))
+            Some(Mutex::new(
+                snapshot
+                    .as_ref()
+                    .and_then(|s| s.graph_state.clone())
+                    .unwrap_or_else(TemporalSecurityGraph::new),
+            ))
         } else {
             None
         };
@@ -495,18 +664,55 @@ impl SentinelRuntime {
                 graph_path_depth: config.l3.max_graph_hops,
                 ..IncidentPolicy::default()
             };
-            Some(Mutex::new(IncidentEngine::new(policy)))
+            Some(Mutex::new(
+                snapshot
+                    .as_ref()
+                    .and_then(|s| s.incident_state.clone())
+                    .unwrap_or_else(|| IncidentEngine::new(policy)),
+            ))
         } else {
             None
         };
-        let fusion = if rule_engine.is_some() || config.l2.enabled || config.l3.enabled {
-            Some(Mutex::new(EvidenceFusion::new(
-                FusionWeights::default(),
-                "sentinel-fusion-v1",
-            )?))
+        let fusion = if fusion_enabled {
+            Some(Mutex::new(
+                match snapshot.as_ref().and_then(|s| s.fusion_state.clone()) {
+                    Some(estado) => estado,
+                    None => EvidenceFusion::new(FusionWeights::default(), "sentinel-fusion-v1")?,
+                },
+            ))
         } else {
             None
         };
+        let acumuladores_de_fusao: BTreeMap<String, FusionAccumulator> = snapshot
+            .as_ref()
+            .map(|s| {
+                s.fusion_accumulators
+                    .iter()
+                    .map(|(chave, estado)| {
+                        (
+                            chave.clone(),
+                            FusionAccumulator {
+                                subject: estado.subject.clone(),
+                                rule_score: estado.rule_score,
+                                behavioral_score: estado.behavioral_score,
+                                graph_score: estado.graph_score,
+                                threat_intel_score: estado.threat_intel_score,
+                                evidence: estado.evidence.clone(),
+                                detectors: estado.detectors.clone(),
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let historico_de_regras = snapshot
+            .as_ref()
+            .map(|s| s.rule_history.clone())
+            .unwrap_or_default();
+        metrics
+            .boot
+            .state_restore_ms
+            .store(relogio.elapsed().as_millis() as u64, Ordering::Release);
         let inner = Arc::new(RuntimeInner {
             log: log.clone(),
             derived_sink,
@@ -519,11 +725,12 @@ impl SentinelRuntime {
             normalizer: GenericNormalizer::default(),
             rule_engine,
             threat,
-            // Vazio: é a segunda passagem que o enche, com poda a cada lote.
-            rule_history: Mutex::new(Vec::new()),
+            // Do snapshot quando ha um; senao vazio, e a segunda passagem
+            // enche-o com poda a cada lote.
+            rule_history: Mutex::new(historico_de_regras),
             behavior_engine,
             fusion,
-            fusion_state: Mutex::new(BTreeMap::new()),
+            fusion_state: Mutex::new(acumuladores_de_fusao),
             signal_ids: Mutex::new(signal_ids),
             sighting_keys: Mutex::new(JanelaDeChaves::nova(TECTO_CHAVES_SIGHTING)),
             // A janela já vem cheia e com tecto da primeira passagem. O código
@@ -549,11 +756,13 @@ impl SentinelRuntime {
             ultimo_snapshot: Mutex::new(Instant::now()),
         });
 
+        let relogio = Instant::now();
+
         // Segunda passagem: grafo (L3) e histórico de regras (L1). O grafo
         // fica pronto antes de o L2 correr, que é a ordem que existia; o
         // histórico fica podado ao horizonte do ruleset, que é o que o torna
         // limitado numa base grande.
-        passagem_de_grafo_e_regras(&inner, ate_exclusivo, lote)?;
+        passagem_de_grafo_e_regras(&inner, desde, ate_exclusivo, lote)?;
 
         // Re-evaluate L1 before L2 so events classified by a deterministic
         // rule are never incorporated into an active behavioral baseline.
@@ -572,13 +781,57 @@ impl SentinelRuntime {
         // Terceira passagem: rebuild do L2 a partir dos episódios canónicos
         // `SecurityEvent`, em ordem de LSN de transacção. Ids de sinal estáveis
         // tornam seguro ligar o L2 numa base existente e reproduzir após crash.
-        passagem_de_l2(&inner, ate_exclusivo, lote, &l1_suspicious)?;
+        passagem_de_l2(&inner, desde, ate_exclusivo, lote, &l1_suspicious)?;
 
         // Quarta passagem: reproduz os sinais persistidos em ordem de LSN de
         // transacção. É isto que reproduz as revisões append-only tal como
         // saíram ao vivo, mesmo quando os LSN de tempo de evento chegaram fora
         // de ordem e provocaram re-keying canónico de incidentes.
-        passagem_de_sinais(&inner, ate_exclusivo, lote)?;
+        passagem_de_sinais(&inner, desde, ate_exclusivo, lote)?;
+
+        metrics
+            .boot
+            .tail_replay_ms
+            .store(relogio.elapsed().as_millis() as u64, Ordering::Release);
+        metrics
+            .boot
+            .total_boot_ms
+            .store(boot_comecou.elapsed().as_millis() as u64, Ordering::Release);
+
+        // §25 — logging obrigatório. "Nunca apenas `starting sentinel...` por
+        // minutos sem informar a fase responsável." Uma linha, com os números
+        // que distinguem um arranque instantâneo de uma reconstrução da base
+        // inteira — que é a pergunta que o operador tem quando o serviço
+        // demora.
+        let relatorio = metrics.boot.relatorio();
+        tracing::info!(
+            resultado = %relatorio.outcome,
+            motivo = ?relatorio.rebuild_reason,
+            watermark = relatorio.watermark_lsn,
+            head = relatorio.head_at_boot_lsn,
+            cauda = relatorio.tail_events,
+            cursor_ms = relatorio.cursor_load_ms,
+            snapshot_ms = relatorio.snapshot_load_ms,
+            restauro_ms = relatorio.state_restore_ms,
+            replay_ms = relatorio.tail_replay_ms,
+            total_ms = relatorio.total_boot_ms,
+            "arranque do Sentinel concluído"
+        );
+
+        // §15 caso 3 — depois de um rebuild canónico, publica o snapshot. Sem
+        // isto a §47 (migração) nunca sairia do primeiro passo: uma base que só
+        // tem `cursor.json` reconstruiria do zero a CADA arranque, para sempre,
+        // e o snapshot que a spec inteira existe para permitir nunca chegaria a
+        // ser escrito.
+        if matches!(decisao, StartupReconciliation::RebuildCanonical { .. }) {
+            if let Err(erro) = publicar_snapshot(&inner) {
+                tracing::warn!(
+                    erro = %erro,
+                    "rebuild canónico concluído mas o snapshot não foi publicado; \
+                     o próximo arranque volta a reconstruir"
+                );
+            }
+        }
 
         let subscriber = Arc::new(SecuritySubscriber::new(queue.clone(), metrics));
         let tail_handle = attach_subscriber_with_stop(log.as_ref(), subscriber, stop.clone());
@@ -1852,16 +2105,39 @@ struct IdsDerivados {
 /// derivado — 8 bytes por evento numa base de 100M — e só depois o despejava na
 /// janela de 262 144. O tecto existia, mas chegava tarde de mais para servir
 /// para alguma coisa.
+#[allow(clippy::too_many_arguments)]
 fn passagem_de_ids(
     log: &AnyLog,
+    desde: Lsn,
     ate: Lsn,
     lote: usize,
     l3_enabled: bool,
     fusion_enabled: bool,
+    snapshot: Option<&SentinelStateSnapshot>,
 ) -> Result<(IdsDerivados, JanelaRecente<Lsn>), SentinelError> {
     let mut ids = IdsDerivados::default();
     let mut derived_sources = JanelaRecente::nova(TECTO_LSN_DERIVADOS);
-    por_lotes(log, 0, ate, lote, |lsn, episode| {
+    // Com snapshot, os conjuntos até ao watermark vêm de lá e a passagem só
+    // varre a cauda. É o INV-5 aplicado também aos ids: sem isto, o "warm boot"
+    // continuaria a ler a base inteira só para reconstruir conjuntos que o
+    // snapshot já traz.
+    if let Some(s) = snapshot {
+        ids.signal_ids.extend(s.signal_ids.iter().cloned());
+        ids.incident_revision_ids
+            .extend(s.incident_revision_ids.iter().cloned());
+        ids.risk_revision_ids
+            .extend(s.risk_revision_ids.iter().cloned());
+        ids.checkpoint_ids.extend(s.checkpoint_ids.iter().cloned());
+        ids.last_checkpoint_lsn = s.last_checkpoint_lsn;
+        ids.l4_ids
+            .extend(s.l4_ids.iter().map(|(chave, lsn)| (chave.clone(), *lsn)));
+        // Já vem por ordem de scan do snapshot que a capturou; reinserir
+        // preserva essa ordem, e com ela a semântica de evicção da janela.
+        for lsn in &s.derived_sources {
+            derived_sources.inserir(lsn);
+        }
+    }
+    por_lotes(log, desde, ate, lote, |lsn, episode| {
         // Attribute names alone are not an authenticity boundary.  Only rows
         // emitted by the internal Sentinel sink are restored as derived state.
         if !episode_is_generated(&episode) {
@@ -1995,6 +2271,7 @@ fn evento_derivado(lsn: Lsn, episode: &Episode) -> Option<(Lsn, SecurityEvent)> 
 /// histórico é a única estrutura aqui cujo tamanho seguiria o da base.
 fn passagem_de_grafo_e_regras(
     inner: &RuntimeInner,
+    desde: Lsn,
     ate: Lsn,
     lote: usize,
 ) -> Result<(), SentinelError> {
@@ -2003,7 +2280,7 @@ fn passagem_de_grafo_e_regras(
     if !l3 && !l1 {
         return Ok(());
     }
-    por_lotes(&inner.log, 0, ate, lote, |lsn, episode| {
+    por_lotes(&inner.log, desde, ate, lote, |lsn, episode| {
         let Some((source_lsn, event)) = evento_derivado(lsn, &episode) else {
             return Ok(());
         };
@@ -2025,6 +2302,7 @@ fn passagem_de_grafo_e_regras(
 /// diferentes das que a instância viva construiu.
 fn passagem_de_l2(
     inner: &RuntimeInner,
+    desde: Lsn,
     ate: Lsn,
     lote: usize,
     suspeitos: &HashSet<EventId>,
@@ -2032,7 +2310,7 @@ fn passagem_de_l2(
     if inner.behavior_engine.is_none() {
         return Ok(());
     }
-    por_lotes(&inner.log, 0, ate, lote, |lsn, episode| {
+    por_lotes(&inner.log, desde, ate, lote, |lsn, episode| {
         let Some((_, event)) = evento_derivado(lsn, &episode) else {
             return Ok(());
         };
@@ -2045,12 +2323,17 @@ fn passagem_de_l2(
 /// Em ordem de LSN de transacção, que é o que reproduz as revisões de
 /// incidente tal como saíram ao vivo, mesmo quando os LSN de tempo de evento
 /// chegaram fora de ordem.
-fn passagem_de_sinais(inner: &RuntimeInner, ate: Lsn, lote: usize) -> Result<(), SentinelError> {
+fn passagem_de_sinais(
+    inner: &RuntimeInner,
+    desde: Lsn,
+    ate: Lsn,
+    lote: usize,
+) -> Result<(), SentinelError> {
     if inner.fusion.is_none() && inner.incident_engine.is_none() {
         return Ok(());
     }
     let mut vistos: HashSet<String> = HashSet::new();
-    por_lotes(&inner.log, 0, ate, lote, |lsn, episode| {
+    por_lotes(&inner.log, desde, ate, lote, |lsn, episode| {
         if !episode_is_generated(&episode) {
             return Ok(());
         }
@@ -4305,28 +4588,39 @@ mod testes_snapshot_spec0072 {
             .unwrap(),
         );
         let caminho = log.dir().join("sentinel").join("state.snapshot");
+        let watermark_do_arranque;
         {
             let runtime = SentinelRuntime::start(log.clone(), config_de_teste())
                 .unwrap()
                 .unwrap();
+            // O arranque a frio já publica (§15 caso 3): sem isso a §47 nunca
+            // sairia do primeiro passo e uma base só com `cursor.json`
+            // reconstruiria do zero a cada arranque, para sempre.
+            assert!(
+                caminho.exists(),
+                "o rebuild canónico tem de deixar um snapshot em {}",
+                caminho.display()
+            );
+            watermark_do_arranque = match SnapshotStore::new(&caminho).carregar(7).unwrap() {
+                SnapshotLoad::Utilizavel(s) => s.applied_until_exclusive,
+                outro => panic!("{outro:?}"),
+            };
+
             log.append(evento_bruto("frank")).unwrap();
             esperar_normalizados(&runtime, 1);
-            assert!(
-                !caminho.exists(),
-                "nada devia ter publicado ainda: 1 evento está muito abaixo da cadência"
-            );
             runtime.shutdown();
         }
-        assert!(
-            caminho.exists(),
-            "o shutdown limpo tem de deixar o snapshot final em {}",
-            caminho.display()
-        );
         let store = SnapshotStore::new(&caminho);
-        assert!(matches!(
-            store.carregar(7).unwrap(),
-            SnapshotLoad::Utilizavel(_)
-        ));
+        match store.carregar(7).unwrap() {
+            SnapshotLoad::Utilizavel(s) => assert!(
+                s.applied_until_exclusive > watermark_do_arranque,
+                "o shutdown limpo tem de publicar um snapshot MAIS ADIANTADO \
+                 que o do arranque ({} vs {watermark_do_arranque}); senão o \
+                 trabalho feito nesta vida perde-se",
+                s.applied_until_exclusive
+            ),
+            outro => panic!("o snapshot do shutdown tinha de ser utilizável: {outro:?}"),
+        }
     }
 
     #[test]
@@ -4370,6 +4664,202 @@ mod testes_snapshot_spec0072 {
 mod testes_rebuild_janelado_spec0072 {
     use super::*;
     use heraclitus_core::FsyncPolicy;
+
+    /// INV-5, medido: com snapshot válido o arranque lê a CAUDA, não a base.
+    ///
+    /// É este o teste que justifica a SPEC-0072 inteira. Tudo o resto —
+    /// digest, publicação atómica, reconciliação — existe para tornar este
+    /// número verdadeiro e seguro.
+    #[test]
+    fn um_arranque_a_quente_le_a_cauda_e_nao_a_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = log_novo(&temp);
+        {
+            let runtime = SentinelRuntime::start(log.clone(), config(8))
+                .unwrap()
+                .unwrap();
+            semear(&log, 60);
+            esperar_estabilizar(&runtime, &log);
+            runtime.shutdown();
+        }
+        let head_depois = log.head();
+        assert!(head_depois > 60);
+
+        // Segundo arranque, sem nada de novo no log: o snapshot do shutdown
+        // cobre tudo, logo a cauda tem de ser ZERO.
+        let runtime = SentinelRuntime::start(log.clone(), config(8))
+            .unwrap()
+            .unwrap();
+        let boot = runtime.status().boot;
+        runtime.shutdown();
+        assert_eq!(
+            boot.outcome, "synchronized",
+            "com snapshot no head e cursor no head o arranque tem de ser \
+             instantâneo; veio {boot:?}"
+        );
+        assert_eq!(boot.tail_events, 0, "não havia cauda para reproduzir");
+        assert_eq!(
+            boot.full_rebuild_total, 0,
+            "um snapshot válido não pode desencadear rebuild"
+        );
+
+        // Terceiro arranque, com 5 eventos novos: a cauda é a diferença, e
+        // NUNCA a base inteira.
+        semear(&log, 5);
+        let head_com_novos = log.head();
+        let runtime = SentinelRuntime::start(log.clone(), config(8))
+            .unwrap()
+            .unwrap();
+        let boot = runtime.status().boot;
+        esperar_estabilizar(&runtime, &log);
+        runtime.shutdown();
+        assert_eq!(boot.outcome, "catch_up_tail", "veio {boot:?}");
+        assert_eq!(
+            boot.tail_events,
+            head_com_novos - head_depois,
+            "a cauda tem de ser exactamente os eventos novos"
+        );
+        assert!(
+            boot.tail_events < head_com_novos / 4,
+            "a cauda ({}) não pode ser da ordem da base ({head_com_novos})",
+            boot.tail_events
+        );
+    }
+
+    /// §36 — snapshot corrompido: rejeitado, rebuild derivado, log preservado.
+    #[test]
+    fn um_snapshot_corrompido_faz_rebuild_sem_tocar_no_log() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = log_novo(&temp);
+        {
+            let runtime = SentinelRuntime::start(log.clone(), config(8))
+                .unwrap()
+                .unwrap();
+            semear(&log, 30);
+            esperar_estabilizar(&runtime, &log);
+            runtime.shutdown();
+        }
+        let head_antes = log.head();
+        let caminho = log.dir().join("sentinel").join("state.snapshot");
+        let mut bytes = std::fs::read(&caminho).unwrap();
+        let ultimo = bytes.len() - 1;
+        bytes[ultimo] ^= 0xFF;
+        std::fs::write(&caminho, &bytes).unwrap();
+
+        let runtime = SentinelRuntime::start(log.clone(), config(8))
+            .unwrap()
+            .unwrap();
+        let boot = runtime.status().boot;
+        esperar_estabilizar(&runtime, &log);
+        runtime.shutdown();
+
+        assert_eq!(boot.outcome, "rebuild_canonical", "veio {boot:?}");
+        assert_eq!(boot.snapshot_rejected_total, 1);
+        assert_eq!(boot.snapshot_corrupt_total, 1);
+        assert_eq!(boot.full_rebuild_total, 1);
+        assert_eq!(
+            log.head(),
+            head_antes,
+            "um snapshot corrompido não pode fazer o rebuild acrescentar \
+             nada ao log canónico"
+        );
+    }
+
+    /// §15 caso 4 + §16 + §17 — cursor além do head.
+    #[test]
+    fn um_cursor_alem_do_head_e_registado_preservado_e_reconstruido() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = log_novo(&temp);
+        {
+            let runtime = SentinelRuntime::start(log.clone(), config(8))
+                .unwrap()
+                .unwrap();
+            semear(&log, 20);
+            esperar_estabilizar(&runtime, &log);
+            runtime.shutdown();
+        }
+        let head_antes = log.head();
+
+        // Um cursor que aponta para além do log é a assinatura de cauda
+        // perdida: restauro de backup, ou truncagem por corrupção.
+        let cursor_path = log.dir().join("sentinel").join("cursor.json");
+        std::fs::write(
+            &cursor_path,
+            serde_json::to_vec_pretty(&SentinelCursor {
+                next_lsn: head_antes + 500,
+                pipeline_version: 1,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        // O snapshot também deixa de servir: foi capturado noutra realidade.
+        let _ = std::fs::remove_file(log.dir().join("sentinel").join("state.snapshot"));
+
+        let runtime = SentinelRuntime::start(log.clone(), config(8))
+            .unwrap()
+            .unwrap();
+        let boot = runtime.status().boot;
+        esperar_estabilizar(&runtime, &log);
+        runtime.shutdown();
+
+        assert_eq!(
+            boot.outcome, "rebuild_canonical",
+            "sob a política `rebuild` (default) a divergência reconstrói em \
+             vez de recusar o arranque; veio {boot:?}"
+        );
+        assert_eq!(boot.divergence_total, 1, "a divergência TEM de ser contada");
+        assert_eq!(boot.cursor_ahead_total, 1);
+        assert!(
+            log.dir()
+                .join("sentinel")
+                .join(format!(
+                    "cursor.divergent.next{}.head{head_antes}.json",
+                    head_antes + 500
+                ))
+                .exists(),
+            "§16: o cursor divergente tem de ficar preservado para auditoria"
+        );
+        assert_eq!(
+            log.head(),
+            head_antes,
+            "recuperar de um cursor divergente não pode alterar o log"
+        );
+    }
+
+    /// §17 — a política `strict` recusa em vez de recuperar.
+    #[test]
+    fn a_politica_strict_recusa_arrancar_com_cursor_divergente() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = log_novo(&temp);
+        {
+            let runtime = SentinelRuntime::start(log.clone(), config(8))
+                .unwrap()
+                .unwrap();
+            semear(&log, 10);
+            esperar_estabilizar(&runtime, &log);
+            runtime.shutdown();
+        }
+        std::fs::write(
+            log.dir().join("sentinel").join("cursor.json"),
+            serde_json::to_vec_pretty(&SentinelCursor {
+                next_lsn: log.head() + 1,
+                pipeline_version: 1,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut cfg = config(8);
+        cfg.recovery.cursor_policy = heraclitus_core::CursorPolicy::Strict;
+        let erro = match SentinelRuntime::start(log.clone(), cfg) {
+            Err(erro) => erro,
+            Ok(_) => panic!("strict tinha de recusar o arranque"),
+        };
+        assert!(
+            erro.to_string().contains("strict"),
+            "a mensagem tem de dizer que foi a política que recusou: {erro}"
+        );
+    }
 
     fn log_novo(temp: &tempfile::TempDir) -> Arc<AnyLog> {
         Arc::new(
