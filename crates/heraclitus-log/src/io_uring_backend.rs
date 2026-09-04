@@ -97,8 +97,7 @@ impl LinuxUringIo {
         // SAFETY: contrato acima; o chamador mantém os buffers vivos.
         unsafe {
             self.ring.submission().push(entrada).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::Other,
+                io::Error::other(
                     "submission queue cheia: a profundidade não chega para as operações em voo",
                 )
             })?;
