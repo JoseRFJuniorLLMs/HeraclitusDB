@@ -70,6 +70,13 @@ pub struct BootMetrics {
     pub(crate) head_at_boot_lsn: AtomicU64,
     /// Quantos eventos a cauda teve de reproduzir.
     pub(crate) tail_events: AtomicU64,
+    /// SPEC-0072 §39 — quantos episodios o arranque LEU do log, somando as
+    /// quatro passagens.
+    ///
+    /// E o numero que tranca a regressao. O tempo de parede nao serve: varia
+    /// com a maquina e faria o CI intermitente. Este e determinista, e um
+    /// arranque a quente que volte a varrer a base inteira di-lo aqui.
+    pub(crate) events_scanned_total: AtomicU64,
     /// `(outcome, motivo_do_rebuild)`. `OnceLock` diz exactamente o que isto
     /// é: escrito uma vez, no arranque, e a partir daí só lido.
     pub(crate) decisao: std::sync::OnceLock<(String, Option<String>)>,
@@ -97,6 +104,7 @@ impl BootMetrics {
             watermark_lsn: self.watermark_lsn.load(Ordering::Acquire),
             head_at_boot_lsn: self.head_at_boot_lsn.load(Ordering::Acquire),
             tail_events: self.tail_events.load(Ordering::Acquire),
+            events_scanned_total: self.events_scanned_total.load(Ordering::Acquire),
             cursor_load_ms: self.cursor_load_ms.load(Ordering::Acquire),
             snapshot_load_ms: self.snapshot_load_ms.load(Ordering::Acquire),
             snapshot_verify_ms: self.snapshot_verify_ms.load(Ordering::Acquire),
@@ -125,6 +133,8 @@ pub struct BootReport {
     pub watermark_lsn: u64,
     pub head_at_boot_lsn: u64,
     pub tail_events: u64,
+    /// Episodios lidos do log durante o arranque, somando as quatro passagens.
+    pub events_scanned_total: u64,
     pub cursor_load_ms: u64,
     pub snapshot_load_ms: u64,
     pub snapshot_verify_ms: u64,

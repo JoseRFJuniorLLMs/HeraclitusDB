@@ -621,6 +621,7 @@ impl SentinelRuntime {
             config.l3.enabled,
             fusion_enabled,
             snapshot.as_ref(),
+            &metrics.boot.events_scanned_total,
         )?;
         let IdsDerivados {
             signal_ids,
@@ -2055,6 +2056,7 @@ fn talvez_publicar_snapshot(inner: &RuntimeInner, processados: u64) {
 /// para comitar.
 fn por_lotes(
     log: &AnyLog,
+    contador: &std::sync::atomic::AtomicU64,
     de: Lsn,
     ate: Lsn,
     lote: usize,
@@ -2068,6 +2070,7 @@ fn por_lotes(
             break;
         }
         let ultimo = linhas.last().map(|(lsn, _)| *lsn).unwrap_or(cursor);
+        contador.fetch_add(linhas.len() as u64, Ordering::Relaxed);
         for (lsn, episodio) in linhas {
             visitar(lsn, episodio)?;
         }
@@ -2114,6 +2117,7 @@ fn passagem_de_ids(
     l3_enabled: bool,
     fusion_enabled: bool,
     snapshot: Option<&SentinelStateSnapshot>,
+    contador: &std::sync::atomic::AtomicU64,
 ) -> Result<(IdsDerivados, JanelaRecente<Lsn>), SentinelError> {
     let mut ids = IdsDerivados::default();
     let mut derived_sources = JanelaRecente::nova(TECTO_LSN_DERIVADOS);
@@ -2137,7 +2141,7 @@ fn passagem_de_ids(
             derived_sources.inserir(lsn);
         }
     }
-    por_lotes(log, desde, ate, lote, |lsn, episode| {
+    por_lotes(log, contador, desde, ate, lote, |lsn, episode| {
         // Attribute names alone are not an authenticity boundary.  Only rows
         // emitted by the internal Sentinel sink are restored as derived state.
         if !episode_is_generated(&episode) {
@@ -2280,18 +2284,25 @@ fn passagem_de_grafo_e_regras(
     if !l3 && !l1 {
         return Ok(());
     }
-    por_lotes(&inner.log, desde, ate, lote, |lsn, episode| {
-        let Some((source_lsn, event)) = evento_derivado(lsn, &episode) else {
-            return Ok(());
-        };
-        if l3 {
-            apply_security_graph(inner, lsn, &event)?;
-        }
-        if l1 {
-            remember_rule_event(inner, source_lsn, &event);
-        }
-        Ok(())
-    })
+    por_lotes(
+        &inner.log,
+        &inner.metrics.boot.events_scanned_total,
+        desde,
+        ate,
+        lote,
+        |lsn, episode| {
+            let Some((source_lsn, event)) = evento_derivado(lsn, &episode) else {
+                return Ok(());
+            };
+            if l3 {
+                apply_security_graph(inner, lsn, &event)?;
+            }
+            if l1 {
+                remember_rule_event(inner, source_lsn, &event);
+            }
+            Ok(())
+        },
+    )
 }
 
 /// Terceira passagem: replay do L2 por LSN de transacção.
@@ -2310,12 +2321,19 @@ fn passagem_de_l2(
     if inner.behavior_engine.is_none() {
         return Ok(());
     }
-    por_lotes(&inner.log, desde, ate, lote, |lsn, episode| {
-        let Some((_, event)) = evento_derivado(lsn, &episode) else {
-            return Ok(());
-        };
-        evaluate_l2(inner, lsn, &event, suspeitos.contains(&event.raw_event_id))
-    })
+    por_lotes(
+        &inner.log,
+        &inner.metrics.boot.events_scanned_total,
+        desde,
+        ate,
+        lote,
+        |lsn, episode| {
+            let Some((_, event)) = evento_derivado(lsn, &episode) else {
+                return Ok(());
+            };
+            evaluate_l2(inner, lsn, &event, suspeitos.contains(&event.raw_event_id))
+        },
+    )
 }
 
 /// Quarta passagem: replay dos sinais persistidos pela fusão e pelo L3.
@@ -2333,25 +2351,32 @@ fn passagem_de_sinais(
         return Ok(());
     }
     let mut vistos: HashSet<String> = HashSet::new();
-    por_lotes(&inner.log, desde, ate, lote, |lsn, episode| {
-        if !episode_is_generated(&episode) {
-            return Ok(());
-        }
-        let EventKind::Custom(kind) = &episode.kind else {
-            return Ok(());
-        };
-        if kind != "SecuritySignal" {
-            return Ok(());
-        }
-        let Ok(signal) = serde_json::from_slice::<SecuritySignal>(&episode.content) else {
-            return Ok(());
-        };
-        if !vistos.insert(signal.signal_id.clone()) {
-            return Ok(());
-        }
-        evaluate_fusion(inner, lsn, &signal)?;
-        evaluate_l3(inner, lsn, &signal)
-    })
+    por_lotes(
+        &inner.log,
+        &inner.metrics.boot.events_scanned_total,
+        desde,
+        ate,
+        lote,
+        |lsn, episode| {
+            if !episode_is_generated(&episode) {
+                return Ok(());
+            }
+            let EventKind::Custom(kind) = &episode.kind else {
+                return Ok(());
+            };
+            if kind != "SecuritySignal" {
+                return Ok(());
+            }
+            let Ok(signal) = serde_json::from_slice::<SecuritySignal>(&episode.content) else {
+                return Ok(());
+            };
+            if !vistos.insert(signal.signal_id.clone()) {
+                return Ok(());
+            }
+            evaluate_fusion(inner, lsn, &signal)?;
+            evaluate_l3(inner, lsn, &signal)
+        },
+    )
 }
 
 impl Sentinel for SentinelRuntime {
@@ -4664,6 +4689,158 @@ mod testes_snapshot_spec0072 {
 mod testes_rebuild_janelado_spec0072 {
     use super::*;
     use heraclitus_core::FsyncPolicy;
+
+    /// SPEC-0072 §39 — o gate de regressão.
+    ///
+    /// Este teste existe para uma coisa só: falhar se alguém voltar a pôr o
+    /// arranque a varrer a base inteira. Mede EPISÓDIOS LIDOS, não tempo de
+    /// parede — o tempo varia com a máquina e faria o CI intermitente; o
+    /// número de episódios é determinista.
+    ///
+    /// A relação que fixa é a que interessa: o custo do arranque a quente tem
+    /// de ficar preso à cauda e não ao tamanho da base. Por isso a base cresce
+    /// entre as duas medições e o orçamento NÃO cresce com ela.
+    #[test]
+    fn um_arranque_a_quente_nao_pode_varrer_a_base() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = log_novo(&temp);
+        {
+            let runtime = SentinelRuntime::start(log.clone(), config(64))
+                .unwrap()
+                .unwrap();
+            semear(&log, 120);
+            esperar_estabilizar(&runtime, &log);
+            runtime.shutdown();
+        }
+        let base = log.head();
+        assert!(
+            base > 120,
+            "base pequena de mais para o teste valer: {base}"
+        );
+
+        // Arranque a quente, sem nada de novo.
+        let runtime = SentinelRuntime::start(log.clone(), config(64))
+            .unwrap()
+            .unwrap();
+        let quente = runtime.status().boot;
+        runtime.shutdown();
+        assert_eq!(
+            quente.events_scanned_total, 0,
+            "com snapshot no head não há cauda nenhuma para ler; \
+             ler {} episódios significa que o arranque voltou a varrer",
+            quente.events_scanned_total
+        );
+
+        // Agora com cauda: 6 eventos novos. O que é lido tem de ser da ordem
+        // da cauda, não da base.
+        semear(&log, 6);
+        let cauda_esperada = log.head() - base;
+        let runtime = SentinelRuntime::start(log.clone(), config(64))
+            .unwrap()
+            .unwrap();
+        let com_cauda = runtime.status().boot;
+        esperar_estabilizar(&runtime, &log);
+        runtime.shutdown();
+
+        // Quatro passagens sobre a mesma cauda: o tecto é 4x, com folga.
+        let tecto = cauda_esperada * 5;
+        assert!(
+            com_cauda.events_scanned_total <= tecto,
+            "o arranque leu {} episódios para uma cauda de {cauda_esperada} \
+             (base={base}); orçamento={tecto}. O arranque voltou a ser \
+             proporcional à base — é exactamente o que o INV-5 proíbe.",
+            com_cauda.events_scanned_total
+        );
+        assert!(
+            com_cauda.events_scanned_total < base,
+            "ler {} de uma base de {base} já é varrer a base",
+            com_cauda.events_scanned_total
+        );
+    }
+
+    /// SPEC-0072 §22 — idempotência do replay.
+    ///
+    /// "Executar o mesmo replay 10 vezes deve resultar nos mesmos SecurityEvent
+    /// IDs, SecuritySignal IDs, incident revision IDs, risk revision IDs, graph
+    /// state, fusion state, cursor e snapshot digest, quando o estado lógico
+    /// não muda."
+    ///
+    /// Dez arranques seguidos sobre a mesma base, sem nada de novo no log. O
+    /// que se compara não é só o estado em memória: é o LOG, que não pode
+    /// crescer, e o snapshot, que não pode mudar de conteúdo.
+    #[test]
+    fn dez_replays_do_mesmo_intervalo_dao_o_mesmo_estado() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = log_novo(&temp);
+        {
+            let runtime = SentinelRuntime::start(log.clone(), config(16))
+                .unwrap()
+                .unwrap();
+            semear(&log, 35);
+            esperar_estabilizar(&runtime, &log);
+            runtime.shutdown();
+        }
+        let head_estavel = log.head();
+        let caminho = log.dir().join("sentinel").join("state.snapshot");
+
+        let mut referencia: Option<SentinelStateSnapshot> = None;
+        for volta in 1..=10 {
+            // Metade das voltas parte de um rebuild frio, para que a
+            // idempotência não seja só a do caminho a quente: apagar o
+            // snapshot obriga a reconstruir tudo do log.
+            if volta % 2 == 0 {
+                let _ = std::fs::remove_file(&caminho);
+            }
+            let runtime = SentinelRuntime::start(log.clone(), config(16))
+                .unwrap()
+                .unwrap();
+            esperar_estabilizar(&runtime, &log);
+            let capturado = runtime.capturar_snapshot();
+            runtime.shutdown();
+
+            assert_eq!(
+                log.head(),
+                head_estavel,
+                "volta {volta}: o replay acrescentou {} episódios ao log",
+                log.head() - head_estavel
+            );
+            match &referencia {
+                None => referencia = Some(capturado),
+                Some(esperado) => {
+                    assert_eq!(
+                        capturado.signal_ids, esperado.signal_ids,
+                        "volta {volta}: outros SecuritySignal IDs"
+                    );
+                    assert_eq!(
+                        capturado.incident_revision_ids, esperado.incident_revision_ids,
+                        "volta {volta}: outras revisões de incidente"
+                    );
+                    assert_eq!(
+                        capturado.risk_revision_ids, esperado.risk_revision_ids,
+                        "volta {volta}: outras revisões de risco"
+                    );
+                    assert_eq!(
+                        capturado.graph_state, esperado.graph_state,
+                        "volta {volta}: outro grafo"
+                    );
+                    assert_eq!(
+                        capturado.fusion_state, esperado.fusion_state,
+                        "volta {volta}: outro estado de fusão"
+                    );
+                    assert_eq!(
+                        capturado.applied_until_exclusive, esperado.applied_until_exclusive,
+                        "volta {volta}: outro cursor"
+                    );
+                    assert_eq!(
+                        capturado.derived_sources, esperado.derived_sources,
+                        "volta {volta}: outra janela de origens derivadas — \
+                         é o sintoma de a janela estar a ser preenchida por \
+                         uma ordem que não é a do scan"
+                    );
+                }
+            }
+        }
+    }
 
     /// INV-5, medido: com snapshot válido o arranque lê a CAUDA, não a base.
     ///
