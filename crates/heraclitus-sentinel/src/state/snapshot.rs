@@ -490,6 +490,9 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|nome| nome.ends_with(".tmp"))
             .collect();
-        assert!(sobras.is_empty(), "ficheiros temporários por limpar: {sobras:?}");
+        assert!(
+            sobras.is_empty(),
+            "ficheiros temporários por limpar: {sobras:?}"
+        );
     }
 }

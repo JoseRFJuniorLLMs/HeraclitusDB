@@ -212,10 +212,7 @@ pub fn reconcile_startup_state(
         if w > head {
             return StartupReconciliation::DivergenceDetected {
                 head,
-                reason: StateDivergenceReason::SnapshotAlemDoHead {
-                    watermark: w,
-                    head,
-                },
+                reason: StateDivergenceReason::SnapshotAlemDoHead { watermark: w, head },
             };
         }
         if cursor_next_lsn < w {
@@ -348,8 +345,7 @@ mod tests {
 
     #[test]
     fn a_politica_strict_recusa_e_a_rebuild_reconstroi() {
-        let divergente =
-            reconcile_startup_state(10, 42, Some(5), RebuildReason::SnapshotAusente);
+        let divergente = reconcile_startup_state(10, 42, Some(5), RebuildReason::SnapshotAusente);
 
         let erro = divergente
             .clone()
@@ -391,7 +387,10 @@ mod tests {
                 r,
                 "strict só recusa divergência; não é um modo mais lento"
             );
-            assert_eq!(r.clone().aplicar_politica(CursorPolicy::Rebuild).unwrap(), r);
+            assert_eq!(
+                r.clone().aplicar_politica(CursorPolicy::Rebuild).unwrap(),
+                r
+            );
         }
     }
 

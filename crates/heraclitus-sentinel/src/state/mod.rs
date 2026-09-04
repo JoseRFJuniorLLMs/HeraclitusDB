@@ -5,8 +5,8 @@ pub mod replay;
 pub mod snapshot;
 pub mod startup;
 
-pub use checkpoint::{CursorStore, SentinelCheckpoint, SentinelCursor};
 pub use crate::cursor::CursorRejeitado;
+pub use checkpoint::{CursorStore, SentinelCheckpoint, SentinelCursor};
 pub use replay::{replay, ReplayReport};
 pub use snapshot::{
     FusionAccumulatorState, SentinelStateSnapshot, SnapshotLoad, SnapshotStore,

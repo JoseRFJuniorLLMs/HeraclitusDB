@@ -85,13 +85,9 @@ impl DetectionExpr {
                 window_ms,
                 ..
             } => (*window_ms).max(predicate.max_window_ms()),
-            Self::Sequence { steps, within_ms } => (*within_ms).max(
-                steps
-                    .iter()
-                    .map(Self::max_window_ms)
-                    .max()
-                    .unwrap_or(0),
-            ),
+            Self::Sequence { steps, within_ms } => {
+                (*within_ms).max(steps.iter().map(Self::max_window_ms).max().unwrap_or(0))
+            }
             Self::DistinctCount { window_ms, .. } => *window_ms,
         }
     }
@@ -1131,7 +1127,11 @@ mod horizonte_tests {
             within_ms: 5_000,
         };
         assert_eq!(count.max_window_ms(), 10_000);
-        assert_eq!(seq.max_window_ms(), 10_000, "uma janela aninhada num passo conta");
+        assert_eq!(
+            seq.max_window_ms(),
+            10_000,
+            "uma janela aninhada num passo conta"
+        );
         let aninhado = DetectionExpr::Or(vec![
             DetectionExpr::Not(Box::new(distinct.clone())),
             seq.clone(),
