@@ -121,6 +121,36 @@ print(b.get('$1', ''))
 " 2>/dev/null
 }
 
+campo_status() {
+  boot_json | python3 -c "
+import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print(''); raise SystemExit
+print((d.get('status') or {}).get('$1', ''))
+" 2>/dev/null
+}
+
+# Espera que o Sentinel apanhe a cauda: `next_lsn >= head_lsn`.
+#
+# NAO e cerimonia. Sem isto o L2 desligava com o Sentinel ainda atrasado, o
+# snapshot do shutdown saia com um watermark baixo, e o segundo arranque lia
+# uma cauda grande — passando o gate por uma razao que nao e a que ele existe
+# para provar. Na primeira corrida verde leu 182 episodios para um limite de
+# 200: verde, e sem significado.
+esperar_catchup() {
+  local prazo="${1:-60}" fim=$((SECONDS + prazo)) n h
+  while (( SECONDS < fim )); do
+    n=$(campo_status next_lsn); h=$(campo_status head_lsn)
+    if [[ -n "$n" && -n "$h" && "$n" -ge "$h" ]]; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
 # ── L0 — build ───────────────────────────────────────────────────────────────
 
 gate "L0 — build release"
@@ -176,17 +206,22 @@ gate "L2 — persisted restart (INV-5)"
 D2="$TRABALHO/l2"; mkdir -p "$D2/data"; escrever_config "$D2"
 if arrancar "$D2"; then
   appendar 70 || falha "appends falharam"   # ~210 eventos
-  sleep 2   # deixa o Sentinel apanhar a cauda
-  TOTAL=$(campo_boot head_at_boot_lsn)
+  esperar_catchup || falha "o Sentinel nao apanhou a cauda antes do shutdown"
+  BASE=$(campo_status head_lsn)
   parar || falha "SIGTERM nao desligou"
   if arrancar "$D2"; then
     LIDOS=$(campo_boot events_scanned_total)
     RESULTADO=$(campo_boot outcome)
-    cinza "  segundo arranque: outcome=$RESULTADO lidos=$LIDOS (base tinha >=200)"
-    if [[ -n "$LIDOS" && "$LIDOS" -lt 200 ]]; then
-      ok "second_boot_events_scanned << total_events ($LIDOS < 200)"
+    cinza "  segundo arranque: outcome=$RESULTADO lidos=$LIDOS (base tinha $BASE)"
+    # Com o Sentinel em dia e um shutdown limpo, o snapshot cobre TUDO: a cauda
+    # e zero. O tecto e generoso (10% da base) e nao zero exacto porque o log
+    # recebe derivados ate ao ultimo instante antes do SIGTERM; o que nao pode
+    # e ser da ORDEM da base, que era o caso que a primeira corrida escondeu.
+    TECTO=$(( BASE / 10 + 5 ))
+    if [[ -n "$LIDOS" && "$LIDOS" -le "$TECTO" ]]; then
+      ok "second_boot_events_scanned << total_events ($LIDOS <= $TECTO, base $BASE)"
     else
-      falha "o segundo arranque leu $LIDOS episodios; devia ler a cauda, nao a base"
+      falha "o segundo arranque leu $LIDOS episodios de uma base de $BASE (tecto $TECTO); devia ler a cauda, nao a base"
     fi
     parar
   else
