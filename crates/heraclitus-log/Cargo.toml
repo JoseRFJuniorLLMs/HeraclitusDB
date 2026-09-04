@@ -24,6 +24,18 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
 
+[features]
+# SPEC-0073 §8 — backend io_uring EXPERIMENTAL.
+#
+# Off por default: a §7 diz "PortableFileIo = default, LinuxUringIo =
+# experimental", e a §11 so permite promover com >=1.10x de throughput ou
+# p99 <= 0.85x, provados pela matriz da §10. Ligar por teoria e o que o I-5
+# proibe.
+linux-io-uring = ["dep:io-uring"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7", optional = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 rand = { workspace = true }
