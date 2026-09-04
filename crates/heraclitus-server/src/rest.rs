@@ -99,6 +99,10 @@ pub fn router_with_sentinel(
         // SPEC-0071 §3 — o evento canonico de seguranca, do lado do banco.
         .route("/security/events", get(security_events))
         .route("/security/events/counts", get(security_event_counts))
+        // SPEC-0071 §8 — Case Management. Nao ha rota que MUTE um caso: o
+        // POST acrescenta um comando ao log e o GET reconstroi.
+        .route("/cases", get(case_list).post(case_command))
+        .route("/cases/:id", get(case_state))
         .route("/verify", get(verify))
         .route("/verify/:segment", get(verify_segment))
         // Fluxo ao vivo de appends (SSE). O log já emitia cada append
@@ -2348,6 +2352,99 @@ async fn security_event_counts(
         Ok(Ok(contagens)) => Json(serde_json::json!({
             "as_of_lsn": as_of_lsn,
             "counts": contagens,
+        }))
+        .into_response(),
+        Ok(Err(erro)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": erro.to_string() })),
+        )
+            .into_response(),
+        Err(erro) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": erro.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// SPEC-0071 §8 — comandos e leitura de casos.
+///
+/// O POST aplica um comando; o GET reconstrói o estado `AS OF LSN`. Não há
+/// rota que MUTE um caso directamente, e é essa a ausência que interessa: a
+/// §8.2 diz que "não existe `UPDATE case SET ...` como fonte de verdade", e a
+/// forma de garantir isso é não haver por onde.
+async fn case_command(
+    State(engine): State<Arc<Engine>>,
+    Json(envelope): Json<heraclitus_case::CaseEnvelope>,
+) -> Response {
+    match tokio::task::spawn_blocking(move || engine.case_command(&envelope)).await {
+        Ok(Ok((lsn, aplicado))) => Json(serde_json::json!({
+            "lsn": lsn,
+            // `false` é a repetição idempotente da §8.3: o comando já tinha
+            // entrado, nada foi escrito, e o LSN é o da entrada original.
+            "applied": aplicado,
+        }))
+        .into_response(),
+        Ok(Err(erro)) => {
+            let texto = erro.to_string();
+            // Um conflito de revisão é 409, não 500: é uma resposta legítima a
+            // um pedido bem formado, e o cliente sabe o que fazer com ela —
+            // reler o estado e tentar outra vez.
+            let codigo = if texto.contains("conflito de revisão") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (codigo, Json(serde_json::json!({ "error": texto }))).into_response()
+        }
+        Err(erro) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": erro.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn case_state(
+    State(engine): State<Arc<Engine>>,
+    axum::extract::Path(case_id): axum::extract::Path<String>,
+    Query(query): Query<TelemetryHealthQuery>,
+) -> Response {
+    let as_of_lsn = query.as_of_lsn.unwrap_or_else(|| engine.head());
+    match tokio::task::spawn_blocking(move || engine.case_state(&case_id, Some(as_of_lsn))).await {
+        Ok(Ok(Some(estado))) => Json(serde_json::json!({
+            "as_of_lsn": as_of_lsn,
+            "case": estado,
+        }))
+        .into_response(),
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "caso não encontrado neste LSN" })),
+        )
+            .into_response(),
+        Ok(Err(erro)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": erro.to_string() })),
+        )
+            .into_response(),
+        Err(erro) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": erro.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn case_list(
+    State(engine): State<Arc<Engine>>,
+    Query(query): Query<TelemetryHealthQuery>,
+) -> Response {
+    let as_of_lsn = query.as_of_lsn.unwrap_or_else(|| engine.head());
+    match tokio::task::spawn_blocking(move || engine.case_ids(Some(as_of_lsn))).await {
+        Ok(Ok(ids)) => Json(serde_json::json!({
+            "as_of_lsn": as_of_lsn,
+            "count": ids.len(),
+            "cases": ids,
         }))
         .into_response(),
         Ok(Err(erro)) => (

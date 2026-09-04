@@ -28,6 +28,7 @@ members = [
     "tools/heraclitus-ingestor",
     "tools/heraclitus-qualifier",
     "crates/heraclitus-sentinel",
+    "crates/heraclitus-case",
     "crates/heraclitus-telemetry-health",
     "crates/heraclitus-analytics",
     "crates/heraclitus-platform",
@@ -81,6 +82,7 @@ heraclitus-raft = { path = "crates/heraclitus-raft" }
 heraclitus-server = { path = "crates/heraclitus-server" }
 heraclitus-sentinel = { path = "crates/heraclitus-sentinel" }
 heraclitus-platform = { path = "crates/heraclitus-platform" }
+heraclitus-case = { path = "crates/heraclitus-case" }
 heraclitus-telemetry-health = { path = "crates/heraclitus-telemetry-health" }
 # HUME (SPEC-0040.1) — kernel primitivo de execução
 hume-kernel = { path = "crates/hume-kernel" }

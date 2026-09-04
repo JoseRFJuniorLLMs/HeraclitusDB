@@ -4995,3 +4995,291 @@ mod testes_security_events_spec0071 {
         assert_eq!(poucos.len(), 3);
     }
 }
+
+impl Engine {
+    /// SPEC-0071 §8 — aplica um comando de caso ao log.
+    ///
+    /// Reconstrói o estado, valida a revisão esperada e a idempotência, e só
+    /// depois apende. A ordem importa: apender primeiro e validar depois
+    /// deixaria no log comandos em conflito, que a reconstrução teria de
+    /// aprender a ignorar — e um log que precisa de saber ignorar-se a si
+    /// próprio deixa de ser canónico.
+    ///
+    /// Devolve `(lsn, aplicado)`. `aplicado = false` é a repetição idempotente
+    /// da §8.3: o comando já tinha entrado, nada foi escrito, e o LSN é o da
+    /// entrada original.
+    pub fn case_command(
+        &self,
+        envelope: &heraclitus_case::CaseEnvelope,
+    ) -> Result<(Lsn, bool), HeraclitusError> {
+        envelope
+            .validar()
+            .map_err(|e| HeraclitusError::Config(e.to_string()))?;
+
+        let (estado, lsn_do_comando) = self.case_state_interno(&envelope.case_id, None)?;
+
+        // Idempotência antes de tudo (§8.3): um cliente que repete por timeout
+        // traz a revisão que tinha quando tentou.
+        if let Some(lsn) = lsn_do_comando.get(&envelope.command_id) {
+            return Ok((*lsn, false));
+        }
+
+        match &estado {
+            Some(e) => {
+                if envelope.expected_revision != e.revision {
+                    return Err(HeraclitusError::Config(
+                        heraclitus_case::CaseError::Conflito {
+                            case_id: envelope.case_id.clone(),
+                            esperada: envelope.expected_revision,
+                            actual: e.revision,
+                        }
+                        .to_string(),
+                    ));
+                }
+            }
+            None => {
+                if !matches!(
+                    envelope.event,
+                    heraclitus_case::CaseEvent::CaseOpened { .. }
+                ) {
+                    return Err(HeraclitusError::Config(
+                        heraclitus_case::CaseError::Inexistente(envelope.case_id.clone())
+                            .to_string(),
+                    ));
+                }
+                if envelope.expected_revision != 0 {
+                    return Err(HeraclitusError::Config(
+                        heraclitus_case::CaseError::Conflito {
+                            case_id: envelope.case_id.clone(),
+                            esperada: envelope.expected_revision,
+                            actual: 0,
+                        }
+                        .to_string(),
+                    ));
+                }
+            }
+        }
+
+        let episode = envelope
+            .para_episodio()
+            .map_err(|e| HeraclitusError::Config(e.to_string()))?;
+        let lsn = self.append(episode)?;
+        Ok((lsn, true))
+    }
+
+    /// O estado de um caso, `AS OF LSN`. `None` se o caso nunca foi aberto.
+    pub fn case_state(
+        &self,
+        case_id: &str,
+        as_of_lsn: Option<Lsn>,
+    ) -> Result<Option<heraclitus_case::CaseState>, HeraclitusError> {
+        Ok(self.case_state_interno(case_id, as_of_lsn)?.0)
+    }
+
+    /// Reconstrói, devolvendo também onde cada `command_id` entrou — que é o
+    /// que permite a repetição idempotente devolver o LSN original em vez de
+    /// um LSN novo.
+    fn case_state_interno(
+        &self,
+        case_id: &str,
+        as_of_lsn: Option<Lsn>,
+    ) -> Result<
+        (
+            Option<heraclitus_case::CaseState>,
+            std::collections::BTreeMap<String, Lsn>,
+        ),
+        HeraclitusError,
+    > {
+        const JANELA: usize = 20_000;
+        let ate = as_of_lsn.unwrap_or_else(|| self.log.head());
+        let mut envelopes: Vec<heraclitus_case::CaseEnvelope> = Vec::new();
+        let mut onde: std::collections::BTreeMap<String, Lsn> = std::collections::BTreeMap::new();
+        let mut cursor = 0u64;
+        while cursor < ate {
+            let linhas = self.log.scan_capped(cursor, ate, JANELA)?;
+            if linhas.is_empty() {
+                break;
+            }
+            let ultimo = linhas.last().map(|(lsn, _)| *lsn).unwrap_or(cursor);
+            for (lsn, episode) in linhas {
+                if let Some(env) = heraclitus_case::do_episodio(&episode) {
+                    if env.case_id == case_id {
+                        onde.entry(env.command_id.clone()).or_insert(lsn);
+                        envelopes.push(env);
+                    }
+                }
+            }
+            cursor = ultimo.saturating_add(1);
+        }
+        let estado = heraclitus_case::reconstruir(case_id, &envelopes)
+            .map_err(|e| HeraclitusError::Config(e.to_string()))?;
+        Ok((estado, onde))
+    }
+
+    /// Lista os `case_id` conhecidos até ao LSN exclusivo.
+    pub fn case_ids(&self, as_of_lsn: Option<Lsn>) -> Result<Vec<String>, HeraclitusError> {
+        const JANELA: usize = 20_000;
+        let ate = as_of_lsn.unwrap_or_else(|| self.log.head());
+        let mut ids = std::collections::BTreeSet::new();
+        let mut cursor = 0u64;
+        while cursor < ate {
+            let linhas = self.log.scan_capped(cursor, ate, JANELA)?;
+            if linhas.is_empty() {
+                break;
+            }
+            let ultimo = linhas.last().map(|(lsn, _)| *lsn).unwrap_or(cursor);
+            for (_, episode) in linhas {
+                if let Some(id) = episode.attrs.get("case.id") {
+                    ids.insert(id.clone());
+                }
+            }
+            cursor = ultimo.saturating_add(1);
+        }
+        Ok(ids.into_iter().collect())
+    }
+}
+
+#[cfg(test)]
+mod testes_case_spec0071 {
+    use super::*;
+    use heraclitus_case::{CaseEnvelope, CaseEvent, CasePriority, CaseStatus, SlaDeadlines};
+
+    fn motor() -> (tempfile::TempDir, Engine) {
+        let temp = tempfile::tempdir().unwrap();
+        let config = HeraclitusConfig {
+            data_dir: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        (temp, Engine::open(&config).unwrap())
+    }
+
+    fn sla() -> SlaDeadlines {
+        SlaDeadlines {
+            policy_version: "sla-v1".into(),
+            triage_due_micros: Some(1_000),
+            investigation_due_micros: None,
+            containment_due_micros: None,
+            review_due_micros: None,
+            regulatory_due_micros: None,
+        }
+    }
+
+    fn abrir(cmd: &str) -> CaseEnvelope {
+        CaseEnvelope::novo(
+            "case-1",
+            cmd,
+            0,
+            "analista-a",
+            "sinal do Sentinel",
+            CaseEvent::CaseOpened {
+                title: "Acessos falhados".into(),
+                priority: CasePriority::High,
+                opened_by: "analista-a".into(),
+                sla: sla(),
+            },
+        )
+    }
+
+    #[test]
+    fn um_caso_abre_e_le_se_pelo_log() {
+        let (_t, engine) = motor();
+        let (_lsn, aplicado) = engine.case_command(&abrir("c1")).unwrap();
+        assert!(aplicado);
+
+        let estado = engine.case_state("case-1", None).unwrap().unwrap();
+        assert_eq!(estado.revision, 1);
+        assert_eq!(estado.title, "Acessos falhados");
+        assert_eq!(estado.status, CaseStatus::Open);
+        assert_eq!(engine.case_ids(None).unwrap(), vec!["case-1".to_string()]);
+    }
+
+    /// §8.3 — repetir o comando devolve o LSN ORIGINAL e nao escreve nada.
+    #[test]
+    fn repetir_o_comando_nao_escreve_segunda_vez() {
+        let (_t, engine) = motor();
+        let (lsn1, aplicado1) = engine.case_command(&abrir("c1")).unwrap();
+        let head_depois = engine.head();
+
+        let (lsn2, aplicado2) = engine.case_command(&abrir("c1")).unwrap();
+        assert!(aplicado1 && !aplicado2);
+        assert_eq!(lsn1, lsn2, "a repeticao devolve o LSN original");
+        assert_eq!(engine.head(), head_depois, "e nao acrescenta ao log");
+    }
+
+    /// §8.3 — conflito EXPLICITO, e o comando NAO entra no log.
+    ///
+    /// Validar antes de apender e o que impede o log de ficar com comandos em
+    /// conflito que a reconstrucao teria de aprender a ignorar.
+    #[test]
+    fn uma_revisao_divergente_e_recusada_e_nao_suja_o_log() {
+        let (_t, engine) = motor();
+        engine.case_command(&abrir("c1")).unwrap();
+        let head_antes = engine.head();
+
+        let atrasado = CaseEnvelope::novo(
+            "case-1",
+            "c2",
+            0, // ja e 1
+            "analista-b",
+            "fechar",
+            CaseEvent::CaseClosed {
+                resolution: "engano".into(),
+            },
+        );
+        let erro = engine.case_command(&atrasado).unwrap_err();
+        assert!(erro.to_string().contains("conflito de revisão"), "{erro}");
+        assert_eq!(
+            engine.head(),
+            head_antes,
+            "o comando em conflito nao entrou"
+        );
+    }
+
+    #[test]
+    fn um_comando_sobre_um_caso_inexistente_e_recusado() {
+        let (_t, engine) = motor();
+        let solto = CaseEnvelope::novo(
+            "case-nao-existe",
+            "c1",
+            0,
+            "p",
+            "r",
+            CaseEvent::CaseClosed {
+                resolution: "?".into(),
+            },
+        );
+        assert!(engine.case_command(&solto).is_err());
+    }
+
+    /// O estado e DERIVADO: `AS OF` um LSN antigo nao ve o que veio depois.
+    #[test]
+    fn o_estado_e_reconstruivel_as_of_lsn() {
+        let (_t, engine) = motor();
+        let (lsn_abertura, _) = engine.case_command(&abrir("c1")).unwrap();
+        engine
+            .case_command(&CaseEnvelope::novo(
+                "case-1",
+                "c2",
+                1,
+                "analista-a",
+                "resolvido",
+                CaseEvent::CaseClosed {
+                    resolution: "falso positivo".into(),
+                },
+            ))
+            .unwrap();
+
+        let agora = engine.case_state("case-1", None).unwrap().unwrap();
+        assert_eq!(agora.status, CaseStatus::Closed);
+
+        let antes = engine
+            .case_state("case-1", Some(lsn_abertura + 1))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            antes.status,
+            CaseStatus::Open,
+            "AS OF nao pode ver o fecho que veio depois"
+        );
+    }
+}
