@@ -76,7 +76,8 @@ pub use metrics::{BootReport, SecurityLagState, SentinelMetrics, SentinelStatus}
 pub use normalize::{GenericNormalizer, NormalizedSecurityEvent};
 pub use policy::{
     ActionResult, ActionRule, AuthorizedAction, DeterministicPolicyEngine, ExecutionConstraints,
-    HumanApproval, PolicyConfig, PolicyDecision, PolicyEngine, PolicyError, SecurityActionExecutor,
+    HumanApproval, PolicyConfig, PolicyDecision, PolicyEngine, PolicyError, RequiredTelemetry,
+    SecurityActionExecutor, TelemetryHealthProbe, TelemetryHealthReading,
 };
 pub use queue::{EnqueueOutcome, QueueSnapshot, SecurityQueue};
 pub use sigma::{

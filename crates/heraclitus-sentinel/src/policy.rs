@@ -13,12 +13,95 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum PolicyError {
     #[error("política de resposta inválida: {0}")]
     Invalid(String),
+}
+
+/// SPEC-0071 §9.1 — uma exigência de saúde da telemetria, declarada.
+///
+/// É o bloco `required_telemetry` da spec, campo a campo:
+///
+/// ```yaml
+/// required_telemetry:
+///   - datasource_class: identity
+///     minimum_trust: 0.90
+///     maximum_age_secs: 300
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RequiredTelemetry {
+    /// A classe de datasource que esta acção precisa de ver saudável.
+    pub datasource_class: String,
+    /// Confiança mínima, em [0, 1].
+    pub minimum_trust: f32,
+    /// Idade máxima da observação mais recente, em segundos.
+    pub maximum_age_secs: u64,
+}
+
+impl RequiredTelemetry {
+    fn validate(&self) -> Result<(), PolicyError> {
+        if self.datasource_class.trim().is_empty() {
+            return Err(PolicyError::Invalid(
+                "required_telemetry.datasource_class vazio".into(),
+            ));
+        }
+        if !self.minimum_trust.is_finite() || !(0.0..=1.0).contains(&self.minimum_trust) {
+            return Err(PolicyError::Invalid(
+                "required_telemetry.minimum_trust inválido".into(),
+            ));
+        }
+        if self.maximum_age_secs == 0 {
+            return Err(PolicyError::Invalid(
+                "required_telemetry.maximum_age_secs tem de ser > 0".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// O que a view de Telemetry Health diz sobre uma classe de datasource.
+///
+/// Deliberadamente MÍNIMO e sem `Option`: cada campo tem de ser respondido.
+/// `saudavel: false` e `confianca: 0.0` é a resposta certa para "não sei", e é
+/// o default que [`TelemetryHealthProbe`] devolve quando não conhece a classe.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TelemetryHealthReading {
+    /// A classe é conhecida E o seu estado agregado é saudável (nem `Silent`,
+    /// nem `Unknown`, nem `Degraded`).
+    pub saudavel: bool,
+    /// Confiança agregada em [0, 1].
+    pub confianca: f32,
+    /// Segundos desde a observação mais recente desta classe.
+    pub idade_secs: u64,
+}
+
+impl TelemetryHealthReading {
+    /// O que se sabe quando não se sabe nada: `Unknown`.
+    ///
+    /// A §9.1 põe `Unknown` ao lado de `Silent` de propósito — não saber se um
+    /// sensor está vivo não é melhor do que saber que está morto.
+    pub fn desconhecida() -> Self {
+        Self {
+            saudavel: false,
+            confianca: 0.0,
+            idade_secs: u64::MAX,
+        }
+    }
+}
+
+/// A fonte da saúde da telemetria, vista pela política.
+///
+/// É um trait e não uma dependência directa do `heraclitus-telemetry-health`
+/// por duas razões. A política fica testável com uma sonda falsa — e um gate
+/// de segurança que não se consegue testar em todos os estados não é um gate.
+/// E o `heraclitus-sentinel` não passa a depender do crate da view, o que
+/// manteria a fronteira: a política PERGUNTA pela saúde, não a calcula.
+pub trait TelemetryHealthProbe: Send + Sync {
+    fn leitura(&self, datasource_class: &str) -> TelemetryHealthReading;
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -32,6 +115,21 @@ pub struct ActionRule {
     pub max_ttl_secs: Option<u64>,
     pub scope: String,
     pub enabled: bool,
+    /// SPEC-0071 §9.1 — a telemetria que esta acção exige ver saudável.
+    ///
+    /// Vazio por omissão, e isso é a decisão de calibração mais importante
+    /// deste gate. A §9.1 fala da "telemetria REQUERIDA", e quem a requer é o
+    /// playbook (§9.2) — que ainda não existe: não há Content Hub, não há
+    /// Playbook IR activado por assinatura. Um gate que, sem playbook,
+    /// inventasse um requisito recusaria toda a acção automática desde o
+    /// primeiro dia, porque em produção o produtor emite
+    /// `minimum_events_per_window: None` e a Completeness fica `Unknown`.
+    ///
+    /// Então o mecanismo fica completo e inerte até alguém declarar o
+    /// requisito. É a diferença entre um gate desligado e um gate que não
+    /// tem nada para verificar — e a segunda é honesta.
+    #[serde(default)]
+    pub required_telemetry: Vec<RequiredTelemetry>,
 }
 
 impl ActionRule {
@@ -41,6 +139,9 @@ impl ActionRule {
         }
         if self.scope.trim().is_empty() {
             return Err(PolicyError::Invalid("scope vazio".into()));
+        }
+        for requisito in &self.required_telemetry {
+            requisito.validate()?;
         }
         Ok(())
     }
@@ -73,6 +174,8 @@ impl Default for PolicyConfig {
                     max_ttl_secs,
                     scope: scope.into(),
                     enabled: true,
+                    // Vazio: ver a nota em `ActionRule::required_telemetry`.
+                    required_telemetry: Vec::new(),
                 },
             );
         };
@@ -342,12 +445,30 @@ pub trait PolicyEngine: Send + Sync {
     ) -> PolicyDecision;
 }
 
-#[derive(Debug, Clone)]
+/// O `Debug` e escrito a mao: o `Arc<dyn TelemetryHealthProbe>` nao o
+/// implementa, e exigi-lo do trait obrigaria cada sonda a derivar `Debug` sem
+/// ganho nenhum.
+#[derive(Clone)]
 pub struct DeterministicPolicyEngine {
     config: PolicyConfig,
     allowlisted_targets: BTreeSet<String>,
     maintenance_window: bool,
     privileged_exception: bool,
+    /// SPEC-0071 §9.1 — a sonda de saude da telemetria. `None` ate alguem a
+    /// ligar; ver `telemetria_em_falta` para o que isso significa.
+    telemetry: Option<Arc<dyn TelemetryHealthProbe>>,
+}
+
+impl std::fmt::Debug for DeterministicPolicyEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeterministicPolicyEngine")
+            .field("config", &self.config)
+            .field("allowlisted_targets", &self.allowlisted_targets)
+            .field("maintenance_window", &self.maintenance_window)
+            .field("privileged_exception", &self.privileged_exception)
+            .field("telemetry", &self.telemetry.is_some())
+            .finish()
+    }
 }
 
 impl DeterministicPolicyEngine {
@@ -358,12 +479,64 @@ impl DeterministicPolicyEngine {
             allowlisted_targets: BTreeSet::new(),
             maintenance_window: false,
             privileged_exception: false,
+            telemetry: None,
         })
     }
 
     pub fn with_allowlist(mut self, targets: impl IntoIterator<Item = String>) -> Self {
         self.allowlisted_targets = targets.into_iter().collect();
         self
+    }
+
+    /// Liga a sonda de saúde da telemetria (SPEC-0071 §9.1).
+    ///
+    /// Sem sonda, uma regra que DECLARE `required_telemetry` não pode ser
+    /// satisfeita — e é assim que tem de ser. Declarar que uma acção depende de
+    /// telemetria e depois não ter como a verificar não é razão para aprovar;
+    /// é razão para exigir um humano. Ver [`Self::telemetria_em_falta`].
+    pub fn with_telemetry_probe(mut self, probe: Arc<dyn TelemetryHealthProbe>) -> Self {
+        self.telemetry = Some(probe);
+        self
+    }
+
+    /// SPEC-0071 §9.1 — o primeiro requisito de telemetria que não está
+    /// satisfeito, se houver.
+    ///
+    /// `None` significa "nada a impedir": ou a regra não declara requisitos, ou
+    /// declara e todos estão satisfeitos.
+    fn telemetria_em_falta(&self, rule: &ActionRule) -> Option<String> {
+        if rule.required_telemetry.is_empty() {
+            return None;
+        }
+        let Some(probe) = self.telemetry.as_ref() else {
+            return Some(format!(
+                "a política exige telemetria saudável de {} classe(s) e não há \
+                 sonda de saúde ligada para o verificar",
+                rule.required_telemetry.len()
+            ));
+        };
+        for requisito in &rule.required_telemetry {
+            let leitura = probe.leitura(&requisito.datasource_class);
+            if !leitura.saudavel {
+                return Some(format!(
+                    "telemetria '{}' não está saudável (Silent ou Unknown)",
+                    requisito.datasource_class
+                ));
+            }
+            if leitura.confianca < requisito.minimum_trust {
+                return Some(format!(
+                    "confiança da telemetria '{}' é {:.3}, abaixo do mínimo {:.3}",
+                    requisito.datasource_class, leitura.confianca, requisito.minimum_trust
+                ));
+            }
+            if leitura.idade_secs > requisito.maximum_age_secs {
+                return Some(format!(
+                    "telemetria '{}' tem {}s, acima do máximo {}s",
+                    requisito.datasource_class, leitura.idade_secs, requisito.maximum_age_secs
+                ));
+            }
+        }
+        None
     }
 
     pub fn policy_version(&self) -> &str {
@@ -603,6 +776,28 @@ impl PolicyEngine for DeterministicPolicyEngine {
                 reason: "ação de impacto elevado exige aprovação humana".into(),
             };
         }
+        // SPEC-0071 §9.1 — o health gate da telemetria.
+        //
+        // É o ÚLTIMO teste antes da aprovação automática, e tem de ser: uma
+        // acção que já ia ser recusada por risco, evidência ou quórum não
+        // precisa de telemetria saudável para ser recusada. Chegar aqui
+        // significa que tudo o resto passou e que a única coisa entre a
+        // proposta e a execução automática é saber se o que a fundamenta ainda
+        // está a ser observado.
+        //
+        // Recusar ou exigir aprovação? A §9.1 admite as duas. Escolhi exigir
+        // aprovação, e o critério é este: uma falha de telemetria é
+        // exactamente a altura em que pode ser mais preciso agir, e transformar
+        // "não vejo" em "não faço" entrega ao atacante um modo de negar a
+        // resposta a partir do momento em que consegue silenciar um sensor.
+        // Com aprovação humana o caminho continua aberto, mas nunca por
+        // omissão, e fica auditado.
+        if let Some(motivo) = self.telemetria_em_falta(rule) {
+            return PolicyDecision::RequireHumanApproval {
+                approval_id: decision_id("approval-telemetry-v1", incident, proposal, assessment),
+                reason: motivo,
+            };
+        }
         PolicyDecision::Approve {
             authorization_id: decision_id("authorization-v1", incident, proposal, assessment),
             constraints,
@@ -684,14 +879,14 @@ mod tests {
     use crate::correlation::FusionWeights;
     use crate::event::EntityRef;
 
-    fn assessment() -> RiskAssessment {
+    pub(super) fn assessment() -> RiskAssessment {
         crate::EvidenceFusion::new(FusionWeights::default(), "v1")
             .unwrap()
             .fuse(EntityRef::new("User", "alice"), 1.0, 1.0, 1.0, 1.0, vec![])
             .unwrap()
     }
 
-    fn incident() -> SecurityIncident {
+    pub(super) fn incident() -> SecurityIncident {
         SecurityIncident {
             incident_id: "inc-1".into(),
             state: IncidentState::New,
@@ -706,7 +901,7 @@ mod tests {
         }
     }
 
-    fn proposal(action: SecurityAction) -> ActionProposal {
+    pub(super) fn proposal(action: SecurityAction) -> ActionProposal {
         ActionProposal {
             proposal_id: "p1".into(),
             incident_id: "inc-1".into(),
@@ -834,5 +1029,258 @@ mod tests {
         .authorized_action(&p, Some(&approval))
         .unwrap();
         assert_eq!(authorized.incident_id, "inc-1");
+    }
+}
+
+#[cfg(test)]
+mod testes_health_gate_spec0071 {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Sonda controlada: devolve o que o teste mandar, e
+    /// `TelemetryHealthReading::desconhecida()` para o que não conhecer — que é
+    /// exactamente o que a sonda real faz com uma classe sem expectativa
+    /// configurada.
+    struct SondaFalsa(HashMap<String, TelemetryHealthReading>);
+
+    impl SondaFalsa {
+        fn com(pares: &[(&str, TelemetryHealthReading)]) -> Arc<Self> {
+            Arc::new(Self(
+                pares.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+            ))
+        }
+    }
+
+    impl TelemetryHealthProbe for SondaFalsa {
+        fn leitura(&self, datasource_class: &str) -> TelemetryHealthReading {
+            self.0
+                .get(datasource_class)
+                .copied()
+                .unwrap_or_else(TelemetryHealthReading::desconhecida)
+        }
+    }
+
+    fn saudavel(confianca: f32, idade_secs: u64) -> TelemetryHealthReading {
+        TelemetryHealthReading {
+            saudavel: true,
+            confianca,
+            idade_secs,
+        }
+    }
+
+    fn requisito() -> RequiredTelemetry {
+        RequiredTelemetry {
+            datasource_class: "identity".into(),
+            minimum_trust: 0.90,
+            maximum_age_secs: 300,
+        }
+    }
+
+    /// Uma política em que `RequireMfa` exige telemetria de identidade —
+    /// o exemplo literal da §9.1.
+    fn politica_com_requisito() -> PolicyConfig {
+        let mut config = PolicyConfig::default();
+        config
+            .actions
+            .get_mut(&ActionKind::RequireMfa)
+            .expect("RequireMfa está na política default")
+            .required_telemetry = vec![requisito()];
+        config
+    }
+
+    fn cenario() -> (SecurityIncident, RiskAssessment, ActionProposal) {
+        (
+            super::tests::incident(),
+            super::tests::assessment(),
+            super::tests::proposal(SecurityAction::RequireMfa {
+                user_id: "alice".into(),
+            }),
+        )
+    }
+
+    fn decidir(
+        engine: &DeterministicPolicyEngine,
+        cenario: &(SecurityIncident, RiskAssessment, ActionProposal),
+    ) -> PolicyDecision {
+        engine.evaluate(&cenario.0, &cenario.1, &cenario.2)
+    }
+
+    #[test]
+    fn sem_requisito_declarado_o_gate_nao_muda_nada() {
+        // A decisão de calibração: um gate que, sem playbook, inventasse um
+        // requisito recusaria toda a acção automática desde o primeiro dia.
+        let c = cenario();
+        let engine = DeterministicPolicyEngine::new(PolicyConfig::default()).unwrap();
+        let sem_sonda = decidir(&engine, &c);
+        let com_sonda_vazia = decidir(
+            &engine.clone().with_telemetry_probe(SondaFalsa::com(&[])),
+            &c,
+        );
+        assert!(
+            matches!(sem_sonda, PolicyDecision::Approve { .. }),
+            "sem requisito declarado a decisão tem de ser a de sempre: {sem_sonda:?}"
+        );
+        assert_eq!(
+            std::mem::discriminant(&sem_sonda),
+            std::mem::discriminant(&com_sonda_vazia),
+            "ligar uma sonda não pode mudar a decisão quando nada é exigido"
+        );
+    }
+
+    #[test]
+    fn telemetria_saudavel_e_fresca_deixa_aprovar() {
+        let c = cenario();
+        let engine = DeterministicPolicyEngine::new(politica_com_requisito())
+            .unwrap()
+            .with_telemetry_probe(SondaFalsa::com(&[("identity", saudavel(0.95, 60))]));
+        assert!(matches!(
+            decidir(&engine, &c),
+            PolicyDecision::Approve { .. }
+        ));
+    }
+
+    #[test]
+    fn telemetria_silent_ou_unknown_nunca_aprova() {
+        // O gate SO0. `Silent` e `Unknown` estão lado a lado na §9.1 de
+        // propósito: não saber se um sensor está vivo não é melhor do que
+        // saber que está morto.
+        let c = cenario();
+        let silent = TelemetryHealthReading {
+            saudavel: false,
+            confianca: 0.99,
+            idade_secs: 1,
+        };
+        for (nome, sonda) in [
+            ("silent", SondaFalsa::com(&[("identity", silent)])),
+            ("unknown", SondaFalsa::com(&[])),
+        ] {
+            let engine = DeterministicPolicyEngine::new(politica_com_requisito())
+                .unwrap()
+                .with_telemetry_probe(sonda);
+            let decisao = decidir(&engine, &c);
+            assert!(
+                matches!(decisao, PolicyDecision::RequireHumanApproval { .. }),
+                "{nome}: tinha de exigir humano, veio {decisao:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn confianca_abaixo_do_minimo_e_telemetria_velha_nao_aprovam() {
+        let c = cenario();
+        for (nome, leitura) in [
+            ("confiança baixa", saudavel(0.89, 60)),
+            ("velha", saudavel(0.99, 301)),
+        ] {
+            let engine = DeterministicPolicyEngine::new(politica_com_requisito())
+                .unwrap()
+                .with_telemetry_probe(SondaFalsa::com(&[("identity", leitura)]));
+            let decisao = decidir(&engine, &c);
+            assert!(
+                matches!(decisao, PolicyDecision::RequireHumanApproval { .. }),
+                "{nome}: tinha de exigir humano, veio {decisao:?}"
+            );
+        }
+        // As fronteiras exactas aprovam: 0.90 é o mínimo, 300s é o máximo.
+        for leitura in [saudavel(0.90, 60), saudavel(0.99, 300)] {
+            let engine = DeterministicPolicyEngine::new(politica_com_requisito())
+                .unwrap()
+                .with_telemetry_probe(SondaFalsa::com(&[("identity", leitura)]));
+            assert!(matches!(
+                decidir(&engine, &c),
+                PolicyDecision::Approve { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn um_sensor_saudavel_de_outra_classe_nao_satisfaz_o_requisito() {
+        // O teste adversarial: o gate tem de olhar para a classe PEDIDA e não
+        // para "existe telemetria saudável algures".
+        let c = cenario();
+        let engine = DeterministicPolicyEngine::new(politica_com_requisito())
+            .unwrap()
+            .with_telemetry_probe(SondaFalsa::com(&[
+                ("network", saudavel(1.0, 1)),
+                ("endpoint", saudavel(1.0, 1)),
+            ]));
+        let decisao = decidir(&engine, &c);
+        assert!(
+            matches!(decisao, PolicyDecision::RequireHumanApproval { .. }),
+            "um sensor de outra classe não pode satisfazer o requisito: {decisao:?}"
+        );
+    }
+
+    #[test]
+    fn declarar_um_requisito_sem_sonda_ligada_nao_aprova() {
+        // Declarar que uma acção depende de telemetria e depois não ter como a
+        // verificar não é razão para aprovar; é razão para exigir um humano.
+        let c = cenario();
+        let engine = DeterministicPolicyEngine::new(politica_com_requisito()).unwrap();
+        let decisao = decidir(&engine, &c);
+        assert!(
+            matches!(decisao, PolicyDecision::RequireHumanApproval { .. }),
+            "sem sonda, um requisito declarado não pode ser dado por satisfeito: {decisao:?}"
+        );
+    }
+
+    #[test]
+    fn o_gate_nao_transforma_um_deny_em_pedido_de_aprovacao() {
+        // O gate é o ÚLTIMO teste: uma acção que já ia ser recusada por outra
+        // razão continua recusada, e não passa a "pede-se um humano" — que
+        // seria abrir um caminho que a política tinha fechado.
+        let (incident, assessment, proposal) = cenario();
+        let mut config = politica_com_requisito();
+        // Desligada: uma recusa que nao depende de nenhum score.
+        config
+            .actions
+            .get_mut(&ActionKind::RequireMfa)
+            .unwrap()
+            .enabled = false;
+        let engine = DeterministicPolicyEngine::new(config)
+            .unwrap()
+            .with_telemetry_probe(SondaFalsa::com(&[]));
+        let decisao = engine.evaluate(&incident, &assessment, &proposal);
+        assert!(
+            matches!(decisao, PolicyDecision::Deny { .. }),
+            "o gate não pode reabrir o que a política fechou: {decisao:?}"
+        );
+    }
+
+    #[test]
+    fn um_requisito_malformado_e_recusado_na_configuracao() {
+        for mau in [
+            RequiredTelemetry {
+                datasource_class: "  ".into(),
+                minimum_trust: 0.9,
+                maximum_age_secs: 300,
+            },
+            RequiredTelemetry {
+                datasource_class: "identity".into(),
+                minimum_trust: 1.5,
+                maximum_age_secs: 300,
+            },
+            RequiredTelemetry {
+                datasource_class: "identity".into(),
+                minimum_trust: f32::NAN,
+                maximum_age_secs: 300,
+            },
+            RequiredTelemetry {
+                datasource_class: "identity".into(),
+                minimum_trust: 0.9,
+                maximum_age_secs: 0,
+            },
+        ] {
+            let mut config = PolicyConfig::default();
+            config
+                .actions
+                .get_mut(&ActionKind::RequireMfa)
+                .unwrap()
+                .required_telemetry = vec![mau.clone()];
+            assert!(
+                DeterministicPolicyEngine::new(config).is_err(),
+                "{mau:?} tinha de ser recusado"
+            );
+        }
     }
 }
