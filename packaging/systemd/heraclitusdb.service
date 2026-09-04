@@ -15,8 +15,22 @@ NotifyAccess=main
 User=heraclitus
 Group=heraclitus
 
-# O servidor aceita o caminho do arquivo de configuração como primeiro argumento posicional
-ExecStart=/usr/bin/heraclitus-server /etc/heraclitusdb/heraclitus.toml
+# O servidor arranca com as variáveis HERACLITUS_* abaixo e NÃO precisa de um
+# ficheiro de configuração. A unit apontava para
+# /etc/heraclitusdb/heraclitus.toml, que o repositório nunca distribuiu — tal
+# como era enviada, não arrancava. Quem preferir TOML tem uma referência em
+# packaging/heraclitus.toml; instale-a e acrescente o caminho como argumento:
+#   ExecStart=/usr/bin/heraclitus-server /etc/heraclitusdb/heraclitus.toml
+ExecStart=/usr/bin/heraclitus-server
+
+# Sem isto o CWD é `/`, e o default de `data_dir` é RELATIVO (`./data`): o
+# servidor tentava criar `/data`, que com ProtectSystem=full não existe nem é
+# gravável. O `%S` resolve para a base de estado do systemd (/var/lib), e o
+# `StateDirectory` abaixo garante que o directório existe e pertence ao serviço.
+WorkingDirectory=%S/heraclitusdb
+Environment=HERACLITUS_DATA_DIR=%S/heraclitusdb
+Environment=HERACLITUS_COLD_TIER_PATH=%S/heraclitusdb/cold
+Environment=HERACLITUS_LOG_DIR=%L/heraclitusdb
 
 # Sinal padrão de término enviado pelo systemctl stop é SIGTERM
 KillSignal=SIGTERM

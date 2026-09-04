@@ -88,13 +88,26 @@ impl Inner {
         Ok(out)
     }
 
-    fn append_record(&mut self, rec: &LogRecord) -> Result<(), StorageError<NodeId>> {
+    /// Escreve sem sincronizar. O `fsync` fica a cargo de quem fecha o lote.
+    fn write_record(&mut self, rec: &LogRecord) -> Result<(), StorageError<NodeId>> {
         let framed = Self::encode_record(rec)?;
         self.wal
             .write_all(&framed)
-            .and_then(|_| self.wal.sync_all()) // fsync ANTES do ack — durabilidade real
             .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
         Ok(())
+    }
+
+    /// Um `fsync` do WAL. Tem de correr ANTES do ack — é o que torna a
+    /// durabilidade real e não uma promessa.
+    fn sync_wal(&mut self) -> Result<(), StorageError<NodeId>> {
+        self.wal
+            .sync_all()
+            .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))
+    }
+
+    fn append_record(&mut self, rec: &LogRecord) -> Result<(), StorageError<NodeId>> {
+        self.write_record(rec)?;
+        self.sync_wal()
     }
 
     /// R23: reescreve o WAL COMPACTADO (um `Purge(last_purged)` + os Inserts
@@ -341,9 +354,25 @@ impl FileRaftLog {
         I: IntoIterator<Item = Entry<TypeConfig>>,
     {
         let mut inner = self.inner.lock().unwrap();
+        // UM fsync por lote, não um por entrada.
+        //
+        // Antes, cada `append_record` fazia `write_all` + `sync_all`, portanto
+        // um lote de N entradas custava N fsyncs — todos com o mutex do WAL
+        // segurado, o que serializa cada escritor do cluster atrás da latência
+        // do disco multiplicada pelo tamanho do lote.
+        //
+        // A durabilidade é a mesma: o que a garante é o fsync acontecer ANTES
+        // do ack, e o ack só existe depois desta função retornar. Um crash a
+        // meio do lote deixa uma cauda meia-escrita, que é exactamente o que o
+        // `replay` já trata — e nenhuma dessas entradas foi reconhecida.
+        let mut escreveu = false;
         for e in entries {
-            inner.append_record(&LogRecord::Insert(e.clone()))?;
+            inner.write_record(&LogRecord::Insert(e.clone()))?;
             inner.entries.insert(e.log_id.index, e);
+            escreveu = true;
+        }
+        if escreveu {
+            inner.sync_wal()?;
         }
         Ok(())
     }

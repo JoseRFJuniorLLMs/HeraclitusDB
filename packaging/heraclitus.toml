@@ -1,0 +1,57 @@
+# HeraclitusDB — configuração de referência para instalação com systemd.
+#
+# A unit em packaging/systemd/heraclitusdb.service arranca SEM este ficheiro:
+# define as variáveis HERACLITUS_* necessárias e usa os defaults para o resto.
+# Este ficheiro existe para quem prefere TOML a variáveis de ambiente.
+#
+# Para o usar:
+#   install -D -m 0644 packaging/heraclitus.toml /etc/heraclitusdb/heraclitus.toml
+# e acrescente o caminho ao ExecStart da unit:
+#   ExecStart=/usr/bin/heraclitus-server /etc/heraclitusdb/heraclitus.toml
+#
+# As variáveis HERACLITUS_* têm PRIORIDADE sobre o que estiver aqui. Se instalar
+# este ficheiro, remova da unit os `Environment=` que quiser controlar por TOML,
+# senão o ambiente ganha e o ficheiro parece não ter efeito.
+
+# ── Caminhos ─────────────────────────────────────────────────────────────────
+#
+# ABSOLUTOS, e não por estética: o default do produto é `./data`, relativo ao
+# CWD. Sob systemd o CWD é `/` a menos que a unit defina WorkingDirectory, e com
+# ProtectSystem=full a criação de `/data` falha. Um caminho relativo numa
+# instalação de serviço é um arranque que não acontece.
+data_dir = "/var/lib/heraclitusdb"
+cold_tier_path = "/var/lib/heraclitusdb/cold"
+
+# ── Rede ─────────────────────────────────────────────────────────────────────
+#
+# Loopback. A superfície REST inclui ESCRITAS duráveis (/hvm/*, /tier/demote,
+# /sql) e, sem `rest_basic_auth`, o servidor só as aceita em loopback — recusa
+# arrancar se `rest_addr` não for loopback e a auth não estiver definida.
+# Para expor, ponha um proxy TLS à frente ou defina a autenticação abaixo.
+grpc_addr = "127.0.0.1:7474"
+rest_addr = "127.0.0.1:7475"
+
+# ── Segurança ────────────────────────────────────────────────────────────────
+#
+# Descomente para exigir `authorization: Bearer <token>` em TODA chamada gRPC.
+# Sem isto, qualquer cliente que alcance a porta corre como Admin.
+# auth_token = "troque-por-um-segredo-forte"
+#
+# HTTP Basic para a superfície REST. Obrigatório se `rest_addr` não for loopback.
+# rest_basic_auth = "utilizador:senha"
+
+# ── Durabilidade ─────────────────────────────────────────────────────────────
+#
+# `always` faz fsync por append. É o default e é o que se quer numa base que
+# promete durabilidade; as alternativas trocam segurança por débito.
+fsync = "always"
+
+# ── Manutenção em background ─────────────────────────────────────────────────
+#
+# Empacotamento RAW->PACKED e recolha de lixo das gerações físicas. Zero desliga.
+v6_packing_interval_secs = 30
+v6_gc_interval_secs = 300
+
+# Checkpoint periódico das views. Limita a cauda que um arranque pós-crash tem
+# de replayar — sem isto só há checkpoint no arranque e no encerramento limpo.
+checkpoint_interval_secs = 300

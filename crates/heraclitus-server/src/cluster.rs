@@ -24,6 +24,14 @@ use heraclitus_raft::net::spawn_node_tcp_on;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+/// Tecto da fila de submissoes ao consenso e das propostas concorrentes.
+///
+/// Nao ha numero certo aqui, ha um numero EXPLICITO: sem tecto, a fila cresce
+/// ate a memoria acabar e a unica forma de o operador descobrir e o OOM-killer.
+const SUBMIT_QUEUE: usize = 4_096;
+const SUBMIT_INFLIGHT: usize = 256;
+const SUBMIT_TIMEOUT_SECS: u64 = 30;
+
 /// Escrita a submeter: episódio + canal (std) de resposta, para o `append`
 /// síncrono do `Engine` bloquear até o consenso confirmar ou rejeitar.
 type Submit = (
@@ -33,7 +41,7 @@ type Submit = (
 
 /// Handle de replicação instalado no `Engine` via `set_replication`.
 pub struct ReplicationHandle {
-    submit: tokio::sync::mpsc::UnboundedSender<Submit>,
+    submit: tokio::sync::mpsc::Sender<Submit>,
     raft: HeraclitusRaft,
     node_id: NodeId,
 }
@@ -41,13 +49,38 @@ pub struct ReplicationHandle {
 impl ReplRouter for ReplicationHandle {
     fn append(&self, episode: Episode) -> Result<Lsn, HeraclitusError> {
         let (tx, rx) = std::sync::mpsc::channel();
+        // `try_send` e não `send`: o canal passou a ser limitado, e quando
+        // enche a resposta certa é recusar depressa em vez de acumular. Um
+        // canal sem limite não tem backpressure — sob carga, cresce até a
+        // memória acabar, e o cliente nunca é informado de que o sistema não
+        // está a acompanhar.
         self.submit
-            .send((episode, tx))
-            .map_err(|_| HeraclitusError::StorageEngine("replicação encerrada".into()))?;
+            .try_send((episode, tx))
+            .map_err(|erro| match erro {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => HeraclitusError::StorageEngine(
+                    "replicação sobrecarregada: fila de submissão cheia; tente novamente".into(),
+                ),
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    HeraclitusError::StorageEngine("replicação encerrada".into())
+                }
+            })?;
         // Bloqueia (como o fsync do append já bloqueia); o loop assíncrono
         // responde quando o raft comita por quórum ou rejeita.
-        rx.recv()
-            .map_err(|_| HeraclitusError::StorageEngine("replicação sem resposta".into()))?
+        //
+        // Com prazo: sem ele, uma proposta que o raft nunca conclua — perda de
+        // quórum, partição, um líder que morre entre o append e o commit —
+        // deixava esta thread parada para sempre, e com ela o pedido do
+        // cliente e o slot do pool. Falhar ao fim de um tempo é recuperável;
+        // ficar pendurado não é.
+        rx.recv_timeout(std::time::Duration::from_secs(SUBMIT_TIMEOUT_SECS))
+            .map_err(|erro| match erro {
+                std::sync::mpsc::RecvTimeoutError::Timeout => HeraclitusError::StorageEngine(
+                    format!("replicação sem resposta em {SUBMIT_TIMEOUT_SECS}s"),
+                ),
+                std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                    HeraclitusError::StorageEngine("replicação sem resposta".into())
+                }
+            })?
     }
 
     fn status(&self) -> serde_json::Value {
@@ -194,11 +227,26 @@ pub async fn spawn(
     // Loop de submissão: recebe escritas do Engine (síncrono) e fá-las passar pelo
     // raft (assíncrono), respondendo pelo canal std. Uma task por escrita ⇒
     // submissões concorrentes não se serializam entre si.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Submit>();
+    // Canal LIMITADO: o unbounded nao tinha backpressure nenhuma — sob carga
+    // crescia ate a memoria acabar, e o cliente nunca sabia que o sistema nao
+    // estava a acompanhar. Cheio, o `try_send` recusa depressa.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Submit>(SUBMIT_QUEUE);
     let raft_for_loop = node.raft.clone();
+    // Tecto de propostas EM VOO. A fila limitada acima trava quem espera para
+    // entrar; sem isto, tudo o que entrasse virava imediatamente uma task
+    // concorrente, e o limite passava a ser só a memória. Com o semáforo, o
+    // número de propostas simultâneas é uma decisão escrita, e o excesso fica
+    // na fila — onde o `try_send` o pode recusar com uma mensagem honesta.
+    let vagas = Arc::new(tokio::sync::Semaphore::new(SUBMIT_INFLIGHT));
     let submit = tokio::spawn(async move {
         while let Some((ep, reply)) = rx.recv().await {
             let raft = raft_for_loop.clone();
+            let Ok(vaga) = vagas.clone().acquire_owned().await else {
+                let _ = reply.send(Err(HeraclitusError::StorageEngine(
+                    "replicação encerrada".into(),
+                )));
+                break;
+            };
             tokio::spawn(async move {
                 let res = match consensus::submit_episode(&raft, episode_bytes(&ep)).await {
                     Ok(SubmitOutcome::Applied(lsn)) => Ok(lsn),
@@ -208,6 +256,7 @@ pub async fn spawn(
                     Err(e) => Err(HeraclitusError::StorageEngine(format!("consenso: {e}"))),
                 };
                 let _ = reply.send(res);
+                drop(vaga);
             });
         }
     });

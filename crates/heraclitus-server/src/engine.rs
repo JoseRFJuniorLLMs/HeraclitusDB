@@ -540,7 +540,7 @@ impl Engine {
             distill_cursor,
         };
         if privacy_rebuild {
-            engine.attr.write().unwrap().save(&engine.attr_dir)?;
+            engine.attr.read().unwrap().save(&engine.attr_dir)?;
             std::fs::remove_file(&privacy_rebuild_marker)?;
         }
         Ok(engine)
@@ -614,7 +614,7 @@ impl Engine {
     /// Grava o checkpoint do índice de atributos (o servidor pode chamar
     /// periodicamente / no shutdown para o arranque seguinte só replayar a cauda).
     pub fn checkpoint_attr(&self) -> Result<(), HeraclitusError> {
-        self.attr.write().unwrap().save(&self.attr_dir)
+        self.attr.read().unwrap().save(&self.attr_dir)
     }
 
     /// Fast boot: persiste o snapshot de TODAS as views (vector/text/graph/
@@ -792,7 +792,7 @@ impl Engine {
     /// O `state_hash` do índice de grafo — usado em testes de equivalência de
     /// consenso (deve ser idêntico entre nós que replicaram o mesmo log).
     pub fn graph_state_hash(&self) -> [u8; 32] {
-        self.graph.write().unwrap().state_hash()
+        self.graph.read().unwrap().state_hash()
     }
 
     /// Abre o backend do cold tier a partir de `cold_tier_path` — um URL de
@@ -949,7 +949,7 @@ impl Engine {
             return Ok(Vec::new());
         }
         let tomb_lsns: Vec<Lsn> = {
-            let g = self.graph.write().unwrap();
+            let g = self.graph.read().unwrap();
             tombstoned.iter().filter_map(|id| g.lsn_of(id)).collect()
         };
 
@@ -1346,12 +1346,12 @@ impl Engine {
     /// Sai do indice `_agent`, nao de um varrimento: duas leituras por fonte
     /// (o primeiro e o ultimo LSN, que sao as pontas dos postings ordenados).
     pub fn fontes(&self) -> serde_json::Value {
-        let vals = self.attr.write().unwrap().field_values("_agent");
+        let vals = self.attr.read().unwrap().field_values("_agent");
         let mut fontes = Vec::with_capacity(vals.len());
         let (mut global_min, mut global_max) = (u64::MAX, 0u64);
 
         for (agente, eventos) in vals {
-            let span = self.attr.write().unwrap().field_span("_agent", &agente);
+            let span = self.attr.read().unwrap().field_span("_agent", &agente);
             let (mut primeiro_ms, mut ultimo_ms) = (None, None);
             if let Some((a, b)) = span {
                 if let Ok(Some((_, ep))) = self.log.read(a) {
@@ -1399,7 +1399,7 @@ impl Engine {
     /// resultado diz `amostrado: true` — uma distribuicao calculada sobre parte
     /// dos dados nao pode ser apresentada como se fosse sobre todos.
     pub fn fonte_detalhe(&self, agente: &str, amostra_max: usize) -> serde_json::Value {
-        let lsns: Vec<Lsn> = self.attr.write().unwrap().lookup("_agent", agente).to_vec();
+        let lsns: Vec<Lsn> = self.attr.read().unwrap().lookup("_agent", agente).to_vec();
         let total = lsns.len();
         // Amostra pelas pontas: os mais RECENTES importam mais para saber o que
         // a fonte faz agora, mas os primeiros mostram como comecou.
@@ -1466,7 +1466,7 @@ impl Engine {
     /// So nomes de campo e contagens: nunca valores. Listar os valores de um
     /// campo `cpf` seria despejar os CPFs todos.
     pub fn atributos(&self) -> serde_json::Value {
-        let campos = self.attr.write().unwrap().fields();
+        let campos = self.attr.read().unwrap().fields();
         let lista: Vec<_> = campos
             .into_iter()
             .map(|(campo, distintos)| {
@@ -1559,7 +1559,7 @@ impl Engine {
         let ate = ate.min(head);
         let de = de.min(ate);
 
-        let campos = self.attr.write().unwrap().diff(de, ate, topo);
+        let campos = self.attr.read().unwrap().diff(de, ate, topo);
         let ms = |lsn: Lsn| self.ts_ms(lsn);
 
         serde_json::json!({
@@ -1595,7 +1595,7 @@ impl Engine {
     /// nenhuns sobre a pessoa. Nesse caso, `rebuild` resolve.
     pub fn titular(&self, agent_id: &str, limite: usize) -> serde_json::Value {
         let lsns: Vec<Lsn> = {
-            let attr = self.attr.write().unwrap();
+            let attr = self.attr.read().unwrap();
             attr.lookup("_agent", agent_id).to_vec()
         };
         // O índice conhece o campo `_agent`? Se não conhecer, foi construído
@@ -1606,7 +1606,7 @@ impl Engine {
         // Nota: os frames H-VM (`hvm_isa`) são excluídos dos índices por
         // desenho (`index_applied`) — vivem no replay da VM. Um log só com
         // esses frames dá `agentes_indexados: 0` legitimamente.
-        let agentes_indexados = self.attr.write().unwrap().field_entries("_agent");
+        let agentes_indexados = self.attr.read().unwrap().field_entries("_agent");
 
         let mut tipos: std::collections::BTreeMap<String, u64> = Default::default();
         let mut amostra = Vec::new();
@@ -2389,14 +2389,14 @@ impl Engine {
             .map(|(_, e)| e.ts_hlc >> 16)
             .unwrap_or(0);
         let txt_hits: Vec<_> = {
-            let idx = self.text.write().unwrap();
+            let idx = self.text.read().unwrap();
             idx.search(text, heraclitus_retrieval::RECALL_N)
                 .into_iter()
                 .map(|h| (h.id, h.lsn, h.score))
                 .collect()
         };
         let act_hits: Vec<_> = {
-            let act = self.activation.write().unwrap();
+            let act = self.activation.read().unwrap();
             act.top_k(now, heraclitus_retrieval::RECALL_N)
                 .into_iter()
                 .map(|h| (h.id, h.score))
@@ -2476,7 +2476,7 @@ impl QueryBackend for Engine {
 
     /// Snapshot do grafo temporal materializado (a view incremental, sem replay).
     fn graph(&self) -> Result<TemporalGraph, HeraclitusError> {
-        Ok(self.tgraph.write().unwrap().clone())
+        Ok(self.tgraph.read().unwrap().clone())
     }
 
     fn scan_range(&self, from: Lsn, to: Lsn) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
@@ -2521,7 +2521,7 @@ impl QueryBackend for Engine {
         // O índice dá os LSNs exatos; cada `log.read` é O(1) via o índice de
         // offset por-LSN do log (seek directo). Hidratação = nº de matches × O(1).
         let mut lsns: Vec<Lsn> = {
-            let idx = self.attr.write().unwrap();
+            let idx = self.attr.read().unwrap();
             idx.lookup(field, value).to_vec()
         };
         if let Some(bound) = as_of {
@@ -2557,7 +2557,7 @@ impl QueryBackend for Engine {
             Some((v, false)) => Bound::Excluded(v),
         };
         let mut lsns: Vec<Lsn> = {
-            let idx = self.attr.write().unwrap();
+            let idx = self.attr.read().unwrap();
             idx.lookup_range(field, to_bound(min), to_bound(max))
         };
         if let Some(bound) = as_of {
@@ -2628,7 +2628,7 @@ impl QueryBackend for Engine {
         // Audit #10: honor AS OF via LSN post-filter (over-fetch first).
         let fetch = if as_of.is_some() { k * 4 } else { k };
         let in_snapshot = |lsn: Lsn| as_of.map(|b| lsn < b).unwrap_or(true);
-        let hits = self.vector.write().unwrap().search(&dims, fetch, 128, None);
+        let hits = self.vector.read().unwrap().search(&dims, fetch, 128, None);
         let mut out = Vec::new();
         for h in hits.into_iter().filter(|h| in_snapshot(h.lsn)) {
             if let Some((l, e)) = self.log.read(h.lsn)? {
@@ -2706,7 +2706,7 @@ impl QueryBackend for Engine {
     ) -> Result<Vec<NeighborRow>, HeraclitusError> {
         // Real path: read the incrementally-maintained view (no replay). The
         // M8 gate is that this matches `LogBackend`'s from-scratch replay.
-        let g = self.tgraph.write().unwrap();
+        let g = self.tgraph.read().unwrap();
         Ok(neighbors_of(&g, node, etype, as_of, min_confidence))
     }
 
@@ -2717,7 +2717,7 @@ impl QueryBackend for Engine {
         as_of: Option<Lsn>,
         min_confidence: f32,
     ) -> Result<Vec<(String, usize)>, HeraclitusError> {
-        let g = self.tgraph.write().unwrap();
+        let g = self.tgraph.read().unwrap();
         Ok(traverse_of(&g, start, max_depth, as_of, min_confidence))
     }
 
@@ -2728,7 +2728,7 @@ impl QueryBackend for Engine {
         dst: Option<&str>,
         as_of: Option<Lsn>,
     ) -> Result<Vec<EdgeRow>, HeraclitusError> {
-        let g = self.tgraph.write().unwrap();
+        let g = self.tgraph.read().unwrap();
         Ok(match_edges_of(&g, src, etype, dst, as_of))
     }
 
@@ -2740,7 +2740,7 @@ impl QueryBackend for Engine {
         as_of: Option<Lsn>,
     ) -> Result<Option<EdgeHypotheses>, HeraclitusError> {
         Ok(hypotheses_of(
-            &self.tgraph.write().unwrap(),
+            &self.tgraph.read().unwrap(),
             from,
             to,
             etype,
@@ -2753,7 +2753,7 @@ impl QueryBackend for Engine {
         node: &str,
         as_of: Option<Lsn>,
     ) -> Result<Option<CommunityResult>, HeraclitusError> {
-        Ok(community_of(&self.tgraph.write().unwrap(), node, as_of))
+        Ok(community_of(&self.tgraph.read().unwrap(), node, as_of))
     }
 
     fn community_leiden(
@@ -2762,7 +2762,7 @@ impl QueryBackend for Engine {
         as_of: Option<Lsn>,
     ) -> Result<Option<CommunityResult>, HeraclitusError> {
         Ok(heraclitus_query::backend::community_leiden_of(
-            &self.tgraph.write().unwrap(),
+            &self.tgraph.read().unwrap(),
             node,
             as_of,
         ))
@@ -2773,7 +2773,7 @@ impl QueryBackend for Engine {
         node: &str,
         as_of: Option<Lsn>,
     ) -> Result<Option<MetricsResult>, HeraclitusError> {
-        Ok(node_metrics_of(&self.tgraph.write().unwrap(), node, as_of))
+        Ok(node_metrics_of(&self.tgraph.read().unwrap(), node, as_of))
     }
 
     fn resolve_entity(
