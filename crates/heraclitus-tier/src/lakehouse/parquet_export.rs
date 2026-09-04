@@ -41,7 +41,7 @@ use heraclitus_core::{Episode, HeraclitusError, Lsn};
 use heraclitus_log::v6::canonical::CANONICAL_CODEC_V1;
 use heraclitus_log::v6::error::HARD_MAX_BLOCK_BYTES;
 use heraclitus_log::v6::{
-    open_packed, physical_digest, BlockSource, PackedSegmentReader, ScanCounters,
+    open_packed, physical_digest_of_file, BlockSource, PackedSegmentReader, ScanCounters,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
@@ -145,8 +145,18 @@ pub fn source_from_path(
     packed: &Path,
     generation: u32,
 ) -> Result<ExportSource<heraclitus_log::v6::FileSource>, HeraclitusError> {
-    let bytes = std::fs::read(packed)?;
-    let digest = physical_digest(&bytes);
+    // SPEC-0073 §17.1 — o digest é calculado em streaming, não sobre uma cópia
+    // integral do segmento em RAM.
+    //
+    // `std::fs::read` trazia o ficheiro inteiro para memória só para o passar
+    // ao hasher e o deitar fora a seguir: um pico de RAM do tamanho do
+    // segmento, por exportação, sem ninguém precisar dos bytes.
+    //
+    // O digest é BYTE A BYTE o mesmo — `physical_digest_of_file` é o mesmo
+    // BLAKE3 sobre o mesmo ficheiro, só que em blocos de 1 MiB. Tinha de ser:
+    // este valor já está publicado em `DerivedArtifactRef`, e mudá-lo
+    // invalidaria a idempotência da SPEC-0050 §209.
+    let digest = physical_digest_of_file(packed)?;
     Ok(ExportSource::new(
         open_packed(packed, HARD_MAX_BLOCK_BYTES)?,
         generation,
