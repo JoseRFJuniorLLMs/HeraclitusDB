@@ -89,6 +89,16 @@ pub struct V6Log {
     packing_lock: Mutex<()>,
     /// Serializa a reconstrução/publicação de sidecars derivados.
     sidecar_lock: Mutex<()>,
+    /// `block_count` por geração PACKED, lido do rodapé UMA vez.
+    ///
+    /// O `/metrics` é chamado por um scraper de quinze em quinze segundos, para
+    /// sempre, e cada chamada abria o rodapé de TODAS as gerações empacotadas
+    /// do manifesto só para somar os blocos. Uma geração publicada é imutável
+    /// — o caminho identifica-a e o valor nunca muda — portanto ler duas vezes
+    /// é ler uma vez a mais. A cache é por caminho e nunca precisa de
+    /// invalidação: uma geração recolhida pelo GC simplesmente deixa de estar
+    /// no manifesto e a sua entrada fica órfã, o que custa bytes e não erros.
+    blocos_por_geracao: Mutex<std::collections::HashMap<PathBuf, u64>>,
     hlc: Arc<Hlc>,
     fsync: FsyncPolicy,
     segment_max_bytes: u64,
@@ -431,6 +441,7 @@ impl V6Log {
             }),
             packing_lock: Mutex::new(()),
             sidecar_lock: Mutex::new(()),
+            blocos_por_geracao: Mutex::new(std::collections::HashMap::new()),
             hlc,
             fsync,
             segment_max_bytes,
@@ -541,8 +552,28 @@ impl V6Log {
                 .filter(|generation| generation.layout == PhysicalLayout::Packed)
             {
                 let path = resolve_location(&self.root, &active.location)?;
-                if let Ok(Some(footer)) = read_footer(&path) {
-                    blocks_total = blocks_total.saturating_add(footer.block_count as u64);
+                let ja_lido = self
+                    .blocos_por_geracao
+                    .lock()
+                    .unwrap_or_else(|erro| erro.into_inner())
+                    .get(&path)
+                    .copied();
+                let blocos = match ja_lido {
+                    Some(n) => Some(n),
+                    None => match read_footer(&path) {
+                        Ok(Some(footer)) => {
+                            let n = footer.block_count as u64;
+                            self.blocos_por_geracao
+                                .lock()
+                                .unwrap_or_else(|erro| erro.into_inner())
+                                .insert(path, n);
+                            Some(n)
+                        }
+                        _ => None,
+                    },
+                };
+                if let Some(n) = blocos {
+                    blocks_total = blocks_total.saturating_add(n);
                 }
             }
         }

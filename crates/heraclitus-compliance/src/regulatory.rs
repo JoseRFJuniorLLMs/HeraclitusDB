@@ -471,12 +471,39 @@ impl RegulatoryState {
     ) -> Result<Self, RegulatoryError> {
         let end = log.head().min(as_of_lsn.saturating_add(1));
         let mut state = Self::default();
+        state.apply_range(log, 0, end)?;
+        state.finalizar();
+        Ok(state)
+    }
+
+    /// Ordenações finais. Os registos entram já por ordem de LSN, portanto isto
+    /// é um no-op barato — fica por contrato, não por necessidade.
+    fn finalizar(&mut self) {
+        self.policy_activations.sort_by_key(|record| record.lsn);
+        self.decisions.sort_by_key(|record| record.lsn);
+    }
+
+    /// Dobra `[desde, ate)` sobre o estado. **Só avança**: não há forma de
+    /// desaplicar um episódio, portanto quem precisa de um instante anterior
+    /// ao que já foi dobrado faz `replay` do zero.
+    ///
+    /// É isto que torna o estado cacheável: como o log é append-only, um
+    /// estado válido "até L" mais a dobra de `[L, head)` é, por construção, o
+    /// estado em `head`. Não há invalidação — só extensão para a frente.
+    pub fn apply_range<L: EpisodeLog + ?Sized>(
+        &mut self,
+        log: &L,
+        desde: Lsn,
+        ate: Lsn,
+    ) -> Result<(), RegulatoryError> {
+        let state = self;
         // Janelado: o `scan(0, end)` anterior materializava o log inteiro em
         // RAM antes de olhar para a primeira linha, e este replay corre no
         // arranque do servidor E em cada chamada dos RPCs de compliance.
-        crate::varrimento::por_episodio(
+        crate::varrimento::por_episodio_desde(
             log,
-            end,
+            desde,
+            ate,
             |error| RegulatoryError::Storage(error.to_string()),
             |lsn, episode| {
                 if episode
@@ -559,10 +586,7 @@ impl RegulatoryState {
                 }
                 Ok(())
             },
-        )?;
-        state.policy_activations.sort_by_key(|record| record.lsn);
-        state.decisions.sort_by_key(|record| record.lsn);
-        Ok(state)
+        )
     }
 
     pub fn active_policy(
@@ -590,15 +614,71 @@ impl RegulatoryState {
 #[derive(Clone)]
 pub struct RegulatoryPolicyEngine {
     log: Arc<AnyLog>,
+    cache: Option<Arc<RegulatoryStateCache>>,
+}
+
+/// Estado regulatório já dobrado até um LSN, partilhado entre chamadas.
+///
+/// O `RegulatoryPolicyEngine` é construído de novo em cada RPC e em cada
+/// passagem do GC, portanto uma cache dentro dele morreria com ele. Esta vive
+/// em quem sobrevive — o `Engine` do servidor — e é passada por `with_cache`.
+/// Sem ela, cada `state()` era um replay do log inteiro: nove escritas de
+/// compliance faziam-no ANTES de appendar (read-modify-write), o crypto-shred
+/// fazia-o para se autorizar, e o GC fazia-o antes de cada colheita.
+///
+/// Guarda `(aplicado_ate_exclusivo, estado)`. Só avança.
+#[derive(Default)]
+pub struct RegulatoryStateCache {
+    inner: std::sync::Mutex<Option<(Lsn, RegulatoryState)>>,
 }
 
 impl RegulatoryPolicyEngine {
     pub fn new(log: Arc<AnyLog>) -> Self {
-        Self { log }
+        Self { log, cache: None }
+    }
+
+    /// Liga esta instância a uma cache partilhada. Ver [`RegulatoryStateCache`].
+    pub fn with_cache(mut self, cache: Arc<RegulatoryStateCache>) -> Self {
+        self.cache = Some(cache);
+        self
     }
 
     pub fn state_as_of(&self, as_of_lsn: Lsn) -> Result<RegulatoryState, RegulatoryError> {
-        RegulatoryState::replay(self.log.as_ref(), as_of_lsn)
+        let log = self.log.as_ref();
+        let end = log.head().min(as_of_lsn.saturating_add(1));
+        let Some(cache) = &self.cache else {
+            return RegulatoryState::replay(log, as_of_lsn);
+        };
+        let mut guard = cache
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match guard.as_mut() {
+            // Caminho quente: só a cauda desde a última dobra. Num sistema em
+            // regime, isto são as poucas linhas escritas desde o pedido
+            // anterior — não o log inteiro.
+            Some((ate, estado)) if *ate <= end => {
+                estado.apply_range(log, *ate, end)?;
+                *ate = end;
+                let mut resposta = estado.clone();
+                resposta.finalizar();
+                Ok(resposta)
+            }
+            // Consulta HISTÓRICA, abaixo da marca de água: não há como
+            // desaplicar, faz-se do zero e a cache NÃO recua. Ou cache vazia.
+            _ => {
+                let fresco = RegulatoryState::replay(log, as_of_lsn)?;
+                let pode_semear = guard.as_ref().is_none_or(|(ate, _)| end >= *ate);
+                if pode_semear {
+                    let mut semente = fresco.clone();
+                    // O clone é semeado por ordem de LSN; `finalizar` corre no
+                    // clone devolvido, e a semente fica pronta a estender.
+                    semente.finalizar();
+                    *guard = Some((end, semente));
+                }
+                Ok(fresco)
+            }
+        }
     }
 
     pub fn state(&self) -> Result<RegulatoryState, RegulatoryError> {
@@ -776,6 +856,89 @@ mod tests {
             }],
         )
         .unwrap()
+    }
+
+    /// A cache partilhada tem de devolver EXACTAMENTE o que o replay completo
+    /// devolve — em cada instante, e a partir de motores diferentes.
+    ///
+    /// O que se prova, por ordem: semear a cache; estendê-la só com ruído
+    /// (episódios que não são de compliance) sem a corromper; estendê-la com
+    /// uma activação nova vinda de OUTRO motor, como acontece em cada RPC; uma
+    /// consulta histórica abaixo da marca de água, que tem de cair para o
+    /// replay completo e não pode ver o futuro; e que essa consulta não fez a
+    /// cache recuar.
+    #[test]
+    fn a_cache_partilhada_e_indistinguivel_do_replay_completo() {
+        let (_temp, log) = open_v6();
+        let cache = Arc::new(RegulatoryStateCache::default());
+        let motor =
+            |log: &Arc<AnyLog>| RegulatoryPolicyEngine::new(log.clone()).with_cache(cache.clone());
+
+        // 1. Semear.
+        let primeira = PolicyActivation {
+            policy: policy(31_536_000),
+            activated_by: "compliance-officer".into(),
+            approval_ref: "approval-2026-001".into(),
+        };
+        let lsn_primeira = motor(&log).activate_policy(primeira).unwrap();
+        let semeado = motor(&log).state().unwrap();
+        assert_eq!(
+            semeado,
+            RegulatoryState::replay(log.as_ref(), log.head().saturating_sub(1)).unwrap()
+        );
+        assert_eq!(semeado.policy_activations.len(), 1);
+
+        // 2. Ruído: a cauda avança sem uma única linha de compliance.
+        for i in 0..25u8 {
+            log.append(Episode::new("app", EventKind::Observation, vec![i]))
+                .unwrap();
+        }
+        let com_ruido = motor(&log).state().unwrap();
+        assert_eq!(
+            com_ruido,
+            RegulatoryState::replay(log.as_ref(), log.head().saturating_sub(1)).unwrap(),
+            "estender pela cauda com ruido divergiu do replay completo"
+        );
+        assert_eq!(
+            com_ruido, semeado,
+            "ruido nao pode mudar o estado regulatorio"
+        );
+
+        // 3. Uma activação nova, escrita por um motor novo — como num RPC.
+        let regras = policy(60).rules.clone();
+        let segunda = PolicyActivation {
+            policy: ConfiguredRegulatoryPolicy::new("gov-br-retention", "2026.2", 200, regras)
+                .unwrap(),
+            activated_by: "compliance-officer".into(),
+            approval_ref: "approval-2026-002".into(),
+        };
+        motor(&log).activate_policy(segunda).unwrap();
+        let com_segunda = motor(&log).state().unwrap();
+        assert_eq!(
+            com_segunda,
+            RegulatoryState::replay(log.as_ref(), log.head().saturating_sub(1)).unwrap(),
+            "estender pela cauda com uma activacao nova divergiu do replay completo"
+        );
+        assert_eq!(com_segunda.policy_activations.len(), 2);
+
+        // 4. Histórico, abaixo da marca de água: replay completo, sem o futuro.
+        let historico = motor(&log).state_as_of(lsn_primeira).unwrap();
+        assert_eq!(
+            historico,
+            RegulatoryState::replay(log.as_ref(), lsn_primeira).unwrap()
+        );
+        assert_eq!(
+            historico.policy_activations.len(),
+            1,
+            "uma consulta historica viu uma activacao do futuro"
+        );
+
+        // 5. E a consulta histórica não fez a cache recuar.
+        let depois = motor(&log).state().unwrap();
+        assert_eq!(
+            depois, com_segunda,
+            "a consulta historica fez a cache recuar"
+        );
     }
 
     fn open_v6() -> (tempfile::TempDir, Arc<AnyLog>) {

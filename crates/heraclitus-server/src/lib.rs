@@ -413,14 +413,19 @@ pub async fn serve_with(
                 &format!("background a cada {}s", config.v6_gc_interval_secs),
             ),
         }
+        // A cache do estado regulatório vive no Engine; as reconciliações
+        // desta tarefa estendem-na pela cauda em vez de replayar o log inteiro.
+        let cache_regulatoria = engine.regulatory_cache.clone();
         Some(tokio::spawn(async move {
             // A reconciliação que corria no arranque passa para aqui: acontece
             // logo, sem esperar pelo primeiro tick, mas em `spawn_blocking` e
             // fora do caminho que a base tem de percorrer para abrir.
             {
                 let inicial = log_regulatorio.clone();
+                let cache = cache_regulatoria.clone();
                 match tokio::task::spawn_blocking(move || {
                     heraclitus_compliance::RegulatoryPolicyEngine::new(inicial)
+                        .with_cache(cache)
                         .reconcile_legal_holds()
                 })
                 .await
@@ -462,8 +467,10 @@ pub async fn serve_with(
                 // aplicar seria trocar prova por espaco em disco.
                 let reconciliado = {
                     let gc_log = log_regulatorio.clone();
+                    let cache = cache_regulatoria.clone();
                     tokio::task::spawn_blocking(move || {
                         heraclitus_compliance::RegulatoryPolicyEngine::new(gc_log)
+                            .with_cache(cache)
                             .reconcile_legal_holds()
                     })
                     .await

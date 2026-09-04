@@ -61,3 +61,7 @@ target-codex*/
 # execucao com caminhos absolutos da maquina: versiona-lo so garante que fica
 # dessincronizado do script que o produz.
 config.carga.toml
+
+# Binarios de release construidos localmente (o WSL escreve-os aqui). Nunca
+# entram no git: um binario de 16 MB fica na historia para sempre.
+/release/

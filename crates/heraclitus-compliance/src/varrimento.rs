@@ -41,6 +41,23 @@ pub(crate) fn por_episodio<L, E, F, M>(
     log: &L,
     ate: Lsn,
     mapear_erro: M,
+    visitar: F,
+) -> Result<(), E>
+where
+    L: EpisodeLog + ?Sized,
+    F: FnMut(Lsn, Episode) -> Result<(), E>,
+    M: Fn(HeraclitusError) -> E,
+{
+    por_episodio_desde(log, 0, ate, mapear_erro, visitar)
+}
+
+/// Como [`por_episodio`], mas a partir de `desde` — é o que permite dobrar só a
+/// **cauda** sobre um estado já calculado, em vez de recomeçar do LSN 0.
+pub(crate) fn por_episodio_desde<L, E, F, M>(
+    log: &L,
+    desde: Lsn,
+    ate: Lsn,
+    mapear_erro: M,
     mut visitar: F,
 ) -> Result<(), E>
 where
@@ -48,7 +65,7 @@ where
     F: FnMut(Lsn, Episode) -> Result<(), E>,
     M: Fn(HeraclitusError) -> E,
 {
-    let mut cursor: Lsn = 0;
+    let mut cursor: Lsn = desde;
     while cursor < ate {
         let janela = log.scan_capped(cursor, ate, JANELA).map_err(&mapear_erro)?;
         // Uma janela vazia antes de `ate` significa que não há mais nada a ler

@@ -196,6 +196,9 @@ pub struct Engine {
     /// semântica nenhuma: duas chaves distintas nunca interagem, portanto
     /// serializá-las juntas nunca foi um requisito, era um acidente.
     idempotency_locks: Vec<Mutex<()>>,
+    /// Estado regulatório dobrado uma vez e estendido pela cauda desde então.
+    /// Vive aqui porque o `RegulatoryPolicyEngine` nasce e morre em cada RPC.
+    pub regulatory_cache: Arc<heraclitus_compliance::RegulatoryStateCache>,
 }
 
 /// Contrato de encaminhamento de escritas pelo consenso. Implementado pelo
@@ -551,6 +554,7 @@ impl Engine {
             replication: std::sync::OnceLock::new(),
             hvm_lock: Mutex::new(()),
             idempotency_locks: (0..IDEMPOTENCY_SHARDS).map(|_| Mutex::new(())).collect(),
+            regulatory_cache: Arc::new(heraclitus_compliance::RegulatoryStateCache::default()),
             cold_range_reads: std::sync::atomic::AtomicU64::new(0),
             cold_bytes_downloaded: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "tier")]

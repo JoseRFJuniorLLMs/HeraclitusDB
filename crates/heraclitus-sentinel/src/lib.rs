@@ -1439,15 +1439,38 @@ impl SentinelRuntime {
     ) -> Result<Vec<SecurityIncident>, SentinelError> {
         let to_exclusive = self.inner.log.head().min(as_of_lsn.saturating_add(1));
         let mut revisions = BTreeMap::new();
-        for (_, episode) in self.inner.log.scan(0, to_exclusive)? {
-            if !episode_is_generated(&episode)
-                || !matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecurityIncident")
-            {
-                continue;
+        // Janelado, e DE PROPÓSITO desde o LSN 0.
+        //
+        // A sugestão era arrancar do último checkpoint em vez de 0, mas isso
+        // mudaria o que este método devolve: o `SentinelCheckpoint` guarda
+        // metadados (watermarks, contadores), NÃO o estado dos incidentes —
+        // um incidente criado antes do checkpoint e nunca revisto depois
+        // desapareceria da resposta. A promessa é "todos os incidentes tal
+        // como estavam no LSN pedido", e mantém-se.
+        //
+        // O que se corrige é a materialização: o `scan(0, to)` anterior
+        // carregava o log inteiro para RAM antes de filtrar uma fracção
+        // minúscula dele, e este método é disparável por um `GET` de leitura.
+        // A memória passa a ser limitada pela janela mais o resultado; o tempo
+        // é o mesmo, porque as linhas a percorrer são as mesmas.
+        const JANELA: usize = 20_000;
+        let mut cursor: Lsn = 0;
+        while cursor < to_exclusive {
+            let lote = self.inner.log.scan_capped(cursor, to_exclusive, JANELA)?;
+            let Some(&(ultimo, _)) = lote.last() else {
+                break;
+            };
+            for (_, episode) in lote {
+                if !episode_is_generated(&episode)
+                    || !matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecurityIncident")
+                {
+                    continue;
+                }
+                if let Ok(incident) = serde_json::from_slice::<SecurityIncident>(&episode.content) {
+                    revisions.insert(incident.incident_id.clone(), incident);
+                }
             }
-            if let Ok(incident) = serde_json::from_slice::<SecurityIncident>(&episode.content) {
-                revisions.insert(incident.incident_id.clone(), incident);
-            }
+            cursor = ultimo.saturating_add(1);
         }
         Ok(revisions.into_values().collect())
     }
