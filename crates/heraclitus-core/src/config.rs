@@ -442,6 +442,16 @@ pub struct HeraclitusConfig {
     pub v6_lakehouse_path: String,
     /// Nome da tabela publicada nos catálogos Iceberg/Delta.
     pub v6_lakehouse_table: String,
+    /// SPEC-0073 §16 — linhas por lote de exportação, e por row group.
+    ///
+    /// Governa duas coisas ao mesmo tempo, de propósito: quantos `Episode`
+    /// ficam em RAM de cada vez durante a exportação, e onde o Parquet corta os
+    /// row groups. Serem o mesmo número é o que mantém a saída determinística —
+    /// o corte depende do índice da linha e de mais nada.
+    ///
+    /// Subir troca memória por menos row groups (ficheiros marginalmente
+    /// menores, leitura selectiva pior). Zero é tratado como 1.
+    pub v6_lakehouse_export_batch_rows: usize,
     /// §3.9 (distill) — intervalo (segundos) da task de consolidação: a cada
     /// tick, os episódios de Observação novos (desde o cursor) são agrupados
     /// na variedade e cada cluster estável vira um `Fact` (`FactDerived`) no
@@ -688,6 +698,8 @@ impl Default for HeraclitusConfig {
             v6_lakehouse_interval_secs: 0,
             v6_lakehouse_path: String::new(),
             v6_lakehouse_table: "episodios".to_string(),
+            // O valor da SPEC-0073 §16.
+            v6_lakehouse_export_batch_rows: 8_192,
             v6_packing_interval_secs: 30,
             v6_gc_interval_secs: 300,
             v6_gc_keep_manifests: 3,

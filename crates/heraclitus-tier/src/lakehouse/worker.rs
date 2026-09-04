@@ -45,7 +45,7 @@ use heraclitus_log::v6::{physical_digest, LakehousePending, V6Log};
 use object_store::ObjectStore;
 
 use super::iceberg::IcebergTable;
-use super::parquet_export::{export_segment, source_from_path};
+use super::parquet_export::{export_segment_com_lote, source_from_path};
 use super::publisher::LakehousePublisher;
 use super::{ExportDecision, ExportedFile};
 use crate::generation::hex;
@@ -73,6 +73,8 @@ pub struct ExportOutcome {
 pub struct LakehouseWorker {
     publisher: LakehousePublisher,
     table_name: String,
+    /// SPEC-0073 §16 — linhas por lote de exportacao e por row group.
+    lote_linhas: usize,
 }
 
 impl LakehouseWorker {
@@ -85,7 +87,17 @@ impl LakehouseWorker {
         Self {
             publisher: LakehousePublisher::new(store, table_name.clone(), iceberg),
             table_name,
+            lote_linhas: crate::lakehouse::parquet_export::EXPORT_BATCH_ROWS,
         }
+    }
+
+    /// SPEC-0073 §16 — define quantas linhas cabem num lote de exportacao.
+    ///
+    /// E o mesmo numero para a memoria e para o corte em row groups: e isso
+    /// que mantem a saida deterministica.
+    pub fn com_lote(mut self, linhas: usize) -> Self {
+        self.lote_linhas = linhas.max(1);
+        self
     }
 
     /// Abre um trabalhador sobre uma localização de object store.
@@ -139,11 +151,12 @@ impl LakehouseWorker {
         // handler `query` no wiring do consenso.
         let packed = pendente.packed.clone();
         let generation = pendente.generation;
+        let lote = self.lote_linhas;
         let (ficheiro, timestamp_ms) =
             tokio::task::spawn_blocking(move || -> Result<(ExportedFile, i64), HeraclitusError> {
                 let fonte = source_from_path(&packed, generation)?;
                 let carimbo = (fonte.max_hlc() >> 16) as i64;
-                Ok((export_segment(&fonte)?, carimbo))
+                Ok((export_segment_com_lote(&fonte, lote)?, carimbo))
             })
             .await
             .map_err(|e| HeraclitusError::StorageEngine(format!("worker lakehouse: {e}")))??;
