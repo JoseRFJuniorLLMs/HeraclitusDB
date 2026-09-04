@@ -140,7 +140,10 @@ print((d.get('status') or {}).get('$1', ''))
 # para provar. Na primeira corrida verde leu 182 episodios para um limite de
 # 200: verde, e sem significado.
 esperar_catchup() {
-  local prazo="${1:-60}" fim=$((SECONDS + prazo)) n h
+  # Duas declaracoes e nao uma: com `set -u`, um `local a=1 b=$((a))` avalia o
+  # `b` antes de o `a` existir.
+  local prazo="${1:-60}" n h
+  local fim=$((SECONDS + prazo))
   while (( SECONDS < fim )); do
     n=$(campo_status next_lsn); h=$(campo_status head_lsn)
     if [[ -n "$n" && -n "$h" && "$n" -ge "$h" ]]; then
