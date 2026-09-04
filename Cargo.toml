@@ -28,6 +28,8 @@ members = [
     "tools/heraclitus-ingestor",
     "tools/heraclitus-qualifier",
     "crates/heraclitus-sentinel",
+    "crates/heraclitus-case",
+    "crates/heraclitus-content",
     "crates/heraclitus-telemetry-health",
     "crates/heraclitus-analytics",
     "crates/heraclitus-platform",
@@ -81,6 +83,8 @@ heraclitus-raft = { path = "crates/heraclitus-raft" }
 heraclitus-server = { path = "crates/heraclitus-server" }
 heraclitus-sentinel = { path = "crates/heraclitus-sentinel" }
 heraclitus-platform = { path = "crates/heraclitus-platform" }
+heraclitus-case = { path = "crates/heraclitus-case" }
+heraclitus-content = { path = "crates/heraclitus-content" }
 heraclitus-telemetry-health = { path = "crates/heraclitus-telemetry-health" }
 # HUME (SPEC-0040.1) — kernel primitivo de execução
 hume-kernel = { path = "crates/hume-kernel" }
@@ -152,3 +156,21 @@ codegen-units = 1
 # visível, um wrap não. Custa alguns por cento; um índice silenciosamente
 # errado custa mais.
 overflow-checks = true
+
+# SPEC-0073 §38 — perfil `native`, para builds LOCAIS.
+#
+# Herda tudo do release e existe só para dar um nome ao build que usa as
+# instruções da máquina em que compila. As flags de `target-cpu` não vivem aqui
+# — vivem em `.cargo/config.toml` ou em `RUSTFLAGS`, porque o Cargo não as
+# aceita num perfil — mas o perfil dá ao artefacto um nome próprio e um
+# directório de saída separado (`target/native/`), que é o que impede um binário
+# `native` de ser confundido com o portátil.
+#
+# A §38 é explícita: "o build `native` não deve ser distribuído como universal".
+# Um binário compilado com AVX-512 numa máquina de build morre com SIGILL num
+# host mais antigo, e morre no arranque, sem mensagem útil.
+#
+#   cargo build --profile native -p heraclitus-server
+#   RUSTFLAGS="-C target-cpu=native" cargo build --profile native -p heraclitus-server
+[profile.native]
+inherits = "release"

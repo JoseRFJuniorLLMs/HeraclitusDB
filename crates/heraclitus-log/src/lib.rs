@@ -18,6 +18,8 @@
 pub mod cpm;
 pub mod format;
 pub mod io_backend; // SPEC-0073 §7: contrato de I/O do log (PortableFileIo default)
+#[cfg(all(target_os = "linux", feature = "linux-io-uring"))]
+pub mod io_uring_backend; // SPEC-0073 §8/§9: backend io_uring experimental
 pub mod mmap;
 pub mod skip_scan; // SPEC-010: segment-level skip-I/O scan wired on zone maps
 pub mod store; // SPEC-0050: fachada explícita e neutra entre HRKL legado/v6
