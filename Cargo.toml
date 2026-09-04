@@ -124,7 +124,7 @@ tracing-appender = "0.2"
 windows-service = "0.7"
 metrics = "0.24"
 ulid = { version = "1", features = ["serde"] }
-toml = "0.8"
+toml = "1.1"
 rand = "0.8"
 proptest = "1"
 criterion = "0.5"
