@@ -190,6 +190,16 @@ pub struct SentinelConfig {
     pub replay_batch_events: usize,
     /// SPEC-0072 §17 — o que fazer quando o cursor diverge do log canónico.
     pub recovery: SentinelRecoveryConfig,
+    /// SPEC-0072 §44 — publica um snapshot ao fim deste número de eventos
+    /// processados. Zero desliga o limiar por eventos.
+    pub snapshot_interval_events: u64,
+    /// SPEC-0072 §44 — e ao fim deste tempo. Zero desliga o limiar por tempo.
+    ///
+    /// Basta um dos dois ser atingido. São limiares diferentes porque medem
+    /// riscos diferentes: o de eventos limita quanto trabalho um crash desfaz,
+    /// o de tempo garante que uma base parada não fica indefinidamente sem
+    /// snapshot só por não ter tráfego.
+    pub snapshot_interval_secs: u64,
 }
 
 impl Default for SentinelConfig {
@@ -209,6 +219,10 @@ impl Default for SentinelConfig {
             // definido por benchmark." Fica o valor da spec até haver medida.
             replay_batch_events: 8_192,
             recovery: SentinelRecoveryConfig::default(),
+            // Os valores da §44. "Valores finais definidos por benchmark" —
+            // ficam os da spec ate haver medida.
+            snapshot_interval_events: 100_000,
+            snapshot_interval_secs: 300,
         }
     }
 }

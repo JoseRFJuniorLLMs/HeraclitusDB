@@ -18,9 +18,9 @@
 //!    em que o sistema de ficheiros mentiu na mesma.
 
 use crate::behavior::BehavioralSnapshot;
-use crate::correlation::{EvidenceFusion, IncidentEngine, TemporalSecurityGraph};
+use crate::correlation::{DetectorChannel, EvidenceFusion, IncidentEngine, TemporalSecurityGraph};
 use crate::error::SentinelError;
-use crate::event::SecurityEvent;
+use crate::event::{EntityRef, EvidenceRef, SecurityEvent};
 use crate::state::startup::RebuildReason;
 use heraclitus_core::Lsn;
 use serde::{Deserialize, Serialize};
@@ -43,18 +43,18 @@ const BINCODE_CFG: bincode::config::Configuration = bincode::config::standard();
 
 /// Estado do acumulador de fusão, na forma que atravessa o disco.
 ///
-/// O `FusionAccumulator` do runtime é privado e guarda um `EntityRef`; esta é
-/// a sua projecção serializável. São tipos separados de propósito: o formato
-/// em disco não deve mudar só porque um campo interno mudou de nome.
+/// O `FusionAccumulator` do runtime é privado a `lib.rs`; esta é a sua
+/// projecção pública. São tipos separados de propósito: o formato em disco não
+/// deve mudar só porque um campo interno do runtime mudou de nome.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FusionAccumulatorState {
-    pub subject_json: String,
+    pub subject: EntityRef,
     pub rule_score: f32,
     pub behavioral_score: f32,
     pub graph_score: f32,
     pub threat_intel_score: f32,
-    pub evidence_json: String,
-    pub detectors_json: String,
+    pub evidence: Vec<EvidenceRef>,
+    pub detectors: BTreeMap<String, DetectorChannel>,
 }
 
 /// O estado derivado do Sentinel, válido até `applied_until_exclusive`.

@@ -72,7 +72,7 @@ pub use execution::{
 pub use governance::{
     FeedbackLabel, GovernanceError, SecurityFeedback, SecurityModelUpdate, SecurityRulesetUpdate,
 };
-pub use metrics::{SecurityLagState, SentinelMetrics, SentinelStatus};
+pub use metrics::{BootReport, SecurityLagState, SentinelMetrics, SentinelStatus};
 pub use normalize::{GenericNormalizer, NormalizedSecurityEvent};
 pub use policy::{
     ActionResult, ActionRule, AuthorizedAction, DeterministicPolicyEngine, ExecutionConstraints,
@@ -83,6 +83,7 @@ pub use sigma::{
     compile_sigma, compile_sigma_file, compile_sigma_path, compile_sigma_rules, parse_sigma,
 };
 pub use state::{
+    snapshot::FusionAccumulatorState,
     reconcile_startup_state, replay, CursorStore, RebuildReason, ReplayReport, SentinelCheckpoint,
     SentinelStateSnapshot, SnapshotLoad, SnapshotStore, StartupReconciliation,
     StateDivergenceReason,
@@ -197,6 +198,12 @@ impl<T: std::hash::Hash + Eq + Clone> JanelaRecente<T> {
     pub(crate) fn len(&self) -> usize {
         self.ordem.len()
     }
+
+    /// As chaves por ordem de insercao — a ordem em que a janela as larga.
+    /// Usado para capturar a janela num snapshot sem lhe mudar a semantica.
+    pub(crate) fn em_ordem(&self) -> impl Iterator<Item = &T> {
+        self.ordem.iter()
+    }
 }
 
 /// Nome antigo, mantido para o sitio que so lida com chaves de texto.
@@ -282,6 +289,14 @@ struct RuntimeInner {
     ai_breaker: Mutex<AiCircuitBreaker>,
     ownership: Option<Arc<dyn LeaderOwnership>>,
     stop: Arc<AtomicBool>,
+    /// SPEC-0072 §6 — `<data_dir>/sentinel/state.snapshot`.
+    snapshot_store: SnapshotStore,
+    /// SPEC-0072 §44 — quantos eventos foram processados desde a ultima
+    /// publicacao. E a cadencia do snapshot; zero logo a seguir a publicar.
+    eventos_desde_snapshot: std::sync::atomic::AtomicU64,
+    /// SPEC-0072 §44 — quando saiu o ultimo snapshot. O `try_lock` sobre isto
+    /// e tambem o rate limiting entre workers.
+    ultimo_snapshot: Mutex<Instant>,
 }
 
 #[derive(Default)]
@@ -398,6 +413,10 @@ impl SentinelRuntime {
         );
         let metrics = Arc::new(SentinelMetrics::default());
         let cursor_store = CursorStore::new(log.dir().join("sentinel").join("cursor.json"));
+        // SPEC-0072 §6 — o snapshot vive ao lado do cursor, no mesmo directorio
+        // derivado. Nenhum dos dois e source of truth (INV-4).
+        let snapshot_store =
+            SnapshotStore::new(log.dir().join("sentinel").join("state.snapshot"));
         let cursor = cursor_store.load(config.pipeline_version)?;
         if cursor.next_lsn > log.head() {
             return Err(SentinelError::Cursor(format!(
@@ -543,6 +562,9 @@ impl SentinelRuntime {
             ),
             ownership,
             stop: stop.clone(),
+            snapshot_store,
+            eventos_desde_snapshot: std::sync::atomic::AtomicU64::new(0),
+            ultimo_snapshot: Mutex::new(Instant::now()),
         });
 
         // Re-evaluate L1 before L2 so events classified by a deterministic
@@ -1581,6 +1603,202 @@ impl SentinelRuntime {
         for handle in workers.drain(..) {
             let _ = handle.join();
         }
+        drop(workers);
+
+        // SPEC-0072 §45 — snapshot no shutdown.
+        //
+        // Depois de os workers terem juntado, e só depois: enquanto uma thread
+        // ainda pudesse mutar um motor, o snapshot capturaria um estado a meio
+        // de um lote e o watermark seria uma mentira.
+        //
+        // Um erro aqui NÃO pode impedir o desligar. O snapshot é derivado
+        // (INV-4): falhar a escrevê-lo custa um arranque frio da próxima vez,
+        // que é exactamente o comportamento que existia antes desta SPEC.
+        // Falhar a desligar custa o SIGKILL do systemd a meio de I/O.
+        if let Err(erro) = self.publicar_snapshot() {
+            tracing::warn!(
+                erro = %erro,
+                "não foi possível publicar o snapshot do Sentinel no shutdown; \
+                 o próximo arranque reconstrói a partir do log"
+            );
+        }
+    }
+
+    /// Captura o estado derivado em memória (SPEC-0072 §5).
+    pub fn capturar_snapshot(&self) -> SentinelStateSnapshot {
+        capturar_snapshot(&self.inner)
+    }
+
+    /// Captura e publica atomicamente (§7). Devolve o watermark publicado.
+    pub fn publicar_snapshot(&self) -> Result<Lsn, SentinelError> {
+        publicar_snapshot(&self.inner)
+    }
+}
+
+/// Captura o estado derivado em memória (SPEC-0072 §5).
+///
+/// **Segura o mutex do cursor durante a captura inteira.** Não é um detalhe de
+/// implementação: `process_until` segura o mesmo mutex do princípio ao fim de
+/// um lote, portanto enquanto este estiver na mão nenhum worker pode estar a
+/// meio de aplicar eventos. Sem isso o snapshot apanharia o grafo já com o
+/// evento N e o histórico L1 ainda sem ele, e o watermark seria uma afirmação
+/// falsa sobre um estado que nunca existiu.
+///
+/// A ordem de aquisição é cursor → motores, a mesma de `process_until`. É o
+/// que impede o abraço mortal.
+///
+/// O `watermark` é o `cursor.next_lsn` — o único número que o Sentinel pode
+/// provar ter aplicado. Usar o head do log seria o `cursor.next_lsn = head`
+/// que a §18 proíbe: inventar progresso que não foi feito.
+fn capturar_snapshot(inner: &RuntimeInner) -> SentinelStateSnapshot {
+    let cursor = inner.cursor.lock().unwrap_or_else(|e| e.into_inner());
+    let watermark = cursor.next_lsn;
+    {
+        let mut snapshot = SentinelStateSnapshot::vazio(inner.config.pipeline_version);
+        snapshot.applied_until_exclusive = watermark;
+        snapshot.canonical_head_at_snapshot = inner.log.head();
+
+        snapshot.rule_history = inner
+            .rule_history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        snapshot.behavior_state = inner
+            .behavior_engine
+            .as_ref()
+            .map(|engine| engine.lock().unwrap_or_else(|e| e.into_inner()).snapshot());
+        snapshot.graph_state = inner
+            .security_graph
+            .as_ref()
+            .map(|graph| graph.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        snapshot.incident_state = inner
+            .incident_engine
+            .as_ref()
+            .map(|engine| engine.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        snapshot.fusion_state = inner
+            .fusion
+            .as_ref()
+            .map(|fusion| fusion.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        snapshot.fusion_accumulators = inner
+            .fusion_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(chave, acc)| {
+                (
+                    chave.clone(),
+                    FusionAccumulatorState {
+                        subject: acc.subject.clone(),
+                        rule_score: acc.rule_score,
+                        behavioral_score: acc.behavioral_score,
+                        graph_score: acc.graph_score,
+                        threat_intel_score: acc.threat_intel_score,
+                        evidence: acc.evidence.clone(),
+                        detectors: acc.detectors.clone(),
+                    },
+                )
+            })
+            .collect();
+        snapshot.signal_ids = inner
+            .signal_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        snapshot.derived_sources = inner
+            .derived_sources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .em_ordem()
+            .copied()
+            .collect();
+        snapshot.incident_revision_ids = inner
+            .incident_revision_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        snapshot.risk_revision_ids = inner
+            .risk_revision_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        snapshot.checkpoint_ids = inner
+            .checkpoint_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        snapshot.last_checkpoint_lsn = *inner
+            .last_checkpoint_lsn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        snapshot.l4_ids = inner
+            .l4_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        drop(cursor);
+        snapshot
+    }
+}
+
+/// Captura e publica atomicamente (§7). Devolve o watermark publicado.
+fn publicar_snapshot(inner: &RuntimeInner) -> Result<Lsn, SentinelError> {
+    let snapshot = capturar_snapshot(inner);
+    let watermark = snapshot.applied_until_exclusive;
+    inner.snapshot_store.publicar(&snapshot)?;
+    inner
+        .eventos_desde_snapshot
+        .store(0, std::sync::atomic::Ordering::Release);
+    *inner
+        .ultimo_snapshot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Instant::now();
+    tracing::info!(
+        watermark,
+        head = snapshot.canonical_head_at_snapshot,
+        "snapshot do Sentinel publicado"
+    );
+    Ok(watermark)
+}
+
+/// SPEC-0072 §44 — publica se algum dos dois limiares foi atingido.
+///
+/// "Não é necessário obedecer aos dois simultaneamente": basta um. São
+/// limiares de riscos diferentes — o de eventos limita quanto trabalho um
+/// crash desfaz, o de tempo garante que uma base com pouco tráfego não fica
+/// indefinidamente sem snapshot.
+///
+/// Com vários workers, só um publica de cada vez: o `try_lock` sobre o relógio
+/// é o rate limiting. Quem não consegue o lock não espera — já há um snapshot
+/// a sair, e o dele seria redundante.
+fn talvez_publicar_snapshot(inner: &RuntimeInner, processados: u64) {
+    let desde = inner
+        .eventos_desde_snapshot
+        .fetch_add(processados, std::sync::atomic::Ordering::AcqRel)
+        + processados;
+
+    let por_eventos = inner.config.snapshot_interval_events > 0
+        && desde >= inner.config.snapshot_interval_events;
+    let por_tempo = inner.config.snapshot_interval_secs > 0 && {
+        let Ok(ultimo) = inner.ultimo_snapshot.try_lock() else {
+            return;
+        };
+        ultimo.elapsed().as_secs() >= inner.config.snapshot_interval_secs
+    };
+    if !por_eventos && !por_tempo {
+        return;
+    }
+    if let Err(erro) = publicar_snapshot(inner) {
+        // Um snapshot que não sai não é uma falha de consistência (§45): custa
+        // um arranque mais lento, não correcção. O que não pode é ser mudo.
+        tracing::warn!(erro = %erro, "falha ao publicar o snapshot periódico do Sentinel");
     }
 }
 
@@ -1835,6 +2053,9 @@ fn process_until(inner: &RuntimeInner) -> Result<(), SentinelError> {
     if rows.is_empty() {
         return Ok(());
     }
+    // Onde este lote começou, para a cadência da §44 saber quanto avançou. O
+    // cursor é a medida certa: conta o que ficou COMMITADO, não o que se leu.
+    let inicio_do_lote = cursor.next_lsn;
 
     // If a crash occurred after appending a derived event but before committing
     // the cursor, the derived row is visible either in this replay window or in
@@ -1997,6 +2218,13 @@ fn process_until(inner: &RuntimeInner) -> Result<(), SentinelError> {
     if cursor.next_lsn < inner.log.head() {
         inner.queue.request_catch_up(cursor.next_lsn);
     }
+    let processados = cursor.next_lsn.saturating_sub(inicio_do_lote);
+
+    // O guard TEM de cair antes da cadência: `capturar_snapshot` volta a
+    // pegar neste mesmo mutex — é assim que garante que nenhum worker está a
+    // meio de um lote — e um `Mutex` não é reentrante.
+    drop(cursor);
+    talvez_publicar_snapshot(inner, processados);
     Ok(())
 }
 
@@ -3754,6 +3982,207 @@ mod poda_l1_tests {
             engine.evaluate(&historico),
             so_a_segunda,
             "podado ao horizonte; o sinal da rajada #2 e exactamente o que ela produz sozinha"
+        );
+    }
+}
+
+#[cfg(test)]
+mod testes_snapshot_spec0072 {
+    use super::*;
+    use heraclitus_core::FsyncPolicy;
+
+    fn evento_bruto(utilizador: &str) -> Episode {
+        Episode::new(
+            "collector",
+            EventKind::Observation,
+            format!(
+                r#"{{"source":"auditd","category":"authentication","activity":"login","outcome":"failure","user":"{utilizador}"}}"#
+            )
+            .into_bytes(),
+        )
+    }
+
+    fn config_de_teste() -> SentinelConfig {
+        SentinelConfig {
+            enabled: true,
+            mode: SentinelMode::Observe,
+            queue_capacity: 16,
+            worker_threads: 1,
+            pipeline_version: 7,
+            catch_up_batch: 32,
+            l3: SentinelL3Config {
+                enabled: true,
+                max_graph_hops: 6,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn esperar_normalizados(runtime: &SentinelRuntime, quantos: u64) {
+        let prazo = Instant::now() + Duration::from_secs(30);
+        while runtime.status().events_normalized_total < quantos && Instant::now() < prazo {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            runtime.status().events_normalized_total,
+            quantos,
+            "o pipeline nao chegou ao fim dentro do prazo"
+        );
+    }
+
+    #[test]
+    fn o_snapshot_de_um_runtime_vivo_atravessa_o_disco_intacto() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let runtime = SentinelRuntime::start(log.clone(), config_de_teste())
+            .unwrap()
+            .unwrap();
+        for utilizador in ["alice", "bob", "carol"] {
+            log.append(evento_bruto(utilizador)).unwrap();
+        }
+        esperar_normalizados(&runtime, 3);
+
+        let capturado = runtime.capturar_snapshot();
+        assert!(
+            capturado.applied_until_exclusive > 0,
+            "o watermark tem de ser o que o cursor prova ter aplicado"
+        );
+        assert!(
+            capturado.graph_state.is_some(),
+            "com L3 ligado o grafo tem de entrar no snapshot"
+        );
+        runtime.publicar_snapshot().unwrap();
+
+        let store = SnapshotStore::new(log.dir().join("sentinel").join("state.snapshot"));
+        match store.carregar(7).unwrap() {
+            SnapshotLoad::Utilizavel(lido) => {
+                assert_eq!(lido.applied_until_exclusive, capturado.applied_until_exclusive);
+                assert_eq!(lido.graph_state, capturado.graph_state);
+                assert_eq!(lido.signal_ids, capturado.signal_ids);
+                assert_eq!(lido.derived_sources, capturado.derived_sources);
+                assert_eq!(lido.l4_ids, capturado.l4_ids);
+            }
+            outro => panic!("o snapshot publicado tinha de voltar utilizável: {outro:?}"),
+        }
+    }
+
+    #[test]
+    fn o_watermark_nunca_ultrapassa_o_que_o_cursor_prova() {
+        // §18 — "recovery nunca pode fazer cursor.next_lsn = head". A captura
+        // é o outro lado da mesma regra: um snapshot com watermark = head
+        // afirmaria estado aplicado sobre eventos que ninguém processou, e o
+        // arranque seguinte saltava-os por acreditar nele.
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let mut config = config_de_teste();
+        // Sem workers a processar, o cursor fica atras do head de propósito.
+        config.enabled = true;
+        let runtime = SentinelRuntime::start(log.clone(), config).unwrap().unwrap();
+        esperar_normalizados(&runtime, 0);
+        runtime.shutdown();
+
+        for utilizador in ["dave", "erin"] {
+            log.append(evento_bruto(utilizador)).unwrap();
+        }
+        let capturado = runtime.capturar_snapshot();
+        assert!(
+            capturado.applied_until_exclusive <= capturado.canonical_head_at_snapshot,
+            "watermark={} head={}",
+            capturado.applied_until_exclusive,
+            capturado.canonical_head_at_snapshot
+        );
+        assert!(
+            capturado.applied_until_exclusive < log.head(),
+            "com o pipeline parado e eventos novos no log, o watermark TEM de \
+             ficar atrás do head — se igualasse, estaria a inventar progresso"
+        );
+    }
+
+    #[test]
+    fn o_shutdown_publica_o_snapshot_final() {
+        // §45 — "em shutdown limpo, SHOULD tentar publicar snapshot final".
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let caminho = log.dir().join("sentinel").join("state.snapshot");
+        {
+            let runtime = SentinelRuntime::start(log.clone(), config_de_teste())
+                .unwrap()
+                .unwrap();
+            log.append(evento_bruto("frank")).unwrap();
+            esperar_normalizados(&runtime, 1);
+            assert!(
+                !caminho.exists(),
+                "nada devia ter publicado ainda: 1 evento está muito abaixo da cadência"
+            );
+            runtime.shutdown();
+        }
+        assert!(
+            caminho.exists(),
+            "o shutdown limpo tem de deixar o snapshot final em {}",
+            caminho.display()
+        );
+        let store = SnapshotStore::new(&caminho);
+        assert!(matches!(
+            store.carregar(7).unwrap(),
+            SnapshotLoad::Utilizavel(_)
+        ));
+    }
+
+    #[test]
+    fn a_cadencia_por_eventos_publica_sozinha() {
+        // §44 — o limiar por eventos. Posto a 1 para o teste não ter de
+        // escrever 100k eventos; o que se fixa é que o limiar dispara sem
+        // ninguém chamar `publicar_snapshot` à mão.
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let mut config = config_de_teste();
+        config.snapshot_interval_events = 1;
+        config.snapshot_interval_secs = 0;
+        let caminho = log.dir().join("sentinel").join("state.snapshot");
+
+        let runtime = SentinelRuntime::start(log.clone(), config).unwrap().unwrap();
+        log.append(evento_bruto("grace")).unwrap();
+        esperar_normalizados(&runtime, 1);
+
+        let prazo = Instant::now() + Duration::from_secs(30);
+        while !caminho.exists() && Instant::now() < prazo {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            caminho.exists(),
+            "com snapshot_interval_events=1 o worker tinha de publicar sozinho"
         );
     }
 }
