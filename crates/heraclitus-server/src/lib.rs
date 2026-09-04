@@ -159,6 +159,24 @@ pub async fn serve_with(
                 Some(Arc::new(runtime))
             }
             Ok(None) => None,
+            // SPEC-0072 §17/§34 — sob `strict` a recusa do Sentinel é FATAL.
+            //
+            // Todo o outro erro do Sentinel é degradação aceitável: o banco
+            // continua a servir sem plano de segurança, com um aviso. Mas
+            // `cursor_policy = "strict"` é uma escolha declarada para
+            // ambientes forenses, e o que ela declara é "nenhuma recuperação
+            // automática pode ocorrer sem um humano". Arrancar na mesma, com a
+            // detecção desligada e um aviso na consola, seria conceder
+            // exactamente o que o operador pediu para não acontecer — e da
+            // maneira mais silenciosa possível, porque o serviço fica verde.
+            Err(error)
+                if config.sentinel.recovery.cursor_policy
+                    == heraclitus_core::CursorPolicy::Strict =>
+            {
+                return Err(HeraclitusError::Config(format!(
+                    "Sentinel recusou arrancar sob cursor_policy=strict: {error}"
+                )));
+            }
             Err(error) => {
                 boot.warn_line(
                     "Heraclitus Sentinel",

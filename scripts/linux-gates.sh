@@ -297,7 +297,6 @@ if arrancar "$D5"; then
   if [[ -f "$SNAP" ]]; then
     # Um byte trocado no fim do corpo: digest invalido.
     printf '\xff' | dd of="$SNAP" bs=1 seek=$(( $(stat -c%s "$SNAP") - 1 )) conv=notrunc status=none
-    HEAD_ANTES=$(ls -l "$D5/data" | wc -l)
     if arrancar "$D5" 60; then
       RESULTADO=$(campo_boot outcome)
       CORRUPTOS=$(campo_boot snapshot_corrupt_total)
