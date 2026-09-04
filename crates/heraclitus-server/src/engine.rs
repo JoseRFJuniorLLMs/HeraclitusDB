@@ -5283,3 +5283,53 @@ mod testes_case_spec0071 {
         );
     }
 }
+
+impl Engine {
+    /// SPEC-0071 §7 — aplica um comando do Content Hub ao log.
+    ///
+    /// Valida contra o estado reconstruído ANTES de apender, pela mesma razão
+    /// dos casos: um log que aceita comandos que a spec proíbe obriga a
+    /// reconstrução a saber ignorá-los, e um log que se ignora a si próprio
+    /// deixa de ser canónico.
+    pub fn content_command(
+        &self,
+        envelope: &heraclitus_content::ContentEnvelope,
+    ) -> Result<Lsn, HeraclitusError> {
+        envelope
+            .validar()
+            .map_err(|e| HeraclitusError::Config(e.to_string()))?;
+        let mut estado = self.content_state(None)?;
+        estado
+            .aplicar(envelope)
+            .map_err(|e| HeraclitusError::Config(e.to_string()))?;
+        let episode = envelope
+            .para_episodio()
+            .map_err(|e| HeraclitusError::Config(e.to_string()))?;
+        self.append(episode)
+    }
+
+    /// O estado do Content Hub, `AS OF LSN`.
+    pub fn content_state(
+        &self,
+        as_of_lsn: Option<Lsn>,
+    ) -> Result<heraclitus_content::ContentState, HeraclitusError> {
+        const JANELA: usize = 20_000;
+        let ate = as_of_lsn.unwrap_or_else(|| self.log.head());
+        let mut envelopes = Vec::new();
+        let mut cursor = 0u64;
+        while cursor < ate {
+            let linhas = self.log.scan_capped(cursor, ate, JANELA)?;
+            if linhas.is_empty() {
+                break;
+            }
+            let ultimo = linhas.last().map(|(lsn, _)| *lsn).unwrap_or(cursor);
+            for (_, episode) in linhas {
+                if let Some(env) = heraclitus_content::do_episodio(&episode) {
+                    envelopes.push(env);
+                }
+            }
+            cursor = ultimo.saturating_add(1);
+        }
+        Ok(heraclitus_content::reconstruir(&envelopes))
+    }
+}

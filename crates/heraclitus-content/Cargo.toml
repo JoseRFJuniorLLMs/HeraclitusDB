@@ -1,0 +1,13 @@
+[package]
+name = "heraclitus-content"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SPEC-0071 Δ5 — Content Hub event-sourced sobre o log canónico (SPEC-0071 Δ4)"
+
+[dependencies]
+heraclitus-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

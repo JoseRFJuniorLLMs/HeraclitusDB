@@ -24,6 +24,7 @@ heraclitus-log = { workspace = true }
 heraclitus-sentinel = { workspace = true }
 heraclitus-platform = { workspace = true }
 heraclitus-case = { workspace = true }
+heraclitus-content = { workspace = true }
 heraclitus-telemetry-health = { workspace = true }
 heraclitus-manifold = { workspace = true }
 heraclitus-memtable = { workspace = true }

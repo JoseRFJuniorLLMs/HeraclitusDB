@@ -103,6 +103,8 @@ pub fn router_with_sentinel(
         // POST acrescenta um comando ao log e o GET reconstroi.
         .route("/cases", get(case_list).post(case_command))
         .route("/cases/:id", get(case_state))
+        // SPEC-0071 §7 — Content Hub.
+        .route("/content", get(content_state).post(content_command))
         .route("/verify", get(verify))
         .route("/verify/:segment", get(verify_segment))
         // Fluxo ao vivo de appends (SSE). O log já emitia cada append
@@ -2445,6 +2447,50 @@ async fn case_list(
             "as_of_lsn": as_of_lsn,
             "count": ids.len(),
             "cases": ids,
+        }))
+        .into_response(),
+        Ok(Err(erro)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": erro.to_string() })),
+        )
+            .into_response(),
+        Err(erro) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": erro.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// SPEC-0071 §7 — Content Hub. POST acrescenta um comando; GET reconstrói.
+async fn content_command(
+    State(engine): State<Arc<Engine>>,
+    Json(envelope): Json<heraclitus_content::ContentEnvelope>,
+) -> Response {
+    match tokio::task::spawn_blocking(move || engine.content_command(&envelope)).await {
+        Ok(Ok(lsn)) => Json(serde_json::json!({ "lsn": lsn })).into_response(),
+        Ok(Err(erro)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": erro.to_string() })),
+        )
+            .into_response(),
+        Err(erro) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": erro.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+async fn content_state(
+    State(engine): State<Arc<Engine>>,
+    Query(query): Query<TelemetryHealthQuery>,
+) -> Response {
+    let as_of_lsn = query.as_of_lsn.unwrap_or_else(|| engine.head());
+    match tokio::task::spawn_blocking(move || engine.content_state(Some(as_of_lsn))).await {
+        Ok(Ok(estado)) => Json(serde_json::json!({
+            "as_of_lsn": as_of_lsn,
+            "content": estado,
         }))
         .into_response(),
         Ok(Err(erro)) => (
