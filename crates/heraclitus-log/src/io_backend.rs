@@ -166,9 +166,7 @@ mod tests {
     /// durabilidade — que é o pior sítio para uma diferença silenciosa.
     #[test]
     fn o_backend_nao_muda_um_byte_face_ao_write_all_directo() {
-        let registos: Vec<Vec<u8>> = (0..64u8)
-            .map(|i| vec![i; 1 + (i as usize % 97)])
-            .collect();
+        let registos: Vec<Vec<u8>> = (0..64u8).map(|i| vec![i; 1 + (i as usize % 97)]).collect();
 
         let (_d1, f1) = ficheiro_temporario();
         let mut io = PortableFileIo::new(f1);

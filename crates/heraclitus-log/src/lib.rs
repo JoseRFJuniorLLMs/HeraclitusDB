@@ -28,13 +28,13 @@ pub mod zone_map; // SPEC-010: per-segment min/max skip-I/O primitive
 
 pub use store::{AnyLog, EpisodeLog, PrunedScanStats};
 
+use crate::io_backend::{LogIoBackend, PortableFileIo};
 use arc_swap::ArcSwap;
 use format::{Decoded, SegmentFooter, SegmentHeader, HEADER_LEN};
 use heraclitus_core::{
     Episode, EventId, EventKind, FsyncPolicy, HeraclitusError, Hlc, Lsn, ProductPoint, SegmentId,
 };
 use heraclitus_crypto::KeyStore;
-use crate::io_backend::{LogIoBackend, PortableFileIo};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
