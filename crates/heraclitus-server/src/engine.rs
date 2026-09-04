@@ -33,6 +33,10 @@ use std::sync::{Arc, Mutex, RwLock};
 /// Reserved technical attributes used to make external delivery exactly-once.
 /// They remain outside the encrypted attribute envelope so retries can still be
 /// identified after a subject has been crypto-shredded.
+/// Shards do lock de idempotência. Chaves distintas nunca precisaram de
+/// esperar umas pelas outras; o lock único fazia-o na mesma.
+const IDEMPOTENCY_SHARDS: usize = 64;
+
 pub const IDEMPOTENCY_KEY_ATTR: &str = "__heraclitus_idempotency_key";
 pub const IDEMPOTENCY_HASH_ATTR: &str = "__heraclitus_idempotency_hash";
 
@@ -176,7 +180,22 @@ pub struct Engine {
     /// Serializa check+append de uma chave externa. O índice de atributos é
     /// persistente/reconstruível pelo log, portanto isto fecha tanto corridas
     /// concorrentes quanto retries depois de crash/restart.
-    idempotency_lock: Mutex<()>,
+    /// Serialização da verificação-e-append idempotente, **por chave**.
+    ///
+    /// Era um único `Mutex<()>` global: cada append idempotente esperava por
+    /// todos os outros, mesmo de chaves sem relação nenhuma — e a secção
+    /// crítica inclui o append durável inteiro, com o round-trip de consenso
+    /// quando há replicação. Um cliente a escrever com a chave `a` ficava atrás
+    /// de outro a escrever com a chave `b`, sem qualquer razão.
+    ///
+    /// A correcção é sharding e não uma reserva em memória, de propósito. A
+    /// reserva (bloquear → reservar → libertar → escrever → confirmar) tira
+    /// mais latência, mas inventa um estado intermédio que pode sobreviver a um
+    /// crash entre reservar e confirmar — um modo de falha novo num caminho que
+    /// existe precisamente para garantir exactly-once. O sharding não muda
+    /// semântica nenhuma: duas chaves distintas nunca interagem, portanto
+    /// serializá-las juntas nunca foi um requisito, era um acidente.
+    idempotency_locks: Vec<Mutex<()>>,
 }
 
 /// Contrato de encaminhamento de escritas pelo consenso. Implementado pelo
@@ -531,7 +550,7 @@ impl Engine {
             audit_queries: config.audit_queries,
             replication: std::sync::OnceLock::new(),
             hvm_lock: Mutex::new(()),
-            idempotency_lock: Mutex::new(()),
+            idempotency_locks: (0..IDEMPOTENCY_SHARDS).map(|_| Mutex::new(())).collect(),
             cold_range_reads: std::sync::atomic::AtomicU64::new(0),
             cold_bytes_downloaded: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "tier")]
@@ -1945,6 +1964,17 @@ impl Engine {
         self.append_idempotent_validated(episode, key)
     }
 
+    /// O shard que serializa esta chave. Chaves diferentes que caiam no mesmo
+    /// shard partilham lock — é contenção residual, não um erro: a correcção
+    /// só precisa que a MESMA chave nunca corra em paralelo consigo própria.
+    fn idempotency_shard(&self, key: &str) -> &Mutex<()> {
+        let digest = blake3::hash(key.as_bytes());
+        let indice = u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap_or_default())
+            as usize
+            % self.idempotency_locks.len();
+        &self.idempotency_locks[indice]
+    }
+
     fn append_idempotent_validated(
         &self,
         mut episode: Episode,
@@ -1993,10 +2023,13 @@ impl Engine {
         .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
         let payload_hash = blake3::hash(&canonical).to_hex().to_string();
 
-        let _guard = self.idempotency_lock.lock().unwrap();
+        let _guard = self.idempotency_shard(key).lock().unwrap();
+        // `.read()` e não `.write()`: `lookup` é `&self`. Tomar o lock de
+        // escrita aqui bloqueava o indexador durante toda a secção crítica —
+        // que inclui o append durável — por causa de uma consulta.
         let previous = self
             .attr
-            .write()
+            .read()
             .unwrap()
             .lookup(IDEMPOTENCY_KEY_ATTR, key)
             .last()
