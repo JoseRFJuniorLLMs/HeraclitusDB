@@ -2014,22 +2014,59 @@ fn normalize_l0(
 }
 
 fn remember_rule_event(inner: &RuntimeInner, source_lsn: Lsn, event: &SecurityEvent) {
-    if inner.rule_engine.is_some() {
-        let mut history = inner
-            .rule_history
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !history.iter().any(|(lsn, existing)| {
-            *lsn == source_lsn && existing.raw_event_id == event.raw_event_id
-        }) {
-            history.push((source_lsn, event.clone()));
-            history.sort_by(|left, right| {
-                left.0
-                    .cmp(&right.0)
-                    .then_with(|| left.1.raw_event_id.cmp(&right.1.raw_event_id))
-            });
-        }
+    let Some(engine) = inner.rule_engine.as_ref() else {
+        return;
+    };
+    let mut history = inner
+        .rule_history
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !history.iter().any(|(lsn, existing)| {
+        *lsn == source_lsn && existing.raw_event_id == event.raw_event_id
+    }) {
+        history.push((source_lsn, event.clone()));
+        history.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.raw_event_id.cmp(&right.1.raw_event_id))
+        });
+        // O histórico deixa de ser ilimitado. O horizonte não é arbitrário:
+        // é a maior janela que o ruleset consulta, mais a tolerância a atraso
+        // configurada — ver `DetectionExpr::max_window_ms`.
+        let horizonte = engine
+            .required_window_ms()
+            .saturating_add(inner.config.l1.max_lateness_ms);
+        podar_historico_l1(&mut history, horizonte, inner.config.l1.history_capacity);
     }
+}
+
+/// Poda o histórico L1 ao horizonte temporal e ao tecto de linhas. Devolve
+/// quantas linhas saíram.
+///
+/// A fronteira é medida a partir do evento **mais recente** em tempo de
+/// evento (`observed_at`), não em LSN: é o tempo de evento que os operadores
+/// temporais comparam. Um evento com `observed_at` mais antigo do que
+/// `mais_recente − horizonte` não pode participar em nenhuma correspondência
+/// de `Count`, `Sequence` ou `DistinctCount` — e os restantes nós são pontuais.
+///
+/// O tecto em linhas é a segunda linha de defesa: um ruleset com janelas de
+/// dias devolveria o histórico ao ilimitado só pelo tempo. Quando dispara,
+/// saem os LSN mais antigos, que é a ordem em que o vector está.
+fn podar_historico_l1(
+    history: &mut Vec<(Lsn, SecurityEvent)>,
+    horizonte_ms: u64,
+    capacidade: usize,
+) -> usize {
+    let antes = history.len();
+    if let Some(mais_recente) = history.iter().map(|(_, e)| e.observed_at).max() {
+        let limite = mais_recente.saturating_sub(horizonte_ms);
+        history.retain(|(_, e)| e.observed_at >= limite);
+    }
+    if capacidade > 0 && history.len() > capacidade {
+        let excesso = history.len() - capacidade;
+        history.drain(0..excesso);
+    }
+    antes - history.len()
 }
 
 /// SPEC-0047 §11/§36 — correlaciona o evento contra o índice de IOC e persiste
@@ -2274,9 +2311,12 @@ fn evaluate_l1(inner: &RuntimeInner) -> Result<HashSet<EventId>, SentinelError> 
     // previous deep clone duplicated every SecurityEvent (including strings
     // and attribute maps) for every invocation and briefly doubled L1 memory.
     //
-    // We intentionally do not discard rows based on observed_at: Sentinel
-    // accepts late/out-of-order event time, so no finite time horizon is safe
-    // until the configuration has an explicit lateness contract.
+    // O histórico já vem podado de `remember_rule_event`: ao horizonte que o
+    // ruleset exige (`RuleEngine::required_window_ms`) mais o
+    // `max_lateness_ms` configurado, e a um tecto de linhas. Este comentário
+    // dizia antes que nenhum horizonte finito era seguro "até haver um
+    // contrato de lateness" — o contrato passou a existir, e o horizonte
+    // revelou-se derivável do próprio ruleset em vez de arbitrário.
     let window = inner
         .rule_history
         .lock()
@@ -3100,6 +3140,7 @@ detection:
             l1: SentinelL1Config {
                 enabled: true,
                 rules_path: Some(rules),
+                ..Default::default()
             },
             l2: SentinelL2Config::default(),
             l3: SentinelL3Config::default(),
@@ -3158,6 +3199,7 @@ detection:
                 l1: SentinelL1Config {
                     enabled: true,
                     rules_path: Some(temp.path().join("failed-login.yml")),
+                    ..Default::default()
                 },
                 l2: SentinelL2Config::default(),
                 l3: SentinelL3Config::default(),
@@ -3608,5 +3650,97 @@ mod testes_janela_de_lsn {
     #[test]
     fn o_tecto_de_producao_e_o_declarado() {
         assert_eq!(TECTO_LSN_DERIVADOS, 262_144);
+    }
+}
+
+#[cfg(test)]
+mod poda_l1_tests {
+    use super::podar_historico_l1;
+    use crate::detection::{DetectionExpr, DetectionRule, Field, RuleEngine, Value};
+    use crate::event::{Outcome, SecurityCategory, SecurityEvent, SecuritySource};
+    use heraclitus_core::EventId;
+
+    fn falha(lsn: u64, observed_at: u64) -> (u64, SecurityEvent) {
+        let mut e = SecurityEvent::unmapped(EventId::new(), SecuritySource::Auditd);
+        e.category = SecurityCategory::Authentication;
+        e.activity = "login".into();
+        e.outcome = Outcome::Failure;
+        e.observed_at = observed_at;
+        (lsn, e)
+    }
+
+    #[test]
+    fn a_fronteira_e_medida_do_evento_mais_recente_em_tempo_de_evento() {
+        let mut h = vec![falha(1, 0), falha(2, 5_000), falha(3, 10_000), falha(4, 20_000)];
+        assert_eq!(podar_historico_l1(&mut h, 10_000, 0), 2);
+        let restantes: Vec<u64> = h.iter().map(|(l, _)| *l).collect();
+        assert_eq!(restantes, vec![3, 4], "20_000 - 10_000 = 10_000 e inclusivo");
+    }
+
+    #[test]
+    fn o_tecto_de_linhas_solta_os_lsn_mais_antigos() {
+        let mut h: Vec<_> = (1..=10).map(|i| falha(i, 1_000 * i)).collect();
+        assert_eq!(podar_historico_l1(&mut h, u64::MAX, 4), 6);
+        let restantes: Vec<u64> = h.iter().map(|(l, _)| *l).collect();
+        assert_eq!(restantes, vec![7, 8, 9, 10]);
+
+        let mut sem_tecto: Vec<_> = (1..=10).map(|i| falha(i, 1_000 * i)).collect();
+        assert_eq!(
+            podar_historico_l1(&mut sem_tecto, u64::MAX, 0),
+            0,
+            "zero desliga o tecto"
+        );
+    }
+
+    /// O `RuleEngine::evaluate` reporta a PRIMEIRA correspondencia de cada
+    /// regra, e o `signal_ids` suprime o que ja foi emitido. Enquanto o
+    /// historico crescia sem tecto, essa primeira correspondencia ficava la
+    /// para sempre: a rajada #1 era emitida uma vez e a rajada #2,
+    /// genuinamente distinta e 48 segundos depois, NUNCA chegava a ser
+    /// emitida. Nao era um throttle — era fome permanente.
+    ///
+    /// A poda ao horizonte derivado do ruleset e o que fecha esse buraco: a
+    /// rajada #1 cai fora da janela, a #2 passa a ser a primeira, e sai.
+    #[test]
+    fn sem_poda_a_segunda_rajada_nunca_e_emitida_e_com_poda_e() {
+        let rule = DetectionRule::new(
+            "failed-logins",
+            "1.0.0",
+            DetectionExpr::Count {
+                predicate: Box::new(DetectionExpr::Eq(
+                    Field::Outcome,
+                    Value::String("failure".into()),
+                )),
+                window_ms: 10_000,
+                threshold: 2,
+            },
+            7,
+        );
+        let engine = RuleEngine::new([rule]).unwrap();
+        let rajada_1 = [falha(1, 1_000), falha(2, 2_000)];
+        let rajada_2 = [falha(3, 50_000), falha(4, 51_000)];
+
+        let so_a_segunda = engine.evaluate(&rajada_2);
+        assert_eq!(so_a_segunda.len(), 1, "a rajada #2 e por si so um sinal");
+
+        let mut historico: Vec<_> = rajada_1.iter().chain(rajada_2.iter()).cloned().collect();
+        let sem_poda = engine.evaluate(&historico);
+        assert_eq!(sem_poda.len(), 1);
+        assert_ne!(
+            sem_poda[0].signal_id, so_a_segunda[0].signal_id,
+            "com historico ilimitado so a rajada #1 e reportada; a #2 fica presa atras dela"
+        );
+
+        podar_historico_l1(&mut historico, engine.required_window_ms(), 0);
+        assert_eq!(
+            historico.len(),
+            2,
+            "o horizonte de 10s deixa passar exactamente a rajada #2"
+        );
+        assert_eq!(
+            engine.evaluate(&historico),
+            so_a_segunda,
+            "podado ao horizonte; o sinal da rajada #2 e exactamente o que ela produz sozinha"
+        );
     }
 }

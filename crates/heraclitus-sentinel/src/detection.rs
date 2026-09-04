@@ -58,6 +58,44 @@ impl DetectionExpr {
         Self::Eq(field, value.into())
     }
 
+    /// A maior janela temporal, em milissegundos, que esta expressão consulta.
+    ///
+    /// É o que torna o histórico L1 **limitável**. O comentário em
+    /// `evaluate_l1` dizia que nenhum horizonte finito era seguro sem um
+    /// "contrato de lateness" — mas o horizonte não é arbitrário, é derivável
+    /// da própria expressão: `Count`, `Sequence` e `DistinctCount` carregam a
+    /// janela explicitamente, e todos os outros nós são **pontuais** — o
+    /// resultado para o evento `i` depende só do evento `i`. Uma regra sem
+    /// operador temporal precisa de janela zero.
+    ///
+    /// Para o histórico inteiro, a fronteira segura é o máximo disto sobre
+    /// todas as regras, mais a tolerância a eventos atrasados que o operador
+    /// configurar. Tudo o que for mais antigo do que isso, medido a partir do
+    /// evento mais recente, **não pode participar em nenhuma correspondência**
+    /// que a regra ainda não tenha visto.
+    pub fn max_window_ms(&self) -> u64 {
+        match self {
+            Self::Eq(_, _) | Self::Ne(_, _) | Self::In(_, _) => 0,
+            Self::And(items) | Self::Or(items) => {
+                items.iter().map(Self::max_window_ms).max().unwrap_or(0)
+            }
+            Self::Not(item) => item.max_window_ms(),
+            Self::Count {
+                predicate,
+                window_ms,
+                ..
+            } => (*window_ms).max(predicate.max_window_ms()),
+            Self::Sequence { steps, within_ms } => (*within_ms).max(
+                steps
+                    .iter()
+                    .map(Self::max_window_ms)
+                    .max()
+                    .unwrap_or(0),
+            ),
+            Self::DistinctCount { window_ms, .. } => *window_ms,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), RuleCompileError> {
         match self {
             Self::Eq(_, _) | Self::Ne(_, _) | Self::In(_, _) => Ok(()),
@@ -814,6 +852,17 @@ impl RuleEngine {
         &self.rules
     }
 
+    /// A janela que o histórico L1 tem de reter para que NENHUMA regra deste
+    /// motor perca uma correspondência: o máximo de
+    /// [`DetectionExpr::max_window_ms`] sobre todas as regras.
+    pub fn required_window_ms(&self) -> u64 {
+        self.rules
+            .iter()
+            .map(|rule| rule.expression.max_window_ms())
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn evaluate(
         &self,
         window: &[(heraclitus_core::Lsn, SecurityEvent)],
@@ -1044,5 +1093,56 @@ mod tests {
         // for the small input and 4,194,304 for the large one.  The new plan
         // performs four logical visits per row; sorting event time is done once.
         assert_eq!(small, 4 * 1_024);
+    }
+}
+
+#[cfg(test)]
+mod horizonte_tests {
+    use super::*;
+
+    fn pontual() -> DetectionExpr {
+        DetectionExpr::Eq(Field::Outcome, Value::String("failure".into()))
+    }
+
+    #[test]
+    fn nos_pontuais_nao_exigem_horizonte() {
+        assert_eq!(pontual().max_window_ms(), 0);
+        assert_eq!(DetectionExpr::Not(Box::new(pontual())).max_window_ms(), 0);
+        assert_eq!(
+            DetectionExpr::And(vec![pontual(), pontual()]).max_window_ms(),
+            0
+        );
+    }
+
+    #[test]
+    fn o_horizonte_e_a_maior_janela_em_qualquer_profundidade() {
+        let count = DetectionExpr::Count {
+            predicate: Box::new(pontual()),
+            window_ms: 10_000,
+            threshold: 2,
+        };
+        let distinct = DetectionExpr::DistinctCount {
+            field: Field::Outcome,
+            window_ms: 60_000,
+            threshold: 3,
+        };
+        let seq = DetectionExpr::Sequence {
+            steps: vec![pontual(), count.clone()],
+            within_ms: 5_000,
+        };
+        assert_eq!(count.max_window_ms(), 10_000);
+        assert_eq!(seq.max_window_ms(), 10_000, "uma janela aninhada num passo conta");
+        let aninhado = DetectionExpr::Or(vec![
+            DetectionExpr::Not(Box::new(distinct.clone())),
+            seq.clone(),
+        ]);
+        assert_eq!(aninhado.max_window_ms(), 60_000);
+
+        let engine = RuleEngine::new([
+            DetectionRule::new("a", "1.0.0", seq, 1),
+            DetectionRule::new("b", "1.0.0", aninhado, 1),
+        ])
+        .unwrap();
+        assert_eq!(engine.required_window_ms(), 60_000);
     }
 }

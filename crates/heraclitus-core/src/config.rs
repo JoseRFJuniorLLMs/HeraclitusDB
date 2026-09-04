@@ -22,11 +22,39 @@ pub enum SentinelMode {
 
 /// Configuration for the deterministic L1 rule plane.  The path is explicit:
 /// no globbing or implicit rules are loaded by the server.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SentinelL1Config {
     pub enabled: bool,
     pub rules_path: Option<PathBuf>,
+    /// O contrato de lateness (SPEC-0072, pré-requisito do snapshot).
+    ///
+    /// O histórico L1 retém, a partir do evento mais recente, a maior janela
+    /// que o ruleset consulta MAIS esta tolerância. Um evento que chegue com
+    /// `observed_at` mais atrasado do que isso não participa em nenhuma
+    /// correlação — é a promessa que torna o histórico limitável, e que antes
+    /// não existia: sem ela o `rule_history` crescia sem tecto e cada evento
+    /// ingerido custava Θ(regras × N).
+    pub max_lateness_ms: u64,
+    /// Tecto duro em linhas, independente do tempo. Zero desliga o tecto.
+    pub history_capacity: usize,
+}
+
+impl Default for SentinelL1Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rules_path: None,
+            // Cinco minutos: a mesma cadência que a SPEC-0072 §44 usa para o
+            // snapshot, e generosa para qualquer fonte de telemetria real. Não
+            // é o default por ser certo para todos — é por ser um número
+            // EXPLÍCITO em vez de nenhum.
+            max_lateness_ms: 300_000,
+            // A mesma escala do `memtable_cap`: o tecto existe para que um
+            // ruleset com janelas de dias não devolva o histórico ao ilimitado.
+            history_capacity: 100_000,
+        }
+    }
 }
 
 /// Configuration for the deterministic L2 behavioral adapter.  Numeric
