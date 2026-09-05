@@ -1764,7 +1764,15 @@ impl BEpsilonTree {
         }
 
         let mut right_keys = old_keys.split_off(mid);
-        let right_slots = old_slots.split_off(mid);
+        // Os slots de um no INTERNO sao derivados: `serialize_slots_and_payload`
+        // itera `keys` e le `slots.get(i)` com omissao, e um pivo que sobe ao
+        // pai entra em `keys`/`children` sem slot. Logo um no interno pode ter
+        // `slots.len() < keys.len()` — a raiz depois do primeiro split, ou um
+        // filho que recebeu pivos — e `split_off(mid)` sobre um Vec curto ou
+        // vazio com `mid > len` e PANICO deterministico assim que a arvore
+        // cresce. Dividir por `min(mid, len)` nunca rebenta e continua alinhado
+        // quando os slots existem.
+        let mut right_slots = old_slots.split_off(mid.min(old_slots.len()));
         let right_vals = if root.is_leaf() {
             old_vals.split_off(mid)
         } else {
@@ -1779,6 +1787,11 @@ impl BEpsilonTree {
         // CORREÇÃO E ENRIJECIMENTO DO SPLIT INTERNAL: O pivot sobe e é removido da chave do filho direito
         if !root.is_leaf() && !right_keys.is_empty() {
             right_keys.remove(0);
+            // O slot do pivo sai com ele — senao `keys` e `slots` do filho
+            // direito ficam desalinhados por um.
+            if !right_slots.is_empty() {
+                right_slots.remove(0);
+            }
         }
 
         let start_idx = if root.is_leaf() { mid } else { mid + 1 };
@@ -2015,7 +2028,15 @@ impl BEpsilonTree {
         }
 
         let mut right_keys = old_keys.split_off(mid);
-        let right_slots = old_slots.split_off(mid);
+        // Os slots de um no INTERNO sao derivados: `serialize_slots_and_payload`
+        // itera `keys` e le `slots.get(i)` com omissao, e um pivo que sobe ao
+        // pai entra em `keys`/`children` sem slot. Logo um no interno pode ter
+        // `slots.len() < keys.len()` — a raiz depois do primeiro split, ou um
+        // filho que recebeu pivos — e `split_off(mid)` sobre um Vec curto ou
+        // vazio com `mid > len` e PANICO deterministico assim que a arvore
+        // cresce. Dividir por `min(mid, len)` nunca rebenta e continua alinhado
+        // quando os slots existem.
+        let mut right_slots = old_slots.split_off(mid.min(old_slots.len()));
         let right_vals = if child.is_leaf() {
             old_vals.split_off(mid)
         } else {
@@ -2030,6 +2051,11 @@ impl BEpsilonTree {
         // CORREÇÃO E ENRIJECIMENTO DO SPLIT DE FILHO INTERNAL: Remove o pivot do filho direito
         if !child.is_leaf() && !right_keys.is_empty() {
             right_keys.remove(0);
+            // O slot do pivo sai com ele — senao `keys` e `slots` do filho
+            // direito ficam desalinhados por um.
+            if !right_slots.is_empty() {
+                right_slots.remove(0);
+            }
         }
 
         let mut left = DiskNode {
@@ -2689,6 +2715,44 @@ mod page_roundtrip_tests {
                 "chave presente após reload do disco"
             );
         }
+    }
+
+    /// O segundo split da raiz entrava em panico: depois do primeiro, a raiz
+    /// interna fica com `slots` vazio (sao derivados) e `split_off(mid)` sobre
+    /// um Vec vazio rebenta. `from_map` (carga em massa) nao o apanhava; so o
+    /// caminho de `upsert`, que faz a arvore crescer split a split. Valores
+    /// grandes baixam o fanout das folhas para a raiz encher e voltar a partir
+    /// com poucos milhares de chaves.
+    #[test]
+    fn a_raiz_parte_duas_vezes_sem_panico_e_a_arvore_fica_integra() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cresce.hbt");
+        let mut t =
+            super::BEpsilonTree::from_map(&path, std::collections::BTreeMap::new()).unwrap();
+        let n = 20_000u32;
+        let val = |i: u32| format!("{i:08}-").repeat(24).into_bytes(); // ~216 B
+        for i in 0..n {
+            t.upsert(format!("k{i:08}").into_bytes(), val(i)).unwrap();
+        }
+        for i in (0..n).step_by(97) {
+            assert_eq!(
+                t.get(&format!("k{i:08}").into_bytes()).as_ref(),
+                Some(&val(i)),
+                "chave {i} legivel depois dos splits"
+            );
+        }
+        // A durabilidade e por `commit()` explicito: sem ele a cache guarda
+        // paginas sujas, o disco esta incompleto, e tanto o `verify` (que le o
+        // disco) como o reload veem um estado parcial.
+        t.commit().unwrap();
+        assert!(t.verify_tree_integrity().unwrap(), "arvore integra");
+        drop(t);
+        let mut t2 = super::BEpsilonTree::load(&path).unwrap();
+        assert_eq!(
+            t2.get(&format!("k{:08}", n - 1).into_bytes()).as_ref(),
+            Some(&val(n - 1))
+        );
+        assert!(t2.verify_tree_integrity().unwrap(), "integra apos reload");
     }
 
     #[test]
