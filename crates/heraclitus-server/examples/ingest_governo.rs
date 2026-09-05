@@ -7,11 +7,11 @@
 //!
 //!   - `agent_id` = a pasta do conjunto (ex.: `202401_Licitacoes`);
 //!   - `kind`     = `Custom(<tipo derivado do nome do ficheiro>)`, que fica
-//!                  indexado sob `_kind` e é o predicado de `MATCH (n:Tipo)`;
+//!     indexado sob `_kind` e é o predicado de `MATCH (n:Tipo)`;
 //!   - `content`  = a linha inteira como objecto JSON `{coluna: valor}`, UTF-8,
-//!                  auto-descritiva;
+//!     auto-descritiva;
 //!   - `attrs`    = só `arquivo` (baixa cardinalidade) — indexar cada coluna
-//!                  encheria o índice de atributos sem discriminar nada.
+//!     encheria o índice de atributos sem discriminar nada.
 //!
 //! Uso:
 //!   cargo run --release -p heraclitus-server --example ingest_governo -- \
@@ -116,7 +116,7 @@ fn main() {
                     }
                 }
             }
-            if total % 100_000 == 0 {
+            if total.is_multiple_of(100_000) {
                 let taxa = total as f64 / inicio.elapsed().as_secs_f64();
                 eprintln!("  … {total} episódios ({taxa:.0}/s)");
             }
