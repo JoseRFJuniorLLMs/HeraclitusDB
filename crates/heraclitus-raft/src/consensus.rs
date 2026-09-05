@@ -247,10 +247,35 @@ impl EpisodeStateMachine {
         let sm_dir = sm_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&sm_dir)
             .map_err(|e| StorageError::from(StorageIOError::read(Self::io_err(e))))?;
-        let meta = Self::load_sm_meta(&sm_dir)?;
+        let (meta, sidecar_existia) = Self::load_sm_meta(&sm_dir)?;
         // Os episódios já em disco além do que o meta registou = aplicados num
         // crash sem meta gravado; o openraft vai re-enviá-los e nós saltamos.
         let head = log.head();
+        // PRIMEIRO ARRANQUE DURÁVEL SOBRE UM LOG NÃO-VAZIO.
+        //
+        // Toda esta máquina de estados assume que POSSUI o log a partir do
+        // LSN 0: `install_snapshot` usa `lsn = índice` e carimba
+        // `normals = head`; o ramo de `skip_normals` no `apply` devolve
+        // `normals - 1` como o LSN do episódio saltado. Se o sidecar está
+        // ausente (primeiro arranque) mas o log já tem episódios, esses
+        // episódios NÃO vieram do raft — são escritas locais, tipicamente de um
+        // arranque anterior em que a replicação não subiu (ver o guarda
+        // equivalente em heraclitus-server, que recusa servir escrita local
+        // quando a replicação está configurada).
+        //
+        // Continuar calcularia `skip_normals = head` e DESCARTARIA em silêncio
+        // os primeiros `head` episódios que o cluster replicasse, com o cliente
+        // a receber "aplicado" sobre LSNs que apontam para dados locais alheios.
+        // Divergência permanente entre réplicas. Recusar arrancar é a única
+        // resposta segura: o operador arranca a replicação sobre um log vazio,
+        // ou faz bootstrap por snapshot.
+        if !sidecar_existia && head > 0 {
+            return Err(StorageError::from(StorageIOError::read(Self::io_err(
+                format!(
+                    "primeiro arranque de replicação sobre um log não-vazio (head={head}):                      estes episódios não foram produzidos pelo raft e seriam descartados.                      Arranque a replicação sobre um log vazio, ou faça bootstrap por snapshot."
+                ),
+            ))));
+        }
         // INVARIANTE DE DURABILIDADE: o meta NUNCA pode estar à frente do log.
         // Sob `FsyncPolicy::GroupCommit` (o DEFAULT) um crash na janela pode
         // deixar `sm_meta` (fsynced) à frente de um episódio ainda não
@@ -282,19 +307,22 @@ impl EpisodeStateMachine {
         })
     }
 
-    fn load_sm_meta(dir: &std::path::Path) -> Result<SmMeta, StorageError<NodeId>> {
+    /// Devolve `(meta, existia)`. O `existia` distingue "primeiro arranque
+    /// durável" (sidecar ausente) de "recuperação de um nó que já foi raft" —
+    /// uma distinção que decide se um log não-vazio é legítimo ou corrupção.
+    fn load_sm_meta(dir: &std::path::Path) -> Result<(SmMeta, bool), StorageError<NodeId>> {
         match std::fs::read(dir.join("sm_meta.bin")) {
             // Escrito atomicamente (tmp+rename) — nunca meio-escrito. Um decode
             // que falhe = corrupção real: FALHAR ALTO em vez de repor um
             // `applied`/membership vazio em silêncio (recuperação incorreta).
             Ok(bytes) => bincode::serde::decode_from_slice(&bytes, BINCODE_CFG)
-                .map(|(m, _)| m)
+                .map(|(m, _)| (m, true))
                 .map_err(|e| {
                     StorageError::from(StorageIOError::read(Self::io_err(format!(
                         "sm_meta.bin corrompido (recusa arrancar): {e}"
                     ))))
                 }),
-            Err(_) => Ok(SmMeta::default()), // primeiro arranque durável
+            Err(_) => Ok((SmMeta::default(), false)), // primeiro arranque durável
         }
     }
 
@@ -1345,6 +1373,63 @@ mod tests {
         );
         assert_eq!(r.data, 5, "LSN denso continua a sequência (0..5)");
         assert_eq!(log.head(), 6, "5 recuperados + 1 novo");
+    }
+
+    /// Um primeiro arranque durável sobre um log que JÁ tem episódios recusa
+    /// arrancar, em vez de descartar em silêncio os episódios que o cluster
+    /// replicasse.
+    ///
+    /// A máquina de estados assume que possui o log a partir do LSN 0
+    /// (`install_snapshot` usa `lsn = índice`, `apply` devolve `normals - 1`).
+    /// Episódios pré-existentes só podem ser escritas locais de um arranque em
+    /// que a replicação não subiu; continuar calcularia `skip_normals = head` e
+    /// saltaria os `head` primeiros episódios replicados, com o cliente a
+    /// receber "aplicado" sobre LSNs de dados locais alheios. Divergência
+    /// permanente. A resposta segura é recusar.
+    #[tokio::test]
+    async fn primeiro_arranque_sobre_log_nao_vazio_recusa() {
+        let root = tempfile::tempdir().unwrap();
+        let log_dir = root.path().join("episodes");
+        let sm_dir = root.path().join("sm");
+
+        // Três escritas LOCAIS diretas, sem replicação nenhuma.
+        let log = Arc::new(
+            AnyLog::open(
+                crate::formato_de_teste(),
+                &log_dir,
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        for i in 0..3 {
+            log.append(ep(i)).unwrap();
+        }
+        assert_eq!(log.head(), 3);
+
+        // Primeiro arranque durável (sidecar ausente) sobre esse log: recusa.
+        let r = EpisodeStateMachine::open_durable(log.clone(), &sm_dir);
+        assert!(
+            r.is_err(),
+            "arrancar replicação sobre 3 episódios locais tem de recusar, não descartá-los"
+        );
+        let msg = format!("{}", r.err().unwrap());
+        assert!(msg.contains("não-vazio") || msg.contains("head=3"), "{msg}");
+
+        // Sanidade: sobre um log VAZIO o mesmo arranque é aceite.
+        drop(log);
+        let vazio_dir = root.path().join("vazio");
+        let sm2 = root.path().join("sm2");
+        let vazio = Arc::new(
+            AnyLog::open(
+                crate::formato_de_teste(),
+                &vazio_dir,
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        assert!(EpisodeStateMachine::open_durable(vazio, &sm2).is_ok());
     }
 
     /// O `on_apply` dispara para cada episódio aplicado no cluster (a base do
