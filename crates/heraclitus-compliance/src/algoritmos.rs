@@ -146,13 +146,42 @@ fn erro(d: String) -> CompError {
 }
 
 /// O que um `AlgorithmIdentifier` de assinatura significa.
+#[derive(Debug, PartialEq, Eq)]
 enum Esquema {
     Ecdsa(Digest),
     RsaPkcs1(Digest),
     RsaPss(Digest),
 }
 
-fn interpretar(alg: &AlgorithmIdentifierOwned) -> Result<Esquema, CompError> {
+/// Traduz o `AlgorithmIdentifier` da assinatura no esquema a verificar.
+///
+/// `digest_externo` e o digest declarado FORA do OID da assinatura. Existe por
+/// causa do CMS: a RFC 3370 §3.2 diz que, para RSA PKCS#1 v1.5, o
+/// `SignerInfo.signatureAlgorithm` e `rsaEncryption` — um OID que NAO carrega
+/// digest nenhum — e que o digest e o do `SignerInfo.digestAlgorithm`. E o que
+/// o OpenSSL emite (`openssl ts -reply`).
+///
+/// Sem isto, `rsaEncryption` caia no ramo de recusa e um carimbo perfeitamente
+/// valido de uma ACT que assine com OpenSSL era rejeitado como "algoritmo nao
+/// suportado".
+///
+/// A tolerancia e ESTREITA de proposito: so se aplica quando ha um digest
+/// externo para usar, e quem verifica certificados X.509 passa `None` — ali o
+/// OID combinado e obrigatorio e `rsaEncryption` continua a ser recusado.
+fn interpretar(
+    alg: &AlgorithmIdentifierOwned,
+    digest_externo: Option<Digest>,
+) -> Result<Esquema, CompError> {
+    if alg.oid == OID_RSA_ENCRYPTION {
+        return match digest_externo {
+            Some(d) => Ok(Esquema::RsaPkcs1(d)),
+            None => Err(erro(
+                "assinatura com rsaEncryption sem digest declarado: este OID nao carrega digest \
+                 e nao ha digestAlgorithm para o suprir"
+                    .into(),
+            )),
+        };
+    }
     match alg.oid {
         OID_ECDSA_SHA256 => Ok(Esquema::Ecdsa(Digest::Sha256)),
         OID_ECDSA_SHA384 => Ok(Esquema::Ecdsa(Digest::Sha384)),
@@ -220,8 +249,20 @@ pub fn verificar(
     assinatura: &[u8],
     politica: &PoliticaAlgoritmos,
 ) -> Result<(), CompError> {
+    verificar_com_digest(cert, alg, None, mensagem, assinatura, politica)
+}
+
+/// O mesmo, sabendo o digest que o CMS declara a parte (ver [`interpretar`]).
+pub fn verificar_com_digest(
+    cert: &Certificate,
+    alg: &AlgorithmIdentifierOwned,
+    digest_externo: Option<Digest>,
+    mensagem: &[u8],
+    assinatura: &[u8],
+    politica: &PoliticaAlgoritmos,
+) -> Result<(), CompError> {
     let spki = &cert.tbs_certificate.subject_public_key_info;
-    match interpretar(alg)? {
+    match interpretar(alg, digest_externo)? {
         Esquema::Ecdsa(d) => {
             if spki.algorithm.oid != OID_EC_PUBLIC_KEY {
                 return Err(erro("assinatura ECDSA com uma chave que não é EC".into()));
@@ -286,7 +327,7 @@ pub fn verificar(
                 )));
             }
             let resumo = d.digerir(mensagem);
-            let resultado = match interpretar(alg)? {
+            let resultado = match interpretar(alg, digest_externo)? {
                 Esquema::RsaPss(_) => {
                     let esquema = match d {
                         Digest::Sha256 => rsa::pss::Pss::new::<sha2::Sha256>(),
@@ -336,4 +377,54 @@ pub fn coerencia_de_algoritmo(cert: &Certificate) -> Result<(), CompError> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod testes_interpretar {
+    use super::*;
+
+    fn alg(oid: ObjectIdentifier) -> AlgorithmIdentifierOwned {
+        AlgorithmIdentifierOwned {
+            oid,
+            parameters: None,
+        }
+    }
+
+    /// O cerne da correccao: no CMS (RFC 3370 §3.2) o `signatureAlgorithm` de
+    /// RSA PKCS#1 v1.5 e `rsaEncryption` — um OID que NAO carrega digest — e o
+    /// digest vem do `digestAlgorithm` a parte. E o que o OpenSSL emite.
+    #[test]
+    fn rsa_encryption_usa_o_digest_externo() {
+        assert_eq!(
+            interpretar(&alg(OID_RSA_ENCRYPTION), Some(Digest::Sha256)).unwrap(),
+            Esquema::RsaPkcs1(Digest::Sha256)
+        );
+        assert_eq!(
+            interpretar(&alg(OID_RSA_ENCRYPTION), Some(Digest::Sha512)).unwrap(),
+            Esquema::RsaPkcs1(Digest::Sha512)
+        );
+    }
+
+    /// Sem digest a parte, `rsaEncryption` nao diz o suficiente: recusa-se, em
+    /// vez de adivinhar SHA-256 (que verificaria com o digest errado e falharia
+    /// como se a assinatura fosse invalida).
+    #[test]
+    fn rsa_encryption_sem_digest_recusa() {
+        assert!(interpretar(&alg(OID_RSA_ENCRYPTION), None).is_err());
+    }
+
+    /// Um OID COMBINADO continua a valer por si — e ignora o digest externo,
+    /// porque ja o carrega. Isto garante que a tolerancia nao afrouxou a
+    /// verificacao de certificados X.509, que passam `None`.
+    #[test]
+    fn oid_combinado_ignora_o_externo_e_vale_sem_ele() {
+        assert_eq!(
+            interpretar(&alg(OID_SHA256_RSA), None).unwrap(),
+            Esquema::RsaPkcs1(Digest::Sha256)
+        );
+        assert_eq!(
+            interpretar(&alg(OID_SHA256_RSA), Some(Digest::Sha512)).unwrap(),
+            Esquema::RsaPkcs1(Digest::Sha256)
+        );
+    }
 }
