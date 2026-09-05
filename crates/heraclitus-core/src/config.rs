@@ -463,6 +463,17 @@ pub struct HeraclitusConfig {
     pub auth_token: Option<String>,
     /// Credenciais multi-principal com RBAC. Podem vir do TOML ou de um JSON
     /// indicado por `HERACLITUS_CREDENTIALS_FILE`.
+    ///
+    /// Valem nas DUAS superfícies: no gRPC como `Authorization: Bearer
+    /// <token>`, no REST como `Authorization: Basic <principal>:<token>` — o
+    /// nome do utilizador tem de ser o do principal a que o token pertence.
+    ///
+    /// **Definir isto muda a postura do REST.** Enquanto está vazio, o REST
+    /// comporta-se como sempre (aberto, ou a credencial única de
+    /// [`Self::rest_basic_auth`]); assim que tem entradas, o REST passa a
+    /// exigir credencial e a aplicar os mesmos papéis que o gRPC. Era essa a
+    /// combinação incoerente que existia antes: papéis declarados, gRPC a
+    /// aplicá-los, e a outra superfície do mesmo processo a ignorá-los.
     pub access_credentials: Vec<AccessCredential>,
     /// Certificado/chain PEM e chave privada PEM do servidor gRPC.
     pub tls_cert_path: Option<PathBuf>,
@@ -475,6 +486,13 @@ pub struct HeraclitusConfig {
     /// call (`/state`, `/verify`, ...). `None` = no auth (default — localhost
     /// bind). Prefer `HERACLITUS_REST_AUTH_FILE`; the legacy inline
     /// `HERACLITUS_REST_AUTH` remains available outside production.
+    ///
+    /// É uma credencial ÚNICA e partilhada: autentica, mas não distingue
+    /// pessoas nem papéis — quem a conhece vale **Admin**. Mantém-se assim por
+    /// compatibilidade. Para autorização a sério use
+    /// [`Self::access_credentials`], que atribui papéis por principal e é
+    /// aceite nas duas superfícies. As duas podem coexistir: esta é tentada
+    /// primeiro, e continua a valer Admin.
     pub rest_basic_auth: Option<String>,
     /// Origens autorizadas a chamar o REST a partir de um browser (CORS).
     /// Vazio (default) = **nenhum** cabeçalho CORS, que é o comportamento

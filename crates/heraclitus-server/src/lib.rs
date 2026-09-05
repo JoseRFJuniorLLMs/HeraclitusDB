@@ -93,8 +93,20 @@ pub async fn serve_with(
                 Some(tasks)
             }
             Err(e) => {
-                boot.warn_line("Replicação Raft", &format!("falhou a arrancar: {e}"));
-                None
+                // A replicação está CONFIGURADA mas não subiu. Antes o servidor
+                // degradava em silêncio para escrita LOCAL não replicada
+                // (`set_replication` nunca era chamado, `Engine::append` volta a
+                // gravar direto no log e faz ack ao cliente). Duas consequências
+                // graves: escritas que o operador julga replicadas não o são; e
+                // o log enche-se de episódios locais que, no arranque seguinte
+                // com a replicação a subir, o raft recusa (episódios não-raft
+                // sobre um log durável) — ou, sem esse guarda, descartaria.
+                //
+                // Recusar arrancar é a postura segura: quem pediu replicação
+                // não quer um nó que aceita escritas sozinho.
+                return Err(HeraclitusError::Config(format!(
+                    "replicação configurada mas o cluster não arrancou ({e}).                      Recusar servir escrita local não replicada — corrija o cluster                      ou remova a configuração de replicação."
+                )));
             }
         }
     } else {
@@ -202,7 +214,10 @@ pub async fn serve_with(
 
     // Autenticação multi-principal: tokens nunca ficam armazenados em claro;
     // cada request é associado a um Principal que os handlers autorizam por papel.
-    let authenticator = auth::Authenticator::from_config(&config)?;
+    // Partilhado com o REST: as duas superficies passam a resolver credenciais
+    // pela MESMA politica, que era precisamente o que faltava — o gRPC exigia
+    // papeis e o REST ignorava-os por completo.
+    let authenticator = std::sync::Arc::new(auth::Authenticator::from_config(&config)?);
     if authenticator.is_required() {
         boot.warn_line(
             "Auth gRPC",
@@ -235,6 +250,7 @@ pub async fn serve_with(
             ),
         );
     }
+    let autenticador_rest = authenticator.clone();
     let auth = move |req| authenticator.authenticate(req);
     // O cliente (heraclitus-client/src/lib.rs:102) e o transporte do raft
     // (heraclitus-raft/src/grpc.rs:145) assumem 256 MiB nos dois sentidos, mas
@@ -252,8 +268,25 @@ pub async fn serve_with(
         .max_encoding_message_size(MAX_MSG),
         auth,
     );
-    if config.rest_basic_auth.is_some() {
-        boot.warn_line("Auth REST", "HTTP Basic EXIGIDO em cada chamada");
+    // As tres linhas dizem tres coisas DIFERENTES de proposito. Antes havia so
+    // "HTTP Basic EXIGIDO", que ao lado da linha do gRPC ("Bearer + RBAC
+    // EXIGIDO · N principal(is)") levava o operador a concluir que as duas
+    // superficies estavam protegidas do mesmo modo — e nao estavam.
+    if autenticador_rest.tem_papeis() {
+        boot.ok_line(
+            "Auth REST",
+            &format!(
+                "Basic + RBAC EXIGIDO · {} principal(is) — os MESMOS papeis do gRPC",
+                config.access_credentials.len()
+            ),
+        );
+    } else if config.rest_basic_auth.is_some() {
+        // A credencial unica legada autentica mas nao distingue papeis: quem a
+        // conhece alcanca tudo, incluindo o que o gRPC reserva a Admin.
+        boot.warn_line(
+            "Auth REST",
+            "HTTP Basic EXIGIDO · credencial UNICA que vale ADMIN — sem papeis",
+        );
     } else if !rest_addr.ip().is_loopback() {
         // A superfície REST inclui ESCRITAS duráveis (/hvm/*, /tier/demote, /sql).
         // Recusar expô-las sem autenticação num endereço não-loopback.
@@ -273,6 +306,7 @@ pub async fn serve_with(
         config.rest_basic_auth.clone(),
         config.rest_cors_origins.clone(),
         config.rest_allow_erasure,
+        Some(autenticador_rest),
     );
 
     let rest_listener = tokio::net::TcpListener::bind(rest_addr).await?;

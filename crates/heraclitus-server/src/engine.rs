@@ -2632,6 +2632,16 @@ impl QueryBackend for Engine {
         value: &str,
         as_of: Option<Lsn>,
     ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
+        // `None` = "o índice não pode responder a isto; varre o log". Um
+        // valor que o índice nunca indexou (SKIP_VALUES como `sim`/`true`/`0`,
+        // ou texto acima de MAX_VALUE_LEN) daria aqui um resultado VAZIO
+        // indistinguível de "não há matches" — e o planner tomava esse vazio
+        // como resposta final, devolvendo zero linhas sobre dados existentes.
+        // Recuar para o varrimento é a resposta certa; o pós-filtro do planner
+        // faz o resto.
+        if !heraclitus_index_attr::valor_indexavel(value) {
+            return Ok(None);
+        }
         // O índice dá os LSNs exatos; cada `log.read` é O(1) via o índice de
         // offset por-LSN do log (seek directo). Hidratação = nº de matches × O(1).
         let mut lsns: Vec<Lsn> = {
@@ -2670,6 +2680,27 @@ impl QueryBackend for Engine {
             Some((v, true)) => Bound::Included(v),
             Some((v, false)) => Bound::Excluded(v),
         };
+        // Os valores numéricos em SKIP_VALUES (`0`, `-1`) NUNCA entram no índice
+        // ordenado. Um intervalo que os abranja perderia esses episódios em
+        // silêncio — a mesma falha do `attr_lookup`, pelo lado do range. Se o
+        // intervalo pedido puder conter um valor ignorado, o índice não pode
+        // responder: recua-se para o varrimento.
+        let inclui = |x: f64| {
+            let acima = match min {
+                None => true,
+                Some((v, true)) => x >= v,
+                Some((v, false)) => x > v,
+            };
+            let abaixo = match max {
+                None => true,
+                Some((v, true)) => x <= v,
+                Some((v, false)) => x < v,
+            };
+            acima && abaixo
+        };
+        if [0.0f64, -1.0].iter().any(|x| inclui(*x)) {
+            return Ok(None);
+        }
         let mut lsns: Vec<Lsn> = {
             let idx = self.attr.read().unwrap();
             idx.lookup_range(field, to_bound(min), to_bound(max))
@@ -4243,6 +4274,95 @@ mod tests {
                 .count(),
             0,
             "sobrou um segmento no intervalo do hold sem proteccao no HRKM"
+        );
+    }
+
+    /// Uma procura por um valor que o indice de atributos NUNCA guarda —
+    /// SKIP_VALUES como `sim`, ou texto acima de MAX_VALUE_LEN — devolvia ZERO
+    /// linhas sobre dados existentes: o `attr_lookup` do Engine dava `Some(vazio)`
+    /// e o planner tomava-o como resposta final em vez de varrer.
+    ///
+    /// Isto e do CAMINHO POR OMISSAO (no unico), nao so do cluster.
+    #[test]
+    fn procura_por_valor_nao_indexavel_nao_devolve_vazio() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            ..Default::default()
+        };
+        let engine = Engine::open(&cfg).unwrap();
+
+        // `sim` esta em SKIP_VALUES — nunca e indexado.
+        let mut e = Episode::new("ana", EventKind::Observation, b"registo".to_vec());
+        e.attrs.insert("ativo".into(), "sim".into());
+        engine.append(e).unwrap();
+        // Um valor longo (> 80 bytes) tambem nao e indexado.
+        let mut longo = Episode::new("ana", EventKind::Observation, b"outro".to_vec());
+        let texto = "x".repeat(120);
+        longo.attrs.insert("descricao".into(), texto.clone());
+        engine.append(longo).unwrap();
+
+        let r = heraclitus_query::execute("MATCH (n) WHERE n.ativo = \"sim\" RETURN n", &engine)
+            .unwrap();
+        assert_eq!(
+            r.as_array().unwrap().len(),
+            1,
+            "o episodio com ativo=sim tem de aparecer: {r:?}"
+        );
+
+        let r2 = heraclitus_query::execute(
+            &format!("MATCH (n) WHERE n.descricao = \"{texto}\" RETURN n"),
+            &engine,
+        )
+        .unwrap();
+        assert_eq!(
+            r2.as_array().unwrap().len(),
+            1,
+            "valor longo tambem tem de aparecer"
+        );
+
+        // E um valor indexavel legitimo continua a funcionar (o indice nao ficou
+        // desligado por engano).
+        let mut c = Episode::new("ana", EventKind::Observation, b"c".to_vec());
+        c.attrs.insert("cpf".into(), "12345678900".into());
+        engine.append(c).unwrap();
+        let r3 =
+            heraclitus_query::execute("MATCH (n) WHERE n.cpf = \"12345678900\" RETURN n", &engine)
+                .unwrap();
+        assert_eq!(r3.as_array().unwrap().len(), 1);
+    }
+
+    /// O mesmo pelo lado do indice ORDENADO: um intervalo que abrange um valor
+    /// numerico ignorado (`0`, `-1`) tem de varrer, senao perde esses episodios.
+    #[test]
+    fn range_que_abrange_valor_ignorado_nao_perde_linhas() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            ..Default::default()
+        };
+        let engine = Engine::open(&cfg).unwrap();
+
+        // saldo = 0 esta em SKIP_VALUES; nunca entra no indice ordenado.
+        let mut zero = Episode::new("ana", EventKind::Observation, b"z".to_vec());
+        zero.attrs.insert("saldo".into(), "0".into());
+        engine.append(zero).unwrap();
+        let mut cinco = Episode::new("ana", EventKind::Observation, b"c".to_vec());
+        cinco.attrs.insert("saldo".into(), "5".into());
+        engine.append(cinco).unwrap();
+
+        // O intervalo [-10, 10] abrange o 0 ignorado: tem de os apanhar aos dois.
+        let r = heraclitus_query::execute(
+            "MATCH (n) WHERE n.saldo > -10 AND n.saldo < 10 RETURN n",
+            &engine,
+        )
+        .unwrap();
+        assert_eq!(
+            r.as_array().unwrap().len(),
+            2,
+            "o intervalo abrange 0 (ignorado) e 5: {r:?}"
         );
     }
 }

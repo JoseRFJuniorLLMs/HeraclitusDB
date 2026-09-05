@@ -18,6 +18,14 @@ impl Principal {
 pub struct Authenticator {
     credentials: Arc<Vec<(Principal, [u8; 32])>>,
     auth_required: bool,
+    /// Ha credenciais que carregam PAPEIS (`access_credentials`), por oposicao
+    /// ao `auth_token` unico legado, que e sempre Admin.
+    ///
+    /// A distincao decide se vale a pena o REST aplicar papeis: com so o token
+    /// legado nao existe papel nenhum para contornar — tudo e Admin de
+    /// qualquer maneira — e exigir autenticacao ali seria mudar o
+    /// comportamento sem fechar buraco nenhum.
+    com_papeis: bool,
 }
 
 impl Authenticator {
@@ -47,6 +55,7 @@ impl Authenticator {
         }
         Ok(Self {
             auth_required: !credentials.is_empty(),
+            com_papeis: !config.access_credentials.is_empty(),
             credentials: Arc::new(credentials),
         })
     }
@@ -55,30 +64,44 @@ impl Authenticator {
         self.auth_required
     }
 
-    #[allow(clippy::result_large_err)]
-    pub fn authenticate(&self, mut req: Request<()>) -> Result<Request<()>, Status> {
+    /// `true` quando estao configuradas credenciais com papeis.
+    pub fn tem_papeis(&self) -> bool {
+        self.com_papeis
+    }
+
+    /// Resolve um segredo em bruto no `Principal` correspondente, sem saber de
+    /// que superficie veio.
+    ///
+    /// Existe para o REST poder reutilizar exactamente esta politica em vez de
+    /// a reescrever: a comparacao em tempo constante, o hash do segredo, e —
+    /// sobretudo — a regra de aberto-por-omissao. Duas copias desta decisao era
+    /// como as duas superficies ficaram com autorizacoes diferentes.
+    pub fn resolver(&self, segredo: Option<&str>) -> Option<Principal> {
         if !self.auth_required {
-            req.extensions_mut().insert(Principal {
+            return Some(Principal {
                 name: "local-loopback".into(),
                 roles: Arc::new(vec![AccessRole::Admin]),
             });
-            return Ok(req);
         }
+        let segredo = segredo.filter(|s| !s.is_empty())?;
+        let got = blake3::hash(segredo.as_bytes());
+        self.credentials
+            .iter()
+            .find(|(_, expected)| crate::rest::ct_eq(got.as_bytes(), expected))
+            .map(|(principal, _)| principal.clone())
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn authenticate(&self, mut req: Request<()>) -> Result<Request<()>, Status> {
         let token = req
             .metadata()
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| Status::unauthenticated("missing or invalid bearer token"))?;
-        let got = blake3::hash(token.as_bytes());
-        let matched = self
-            .credentials
-            .iter()
-            .find(|(_, expected)| crate::rest::ct_eq(got.as_bytes(), expected));
-        match matched {
-            Some((principal, _)) => {
-                req.extensions_mut().insert(principal.clone());
+            .map(str::to_owned);
+        match self.resolver(token.as_deref()) {
+            Some(principal) => {
+                req.extensions_mut().insert(principal);
                 Ok(req)
             }
             None => Err(Status::unauthenticated("missing or invalid bearer token")),
