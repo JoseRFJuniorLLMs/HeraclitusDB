@@ -298,6 +298,29 @@ impl ColdTier {
             .bytes()
             .await
             .map_err(|e| HeraclitusError::Storage(std::io::Error::other(e)))?;
+
+        // AUTENTICAR OS BYTES DESCARREGADOS antes de recompactar.
+        //
+        // Sem isto, um objeto frio truncado ou com um bit trocado (bit rot no
+        // armazenamento, um PUT interrompido) era recompactado na mesma, e saía
+        // de cá com um rodapé e uma raiz Merkle NOVOS e internamente coerentes
+        // — corrupção "lavada" num recibo de aparência íntegra, que nenhuma
+        // verificação posterior distinguiria de dados bons. É a mesma
+        // verificação que o `verify_receipt` faz; faltava só aqui.
+        let (count, root) = scan_and_root(&bytes)?;
+        if count != receipt.record_count || hex(&root) != receipt.blake3_root {
+            return Err(HeraclitusError::Corruption {
+                context: "tier compact_cold".into(),
+                detail: format!(
+                    "objeto frio {} não bate com o recibo de origem                      (registos {count}/{}, raiz {}/{}) — recusa recompactar corrupção",
+                    receipt.object_path,
+                    receipt.record_count,
+                    hex(&root),
+                    receipt.blake3_root
+                ),
+            });
+        }
+
         let version = SegmentHeader::decode(&bytes)?.version;
 
         // Novo segmento: header original + registos sobreviventes (bytes
@@ -839,6 +862,65 @@ mod tests {
             .unwrap();
         assert!(gen2.object_path.contains("-c2"), "{}", gen2.object_path);
         assert!(tier.verify_receipt(&gen2).await.unwrap());
+    }
+
+    /// A compaction descarregava o objeto frio e recompactava-o SEM o
+    /// autenticar contra o recibo de origem. Um objeto truncado ou com um bit
+    /// trocado saía de cá com um rodapé e uma raiz Merkle novos e coerentes —
+    /// corrupção "lavada" numa aparência íntegra. Agora recusa.
+    #[tokio::test]
+    async fn compaction_recusa_objecto_frio_corrompido() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = seeded_log(&dir.path().join("log"));
+        let cold_root = dir.path().join("cold");
+        let tier = ColdTier::open_local(cold_root.clone()).unwrap();
+        let seg = log.sealed_segments()[0].clone();
+        let (receipt, _) = tier.demote(&log, seg.id).await.unwrap();
+
+        // Antes de corromper, a compaction funciona.
+        assert!(tier.verify_receipt(&receipt).await.unwrap());
+
+        // Corromper UM byte no meio do ficheiro do objeto frio, no disco.
+        let ficheiro = {
+            let mut achado = None;
+            for e in walkdir(&cold_root) {
+                if e.extension().and_then(|x| x.to_str()) == Some("hrkl") {
+                    achado = Some(e);
+                    break;
+                }
+            }
+            achado.expect("objeto frio no disco")
+        };
+        let mut bytes = std::fs::read(&ficheiro).unwrap();
+        let meio = bytes.len() / 2;
+        bytes[meio] ^= 0xFF;
+        std::fs::write(&ficheiro, &bytes).unwrap();
+
+        // A compaction tem de RECUSAR, nao produzir um recibo novo "valido".
+        let r = tier.compact_cold(&log, &receipt, |_lsn, _ep| false).await;
+        assert!(
+            r.is_err(),
+            "recompactar um objeto corrompido tem de recusar, nao lavar a corrupcao"
+        );
+    }
+
+    /// Caminhada simples da arvore, so para o teste acima encontrar o ficheiro.
+    fn walkdir(raiz: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut pilha = vec![raiz.to_path_buf()];
+        while let Some(d) = pilha.pop() {
+            if let Ok(rd) = std::fs::read_dir(&d) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        pilha.push(p);
+                    } else {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+        out
     }
 
     #[test]
