@@ -185,17 +185,27 @@ impl View for GraphIndex {
         let Some(snap) = heraclitus_views::ckpt::load::<GraphSnapshot>(dir, "graph")? else {
             return Ok(false);
         };
+        // Um bitmap roaring que não desserializa é um checkpoint INUTILIZÁVEL,
+        // não um erro fatal. O contrato do `ckpt::load` — e o que TODAS as
+        // outras views fazem — é degradar para rebuild a partir do LSN 0, porque
+        // o log é a verdade. Propagar o `Err` matava o arranque do servidor com
+        // base num checkpoint corrompido, quando reconstruir era possível e
+        // correcto.
+        //
+        // Tudo é montado em locais PRIMEIRO: se um bitmap falha, `self` fica
+        // intacto e devolve-se `Ok(false)` (rebuild), sem estado meio-restaurado.
+        let mut attr_idx = std::collections::HashMap::new();
+        for (k, bytes) in snap.attr {
+            match RoaringBitmap::deserialize_from(&bytes[..]) {
+                Ok(b) => {
+                    attr_idx.insert(k, b);
+                }
+                Err(_) => return Ok(false),
+            }
+        }
         self.out = snap.out.into_iter().collect();
         self.inn = snap.inn.into_iter().collect();
-        self.attr_idx = snap
-            .attr
-            .into_iter()
-            .map(|(k, bytes)| {
-                RoaringBitmap::deserialize_from(&bytes[..])
-                    .map(|b| (k, b))
-                    .map_err(|e| heraclitus_core::HeraclitusError::Serialization(e.to_string()))
-            })
-            .collect::<Result<_, _>>()?;
+        self.attr_idx = attr_idx.into_iter().collect();
         self.dense = dense_map::DenseEntityMap::from_events(snap.by_internal);
         self.lsn_of = snap.lsn_of.into_iter().collect();
         self.watermark = snap.watermark;

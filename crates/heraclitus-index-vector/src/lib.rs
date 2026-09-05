@@ -402,12 +402,24 @@ impl VectorIndex {
             // connect at each level from min(level, top) down to 0
             for l in (0..=level.min(top)).rev() {
                 let neighbors = self.search_layer(&pq, ep, l, self.ef_construction, None);
-                let selected: Vec<u32> = neighbors
+                let mut selected: Vec<u32> = neighbors
                     .iter()
                     .filter(|c| c.id != id)
                     .take(self.m)
                     .map(|c| c.id)
                     .collect::<Vec<u32>>();
+                // ÓRFÃO: `search_layer` nunca devolve tombstoned nos resultados.
+                // Se TODOS os nós alcançáveis a partir do entry estão
+                // tombstoned, `selected` fica vazio — e sem back-links o nó novo
+                // fica sem UMA aresta sequer, inalcançável em qualquer busca
+                // futura (uma inserção que se perde a si própria). Ligar ao
+                // `ep` garante a entrada no grafo: o `ep` é alcançável a partir
+                // da raiz por construção, e os tombstoned CONTINUAM a ser
+                // atravessados na busca (só não entram nos resultados), portanto
+                // um back-link através dele preserva a conectividade.
+                if selected.is_empty() && ep != id {
+                    selected.push(ep);
+                }
                 for &n in &selected {
                     let nl = self.nodes[n as usize].neighbors.len();
                     if l < nl {
@@ -612,16 +624,25 @@ impl VectorIndex {
         // e um vec vazio dava underflow/panic em TODA pesquisa futura). Um
         // checkpoint decodável mas violado degrada para rebuild do log (I6),
         // nunca para um índice que panica.
-        let coherent = snap.nodes.len() == snap.ids.len()
-            && snap.nodes.len() == snap.lsns.len()
+        let n_nodes = snap.nodes.len();
+        let coherent = n_nodes == snap.ids.len()
+            && n_nodes == snap.lsns.len()
             && snap
                 .nodes
                 .iter()
                 .all(|n| n.neighbors.len() == n.level + 1 && !n.neighbors.is_empty())
             && snap
                 .entry
-                .map(|e| (e as usize) < snap.nodes.len())
-                .unwrap_or(true);
+                .map(|e| (e as usize) < n_nodes)
+                .unwrap_or(true)
+            // Cada id de vizinho, em TODAS as camadas, tem de existir. Um id
+            // fora de `nodes.len()` decodifica sem erro e só rebenta depois, num
+            // `self.nodes[vizinho]` fora de limites durante a pesquisa — pânico
+            // que envenena o índice inteiro. Faltava esta parte da coerência.
+            && snap
+                .nodes
+                .iter()
+                .all(|n| n.neighbors.iter().flatten().all(|&v| (v as usize) < n_nodes));
         if !coherent {
             return Ok(false);
         }
@@ -842,6 +863,36 @@ mod tests {
             got, gt_ids,
             "GPU-accelerated exact search must equal f64 brute-force"
         );
+    }
+
+    /// Um nó inserido quando TODOS os nós alcançáveis estão tombstoned não pode
+    /// ficar órfão. `search_layer` nunca devolve tombstoned nos resultados,
+    /// portanto os vizinhos candidatos vinham vazios e o nó novo ficava sem uma
+    /// aresta sequer — invisível a qualquer busca futura. Tem de ligar-se ao
+    /// grafo à mesma.
+    #[test]
+    fn no_novo_nao_fica_orfao_com_tudo_tombstoned() {
+        let mut idx = VectorIndex::new(ProductMetric::default());
+        // Muitos nós: o entry fica estável num nível alto, para que o B
+        // inserido depois NÃO se torne o entry (o que trivializaria a busca).
+        let mut ids = Vec::new();
+        for i in 0..64u64 {
+            let e = EventId::new();
+            ids.push(e);
+            idx.insert(e, i, pt(vec![i as f32 / 64.0]));
+        }
+        // Tombstone de TODOS: qualquer caminho a partir do entry é só tombstoned.
+        for e in &ids {
+            assert!(idx.tombstone_event(e));
+        }
+        // Inserir B nesse estado.
+        let b = EventId::new();
+        idx.insert(b, 64, pt(vec![0.5]));
+
+        // B TEM de ser encontrável — senão a inserção perdeu-se a si própria.
+        let hits = idx.search(&pt(vec![0.5]), 1, 32, None);
+        assert_eq!(hits.len(), 1, "B tem de aparecer, não ficar órfão");
+        assert_eq!(hits[0].id, b);
     }
 
     #[test]
@@ -1401,5 +1452,48 @@ mod testes_prepared_query {
         for par in hits.windows(2) {
             assert!(par[0].dist <= par[1].dist);
         }
+    }
+
+    /// Um checkpoint decodável mas com um id de vizinho fora de `nodes.len()`
+    /// passava a verificação de coerência e só rebentava depois, num
+    /// `self.nodes[vizinho]` fora de limites durante a pesquisa — pânico que
+    /// envenena o índice inteiro. Agora degrada para rebuild (`Ok(false)`).
+    #[test]
+    fn checkpoint_com_vizinho_fora_de_intervalo_degrada() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = VectorIndex::new(ProductMetric::default());
+        for i in 0..4u64 {
+            let id = EventId::new();
+            idx.insert(
+                id,
+                i,
+                ProductPoint {
+                    hyp: vec![(i as f32) / 10.0, 0.1],
+                    sph: vec![],
+                    euc: vec![],
+                },
+            );
+        }
+        idx.save_checkpoint(dir.path()).unwrap();
+
+        // Decodificar, envenenar um id de vizinho, re-escrever.
+        let bytes = std::fs::read(dir.path().join(VECTOR_CKPT_FILE)).unwrap();
+        let (mut snap, _): (VectorSnapshot, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        // Um vizinho que aponta muito para lá do fim.
+        snap.nodes[0].neighbors[0] = vec![9_999];
+        let envenenado = bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap();
+        std::fs::write(dir.path().join(VECTOR_CKPT_FILE), &envenenado).unwrap();
+
+        // Restore tem de degradar, nao adoptar o estado que panica.
+        let mut fresco = VectorIndex::new(ProductMetric::default());
+        assert!(
+            !fresco.restore(dir.path()).unwrap(),
+            "checkpoint com vizinho fora de intervalo degrada para rebuild"
+        );
+
+        // E um checkpoint SÃO continua a restaurar.
+        let mut bom = VectorIndex::new(ProductMetric::default());
+        assert!(bom.restore(dir.path()).is_ok());
     }
 }
