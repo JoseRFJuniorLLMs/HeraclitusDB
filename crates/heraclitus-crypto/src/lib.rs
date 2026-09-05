@@ -17,7 +17,7 @@ use dashmap::DashMap;
 use rand::RngCore;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 /// Magic prefix marking a sealed (encrypted) content blob.
 pub const ENC_MAGIC: &[u8; 8] = b"HRKLENC1";
@@ -72,6 +72,21 @@ pub fn open(key: &[u8; 32], blob: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
 pub struct KeyStore {
     dir: PathBuf,
     cache: DashMap<String, [u8; 32]>,
+    /// Ordena o `shred` (escrita) contra `get`/`get_or_create` (leitura).
+    ///
+    /// A DashMap protege cada ENTRADA, nao a SEQUENCIA. O shred faz
+    /// remove-da-cache -> sobrescrever-a-zeros -> apagar; sem isto, um
+    /// `get_or_create` concorrente do mesmo agente caia entre os passos:
+    /// falhava a cache, relia o ficheiro JA A ZEROS, e `read_key` aceitava-o
+    /// — o agente passava a cifrar com uma chave de 32 bytes nulos, cacheada
+    /// para o resto da vida do processo. Na janela mais estreita voltava a
+    /// cachear a chave REAL, e o "apagado" que o servidor reportara revertia.
+    guarda: RwLock<()>,
+    /// Costura SO de teste (ver `shred`): barreira POR INSTANCIA, para um
+    /// teste parar o seu proprio shred na janela critica sem prender os
+    /// shreds dos outros testes que correm em paralelo no mesmo binario.
+    #[cfg(test)]
+    ponto_shred: std::sync::Mutex<Option<Arc<std::sync::Barrier>>>,
 }
 
 /// Restringe o diretório de chaves a owner-only (0700) no Unix. No Windows os
@@ -127,6 +142,9 @@ impl KeyStore {
         Ok(Arc::new(Self {
             dir,
             cache: DashMap::new(),
+            guarda: RwLock::new(()),
+            #[cfg(test)]
+            ponto_shred: std::sync::Mutex::new(None),
         }))
     }
 
@@ -143,6 +161,14 @@ impl KeyStore {
         }
         let mut k = [0u8; 32];
         k.copy_from_slice(&bytes);
+        // Uma chave toda a zeros nunca e uma chave: e o que o `shred` deixa no
+        // ficheiro entre sobrescrever e apagar, e e publicamente conhecida.
+        // Tratar isso como "nao ha chave" e defesa em profundidade por baixo
+        // do lock — se alguma vez a ordenacao falhar, o pior caso passa a ser
+        // "chave nova" em vez de "cifrar com zeros".
+        if k.iter().all(|&b| b == 0) {
+            return None;
+        }
         Some(k)
     }
 
@@ -155,6 +181,9 @@ impl KeyStore {
     /// restart. O árbitro agora é `create_new` no caminho final: exatamente um
     /// thread cria; os outros leem a chave do vencedor.
     pub fn get_or_create(&self, agent_id: &str) -> io::Result<[u8; 32]> {
+        // Leitura partilhada: varios agentes criam chaves em paralelo; um
+        // `shred` espera que todos saiam, e nenhum entra a meio dele.
+        let _g = self.guarda.read().unwrap_or_else(|e| e.into_inner());
         if let Some(k) = self.cache.get(agent_id) {
             return Ok(*k);
         }
@@ -212,6 +241,8 @@ impl KeyStore {
     /// Fetch the agent's key if it still exists (`None` if never created or
     /// already shredded).
     pub fn get(&self, agent_id: &str) -> Option<[u8; 32]> {
+        // Mesma corrida que o `get_or_create`: cache -> ficheiro -> insere.
+        let _g = self.guarda.read().unwrap_or_else(|e| e.into_inner());
         if let Some(k) = self.cache.get(agent_id) {
             return Some(*k);
         }
@@ -245,7 +276,17 @@ impl KeyStore {
     /// one that holds. Erasure at the medium level needs full-disk encryption
     /// with a destroyed volume key, or physical destruction.
     pub fn shred(&self, agent_id: &str) -> io::Result<bool> {
+        // Exclusivo durante a sequencia inteira (ver `guarda`).
+        let _g = self.guarda.write().unwrap_or_else(|e| e.into_inner());
         self.cache.remove(agent_id);
+        // Costura SO de teste: para o shred exactamente na janela entre limpar
+        // a cache e zerar o ficheiro — a janela em que, sem o lock, um leitor
+        // re-cacheava a chave real e o apagamento revertia. Sem isto a corrida
+        // dura microssegundos e nao e provavel por mutacao.
+        #[cfg(test)]
+        if let Some(b) = self.ponto_shred.lock().unwrap().clone() {
+            b.wait();
+        }
         let path = self.key_path(agent_id);
         if !path.exists() {
             return Ok(false);
@@ -340,5 +381,167 @@ mod tests {
         assert_eq!(kmode & 0o777, 0o600, "ficheiro .key deve ser 0600");
         let dmode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
         assert_eq!(dmode & 0o777, 0o700, "dir de chaves deve ser 0700");
+    }
+}
+
+#[cfg(test)]
+mod testes_shred {
+    use super::*;
+
+    /// PROVA DETERMINISTA do lock. O shred desta instancia e parado na janela
+    /// critica; um leitor tenta `get_or_create` durante a janela. COM
+    /// exclusividade o leitor bloqueia ate o shred acabar e sai com uma chave
+    /// NOVA. SEM ela (a mutacao) entra, le a chave real, re-cacheia-a, e depois
+    /// do shred o `get` devolve a chave declarada apagada.
+    #[test]
+    fn leitor_na_janela_do_shred_nunca_reaviva_a_chave_apagada() {
+        let (_d, ks) = loja();
+        let antiga = ks.get_or_create("ana").unwrap();
+        let barreira = Arc::new(std::sync::Barrier::new(2));
+        *ks.ponto_shred.lock().unwrap() = Some(barreira.clone());
+
+        let ks_shred = ks.clone();
+        let fio_shred = std::thread::spawn(move || ks_shred.shred("ana"));
+        // Esperar pelo FACTO, nao pelo relogio: a cache vazia para "ana"
+        // significa que o shred ja executou o `remove` — e como o faz DEPOIS
+        // de tomar o write-lock, esta agora parado na barreira com o lock na
+        // mao. Um `sleep` aqui era uma corrida (o leitor podia ler a chave
+        // antiga antes de o shred sequer comecar, o que e legitimo e nao e o
+        // bug).
+        let t0 = std::time::Instant::now();
+        while ks.cache.get("ana").is_some() {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "o shred nunca chegou a janela"
+            );
+            std::thread::yield_now();
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ks_leitor = ks.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(ks_leitor.get_or_create("ana"));
+        });
+        let na_janela = rx.recv_timeout(std::time::Duration::from_millis(300)).ok();
+
+        barreira.wait();
+        assert!(
+            fio_shred.join().unwrap().unwrap(),
+            "o shred tem de ter apagado"
+        );
+        *ks.ponto_shred.lock().unwrap() = None;
+
+        if let Some(Ok(k)) = na_janela {
+            assert_ne!(
+                k, antiga,
+                "o leitor entrou na janela e leu a chave que estava a ser apagada"
+            );
+        }
+        assert_ne!(
+            ks.get("ana"),
+            Some(antiga),
+            "o shred REVERTEU: a chave apagada voltou"
+        );
+    }
+
+    /// O defeito: `shred` limpava a cache ANTES de zerar o ficheiro; um
+    /// `get_or_create` concorrente relia o ficheiro a zeros, `read_key`
+    /// aceitava-o, e o agente passava a cifrar com `[0; 32]` — cacheado para
+    /// sempre. Estes testes fecham as duas portas: a chave nula nunca e uma
+    /// chave, e o shred e exclusivo contra as leituras.
+    fn loja() -> (tempfile::TempDir, Arc<KeyStore>) {
+        let d = tempfile::tempdir().unwrap();
+        let ks = KeyStore::open(d.path()).unwrap();
+        (d, ks)
+    }
+
+    /// Um ficheiro de chave todo a zeros — o que o shred deixa entre
+    /// sobrescrever e apagar, ou um crash a meio — NUNCA pode virar chave.
+    #[test]
+    fn ficheiro_a_zeros_nunca_e_uma_chave() {
+        let (_d, ks) = loja();
+        let k = ks.get_or_create("ana").unwrap();
+        assert!(k.iter().any(|&b| b != 0), "uma chave a serio nao e nula");
+        // Simular o estado intermedio do shred: ficheiro a zeros, cache vazia.
+        ks.cache.remove("ana");
+        std::fs::write(ks.key_path("ana"), [0u8; 32]).unwrap();
+        // `get` nao pode devolver zeros.
+        assert!(ks.get("ana").is_none(), "zeros no disco nao sao uma chave");
+        // `get_or_create` tambem nao: falha alto (artefacto de crash) em vez
+        // de cifrar com uma chave que toda a gente conhece.
+        // Recusar e aceitavel; devolver [0;32] nunca.
+        if let Ok(k) = ks.get_or_create("ana") {
+            assert!(k.iter().any(|&b| b != 0), "devolveu a chave nula");
+        }
+        assert!(
+            ks.cache
+                .get("ana")
+                .is_none_or(|k| k.iter().any(|&b| b != 0)),
+            "a cache nao pode ficar envenenada com zeros"
+        );
+    }
+
+    /// Depois do shred, o agente NAO tem chave (get = None, cache vazia) e a
+    /// chave seguinte e nova — o apagamento nao reverte.
+    #[test]
+    fn shred_e_definitivo_e_a_chave_seguinte_e_nova() {
+        let (_d, ks) = loja();
+        let antiga = ks.get_or_create("ana").unwrap();
+        assert!(ks.shred("ana").unwrap());
+        assert!(ks.get("ana").is_none(), "depois do shred nao ha chave");
+        assert!(
+            ks.cache.get("ana").is_none(),
+            "a cache nao pode ressuscitar o agente"
+        );
+        let nova = ks.get_or_create("ana").unwrap();
+        assert_ne!(nova, antiga, "a chave nova nao pode ser a apagada");
+        assert!(nova.iter().any(|&b| b != 0));
+    }
+
+    /// Stress: leitores concorrentes durante um shred nunca veem zeros nem a
+    /// chave antiga depois de o shred ter devolvido. Com o lock isto e
+    /// deterministicamente seguro; sem ele, apanhava zeros ou a chave velha.
+    #[test]
+    fn leitores_concorrentes_nunca_veem_zeros_durante_o_shred() {
+        let (_d, ks) = loja();
+        let antiga = ks.get_or_create("ana").unwrap();
+        let vistas: std::sync::Arc<std::sync::Mutex<Vec<[u8; 32]>>> = Default::default();
+        let mut fios = Vec::new();
+        for _ in 0..8 {
+            let ks = ks.clone();
+            let vistas = vistas.clone();
+            fios.push(std::thread::spawn(move || {
+                for _ in 0..200 {
+                    if let Ok(k) = ks.get_or_create("ana") {
+                        vistas.lock().unwrap().push(k);
+                    }
+                }
+            }));
+        }
+        // O que o lock garante e que ninguem tem em maos a chave que existia
+        // ANTES de um shred depois de esse shred ter devolvido. Sem
+        // exclusividade, um leitor cai entre o `remove` da cache e os zeros,
+        // re-cacheia a chave real, e o "apagado" reverte em silencio.
+        let mut revertidos = 0;
+        for _ in 0..50 {
+            let antes = ks.get_or_create("ana").unwrap();
+            if ks.shred("ana").unwrap_or(false) && ks.get("ana") == Some(antes) {
+                revertidos += 1;
+            }
+        }
+        for f in fios {
+            f.join().unwrap();
+        }
+        let vistas = vistas.lock().unwrap();
+        assert!(!vistas.is_empty());
+        assert!(
+            vistas.iter().all(|k| k.iter().any(|&b| b != 0)),
+            "um leitor viu a chave nula"
+        );
+        assert_eq!(
+            revertidos, 0,
+            "a chave apagada voltou a cache {revertidos} vezes: o shred reverteu"
+        );
+        let _ = antiga;
     }
 }
