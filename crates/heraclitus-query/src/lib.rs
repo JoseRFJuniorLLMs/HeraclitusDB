@@ -135,6 +135,26 @@ mod tests {
         assert_eq!(v.as_array().unwrap().len(), 4);
     }
 
+    /// Rótulos e colunas acentuados são dados reais (Portal da Transparência:
+    /// `Licitação`, `n.órgão`). O `ident` era ASCII-only e recusava-os com um
+    /// erro de parse — a query correcta sobre dados existentes não corria.
+    #[test]
+    fn rotulos_e_colunas_acentuados_parseiam() {
+        // Rótulo (kind) com cedilha e til.
+        assert!(
+            parse("MATCH (n:Licitação) RETURN n").is_ok(),
+            "rótulo acentuado tem de parsear"
+        );
+        assert!(parse("MATCH (n:Transferência) RETURN n").is_ok());
+        // Coluna com acento no WHERE.
+        assert!(
+            parse("MATCH (n) WHERE n.órgão = \"44000\" RETURN n").is_ok(),
+            "coluna acentuada tem de parsear"
+        );
+        // ASCII continua a funcionar (não partimos o caso comum).
+        assert!(parse("MATCH (n:Despesas) RETURN n").is_ok());
+    }
+
     #[test]
     fn rbac_query_classification_is_fail_closed_for_mutations() {
         assert_eq!(
