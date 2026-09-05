@@ -588,7 +588,15 @@ impl<S: BlockSource> PackedSegmentReader<S> {
     pub fn scan_all(&self, counters: &mut ScanCounters) -> V6Result<Vec<(Lsn, u64, Vec<u8>)>> {
         counters.blocks_candidate += self.directory.len() as u64;
         counters.bytes_candidate += self.all_block_physical_bytes();
-        let mut out = Vec::with_capacity(self.footer.record_count as usize);
+        // O `record_count` vem do rodape do ficheiro. Sem tecto, um rodape
+        // forjado ou com bit rot pedia uma reserva arbitraria — e em Rust uma
+        // falha de alocacao ABORTA o processo, nao devolve erro. O tecto fisico
+        // e o numero de bytes candidatos: nenhum registo ocupa menos de um byte,
+        // logo nao pode haver mais registos do que bytes no segmento.
+        let tecto = self
+            .all_block_physical_bytes()
+            .min(self.footer.record_count);
+        let mut out = Vec::with_capacity(tecto as usize);
         for i in 0..self.directory.len() {
             let (header, body) = self.read_block(i, counters)?;
             for r in decode_block_records(&header, &body)? {

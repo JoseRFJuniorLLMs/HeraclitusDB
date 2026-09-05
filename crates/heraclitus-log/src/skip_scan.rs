@@ -61,7 +61,14 @@ fn zmap_decode(bytes: &[u8]) -> Option<&[u8]> {
         return None;
     }
     let len = u64::from_le_bytes(bytes[6..14].try_into().ok()?) as usize;
-    let payload = bytes.get(ZMAP_HEADER_LEN..ZMAP_HEADER_LEN + len)?;
+    // `checked_add` e nao `+`: `len` vem dos bytes do sidecar. Um comprimento
+    // perto de `u64::MAX` fazia a soma transbordar ANTES de o `get` seguro
+    // sequer correr — e com `overflow-checks` ligado na release isso e panico,
+    // logo um `.zmap` corrompido matava o processo em vez de ser descartado.
+    // Toda esta funcao existe para devolver `None` perante lixo; reconstruir e
+    // sempre correcto.
+    let fim = ZMAP_HEADER_LEN.checked_add(len)?;
+    let payload = bytes.get(ZMAP_HEADER_LEN..fim)?;
     if blake3::hash(payload).as_bytes() != &bytes[14..46] {
         return None;
     }

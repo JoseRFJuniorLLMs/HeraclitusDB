@@ -660,6 +660,41 @@ impl V6Log {
     /// nível de localização. O path activo só é consultado para LSNs ainda não
     /// selados.
     pub fn read(&self, lsn: Lsn) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
+        // O caminho e resolvido sob o lock e o ficheiro so e aberto DEPOIS de o
+        // largar. Isso e deliberado — ler o segmento activo com o lock na mao
+        // serializaria as leituras com os appends — mas abre uma janela: um
+        // append concorrente que role o segmento renomeia
+        // `<id>.active.hrkl` para `<id>.g0000.raw.hrkl`, e a nossa abertura
+        // falha com NotFound sobre um LSN JA COMITADO. O `Engine::titular`
+        // engolia esse erro e o evento desaparecia da resposta ao titular sem
+        // aviso nenhum; o `append_idempotent` devolvia 500 a um retry legitimo.
+        //
+        // Manter o handle aberto por cima do rename nao e portavel (no Windows
+        // o rename falharia e partiria o append). A resposta certa e
+        // reresolver: depois do rolo, o mesmo LSN esta no manifesto como
+        // SELADO, portanto a tentativa seguinte encontra-o no sitio novo. O
+        // sinal de que houve rolo e o proprio ficheiro ter deixado de existir —
+        // mais directo do que inspeccionar a cadeia de erros.
+        //
+        // Tres tentativas cobrem rolos consecutivos. A partir dai o erro sobe,
+        // porque ja nao e uma corrida: e um ficheiro que falta mesmo.
+        const TENTATIVAS: usize = 3;
+        for tentativa in 1..=TENTATIVAS {
+            match self.tentar_ler(lsn) {
+                Ok(saida) => return Ok(saida),
+                Err(TentativaFalhou::Rolou) if tentativa < TENTATIVAS => continue,
+                Err(TentativaFalhou::Rolou) => {
+                    return Err(HeraclitusError::StorageEngine(format!(
+                        "LSN {lsn}: o segmento activo rolou {TENTATIVAS} vezes durante a leitura"
+                    )))
+                }
+                Err(TentativaFalhou::Erro(e)) => return Err(e),
+            }
+        }
+        unreachable!("o laco devolve sempre dentro de TENTATIVAS")
+    }
+
+    fn tentar_ler(&self, lsn: Lsn) -> Result<Option<(Lsn, Episode)>, TentativaFalhou> {
         let source = {
             let state = self.lock_state()?;
             if lsn >= state.next_lsn {
@@ -690,11 +725,17 @@ impl V6Log {
         };
 
         let found = match source {
-            ReadSource::Active(path) => scan_raw_segment(&path)?
-                .records
-                .into_iter()
-                .find(|r| r.lsn == lsn)
-                .map(|r| (r.lsn, r.payload)),
+            ReadSource::Active(path) => match scan_raw_segment(&path) {
+                Ok(varrido) => varrido
+                    .records
+                    .into_iter()
+                    .find(|r| r.lsn == lsn)
+                    .map(|r| (r.lsn, r.payload)),
+                // O ficheiro deixou de existir: alguem selou o segmento entre a
+                // resolucao do caminho e a abertura. Nao e erro — e a corrida.
+                Err(_) if !path.exists() => return Err(TentativaFalhou::Rolou),
+                Err(e) => return Err(TentativaFalhou::Erro(e)),
+            },
             ReadSource::Sealed(path, PhysicalLayout::Raw) => scan_raw_segment(&path)?
                 .records
                 .into_iter()
@@ -1987,6 +2028,31 @@ impl V6Log {
     }
 
     fn seal_active_locked(&self, state: &mut V6State) -> Result<(), HeraclitusError> {
+        // A colisao de caminho verifica-se ANTES de tocar no estado.
+        //
+        // Estava a ser verificada depois do `take()` e depois do `seal()`, que
+        // consome o writer: uma colisao — que e deterministica e nao depende de
+        // I/O nenhum — deixava o motor SEM segmento activo, e todos os appends
+        // seguintes falhavam com "V6Log sem segmento ativo" ate alguem
+        // reiniciar o processo. Verificada aqui, o erro nao destroi nada.
+        //
+        // Nota honesta sobre o que isto NAO resolve: as falhas depois do
+        // `seal()` (I/O ao selar, rename, reconcile, commit do manifesto)
+        // continuam a deixar `state.active` a None. Aí o writer ja foi
+        // consumido e nao ha nada para repor sem reabrir o ficheiro, e o
+        // manifesto ja e reposto (`state.manifest = before`) nesses caminhos.
+        // Fechar essa janela e uma decisao de desenho do motor de armazenamento
+        // — improvisa-la aqui arriscaria perda de dados, que e pior do que a
+        // necessidade de reiniciar.
+        if let Some(activo) = state.active.as_ref() {
+            let destino = raw_path(&self.segments_dir, activo.id);
+            if activo.writer.record_count() > 0 && destino.exists() {
+                return Err(corrupt(
+                    "hrkl v6 seal",
+                    "immutable RAW generation path already exists",
+                ));
+            }
+        }
         let active = state
             .active
             .take()
@@ -2006,6 +2072,8 @@ impl V6Log {
         }
 
         let footer = active.writer.seal()?;
+        // Ja verificado acima, antes de o estado ser tocado; aqui fica so como
+        // rede, porque entre as duas verificacoes nada mais cria este nome.
         let final_path = raw_path(&self.segments_dir, active.id);
         if final_path.exists() {
             return Err(corrupt(
@@ -2058,6 +2126,21 @@ impl V6Log {
         self.state
             .lock()
             .map_err(|_| HeraclitusError::StorageEngine("mutex do V6Log envenenado".into()))
+    }
+}
+
+/// Porque e que uma tentativa de leitura nao produziu o registo.
+///
+/// `Rolou` nao e um erro que se mostre a ninguem: e o sinal de que o segmento
+/// activo foi selado no meio da leitura e que vale a pena reresolver o caminho.
+enum TentativaFalhou {
+    Rolou,
+    Erro(HeraclitusError),
+}
+
+impl From<HeraclitusError> for TentativaFalhou {
+    fn from(e: HeraclitusError) -> Self {
+        Self::Erro(e)
     }
 }
 
