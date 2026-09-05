@@ -2736,7 +2736,12 @@ fn remember_rule_event(inner: &RuntimeInner, source_lsn: Lsn, event: &SecurityEv
         let horizonte = engine
             .required_window_ms()
             .saturating_add(inner.config.l1.max_lateness_ms);
-        podar_historico_l1(&mut history, horizonte, inner.config.l1.history_capacity);
+        podar_historico_l1(
+            &mut history,
+            horizonte,
+            inner.config.l1.history_capacity,
+            now_ms(),
+        );
     }
 }
 
@@ -2756,9 +2761,28 @@ fn podar_historico_l1(
     history: &mut Vec<(Lsn, SecurityEvent)>,
     horizonte_ms: u64,
     capacidade: usize,
+    agora_ms: u64,
 ) -> usize {
     let antes = history.len();
-    if let Some(mais_recente) = history.iter().map(|(_, e)| e.observed_at).max() {
+    // A fronteira sai do evento mais recente que NAO esteja no futuro.
+    //
+    // Sem o filtro, `observed_at` — que vem do JSON ingerido, sem limite — era
+    // ao mesmo tempo o dado podado e a regua que decide a poda. UM evento com
+    // `observed_at` gigante (um relogio adiantado, um shipper avariado, um
+    // sensor comprometido) punha a fronteira no futuro e o `retain` apagava
+    // TODO o resto do historico do L1, de forma permanente e silenciosa.
+    //
+    // Continua a medir-se em tempo de EVENTO e nao no relogio local, para o
+    // replay de dados historicos nao se auto-destruir; o relogio local entra so
+    // como tecto do que pode contar como "mais recente". Se TODOS os eventos
+    // estiverem no futuro, nao ha poda temporal nenhuma — sobra o tecto de
+    // linhas, que guarda dados em vez de os deitar fora.
+    let mais_recente = history
+        .iter()
+        .map(|(_, e)| e.observed_at)
+        .filter(|observado| *observado <= agora_ms)
+        .max();
+    if let Some(mais_recente) = mais_recente {
         let limite = mais_recente.saturating_sub(horizonte_ms);
         history.retain(|(_, e)| e.observed_at >= limite);
     }
@@ -2810,15 +2834,29 @@ fn evaluate_threat(
             "t:{}:{}:{}",
             sighting.indicator_id, sighting.match_kind, sighting.event_id
         );
-        let novo = inner
+        // A chave so se marca DEPOIS de o sighting estar mesmo no log — que e
+        // a mesma ordem que o caminho dos signals, logo aqui abaixo, ja usava.
+        //
+        // Marca-la ANTES (como estava) tinha uma consequencia silenciosa: um
+        // `Err` transitorio do sink propagava pelo `?` com a chave ja marcada,
+        // e a re-execucao do mesmo evento caia no `continue` — a evidencia
+        // desaparecia para sempre, sem erro, sem metrica, sem rasto. Num
+        // produto de seguranca, perder uma observacao por causa de um EIO
+        // passageiro e pior do que emiti-la duas vezes.
+        let ja_visto = inner
             .sighting_keys
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .inserir(&key.to_string());
-        if !novo {
+            .contem(&key);
+        if ja_visto {
             continue;
         }
         inner.derived_sink.append(sighting.into_episode()?, &key)?;
+        inner
+            .sighting_keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .inserir(&key);
         inner
             .metrics
             .threat_sightings_emitted_total
@@ -4422,7 +4460,7 @@ mod poda_l1_tests {
             falha(3, 10_000),
             falha(4, 20_000),
         ];
-        assert_eq!(podar_historico_l1(&mut h, 10_000, 0), 2);
+        assert_eq!(podar_historico_l1(&mut h, 10_000, 0, u64::MAX), 2);
         let restantes: Vec<u64> = h.iter().map(|(l, _)| *l).collect();
         assert_eq!(
             restantes,
@@ -4431,16 +4469,44 @@ mod poda_l1_tests {
         );
     }
 
+    /// UM evento datado no futuro apagava TODO o historico do L1: a fronteira
+    /// da poda saia do `max(observed_at)` do proprio historico, e `observed_at`
+    /// vem do JSON ingerido sem limite nenhum. Bastava um shipper com o relogio
+    /// adiantado — ou um sensor comprometido — para o motor de regras perder a
+    /// memoria toda, em silencio e sem retorno.
+    #[test]
+    fn um_carimbo_do_futuro_nao_apaga_o_historico() {
+        let agora = 100_000u64;
+        let mut h = vec![
+            falha(1, 90_000),
+            falha(2, 95_000),
+            // O veneno: muito alem do relogio local.
+            falha(3, u64::MAX),
+        ];
+        podar_historico_l1(&mut h, 10_000, 0, agora);
+        let restantes: Vec<u64> = h.iter().map(|(l, _)| *l).collect();
+        assert_eq!(
+            restantes,
+            vec![1, 2, 3],
+            "o evento do futuro nao pode empurrar a fronteira e apagar os reais"
+        );
+
+        // E se TODOS estiverem no futuro nao ha poda temporal — guardar dados e
+        // sempre melhor do que deita-los fora com base num relogio que mente.
+        let mut todos_futuros = vec![falha(1, u64::MAX - 1), falha(2, u64::MAX)];
+        assert_eq!(podar_historico_l1(&mut todos_futuros, 10_000, 0, agora), 0);
+    }
+
     #[test]
     fn o_tecto_de_linhas_solta_os_lsn_mais_antigos() {
         let mut h: Vec<_> = (1..=10).map(|i| falha(i, 1_000 * i)).collect();
-        assert_eq!(podar_historico_l1(&mut h, u64::MAX, 4), 6);
+        assert_eq!(podar_historico_l1(&mut h, u64::MAX, 4, u64::MAX), 6);
         let restantes: Vec<u64> = h.iter().map(|(l, _)| *l).collect();
         assert_eq!(restantes, vec![7, 8, 9, 10]);
 
         let mut sem_tecto: Vec<_> = (1..=10).map(|i| falha(i, 1_000 * i)).collect();
         assert_eq!(
-            podar_historico_l1(&mut sem_tecto, u64::MAX, 0),
+            podar_historico_l1(&mut sem_tecto, u64::MAX, 0, u64::MAX),
             0,
             "zero desliga o tecto"
         );
@@ -4485,7 +4551,7 @@ mod poda_l1_tests {
             "com historico ilimitado so a rajada #1 e reportada; a #2 fica presa atras dela"
         );
 
-        podar_historico_l1(&mut historico, engine.required_window_ms(), 0);
+        podar_historico_l1(&mut historico, engine.required_window_ms(), 0, u64::MAX);
         assert_eq!(
             historico.len(),
             2,
