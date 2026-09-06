@@ -218,6 +218,52 @@ pub(crate) const TECTO_CHAVES_SIGHTING: usize = 65_536;
 /// a derivacao e o derivado a voltar pelo subscriber.
 pub(crate) const TECTO_LSN_DERIVADOS: usize = 262_144;
 
+/// Auditoria 2026-09-05, A38 — tecto da evidencia acumulada por sujeito na
+/// fusao (L3).
+///
+/// O `FusionAccumulator` nunca decai nem e reposto, e cada sinal novo do mesmo
+/// sujeito traz uma `EvidenceRef` INEDITA (o `event_id` e o `raw_event_id` do
+/// evento de origem, distinto por evento). Como a evidencia acumulada e
+/// reserializada por INTEIRO em cada `SecurityRiskAssessment` persistido — e
+/// ainda vai um `EventId` por referencia em `episode.parents` —, N sinais do
+/// mesmo sujeito escreviam 1+2+...+N referencias: O(N^2) bytes num log
+/// append-only. O mesmo vector ia integral em cada snapshot publicado.
+///
+/// O irmao do mesmo pipeline ja tinha tecto (`max_evidence_per_incident`), tal
+/// como as duas janelas aqui em cima; so o `fusion_state` ficara de fora.
+/// Guardam-se as mais RECENTES por LSN: a evidencia completa continua no log,
+/// nos episodios `SecuritySignal`, e o assessment e uma vista sobre ela.
+pub(crate) const TECTO_EVIDENCIA_POR_SUJEITO: usize = 4_096;
+
+/// Auditoria 2026-09-05, A38 — acumula evidencia mantendo a ordem e o tecto.
+///
+/// O vector esta SEMPRE ordenado por `(lsn, event_id)` — e a mesma ordem que
+/// `sorted_evidence` produz e de que a serializacao byte a byte do assessment
+/// depende —, logo a deduplicacao e a insercao sao a MESMA busca binaria, e
+/// nao um `contains` linear seguido de reordenar um vector que ja estava
+/// ordenado. No caso comum (LSN monotono) a posicao cai no fim e o `insert`
+/// degenera num `push`.
+///
+/// O tecto corta pelo PREFIXO porque o vector cresce em LSN: o que se descarta
+/// e sempre a evidencia mais antiga. E deterministico sob replay e sob
+/// restauro de snapshot, porque a ordem de processamento e sempre a ordem de
+/// LSN do log.
+fn acumular_evidencia(acumulado: &mut Vec<EvidenceRef>, novas: &[EvidenceRef], tecto: usize) {
+    for evidencia in novas {
+        if let Err(posicao) = acumulado.binary_search_by(|item| {
+            item.lsn
+                .cmp(&evidencia.lsn)
+                .then_with(|| item.event_id.cmp(&evidencia.event_id))
+        }) {
+            acumulado.insert(posicao, evidencia.clone());
+        }
+    }
+    if tecto > 0 && acumulado.len() > tecto {
+        let excesso = acumulado.len() - tecto;
+        acumulado.drain(..excesso);
+    }
+}
+
 struct RuntimeInner {
     log: Arc<AnyLog>,
     derived_sink: Arc<dyn DerivedEventSink>,
@@ -699,6 +745,18 @@ impl SentinelRuntime {
                 s.fusion_accumulators
                     .iter()
                     .map(|(chave, estado)| {
+                        // Auditoria 2026-09-05, A38 — o snapshot vem de disco
+                        // e a insercao ordenada de `acumular_evidencia` EXIGE
+                        // a ordem por `(lsn, event_id)`. Antes, o `sort_by`
+                        // por sinal reparava-a de graca; agora ordena-se uma
+                        // vez no arranque (custo unico, irrelevante).
+                        let mut evidence = estado.evidence.clone();
+                        evidence.sort_by(|esquerda, direita| {
+                            esquerda
+                                .lsn
+                                .cmp(&direita.lsn)
+                                .then_with(|| esquerda.event_id.cmp(&direita.event_id))
+                        });
                         (
                             chave.clone(),
                             FusionAccumulator {
@@ -707,7 +765,7 @@ impl SentinelRuntime {
                                 behavioral_score: estado.behavioral_score,
                                 graph_score: estado.graph_score,
                                 threat_intel_score: estado.threat_intel_score,
-                                evidence: estado.evidence.clone(),
+                                evidence,
                                 detectors: estado.detectors.clone(),
                             },
                         )
@@ -3193,16 +3251,16 @@ fn evaluate_fusion(
             DetectorChannel::Custom(_) => {}
         }
         state.detectors.insert(signal.detector.id.clone(), channel);
-        for evidence in &signal.evidence {
-            if !state.evidence.contains(evidence) {
-                state.evidence.push(evidence.clone());
-            }
-        }
-        state.evidence.sort_by(|left, right| {
-            left.lsn
-                .cmp(&right.lsn)
-                .then_with(|| left.event_id.cmp(&right.event_id))
-        });
+        // Auditoria 2026-09-05, A38 — ver `acumular_evidencia`: o `contains`
+        // linear + `push` + `sort_by` de um vector ja ordenado passou a uma
+        // insercao ordenada, e a acumulacao passou a ter tecto. Sem o tecto, a
+        // evidencia deste sujeito crescia sem limite e era reserializada por
+        // inteiro em cada assessment persistido.
+        acumular_evidencia(
+            &mut state.evidence,
+            &signal.evidence,
+            TECTO_EVIDENCIA_POR_SUJEITO,
+        );
         let fusion = fusion
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4510,6 +4568,180 @@ detection:
             "o erro de dados TEM de continuar a subir ate ao worker"
         );
         runtime.shutdown();
+    }
+
+    /// Auditoria 2026-09-05, A38 — a evidencia acumulada por sujeito nao tinha
+    /// tecto e era reserializada por INTEIRO em cada `SecurityRiskAssessment`
+    /// persistido: N sinais do mesmo sujeito escreviam O(N^2) bytes no log.
+    ///
+    /// Usam-se poucos sinais com MUITA evidencia cada (em vez de muitos sinais
+    /// com uma evidencia cada) para atravessar o tecto sem escrever centenas de
+    /// MB no log de teste.
+    #[test]
+    fn a_evidencia_de_fusao_tem_tecto_e_guarda_as_mais_recentes() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 22,
+                FsyncPolicy::GroupCommit { interval_ms: 50 },
+            )
+            .unwrap(),
+        );
+        let runtime = SentinelRuntime::start(log.clone(), l3_config())
+            .unwrap()
+            .unwrap();
+
+        let bloco = |nome: &str, de: Lsn, ate: Lsn| {
+            let mut s = signal(nome, ate, EventId::new(), 0.5);
+            s.evidence = (de..ate)
+                .map(|lsn| EvidenceRef {
+                    lsn,
+                    event_id: EventId::new(),
+                })
+                .collect();
+            s
+        };
+        // 2000 + 2000 + 300 = 4300 referencias distintas para `User:alice`,
+        // que e 204 acima do tecto.
+        for s in [
+            bloco("sig-a", 0, 2_000),
+            bloco("sig-b", 2_000, 4_000),
+            bloco("sig-c", 4_000, 4_300),
+        ] {
+            log.append(s.into_episode().unwrap()).unwrap();
+        }
+        wait_for_catch_up(&runtime, &log);
+
+        let ultimo = log
+            .scan(0, log.head())
+            .unwrap()
+            .into_iter()
+            .rfind(|(_, episode)| {
+                matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecurityRiskAssessment")
+            })
+            .expect("tem de haver pelo menos um assessment persistido");
+        let assessment: RiskAssessment = serde_json::from_slice(&ultimo.1.content).unwrap();
+
+        assert_eq!(
+            assessment.evidence.len(),
+            TECTO_EVIDENCIA_POR_SUJEITO,
+            "a evidencia persistida tem de parar no tecto"
+        );
+        assert_eq!(
+            assessment.evidence.first().unwrap().lsn,
+            4_300 - TECTO_EVIDENCIA_POR_SUJEITO as Lsn,
+            "o que se descarta e o PREFIXO (a evidencia mais antiga)"
+        );
+        assert_eq!(
+            assessment.evidence.last().unwrap().lsn,
+            4_299,
+            "a evidencia mais recente tem de sobreviver"
+        );
+        assert_eq!(
+            ultimo.1.parents.len(),
+            TECTO_EVIDENCIA_POR_SUJEITO,
+            "os pais causais seguem a evidencia; era por aqui que o episodio inchava"
+        );
+        runtime.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod testes_acumulacao_de_evidencia {
+    use super::{acumular_evidencia, EvidenceRef};
+    use heraclitus_core::{EventId, Lsn};
+
+    fn refs(pares: &[(Lsn, u8)], ids: &[EventId]) -> Vec<EvidenceRef> {
+        pares
+            .iter()
+            .map(|(lsn, i)| EvidenceRef {
+                lsn: *lsn,
+                event_id: ids[*i as usize],
+            })
+            .collect()
+    }
+
+    /// Implementacao de referencia: o codigo EXACTO que existia antes da
+    /// correccao (`contains` linear + `push` + `sort_by`).
+    fn referencia_antiga(acumulado: &mut Vec<EvidenceRef>, novas: &[EvidenceRef]) {
+        for evidencia in novas {
+            if !acumulado.contains(evidencia) {
+                acumulado.push(evidencia.clone());
+            }
+        }
+        acumulado.sort_by(|esquerda, direita| {
+            esquerda
+                .lsn
+                .cmp(&direita.lsn)
+                .then_with(|| esquerda.event_id.cmp(&direita.event_id))
+        });
+    }
+
+    /// Auditoria 2026-09-05, A38 — a insercao ordenada tem de dar o MESMO
+    /// vector que o `push` + `sort_by` dava. A ordem nao e cosmetica: e a
+    /// ordem que `sorted_evidence` produz e de que a identidade do assessment
+    /// (`revision_id`, um digest do JSON) depende.
+    #[test]
+    fn insercao_ordenada_da_o_mesmo_vector_que_push_mais_sort() {
+        let ids: Vec<EventId> = (0..4).map(|_| EventId::new()).collect();
+        let lotes = [
+            // LSN monotono
+            refs(&[(10, 0), (20, 1)], &ids),
+            // LSN atrasado: insercao no MEIO, nao no fim
+            refs(&[(15, 2)], &ids),
+            // mesmo LSN, event_id diferente: desempate
+            refs(&[(15, 3)], &ids),
+            // duplicado exacto: nao faz nada
+            refs(&[(10, 0)], &ids),
+        ];
+
+        let mut novo = Vec::new();
+        let mut antigo = Vec::new();
+        for lote in &lotes {
+            acumular_evidencia(&mut novo, lote, 0);
+            referencia_antiga(&mut antigo, lote);
+            assert_eq!(novo, antigo, "divergiu do comportamento anterior");
+        }
+        assert_eq!(novo.len(), 4, "o duplicado exacto nao entra");
+    }
+
+    /// Auditoria 2026-09-05, A38 — o tecto corta pelo PREFIXO: descarta-se a
+    /// evidencia mais antiga, guarda-se a mais recente.
+    #[test]
+    fn o_tecto_descarta_a_evidencia_mais_antiga() {
+        let mut acumulado = Vec::new();
+        for lsn in 0..10u64 {
+            let nova = vec![EvidenceRef {
+                lsn,
+                event_id: EventId::new(),
+            }];
+            acumular_evidencia(&mut acumulado, &nova, 4);
+            assert!(acumulado.len() <= 4, "o tecto nunca pode ser ultrapassado");
+        }
+        assert_eq!(acumulado.len(), 4);
+        assert_eq!(
+            acumulado.iter().map(|e| e.lsn).collect::<Vec<_>>(),
+            vec![6, 7, 8, 9],
+            "sobrevivem as quatro mais recentes"
+        );
+    }
+
+    /// Auditoria 2026-09-05, A38 — um lote unico maior que o tecto tambem tem
+    /// de ser cortado, senao um so sinal com muita evidencia furava o limite.
+    #[test]
+    fn um_lote_maior_que_o_tecto_tambem_e_cortado() {
+        let novas: Vec<EvidenceRef> = (0..100u64)
+            .map(|lsn| EvidenceRef {
+                lsn,
+                event_id: EventId::new(),
+            })
+            .collect();
+        let mut acumulado = Vec::new();
+        acumular_evidencia(&mut acumulado, &novas, 10);
+        assert_eq!(acumulado.len(), 10);
+        assert_eq!(acumulado.first().unwrap().lsn, 90);
     }
 }
 
