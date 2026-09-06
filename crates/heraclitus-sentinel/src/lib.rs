@@ -3035,13 +3035,15 @@ fn evaluate_l2(
             severity: ((score * 10.0).ceil() as u8).clamp(1, 10),
             score,
             subject: Some(input.entity),
-            evidence: vec![
-                evidence.clone(),
-                EvidenceRef {
-                    lsn: 1,
-                    event_id: EventId::new(),
-                },
-            ],
+            // Auditoria 2026-09-05 (CONFIRMADO): aqui ia uma SEGUNDA referência
+            // de evidência FABRICADA — `EvidenceRef { lsn: 1, event_id:
+            // EventId::new() }` — que apontava para um evento que nunca
+            // existiu. Ficava em `episode.parents` (pai causal pendurado, que
+            // nenhuma consulta de proveniência resolve) e inflacionava a
+            // contagem que a política de resposta usa como quórum
+            // (`minimum_evidence`). A evidência de um sinal L2 é a observação
+            // que o produziu; mais do que uma só se for real.
+            evidence: vec![evidence.clone()],
             created_at_lsn: source_lsn,
             labels,
         });
@@ -4125,13 +4127,38 @@ detection:
                 s.l2_latency_ms,
             );
         }
-        assert!(log.scan(0, log.head()).unwrap().iter().any(|(_, episode)| {
-            matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecuritySignal")
-                && episode
-                    .attrs
-                    .get("sentinel.detector")
-                    .is_some_and(|value| value == "l2.behavioral.baseline")
-        }));
+        let tudo = log.scan(0, log.head()).unwrap();
+        let sinais: Vec<&Episode> = tudo
+            .iter()
+            .map(|(_, episode)| episode)
+            .filter(|episode| {
+                matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecuritySignal")
+                    && episode
+                        .attrs
+                        .get("sentinel.detector")
+                        .is_some_and(|value| value == "l2.behavioral.baseline")
+            })
+            .collect();
+        assert!(!sinais.is_empty());
+        // Auditoria 2026-09-05: o sinal L2 levava uma segunda evidência
+        // FABRICADA (`EventId::new()`), que virava um pai causal pendurado.
+        // Cada pai tem de ser um episódio REAL do log, e há exactamente um:
+        // a observação que produziu o sinal.
+        let ids: std::collections::HashSet<EventId> = tudo.iter().map(|(_, e)| e.id).collect();
+        for sinal in &sinais {
+            assert_eq!(
+                sinal.parents.len(),
+                1,
+                "um sinal L2 tem UMA evidência: {:?}",
+                sinal.parents
+            );
+            for pai in &sinal.parents {
+                assert!(ids.contains(pai), "pai causal {pai} não existe no log");
+            }
+            let decod: SecuritySignal = serde_json::from_slice(&sinal.content).unwrap();
+            assert_eq!(decod.evidence.len(), 1);
+            assert_eq!(decod.evidence[0].event_id, sinal.parents[0]);
+        }
         assert!(runtime.behavioral_snapshot().is_some());
         assert!(runtime
             .behavioral_snapshot_as_of(0)
