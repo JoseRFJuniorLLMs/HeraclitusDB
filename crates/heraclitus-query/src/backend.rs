@@ -714,19 +714,42 @@ pub trait QueryBackend {
         as_of: Option<Lsn>,
     ) -> Result<DecisionReport, HeraclitusError> {
         let bound = self.resolve_as_of_bound(as_of)?;
-        let mut g = TemporalGraph::new();
+
+        // Auditoria 2026-09-05 (A33): o grafo vem de `graph()` e NÃO de um
+        // replay de `scan_range`. Dentro de `SIMULATE ... THEN DECIDE`, `self`
+        // é o `VirtualBackend`, cujo `scan_range` delega no log REAL (só
+        // `graph()` devolve o overlay): o replay ignorava por completo a aresta
+        // contrafactual e a política era avaliada contra a realidade. O
+        // resultado vinha bem formado e idêntico à baseline — sem erro nem
+        // aviso — no único caminho cujo propósito é «o que dispararia se esta
+        // aresta existisse», e em desacordo com as funções irmãs (COMMUNITY,
+        // NEIGHBORS, METRICS, HYPOTHESES) que já liam o overlay. É a mesma
+        // razão pela qual o SIMULATE usa `be.graph()` em vez de um replay
+        // (plan.rs) — `graph()` é obrigatório no trait, logo qualquer backend
+        // que sirva um grafo fica correcto por construção.
+        //
+        // Sem o replay a truncar o log, o corte temporal passa a ser feito pelo
+        // `as_of` de `decision::evaluate` (`alive_at`/`aggregate_as_of`), com a
+        // MESMA convenção de fronteira exclusiva de todas as outras leituras
+        // (`as_of_point`): `AS OF LSN k` observa os LSN `[0, k)`. O
+        // `scan_range(0, bound)` fica APENAS para o conjunto de idempotência,
+        // que é semântica de log e não de grafo.
+        let g = self.graph()?;
         let mut existing = BTreeSet::new();
 
         let snapshot_events = self.scan_range(0, bound)?;
-        for (lsn, e) in snapshot_events {
-            g.apply_episode(lsn, &e);
+        for (_, e) in snapshot_events {
             if e.kind == EventKind::Action {
                 if let Some(act_id) = e.attrs.get("action_id") {
                     existing.insert(act_id.clone());
                 }
             }
         }
-        let decisions = decision::evaluate(&g, u64::MAX, &policy);
+        let decisions = match as_of_point(as_of) {
+            Some(point) => decision::evaluate(&g, point, &policy),
+            // `AS OF LSN 0` = estado vazio (não existe LSN < 0): nada a decidir.
+            None => Vec::new(),
+        };
 
         let mut report = DecisionReport::default();
         for d in decisions {

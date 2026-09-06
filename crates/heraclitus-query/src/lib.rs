@@ -1213,6 +1213,182 @@ mod tests {
     }
 
     #[test]
+    fn simulate_then_decide_ve_o_contrafactual() {
+        // Auditoria 2026-09-05 (A33): `SIMULATE ... THEN DECIDE` avaliava a
+        // politica contra o grafo REAL. O `decide` por omissao reconstruia o
+        // grafo com `scan_range` (que o VirtualBackend delega no log real) em
+        // vez de usar `graph()` (o overlay), pelo que a aresta contrafactual
+        // era invisivel: a resposta vinha bem formada e IGUAL a baseline, sem
+        // erro nem aviso — precisamente no caminho cujo unico proposito e
+        // "o que dispararia se esta aresta existisse".
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        let edge = |from: &str, to: &str, etype: &str, conf: &str| {
+            let mut e = Episode::new("ag", EventKind::Observation, vec![]);
+            e.attrs.insert("edge_from".into(), from.into());
+            e.attrs.insert("edge_to".into(), to.into());
+            e.attrs.insert("edge_type".into(), etype.into());
+            e.attrs.insert("confidence".into(), conf.into());
+            e
+        };
+        // Nenhuma aresta `fraud_partner` no log: a realidade nao dispara nada.
+        log.append(edge("p1", "p2", "socio_de", "1.0")).unwrap();
+        let be = LogBackend::new(log);
+
+        let ids = |v: &serde_json::Value| -> Vec<String> {
+            v["fired"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a["action_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let base = execute("DECIDE ()", &be).unwrap();
+        assert!(
+            ids(&base).is_empty(),
+            "baseline sem fraud_partner nao dispara: {:?}",
+            ids(&base)
+        );
+
+        // O contrafactual cria a aresta com confianca 1.0, muito acima do
+        // `fraud_belief_threshold` de 0.7 — a regra flag_fraud TEM de disparar.
+        let cf = execute(
+            "SIMULATE ADD EDGE (\"p1\", \"p2\", \"fraud_partner\") THEN DECIDE ()",
+            &be,
+        )
+        .unwrap();
+        assert!(
+            ids(&cf).contains(&"flag_fraud:p1->p2".to_string()),
+            "o DECIDE dentro do SIMULATE tem de ver a aresta contrafactual: {:?}",
+            ids(&cf)
+        );
+
+        // Simetria com as funcoes irmas: HYPOTHESES ja via o overlay.
+        let hyp = execute(
+            "SIMULATE ADD EDGE (\"p1\", \"p2\", \"fraud_partner\") \
+             THEN HYPOTHESES (\"p1\", \"p2\", \"fraud_partner\")",
+            &be,
+        )
+        .unwrap();
+        assert_eq!(hyp["alive"], serde_json::json!(true));
+
+        // E o inverso: remover a aresta que EXISTE tem de calar a regra.
+        let dir2 = tempfile::tempdir().unwrap();
+        let log2 = Arc::new(Log::open(dir2.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        log2.append(edge("p1", "p2", "fraud_partner", "0.9"))
+            .unwrap();
+        let be2 = LogBackend::new(log2);
+        let real = execute("DECIDE ()", &be2).unwrap();
+        assert!(
+            ids(&real).contains(&"flag_fraud:p1->p2".to_string()),
+            "a aresta real dispara: {:?}",
+            ids(&real)
+        );
+        let removed = execute(
+            "SIMULATE REMOVE EDGE (\"p1\", \"p2\", \"fraud_partner\") THEN DECIDE ()",
+            &be2,
+        )
+        .unwrap();
+        assert!(
+            !ids(&removed).contains(&"flag_fraud:p1->p2".to_string()),
+            "remover a aresta no contrafactual cala a regra: {:?}",
+            ids(&removed)
+        );
+    }
+
+    #[test]
+    fn simulate_then_decide_nao_toca_na_realidade() {
+        // Auditoria 2026-09-05 (A33): o DECIDE contrafactual passa a disparar,
+        // mas continua a ser uma pergunta: o `append` do VirtualBackend e
+        // no-op, logo nenhum evento Action entra no log e um DECIDE real
+        // seguinte nao o ve como ja tomado (nada em `skipped`).
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        let mut e = Episode::new("ag", EventKind::Observation, vec![]);
+        e.attrs.insert("edge_from".into(), "p1".into());
+        e.attrs.insert("edge_to".into(), "p2".into());
+        e.attrs.insert("edge_type".into(), "socio_de".into());
+        e.attrs.insert("confidence".into(), "1.0".into());
+        log.append(e).unwrap();
+        let be = LogBackend::new(log);
+
+        let cf = execute(
+            "SIMULATE ADD EDGE (\"p1\", \"p2\", \"fraud_partner\") THEN DECIDE ()",
+            &be,
+        )
+        .unwrap();
+        assert!(!cf["fired"].as_array().unwrap().is_empty());
+
+        let acoes = execute("MATCH (n:Action) RETURN n", &be).unwrap();
+        assert!(
+            acoes.as_array().unwrap().is_empty(),
+            "o contrafactual nao escreve no log: {acoes}"
+        );
+        let real = execute("DECIDE ()", &be).unwrap();
+        assert!(real["fired"].as_array().unwrap().is_empty());
+        assert!(
+            real["skipped"].as_array().unwrap().is_empty(),
+            "nada foi dado como ja decidido: {real}"
+        );
+    }
+
+    #[test]
+    fn decide_as_of_nao_ve_o_futuro() {
+        // Auditoria 2026-09-05 (A33): trocar o replay por `graph()` transfere o
+        // corte temporal do varrimento para o `as_of` de `decision::evaluate`.
+        // Este teste fixa a fronteira EXCLUSIVA (`AS OF LSN k` observa [0, k)),
+        // a mesma de todas as outras leituras — sem ele, o fix trocaria uma
+        // resposta errada (o contrafactual) por outra (o AS OF a ver o futuro).
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        let edge = |from: &str, to: &str, etype: &str, conf: &str| {
+            let mut e = Episode::new("ag", EventKind::Observation, vec![]);
+            e.attrs.insert("edge_from".into(), from.into());
+            e.attrs.insert("edge_to".into(), to.into());
+            e.attrs.insert("edge_type".into(), etype.into());
+            e.attrs.insert("confidence".into(), conf.into());
+            e
+        };
+        // LSN 0..3: estrela H com 4 folhas (dispara flag_anomaly:H).
+        for leaf in ["L1", "L2", "L3", "L4"] {
+            log.append(edge("H", leaf, "socio_de", "1.0")).unwrap();
+        }
+        // LSN 4: a aresta de fraude, DEPOIS da fronteira que vamos usar.
+        let lsn_fraude = log.append(edge("X", "Y", "fraud_partner", "0.9")).unwrap();
+        assert_eq!(lsn_fraude, 4);
+        let be = LogBackend::new(log);
+
+        let ids = |v: &serde_json::Value| -> Vec<String> {
+            v["fired"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a["action_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // AS OF LSN 4 = os LSN [0, 4): a estrela ja existe, a fraude ainda nao.
+        let antes = ids(&execute("DECIDE () AS OF LSN 4", &be).unwrap());
+        assert!(antes.contains(&"flag_anomaly:H".to_string()), "{antes:?}");
+        assert!(
+            !antes.contains(&"flag_fraud:X->Y".to_string()),
+            "a aresta do LSN 4 esta FORA de [0, 4): {antes:?}"
+        );
+
+        // AS OF LSN 5 ja a inclui.
+        let depois = ids(&execute("DECIDE () AS OF LSN 5", &be).unwrap());
+        assert!(
+            depois.contains(&"flag_fraud:X->Y".to_string()),
+            "a aresta do LSN 4 esta dentro de [0, 5): {depois:?}"
+        );
+
+        // AS OF LSN 0 = estado vazio.
+        let vazio = execute("DECIDE () AS OF LSN 0", &be).unwrap();
+        assert!(ids(&vazio).is_empty(), "estado vazio: {vazio}");
+    }
+
+    #[test]
     fn graph_analytics_via_gql() {
         // M14: two fraud rings; COMMUNITY/METRICS detect and score them.
         let dir = tempfile::tempdir().unwrap();
