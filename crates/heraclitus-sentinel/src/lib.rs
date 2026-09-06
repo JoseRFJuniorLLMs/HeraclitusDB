@@ -1479,6 +1479,44 @@ impl SentinelRuntime {
             None,
             10_000,
         )?;
+        // Auditoria 2026-09-05, A39 — estas duas varreduras estavam DENTRO do
+        // ciclo, com argumentos que só dependem de `authorized` e nunca da
+        // decisão a ser examinada: o custo era O(D × log) para um trabalho que
+        // é O(log). O compilador não as podia içar, porque `l4_events` faz I/O.
+        //
+        // A equivalência é exacta e não é acidental: o predicado antigo era
+        // `.filter(proposal_id igual).any(acção igual)`, e `authorized.action`
+        // é constante no ciclo — logo o conjunto dos `proposal_id` cuja
+        // proposta tem ESTA acção decide o mesmo que o `.any(...)` decidia,
+        // incluindo o caso de várias propostas partilharem o mesmo id.
+        let propostas_com_a_accao: std::collections::BTreeSet<String> = self
+            .l4_events(
+                Some("SecurityActionProposal"),
+                Some(&authorized.incident_id),
+                None,
+                10_000,
+            )?
+            .into_iter()
+            .filter_map(|(_, episode)| {
+                let proposal_id = episode.attrs.get("sentinel.action_proposal_id")?.clone();
+                let proposal = serde_json::from_slice::<ActionProposal>(&episode.content).ok()?;
+                (proposal.action == authorized.action).then_some(proposal_id)
+            })
+            .collect();
+        let aprovacoes_concedidas: std::collections::BTreeSet<String> = self
+            .l4_events(
+                Some("SecurityApproval"),
+                Some(&authorized.incident_id),
+                None,
+                10_000,
+            )?
+            .into_iter()
+            .filter_map(|(_, episode)| {
+                (episode.attrs.get("sentinel.approved").map(String::as_str) == Some("true"))
+                    .then(|| episode.attrs.get("sentinel.approval_id").cloned())
+                    .flatten()
+            })
+            .collect();
         for (_, decision_episode) in decisions {
             let Ok(payload) =
                 serde_json::from_slice::<serde_json::Value>(&decision_episode.content)
@@ -1498,26 +1536,7 @@ impl SentinelRuntime {
             else {
                 continue;
             };
-            let proposal_matches = self
-                .l4_events(
-                    Some("SecurityActionProposal"),
-                    Some(&authorized.incident_id),
-                    None,
-                    10_000,
-                )?
-                .into_iter()
-                .filter(|(_, episode)| {
-                    episode
-                        .attrs
-                        .get("sentinel.action_proposal_id")
-                        .map(String::as_str)
-                        == Some(proposal_id)
-                })
-                .any(|(_, episode)| {
-                    serde_json::from_slice::<ActionProposal>(&episode.content)
-                        .map(|proposal| proposal.action == authorized.action)
-                        .unwrap_or(false)
-                });
+            let proposal_matches = propostas_com_a_accao.contains(proposal_id);
             if !proposal_matches {
                 continue;
             }
@@ -1539,23 +1558,7 @@ impl SentinelRuntime {
                 if authorized.authorization_id != format!("authz-{approval_id}") {
                     continue;
                 }
-                let approved = self
-                    .l4_events(
-                        Some("SecurityApproval"),
-                        Some(&authorized.incident_id),
-                        None,
-                        10_000,
-                    )?
-                    .into_iter()
-                    .any(|(_, episode)| {
-                        episode
-                            .attrs
-                            .get("sentinel.approval_id")
-                            .map(String::as_str)
-                            == Some(approval_id)
-                            && episode.attrs.get("sentinel.approved").map(String::as_str)
-                                == Some("true")
-                    });
+                let approved = aprovacoes_concedidas.contains(approval_id);
                 if approved {
                     return Ok(());
                 }
@@ -1745,50 +1748,93 @@ impl SentinelRuntime {
         as_of_lsn: Option<Lsn>,
         limit: usize,
     ) -> Result<Vec<(Lsn, Episode)>, SentinelError> {
+        // A MESMA janela de `incident_revisions_as_of`, de propósito: dois
+        // tectos diferentes para o mesmo padrão divergiriam com o tempo.
+        const JANELA: usize = 20_000;
+        self.l4_events_com_janela(kind, incident_id, as_of_lsn, limit, JANELA)
+    }
+
+    /// Auditoria 2026-09-05, A39 — o corpo de `l4_events`, com a janela
+    /// injectável para o teste de equivalência poder exercitar as fronteiras
+    /// dos lotes com um log pequeno.
+    ///
+    /// O que se corrige é a materialização, exactamente como já se corrigiu em
+    /// `incident_revisions_as_of`: o `scan(0, upper)` anterior devolvia um
+    /// `Vec` com TODOS os episódios do log — conteúdo incluído — antes de
+    /// filtrar a fracção minúscula que interessa, e o `limit` (validado a
+    /// entrada, cortado no `break`) só limitava a SAÍDA, nunca a leitura. Isto
+    /// é disparável por quatro rotas REST e um RPC de leitura, e a SPEC-0072
+    /// §10 proíbe `log.scan(0, head())` por escrito.
+    ///
+    /// O resultado é bit a bit o mesmo: `scan_capped` devolve por LSN
+    /// crescente, os lotes são contíguos e o predicado não mudou, portanto
+    /// saem as mesmas primeiras `limit` linhas na mesma ordem. O que muda é o
+    /// pico de memória: de O(log inteiro) para O(janela + resultado).
+    fn l4_events_com_janela(
+        &self,
+        kind: Option<&str>,
+        incident_id: Option<&str>,
+        as_of_lsn: Option<Lsn>,
+        limit: usize,
+        janela: usize,
+    ) -> Result<Vec<(Lsn, Episode)>, SentinelError> {
         if limit == 0 || limit > 10_000 {
             return Err(SentinelError::Config(
                 "l4 event limit deve estar entre 1 e 10000".into(),
             ));
         }
+        let janela = janela.max(1);
         let upper = as_of_lsn
             .map(|lsn| self.inner.log.head().min(lsn.saturating_add(1)))
             .unwrap_or_else(|| self.inner.log.head());
+        self.inner
+            .metrics
+            .l4_scans_total
+            .fetch_add(1, Ordering::Relaxed);
         let mut rows = Vec::new();
-        for (lsn, episode) in self.inner.log.scan(0, upper)? {
-            let EventKind::Custom(event_kind) = &episode.kind else {
-                continue;
-            };
-            if !matches!(
-                event_kind.as_str(),
-                "SecurityInvestigation"
-                    | "SecurityAiInvocation"
-                    | "SecurityActionProposal"
-                    | "SecurityPolicyDecision"
-                    | "SecurityApproval"
-                    | "SecurityActionResult"
-                    | "SecurityModelUpdate"
-                    | "SecurityRulesetUpdate"
-                    | "SecurityFeedback"
-            ) || !episode_is_generated(&episode)
-            {
-                continue;
-            }
-            if kind.is_some_and(|wanted| wanted != event_kind) {
-                continue;
-            }
-            if incident_id.is_some_and(|wanted| {
-                episode
-                    .attrs
-                    .get("sentinel.incident_id")
-                    .map(String::as_str)
-                    != Some(wanted)
-            }) {
-                continue;
-            }
-            rows.push((lsn, episode));
-            if rows.len() >= limit {
+        let mut cursor: Lsn = 0;
+        'fora: while cursor < upper {
+            let lote = self.inner.log.scan_capped(cursor, upper, janela)?;
+            let Some(&(ultimo, _)) = lote.last() else {
                 break;
+            };
+            for (lsn, episode) in lote {
+                let EventKind::Custom(event_kind) = &episode.kind else {
+                    continue;
+                };
+                if !matches!(
+                    event_kind.as_str(),
+                    "SecurityInvestigation"
+                        | "SecurityAiInvocation"
+                        | "SecurityActionProposal"
+                        | "SecurityPolicyDecision"
+                        | "SecurityApproval"
+                        | "SecurityActionResult"
+                        | "SecurityModelUpdate"
+                        | "SecurityRulesetUpdate"
+                        | "SecurityFeedback"
+                ) || !episode_is_generated(&episode)
+                {
+                    continue;
+                }
+                if kind.is_some_and(|wanted| wanted != event_kind) {
+                    continue;
+                }
+                if incident_id.is_some_and(|wanted| {
+                    episode
+                        .attrs
+                        .get("sentinel.incident_id")
+                        .map(String::as_str)
+                        != Some(wanted)
+                }) {
+                    continue;
+                }
+                rows.push((lsn, episode));
+                if rows.len() >= limit {
+                    break 'fora;
+                }
             }
+            cursor = ultimo.saturating_add(1);
         }
         Ok(rows)
     }
@@ -4643,6 +4689,178 @@ detection:
             ultimo.1.parents.len(),
             TECTO_EVIDENCIA_POR_SUJEITO,
             "os pais causais seguem a evidencia; era por aqui que o episodio inchava"
+        );
+        runtime.shutdown();
+    }
+
+    /// Um episodio derivado pelo Sentinel, do tipo pedido. `l4_events` so
+    /// aceita episodios que passem `episode_is_generated`.
+    fn episodio_l4(kind: &str, incident_id: &str, conteudo: Vec<u8>) -> Episode {
+        let mut episode = Episode::new("sentinel", EventKind::Custom(kind.into()), conteudo);
+        episode
+            .attrs
+            .insert("sentinel.generated".into(), "true".into());
+        episode
+            .attrs
+            .insert("sentinel.incident_id".into(), incident_id.into());
+        episode
+    }
+
+    /// Auditoria 2026-09-05, A39 — `l4_events` passou de `scan(0, upper)` (o
+    /// log INTEIRO em RAM antes de filtrar) para lotes de `scan_capped`. E uma
+    /// mudanca de memoria, nao de resultado: este teste prova a igualdade
+    /// contra o caminho antigo (janela = `usize::MAX` e literalmente a
+    /// varredura unica) com a janela a cair em cima, antes e depois de cada
+    /// fronteira de lote.
+    #[test]
+    fn l4_events_janelado_equivale_a_varredura_unica() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let runtime = SentinelRuntime::start(log.clone(), l3_config())
+            .unwrap()
+            .unwrap();
+        // Ruido tambem derivado, para nao ser normalizado e nao fazer o log
+        // crescer sozinho durante o teste.
+        for i in 0..40u32 {
+            if i % 3 == 0 {
+                log.append(episodio_l4(
+                    "SecurityApproval",
+                    if i % 2 == 0 { "inc-1" } else { "inc-2" },
+                    b"{}".to_vec(),
+                ))
+                .unwrap();
+            } else if i % 7 == 0 {
+                log.append(episodio_l4(
+                    "SecurityActionProposal",
+                    "inc-1",
+                    b"{}".to_vec(),
+                ))
+                .unwrap();
+            } else {
+                log.append(episodio_l4("Ruido", "inc-1", b"{}".to_vec()))
+                    .unwrap();
+            }
+        }
+        wait_for_catch_up(&runtime, &log);
+        let head = log.head();
+
+        for (kind, incidente) in [
+            (None, None),
+            (Some("SecurityApproval"), None),
+            (Some("SecurityApproval"), Some("inc-1")),
+            (None, Some("inc-2")),
+        ] {
+            for limite in [1usize, 3, 10_000] {
+                for as_of in [None, Some(0), Some(head / 2), Some(head)] {
+                    let chaves = |linhas: Vec<(Lsn, Episode)>| -> Vec<(Lsn, String, Vec<u8>)> {
+                        linhas
+                            .into_iter()
+                            .map(|(lsn, e)| (lsn, format!("{:?}", e.kind), e.content))
+                            .collect()
+                    };
+                    let oraculo = chaves(
+                        runtime
+                            .l4_events_com_janela(kind, incidente, as_of, limite, usize::MAX)
+                            .unwrap(),
+                    );
+                    for janela in [1usize, 2, 3, 7, 39, 40, 41, 20_000] {
+                        let janelado = chaves(
+                            runtime
+                                .l4_events_com_janela(kind, incidente, as_of, limite, janela)
+                                .unwrap(),
+                        );
+                        assert_eq!(
+                            janelado, oraculo,
+                            "janela={janela} kind={kind:?} inc={incidente:?} limite={limite} as_of={as_of:?}"
+                        );
+                    }
+                }
+            }
+        }
+        runtime.shutdown();
+    }
+
+    /// Auditoria 2026-09-05, A39 — `ensure_persisted_authorization` fazia DUAS
+    /// varreduras completas do log POR DECISAO de politica do incidente, com
+    /// argumentos invariantes do ciclo. O custo tem de ser independente do
+    /// numero de decisoes ja persistidas.
+    #[test]
+    fn autorizar_uma_accao_nao_escala_com_o_numero_de_decisoes() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let runtime = SentinelRuntime::start(log.clone(), l3_config())
+            .unwrap()
+            .unwrap();
+        let autorizada = AuthorizedAction {
+            authorization_id: "authz-nao-existe".into(),
+            incident_id: "inc-1".into(),
+            action: SecurityAction::BlockIp {
+                ip: "203.0.113.25".into(),
+                ttl_secs: 60,
+            },
+            constraints: ExecutionConstraints {
+                scope: "test".into(),
+                max_ttl_secs: Some(60),
+                requires_approval: false,
+                allow_retries: false,
+            },
+            evidence: Vec::new(),
+            policy_version: "response-policy-v1".into(),
+        };
+        let decisao = |i: usize| {
+            episodio_l4(
+                "SecurityPolicyDecision",
+                "inc-1",
+                serde_json::to_vec(&serde_json::json!({
+                    "policy_version": "response-policy-v1",
+                    "proposal_id": format!("p-{i}"),
+                    "decision": { "Approve": { "authorization_id": "authz-outra" } },
+                }))
+                .unwrap(),
+            )
+        };
+
+        let custo = |runtime: &SentinelRuntime| {
+            let antes = runtime.status().l4_scans_total;
+            // Falha de propósito (nenhuma proposta casa): o que se mede é o
+            // custo do caminho COMPLETO, que percorre todas as decisões.
+            assert!(runtime.ensure_persisted_authorization(&autorizada).is_err());
+            runtime.status().l4_scans_total - antes
+        };
+
+        log.append(decisao(0)).unwrap();
+        wait_for_catch_up(&runtime, &log);
+        let com_uma = custo(&runtime);
+
+        for i in 1..6 {
+            log.append(decisao(i)).unwrap();
+        }
+        wait_for_catch_up(&runtime, &log);
+        let com_seis = custo(&runtime);
+
+        assert_eq!(
+            com_uma, com_seis,
+            "o custo de autorizar tem de ser independente do numero de decisoes: {com_uma} vs {com_seis}"
+        );
+        assert_eq!(
+            com_seis, 3,
+            "tres varreduras: decisoes, propostas, aprovacoes"
         );
         runtime.shutdown();
     }

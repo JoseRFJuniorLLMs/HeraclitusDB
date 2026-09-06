@@ -46,6 +46,15 @@ pub struct SentinelMetrics {
     pub(crate) actions_denied_total: AtomicU64,
     pub(crate) actions_executed_total: AtomicU64,
     pub(crate) action_failures_total: AtomicU64,
+    /// Auditoria 2026-09-05, A39 — quantas varreduras do log a leitura de
+    /// registos L4 custou.
+    ///
+    /// Existe porque a alternativa era invisível: `ensure_persisted_authorization`
+    /// fazia UMA varredura por decisão de política do incidente, com argumentos
+    /// invariantes do ciclo, e nada no sistema o dizia. É este contador que
+    /// tranca a regressão — o custo de autorizar uma acção não pode voltar a
+    /// crescer com o número de decisões já persistidas.
+    pub(crate) l4_scans_total: AtomicU64,
     /// SPEC-0072 §24 — instrumentação do arranque.
     ///
     /// O arranque era uma caixa preta: a linha era `starting sentinel...` e a
@@ -213,6 +222,8 @@ pub struct SentinelStatus {
     pub actions_denied_total: u64,
     pub actions_executed_total: u64,
     pub action_failures_total: u64,
+    /// Auditoria 2026-09-05, A39 — varreduras do log feitas por `l4_events`.
+    pub l4_scans_total: u64,
     /// SPEC-0072 §24/§25 — o que o arranque fez, e quanto tempo levou cada fase.
     pub boot: BootReport,
 }
@@ -290,6 +301,7 @@ impl SentinelMetrics {
             actions_denied_total: self.actions_denied_total.load(Ordering::Acquire),
             actions_executed_total: self.actions_executed_total.load(Ordering::Acquire),
             action_failures_total: self.action_failures_total.load(Ordering::Acquire),
+            l4_scans_total: self.l4_scans_total.load(Ordering::Acquire),
             boot: self.boot.relatorio(),
         }
     }
