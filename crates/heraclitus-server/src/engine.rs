@@ -2679,19 +2679,34 @@ impl Engine {
             .map(|h| (h.id, h.lsn, h.score))
             .collect();
 
-        // Memtable hits join the text channel (freshest truth first).
-        let mut text_channel = mem_hits;
-        text_channel.extend(txt_hits);
-
         let reranker = LinearReranker {
             head_lsn: self.log.head(),
             ..Default::default()
         };
+        // Auditoria 2026-09-05, A10: a memtable entra como CANAL PRÓPRIO, não
+        // como cauda do canal BM25.
+        //
+        // Antes concatenavam-se as duas listas (`mem_hits` seguido de
+        // `txt_hits`) e entregava-se o resultado ao RRF como se fosse UM
+        // ranking. Mas o RRF lê a POSIÇÃO como relevância dentro da lista: os
+        // 200 hits da memtable ocupavam os ranks 0..199 e o TOPO do BM25
+        // começava no rank 200 — pior do que o último hit da memtable. Com mais
+        // de `RECALL_N` correspondências, o melhor documento do corpus por BM25
+        // ficava em 201.º e era eliminado pelo `.take(RECALL_N)` ANTES de o
+        // reranker o ver; quem decidia o corte era a contagem crua de
+        // substrings da memtable (que nem fronteiras de token respeita).
+        //
+        // Como canais separados, o topo de cada um fica no topo, e um id
+        // presente nos dois soma duas contribuições legítimas — o acordo entre
+        // canais que o RRF existe para premiar. Os sinais do reranker não
+        // mudam: o `retrieve` reconstrói `txt_by` na mesma ordem de precedência
+        // (memtable primeiro, BM25 a sobrepor-se).
         let ranked = retrieve(
             text,
             RecallInputs {
                 vector: Vec::new(), // no query embedding for raw text (no LLM in the engine)
-                text: text_channel,
+                text: txt_hits,
+                memtable_text: mem_hits,
                 activation: act_hits,
             },
             &reranker,
@@ -4734,6 +4749,82 @@ mod tests {
             heraclitus_query::execute("MATCH (n) WHERE n.cpf = \"00000000000\" RETURN n", &engine)
                 .unwrap();
         assert_eq!(r4.as_array().unwrap().len(), 0, "{r4:?}");
+    }
+
+    /// O MELHOR documento por BM25 desaparecia do `/recall` (auditoria
+    /// 2026-09-05, A10).
+    ///
+    /// O canal de texto era a CONCATENACAO de dois rankings independentes — a
+    /// memtable (contagem crua de ocorrencias) seguida do indice BM25 — numa
+    /// unica "lista" entregue ao RRF. Como o RRF le a POSICAO como relevancia
+    /// dentro da lista, os 200 hits da memtable ocupavam os ranks 0..199 e o
+    /// topo do canal BM25 comecava no rank 200: pior do que o ULTIMO hit da
+    /// memtable. Com mais de RECALL_N correspondencias, o melhor documento do
+    /// corpus por BM25 caia fora do corte `.take(RECALL_N)` ANTES de o
+    /// reranker o ver, e quem decidia o corte era a contagem crua de
+    /// substrings.
+    ///
+    /// Montagem: UM episodio curtissimo com o termo uma vez (topo do BM25 pela
+    /// normalizacao de comprimento, fundo da memtable que so conta
+    /// ocorrencias) e 250 episodios LONGOS com o termo tres vezes. O canal de
+    /// ativacao e neutralizado de proposito — um `touch` extra em cada
+    /// episodio de ruido poe o alvo em ultimo nesse canal — para o teste medir
+    /// SO o corte do canal de texto e nao a lotaria dos empates de recencia ao
+    /// milissegundo.
+    #[test]
+    fn o_melhor_do_canal_bm25_sobrevive_ao_corte_do_recall() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path());
+
+        // Curto e com UMA ocorrencia: o melhor BM25 do corpus, e o pior da
+        // memtable. Primeiro, para ser tambem o menos recente.
+        let alvo = Episode::new("ag", EventKind::Observation, b"fraude".to_vec());
+        let id_alvo = alvo.id.to_string();
+        engine.append(alvo).unwrap();
+
+        let enchimento = "processo administrativo interno arquivado ".repeat(40);
+        let mut ruido = Vec::new();
+        for i in 0..250 {
+            let corpo = format!("{enchimento} fraude fraude fraude caso {i}");
+            let e = Episode::new("ag", EventKind::Observation, corpo.into_bytes());
+            ruido.push(e.id);
+            engine.append(e).unwrap();
+        }
+
+        // Um acesso a mais em cada episodio de ruido: com dois acessos contra
+        // um, a massa de ativacao deles fica ESTRITAMENTE acima da do alvo, e o
+        // top-200 do canal de ativacao deixa o alvo de fora sem depender de
+        // desempates.
+        let recente = engine
+            .log
+            .read(engine.log.head() - 1)
+            .unwrap()
+            .unwrap()
+            .1
+            .ts_hlc
+            >> 16;
+        {
+            let act = engine.activation.read().unwrap();
+            for id in &ruido {
+                act.touch(*id, recente);
+            }
+        }
+
+        // k acima de RECALL_N: o que sai e exactamente o conjunto que
+        // sobreviveu ao corte da fusao, sem truncagem posterior.
+        let v = engine.recall("fraude", 250).unwrap();
+        let ids: Vec<String> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            ids.contains(&id_alvo),
+            "o documento com o melhor BM25 do corpus foi cortado antes do reranker \
+             ({} candidatos devolvidos)",
+            ids.len()
+        );
     }
 
     /// A guarda ao nivel do backend, sem passar pelo planner: um campo que o
