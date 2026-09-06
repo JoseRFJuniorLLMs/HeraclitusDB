@@ -98,6 +98,10 @@ pub struct ViewRegistry {
     names: Vec<String>,
     watermarks: HashMap<String, Lsn>,
     watermarks_vec: Vec<Lsn>,
+    /// As views deste registry NÃO descrevem o log (arranque com o replay
+    /// saltado). Enquanto estiver a `true`, `checkpoint()` é um no-op — ver
+    /// [`ViewRegistry::mark_unmaterialized`].
+    nao_materializado: bool,
 }
 
 impl ViewRegistry {
@@ -133,6 +137,7 @@ impl ViewRegistry {
             names: Vec::new(),
             watermarks,
             watermarks_vec: Vec::new(),
+            nao_materializado: false,
         })
     }
 
@@ -179,6 +184,63 @@ impl ViewRegistry {
         for wm in self.watermarks_vec.iter_mut() {
             *wm = 0;
         }
+    }
+
+    /// Declara que as views deste registry NÃO descrevem o log — arrancaram
+    /// vazias com o replay saltado (`HERACLITUS_SKIP_VIEW_REPLAY` /
+    /// `HERACLITUS_LOG_ONLY`) — e por isso nenhum snapshot delas pode ir para
+    /// disco até serem materializadas a partir do log.
+    ///
+    /// Auditoria 2026-09-05 (A50): zerar as watermarks (`reset_watermarks`) não
+    /// chegava. Nesse modo o banco continua a ACEITAR escritas, e cada append
+    /// vivo chega às views por `apply`, onde toda a view faz
+    /// `self.watermark = self.watermark.max(lsn)`. O watermark INTERNO — que é
+    /// a AUTORIDADE em [`catch_up`](ViewRegistry::catch_up), ver o comentário
+    /// lá — salta assim para o LSN corrente por cima de uma view sem histórico,
+    /// fora do alcance de `reset_watermarks`, que só zera a cópia do registry.
+    /// O checkpoint seguinte (o periódico ou o de shutdown) persistia o par
+    /// mentiroso ⟨conteúdo de um punhado de eventos, watermark alto⟩ e o
+    /// arranque normal seguinte replayava só a cauda: tudo o que estava abaixo
+    /// desse watermark ficava invisível às views PARA SEMPRE, sem um único
+    /// erro, e o estado errado era re-persistido em cada checkpoint.
+    ///
+    /// Um checkpoint que não descreve o log é PIOR do que checkpoint nenhum:
+    /// sem ele o arranque seguinte é lento (replay do log inteiro) mas
+    /// correcto. Daí o no-op em vez de uma escrita "melhor que nada".
+    ///
+    /// Também zera o estado das views (`View::reset`) e as watermarks, para que
+    /// a autoridade — o watermark interno — parta mesmo de 0 e não dependa de
+    /// ninguém se lembrar de chamar os dois métodos.
+    ///
+    /// A marca vive AQUI, e não numa bandeira do `Engine`, de propósito: é o
+    /// registry o dono dos snapshots, e há quem chame
+    /// [`checkpoint`](ViewRegistry::checkpoint) sem passar pelo
+    /// `Engine::checkpoint_views` — o `Engine::shred`. Baixa-se em
+    /// [`catch_up`](ViewRegistry::catch_up) e num
+    /// [`rebuild`](ViewRegistry::rebuild) integral, que são exactamente os dois
+    /// caminhos que voltam a pôr as views a descrever o log. O índice de
+    /// atributos tem o buraco IRMÃO e uma marca SEPARADA no `Engine`
+    /// (`attr_nao_materializado`, auditoria A47): `view rebuild` materializa as
+    /// views sem lhe tocar, logo baixar uma não pode baixar a outra.
+    pub fn mark_unmaterialized(&mut self) {
+        for v in self.views.iter_mut() {
+            v.reset();
+        }
+        self.reset_watermarks();
+        self.nao_materializado = true;
+    }
+
+    /// `true` enquanto as views não tiverem sido materializadas a partir do log
+    /// (ver [`mark_unmaterialized`](ViewRegistry::mark_unmaterialized)).
+    ///
+    /// É a face de LEITURA do invariante, para quem precise de saber se um
+    /// checkpoint vai ser gravado antes de o pedir — a inibição em si não
+    /// depende de ninguém a consultar: quem recusa é o
+    /// [`checkpoint`](ViewRegistry::checkpoint). O índice de atributos, que tem
+    /// o buraco irmão, é governado pela marca dele no `Engine`
+    /// (`attr_nao_materializado`, auditoria A47) e não por esta.
+    pub fn unmaterialized(&self) -> bool {
+        self.nao_materializado
     }
 
     /// Minimum watermark across views (safe prune point for the memtable).
@@ -264,12 +326,46 @@ impl ViewRegistry {
             }
             cur = last + 1;
         }
+        // O replay chegou ao fim sem erro: as views voltam a descrever o log e
+        // o checkpoint volta a ser seguro (Auditoria 2026-09-05, A50). Se o
+        // `?` acima tivesse saltado para fora, a marca ficava de pé — que é o
+        // lado conservador certo.
+        self.nao_materializado = false;
         self.sync_watermarks_map();
         self.persist_watermarks()?;
         Ok(applied)
     }
 
     /// `heraclitus-cli view rebuild --view X` — must always work from LSN 0.
+    ///
+    /// Auditoria 2026-09-05 (A50): um rebuild INTEGRAL (`view_name == None`)
+    /// BAIXA a marca de [`mark_unmaterialized`](ViewRegistry::mark_unmaterialized) —
+    /// reconstruiu todas as views do LSN 0, portanto elas voltaram a descrever
+    /// o log e não há razão para continuar a proibir o checkpoint. Um rebuild
+    /// de UMA view só não a baixa: as outras continuam como estavam.
+    ///
+    /// A primeira versão desta correcção decidiu o contrário — "o rebuild nunca
+    /// baixa a marca" — com o argumento de que quem grava o checkpoint (o
+    /// `Engine`) grava no MESMO passo o índice de atributos, que este método
+    /// não toca. Esse argumento não se sustenta e a decisão fazia um estrago
+    /// concreto:
+    /// - o índice de atributos tem a sua PRÓPRIA marca no `Engine`
+    ///   (`attr_nao_materializado`, auditoria A47) e a sua própria guarda em
+    ///   `checkpoint_attr`; não precisa de ser protegido pela marca das views;
+    /// - o único chamador vivo de rebuild-integral-seguido-de-checkpoint é o
+    ///   `Engine::shred` (crypto-shred, §3.10), e aí o índice de atributos é
+    ///   reconstruído do LSN 0 e gravado pelo próprio `shred`. Não havia
+    ///   nenhum buraco do attr para proteger — só o do shred a ser criado: com
+    ///   a marca de pé, o `views.checkpoint()` do shred virava um no-op
+    ///   silencioso, os snapshots PRÉ-shred (com o plaintext derivado da
+    ///   titular) ficavam em disco, o marcador `privacy-rebuild-required` era
+    ///   apagado a seguir e o arranque seguinte RESSUSCITAVA o plaintext
+    ///   depois de a chave ter sido destruída.
+    ///
+    /// Baixar a marca aqui é também o que restaura a recuperação documentada do
+    /// modo `HERACLITUS_SKIP_VIEW_REPLAY` ("as views ficam vazias até um
+    /// `view rebuild`"): sem isto, o fast-boot só voltava depois de um reinício
+    /// sem a variável.
     pub fn rebuild<L: EpisodeLog + ?Sized>(
         &mut self,
         log: &L,
@@ -308,12 +404,31 @@ impl ViewRegistry {
             }
             cur = last + 1;
         }
+        if view_name.is_none() {
+            // Todas as views foram reconstruídas do LSN 0: voltam a descrever o
+            // log e o checkpoint volta a ser seguro (auditoria 2026-09-05,
+            // A50 — ver o PORQUÊ na doc deste método). Com um nome, só uma foi
+            // reconstruída e as outras continuam por materializar.
+            self.nao_materializado = false;
+        }
         self.sync_watermarks_map();
         self.persist_watermarks()?;
         Ok(())
     }
 
     pub fn checkpoint(&mut self) -> Result<(), HeraclitusError> {
+        // Auditoria 2026-09-05 (A50): gravar snapshots de views que não
+        // descrevem o log corrompe o estado em disco de forma permanente e
+        // silenciosa — ver `mark_unmaterialized`. Saltar é a única opção
+        // segura; o arranque seguinte replaya o log inteiro (lento, CORRECTO).
+        if self.nao_materializado {
+            tracing::warn!(
+                "views não materializadas (replay saltado no arranque): checkpoint SALTADO \
+                 para não gravar snapshots que não descrevem o log; corre `view rebuild` \
+                 ou reinicia sem HERACLITUS_SKIP_VIEW_REPLAY"
+            );
+            return Ok(());
+        }
         for v in &self.views {
             v.checkpoint(&self.dir)?;
         }
