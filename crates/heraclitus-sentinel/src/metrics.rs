@@ -41,6 +41,16 @@ pub struct SentinelMetrics {
     /// que tranca a regressao, e e ele que da ao operador a razao varreduras por
     /// evento com que julgar o custo do L1.
     pub(crate) l1_evaluations_total: AtomicU64,
+    /// Auditoria 2026-09-05, A20 — perfis comportamentais copiados para o
+    /// candidato do L2.
+    ///
+    /// `evaluate_l2` trabalha sobre uma copia para que os sinais duraveis saiam
+    /// antes de o estado vivo avancar. Enquanto essa copia era o motor INTEIRO,
+    /// o custo crescia com o numero de entidades ja observadas e nada no sistema
+    /// o dizia. Dividido por `events_processed_total` da quanto estado se copia
+    /// por evento — que tem de ficar na ordem das unidades, nao da cardinalidade
+    /// do trafego.
+    pub(crate) l2_profiles_copied_total: AtomicU64,
     pub(crate) l0_latency_us: AtomicU64,
     pub(crate) l1_latency_ms: AtomicU64,
     pub(crate) l2_latency_ms: AtomicU64,
@@ -217,6 +227,9 @@ pub struct SentinelStatus {
     /// Auditoria 2026-09-05, A19 — varreduras completas do `RuleEngine`. Ver
     /// `SentinelMetrics::l1_evaluations_total`.
     pub l1_evaluations_total: u64,
+    /// Auditoria 2026-09-05, A20 — perfis copiados para o candidato do L2. Ver
+    /// `SentinelMetrics::l2_profiles_copied_total`.
+    pub l2_profiles_copied_total: u64,
     pub l0_latency_us: u64,
     pub l1_latency_ms: u64,
     pub l2_latency_ms: u64,
@@ -295,6 +308,7 @@ impl SentinelMetrics {
             normalization_errors_total: self.normalization_errors_total.load(Ordering::Acquire),
             catchup_passes_total: self.catchup_passes_total.load(Ordering::Acquire),
             l1_evaluations_total: self.l1_evaluations_total.load(Ordering::Acquire),
+            l2_profiles_copied_total: self.l2_profiles_copied_total.load(Ordering::Acquire),
             l0_latency_us: self.l0_latency_us.load(Ordering::Acquire),
             l1_latency_ms: self.l1_latency_ms.load(Ordering::Acquire),
             l2_latency_ms: self.l2_latency_ms.load(Ordering::Acquire),

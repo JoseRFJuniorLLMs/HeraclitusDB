@@ -98,6 +98,7 @@ pub use threat::{
     ThreatSighting, ThreatSourcePolicy, ThreatSourceRegistry, TlpLevel, TrustLevel,
 };
 
+use behavior::chaves_de_entidades;
 use heraclitus_core::{Episode, EventId, EventKind, HeraclitusError, Lsn};
 use heraclitus_log::subscribe::attach_subscriber_with_stop;
 use heraclitus_log::AnyLog;
@@ -3230,10 +3231,23 @@ fn evaluate_l2(
     // Work on a candidate copy.  Durable derived signals are appended before
     // the candidate replaces live state, closing the crash window where an
     // in-memory baseline advanced but its anomaly signal did not reach the log.
+    //
+    // Auditoria 2026-09-05, A20 — a cópia é SÓ das entidades que este evento
+    // toca (no máximo oito), e não do motor inteiro. As entradas passaram para
+    // antes da cópia porque são elas que dizem quais são essas entidades; o
+    // `Err` de `security_event_inputs` já era devolvido antes de qualquer
+    // mutação do motor vivo, portanto nada muda no comportamento observável
+    // além de se poupar a cópia. Ver `BehavioralEngine::extrair_entidades`.
+    let entradas = security_event_inputs(event, inner.config.l2.suspicious_severity)?;
+    let chaves = chaves_de_entidades(entradas.iter().map(|entrada| &entrada.entity));
     let mut candidate = engine
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
+        .extrair_entidades(&chaves);
+    inner
+        .metrics
+        .l2_profiles_copied_total
+        .fetch_add(candidate.numero_de_perfis() as u64, Ordering::Relaxed);
     let source_lsn = event
         .attributes
         .get("sec.source_lsn")
@@ -3255,7 +3269,7 @@ fn evaluate_l2(
         ),
     };
     let mut derived = Vec::new();
-    for mut input in security_event_inputs(event, inner.config.l2.suspicious_severity)? {
+    for mut input in entradas {
         input.suspicious |= rule_suspicious;
         let observation = match candidate.observe(
             security_event_lsn,
@@ -3386,9 +3400,14 @@ fn evaluate_l2(
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    *engine
+    // Auditoria 2026-09-05, A20 — no MESMO ponto de antes, depois de todos os
+    // appends duráveis, e a escrever de volta só as entidades trabalhadas. Um
+    // erro no ciclo acima sai pelo `?` e deita fora o parcial, deixando o motor
+    // vivo intocado — exactamente como o `*engine = candidate` fazia.
+    engine
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = candidate;
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .fundir_entidades(&chaves, candidate);
     Ok(())
 }
 
@@ -4645,6 +4664,96 @@ detection:
                 matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecuritySignal")
             }),
             "e o sinal tem de estar mesmo no log, nao so contado na metrica"
+        );
+    }
+
+    /// Auditoria 2026-09-05, A20 — o custo de uma avaliação L2 não pode crescer
+    /// com o número de entidades já observadas.
+    ///
+    /// `evaluate_l2` clonava o `BehavioralEngine` INTEIRO por evento — sete
+    /// mapas indexados por entidade, cada perfil com três mapas de features e um
+    /// `Vec<f64>` de até 4096 amostras —, e não há evicção de perfis: a
+    /// cardinalidade do tráfego é o único limite. O trabalho útil é no máximo
+    /// oito entidades, que é o que `security_event_inputs` devolve.
+    #[test]
+    fn evaluate_l2_nao_escala_com_a_cardinalidade() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let runtime = SentinelRuntime::start(
+            log,
+            SentinelConfig {
+                enabled: true,
+                mode: SentinelMode::Observe,
+                queue_capacity: 8,
+                worker_threads: 1,
+                pipeline_version: 2,
+                catch_up_batch: 32,
+                l2: SentinelL2Config {
+                    enabled: true,
+                    minimum_support: 1,
+                    learning_delay_events: 1,
+                    shadow_only: false,
+                    suspicious_severity: 9,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        // Semear as entidades DIRECTAMENTE no motor vivo: o que se mede é o
+        // custo da cópia, que só depende de quantas lá estão, e fazê-las passar
+        // pelo pipeline só acrescentaria espera e não-determinismo.
+        const RUIDO: u64 = 500;
+        {
+            let mut motor = runtime
+                .inner
+                .behavior_engine
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap();
+            for i in 0..RUIDO {
+                motor
+                    .observe(
+                        i + 1,
+                        EntityRef::new("user", format!("ruido-{i}")),
+                        BTreeMap::from([(FeatureId::new("bytes").unwrap(), i as f64)]),
+                        false,
+                    )
+                    .unwrap();
+            }
+        }
+
+        let antes = runtime.status().l2_profiles_copied_total;
+        let mut evento = SecurityEvent::unmapped(EventId::new(), SecuritySource::Auditd);
+        evento.user = Some(EntityRef::new("user", "alvo"));
+        evento.host = Some(EntityRef::new("host", "alvo"));
+        evaluate_l2(&runtime.inner, RUIDO + 1_000, &evento, false).unwrap();
+        let copiados = runtime.status().l2_profiles_copied_total - antes;
+        // A segunda chamada prova que o número não é um acaso da primeira: o
+        // motor já tem os perfis das duas entidades do evento, e continua a
+        // copiar-se só a si próprio.
+        let antes_da_segunda = runtime.status().l2_profiles_copied_total;
+        evaluate_l2(&runtime.inner, RUIDO + 2_000, &evento, false).unwrap();
+        let copiados_na_segunda = runtime.status().l2_profiles_copied_total - antes_da_segunda;
+        runtime.shutdown();
+
+        assert!(
+            copiados <= 8,
+            "o evento toca 2 entidades e o motor tem {RUIDO}: copiaram-se {copiados} perfis"
+        );
+        assert!(
+            copiados_na_segunda <= 8,
+            "na segunda passagem copiaram-se {copiados_na_segunda} perfis"
         );
     }
 

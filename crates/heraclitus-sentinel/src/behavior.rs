@@ -10,7 +10,7 @@
 use crate::event::{EntityRef, Outcome, SecurityEvent};
 use heraclitus_core::Lsn;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use thiserror::Error;
 
@@ -679,6 +679,68 @@ impl BehavioralEngine {
         })
     }
 
+    /// Auditoria 2026-09-05, A20 — um motor com SÓ as entidades pedidas.
+    ///
+    /// `evaluate_l2` trabalha sobre uma cópia para que os sinais duráveis saiam
+    /// antes de o estado vivo avançar. A atomicidade que isso exige é POR
+    /// ENTIDADE, não global: os seis mapas são todos indexados por
+    /// `entity_key`, `policy` é imutável, e nada em `observe_internal` liga
+    /// entidades distintas — `score`, `allow_rate` e `result` lêem só a chave
+    /// que estão a tratar. Um evento toca no máximo oito entidades
+    /// (`security_event_inputs`), mas o `clone()` do motor inteiro copiava um
+    /// perfil por entidade JÁ VISTA, e não há evicção de perfis: o custo crescia
+    /// sem tecto com a cardinalidade do tráfego.
+    pub(crate) fn extrair_entidades(&self, chaves: &BTreeSet<String>) -> Self {
+        Self {
+            policy: self.policy.clone(),
+            profiles: recortar(&self.profiles, chaves),
+            shadow_profiles: recortar(&self.shadow_profiles, chaves),
+            shadow_started_lsn: recortar(&self.shadow_started_lsn, chaves),
+            last_seen_lsn: recortar(&self.last_seen_lsn, chaves),
+            rate: recortar(&self.rate, chaves),
+            quarantine_remaining: recortar(&self.quarantine_remaining, chaves),
+        }
+    }
+
+    /// Auditoria 2026-09-05, A20 — escreve de volta as entidades trabalhadas.
+    ///
+    /// Só as `chaves` são tocadas; tudo o resto do motor vivo fica como estava.
+    /// O ramo de REMOÇÃO não é opcional: `observe_internal` apaga de
+    /// `shadow_profiles`/`shadow_started_lsn` quando promove um perfil, e de
+    /// `quarantine_remaining` quando a quarentena acaba. Uma fusão só de
+    /// inserção deixava perfis fantasma em shadow e quarentenas eternas — a
+    /// baseline corrompia-se em silêncio e os scores mudavam.
+    pub(crate) fn fundir_entidades(&mut self, chaves: &BTreeSet<String>, parcial: Self) {
+        let mut parcial = parcial;
+        fundir(&mut self.profiles, chaves, &mut parcial.profiles);
+        fundir(
+            &mut self.shadow_profiles,
+            chaves,
+            &mut parcial.shadow_profiles,
+        );
+        fundir(
+            &mut self.shadow_started_lsn,
+            chaves,
+            &mut parcial.shadow_started_lsn,
+        );
+        fundir(&mut self.last_seen_lsn, chaves, &mut parcial.last_seen_lsn);
+        fundir(&mut self.rate, chaves, &mut parcial.rate);
+        fundir(
+            &mut self.quarantine_remaining,
+            chaves,
+            &mut parcial.quarantine_remaining,
+        );
+    }
+
+    /// Auditoria 2026-09-05, A20 — quantos perfis este motor carrega.
+    ///
+    /// É a medida do que uma cópia custa. Serve `l2_profiles_copied_total`:
+    /// sem um número, a diferença entre copiar oito entidades e copiar a base
+    /// inteira não aparece em lado nenhum senão no relógio.
+    pub(crate) fn numero_de_perfis(&self) -> usize {
+        self.profiles.len() + self.shadow_profiles.len()
+    }
+
     fn observe_internal(
         &mut self,
         lsn: Lsn,
@@ -1006,6 +1068,51 @@ fn entity_key(entity: &EntityRef) -> String {
         entity.id.len(),
         entity.id
     )
+}
+
+/// Auditoria 2026-09-05, A20 — as chaves que um conjunto de entidades toca.
+///
+/// É a unidade de atomicidade do L2, e sai daqui para que `entity_key` — a
+/// identidade de que todos os seis mapas dependem — continue privada a este
+/// módulo. Duas entidades com a mesma chave contam uma vez, exactamente como
+/// `security_event_inputs` já as deduplica.
+pub(crate) fn chaves_de_entidades<'a>(
+    entidades: impl IntoIterator<Item = &'a EntityRef>,
+) -> BTreeSet<String> {
+    entidades.into_iter().map(entity_key).collect()
+}
+
+/// Copia de `mapa` apenas as entradas cujas chaves estão em `chaves`.
+fn recortar<V: Clone>(
+    mapa: &BTreeMap<String, V>,
+    chaves: &BTreeSet<String>,
+) -> BTreeMap<String, V> {
+    chaves
+        .iter()
+        .filter_map(|chave| mapa.get(chave).map(|valor| (chave.clone(), valor.clone())))
+        .collect()
+}
+
+/// Escreve `parcial` de volta em `mapa`, para as `chaves` e só para elas.
+///
+/// Uma chave AUSENTE do parcial significa que a operação a apagou de propósito
+/// (promoção de shadow, fim de quarentena), e por isso tem de sair também do
+/// mapa vivo. Isto é o oposto de um merge tolerante, e é intencional.
+fn fundir<V>(
+    mapa: &mut BTreeMap<String, V>,
+    chaves: &BTreeSet<String>,
+    parcial: &mut BTreeMap<String, V>,
+) {
+    for chave in chaves {
+        match parcial.remove(chave) {
+            Some(valor) => {
+                mapa.insert(chave.clone(), valor);
+            }
+            None => {
+                mapa.remove(chave);
+            }
+        }
+    }
 }
 
 fn splitmix64(value: u64) -> u64 {
@@ -1394,6 +1501,245 @@ mod tests {
         assert_eq!(
             score.score, esperado,
             "z legitimo tem de passar intacto pelo tecto"
+        );
+    }
+
+    /// Auditoria 2026-09-05, A20 — trabalhar sobre um RECORTE das entidades
+    /// tocadas e fundi-lo de volta tem de dar exactamente o mesmo motor que
+    /// trabalhar sobre um clone completo.
+    ///
+    /// As duas fases não são decorativas: são os dois sítios onde
+    /// `observe_internal` REMOVE entradas. A promoção de um shadow apaga de
+    /// `shadow_profiles` e de `shadow_started_lsn`; a saída de quarentena por
+    /// feedback confiável apaga de `quarantine_remaining`. Uma fusão só de
+    /// inserção passaria em tudo o resto e deixava perfis fantasma e
+    /// quarentenas eternas — em silêncio, e a mudar scores.
+    #[test]
+    fn o_recorte_por_entidade_equivale_ao_clone_completo() {
+        let politica = BaselinePolicy {
+            minimum_support: 2,
+            learning_delay_events: 1,
+            quarantine_period: 3,
+            shadow_only: false,
+            ..BaselinePolicy::default()
+        };
+        let mut motor = BehavioralEngine::new(politica).unwrap();
+
+        // Ruído: entidades que o evento NÃO toca. Se a fusão lhes mexesse — ou
+        // se o recorte as levasse e as trouxesse de volta alteradas — o
+        // `assert_eq!` do motor inteiro apanhava-o.
+        let mut lsn = 0u64;
+        for i in 0..20u64 {
+            lsn += 1;
+            motor
+                .observe(
+                    lsn,
+                    EntityRef::new("user", format!("ruido-{i}")),
+                    feature("bytes", i as f64),
+                    false,
+                )
+                .unwrap();
+        }
+
+        // FASE 1 — promoção. `promotion_support` = 2 + 1 = 3, portanto duas
+        // observações deixam-no em shadow e a terceira promove-o.
+        let promovido = EntityRef::new("user", "promovido");
+        let acompanhante = EntityRef::new("host", "acompanhante");
+        for _ in 0..2 {
+            lsn += 1;
+            motor
+                .observe(lsn, promovido.clone(), feature("bytes", 10.0), false)
+                .unwrap();
+        }
+        lsn += 1;
+        motor
+            .observe(lsn, acompanhante.clone(), feature("bytes", 1.0), false)
+            .unwrap();
+
+        let chaves = chaves_de_entidades([&promovido, &acompanhante]);
+        lsn += 1;
+        let observar = |motor: &mut BehavioralEngine, lsn: u64| {
+            motor
+                .observe(lsn, promovido.clone(), feature("bytes", 11.0), false)
+                .unwrap();
+            motor
+                .observe(lsn, acompanhante.clone(), feature("bytes", 2.0), false)
+                .unwrap();
+        };
+
+        // Referência: o caminho anterior, clone completo e substituição.
+        let mut esperado = motor.clone();
+        observar(&mut esperado, lsn);
+
+        let mut parcial = motor.extrair_entidades(&chaves);
+        assert_eq!(
+            parcial.numero_de_perfis(),
+            2,
+            "o recorte leva as DUAS entidades pedidas, nao as 22 que o motor tem"
+        );
+        observar(&mut parcial, lsn);
+        let mut obtido = motor.clone();
+        obtido.fundir_entidades(&chaves, parcial);
+
+        assert!(
+            esperado.profile(&promovido).is_some() && esperado.shadow_profile(&promovido).is_none(),
+            "a montagem tem de exercitar mesmo a promoção, senão o teste é vácuo"
+        );
+        assert!(
+            obtido == esperado,
+            "depois da promoção o motor fundido tem de ser igual ao do clone completo"
+        );
+
+        // FASE 2 — saída de quarentena, que é o outro `remove`.
+        let mut motor = obtido;
+        lsn += 1;
+        motor
+            .observe(lsn, promovido.clone(), feature("bytes", 12.0), true)
+            .unwrap();
+        assert!(
+            motor
+                .quarantine_remaining
+                .get(&entity_key(&promovido))
+                .copied()
+                .unwrap_or(0)
+                > 0,
+            "a montagem tem de deixar mesmo o perfil em quarentena"
+        );
+
+        let chaves = chaves_de_entidades([&promovido]);
+        lsn += 1;
+        let mut esperado = motor.clone();
+        esperado
+            .observe_trusted_feedback(lsn, promovido.clone(), feature("bytes", 13.0), false)
+            .unwrap();
+
+        let mut parcial = motor.extrair_entidades(&chaves);
+        parcial
+            .observe_trusted_feedback(lsn, promovido.clone(), feature("bytes", 13.0), false)
+            .unwrap();
+        let mut obtido = motor.clone();
+        obtido.fundir_entidades(&chaves, parcial);
+
+        assert_eq!(
+            esperado
+                .quarantine_remaining
+                .get(&entity_key(&promovido))
+                .copied()
+                .unwrap_or(0),
+            0,
+            "a montagem tem de exercitar mesmo a saída de quarentena"
+        );
+        assert!(
+            obtido == esperado,
+            "depois da saída de quarentena o motor fundido tem de ser igual ao do clone completo"
+        );
+    }
+
+    /// Auditoria 2026-09-05, A20 — o recorte tem de levar os SEIS mapas
+    /// indexados por entidade, não cinco.
+    ///
+    /// Esta verificação é estrutural de propósito. Esquecer um mapa não dá erro
+    /// de compilação (os campos que faltam vinham a zero num `Default`) e a
+    /// consequência de comportamento é indirecta: sem `last_seen_lsn` a guarda
+    /// de ordem deixa de ver o último LSN e um replay volta a ser incorporado;
+    /// sem `rate` o limitador reinicia a janela; sem `quarantine_remaining` um
+    /// perfil em quarentena volta a actualizar a baseline. Um teste de
+    /// comportamento só apanha cada um desses casos com a montagem exacta que
+    /// os provoca; a comparação directa apanha-os todos.
+    #[test]
+    fn o_recorte_leva_os_seis_mapas_da_entidade() {
+        let politica = BaselinePolicy {
+            minimum_support: 2,
+            learning_delay_events: 1,
+            quarantine_period: 3,
+            shadow_only: false,
+            ..BaselinePolicy::default()
+        };
+        let mut motor = BehavioralEngine::new(politica).unwrap();
+
+        // Duas entidades porque uma só não chega: depois de promovido, um perfil
+        // está em `profiles` OU em `shadow_profiles`, nunca nos dois.
+        let promovido = EntityRef::new("user", "promovido");
+        let em_shadow = EntityRef::new("host", "em-shadow");
+        let mut lsn = 0;
+        for _ in 0..3 {
+            lsn += 1;
+            motor
+                .observe(lsn, promovido.clone(), feature("bytes", 10.0), false)
+                .unwrap();
+        }
+        lsn += 1;
+        // Suspeito sobre um perfil já activo: é o que põe a entidade em
+        // quarentena, e portanto o que enche `quarantine_remaining`.
+        motor
+            .observe(lsn, promovido.clone(), feature("bytes", 99.0), true)
+            .unwrap();
+        lsn += 1;
+        motor
+            .observe(lsn, em_shadow.clone(), feature("bytes", 1.0), false)
+            .unwrap();
+
+        // Ruído, para que a igualdade abaixo não passe por os mapas estarem
+        // todos completos.
+        for i in 0..10u64 {
+            lsn += 1;
+            motor
+                .observe(
+                    lsn,
+                    EntityRef::new("user", format!("ruido-{i}")),
+                    feature("bytes", i as f64),
+                    false,
+                )
+                .unwrap();
+        }
+
+        let chaves = chaves_de_entidades([&promovido, &em_shadow]);
+        let parcial = motor.extrair_entidades(&chaves);
+
+        // Cada mapa é comparado com a sua própria restrição às chaves, e
+        // exige-se que nenhum esteja vazio — senão a comparação era vácua.
+        let mapas: [(&str, bool, bool); 6] = [
+            (
+                "profiles",
+                parcial.profiles == recortar(&motor.profiles, &chaves),
+                parcial.profiles.is_empty(),
+            ),
+            (
+                "shadow_profiles",
+                parcial.shadow_profiles == recortar(&motor.shadow_profiles, &chaves),
+                parcial.shadow_profiles.is_empty(),
+            ),
+            (
+                "shadow_started_lsn",
+                parcial.shadow_started_lsn == recortar(&motor.shadow_started_lsn, &chaves),
+                parcial.shadow_started_lsn.is_empty(),
+            ),
+            (
+                "last_seen_lsn",
+                parcial.last_seen_lsn == recortar(&motor.last_seen_lsn, &chaves),
+                parcial.last_seen_lsn.is_empty(),
+            ),
+            (
+                "rate",
+                parcial.rate == recortar(&motor.rate, &chaves),
+                parcial.rate.is_empty(),
+            ),
+            (
+                "quarantine_remaining",
+                parcial.quarantine_remaining == recortar(&motor.quarantine_remaining, &chaves),
+                parcial.quarantine_remaining.is_empty(),
+            ),
+        ];
+        for (nome, igual, vazio) in mapas {
+            assert!(igual, "o recorte perdeu o mapa `{nome}`");
+            assert!(
+                !vazio,
+                "a montagem tem de encher `{nome}`, senao a comparacao era vacua"
+            );
+        }
+        assert_eq!(
+            parcial.policy, motor.policy,
+            "a política é imutável e partilhada: o recorte tem de a levar intacta"
         );
     }
 }
