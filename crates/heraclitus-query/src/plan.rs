@@ -596,12 +596,43 @@ fn cmp_json(a: &Json, b: &Json, cmp: Cmp) -> bool {
 /// intervalos de LSN. Um facto sem valid time é atemporal e passa sempre.
 /// Lê primeiro os campos NATIVOS do Episode (FORMAT v4); attrs são o
 /// fallback de compatibilidade (a convenção pré-v4).
+///
+/// Auditoria 2026-09-05: a comparação é EXACTA em `u64`. O tempo do mundo é
+/// escolhido pelo cliente e não é validado em lado nenhum — em nanossegundos
+/// desde a época (~1,8e18) passa 2^53 e a mantissa de 53 bits do `f64`
+/// colapsava todos os valores de um mesmo quantum (256 ns), invertendo a
+/// comparação nas duas fronteiras: `valid_from = 2^53+1` casava em `t = 2^53`
+/// (o facto ainda não começou) e `valid_to = 2^53+1` deixava de casar em
+/// `t = 2^53` (ainda dentro do intervalo). As funções irmãs — o filtro de
+/// arestas aqui ao lado e o `temporal.rs` — sempre compararam em `u64`. O
+/// `f64` fica reservado ao único caso que o exige: um attr não inteiro
+/// ("1000.5"), que antes era aceite e não pode passar silenciosamente a
+/// atemporal.
 fn valid_at_matches(e: &Episode, t: u64) -> bool {
-    let num = |k: &str| e.attrs.get(k).and_then(|v| v.trim().parse::<f64>().ok());
-    let from = e.valid_from.map(|v| v as f64).or_else(|| num("valid_from"));
-    let to = e.valid_to.map(|v| v as f64).or_else(|| num("valid_to"));
-    let from_ok = from.is_none_or(|from| from <= t as f64);
-    let to_ok = to.is_none_or(|to| (t as f64) < to);
+    enum Limite {
+        Exacto(u64),
+        Aprox(f64),
+    }
+    let limite = |nativo: Option<u64>, chave: &str| -> Option<Limite> {
+        if let Some(v) = nativo {
+            return Some(Limite::Exacto(v));
+        }
+        let s = e.attrs.get(chave)?.trim();
+        s.parse::<u64>()
+            .ok()
+            .map(Limite::Exacto)
+            .or_else(|| s.parse::<f64>().ok().map(Limite::Aprox))
+    };
+    let from_ok = match limite(e.valid_from, "valid_from") {
+        None => true,
+        Some(Limite::Exacto(from)) => from <= t,
+        Some(Limite::Aprox(from)) => from <= t as f64,
+    };
+    let to_ok = match limite(e.valid_to, "valid_to") {
+        None => true,
+        Some(Limite::Exacto(to)) => t < to,
+        Some(Limite::Aprox(to)) => (t as f64) < to,
+    };
     from_ok && to_ok
 }
 
@@ -1936,5 +1967,72 @@ mod testes_rotulo_indice {
     fn kind_inexistente_da_zero_linhas() {
         let v = crate::execute("MATCH (n:Fantasma) RETURN n", &Divergente).unwrap();
         assert!(conteudos(&v).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod testes_valid_at_precisao {
+    //! Auditoria 2026-09-05: o VALID AT chega ao comparador como `u64` exacto,
+    //! mas `valid_at_matches` degradava as fronteiras para `f64` — a mantissa
+    //! de 53 bits colapsa todos os valores de um mesmo quantum e a comparacao
+    //! inverte-se acima de 2^53 (tempo do mundo em nanossegundos: ~1,8e18).
+    use super::*;
+    use heraclitus_core::{Episode, EventKind};
+
+    const DOIS_53: u64 = 9_007_199_254_740_992; // 2^53
+    const DOIS_53_MAIS_1: u64 = 9_007_199_254_740_993; // nao representavel em f64
+
+    fn facto() -> Episode {
+        Episode::new("ag", EventKind::Observation, b"facto".to_vec())
+    }
+
+    /// `2^53+1 as f64` arredonda para `2^53`, logo `from <= t` dava true onde a
+    /// semantica exacta diz false: o facto AINDA NAO comecou.
+    #[test]
+    fn fronteira_inferior_acima_de_2_53_e_exacta() {
+        let mut e = facto();
+        e.valid_from = Some(DOIS_53_MAIS_1);
+        assert!(
+            !valid_at_matches(&e, DOIS_53),
+            "o facto so passa a valer em 2^53+1"
+        );
+        assert!(valid_at_matches(&e, DOIS_53_MAIS_1));
+    }
+
+    /// O erro corta nos DOIS sentidos: aqui o f64 excluia um facto ainda valido.
+    #[test]
+    fn fronteira_superior_acima_de_2_53_e_exacta() {
+        let mut e = facto();
+        e.valid_to = Some(DOIS_53_MAIS_1);
+        assert!(
+            valid_at_matches(&e, DOIS_53),
+            "2^53 ainda esta dentro de [from, to)"
+        );
+        assert!(
+            !valid_at_matches(&e, DOIS_53_MAIS_1),
+            "[from, to) e meio-aberto"
+        );
+    }
+
+    /// O fallback de compatibilidade (attrs, convencao pre-v4) e inteiro na
+    /// esmagadora maioria dos casos — tem de ser lido em u64, como ja acontece
+    /// do lado do grafo (`temporal.rs`).
+    #[test]
+    fn fallback_por_attrs_inteiro_e_exacto() {
+        let mut e = facto();
+        e.attrs
+            .insert("valid_from".into(), DOIS_53_MAIS_1.to_string());
+        assert!(!valid_at_matches(&e, DOIS_53));
+        assert!(valid_at_matches(&e, DOIS_53_MAIS_1));
+    }
+
+    /// Sem regressao: um attr NAO inteiro continua a ser aceite pelo f64 — se
+    /// deixasse de o ser, o facto passava silenciosamente a atemporal.
+    #[test]
+    fn fallback_por_attrs_nao_inteiro_continua_a_valer() {
+        let mut e = facto();
+        e.attrs.insert("valid_from".into(), "1000.5".into());
+        assert!(!valid_at_matches(&e, 1000), "1000.5 <= 1000 e falso");
+        assert!(valid_at_matches(&e, 1001));
     }
 }
