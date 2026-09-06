@@ -706,10 +706,19 @@ impl VectorIndex {
             && (EF_CONSTRUCTION_MIN..=EF_CONSTRUCTION_MAX).contains(&snap.ef_construction)
             && n_nodes == snap.ids.len()
             && n_nodes == snap.lsns.len()
+            // A comparação é feita do lado do COMPRIMENTO, nunca somando sobre
+            // `level` (auditoria 2026-09-05, A51). `level` é um varint sem
+            // tecto lido do ficheiro: com `usize::MAX`, o `level + 1` que aqui
+            // estava transbordava e o próprio guarda anti-pânico entrava em
+            // pânico — dentro de `load_checkpoint`, ou seja no boot, por causa
+            // de um ficheiro puramente derivado. `checked_sub` sobre
+            // `neighbors.len()` (esse sim, o comprimento real de um Vec já
+            // alocado) devolve `None` para o vec vazio, pelo que subsume também
+            // a defesa do `!is_empty()` que aqui estava.
             && snap
                 .nodes
                 .iter()
-                .all(|n| n.neighbors.len() == n.level + 1 && !n.neighbors.is_empty())
+                .all(|n| n.neighbors.len().checked_sub(1) == Some(n.level))
             && snap
                 .entry
                 .map(|e| (e as usize) < n_nodes)
@@ -1706,6 +1715,48 @@ mod testes_coerencia_do_checkpoint {
             "checkpoint intacto tem de restaurar"
         );
         assert_eq!(bom.len(), 4);
+    }
+
+    /// Auditoria 2026-09-05, A51. O PROPRIO guarda de coerencia somava sobre um
+    /// valor nao confiavel: `n.neighbors.len() == n.level + 1`, com `level` a
+    /// vir do ficheiro como varint sem tecto. Com `level = usize::MAX` a soma
+    /// transbordava — e `overflow-checks = true` tambem no perfil release, logo
+    /// panico dentro de `load_checkpoint`, que sobe por `View::restore` ->
+    /// `ViewRegistry::catch_up` -> `Engine::open_with_boot`: o servidor nao
+    /// arrancava por causa de um ficheiro puramente derivado. Tem de degradar
+    /// para rebuild do log, como a funcao promete.
+    #[test]
+    fn checkpoint_com_nivel_absurdo_degrada_em_vez_de_transbordar() {
+        let dir = tempfile::tempdir().unwrap();
+        indice_com_quatro_pontos(dir.path());
+        assert!(
+            !restaurar_com_snapshot_envenenado(dir.path(), |snap| snap.nodes[0].level = usize::MAX),
+            "nivel absurdo degrada para rebuild, nao panica"
+        );
+
+        // O vec de vizinhos vazio continua recusado — `search_layer` indexa
+        // `neighbors[..len()-1]` e um vec vazio dava underflow em toda pesquisa
+        // futura. O `checked_sub` subsume esta defesa; o teste prende-a.
+        let dir = tempfile::tempdir().unwrap();
+        indice_com_quatro_pontos(dir.path());
+        assert!(
+            !restaurar_com_snapshot_envenenado(dir.path(), |snap| snap.nodes[0].neighbors.clear()),
+            "checkpoint com lista de vizinhos vazia degrada para rebuild"
+        );
+
+        // E a combinacao das duas: vec vazio COM `level = usize::MAX`. Um
+        // `wrapping_sub(1)` daria `usize::MAX`, que casa com o `level` do
+        // ficheiro — o snapshot passava a coerencia e `search_layer` ia
+        // indexar `neighbors[..len()-1]` num vec vazio.
+        let dir = tempfile::tempdir().unwrap();
+        indice_com_quatro_pontos(dir.path());
+        assert!(
+            !restaurar_com_snapshot_envenenado(dir.path(), |snap| {
+                snap.nodes[0].level = usize::MAX;
+                snap.nodes[0].neighbors.clear();
+            }),
+            "vec vazio com nivel usize::MAX nao pode passar por dar a volta"
+        );
     }
 
     /// Auditoria 2026-09-05, A26 (defesa em profundidade). `random_level`
