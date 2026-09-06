@@ -300,6 +300,17 @@ pub struct TemporalGraph {
     pub watermark: Lsn,
 }
 
+// Auditoria 2026-09-05 (A14/A17): arestas TOCADAS pelo último `match_edges`.
+//
+// Só existe em builds de teste. É a única forma determinista (sem relógio, logo
+// sem flakiness em CI) de provar que a procura por destino consulta o índice de
+// entrada `inn` em vez de varrer as E arestas do grafo — a diferença entre
+// O(deg_in(dst)) e O(E) não é observável no resultado, que é idêntico.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ARESTAS_TOCADAS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl TemporalGraph {
     pub fn new() -> Self {
         Self::default()
@@ -459,8 +470,23 @@ impl TemporalGraph {
 
     /// MATCH `(a)-[r:etype?]->(b) AS OF X` (M9): enumera arestas vivas em `as_of`
     /// que casam com os filtros opcionais de origem/tipo/destino. Ordem
-    /// determinística: por `from` então por `etype` (iteração de `BTreeMap`), ou
-    /// por `edge_id` quando varre o grafo inteiro. Corre por `min_confidence`.
+    /// determinística: por `from` então por `etype` (iteração de `BTreeMap`)
+    /// quando a origem é fixa, e por `edge_id` nos restantes casos. Corta por
+    /// `min_confidence`.
+    ///
+    /// # Qual das três adjacências se percorre
+    ///
+    /// Auditoria 2026-09-05 (A14/A17): só a ORIGEM tinha índice. Com destino
+    /// fixo e origem livre — `MATCH (a)-[r]->(b) WHERE b.id = "X"`, um padrão
+    /// GQL banal — varriam-se as E arestas do grafo para devolver `deg_in(X)`
+    /// linhas, com o `RwLock` do grafo temporal tomado em leitura, e sem que o
+    /// `LIMIT` travasse nada (o planeador só trunca depois de receber tudo). O
+    /// índice de entrada `inn` já existia, é mantido em `upsert_edge` na mesma
+    /// passagem de `out` (o único ponto de inserção de arestas) e sobrevive ao
+    /// checkpoint — só nunca era consultado.
+    ///
+    /// O varrimento completo fica reservado ao caso em que não há nem origem
+    /// nem destino, onde nenhum índice ajuda.
     pub fn match_edges(
         &self,
         src: Option<&str>,
@@ -471,6 +497,8 @@ impl TemporalGraph {
     ) -> Vec<EdgeMatch> {
         let mut out = Vec::new();
         let mut consider = |edge: &Edge| {
+            #[cfg(test)]
+            ARESTAS_TOCADAS.with(|c| c.set(c.get() + 1));
             if !edge.alive_at(as_of) {
                 return;
             }
@@ -498,25 +526,45 @@ impl TemporalGraph {
                 world_valid_to: edge.world_valid_to,
             });
         };
-        match src {
-            // Origem fixa: percorre só a adjacência de saída desse nó (rápido).
-            Some(s) => {
-                if let Some(types) = self.out.get(s) {
-                    for eids in types.values() {
-                        for eid in eids {
-                            if let Some(edge) = self.edges.get(eid) {
-                                consider(edge);
-                            }
+        // Origem fixa → adjacência de saída; senão destino fixo → adjacência de
+        // entrada; sem nenhum dos dois, não há índice que ajude.
+        let adjacencia = match (src, dst) {
+            (Some(s), _) => self.out.get(s),
+            (None, Some(d)) => self.inn.get(d),
+            (None, None) => None,
+        };
+        if src.is_some() || dst.is_some() {
+            if let Some(types) = adjacencia {
+                for (t, eids) in types {
+                    // Com o tipo conhecido nem se abrem os baldes dos outros
+                    // tipos do nó — o `consider` filtrava-os, mas só depois de
+                    // uma procura em `self.edges` por aresta descartada.
+                    if let Some(want) = etype {
+                        if want != t {
+                            continue;
+                        }
+                    }
+                    for eid in eids {
+                        if let Some(edge) = self.edges.get(eid) {
+                            consider(edge);
                         }
                     }
                 }
             }
-            // Sem origem: varre todas as arestas (ordenadas por edge_id).
-            None => {
-                for edge in self.edges.values() {
-                    consider(edge);
-                }
+        } else {
+            // Sem origem nem destino: varre todas as arestas (por edge_id).
+            for edge in self.edges.values() {
+                consider(edge);
             }
+        }
+
+        // A ordem é OBSERVÁVEL: o planeador aplica `LIMIT` sem exigir ORDER BY,
+        // logo mudá-la mudaria em silêncio que linhas o utilizador vê. O
+        // varrimento entregava por `edge_id` (chave do `BTreeMap` `edges`), mas
+        // `inn` guarda `Vec<EdgeId>` por tipo e por ordem de chegada — repõe-se
+        // aqui, sobre `deg_in(dst)` elementos (custo desprezável).
+        if src.is_none() && dst.is_some() {
+            out.sort_by(|a, b| a.edge_id.cmp(&b.edge_id));
         }
         out
     }
@@ -1845,6 +1893,294 @@ mod testes_csr {
             "fraccao na saida : {:.0}%  (nos={}, arestas=100000)",
             100.0 * saida.as_secs_f64() / completo.as_secs_f64(),
             a.metrics.len()
+        );
+    }
+}
+
+/// Auditoria 2026-09-05 (A14/A17): `match_edges` com DESTINO fixo e origem
+/// livre — o padrão GQL banal `MATCH (a)-[r]->(b) WHERE b.id = "X"` — varria as
+/// E arestas do grafo, apesar de o índice de entrada `inn` existir, ser mantido
+/// simetricamente com `out` em `upsert_edge` e sobreviver ao checkpoint.
+#[cfg(test)]
+mod testes_match_por_destino {
+    use super::tests::{edge, ver};
+    use super::*;
+
+    struct R(u64);
+    impl R {
+        fn p(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    fn tipo(i: usize) -> EdgeType {
+        match i % 6 {
+            0 => EdgeType::FraudPartner,
+            1 => EdgeType::SocioDe,
+            2 => EdgeType::Pagou,
+            3 => EdgeType::SimilarA,
+            4 => EdgeType::NotRelated,
+            _ => EdgeType::Custom("ligado_a".into()),
+        }
+    }
+
+    /// Liga `from -[etype]-> to` com o `edge_id` determinístico REAL
+    /// (`TemporalGraph::edge_id`). Importa que seja o real: a ordem de inserção
+    /// em `inn` (por tipo, depois por chegada) não coincide com a ordem
+    /// lexicográfica de `edge_id`, e é essa divergência que torna a ordem de
+    /// saída observável.
+    fn liga(
+        g: &mut TemporalGraph,
+        from: &str,
+        to: &str,
+        et: EdgeType,
+        vf: Lsn,
+        conf: f32,
+    ) -> EdgeId {
+        let id = TemporalGraph::edge_id(from, to, &et);
+        let v = ver(&format!("h-{id}"), conf, &et);
+        g.upsert_edge(edge(&id, from, to, et, vf), vec![v]);
+        id
+    }
+
+    /// Muito ruído e um destino raro: só 3 arestas chegam a "ALVO".
+    fn grafo_com_alvo(n_arestas: usize) -> TemporalGraph {
+        let mut g = TemporalGraph::new();
+        let mut r = R(2026);
+        for i in 0..n_arestas {
+            let a = r.p() % 4_000;
+            let b = r.p() % 4_000;
+            liga(
+                &mut g,
+                &format!("no-{a:05}"),
+                &format!("no-{b:05}"),
+                tipo(i),
+                0,
+                0.9,
+            );
+        }
+        // As únicas arestas de entrada de ALVO, de três tipos distintos.
+        for (i, de) in ["no-00007", "no-01234", "zz-ultimo"].iter().enumerate() {
+            liga(&mut g, de, "ALVO", tipo(i), 0, 0.9);
+        }
+        g
+    }
+
+    /// O defeito: procurar por destino custava O(E). Aqui conta-se o trabalho
+    /// REAL (arestas tocadas), não o relógio — determinista, sem flakiness.
+    #[test]
+    fn match_por_destino_nao_varre_o_grafo() {
+        let g = grafo_com_alvo(20_000);
+        let e = g.edges.len();
+        assert!(e > 15_000, "grafo de teste degenerou: {e} arestas");
+
+        ARESTAS_TOCADAS.with(|c| c.set(0));
+        let r = g.match_edges(None, None, Some("ALVO"), u64::MAX, 0.0);
+        let tocadas = ARESTAS_TOCADAS.with(|c| c.get());
+        assert_eq!(r.len(), 3, "ALVO tem exactamente 3 arestas de entrada");
+        assert!(
+            tocadas <= 8,
+            "procura por destino tocou {tocadas} arestas num grafo de {e}: \
+             o índice de entrada `inn` não foi usado (varrimento O(E))"
+        );
+
+        // Com o tipo conhecido, nem os baldes dos outros tipos do nó se abrem.
+        ARESTAS_TOCADAS.with(|c| c.set(0));
+        let r = g.match_edges(
+            None,
+            Some(&EdgeType::FraudPartner),
+            Some("ALVO"),
+            u64::MAX,
+            0.0,
+        );
+        let tocadas = ARESTAS_TOCADAS.with(|c| c.get());
+        assert_eq!(r.len(), 1, "só uma aresta FraudPartner chega a ALVO");
+        assert!(
+            tocadas <= 2,
+            "procura por destino+tipo tocou {tocadas} arestas num grafo de {e}"
+        );
+    }
+
+    /// O irmão menor do mesmo defeito: com ORIGEM fixa e tipo conhecido,
+    /// percorriam-se todos os tipos de aresta do nó em vez de só o pedido.
+    #[test]
+    fn match_por_origem_e_tipo_nao_abre_os_outros_tipos() {
+        let mut g = TemporalGraph::new();
+        for i in 0..6 {
+            liga(&mut g, "HUB", &format!("destino-{i}"), tipo(i), 0, 0.9);
+        }
+        ARESTAS_TOCADAS.with(|c| c.set(0));
+        let r = g.match_edges(Some("HUB"), Some(&EdgeType::SimilarA), None, u64::MAX, 0.0);
+        let tocadas = ARESTAS_TOCADAS.with(|c| c.get());
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].to, "destino-3");
+        assert!(
+            tocadas <= 1,
+            "com o tipo conhecido tocaram-se {tocadas} arestas das 6 do HUB"
+        );
+    }
+
+    /// Projecção comparável de um `EdgeMatch` (a crença por bits — nunca
+    /// igualdade de `f32` — e sem tocar no tipo público para lhe dar `PartialEq`).
+    type Linha = (
+        EdgeId,
+        EntityId,
+        EntityId,
+        EdgeType,
+        u32,
+        Option<u64>,
+        Option<u64>,
+    );
+
+    fn projecta(v: &[EdgeMatch]) -> Vec<Linha> {
+        v.iter()
+            .map(|m| {
+                (
+                    m.edge_id.clone(),
+                    m.from.clone(),
+                    m.to.clone(),
+                    m.etype.clone(),
+                    m.belief.to_bits(),
+                    m.world_valid_from,
+                    m.world_valid_to,
+                )
+            })
+            .collect()
+    }
+
+    /// Oráculo: o varrimento `self.edges.values()` que `match_edges` fazia
+    /// antes da correcção, com os MESMOS filtros. É contra isto que a versão
+    /// indexada tem de ser idêntica — elementos E ordem.
+    fn varrimento_referencia(
+        g: &TemporalGraph,
+        etype: Option<&EdgeType>,
+        dst: Option<&str>,
+        as_of: Lsn,
+        min_confidence: f32,
+    ) -> Vec<Linha> {
+        let mut out = Vec::new();
+        for e in g.edges.values() {
+            if !e.alive_at(as_of) {
+                continue;
+            }
+            if let Some(want) = etype {
+                if *want != e.etype {
+                    continue;
+                }
+            }
+            if let Some(d) = dst {
+                if e.to != d {
+                    continue;
+                }
+            }
+            let belief = g.belief_at(&e.id, as_of);
+            if belief < min_confidence {
+                continue;
+            }
+            out.push((
+                e.id.clone(),
+                e.from.clone(),
+                e.to.clone(),
+                e.etype.clone(),
+                belief.to_bits(),
+                e.world_valid_from,
+                e.world_valid_to,
+            ));
+        }
+        out
+    }
+
+    /// Grafo com tudo o que pode distinguir os dois caminhos: vários tipos,
+    /// arestas fechadas, arestas reabertas (`closed_intervals`), auto-aresta,
+    /// crenças variadas e valid time do mundo.
+    fn grafo_rico() -> TemporalGraph {
+        let mut g = TemporalGraph::new();
+        let mut r = R(99);
+        let destinos = ["alfa", "beto", "ALVO", "zeta"];
+        let mut ids: Vec<EdgeId> = Vec::new();
+        for i in 0..240 {
+            let de = format!("origem-{:03}", r.p() % 40);
+            let para = destinos[(r.p() % destinos.len() as u64) as usize];
+            let conf = (r.p() % 100) as f32 / 100.0;
+            ids.push(liga(&mut g, &de, para, tipo(i), 10, conf));
+        }
+        ids.push(liga(&mut g, "ALVO", "ALVO", EdgeType::SocioDe, 10, 0.8));
+
+        // Fecha um terço em LSN 50; reabre metade dessas em LSN 70 (R12).
+        let fechadas: Vec<EdgeId> = ids.iter().step_by(3).cloned().collect();
+        for id in &fechadas {
+            g.close_edge(id, 50);
+        }
+        for id in fechadas.iter().step_by(2) {
+            let e = g.edges.get(id).cloned().expect("aresta fechada existe");
+            g.upsert_edge(
+                Edge {
+                    valid_from_lsn: 70,
+                    ..e
+                },
+                vec![],
+            );
+        }
+        // Valid time do mundo em algumas — viaja no `EdgeMatch`.
+        for id in ids.iter().step_by(7) {
+            if let Some(e) = g.edges.get_mut(id) {
+                e.world_valid_from = Some(100);
+                e.world_valid_to = Some(200);
+            }
+        }
+        g
+    }
+
+    /// A melhoria não pode mudar a resposta: mesmos elementos e MESMA ORDEM
+    /// (o LIMIT do planeador corta pelo prefixo, logo a ordem é observável).
+    #[test]
+    fn match_por_destino_equivale_ao_varrimento() {
+        let g = grafo_rico();
+        let tipos: Vec<Option<EdgeType>> = std::iter::once(None)
+            .chain((0..6).map(|i| Some(tipo(i))))
+            .collect();
+        let mut nao_vazios = 0usize;
+        for d in ["alfa", "beto", "ALVO", "zeta", "inexistente"] {
+            for t in &tipos {
+                for as_of in [0u64, 40, 60, 80, u64::MAX] {
+                    for mc in [0.0f32, 0.5, 0.95] {
+                        let obtido = projecta(&g.match_edges(None, t.as_ref(), Some(d), as_of, mc));
+                        let esperado = varrimento_referencia(&g, t.as_ref(), Some(d), as_of, mc);
+                        assert_eq!(
+                            obtido, esperado,
+                            "divergiu em dst={d} etype={t:?} as_of={as_of} mc={mc}"
+                        );
+                        nao_vazios += usize::from(!esperado.is_empty());
+                    }
+                }
+            }
+        }
+        assert!(
+            nao_vazios >= 40,
+            "grafo de teste demasiado esparso: só {nao_vazios} casos com resultados"
+        );
+
+        // A ordem só é observável se um destino receber arestas de VÁRIOS
+        // tipos: sem o `sort_by(edge_id)` final, `inn` devolvê-las-ia agrupadas
+        // por tipo. Garantir que o grafo de teste exercita esse caso.
+        let alvo = g.match_edges(None, None, Some("ALVO"), u64::MAX, 0.0);
+        assert!(
+            alvo.len() > 10,
+            "ALVO recebeu poucas arestas: {}",
+            alvo.len()
+        );
+        let tipos_no_alvo: BTreeSet<EdgeType> = alvo.iter().map(|m| m.etype.clone()).collect();
+        assert!(
+            tipos_no_alvo.len() >= 3,
+            "ALVO só recebeu {} tipos distintos",
+            tipos_no_alvo.len()
+        );
+        assert!(
+            alvo.windows(2).all(|w| w[0].edge_id < w[1].edge_id),
+            "a saída por destino tem de vir ordenada por edge_id"
         );
     }
 }
