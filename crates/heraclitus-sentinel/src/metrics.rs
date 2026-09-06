@@ -19,6 +19,15 @@ pub struct SentinelMetrics {
     pub(crate) risk_assessments_emitted_total: AtomicU64,
     pub(crate) incidents_created_total: AtomicU64,
     pub(crate) incident_revisions_emitted_total: AtomicU64,
+    /// Auditoria 2026-09-05, A36 — sinais que o motor de incidentes recusou
+    /// por saturacao (`CorrelationError::IncidentCapacity`).
+    ///
+    /// Deliberadamente SEPARADO de `normalization_errors_total`: perder
+    /// correlacao por um incidente cheio e materialmente diferente de saltar
+    /// um replay idempotente, e o operador tem de conseguir distinguir os
+    /// dois. Este contador a subir quer dizer que ha evidencia a ser
+    /// descartada — nao que o pipeline esta parado.
+    pub(crate) incident_capacity_drops_total: AtomicU64,
     pub(crate) normalization_skipped_total: AtomicU64,
     pub(crate) normalization_errors_total: AtomicU64,
     pub(crate) queue_overflow_total: AtomicU64,
@@ -181,6 +190,9 @@ pub struct SentinelStatus {
     pub risk_assessments_emitted_total: u64,
     pub incidents_created_total: u64,
     pub incident_revisions_emitted_total: u64,
+    /// Auditoria 2026-09-05, A36 — sinais recusados por saturacao do motor de
+    /// incidentes. Ver `SentinelMetrics::incident_capacity_drops_total`.
+    pub incident_capacity_drops_total: u64,
     pub normalization_skipped_total: u64,
     pub normalization_errors_total: u64,
     pub catchup_passes_total: u64,
@@ -252,6 +264,9 @@ impl SentinelMetrics {
             incidents_created_total: self.incidents_created_total.load(Ordering::Acquire),
             incident_revisions_emitted_total: self
                 .incident_revisions_emitted_total
+                .load(Ordering::Acquire),
+            incident_capacity_drops_total: self
+                .incident_capacity_drops_total
                 .load(Ordering::Acquire),
             normalization_skipped_total: self.normalization_skipped_total.load(Ordering::Acquire),
             normalization_errors_total: self.normalization_errors_total.load(Ordering::Acquire),

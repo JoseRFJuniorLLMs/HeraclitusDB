@@ -3266,19 +3266,70 @@ fn evaluate_l3(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     });
-    let (ingest, incident) = {
+    let resultado = {
         let mut engine = incident_engine
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let ingest =
-            engine.ingest_signal_with_graph_as_of(signal, graph.as_deref(), signal_episode_lsn)?;
-        let incident = engine
-            .incident(&ingest.incident_id)
-            .cloned()
-            .ok_or_else(|| SentinelError::Worker("incidente ingerido não encontrado".into()))?;
-        (ingest, incident)
+        match engine.ingest_signal_with_graph_as_of(signal, graph.as_deref(), signal_episode_lsn) {
+            Ok(ingest) => {
+                let incident = engine
+                    .incident(&ingest.incident_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        SentinelError::Worker("incidente ingerido não encontrado".into())
+                    })?;
+                Some((ingest, incident))
+            }
+            // ISTO ERA O IMPASSE DO L3 — Auditoria 2026-09-05, A36. É o irmão
+            // exacto do impasse do L2 tratado em `evaluate_l2`, e ficara por
+            // corrigir aqui.
+            //
+            // Mecanismo: `IncidentEngine` recusa com `IncidentCapacity` quando
+            // o incidente atinge `max_signals_per_incident` (ou o mapa atinge
+            // `max_incidents`). O `?` transformava essa recusa do MOTOR numa
+            // falha do LOTE; como `process_until` só comita o cursor no fim do
+            // trabalho de cada LSN, o cursor ficava NESSE LSN e o
+            // `worker_loop` limitava-se a repetir. E a repetição dá o MESMO
+            // erro: `signal_index` — que deduplica os sinais já ingeridos — só
+            // é escrito DEPOIS do teste de capacidade, portanto o sinal
+            // recusado nunca lá entra. Estado absorvente: a detecção inteira
+            // (L0, L1, L2, normalização) parava, e reiniciar piorava, porque
+            // `passagem_de_sinais` reproduz o mesmo sinal no arranque.
+            //
+            // Uma recusa por saturação é determinística e irrecuperável por
+            // retentativa: tratá-la como falha do lote nunca pode progredir.
+            // Avançamos o cursor e contamos a perda numa métrica DEDICADA —
+            // não em `normalization_errors_total`, porque perder correlação é
+            // materialmente diferente de saltar um replay idempotente e o
+            // operador tem de conseguir distinguir os dois.
+            //
+            // Isto resolve o IMPASSE, não a SATURAÇÃO: um incidente cheio
+            // continua a nunca mais enriquecer e nunca é purgado. A rotação do
+            // incidente saturado muda semântica de correlação e formato de
+            // snapshot — fica para achado próprio.
+            Err(CorrelationError::IncidentCapacity(limite)) => {
+                inner
+                    .metrics
+                    .incident_capacity_drops_total
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    signal_id = %signal.signal_id,
+                    lsn = signal_episode_lsn,
+                    limite,
+                    "L3: motor de incidentes saturado; sinal não foi correlacionado — o cursor avança"
+                );
+                None
+            }
+            // Qualquer outro `CorrelationError` (score inválido, entidade
+            // inválida) é erro de DADOS do sinal, não saturação de estado, e
+            // continua a subir. Engolir tudo aqui esconderia defeitos reais.
+            Err(outro) => return Err(outro.into()),
+        }
     };
     drop(graph);
+    let Some((ingest, incident)) = resultado else {
+        return Ok(());
+    };
 
     let revision_id = incident.revision_id()?;
     let mut revisions = inner
@@ -4342,6 +4393,122 @@ detection:
         assert_eq!(count_custom(&log, "SecurityRiskAssessment"), 1);
         assert_eq!(runtime.status().risk_assessments_emitted_total, 1);
         assert_eq!(runtime.status().incidents_created_total, 1);
+        runtime.shutdown();
+    }
+
+    /// Auditoria 2026-09-05, A36 — um motor de incidentes SATURADO recusava o
+    /// sinal com `IncidentCapacity`, o `?` de `evaluate_l3` transformava isso
+    /// em falha do LOTE, o cursor congelava nesse LSN e o worker repetia para
+    /// sempre. Como `signal_index` so guarda os sinais que ENTRARAM, a
+    /// retentativa reapresentava o mesmo sinal e recebia o mesmo erro: estado
+    /// absorvente, com a deteccao inteira parada.
+    #[test]
+    fn l3_saturado_nao_congela_o_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let runtime = SentinelRuntime::start(log.clone(), l3_config())
+            .unwrap()
+            .unwrap();
+        // Tecto de 1 sinal por incidente: o segundo sinal do mesmo sujeito
+        // (`User:alice`, que o helper `signal` ja usa) cai no ramo de
+        // enriquecimento e bate na capacidade. Sem isto, o teste precisaria de
+        // 4096 sinais para exercitar o mesmo caminho.
+        {
+            let mut engine = runtime
+                .inner
+                .incident_engine
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap();
+            *engine = IncidentEngine::new(IncidentPolicy {
+                max_signals_per_incident: 1,
+                graph_path_depth: 6,
+                ..IncidentPolicy::default()
+            });
+        }
+
+        log.append(
+            signal("sig-1", 0, EventId::new(), 0.75)
+                .into_episode()
+                .unwrap(),
+        )
+        .unwrap();
+        log.append(
+            signal("sig-2", 1, EventId::new(), 0.75)
+                .into_episode()
+                .unwrap(),
+        )
+        .unwrap();
+        wait_for_catch_up(&runtime, &log);
+
+        assert_eq!(
+            runtime.status().incident_capacity_drops_total,
+            1,
+            "o sinal recusado por saturacao tem de ser contado na metrica dedicada"
+        );
+        assert_eq!(
+            runtime.status().normalization_errors_total,
+            0,
+            "saturacao do L3 nao e erro de normalizacao — era essa a pista enganadora"
+        );
+
+        // O pipeline continua vivo depois da recusa: nao ficou so a saltar
+        // aquele LSN por acaso.
+        log.append(
+            signal("sig-3", 2, EventId::new(), 0.75)
+                .into_episode()
+                .unwrap(),
+        )
+        .unwrap();
+        wait_for_catch_up(&runtime, &log);
+        runtime.shutdown();
+    }
+
+    /// Auditoria 2026-09-05, A36 — guarda anti-sobre-correccao: engolir TODO o
+    /// `SentinelError::Correlation` faria desaparecer erros de dados reais. So
+    /// a saturacao (`IncidentCapacity`) pode ser recusa tolerada.
+    #[test]
+    fn l3_erro_de_dados_nao_conta_como_saturacao() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let runtime = SentinelRuntime::start(log.clone(), l3_config())
+            .unwrap()
+            .unwrap();
+        // Score fora de [0,1] dispara `validate_score` (a PRIMEIRA linha de
+        // `ingest_signal_with_graph_as_of`) -> `CorrelationError::InvalidScore`,
+        // que NAO e saturacao. Sem sujeito, para que `evaluate_fusion` saia
+        // logo no inicio e o erro venha provadamente do L3.
+        let mut mau = signal("sig-mau", 0, EventId::new(), 0.5);
+        mau.score = 1.5;
+        mau.subject = None;
+        log.append(mau.into_episode().unwrap()).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            runtime.status().incident_capacity_drops_total,
+            0,
+            "um erro de dados nao pode ser contabilizado como saturacao"
+        );
+        assert!(
+            runtime.status().normalization_errors_total > 0,
+            "o erro de dados TEM de continuar a subir ate ao worker"
+        );
         runtime.shutdown();
     }
 }
