@@ -345,7 +345,19 @@ impl ThreatIntelDetector {
         Some(SecuritySignal {
             signal_id,
             detector: self.identity.clone(),
-            severity: (score * 100.0).round().clamp(0.0, 100.0) as u8,
+            // Auditoria 2026-09-05: aqui estava `(score * 100.0).round()`, uma
+            // escala 0-100 que mais nenhum produtor de `SecuritySignal` usa. O
+            // Sigma emite 1-10 (`critical` => 10) e o L2 emite
+            // `((score*10.0).ceil() as u8).clamp(1, 10)`. A severidade de um
+            // incidente é o MÁXIMO das dos seus sinais, e esse máximo é
+            // irreversível: um único match de IOC punha o incidente em 81 e
+            // deixava-o lá. Fora do domínio 0-10, nenhum filtro que o operador
+            // consiga exprimir o exclui (o filtro recusa `min_severity > 10`) e
+            // a triagem inverte-se — um IOC medíocre pesava mais do que um
+            // alerta Sigma crítico. O `ceil` (e não `round`) é o mesmo do L2 e é
+            // deliberado: um sinal só é emitido quando `score > 0`, logo o piso
+            // da escala tem de ser 1 e nunca 0.
+            severity: ((score * 10.0).ceil() as u8).clamp(1, 10),
             score,
             subject: Some(subject),
             evidence,
@@ -579,5 +591,73 @@ mod tests {
         assert_eq!(signal.labels["threat.broadest_match"], "suffix-or-prefix");
         assert_eq!(signal.labels["threat.max_tlp"], "TLP:AMBER");
         assert_eq!(signal.created_at_lsn, 7);
+    }
+
+    #[test]
+    fn a_severidade_do_sinal_vive_na_escala_1_a_10_do_sigma_e_do_l2() {
+        // Auditoria 2026-09-05 (A12): `severity` era `(score * 100.0).round()`,
+        // enquanto os outros dois produtores de `SecuritySignal` usam 0-10 — o
+        // Sigma (`critical` => 10) e o L2 (`((score*10.0).ceil()).clamp(1,10)`).
+        // Como a severidade do incidente é o MÁXIMO das dos sinais
+        // (`correlation.rs`), um único IOC punha o incidente em 81, fora do
+        // domínio que o próprio filtro de consulta declara (`min_severity`
+        // recusa > 10): nenhum filtro do operador o conseguia excluir.
+        let detector = ThreatIntelDetector::new("1.0.0");
+
+        // Institutional (0.9) x confidence 90 x exacto (1.0) => score 0.81.
+        let institucional = registry(TrustLevel::Institutional, 0, 3_600);
+        let forte = detector
+            .signal(
+                EntityRef::new("host", "h1"),
+                &[hit("feed", 90, MatchKind::Exact)],
+                vec![],
+                &institucional,
+                1,
+            )
+            .unwrap();
+        assert!(
+            (1..=10).contains(&forte.severity),
+            "a severidade tem de caber na escala partilhada 1-10; veio {}",
+            forte.severity
+        );
+
+        // O topo desta escala é o mesmo topo do Sigma `critical`: 10.
+        let interno = registry(TrustLevel::Internal, 0, 3_600);
+        let maximo = detector
+            .signal(
+                EntityRef::new("host", "h1"),
+                &[hit("feed", 100, MatchKind::Exact)],
+                vec![],
+                &interno,
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            maximo.severity, 10,
+            "um match máximo vale exactamente o mesmo que um Sigma critical"
+        );
+
+        // Um sinal só existe quando `score > 0`, logo o piso da escala é 1 e
+        // nunca 0: um sinal de severidade zero seria um sinal invisível.
+        let comunidade = registry(TrustLevel::Community, 0, 3_600);
+        let fraco = detector
+            .signal(
+                EntityRef::new("host", "h1"),
+                &[hit("feed", 20, MatchKind::DomainSuffix)],
+                vec![],
+                &comunidade,
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            fraco.severity, 1,
+            "o match mais fraco que ainda produz sinal vale 1, não 0"
+        );
+        assert!(
+            fraco.severity < forte.severity,
+            "a ordem de triagem tem de sobreviver à escala ({} vs {})",
+            fraco.severity,
+            forte.severity
+        );
     }
 }

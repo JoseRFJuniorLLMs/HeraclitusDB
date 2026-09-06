@@ -861,6 +861,16 @@ impl IncidentEngine {
         graph_as_of_lsn: Lsn,
     ) -> Result<IncidentIngestResult, CorrelationError> {
         validate_score(signal.score)?;
+        // Auditoria 2026-09-05: o `score` era validado aqui e a `severity` não,
+        // apesar de ser ela que chega ao painel e ao filtro do operador. Um
+        // produtor com a escala trocada (o detector de threat intel emitia
+        // 0-100) contaminava o incidente de forma irreversível, porque a
+        // severidade do incidente é o MÁXIMO das dos sinais. Limita-se em vez de
+        // rejeitar de propósito: o log é append-only e já contém sinais antigos
+        // fora de escala; devolver `Err` aqui faria o replay do worker parar
+        // numa instalação anterior à correcção. Limitar corrige o passado sem o
+        // recusar.
+        let severity = signal.severity.min(SEVERITY_MAXIMA);
         if let Some(existing) = self.signal_index.get(&signal.signal_id) {
             return Ok(IncidentIngestResult {
                 incident_id: existing.clone(),
@@ -964,7 +974,7 @@ impl IncidentEngine {
                 SecurityIncident {
                     incident_id: incident_id.clone(),
                     state: IncidentState::New,
-                    severity: signal.severity,
+                    severity,
                     risk_score: signal.score,
                     subjects: signal.subject.clone().into_iter().collect(),
                     signals: vec![signal.signal_id.clone()],
@@ -982,7 +992,7 @@ impl IncidentEngine {
                 .incidents
                 .get_mut(&incident_id)
                 .expect("candidate incident exists");
-            incident.severity = incident.severity.max(signal.severity);
+            incident.severity = incident.severity.max(severity);
             incident.risk_score = incident.risk_score.max(signal.score);
             if let Some(subject) = signal.subject.clone() {
                 incident.subjects.push(subject);
@@ -1353,6 +1363,13 @@ fn validate_entity(entity: &EntityRef) -> Result<(), CorrelationError> {
     Ok(())
 }
 
+/// O topo do domínio de severidade partilhado por todo o Sentinel: o Sigma
+/// (`critical` => 10), o L2 (`clamp(1, 10)`), a validação de configuração
+/// (`l2.suspicious_severity <= 10`) e o filtro de incidentes (`min_severity`
+/// recusa > 10) já o afirmavam cada um por si. Nomeá-lo aqui evita que o
+/// próximo produtor volte a inventar uma escala.
+const SEVERITY_MAXIMA: u8 = 10;
+
 fn validate_score(score: f32) -> Result<(), CorrelationError> {
     if score.is_finite() && (0.0..=1.0).contains(&score) {
         Ok(())
@@ -1544,6 +1561,41 @@ mod tests {
         assert_eq!(
             first.kind,
             EventKind::Custom("SecurityRiskAssessment".into())
+        );
+    }
+
+    #[test]
+    fn severidade_de_sinal_fora_da_escala_nao_contamina_o_incidente() {
+        // Auditoria 2026-09-05 (A12): o detector de threat intel emitia
+        // `severity` numa escala 0-100 e o motor copiava-a sem validar
+        // (`validate_score` só olha para `score`). Como a severidade do
+        // incidente é o MÁXIMO das dos sinais, o valor fora de escala ficava
+        // preso para sempre e nenhum filtro do operador (`min_severity <= 10`)
+        // o conseguia excluir. O log é append-only: sinais antigos com 0-100
+        // continuam lá e são reprocessados no replay, por isso a fronteira
+        // limita em vez de rejeitar — rejeitar partiria o replay.
+        let mut engine = IncidentEngine::new(IncidentPolicy::default());
+        let mut legado = signal("sig-legado", 7, Some(entity("User", "alice")), 0.9);
+        legado.severity = 90;
+        let incident_id = engine.ingest_signal(&legado).unwrap().incident_id;
+        assert!(
+            engine.incident(&incident_id).unwrap().severity <= 10,
+            "incidente novo: severidade {} está fora do domínio 0-10",
+            engine.incident(&incident_id).unwrap().severity
+        );
+
+        // E o mesmo pelo caminho do `max`, quando o incidente já existe.
+        let mut engine = IncidentEngine::new(IncidentPolicy::default());
+        let normal = signal("sig-normal", 7, Some(entity("User", "bob")), 0.5);
+        let incident_id = engine.ingest_signal(&normal).unwrap().incident_id;
+        let mut legado = signal("sig-legado", 8, Some(entity("User", "bob")), 0.9);
+        legado.severity = 90;
+        let segundo = engine.ingest_signal(&legado).unwrap().incident_id;
+        assert_eq!(segundo, incident_id, "os dois sinais têm de correlacionar");
+        assert!(
+            engine.incident(&incident_id).unwrap().severity <= 10,
+            "incidente enriquecido: severidade {} está fora do domínio 0-10",
+            engine.incident(&incident_id).unwrap().severity
         );
     }
 
