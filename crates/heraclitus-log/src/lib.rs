@@ -2182,6 +2182,17 @@ impl Log {
     pub fn dir(&self) -> &Path {
         &self.dir
     }
+
+    /// Este log tem cifra em repouso? (isto é: foi aberto com uma `KeyStore`.)
+    ///
+    /// Auditoria 2026-09-05, A21: quem DERIVA ficheiros a partir de
+    /// `Log::scan`/`Log::read` recebe os episódios já **decifrados** e não tinha
+    /// como saber disso — `keystore` é privado e não existia acessor nenhum. O
+    /// `skip_scan` usa este predicado para não gravar, ao lado de um WAL
+    /// cifrado, um sidecar em claro derivado desses episódios.
+    pub fn cifrado_em_repouso(&self) -> bool {
+        self.keystore.is_some()
+    }
 }
 
 /// SPEC-024 wired — o Log implementa o contrato de catálogo de segmentos: o

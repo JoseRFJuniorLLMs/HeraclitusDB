@@ -135,13 +135,37 @@ impl SkipScanner {
     /// Zone map for a sealed segment. Resolution order: in-RAM cache → persisted
     /// `.zmap` sidecar (small read, no segment scan) → build from the segment
     /// once and persist the sidecar for next time.
+    ///
+    /// Num log com cifra em repouso o sidecar NÃO é usado nem escrito: ver o
+    /// comentário sobre `cifrado` no corpo (Auditoria 2026-09-05, A21).
     fn zone_map_for(&self, meta: &SegmentMeta) -> Result<Arc<ZoneMap>, HeraclitusError> {
         if let Some(z) = self.cache.lock().unwrap().get(&meta.id) {
             return Ok(z.clone());
         }
-        // Try the persisted sidecar first (avoids the full-segment warm read).
+        // Auditoria 2026-09-05, A21: o zone map é derivado do que `Log::scan`
+        // devolve, e com keystore o `scan` DECIFRA cada episódio. O `ZoneMap`
+        // guarda então min/max de `agent_id`, `session_id` e de cada `attrs[k]`
+        // como `String` crua, e o sidecar é bincode puro (magic + digest só
+        // provam integridade, nunca confidencialidade) gravado no MESMO
+        // directório do WAL. Persisti-lo anulava a cifra em repouso — e, por o
+        // `.zmap` não depender de chave nenhuma, o PII SOBREVIVIA ao
+        // `KeyStore::shred`, ou seja o crypto-shredding deixava de apagar o
+        // acesso ao dado. É a regra que o v6 já escreve para o HRKI (`v6/hrki.rs`,
+        // SPEC §64: não persistir min/max de strings arbitrárias); o `.zmap`
+        // legado não a cumpria. Num log cifrado o zone map fica só em RAM — que
+        // já é o comportamento de recurso quando a escrita falha, portanto não
+        // muda um único resultado de query, só o custo de o reconstruir uma vez
+        // por processo.
+        let cifrado = self.log.cifrado_em_repouso();
         let path = self.sidecar_path(meta.id);
-        if let Ok(bytes) = std::fs::read(&path) {
+        if cifrado {
+            // Um `.zmap` deixado por uma abertura anterior SEM keystore
+            // continuaria a servir esses min/max em claro ao pruning (e a
+            // sobreviver a um shred). O ficheiro é derivado e descartável:
+            // apagá-lo só força a reconstrução, o log fica intacto.
+            let _ = std::fs::remove_file(&path);
+        } else if let Ok(bytes) = std::fs::read(&path) {
+            // Try the persisted sidecar first (avoids the full-segment warm read).
             if let Some(payload) = zmap_decode(&bytes) {
                 if let Ok((zm, _)) =
                     bincode::serde::decode_from_slice::<ZoneMap, _>(payload, BINCODE_CFG)
@@ -156,7 +180,9 @@ impl SkipScanner {
         }
         let eps = self.log.scan(meta.base_lsn, meta.max_lsn + 1)?;
         let zm = Arc::new(ZoneMap::build(eps.iter().map(|(l, e)| (*l, e))));
-        self.persist_sidecar(&path, &zm);
+        if !cifrado {
+            self.persist_sidecar(&path, &zm);
+        }
         self.cache.lock().unwrap().insert(meta.id, zm.clone());
         self.built.fetch_add(1, Ordering::Relaxed);
         Ok(zm)
