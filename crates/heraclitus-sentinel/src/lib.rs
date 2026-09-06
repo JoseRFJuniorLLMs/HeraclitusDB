@@ -340,9 +340,23 @@ struct RuntimeInner {
     /// SPEC-0072 §44 — quantos eventos foram processados desde a ultima
     /// publicacao. E a cadencia do snapshot; zero logo a seguir a publicar.
     eventos_desde_snapshot: std::sync::atomic::AtomicU64,
-    /// SPEC-0072 §44 — quando saiu o ultimo snapshot. O `try_lock` sobre isto
-    /// e tambem o rate limiting entre workers.
+    /// SPEC-0072 §44 — quando saiu o ultimo snapshot.
     ultimo_snapshot: Mutex<Instant>,
+    /// Auditoria 2026-09-05, A37 — a exclusao entre publicadores.
+    ///
+    /// Existe um so ficheiro temporario, de caminho FIXO
+    /// (`state.snapshot.tmp`, SPEC-0072 §6), aberto com `truncate`: dois
+    /// publicadores em simultaneo escrevem ambos a partir do offset 0 do MESMO
+    /// inode. Antes, a unica coisa que se parecia com exclusao era um
+    /// `try_lock` sobre `ultimo_snapshot` que morria antes de a publicacao
+    /// comecar — um TOCTOU. Este mutex e segurado durante a publicacao
+    /// INTEIRA, e cobre os tres caminhos: os workers, a API publica
+    /// `Runtime::publicar_snapshot()` e o `shutdown`.
+    ///
+    /// Ordem de locks: publicacao -> cursor -> motores. NUNCA pegar neste com
+    /// o mutex do cursor na mao — `capturar_snapshot` volta a pegar no cursor,
+    /// e seria abraco mortal.
+    publicacao_snapshot: Mutex<()>,
 }
 
 /// Guarda RAII da permissão do circuit breaker do plano L4.
@@ -822,6 +836,7 @@ impl SentinelRuntime {
             snapshot_store,
             eventos_desde_snapshot: std::sync::atomic::AtomicU64::new(0),
             ultimo_snapshot: Mutex::new(Instant::now()),
+            publicacao_snapshot: Mutex::new(()),
         });
 
         let relogio = Instant::now();
@@ -2129,7 +2144,22 @@ fn capturar_snapshot(inner: &RuntimeInner) -> SentinelStateSnapshot {
 }
 
 /// Captura e publica atomicamente (§7). Devolve o watermark publicado.
+///
+/// Espera pela vez se outro publicador estiver a meio: quem chama isto —
+/// `shutdown`, o rebuild do arranque, a API publica — quer o snapshot, nao um
+/// "talvez". A cadencia periodica usa `talvez_publicar_snapshot`, que desiste.
 fn publicar_snapshot(inner: &RuntimeInner) -> Result<Lsn, SentinelError> {
+    let _guarda = inner
+        .publicacao_snapshot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    publicar_snapshot_com_guarda(inner)
+}
+
+/// Auditoria 2026-09-05, A37 — o corpo da publicacao. So pode ser chamado com
+/// `publicacao_snapshot` na mao: e esse mutex que impede dois escritores no
+/// mesmo `state.snapshot.tmp`.
+fn publicar_snapshot_com_guarda(inner: &RuntimeInner) -> Result<Lsn, SentinelError> {
     let snapshot = capturar_snapshot(inner);
     let watermark = snapshot.applied_until_exclusive;
     inner.snapshot_store.publicar(&snapshot)?;
@@ -2155,9 +2185,15 @@ fn publicar_snapshot(inner: &RuntimeInner) -> Result<Lsn, SentinelError> {
 /// crash desfaz, o de tempo garante que uma base com pouco tráfego não fica
 /// indefinidamente sem snapshot.
 ///
-/// Com vários workers, só um publica de cada vez: o `try_lock` sobre o relógio
-/// é o rate limiting. Quem não consegue o lock não espera — já há um snapshot
-/// a sair, e o dele seria redundante.
+/// Com vários workers, só um publica de cada vez — e é o `publicacao_snapshot`
+/// que o garante, segurado durante a publicação inteira. Quem não consegue o
+/// lock não espera: já há um snapshot a sair, e o dele seria redundante.
+///
+/// Auditoria 2026-09-05, A37 — o comentário anterior afirmava esta mesma
+/// exclusão, mas o código não a implementava: o `MutexGuard` do relógio nascia
+/// e morria dentro da expressão `let por_tempo = ...` e `publicar_snapshot`
+/// corria a seguir sem guarda nenhum. TOCTOU clássico, com dois publicadores a
+/// truncar o mesmo `state.snapshot.tmp`.
 fn talvez_publicar_snapshot(inner: &RuntimeInner, processados: u64) {
     let desde = inner
         .eventos_desde_snapshot
@@ -2166,20 +2202,33 @@ fn talvez_publicar_snapshot(inner: &RuntimeInner, processados: u64) {
 
     let por_eventos =
         inner.config.snapshot_interval_events > 0 && desde >= inner.config.snapshot_interval_events;
-    let por_tempo = inner.config.snapshot_interval_secs > 0 && {
-        let Ok(ultimo) = inner.ultimo_snapshot.try_lock() else {
-            return;
-        };
-        ultimo.elapsed().as_secs() >= inner.config.snapshot_interval_secs
-    };
+    // O relógio ocupado significa "não sei", não "não publiques": antes, o
+    // `else { return; }` daqui abortava a publicação mesmo com o limiar de
+    // EVENTOS já atingido, deixando-o refém de um lock que nada tem a ver com
+    // ele.
+    let por_tempo = inner.config.snapshot_interval_secs > 0
+        && inner
+            .ultimo_snapshot
+            .try_lock()
+            .map(|ultimo| ultimo.elapsed().as_secs() >= inner.config.snapshot_interval_secs)
+            .unwrap_or(false);
     if !por_eventos && !por_tempo {
         return;
     }
-    if let Err(erro) = publicar_snapshot(inner) {
+    let guarda = match inner.publicacao_snapshot.try_lock() {
+        Ok(guarda) => guarda,
+        // Um `Mutex<()>` sem código a correr lá dentro que possa entornar não
+        // devia envenenar; se envenenar, tomamos a posse e seguimos, como em
+        // todos os outros locks deste ficheiro.
+        Err(std::sync::TryLockError::Poisoned(envenenado)) => envenenado.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    if let Err(erro) = publicar_snapshot_com_guarda(inner) {
         // Um snapshot que não sai não é uma falha de consistência (§45): custa
         // um arranque mais lento, não correcção. O que não pode é ser mudo.
         tracing::warn!(erro = %erro, "falha ao publicar o snapshot periódico do Sentinel");
     }
+    drop(guarda);
 }
 
 /// SPEC-0072 §10/§11 — percorre `[de, ate)` em lotes, sem nunca materializar
@@ -5425,6 +5474,150 @@ mod testes_snapshot_spec0072 {
             caminho.exists(),
             "com snapshot_interval_events=1 o worker tinha de publicar sozinho"
         );
+    }
+
+    /// Auditoria 2026-09-05, A37 — o `try_lock` que o comentario dizia ser a
+    /// exclusao entre publicadores morria no fim da expressao `let por_tempo =
+    /// ...`, e a publicacao acontecia a seguir SEM guarda nenhum. Dois
+    /// publicadores abriam o MESMO `state.snapshot.tmp` (caminho fixo) com
+    /// `truncate`, cada um a escrever a partir do offset 0: o corpo publicado
+    /// saia emendado (digest invalido -> rebuild canonico desde o LSN 0) ou o
+    /// `state.snapshot` desaparecia de vez, porque o segundo movia o snapshot
+    /// bom do primeiro para `.prev` e depois falhava o seu proprio rename.
+    #[test]
+    fn publicacoes_concorrentes_nunca_deixam_um_snapshot_invalido() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let mut config = config_de_teste();
+        // O worker nao entra na experiencia: quem publica sao as threads
+        // abaixo, pela API publica, que e o segundo caminho concorrente
+        // (independente do numero de workers) do mesmo defeito.
+        config.snapshot_interval_events = 0;
+        config.snapshot_interval_secs = 0;
+        let caminho = log.dir().join("sentinel").join("state.snapshot");
+        let runtime = Arc::new(
+            SentinelRuntime::start(log.clone(), config)
+                .unwrap()
+                .unwrap(),
+        );
+        // Estado grande de proposito: a janela da corrida e a duracao da
+        // escrita do corpo serializado, e com cinco eventos ela e curta de
+        // mais para o defeito aparecer de forma fiavel.
+        for i in 0..600 {
+            log.append(evento_bruto(&format!("utilizador-{i}")))
+                .unwrap();
+        }
+        esperar_normalizados(&runtime, 600);
+
+        // Duas publicacoes em simultaneo colidem no MESMO `state.snapshot.tmp`
+        // (caminho fixo, aberto com `truncate`). O sintoma deterministico dessa
+        // colisao e o `rename(temp, path)` a falhar porque o outro publicador
+        // ja consumiu o temporario — ninguem mais lhe toca. Contamos isso.
+        //
+        // NAO se poe aqui uma thread a ler o ficheiro em ciclo: no Windows um
+        // leitor com o handle aberto faz o proprio `rename` falhar, e o teste
+        // passaria a medir a interferencia do observador em vez do defeito.
+        let publicadores: Vec<_> = (0..4)
+            .map(|_| {
+                let runtime = runtime.clone();
+                std::thread::spawn(move || {
+                    let mut erros = 0usize;
+                    for _ in 0..60 {
+                        if let Err(erro) = runtime.publicar_snapshot() {
+                            erros += 1;
+                            eprintln!("publicacao falhada: {erro}");
+                        }
+                    }
+                    erros
+                })
+            })
+            .collect();
+        let erros: usize = publicadores
+            .into_iter()
+            .map(|publicador| publicador.join().unwrap())
+            .sum();
+
+        assert_eq!(
+            erros, 0,
+            "publicacoes concorrentes colidiram no mesmo `state.snapshot.tmp`"
+        );
+        assert!(
+            caminho.exists(),
+            "o `state.snapshot` desapareceu: a cadeia dupla de renames destruiu-o"
+        );
+        assert!(
+            matches!(
+                SnapshotStore::new(&caminho).carregar(7).unwrap(),
+                SnapshotLoad::Utilizavel(_)
+            ),
+            "o snapshot final tem de servir"
+        );
+        assert!(
+            !caminho.with_extension("snapshot.tmp").exists(),
+            "nenhum temporario pode ficar para tras"
+        );
+        runtime.shutdown();
+    }
+
+    /// Auditoria 2026-09-05, A37 — o limiar de EVENTOS nao pode ficar refem do
+    /// relogio. O `else { return; }` que vivia dentro da expressao de
+    /// `por_tempo` abortava a publicacao inteira quando o `try_lock` sobre
+    /// `ultimo_snapshot` falhava, mesmo com `snapshot_interval_events` ja
+    /// atingido — um lock que nada tem a ver com esse limiar.
+    #[test]
+    fn o_limiar_de_eventos_nao_fica_refem_do_relogio() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let mut config = config_de_teste();
+        config.snapshot_interval_events = 1;
+        // Limiar temporal LIGADO e longe de disparar: e o que faz o `&&` da
+        // linha de `por_tempo` ser avaliado em vez de curto-circuitar.
+        config.snapshot_interval_secs = 300;
+        let caminho = log.dir().join("sentinel").join("state.snapshot");
+        let runtime = SentinelRuntime::start(log.clone(), config)
+            .unwrap()
+            .unwrap();
+        log.append(evento_bruto("heidi")).unwrap();
+        esperar_normalizados(&runtime, 1);
+        let _ = std::fs::remove_file(&caminho);
+
+        // Prender o relogio a partir de outra thread, com sinalizacao, para o
+        // `try_lock` falhar de forma determinista.
+        let (avisou, espera) = std::sync::mpsc::channel();
+        let interno = runtime.inner.clone();
+        let prendedor = std::thread::spawn(move || {
+            let _preso = interno
+                .ultimo_snapshot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            avisou.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        espera.recv().unwrap();
+        talvez_publicar_snapshot(&runtime.inner, 1);
+        prendedor.join().unwrap();
+
+        assert!(
+            caminho.exists(),
+            "com o limiar de eventos atingido, um relogio ocupado nao pode cancelar o snapshot"
+        );
+        runtime.shutdown();
     }
 }
 
