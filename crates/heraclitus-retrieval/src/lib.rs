@@ -76,7 +76,23 @@ impl Default for LinearReranker {
 impl Reranker for LinearReranker {
     fn score(&self, _query: &str, c: &Candidate) -> f32 {
         let vec_sim = c.vec_dist.map(|d| 1.0 / (1.0 + d)).unwrap_or(0.0);
-        let bm25 = c.bm25.unwrap_or(0.0).tanh();
+        // Auditoria 2026-09-05 (A09): o BM25 que chega aqui não tem tecto — é a
+        // soma sobre os termos de idf*(K1+1) (heraclitus-index-text), e o
+        // memtable injecta no mesmo canal `tf` em bruto. `tanh(b)` já vale
+        // EXACTAMENTE 1.0f32 para b >= ~9.1 (e partilha bit-pattern desde ~8.5),
+        // ou seja acima do joelho o sinal textual virava uma constante e a ordem
+        // final passava a ser decidida só pela recência (w_recency = 0.1 chega
+        // para inverter dois documentos com 3x de diferença em BM25).
+        // `b/(1+b)` fica no mesmo contradomínio [0,1) mas mantém-se
+        // estritamente monótono em toda a gama alcançável (derivada 2.3e-3 em
+        // b=20, cinco ordens de grandeza acima de tanh). As duas guardas são
+        // necessárias porque o canal vem de fora: `max(0.0)` afasta o pólo em
+        // b = -1 e neutraliza o NaN (f32::max devolve o operando não-NaN —
+        // `clamp` NÃO serve, propaga NaN), e o `is_finite` tapa o +inf, que com
+        // `tanh` dava 1.0 e aqui daria inf/inf = NaN; 1.0 é o supremo de
+        // b/(1+b), portanto a monotonia mantém-se no limite.
+        let b = c.bm25.unwrap_or(0.0).max(0.0);
+        let bm25 = if b.is_finite() { b / (1.0 + b) } else { 1.0 };
         let act = c.activation.map(|a| a.max(-5.0) / 5.0).unwrap_or(0.0);
         let recency = if self.head_lsn > 0 {
             (c.lsn as f32) / (self.head_lsn as f32)
@@ -215,5 +231,67 @@ mod tests {
         let lsn = log_feedback(&log, "agent-1", &fb).unwrap();
         let (_, ep) = log.read(lsn).unwrap().unwrap();
         assert_eq!(ep.kind, EventKind::RetrievalFeedback);
+    }
+
+    /// Constrói um candidato só com sinal textual (os outros canais a zero),
+    /// para isolar o esmagamento do BM25 no score final.
+    fn candidato_so_texto(lsn: Lsn, bm25: f32) -> Candidate {
+        Candidate {
+            id: EventId::new(),
+            lsn,
+            rrf: 0.0,
+            vec_dist: None,
+            bm25: Some(bm25),
+            activation: None,
+        }
+    }
+
+    #[test]
+    fn bm25_forte_nao_perde_para_recencia_por_saturacao() {
+        // Auditoria 2026-09-05 (A09): com `tanh` cru, BM25 18.0 e 9.6 dão ambos
+        // exactamente 1.0f32 e a ordem passa a ser decidida só pela recência.
+        let r = LinearReranker {
+            head_lsn: 1_000_000,
+            ..Default::default()
+        };
+        let forte = candidato_so_texto(1, 18.0);
+        let fraco = candidato_so_texto(1_000, 9.6);
+        let (s_forte, s_fraco) = (r.score("q", &forte), r.score("q", &fraco));
+        assert!(
+            s_forte > s_fraco,
+            "BM25 18.0 (lsn=1) tem de bater BM25 9.6 (lsn=1000): {s_forte} vs {s_fraco}"
+        );
+    }
+
+    #[test]
+    fn esmagamento_do_bm25_e_estritamente_monotono_ate_30() {
+        // head_lsn = 0 zera a recência, logo o score é só w_bm25 * esmagamento(b).
+        let r = LinearReranker {
+            head_lsn: 0,
+            ..Default::default()
+        };
+        let mut anterior = f32::NEG_INFINITY;
+        for passo in 0..=60 {
+            let b = passo as f32 * 0.5; // 0.0 .. 30.0 — a gama alcançável com n=10k
+            let s = r.score("q", &candidato_so_texto(0, b));
+            assert!(
+                s > anterior,
+                "o sinal textual estagnou em b={b}: {s} <= {anterior}"
+            );
+            anterior = s;
+        }
+    }
+
+    #[test]
+    fn bm25_negativo_ou_nan_nao_envenena_o_score() {
+        // b/(1+b) explode em b = -1 e propaga NaN; o canal de texto recebe
+        // valores de fora (índice e memtable), por isso o esmagamento tem de os
+        // sanear antes da divisão.
+        let r = LinearReranker::default();
+        for b in [-1.0f32, -2.0, f32::NAN, f32::NEG_INFINITY, f32::INFINITY] {
+            let s = r.score("q", &candidato_so_texto(0, b));
+            assert!(s.is_finite(), "score não-finito para bm25={b}: {s}");
+            assert!(s >= 0.0, "score negativo para bm25={b}: {s}");
+        }
     }
 }
