@@ -191,6 +191,22 @@ pub struct Engine {
     /// R16: serializa o par (ler head → append) das escritas H-VM, para que
     /// dois upserts concorrentes nunca carimbem o mesmo lsn na VmInstruction.
     hvm_lock: Mutex<()>,
+    /// Ponto de consistência para o checkpoint: nenhum append pode estar EM VOO
+    /// (já no log, ainda por indexar) quando um snapshot é tirado.
+    ///
+    /// O LSN é atribuído dentro da secção crítica do worker do log, mas a
+    /// INDEXAÇÃO corre fora dela e fora de ordem: com escrita concorrente, o
+    /// LSN 6 pode ser aplicado (watermark → 6) antes do 5. Um checkpoint que
+    /// caia nessa janela persiste um watermark que já ultrapassou um LSN por
+    /// aplicar, e o arranque seguinte replaya só a cauda — o episódio 5 nunca
+    /// mais entra nas views nem no índice de atributos, em silêncio e para
+    /// sempre. Auditoria 2026-09-05, A07.
+    ///
+    /// `read` no caminho de escrita (appends continuam concorrentes entre si,
+    /// custo zero), `write` no checkpoint. Truncar o watermark PERSISTIDO em
+    /// watermarks.json não serviria: quem manda no arranque é o watermark do
+    /// snapshot (`View::watermark`) e o do `AttrIndex`, não o JSON.
+    index_gate: std::sync::RwLock<()>,
     /// Serializa check+append de uma chave externa. O índice de atributos é
     /// persistente/reconstruível pelo log, portanto isto fecha tanto corridas
     /// concorrentes quanto retries depois de crash/restart.
@@ -599,6 +615,7 @@ impl Engine {
             audit_queries: config.audit_queries,
             replication: std::sync::OnceLock::new(),
             hvm_lock: Mutex::new(()),
+            index_gate: std::sync::RwLock::new(()),
             idempotency_locks: (0..IDEMPOTENCY_SHARDS).map(|_| Mutex::new(())).collect(),
             case_locks: (0..IDEMPOTENCY_SHARDS).map(|_| Mutex::new(())).collect(),
             regulatory_cache: Arc::new(heraclitus_compliance::RegulatoryStateCache::default()),
@@ -625,6 +642,18 @@ impl Engine {
     /// Indexação síncrona de um episódio já no log (memtable + views + attr).
     /// É o núcleo partilhado por `append` e pelo hook de apply do consenso — ao
     /// replicar, cada nó indexa localmente o que aplica (read-your-writes).
+    /// Marca um append como EM VOO até o guard cair. O `append_internal`
+    /// segura-o entre `append_stamped` e `index_applied`; o checkpoint pede o
+    /// lado exclusivo do mesmo `RwLock` e espera por todos os que estiverem em
+    /// voo antes de tirar o snapshot (auditoria 2026-09-05, A07).
+    ///
+    /// Público porque quem indexa por fora do `append_internal` (o aplicador do
+    /// consenso, ou um teste que materialize a janela) tem de poder abrir a
+    /// mesma janela — o `index_applied` sozinho não a delimita.
+    pub fn begin_indexing(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+        self.index_gate.read().unwrap()
+    }
+
     pub fn index_applied(&self, lsn: Lsn, episode: &Episode) {
         if self.log_only {
             return;
@@ -705,7 +734,17 @@ impl Engine {
             );
             return Ok(());
         }
-        self.attr.read().unwrap().save(&self.attr_dir)
+        // Auditoria 2026-09-05, A07 — barreira de consistência. Esperar pelo
+        // lado exclusivo do `index_gate` garante que NENHUM append está entre o
+        // log e o `index_applied`; tomar o lock do índice ANTES de largar a
+        // barreira impede que um append novo se intrometa. Larga-se a barreira
+        // logo a seguir para não bloquear a escrita durante o `save` inteiro:
+        // um append que entre a partir daí fica à espera do lock do índice, e o
+        // LSN dele é maior que o watermark gravado — o replay da cauda cobre-o.
+        let voo = self.index_gate.write().unwrap();
+        let idx = self.attr.read().unwrap();
+        drop(voo);
+        idx.save(&self.attr_dir)
     }
 
     /// Fast boot: persiste o snapshot de TODAS as views (vector/text/graph/
@@ -733,7 +772,15 @@ impl Engine {
                  para não persistir estado derivado incompleto; corre `view rebuild`"
             );
         } else {
-            self.views.lock().unwrap().checkpoint()?;
+            // Auditoria 2026-09-05, A07 — a mesma barreira, do lado das views.
+            // Ordem única de locks em todo o Engine (index_gate → views →
+            // attr), e o lock das views é LARGADO antes do `checkpoint_attr`:
+            // quem segura views nunca pode ficar à espera do `index_gate`,
+            // senão cruzava-se com um append (que segura o gate e quer views).
+            let voo = self.index_gate.write().unwrap();
+            let mut views = self.views.lock().unwrap();
+            drop(voo);
+            views.checkpoint()?;
         }
         self.checkpoint_attr()
     }
@@ -2281,6 +2328,12 @@ impl Engine {
         // real: as views vivas divergiam das reconstruídas do LSN 0 — quebra do
         // invariante I6 (a `activation` usa `ts_hlc >> 16` como instante de acesso,
         // logo ao vivo registava tudo no instante 0).
+        // O append fica marcado como EM VOO desde antes de receber o LSN até
+        // depois de indexado: é a janela em que o log já sabe do episódio e as
+        // views ainda não. Um checkpoint que caísse aqui persistia um watermark
+        // à frente de um LSN por aplicar (auditoria 2026-09-05, A07). Read
+        // lock: dois appends nunca esperam um pelo outro.
+        let _voo = self.begin_indexing();
         let (lsn, stamped) = self.log.append_stamped(episode)?;
         self.index_applied(lsn, &stamped);
         Ok(lsn)
@@ -4749,6 +4802,103 @@ mod tests {
             heraclitus_query::execute("MATCH (n) WHERE n.cpf = \"00000000000\" RETURN n", &engine)
                 .unwrap();
         assert_eq!(r4.as_array().unwrap().len(), 0, "{r4:?}");
+    }
+
+    /// PERDA SILENCIOSA POR CHECKPOINT NA JANELA ERRADA (auditoria 2026-09-05,
+    /// A07).
+    ///
+    /// O LSN e atribuido dentro da seccao critica do worker do log, mas a
+    /// indexacao corre FORA dela: com escrita concorrente, o LSN 1 pode ser
+    /// aplicado (watermark -> 1) antes do 0. Um checkpoint que caia nessa
+    /// janela grava um snapshot que declara watermark 1 mas nao contem o 0; no
+    /// arranque seguinte o `catch_up` replaya so `(1, head]` e o episodio 0
+    /// nunca mais entra nas views nem no indice de atributos — some do NEAREST,
+    /// RECALL, MATCH e do `WHERE n.campo = "x"`, sem erro nem aviso, ate um
+    /// rebuild manual.
+    ///
+    /// O teste materializa a janela em vez de a caçar por escalonamento:
+    /// `begin_indexing` (o MESMO guard que o `append_internal` usa, nao uma
+    /// costura de teste) mantem o episodio A em voo enquanto o B e indexado e
+    /// o checkpoint corre noutra thread.
+    #[test]
+    fn checkpoint_nao_persiste_watermark_a_frente_de_um_append_em_voo() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(engine_in(dir.path()));
+
+        let mut a = Episode::new("ag", EventKind::Observation, b"alfa rio".to_vec());
+        a.attrs.insert("dossie".into(), "alfa".into());
+        let mut b = Episode::new("ag", EventKind::Observation, b"beta rio".to_vec());
+        b.attrs.insert("dossie".into(), "beta".into());
+
+        let voo = engine.begin_indexing();
+        // A leva o LSN MENOR e fica por indexar; B leva o maior e e indexado
+        // primeiro — a ordem que faz o watermark ultrapassar um buraco.
+        let (lsn_a, a_carimbado) = engine.log.append_stamped(a).unwrap();
+        let (lsn_b, b_carimbado) = engine.log.append_stamped(b).unwrap();
+        engine.index_applied(lsn_b, &b_carimbado);
+
+        let e2 = engine.clone();
+        let h = std::thread::spawn(move || e2.checkpoint_views().unwrap());
+        // Margem larga: com dados minusculos, sem a barreira o checkpoint
+        // termina muito antes disto.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        engine.index_applied(lsn_a, &a_carimbado);
+        drop(voo);
+        h.join().unwrap();
+        drop(engine);
+
+        // Arranque seguinte: o episodio A tem de estar no estado derivado.
+        let engine2 = engine_in(dir.path());
+        assert_eq!(
+            engine2.stats()["text_indexed"].as_u64(),
+            Some(2),
+            "o episodio em voo desapareceu das views"
+        );
+        let v = heraclitus_query::execute("MATCH (n) WHERE n.dossie = \"alfa\" RETURN n", &engine2)
+            .unwrap();
+        assert_eq!(
+            v.as_array().unwrap().len(),
+            1,
+            "o episodio em voo desapareceu do indice de atributos: {v}"
+        );
+    }
+
+    /// A MESMA barreira, pelo lado do `checkpoint_attr` chamado SOZINHO — que e
+    /// API publica e nao passa pelo `checkpoint_views` (auditoria 2026-09-05,
+    /// A07). Sem ela, o `AttrIndex::save` grava um watermark que ja ultrapassou
+    /// o LSN em voo e o arranque seguinte parte de `idx.watermark()`: o
+    /// episodio A nunca mais e indexado.
+    #[test]
+    fn checkpoint_do_indice_de_atributos_espera_pelo_append_em_voo() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(engine_in(dir.path()));
+
+        let mut a = Episode::new("ag", EventKind::Observation, b"alfa".to_vec());
+        a.attrs.insert("dossie".into(), "alfa".into());
+        let mut b = Episode::new("ag", EventKind::Observation, b"beta".to_vec());
+        b.attrs.insert("dossie".into(), "beta".into());
+
+        let voo = engine.begin_indexing();
+        let (lsn_a, a_carimbado) = engine.log.append_stamped(a).unwrap();
+        let (lsn_b, b_carimbado) = engine.log.append_stamped(b).unwrap();
+        engine.index_applied(lsn_b, &b_carimbado);
+
+        let e2 = engine.clone();
+        let h = std::thread::spawn(move || e2.checkpoint_attr().unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        engine.index_applied(lsn_a, &a_carimbado);
+        drop(voo);
+        h.join().unwrap();
+        drop(engine);
+
+        let engine2 = engine_in(dir.path());
+        let v = heraclitus_query::execute("MATCH (n) WHERE n.dossie = \"alfa\" RETURN n", &engine2)
+            .unwrap();
+        assert_eq!(
+            v.as_array().unwrap().len(),
+            1,
+            "o episodio em voo ficou fora do indice de atributos para sempre: {v}"
+        );
     }
 
     /// O MELHOR documento por BM25 desaparecia do `/recall` (auditoria
