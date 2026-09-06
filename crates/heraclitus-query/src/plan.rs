@@ -1040,6 +1040,26 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                     },
                 },
             };
+            // ROTULO -> INDICE `_kind`. `MATCH (n:Despesas)` — a forma canonica
+            // de Cypher — so era aplicado como POS-FILTRO sobre o varrimento
+            // capado (QUERY_SCAN_CAP): o `attr_eq_hint` so ve o WHERE, e o
+            // rotulo do padrao nunca chegava ao indice `_kind`, apesar de o
+            // indice o guardar. Medido sobre 8 968 663 episodios reais do
+            // Portal da Transparencia: `MATCH (n:Despesas) RETURN n LIMIT 5`
+            // devolvia 0 linhas — os episodios existem, mas vivem todos para
+            // la dos primeiros 250 000 LSN. Resposta errada, em silencio.
+            //
+            // Usa-se o indice so quando devolve ALGO: o indice e exacto e o
+            // pos-filtro e insensivel a capitalizacao, portanto um rotulo com
+            // capitalizacao diferente (ou um kind ausente) recua para o
+            // varrimento de hoje — sem regressao — em vez de tomar `Some(vazio)`
+            // como resposta final, que e a classe do bug critico ja corrigido.
+            let indexed = match (indexed, label.as_deref()) {
+                (None, Some(rotulo)) => be
+                    .attr_lookup("_kind", rotulo, bound)?
+                    .filter(|hits| !hits.is_empty()),
+                (outro, _) => outro,
+            };
             let candidates: Vec<(Lsn, Episode)> = match indexed {
                 Some(hit) => hit,
                 None => {
@@ -1373,5 +1393,191 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
             let lsn = be.append(label.as_deref(), props)?;
             Ok(json!({ "lsn": lsn }))
         }
+    }
+}
+
+#[cfg(test)]
+mod testes_rotulo_indice {
+    //! `MATCH (n:Kind)` tem de chegar ao indice `_kind`. Aqui o indice e o
+    //! varrimento DIVERGEM de proposito: o conteudo devolvido denuncia o
+    //! caminho que o planner tomou.
+    use super::*;
+    use crate::backend::*;
+    use heraclitus_core::{Episode, EventKind};
+    use heraclitus_index_graph::temporal::TemporalGraph;
+
+    fn ep(kind: &str, conteudo: &str) -> (Lsn, Episode) {
+        (
+            1,
+            Episode::new(
+                "a",
+                EventKind::Custom(kind.into()),
+                conteudo.as_bytes().to_vec(),
+            ),
+        )
+    }
+
+    struct Divergente;
+
+    impl QueryBackend for Divergente {
+        fn head(&self) -> Result<Lsn, HeraclitusError> {
+            Ok(10)
+        }
+        fn scan(&self, _as_of: Option<Lsn>) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
+            self.scan_range(0, 10)
+        }
+        /// O varrimento so conhece "via-scan".
+        fn scan_range(&self, _from: Lsn, _to: Lsn) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
+            Ok(vec![ep("Despesas", "via-scan"), ep("Outro", "ruido")])
+        }
+        /// O indice `_kind` so conhece "via-indice" — e so para o rotulo exacto.
+        fn attr_lookup(
+            &self,
+            field: &str,
+            value: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
+            Ok(Some(if field == "_kind" && value == "Despesas" {
+                vec![ep("Despesas", "via-indice")]
+            } else {
+                vec![] // indexavel mas ausente — como o Engine faz
+            }))
+        }
+        fn graph(&self) -> Result<TemporalGraph, HeraclitusError> {
+            unimplemented!("graph: fora do ambito deste mock")
+        }
+        fn append(
+            &self,
+            _label: Option<&str>,
+            _props: &[(String, Value)],
+        ) -> Result<Lsn, HeraclitusError> {
+            unimplemented!("append: fora do ambito deste mock")
+        }
+        fn recall(
+            &self,
+            _text: &str,
+            _k: usize,
+            _as_of: Option<Lsn>,
+        ) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError> {
+            unimplemented!("recall: fora do ambito deste mock")
+        }
+        fn nearest(
+            &self,
+            _vector: &[f32],
+            _k: usize,
+            _as_of: Option<Lsn>,
+        ) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError> {
+            unimplemented!("nearest: fora do ambito deste mock")
+        }
+        fn provenance(&self, _id: &str) -> Result<Vec<String>, HeraclitusError> {
+            unimplemented!("provenance: fora do ambito deste mock")
+        }
+        fn neighbors(
+            &self,
+            _node: &str,
+            _etype: Option<&str>,
+            _as_of: Option<Lsn>,
+            _min_confidence: f32,
+        ) -> Result<Vec<NeighborRow>, HeraclitusError> {
+            unimplemented!("neighbors: fora do ambito deste mock")
+        }
+        fn traverse(
+            &self,
+            _start: &str,
+            _max_depth: usize,
+            _as_of: Option<Lsn>,
+            _min_confidence: f32,
+        ) -> Result<Vec<(String, usize)>, HeraclitusError> {
+            unimplemented!("traverse: fora do ambito deste mock")
+        }
+        fn match_edges(
+            &self,
+            _src: Option<&str>,
+            _etype: Option<&str>,
+            _dst: Option<&str>,
+            _as_of: Option<Lsn>,
+        ) -> Result<Vec<EdgeRow>, HeraclitusError> {
+            unimplemented!("match_edges: fora do ambito deste mock")
+        }
+        fn community(
+            &self,
+            _node: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<CommunityResult>, HeraclitusError> {
+            unimplemented!("community: fora do ambito deste mock")
+        }
+        fn node_metrics(
+            &self,
+            _node: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<MetricsResult>, HeraclitusError> {
+            unimplemented!("node_metrics: fora do ambito deste mock")
+        }
+        fn edge_hypotheses(
+            &self,
+            _from: &str,
+            _to: &str,
+            _etype: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<EdgeHypotheses>, HeraclitusError> {
+            unimplemented!("edge_hypotheses: fora do ambito deste mock")
+        }
+        fn lsn_for_timestamp(&self, _ts_ms: u64) -> Result<Lsn, HeraclitusError> {
+            unimplemented!("lsn_for_timestamp: fora do ambito deste mock")
+        }
+        fn resolve_entity(
+            &self,
+            _key: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<String>, HeraclitusError> {
+            unimplemented!("resolve_entity: fora do ambito deste mock")
+        }
+        fn entity_cluster(
+            &self,
+            _entity_id: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Vec<String>, HeraclitusError> {
+            unimplemented!("entity_cluster: fora do ambito deste mock")
+        }
+    }
+
+    fn conteudos(v: &serde_json::Value) -> Vec<String> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["content"].as_str().unwrap_or("").to_string())
+            .collect()
+    }
+
+    /// O defeito medido sobre 8 968 663 episodios reais: o rotulo so era
+    /// pos-filtro sobre o varrimento capado, e `MATCH (n:Despesas)` devolvia 0
+    /// linhas com os episodios a existirem. Com o rotulo encaminhado ao
+    /// indice, o resultado vem "via-indice".
+    #[test]
+    fn o_rotulo_do_padrao_chega_ao_indice_kind() {
+        let v = crate::execute("MATCH (n:Despesas) RETURN n", &Divergente).unwrap();
+        assert_eq!(
+            conteudos(&v),
+            vec!["via-indice"],
+            "tinha de vir do indice, veio do varrimento"
+        );
+    }
+
+    /// Sem regressao: o indice e exacto, o pos-filtro nao. Um rotulo com outra
+    /// capitalizacao da `Some(vazio)` no indice e tem de RECUAR para o
+    /// varrimento (onde o pos-filtro insensivel o encontra) — nunca tomar o
+    /// vazio como resposta final.
+    #[test]
+    fn rotulo_com_capitalizacao_diferente_recua_para_o_varrimento() {
+        let v = crate::execute("MATCH (n:despesas) RETURN n", &Divergente).unwrap();
+        assert_eq!(conteudos(&v), vec!["via-scan"]);
+    }
+
+    /// Um kind que nao existe: indice vazio, varrimento sem ele -> 0 linhas,
+    /// sem panico.
+    #[test]
+    fn kind_inexistente_da_zero_linhas() {
+        let v = crate::execute("MATCH (n:Fantasma) RETURN n", &Divergente).unwrap();
+        assert!(conteudos(&v).is_empty());
     }
 }
