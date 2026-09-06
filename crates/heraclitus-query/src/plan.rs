@@ -37,7 +37,13 @@ pub enum Plan {
     },
     GraphMatch {
         from_var: String,
+        /// Rótulo do nó de origem (`MATCH (a:Pessoa)-[r]->(b)`). Auditoria
+        /// 2026-09-05: era parseado e descartado no lowering — sem campo onde
+        /// viver, nenhum passo seguinte o podia recuperar.
+        from_label: Option<String>,
         to_var: String,
+        /// Rótulo do nó de destino (`->(b:Empresa)`). Ver `from_label`.
+        to_label: Option<String>,
         rel_var: String,
         rel_type: Option<String>,
         conditions: Vec<(BoolOp, Condition)>,
@@ -129,7 +135,15 @@ pub fn plan(stmt: &Stmt) -> Plan {
             let e = m.edge.as_ref().unwrap();
             Plan::GraphMatch {
                 from_var: m.var.clone(),
+                // Auditoria 2026-09-05: os rótulos dos DOIS nós do padrão eram
+                // parseados (`node_pat` aceita `(a:Pessoa)`) e descartados aqui
+                // em silêncio — `MATCH (a:Pessoa)-[r]->(b:Empresa)` devolvia
+                // arestas entre nós de QUALQUER kind, e o EXPLAIN nem os
+                // imprimia. Agora seguem para o executor, que os recusa
+                // explicitamente enquanto a semântica não estiver definida.
+                from_label: m.label.clone(),
                 to_var: e.to_var.clone(),
+                to_label: e.to_label.clone(),
                 rel_var: e.rel_var.clone(),
                 rel_type: e.rel_type.clone(),
                 conditions: m.conditions.clone(),
@@ -309,7 +323,9 @@ pub fn render(plan: &Plan) -> String {
         Plan::Provenance { id } => format!("ProvenanceExpand\n  id = {id}\n"),
         Plan::GraphMatch {
             from_var,
+            from_label,
             to_var,
+            to_label,
             rel_var,
             rel_type,
             conditions,
@@ -319,12 +335,19 @@ pub fn render(plan: &Plan) -> String {
             limit,
             ..
         } => {
+            // Auditoria 2026-09-05: o EXPLAIN escondia os rótulos dos nós — o
+            // utilizador escrevia `(a:Pessoa)`, o planner descartava-o e o
+            // plano impresso dizia só `(a)`. O que o planner recebeu tem de
+            // aparecer aqui, mesmo (sobretudo) quando não é suportado.
+            let rotulo = |l: &Option<String>| l.as_ref().map(|t| format!(":{t}")).unwrap_or_default();
             let mut s = format!(
-                "GraphMatch\n  ({from_var})-[{rel_var}{}]->({to_var})\n",
+                "GraphMatch\n  ({from_var}{})-[{rel_var}{}]->({to_var}{})\n",
+                rotulo(from_label),
                 rel_type
                     .as_ref()
                     .map(|t| format!(":{t}"))
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                rotulo(to_label),
             );
             for (op, c) in conditions {
                 s += &format!("  cond[{op:?}] {:?} {:?} {:?}\n", c.lhs, c.cmp, c.rhs);
@@ -1227,7 +1250,9 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
         }
         Plan::GraphMatch {
             from_var,
+            from_label,
             to_var,
+            to_label,
             rel_var,
             rel_type,
             conditions,
@@ -1237,6 +1262,25 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
             returns,
             limit,
         } => {
+            // Auditoria 2026-09-05: um rótulo num extremo do padrão era aceite
+            // pela gramática e ignorado em silêncio — `MATCH (a:Pessoa)-[r]->
+            // (b:Empresa)` devolvia exactamente as mesmas linhas que
+            // `MATCH (a)-[r]->(b)`, mesmo com rótulos que não existem em
+            // episódio nenhum, e o LIMIT cortava N linhas de um conjunto já
+            // contaminado. Não se corrige filtrando: os extremos de uma aresta
+            // são ids de ENTIDADE (`temporal.rs`: `pub type EntityId = String`,
+            // arestas entre entidades nomeadas), não ids de episódio, e não
+            // têm kind — o que `:Pessoa` significaria aqui continua por
+            // definir (docs/AUDITORIA-2026-09-05.md, "Vaga 3 — em aberto").
+            // Enquanto não estiver definido, errar alto é a única resposta
+            // honesta; responder errado em silêncio não é.
+            if let Some(rotulo) = from_label.as_deref().or(to_label.as_deref()) {
+                return Err(HeraclitusError::Query(format!(
+                    "rótulo de nó (:{rotulo}) não é suportado num padrão de relação: \
+                     os extremos de uma aresta são ids de entidade, sem kind — \
+                     filtre por rótulo num padrão de nó, `MATCH (n:{rotulo})`"
+                )));
+            }
             let bound = resolve_as_of(as_of, be)?;
             // Pattern variables constrained in WHERE become graph filters; the
             // inline `[r:type]` label is the default edge type (a WHERE

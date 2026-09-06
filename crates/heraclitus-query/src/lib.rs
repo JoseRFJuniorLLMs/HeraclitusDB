@@ -761,6 +761,50 @@ mod tests {
         assert!(s.contains("OrderBy(r.belief, asc=false)"), "{s}");
     }
 
+    /// Auditoria recursiva 2026-09-05 (A57): os rótulos dos nós de um padrão de
+    /// relação eram parseados e DESCARTADOS pelo planner. `MATCH
+    /// (a:Pessoa)-[r]->(b:Empresa)` devolvia exactamente as mesmas linhas que
+    /// `MATCH (a)-[r]->(b)` — até com rótulos que não existem em episódio
+    /// nenhum — e o EXPLAIN nem os imprimia, portanto o descarte era invisível.
+    /// Não se corrige filtrando por `_kind`: os extremos de uma aresta são ids
+    /// de ENTIDADE (nomes), não ids de episódio, e não têm kind; o que
+    /// `:Pessoa` significa aqui continua por definir. Enquanto não estiver,
+    /// recusar é a resposta honesta.
+    #[test]
+    fn rotulo_de_no_num_padrao_de_relacao_e_recusado() {
+        let (_d, be) = edge_backend();
+        // Sem rótulos: o padrão de relação continua a responder como sempre.
+        let v = execute("MATCH (a)-[r]->(b) AS OF LSN 2 RETURN *", &be).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 2);
+
+        // Rótulo no DESTINO: erro explícito, com o rótulo na mensagem.
+        let e = execute("MATCH (a)-[r]->(b:Empresa) AS OF LSN 2 RETURN *", &be).unwrap_err();
+        let msg = e.to_string();
+        assert!(
+            msg.contains("Empresa") && msg.contains("padrão de relação"),
+            "{msg}"
+        );
+        // Rótulo na ORIGEM: idem — os DOIS extremos eram descartados.
+        let e = execute("MATCH (a:Pessoa)-[r]->(b) AS OF LSN 2 RETURN *", &be).unwrap_err();
+        assert!(e.to_string().contains("Pessoa"), "{e}");
+        // Rótulo que não existe em episódio nenhum também é recusado — antes
+        // era inerte, e a query devolvia as 2 arestas na mesma.
+        assert!(execute("MATCH (a:NaoExisteMesmo)-[r]->(b) RETURN *", &be).is_err());
+
+        // NÃO REGRIDE: o rótulo num padrão de NÓ continua a filtrar.
+        let v = execute("MATCH (n:Observation) RETURN n", &be).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 3);
+        assert!(execute("MATCH (n:Fantasma) RETURN n", &be)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        // E o EXPLAIN deixa de esconder os rótulos que o planner recebeu.
+        let s = explain("MATCH (a:Pessoa)-[r:paga]->(b:Empresa) RETURN *").unwrap();
+        assert!(s.contains("(a:Pessoa)") && s.contains("(b:Empresa)"), "{s}");
+    }
+
     /// Builds a tiny fraud-style dataset anchored on event A. Four candidates,
     /// each child of A, are designed so that each single channel is topped by a
     /// *different* candidate, while the consensus candidate X (strong on all
