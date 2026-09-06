@@ -1039,6 +1039,62 @@ mod tests {
             );
         }
     }
+
+    fn xorshift(estado: &mut u64) -> u64 {
+        *estado ^= *estado << 13;
+        *estado ^= *estado >> 7;
+        *estado ^= *estado << 17;
+        *estado
+    }
+
+    /// Vetor de 32 dims dentro da bola, o formato real dos embeddings.
+    fn hyp32(semente: &mut u64) -> Vec<f32> {
+        let mut v: Vec<f32> = (0..32)
+            .map(|_| ((xorshift(semente) % 20_001) as f32 / 10_000.0 - 1.0) * 0.1)
+            .collect();
+        heraclitus_manifold::project_to_ball(&mut v);
+        v
+    }
+
+    /// Auditoria 2026-09-05 (A03): UM append com um embedding de dimensao
+    /// diferente — `hyp` vazio e so `sph` preenchido, que e exactamente o que a
+    /// barreira de ingestao do gRPC deixa passar — envenenava a busca INTEIRA.
+    /// A metrica truncava o par pelo mais curto, o no ficava a distancia ZERO
+    /// de qualquer consulta e saia em primeiro lugar em quase todas. Como o log
+    /// e append-only, ficava la ate alguem lhe fazer tombstone.
+    #[test]
+    fn um_embedding_de_dimensao_diferente_nao_envenena_a_busca() {
+        let mut idx = VectorIndex::new(ProductMetric::default());
+        let mut semente = 0x243f_6a88_85a3_08d3u64;
+        for i in 0..200u64 {
+            idx.insert(EventId::new(), i, pt(hyp32(&mut semente)));
+        }
+        let envenenado = EventId::new();
+        idx.insert(
+            envenenado,
+            200,
+            ProductPoint {
+                hyp: vec![],
+                sph: vec![1.0],
+                euc: vec![],
+            },
+        );
+
+        let mut primeiros = 0usize;
+        for _ in 0..50 {
+            let hits = idx.search(&pt(hyp32(&mut semente)), 5, 128, None);
+            assert_eq!(hits.len(), 5);
+            if hits[0].id == envenenado {
+                primeiros += 1;
+            }
+            assert!(
+                hits.iter().all(|h| h.id != envenenado),
+                "o no de dimensao diferente voltou aos resultados (foi 1o em \
+                 {primeiros} consultas); distancias: {:?}",
+                hits.iter().map(|h| h.dist).collect::<Vec<_>>()
+            );
+        }
+    }
 }
 
 #[cfg(test)]
