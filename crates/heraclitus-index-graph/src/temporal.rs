@@ -311,6 +311,47 @@ thread_local! {
     pub(crate) static ARESTAS_TOCADAS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// Média e desvio-padrão do grau — o que alimenta o z-score de `anomaly_score`.
+///
+/// Único sítio onde esta estatística se calcula: `analyze` (CSR) e
+/// `analyze_referencia` têm de concordar, e uma cópia da fórmula em cada lado
+/// significa que a referência confirmaria alegremente o valor errado do outro.
+///
+/// # Porquê `u64` e `f64` para somar inteiros pequenos
+///
+/// Auditoria 2026-09-05 (A30): os graus são INTEIROS, mas a soma era acumulada
+/// em `f32`, que satura em 2^24. Acima de ~8,4 milhões de arestas vivas
+/// (2E > 2^24) cada `+1.0` arredonda para nada, a soma congela em 16.777.216 e
+/// a média sai grosseiramente abaixo da verdadeira. O erro é ZERO enquanto
+/// 2E < 2^24 e depois cresce (medido: 1,2% em 2E≈24M, 4,8% em 2E≈60M), sempre
+/// no mesmo sentido — média subestimada infla o z-score de todos os nós acima
+/// da média, contra o limiar de 1.5 com que `decision::evaluate` emite
+/// `flag_anomaly`. Há configurações de grau em que isso faz milhões de nós
+/// cruzarem o limiar que a matemática exacta deixa abaixo.
+///
+/// Somar em `u64` é exacto, e acumular a variância em `f64` tira ao resultado
+/// a dependência do NÚMERO de termos: reforça o contrato de determinismo do
+/// replay em vez de o enfraquecer. A soma em `u64` não pode transbordar —
+/// `offsets` no CSR do [`TemporalGraph::analyze`] é `u32` e `overflow-checks`
+/// já impõe 2E < 2^32 antes de se chegar aqui.
+fn estatistica_do_grau(grau: &[u32]) -> (f32, f32) {
+    let n = grau.len();
+    if n == 0 {
+        return (0.0, 0.0);
+    }
+    let soma: u64 = grau.iter().map(|g| u64::from(*g)).sum();
+    let media = soma as f64 / n as f64;
+    let var = grau
+        .iter()
+        .map(|g| {
+            let x = f64::from(*g) - media;
+            x * x
+        })
+        .sum::<f64>()
+        / n as f64;
+    (media as f32, var.sqrt() as f32)
+}
+
 impl TemporalGraph {
     pub fn new() -> Self {
         Self::default()
@@ -747,16 +788,7 @@ impl TemporalGraph {
         }
 
         // --- centralidade e anomaly (z-score do grau) -----------------------
-        let media = grau.iter().map(|g| *g as f32).sum::<f32>() / n as f32;
-        let var = grau
-            .iter()
-            .map(|g| {
-                let x = *g as f32 - media;
-                x * x
-            })
-            .sum::<f32>()
-            / n as f32;
-        let std = var.sqrt();
+        let (media, std) = estatistica_do_grau(&grau);
 
         // --- de volta aos nomes, `n` vezes ----------------------------------
         let mut community: BTreeMap<EntityId, EntityId> = BTreeMap::new();
@@ -840,21 +872,11 @@ impl TemporalGraph {
 
         // Centralidade e anomaly (z-score do grau) sobre o conjunto de nós.
         let n = nodes.len();
-        let degs: Vec<f32> = nodes
+        let degs: Vec<u32> = nodes
             .iter()
-            .map(|node| *degree.get(node).unwrap_or(&0) as f32)
+            .map(|node| *degree.get(node).unwrap_or(&0))
             .collect();
-        let mean = if n > 0 {
-            degs.iter().sum::<f32>() / n as f32
-        } else {
-            0.0
-        };
-        let var = if n > 0 {
-            degs.iter().map(|d| (d - mean) * (d - mean)).sum::<f32>() / n as f32
-        } else {
-            0.0
-        };
-        let std = var.sqrt();
+        let (mean, std) = estatistica_do_grau(&degs);
 
         let mut metrics: BTreeMap<EntityId, NodeMetrics> = BTreeMap::new();
         for node in &nodes {
@@ -1763,7 +1785,16 @@ mod testes_csr {
     /// centralidade e anomaly identicos aos da versao com `BTreeMap<String, ...>`.
     #[test]
     fn o_csr_concorda_com_a_versao_em_btreemap_de_string() {
-        for (n_nos, n_arestas, semente) in [(50, 200, 1u64), (200, 1500, 7), (400, 5000, 99)] {
+        for (n_nos, n_arestas, semente) in [
+            (50, 200, 1u64),
+            (200, 1500, 7),
+            (400, 5000, 99),
+            (300, 3333, 5),
+            (777, 9999, 13),
+            (123, 4567, 21),
+            (1000, 30000, 31),
+            (64, 999, 77),
+        ] {
             let g = grafo(n_nos, n_arestas, semente);
             let novo = g.analyze(u64::MAX, 0.0);
             let refer = g.analyze_referencia(u64::MAX, 0.0);
@@ -1787,8 +1818,14 @@ mod testes_csr {
                     (a.centrality - m.centrality).abs() < 1e-6,
                     "centralidade de {no}"
                 );
-                assert!(
-                    (a.anomaly_score - m.anomaly_score).abs() < 1e-5,
+                // As duas vias partilham `estatistica_do_grau` sobre o MESMO
+                // vector de graus (ambos por ordem alfabetica de no), logo tem
+                // de coincidir BIT A BIT — nao apenas dentro de uma tolerancia.
+                // Auditoria 2026-09-05 (A30): e isto que impede que uma das
+                // vias volte a ter formula propria (a antiga, em f32).
+                assert_eq!(
+                    a.anomaly_score.to_bits(),
+                    m.anomaly_score.to_bits(),
                     "anomaly de {no}: {} vs {}",
                     a.anomaly_score,
                     m.anomaly_score
@@ -1815,6 +1852,52 @@ mod testes_csr {
         for no in ["abacate", "melancia", "zebra"] {
             assert_eq!(a.community[no], "abacate", "comunidade de {no}");
         }
+    }
+
+    /// Auditoria 2026-09-05 (A30): a soma dos graus satura o acumulador `f32`
+    /// em 2^24. Com graus todos IGUAIS o desvio verdadeiro e zero; um
+    /// acumulador `f32` inventa media e desvio, e o z-score de nos identicos
+    /// deixa de ser 0 — enviesado para cima, contra o limiar de 1.5 que
+    /// `decision::evaluate` usa para emitir `flag_anomaly`.
+    ///
+    /// O teste ataca a formula isolada porque um grafo real com 2E > 2^24
+    /// exigiria dezenas de GB de `BTreeMap<EdgeId, Edge>` vivos.
+    #[test]
+    fn a_estatistica_do_grau_nao_satura_o_acumulador() {
+        // (1) A SOMA. 2E = 2e10, muito acima de 2^24 = 16.777.216. Com graus
+        // todos IGUAIS o desvio verdadeiro e exactamente zero.
+        let grau = vec![4_000_000u32; 5_000];
+        let (media, std) = estatistica_do_grau(&grau);
+        assert_eq!(
+            media, 4_000_000.0,
+            "media exacta; a somar em f32 da 3999799.3"
+        );
+        assert_eq!(
+            std, 0.0,
+            "graus identicos => desvio zero; a somar em f32 da 200.7554"
+        );
+
+        // (2) O ACUMULADOR DA VARIANCIA. Um outlier grande faz o acumulador
+        // subir tanto que os termos seguintes ficam abaixo de meio-ulp e sao
+        // engolidos. Aqui a media ja sai exacta nas duas versoes: o que a
+        // tolerancia apertada mata e so o acumulador em f32.
+        let mut grau = vec![1_000_000u32; 20_000];
+        grau[0] = 3_000_000;
+        let (media, std) = estatistica_do_grau(&grau);
+        assert_eq!(media, 1_000_100.0, "media exacta com um outlier");
+        assert!(
+            (std - 14_141.782).abs() < 0.05,
+            "desvio {std}; exacto 14141.782, com acumulador f32 da 14141.429"
+        );
+
+        // (3) O mesmo, com a cauda INTEIRA a ser engolida pelo outlier.
+        let mut grau = vec![1u32; 20_000];
+        grau[0] = 4_000_000;
+        let (_, std) = estatistica_do_grau(&grau);
+        assert!(
+            (std - 28_283.557).abs() < 0.05,
+            "desvio {std}; exacto 28283.557, com acumulador f32 da 28282.85"
+        );
     }
 
     /// Um grafo sem arestas vivas nao pode partir a indexacao densa.
