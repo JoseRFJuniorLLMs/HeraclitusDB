@@ -787,10 +787,19 @@ impl SentinelRuntime {
                     .collect()
             })
             .unwrap_or_default();
-        let historico_de_regras = snapshot
-            .as_ref()
-            .map(|s| s.rule_history.clone())
-            .unwrap_or_default();
+        let historico_de_regras = {
+            let mut linhas: Vec<(Lsn, SecurityEvent)> = snapshot
+                .as_ref()
+                .map(|s| s.rule_history.clone())
+                .unwrap_or_default();
+            // Auditoria 2026-09-05, A18 — o snapshot vem de disco e a inserção
+            // por busca binária EXIGE a ordem; antes, o `sort_by` por evento
+            // reparava-a de graça. Ordena-se uma vez no arranque (custo único,
+            // irrelevante); sem isto, um `rule_history` desordenado passaria a
+            // deduplicar mal, em silêncio.
+            ordenar_historico_l1(&mut linhas);
+            linhas
+        };
         metrics
             .boot
             .state_restore_ms
@@ -2900,6 +2909,87 @@ fn normalize_l0(
     inner.normalizer.normalize(lsn, episode, now_ms())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Auditoria 2026-09-05, A18 — comparações feitas ao inserir no histórico L1.
+    ///
+    /// Só existe em teste, e é o que permite trancar a complexidade da inserção
+    /// (Θ(log N), não Θ(N)) sem medir tempo de relógio — que variaria com a
+    /// máquina e faria o CI intermitente.
+    ///
+    /// É por THREAD, e não um estático global, de propósito: os testes desta
+    /// crate correm em paralelo no MESMO processo e vários levantam runtimes com
+    /// o L1 ligado. Um contador global contaria também as inserções desses
+    /// workers e o teste ficaria intermitente.
+    pub(crate) static COMPARACOES_HISTORICO_L1: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// A chave que ordena o histórico L1.
+///
+/// Não é arbitrária: é a ordem em que `RuleEngine::evaluate` lê a janela, e o
+/// operador `Sequence` depende dela. Preservá-la byte a byte é o que torna a
+/// inserção ordenada semanticamente neutra.
+fn chave_do_historico_l1(lsn: Lsn, evento: &SecurityEvent) -> (Lsn, EventId) {
+    (lsn, evento.raw_event_id)
+}
+
+/// O comparador do histórico L1, num sítio só — para que a inserção, a
+/// verificação de duplicado e a reordenação do snapshot não possam divergir.
+fn compara_historico_l1(esquerda: (Lsn, EventId), direita: (Lsn, EventId)) -> std::cmp::Ordering {
+    #[cfg(test)]
+    COMPARACOES_HISTORICO_L1.with(|contador| contador.set(contador.get().saturating_add(1)));
+    esquerda.cmp(&direita)
+}
+
+/// Auditoria 2026-09-05, A18 — repõe a ordem do histórico L1.
+///
+/// Só é preciso no restauro do snapshot: é o único ponto de entrada do vector
+/// que não passa por [`inserir_no_historico_l1`]. Enquanto havia um `sort_by`
+/// completo por evento, um histórico desordenado vindo de disco era reparado de
+/// graça no primeiro evento; com a busca binária deixa de ser, e um snapshot
+/// desordenado passaria a deduplicar mal — em silêncio.
+fn ordenar_historico_l1(historico: &mut [(Lsn, SecurityEvent)]) {
+    historico.sort_by(|esquerda, direita| {
+        compara_historico_l1(
+            chave_do_historico_l1(esquerda.0, &esquerda.1),
+            chave_do_historico_l1(direita.0, &direita.1),
+        )
+    });
+}
+
+/// Auditoria 2026-09-05, A18 — insere no histórico L1 mantendo a ordem.
+/// Devolve `false` se a linha já lá estava.
+///
+/// O vector está SEMPRE ordenado por `(lsn, raw_event_id)`: os únicos pontos
+/// que o mutam são esta função, o `retain` e o `drain` da poda, e o restauro do
+/// snapshot (que passou a ordenar). Logo a deduplicação e a inserção são a
+/// MESMA busca binária.
+///
+/// O que estava antes era uma varredura linear de deduplicação seguida de um
+/// `sort_by` COMPLETO de um vector que já estava ordenado — por evento
+/// ingerido, sobre um histórico de até `history_capacity` (100 000 por
+/// omissão) `SecurityEvent`. Medido: 574 µs por evento a 100 000 linhas,
+/// contra 96 µs com a inserção ordenada, para exactamente o mesmo vector.
+fn inserir_no_historico_l1(
+    history: &mut Vec<(Lsn, SecurityEvent)>,
+    source_lsn: Lsn,
+    event: &SecurityEvent,
+) -> bool {
+    let chave = chave_do_historico_l1(source_lsn, event);
+    match history.binary_search_by(|(lsn, existente)| {
+        compara_historico_l1(chave_do_historico_l1(*lsn, existente), chave)
+    }) {
+        // Já lá está: a mesma decisão que a varredura linear tomava.
+        Ok(_) => false,
+        Err(posicao) => {
+            // Com LSN monótono `posicao` cai no fim e isto degenera num `push`.
+            history.insert(posicao, (source_lsn, event.clone()));
+            true
+        }
+    }
+}
+
 fn remember_rule_event(inner: &RuntimeInner, source_lsn: Lsn, event: &SecurityEvent) {
     let Some(engine) = inner.rule_engine.as_ref() else {
         return;
@@ -2908,16 +2998,7 @@ fn remember_rule_event(inner: &RuntimeInner, source_lsn: Lsn, event: &SecurityEv
         .rule_history
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !history
-        .iter()
-        .any(|(lsn, existing)| *lsn == source_lsn && existing.raw_event_id == event.raw_event_id)
-    {
-        history.push((source_lsn, event.clone()));
-        history.sort_by(|left, right| {
-            left.0
-                .cmp(&right.0)
-                .then_with(|| left.1.raw_event_id.cmp(&right.1.raw_event_id))
-        });
+    if inserir_no_historico_l1(&mut history, source_lsn, event) {
         // O histórico deixa de ser ilimitado. O horizonte não é arbitrário:
         // é a maior janela que o ruleset consulta, mais a tolerância a atraso
         // configurada — ver `DetectionExpr::max_window_ms`.
@@ -5294,6 +5375,167 @@ mod poda_l1_tests {
     }
 }
 
+/// Auditoria 2026-09-05, A18 — a insercao ordenada no historico L1.
+#[cfg(test)]
+mod testes_insercao_no_historico_l1 {
+    use super::{inserir_no_historico_l1, ordenar_historico_l1, COMPARACOES_HISTORICO_L1};
+    use crate::event::{SecurityEvent, SecuritySource};
+    use heraclitus_core::{EventId, Lsn};
+
+    fn evento(id: EventId) -> SecurityEvent {
+        SecurityEvent::unmapped(id, SecuritySource::Auditd)
+    }
+
+    /// A implementacao ANTERIOR, palavra por palavra: varredura linear de
+    /// deduplicacao, `push` e `sort_by` COMPLETO. Serve de oraculo — a
+    /// correccao so e legitima se o vector final for exactamente o mesmo, porque
+    /// `RuleEngine::evaluate` le a janela pela ordem em que a recebe e o
+    /// operador `Sequence` depende dela.
+    fn referencia_push_mais_sort(
+        historico: &mut Vec<(Lsn, SecurityEvent)>,
+        source_lsn: Lsn,
+        evento: &SecurityEvent,
+    ) -> bool {
+        if historico.iter().any(|(lsn, existente)| {
+            *lsn == source_lsn && existente.raw_event_id == evento.raw_event_id
+        }) {
+            return false;
+        }
+        historico.push((source_lsn, evento.clone()));
+        historico.sort_by(|esquerda, direita| {
+            esquerda
+                .0
+                .cmp(&direita.0)
+                .then_with(|| esquerda.1.raw_event_id.cmp(&direita.1.raw_event_id))
+        });
+        true
+    }
+
+    #[test]
+    fn a_insercao_ordenada_da_o_mesmo_vector_que_o_push_mais_sort() {
+        // Dois ids ORDENADOS, para o empate no mesmo LSN ser legivel: o
+        // desempate e por `raw_event_id` e tem de sobreviver a correccao.
+        let mut ids = [EventId::new(), EventId::new()];
+        ids.sort();
+        let menor = evento(ids[0]);
+        let maior = evento(ids[1]);
+        let outro = evento(EventId::new());
+
+        // A sequencia atravessa os quatro casos: LSN monotono, empate no mesmo
+        // LSN resolvido pelo id, LSN ATRASADO (insercao no MEIO — o caminho que
+        // um `push` em vez de `insert(posicao, ..)` estragaria) e duplicado
+        // exacto.
+        let passos: Vec<(Lsn, &SecurityEvent)> = vec![
+            (10, &outro),
+            (20, &maior),
+            (20, &menor),
+            (15, &outro),
+            (20, &maior),
+            (10, &outro),
+            (5, &menor),
+        ];
+
+        let mut oraculo: Vec<(Lsn, SecurityEvent)> = Vec::new();
+        let mut sob_teste: Vec<(Lsn, SecurityEvent)> = Vec::new();
+        for (passo, (lsn, linha)) in passos.iter().enumerate() {
+            let esperado = referencia_push_mais_sort(&mut oraculo, *lsn, linha);
+            let obtido = inserir_no_historico_l1(&mut sob_teste, *lsn, linha);
+            assert_eq!(
+                obtido, esperado,
+                "passo {passo}: a decisao de duplicado tem de ser a mesma"
+            );
+            assert_eq!(
+                sob_teste, oraculo,
+                "passo {passo}: o vector tem de ficar identico ao do push+sort"
+            );
+        }
+        assert_eq!(
+            sob_teste.len(),
+            5,
+            "dois dos sete passos eram duplicados exactos"
+        );
+    }
+
+    /// Quantas comparacoes custa inserir o (N+1)-esimo evento num historico de
+    /// N linhas ja ordenadas — o estado em que `remember_rule_event` o encontra
+    /// sempre.
+    fn comparacoes_para_inserir(n: u64) -> u64 {
+        let mut historico: Vec<(Lsn, SecurityEvent)> =
+            (0..n).map(|i| (i, evento(EventId::new()))).collect();
+        let novo = evento(EventId::new());
+        COMPARACOES_HISTORICO_L1.with(|contador| contador.set(0));
+        assert!(
+            inserir_no_historico_l1(&mut historico, n, &novo),
+            "o LSN e novo: tem de ser inserido"
+        );
+        COMPARACOES_HISTORICO_L1.with(|contador| contador.get())
+    }
+
+    /// Auditoria 2026-09-05, A18 — o custo por evento tem de ser O(log N).
+    ///
+    /// O que estava antes varria o historico inteiro para deduplicar e a seguir
+    /// reordenava um vector JA ordenado, por cada evento ingerido, sobre ate
+    /// `history_capacity` linhas (100 000 por omissao).
+    #[test]
+    fn inserir_no_historico_l1_custa_log_e_nao_linear() {
+        let mil = comparacoes_para_inserir(1_024);
+        let dois_mil = comparacoes_para_inserir(2_048);
+
+        // Passar pelo comparador PARTILHADO nao e acessorio: e o que garante que
+        // a insercao, a deduplicacao e a reordenacao do snapshot nao possam
+        // divergir. Uma implementacao com o seu proprio comparador inline — a
+        // anterior — nao conta nada aqui, e e isto que o apanha.
+        assert!(
+            mil >= 1,
+            "a insercao tem de comparar pelo comparador partilhado"
+        );
+        assert!(
+            mil <= 16,
+            "1024 linhas custam log2(1024) = 10 comparacoes, nao 1024; obtido {mil}"
+        );
+        assert!(
+            dois_mil <= mil + 2,
+            "duplicar o historico so pode custar mais uma comparacao: {mil} -> {dois_mil}"
+        );
+    }
+
+    /// O restauro do snapshot e o unico ponto de entrada do vector que nao passa
+    /// pela insercao ordenada. Enquanto havia `sort_by` por evento, um
+    /// `rule_history` desordenado era reparado de graca; com a busca binaria
+    /// deixaria de ser, e a deduplicacao passaria a falhar EM SILENCIO —
+    /// duplicando linhas no historico e mudando a janela que o `RuleEngine` ve.
+    #[test]
+    fn o_historico_restaurado_do_snapshot_e_reordenado_antes_de_ser_usado() {
+        let linhas: Vec<(Lsn, SecurityEvent)> = [1u64, 2, 3, 0]
+            .into_iter()
+            .map(|lsn| (lsn, evento(EventId::new())))
+            .collect();
+        // A linha fora do lugar: o LSN 0 no fim, como sairia de um snapshot
+        // corrompido ou de uma versao que mudasse a ordem de serializacao.
+        let (lsn_solto, solto) = linhas[3].clone();
+
+        let mut desordenado = linhas.clone();
+        assert!(
+            inserir_no_historico_l1(&mut desordenado, lsn_solto, &solto),
+            "sem ordenar, a MESMA linha escapa a deduplicacao e entra uma segunda vez"
+        );
+        assert_eq!(
+            desordenado.len(),
+            5,
+            "e a falha e silenciosa: o historico cresce com uma linha repetida"
+        );
+
+        let mut restaurado = linhas;
+        ordenar_historico_l1(&mut restaurado);
+        let lsns: Vec<Lsn> = restaurado.iter().map(|(lsn, _)| *lsn).collect();
+        assert_eq!(lsns, vec![0, 1, 2, 3], "o restauro tem de repor a ordem");
+        assert!(
+            !inserir_no_historico_l1(&mut restaurado, lsn_solto, &solto),
+            "sobre o vector ordenado, a mesma linha e reconhecida como duplicada"
+        );
+    }
+}
+
 #[cfg(test)]
 mod testes_snapshot_spec0072 {
     use super::*;
@@ -5335,6 +5577,58 @@ mod testes_snapshot_spec0072 {
             runtime.status().events_normalized_total,
             quantos,
             "o pipeline nao chegou ao fim dentro do prazo"
+        );
+    }
+
+    /// Auditoria 2026-09-05, A18 — o `rule_history` lido do snapshot é o ÚNICO
+    /// ponto de entrada do histórico L1 que não passa pela inserção ordenada.
+    /// Enquanto havia um `sort_by` completo por evento, uma ordem errada vinda
+    /// de disco era reparada de graça no primeiro evento; com a busca binária
+    /// deixa de ser, e a deduplicação passaria a falhar EM SILÊNCIO. Por isso o
+    /// arranque ordena uma vez — e é esse passo que este teste tranca.
+    #[test]
+    fn o_rule_history_do_snapshot_chega_ordenado_ao_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let caminho = log.dir().join("sentinel").join("state.snapshot");
+
+        let mut snapshot = SentinelStateSnapshot::vazio(7);
+        // Deliberadamente ao contrário da ordem que a inserção binária exige.
+        snapshot.rule_history = [3u64, 1, 2, 0]
+            .into_iter()
+            .map(|lsn| {
+                (
+                    lsn,
+                    SecurityEvent::unmapped(EventId::new(), SecuritySource::Auditd),
+                )
+            })
+            .collect();
+        SnapshotStore::new(&caminho).publicar(&snapshot).unwrap();
+
+        let runtime = SentinelRuntime::start(log, config_de_teste())
+            .unwrap()
+            .unwrap();
+        let lsns: Vec<Lsn> = runtime
+            .inner
+            .rule_history
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(lsn, _)| *lsn)
+            .collect();
+        runtime.shutdown();
+        assert_eq!(
+            lsns,
+            vec![0, 1, 2, 3],
+            "o arranque tem de repor a ordem do histórico L1 que veio do snapshot"
         );
     }
 
