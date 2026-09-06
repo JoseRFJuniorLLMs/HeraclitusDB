@@ -2212,6 +2212,23 @@ impl Engine {
         self.append_internal(episode)
     }
 
+    /// Hidratação capada para os caminhos que ainda pedem episódios ao
+    /// índice (`attr_lookup`/`attr_range_lookup`). O planner do GQL já não
+    /// passa por aqui: pede os LSNs e hidrata um a um até ao LIMIT.
+    fn hidratar(&self, lsns: Vec<Lsn>) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
+        let mut out: Vec<(Lsn, Episode)> =
+            Vec::with_capacity(lsns.len().min(heraclitus_query::backend::QUERY_SCAN_CAP));
+        for l in lsns {
+            if let Some(hit) = self.log.read(l)? {
+                out.push(hit);
+            }
+            if out.len() >= heraclitus_query::backend::QUERY_SCAN_CAP {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     pub fn snapshot(&self) -> Lsn {
         self.log.head()
     }
@@ -2650,6 +2667,18 @@ impl QueryBackend for Engine {
         value: &str,
         as_of: Option<Lsn>,
     ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
+        let Some(lsns) = self.attr_lookup_lsns(field, value, as_of)? else {
+            return Ok(None);
+        };
+        self.hidratar(lsns).map(Some)
+    }
+
+    fn attr_lookup_lsns(
+        &self,
+        field: &str,
+        value: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
         // `None` = "o índice não pode responder a isto; varre o log". Um
         // valor que o índice nunca indexou (SKIP_VALUES como `sim`/`true`/`0`,
         // ou texto acima de MAX_VALUE_LEN) daria aqui um resultado VAZIO
@@ -2660,8 +2689,9 @@ impl QueryBackend for Engine {
         if !heraclitus_index_attr::valor_indexavel(value) {
             return Ok(None);
         }
-        // O índice dá os LSNs exatos; cada `log.read` é O(1) via o índice de
-        // offset por-LSN do log (seek directo). Hidratação = nº de matches × O(1).
+        // Só os LSNs: a hidratação fica no planner, que a pára ao encher o
+        // LIMIT (auditoria 2026-09-05 — antes lia-se TODO o posting, até
+        // QUERY_SCAN_CAP episódios, para devolver 10).
         let mut lsns: Vec<Lsn> = {
             let idx = self.attr.read().unwrap();
             idx.lookup(field, value).to_vec()
@@ -2670,16 +2700,12 @@ impl QueryBackend for Engine {
             lsns.retain(|l| *l < bound);
         }
         lsns.sort_unstable();
-        let mut out: Vec<(Lsn, Episode)> = Vec::with_capacity(lsns.len());
-        for l in lsns {
-            if let Some(hit) = self.log.read(l)? {
-                out.push(hit);
-            }
-            if out.len() >= heraclitus_query::backend::QUERY_SCAN_CAP {
-                break;
-            }
-        }
-        Ok(Some(out))
+        Ok(Some(lsns))
+    }
+
+    fn read_lsn(&self, lsn: Lsn) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
+        // O(1) via o índice de offset por-LSN do log (seek directo).
+        self.log.read(lsn)
     }
 
     /// Range numérico (C1.6): resolvido pelo BTreeMap ordenado do índice de
@@ -2692,6 +2718,19 @@ impl QueryBackend for Engine {
         max: Option<(f64, bool)>,
         as_of: Option<Lsn>,
     ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
+        let Some(lsns) = self.attr_range_lookup_lsns(field, min, max, as_of)? else {
+            return Ok(None);
+        };
+        self.hidratar(lsns).map(Some)
+    }
+
+    fn attr_range_lookup_lsns(
+        &self,
+        field: &str,
+        min: Option<(f64, bool)>,
+        max: Option<(f64, bool)>,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
         use std::ops::Bound;
         let to_bound = |b: Option<(f64, bool)>| match b {
             None => Bound::Unbounded,
@@ -2726,16 +2765,7 @@ impl QueryBackend for Engine {
         if let Some(bound) = as_of {
             lsns.retain(|l| *l < bound);
         }
-        let mut out: Vec<(Lsn, Episode)> = Vec::with_capacity(lsns.len());
-        for l in lsns {
-            if let Some(hit) = self.log.read(l)? {
-                out.push(hit);
-            }
-            if out.len() >= heraclitus_query::backend::QUERY_SCAN_CAP {
-                break;
-            }
-        }
-        Ok(Some(out))
+        Ok(Some(lsns))
     }
 
     fn head(&self) -> Result<Lsn, HeraclitusError> {
@@ -3039,6 +3069,50 @@ mod tests {
         // E por rótulo.
         let v = heraclitus_query::execute("MATCH (n:LegalHold) RETURN n", engine.as_ref()).unwrap();
         assert_eq!(v.as_array().map(|a| a.len()), Some(1), "{v}");
+    }
+
+    /// Auditoria 2026-09-05 (LIMIT não empurrado): o índice devolve LSNs sem
+    /// hidratar e a leitura pontual é O(1); `attr_lookup` continua a ser
+    /// exactamente a hidratação desses LSNs.
+    #[test]
+    fn attr_lookup_lsns_e_read_lsn_batem_com_attr_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            storage_format: heraclitus_core::StorageFormat::V6,
+            ..Default::default()
+        };
+        let engine = Engine::open(&cfg).unwrap();
+        for cor in ["azul", "azul", "verde", "azul"] {
+            let mut e = Episode::new("a", EventKind::Observation, cor.as_bytes().to_vec());
+            e.attrs.insert("cor".into(), cor.into());
+            engine.append(e).unwrap();
+        }
+        let lsns = engine
+            .attr_lookup_lsns("cor", "azul", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lsns, vec![0, 1, 3]);
+        let hidratados = engine.attr_lookup("cor", "azul", None).unwrap().unwrap();
+        assert_eq!(
+            hidratados.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+            lsns,
+            "attr_lookup é a hidratação de attr_lookup_lsns"
+        );
+        // AS OF corta pelo LSN, e a leitura pontual devolve o episódio certo.
+        assert_eq!(
+            engine
+                .attr_lookup_lsns("cor", "azul", Some(2))
+                .unwrap()
+                .unwrap(),
+            vec![0, 1]
+        );
+        let (l, e) = engine.read_lsn(3).unwrap().unwrap();
+        assert_eq!((l, e.content.as_slice()), (3, b"azul".as_slice()));
+        assert!(engine.read_lsn(99).unwrap().is_none());
+        // Valor que o índice nunca indexa (SKIP_VALUES): o índice não responde.
+        assert!(engine.attr_lookup_lsns("cor", "0", None).unwrap().is_none());
     }
 
     /// Appends a provenance chain a←b←c plus a distilled fact f from {a,b}

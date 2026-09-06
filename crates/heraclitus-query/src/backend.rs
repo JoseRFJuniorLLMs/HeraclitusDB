@@ -519,6 +519,46 @@ pub trait QueryBackend {
         value: &str,
         as_of: Option<Lsn>,
     ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError>;
+    /// Os LSNs dos postings de `field = value`, SEM hidratar. É o que permite
+    /// ao planner empurrar o LIMIT para a hidratação (auditoria 2026-09-05:
+    /// `MATCH ... WHERE n.kind = "X" LIMIT 10` lia do disco TODOS os episódios
+    /// do posting — até `QUERY_SCAN_CAP` — antes de cortar 10; sobre 9 M de
+    /// episódios, 9 GB de RAM). Mesma semântica do `attr_lookup`: `Ok(None)`
+    /// = "o índice não pode responder; varre". O default deriva de
+    /// `attr_lookup` — correcto, sem o ganho; os backends com índice real
+    /// sobrepõem-no.
+    fn attr_lookup_lsns(
+        &self,
+        field: &str,
+        value: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
+        Ok(self
+            .attr_lookup(field, value, as_of)?
+            .map(|hits| hits.into_iter().map(|(l, _)| l).collect()))
+    }
+    /// O mesmo para o range numérico (ver `attr_range_lookup`).
+    fn attr_range_lookup_lsns(
+        &self,
+        field: &str,
+        min: Option<(f64, bool)>,
+        max: Option<(f64, bool)>,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
+        Ok(self
+            .attr_range_lookup(field, min, max, as_of)?
+            .map(|hits| hits.into_iter().map(|(l, _)| l).collect()))
+    }
+    /// Hidrata UM LSN — a unidade em que o planner pára ao encher o LIMIT.
+    /// `None` se o LSN não existir (fora do log, ou apagado por shred). O
+    /// default varre uma janela de uma unidade; os backends com leitura
+    /// pontual O(1) sobrepõem-no.
+    fn read_lsn(&self, lsn: Lsn) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
+        Ok(self
+            .scan_range(lsn, lsn.saturating_add(1))?
+            .into_iter()
+            .find(|(l, _)| *l == lsn))
+    }
     /// Range NUMÉRICO sobre um atributo (`WHERE n.campo > x AND n.campo < y`)
     /// resolvido pelo índice ordenado em vez do scan. Bounds `(valor,
     /// inclusivo?)`. Default `Ok(None)` = backend sem a capacidade → o planner
@@ -1120,6 +1160,24 @@ impl QueryBackend for LogBackend {
         value: &str,
         as_of: Option<Lsn>,
     ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
+        let Some(lsns) = self.attr_lookup_lsns(field, value, as_of)? else {
+            return Ok(None);
+        };
+        let mut results = Vec::with_capacity(lsns.len());
+        for lsn in lsns {
+            if let Some((_, ep)) = self.log.read(lsn)? {
+                results.push((lsn, ep));
+            }
+        }
+        Ok(Some(results))
+    }
+
+    fn attr_lookup_lsns(
+        &self,
+        field: &str,
+        value: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
         let b = self.sync_bundle()?;
         let bound = self.resolve_as_of_bound(as_of)?;
 
@@ -1139,14 +1197,11 @@ impl QueryBackend for LogBackend {
         if target_lsns.is_empty() {
             return Ok(None);
         }
+        Ok(Some(target_lsns.to_vec()))
+    }
 
-        let mut results = Vec::with_capacity(target_lsns.len());
-        for &lsn in target_lsns {
-            if let Some((_, ep)) = self.log.read(lsn)? {
-                results.push((lsn, ep));
-            }
-        }
-        Ok(Some(results))
+    fn read_lsn(&self, lsn: Lsn) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
+        self.log.read(lsn)
     }
 
     /// Range numérico de referência: varre os VALORES distintos do campo no
@@ -2140,6 +2195,26 @@ impl QueryBackend for VirtualBackend<'_> {
         as_of: Option<Lsn>,
     ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
         self.base.attr_lookup(field, value, as_of)
+    }
+    fn attr_lookup_lsns(
+        &self,
+        field: &str,
+        value: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
+        self.base.attr_lookup_lsns(field, value, as_of)
+    }
+    fn attr_range_lookup_lsns(
+        &self,
+        field: &str,
+        min: Option<(f64, bool)>,
+        max: Option<(f64, bool)>,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
+        self.base.attr_range_lookup_lsns(field, min, max, as_of)
+    }
+    fn read_lsn(&self, lsn: Lsn) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
+        self.base.read_lsn(lsn)
     }
     fn recall(
         &self,

@@ -4,7 +4,7 @@
 //! planner has statistics to feed on (§3.12).
 
 use crate::ast::*;
-use crate::backend::{materialize_virtual, EdgeRow, QueryBackend, VirtualBackend};
+use crate::backend::{materialize_virtual, EdgeRow, QueryBackend, VirtualBackend, QUERY_SCAN_CAP};
 use crate::fusion::FusionWeights;
 use heraclitus_core::{Episode, EventKind, HeraclitusError, Lsn};
 use heraclitus_index_graph::decision::DecisionPolicy;
@@ -1059,12 +1059,26 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
             // campo não-builtin, resolve pelo índice de atributos (global,
             // O(postings)) em vez de varrer a janela capada. O pós-filtro
             // `matches` revalida tudo, por isso a correção nunca depende disto.
-            let indexed: Option<Vec<(Lsn, Episode)>> = match attr_eq_hint(conditions) {
-                Some((field, value)) => be.attr_lookup(&field, &value, bound)?,
+            // Auditoria 2026-09-05: o índice devolve LSNs, NÃO episódios. A
+            // hidratação (uma leitura do log por LSN) fica aqui, e pára ao
+            // encher o LIMIT — antes, `attr_lookup` lia do disco TODOS os
+            // episódios do posting (até QUERY_SCAN_CAP = 250 000) para um
+            // `LIMIT 10`; sobre os 9 M de episódios da carga do governo, 9 GB
+            // de RAM e minutos, para devolver 5 linhas.
+            enum Fonte {
+                Lsns(Vec<Lsn>),
+                Linhas(Vec<(Lsn, Episode)>),
+            }
+            let fonte: Option<Fonte> = match attr_eq_hint(conditions) {
+                Some((field, value)) => {
+                    be.attr_lookup_lsns(&field, &value, bound)?.map(Fonte::Lsns)
+                }
                 None => match attr_range_hint(conditions) {
                     // ÍNDICE ORDENADO (C1.6): WHERE n.<campo> >/< número resolve
                     // pelo range do índice de atributos em vez do scan.
-                    Some((field, min, max)) => be.attr_range_lookup(&field, min, max, bound)?,
+                    Some((field, min, max)) => be
+                        .attr_range_lookup_lsns(&field, min, max, bound)?
+                        .map(Fonte::Lsns),
                     None => match builtin_skip_hint(conditions) {
                         // SPEC-010 skip-I/O: WHERE agent_id/session_id = "v" salta
                         // segmentos selados cujo zone map não contém o valor
@@ -1072,7 +1086,7 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                         // atributos); o pós-filtro `matches` revalida o exato.
                         Some((field, value)) => be
                             .scan_builtin_eq(&field, &value, bound)?
-                            .map(|result| result.rows),
+                            .map(|result| Fonte::Linhas(result.rows)),
                         None => None,
                     },
                 },
@@ -1091,31 +1105,63 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
             // capitalizacao diferente (ou um kind ausente) recua para o
             // varrimento de hoje — sem regressao — em vez de tomar `Some(vazio)`
             // como resposta final, que e a classe do bug critico ja corrigido.
-            let indexed = match (indexed, label.as_deref()) {
+            let fonte = match (fonte, label.as_deref()) {
                 (None, Some(rotulo)) => be
-                    .attr_lookup("_kind", rotulo, bound)?
-                    .filter(|hits| !hits.is_empty()),
-                (outro, _) => outro,
+                    .attr_lookup_lsns("_kind", rotulo, bound)?
+                    .filter(|lsns| !lsns.is_empty())
+                    .map(Fonte::Lsns),
+                (outra, _) => outra,
             };
-            let candidates: Vec<(Lsn, Episode)> = match indexed {
-                Some(hit) => hit,
+            let aceita = |l: Lsn, e: &Episode| -> bool {
+                label
+                    .as_ref()
+                    .map(|rotulo| kind_label(&e.kind).eq_ignore_ascii_case(rotulo))
+                    .unwrap_or(true)
+                    && valid_at.is_none_or(|t| valid_at_matches(e, t))
+                    && matches(conditions, l, e)
+            };
+            // LIMIT empurrado para a hidratação: sem ORDER BY — ou com
+            // `ORDER BY n.lsn`, que é a ordem natural dos LSNs — pára-se ao
+            // encher o LIMIT. Com outro ORDER BY é preciso o conjunto inteiro,
+            // capado como sempre. O pós-filtro `aceita` corre ANTES de contar,
+            // por isso o corte é sempre sobre linhas que passam.
+            let (tecto, inverter) = match (order_by, limit) {
+                (None, Some(k)) => (Some(*k as usize), false),
+                (Some((OrderKey::Field(f), asc)), Some(k)) if f == "lsn" => {
+                    (Some(*k as usize), !*asc)
+                }
+                _ => (None, false),
+            };
+            let mut rows: Vec<(Lsn, Episode)> = match fonte {
+                Some(Fonte::Lsns(mut lsns)) => {
+                    if inverter {
+                        lsns.reverse();
+                    }
+                    let mut out = Vec::new();
+                    for l in lsns.into_iter().take(QUERY_SCAN_CAP) {
+                        if tecto.is_some_and(|k| out.len() >= k) {
+                            break;
+                        }
+                        if let Some((l, e)) = be.read_lsn(l)? {
+                            if aceita(l, &e) {
+                                out.push((l, e));
+                            }
+                        }
+                    }
+                    out
+                }
+                Some(Fonte::Linhas(linhas)) => {
+                    linhas.into_iter().filter(|(l, e)| aceita(*l, e)).collect()
+                }
                 None => {
                     // Push any `n.lsn` bounds down to a pruned, capped scan window.
                     let (lo, hi) = lsn_window(conditions, bound);
                     be.scan_range(lo, hi)?
+                        .into_iter()
+                        .filter(|(l, e)| aceita(*l, e))
+                        .collect()
                 }
             };
-            let mut rows: Vec<(Lsn, Episode)> = candidates
-                .into_iter()
-                .filter(|(_, e)| {
-                    label
-                        .as_ref()
-                        .map(|l| kind_label(&e.kind).eq_ignore_ascii_case(l))
-                        .unwrap_or(true)
-                })
-                .filter(|(_, e)| valid_at.is_none_or(|t| valid_at_matches(e, t)))
-                .filter(|(l, e)| matches(conditions, *l, e))
-                .collect();
             if let Some((key, asc)) = order_by {
                 match key {
                     // Correção R3: comparação numérica (com coerção) em vez de
@@ -1502,6 +1548,10 @@ mod testes_rotulo_indice {
         fn scan_range(&self, _from: Lsn, _to: Lsn) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
             Ok(vec![ep("Despesas", "via-scan"), ep("Outro", "ruido")])
         }
+        /// A hidratacao de um LSN vindo do indice devolve o episodio do indice.
+        fn read_lsn(&self, lsn: Lsn) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
+            Ok((lsn == 1).then(|| ep("Despesas", "via-indice")))
+        }
         /// O indice `_kind` so conhece "via-indice" — e so para o rotulo exacto.
         fn attr_lookup(
             &self,
@@ -1611,6 +1661,188 @@ mod testes_rotulo_indice {
         ) -> Result<Vec<String>, HeraclitusError> {
             unimplemented!("entity_cluster: fora do ambito deste mock")
         }
+    }
+
+    /// Auditoria 2026-09-05: o LIMIT tem de ser empurrado para a hidratação.
+    /// Um posting com 1 000 LSNs e `LIMIT 5` custa 5 leituras — não 1 000.
+    struct Contador {
+        leituras: std::cell::Cell<usize>,
+    }
+
+    impl QueryBackend for Contador {
+        fn head(&self) -> Result<Lsn, HeraclitusError> {
+            Ok(1000)
+        }
+        fn scan(&self, _as_of: Option<Lsn>) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
+            unimplemented!("o planner tem de ir pelo indice, nao pelo varrimento")
+        }
+        fn scan_range(&self, _from: Lsn, _to: Lsn) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
+            unimplemented!("o planner tem de ir pelo indice, nao pelo varrimento")
+        }
+        fn attr_lookup(
+            &self,
+            _field: &str,
+            _value: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
+            unimplemented!("o planner pede LSNs, nao episodios hidratados")
+        }
+        fn attr_lookup_lsns(
+            &self,
+            field: &str,
+            value: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
+            Ok((field == "cor" && value == "azul").then(|| (0..1000).collect()))
+        }
+        fn read_lsn(&self, lsn: Lsn) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
+            self.leituras.set(self.leituras.get() + 1);
+            let mut e = Episode::new("a", EventKind::Observation, vec![]);
+            e.attrs.insert("cor".into(), "azul".into());
+            Ok(Some((lsn, e)))
+        }
+        fn graph(&self) -> Result<TemporalGraph, HeraclitusError> {
+            unimplemented!("graph: fora do ambito deste mock")
+        }
+        fn append(
+            &self,
+            _label: Option<&str>,
+            _props: &[(String, Value)],
+        ) -> Result<Lsn, HeraclitusError> {
+            unimplemented!("append: fora do ambito deste mock")
+        }
+        fn recall(
+            &self,
+            _text: &str,
+            _k: usize,
+            _as_of: Option<Lsn>,
+        ) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError> {
+            unimplemented!("recall: fora do ambito deste mock")
+        }
+        fn nearest(
+            &self,
+            _vector: &[f32],
+            _k: usize,
+            _as_of: Option<Lsn>,
+        ) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError> {
+            unimplemented!("nearest: fora do ambito deste mock")
+        }
+        fn provenance(&self, _id: &str) -> Result<Vec<String>, HeraclitusError> {
+            unimplemented!("provenance: fora do ambito deste mock")
+        }
+        fn neighbors(
+            &self,
+            _node: &str,
+            _etype: Option<&str>,
+            _as_of: Option<Lsn>,
+            _min_confidence: f32,
+        ) -> Result<Vec<NeighborRow>, HeraclitusError> {
+            unimplemented!("neighbors: fora do ambito deste mock")
+        }
+        fn traverse(
+            &self,
+            _start: &str,
+            _max_depth: usize,
+            _as_of: Option<Lsn>,
+            _min_confidence: f32,
+        ) -> Result<Vec<(String, usize)>, HeraclitusError> {
+            unimplemented!("traverse: fora do ambito deste mock")
+        }
+        fn match_edges(
+            &self,
+            _src: Option<&str>,
+            _etype: Option<&str>,
+            _dst: Option<&str>,
+            _as_of: Option<Lsn>,
+        ) -> Result<Vec<EdgeRow>, HeraclitusError> {
+            unimplemented!("match_edges: fora do ambito deste mock")
+        }
+        fn community(
+            &self,
+            _node: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<CommunityResult>, HeraclitusError> {
+            unimplemented!("community: fora do ambito deste mock")
+        }
+        fn node_metrics(
+            &self,
+            _node: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<MetricsResult>, HeraclitusError> {
+            unimplemented!("node_metrics: fora do ambito deste mock")
+        }
+        fn edge_hypotheses(
+            &self,
+            _from: &str,
+            _to: &str,
+            _etype: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<EdgeHypotheses>, HeraclitusError> {
+            unimplemented!("edge_hypotheses: fora do ambito deste mock")
+        }
+        fn lsn_for_timestamp(&self, _ts_ms: u64) -> Result<Lsn, HeraclitusError> {
+            unimplemented!("lsn_for_timestamp: fora do ambito deste mock")
+        }
+        fn resolve_entity(
+            &self,
+            _key: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<String>, HeraclitusError> {
+            unimplemented!("resolve_entity: fora do ambito deste mock")
+        }
+        fn entity_cluster(
+            &self,
+            _entity_id: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Vec<String>, HeraclitusError> {
+            unimplemented!("entity_cluster: fora do ambito deste mock")
+        }
+    }
+
+    #[test]
+    fn limit_e_empurrado_para_a_hidratacao_do_indice() {
+        let be = Contador {
+            leituras: std::cell::Cell::new(0),
+        };
+        let lsns = |q: &str| -> Vec<u64> {
+            crate::execute(q, &be)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["lsn"].as_u64().unwrap())
+                .collect()
+        };
+        // Sem ORDER BY: 5 linhas, 5 leituras.
+        assert_eq!(
+            lsns("MATCH (n) WHERE n.cor = \"azul\" RETURN n LIMIT 5"),
+            vec![0, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            be.leituras.get(),
+            5,
+            "LIMIT 5 tem de custar 5 leituras, nao o posting inteiro"
+        );
+        // ORDER BY n.lsn DESC e a ordem natural invertida: 3 leituras, do fim.
+        be.leituras.set(0);
+        assert_eq!(
+            lsns("MATCH (n) WHERE n.cor = \"azul\" RETURN n ORDER BY n.lsn DESC LIMIT 3"),
+            vec![999, 998, 997]
+        );
+        assert_eq!(be.leituras.get(), 3);
+        // Um pos-filtro que rejeita: continua-se a ler ate encher — o corte
+        // e sobre linhas que PASSAM, nunca sobre candidatos.
+        be.leituras.set(0);
+        assert_eq!(
+            lsns("MATCH (n) WHERE n.cor = \"azul\" AND n.lsn >= 10 RETURN n LIMIT 2"),
+            vec![10, 11]
+        );
+        assert_eq!(be.leituras.get(), 12);
+        // Outro ORDER BY precisa do conjunto inteiro: hidrata tudo, como sempre.
+        be.leituras.set(0);
+        let v = lsns("MATCH (n) WHERE n.cor = \"azul\" RETURN n ORDER BY n.agent_id ASC LIMIT 2");
+        assert_eq!(v.len(), 2);
+        assert_eq!(be.leituras.get(), 1000);
     }
 
     fn conteudos(v: &serde_json::Value) -> Vec<String> {
