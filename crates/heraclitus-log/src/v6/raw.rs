@@ -402,8 +402,14 @@ pub struct RawScan {
 
 /// Lê um segmento RAW inteiro para memória.
 ///
-/// Serve o packer e o `verify`. O caminho de leitura quente do motor usa mmap;
-/// esta função é a versão simples e auditável do mesmo percurso.
+/// Serve quem precisa mesmo do ficheiro todo: o packer, o `verify`, a migração
+/// e o `resume` do writer. **Não** serve o ponto de leitura quente — para uma
+/// leitura pontual ou uma janela existe [`percorrer_raw_segmento`], que faz
+/// streaming e pára onde chega.
+///
+/// (O doc-comment anterior afirmava que "o caminho de leitura quente do motor
+/// usa mmap". Era falso: `V6Log::read` chamava esta função e materializava o
+/// segmento inteiro para devolver um registo. Auditoria 2026-09-05, A04.)
 pub fn scan_raw_segment(path: &Path) -> V6Result<RawScan> {
     let mut file = File::open(path)?;
     let mut buf = Vec::new();
@@ -478,6 +484,157 @@ pub fn scan_raw_bytes(buf: &[u8]) -> V6Result<RawScan> {
         records,
         footer,
         torn_at,
+    })
+}
+
+/// Decisão de quem está a visitar os registos de uma varredura em streaming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControloVarredura {
+    Continuar,
+    /// Já se tem o que era preciso: o resto do ficheiro não chega a ser lido.
+    Parar,
+}
+
+/// Buffer de leitura do percurso em streaming. Um segmento activo vai até 8 MiB
+/// por omissão; 256 KiB dão poucas syscalls sem prender memória por leitor.
+const BUFFER_PERCURSO: usize = 256 * 1024;
+
+/// Percorre os registos de um segmento RAW **em streaming**, entregando cada
+/// payload por referência e parando onde quem visita mandar.
+///
+/// Auditoria 2026-09-05, A04/A13. O motor fazia toda a leitura RAW — pontual ou
+/// por janela — com [`scan_raw_segment`], isto é, `read_to_end` do ficheiro
+/// inteiro mais um `Vec<u8>` por registo, e a seguir deitava fora tudo menos o
+/// que queria. Com os defaults (segmentos de 8 MiB, registos de ~500 B) uma
+/// leitura pontual no segmento activo custava até 8 MiB de memcpy e ~16 000
+/// alocações imediatamente descartadas. Aqui não há alocação por registo: o
+/// buffer é reutilizado e quem visita decide se copia.
+///
+/// Devolve os **bytes do ficheiro percorridos** até parar — a medida honesta do
+/// trabalho feito, e o que os testes usam para provar a paragem antecipada.
+///
+/// A máquina de estados é a de [`scan_raw_bytes`] e a descodificação é
+/// literalmente [`decode_raw_record`], para não haver duas noções de registo
+/// válido: mesmo CRC, mesmo tratamento de cauda rasgada, mesmo tecto de
+/// `HARD_MAX_RECORD_BYTES`. A diferença deliberada é o que **não** acontece: um
+/// percurso parcial não chega ao footer, portanto não corre
+/// `validate_raw_footer` nem a recusa de bytes depois do footer. Isso é agora
+/// exclusivo de quem tem de o fazer — `verify_sealed`/`verify_active_tail` e o
+/// boot, que confronta o tamanho do ficheiro com o manifesto — exactamente como
+/// o ramo PACKED já vivia.
+pub fn percorrer_raw_segmento<F>(path: &Path, mut visitar: F) -> V6Result<u64>
+where
+    F: FnMut(Lsn, u64, &[u8]) -> V6Result<ControloVarredura>,
+{
+    let file = File::open(path)?;
+    let tamanho = file.metadata()?.len();
+    let mut leitor = std::io::BufReader::with_capacity(BUFFER_PERCURSO, file);
+
+    let mut cabecalho = vec![0u8; FILE_HEADER_LEN];
+    let lidos = ler_ate_encher(&mut leitor, &mut cabecalho)?;
+    cabecalho.truncate(lidos);
+    // Um toco de crash (menos de um header) tem de dar o mesmo "short header"
+    // que `scan_raw_bytes` dá — o boot filtra-o por `is_crash_stub`.
+    let header = FileHeaderV6::decode(&cabecalho)?;
+    if header.physical_layout != PhysicalLayout::Raw {
+        return Err(corrupt("hrkl v6 raw scan", "segment is not RAW"));
+    }
+
+    let mut pos = FILE_HEADER_LEN as u64;
+    let mut buf: Vec<u8> = Vec::with_capacity(RAW_RECORD_HEADER_LEN);
+    loop {
+        buf.clear();
+        buf.resize(RAW_RECORD_HEADER_LEN, 0);
+        if ler_ate_encher(&mut leitor, &mut buf)? < RAW_RECORD_HEADER_LEN {
+            return Ok(pos); // fim do ficheiro ou cauda rasgada
+        }
+        if buf[..4] == FOOTER_MAGIC {
+            return Ok(pos); // acabaram os registos
+        }
+        let len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
+        // SPEC-0050 §140: um comprimento vindo do disco não pode chegar a um
+        // `resize` sem passar por um tecto **e** pelo que resta do ficheiro. Em
+        // memória o `decode_raw_record` compara com o buffer que já tem; aqui,
+        // como ainda não lemos os bytes, o tecto tem de ser explícito.
+        let restante = tamanho.saturating_sub(pos + RAW_RECORD_HEADER_LEN as u64);
+        if len > HARD_MAX_RECORD_BYTES || len as u64 > restante {
+            return Ok(pos); // cauda rasgada
+        }
+        buf.resize(RAW_RECORD_HEADER_LEN + len, 0);
+        if ler_ate_encher(&mut leitor, &mut buf[RAW_RECORD_HEADER_LEN..])? < len {
+            return Ok(pos);
+        }
+        match decode_raw_record(&buf) {
+            RawDecoded::Record {
+                lsn,
+                hlc,
+                payload,
+                total,
+            } => {
+                let avanco = pos + total as u64;
+                let controlo = visitar(lsn, hlc, payload)?;
+                pos = avanco;
+                if controlo == ControloVarredura::Parar {
+                    return Ok(pos);
+                }
+            }
+            // CRC falhado (ou um footer que não estava onde devia): é o mesmo
+            // fim de percurso que `scan_raw_bytes` trata como cauda.
+            RawDecoded::Footer(_) | RawDecoded::Torn => return Ok(pos),
+        }
+    }
+}
+
+/// Lê até encher `destino` ou acabar o ficheiro. Devolve quantos bytes leu.
+///
+/// Não é `read_exact`: o fim do ficheiro **não** é erro nesta camada — é o sinal
+/// normal de fim de registos (ou de cauda rasgada, no segmento activo).
+fn ler_ate_encher(leitor: &mut impl Read, destino: &mut [u8]) -> V6Result<usize> {
+    let mut total = 0usize;
+    while total < destino.len() {
+        match leitor.read(&mut destino[total..])? {
+            0 => break,
+            n => total += n,
+        }
+    }
+    Ok(total)
+}
+
+/// O que uma procura pontual encontrou, e quanto do ficheiro custou.
+#[derive(Debug)]
+pub struct RawLookup {
+    pub record: Option<RawRecord>,
+    /// Bytes do ficheiro percorridos até parar.
+    pub bytes_percorridos: u64,
+}
+
+/// Procura um LSN num segmento RAW, parando **no registo alvo**.
+///
+/// Auditoria 2026-09-05, A04: substitui o `scan_raw_segment(..).records.find(..)`
+/// do caminho de leitura pontual do motor. Uma única cópia de payload em vez de
+/// uma por registo do ficheiro, e em média metade dos bytes tocados.
+///
+/// Não pára em `lsn > alvo`, apesar de o motor v6 só escrever LSN crescentes: o
+/// `RawSegmentWriter` aceita deliberadamente segmentos esparsos (ferramentas de
+/// migração e perícia), e o comportamento anterior — `find` sobre todos os
+/// registos do ficheiro — encontrava o alvo estivesse ele onde estivesse. A
+/// paragem no alvo é a poupança que não custa nenhuma suposição nova.
+pub fn find_raw_record(path: &Path, alvo: Lsn) -> V6Result<RawLookup> {
+    let mut encontrado = None;
+    let bytes_percorridos = percorrer_raw_segmento(path, |lsn, hlc, payload| {
+        if lsn != alvo {
+            return Ok(ControloVarredura::Continuar);
+        }
+        encontrado = Some(RawRecord {
+            lsn,
+            hlc,
+            payload: payload.to_vec(),
+        });
+        Ok(ControloVarredura::Parar)
+    })?;
+    Ok(RawLookup {
+        record: encontrado,
+        bytes_percorridos,
     })
 }
 
@@ -782,6 +939,116 @@ mod tests {
         assert_eq!(scan.footer.unwrap().logical_root, footer.logical_root);
         assert!(scan.torn_at.is_none());
         assert_eq!(read_footer(&path).unwrap().unwrap(), footer);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Escreve um segmento RAW selado com `n` registos de payload fixo e
+    /// devolve o caminho. Serve os testes da procura pontual.
+    fn segmento_selado_com(nome: &str, n: u64) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("hrkl6-raw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(nome);
+        let _ = std::fs::remove_file(&path);
+        let init = SegmentInit {
+            segment_id: 11,
+            created_hlc: 1,
+            first_lsn: 0,
+            writer_epoch: 1,
+            storage_namespace_id: [7u8; 16],
+        };
+        let mut w = RawSegmentWriter::create(&path, init).unwrap();
+        for i in 0..n {
+            w.append(i, 1000 + i, &[b'p'; 512], &h((i % 251) as u8 + 1))
+                .unwrap();
+        }
+        w.seal().unwrap();
+        path
+    }
+
+    #[test]
+    fn procura_pontual_para_no_alvo_em_vez_de_percorrer_o_segmento_todo() {
+        // Auditoria 2026-09-05, A04: a leitura pontual do motor materializava o
+        // segmento INTEIRO (`read_to_end` + um `Vec` por registo) para devolver
+        // um registo. Um alvo no princípio do ficheiro tem de custar o princípio
+        // do ficheiro.
+        let path = segmento_selado_com("seg-lookup-cedo.hrkl", 500);
+        let tamanho = std::fs::metadata(&path).unwrap().len();
+
+        let achado = find_raw_record(&path, 9).unwrap();
+        assert_eq!(achado.record.as_ref().unwrap().lsn, 9);
+        assert_eq!(achado.record.as_ref().unwrap().hlc, 1009);
+        assert_eq!(achado.record.as_ref().unwrap().payload, vec![b'p'; 512]);
+        assert!(
+            achado.bytes_percorridos < tamanho / 4,
+            "percorreu {} de {tamanho} bytes para o 10.º registo",
+            achado.bytes_percorridos
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn procura_pontual_devolve_o_mesmo_que_o_varrimento_completo() {
+        // Rede de segurança da refactorização: o leitor em streaming e o
+        // leitor que materializa o ficheiro têm de concordar registo a registo,
+        // e concordar também no que NÃO existe.
+        let path = segmento_selado_com("seg-lookup-equiv.hrkl", 120);
+        let varrido = scan_raw_segment(&path).unwrap();
+        assert_eq!(varrido.records.len(), 120);
+        for esperado in &varrido.records {
+            let achado = find_raw_record(&path, esperado.lsn).unwrap().record;
+            let achado = achado.unwrap_or_else(|| panic!("LSN {} desapareceu", esperado.lsn));
+            assert_eq!(achado.lsn, esperado.lsn);
+            assert_eq!(achado.hlc, esperado.hlc);
+            assert_eq!(achado.payload, esperado.payload);
+        }
+        // Acima do máximo e (por construção) inexistente: o percurso chega ao
+        // footer e devolve `None`, não um erro.
+        assert!(find_raw_record(&path, 120).unwrap().record.is_none());
+        assert!(find_raw_record(&path, u64::MAX).unwrap().record.is_none());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn percurso_em_streaming_para_na_cauda_rasgada_como_o_varrimento() {
+        // A cauda rasgada é o caso normal do segmento activo. O percurso em
+        // streaming tem de a tratar como `scan_raw_bytes`: parar, sem erro.
+        let dir = std::env::temp_dir().join(format!("hrkl6-raw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("seg-stream-torn.hrkl");
+        let _ = std::fs::remove_file(&path);
+        let init = SegmentInit {
+            segment_id: 12,
+            created_hlc: 1,
+            first_lsn: 0,
+            writer_epoch: 1,
+            storage_namespace_id: [0u8; 16],
+        };
+        let mut w = RawSegmentWriter::create(&path, init).unwrap();
+        for i in 0..5u64 {
+            w.append(i, i, b"abcdefgh", &h(i as u8 + 1)).unwrap();
+        }
+        w.sync().unwrap();
+        let bom = std::fs::metadata(&path).unwrap().len();
+        drop(w);
+        {
+            use std::io::Write as _;
+            let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&encode_raw_record(5, 5, b"abcdefgh")[..10])
+                .unwrap();
+        }
+
+        let mut vistos = Vec::new();
+        let percorridos = percorrer_raw_segmento(&path, |lsn, _, _| {
+            vistos.push(lsn);
+            Ok(ControloVarredura::Continuar)
+        })
+        .unwrap();
+        assert_eq!(vistos, vec![0, 1, 2, 3, 4]);
+        assert_eq!(percorridos, bom);
+        assert!(find_raw_record(&path, 5).unwrap().record.is_none());
 
         std::fs::remove_file(&path).ok();
     }

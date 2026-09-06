@@ -43,7 +43,8 @@ use super::manifest::{
 use super::packed::{open_packed, PackOptions, ScanCounters};
 use super::packer::{pack_segment, PackOutcome};
 use super::raw::{
-    read_footer, repair_active_tail, scan_raw_segment, RawSegmentWriter, SegmentInit,
+    find_raw_record, read_footer, repair_active_tail, scan_raw_segment, RawSegmentWriter,
+    SegmentInit,
 };
 use super::receipts::{persist_pack_receipt, physical_digest_of_file};
 use super::verify::{verify_segment as verify_segment_file, IntegrityLevel, VerifyReport};
@@ -763,22 +764,26 @@ impl V6Log {
             }
         };
 
+        // Auditoria 2026-09-05, A04: os dois ramos RAW faziam
+        // `scan_raw_segment(..).records.into_iter().find(|r| r.lsn == lsn)` —
+        // ou seja, liam o ficheiro TODO e alocavam um `Vec<u8>` por registo
+        // para devolver um e deitar fora os outros. Com os defaults (segmento
+        // activo até 8 MiB, registos de ~500 B) isso são ~16 000 alocações
+        // descartadas e até 8 MiB de memcpy por leitura pontual, e o motor faz
+        // uma destas por LSN ao hidratar uma posting list de índice. O percurso
+        // em streaming pára no registo alvo e copia só esse payload; o ramo
+        // PACKED ao lado já fazia o equivalente (descomprime um bloco, não o
+        // segmento).
         let found = match source {
-            ReadSource::Active(path) => match scan_raw_segment(&path) {
-                Ok(varrido) => varrido
-                    .records
-                    .into_iter()
-                    .find(|r| r.lsn == lsn)
-                    .map(|r| (r.lsn, r.payload)),
+            ReadSource::Active(path) => match find_raw_record(&path, lsn) {
+                Ok(achado) => achado.record.map(|r| (r.lsn, r.payload)),
                 // O ficheiro deixou de existir: alguem selou o segmento entre a
                 // resolucao do caminho e a abertura. Nao e erro — e a corrida.
                 Err(_) if !path.exists() => return Err(TentativaFalhou::Rolou),
                 Err(e) => return Err(TentativaFalhou::Erro(e)),
             },
-            ReadSource::Sealed(path, PhysicalLayout::Raw) => scan_raw_segment(&path)?
-                .records
-                .into_iter()
-                .find(|r| r.lsn == lsn)
+            ReadSource::Sealed(path, PhysicalLayout::Raw) => find_raw_record(&path, lsn)?
+                .record
                 .map(|r| (r.lsn, r.payload)),
             ReadSource::Sealed(path, PhysicalLayout::Packed) => {
                 let reader = open_packed(&path, HARD_MAX_BLOCK_BYTES)?;
@@ -3002,6 +3007,48 @@ mod tests {
             reopened.metrics_snapshot().unwrap().physical_crc_failures,
             1,
             "a falha física precisa ser observável operacionalmente"
+        );
+    }
+
+    #[test]
+    fn leitura_pontual_para_no_registo_e_nao_no_fim_do_ficheiro() {
+        // Auditoria 2026-09-05, A04: `V6Log::read` materializava o segmento RAW
+        // INTEIRO (`scan_raw_segment` = `read_to_end` + um `Vec<u8>` por
+        // registo) para devolver um registo e deitar fora os outros. A prova
+        // observável de que agora pára no alvo é que a leitura do PRIMEIRO
+        // registo deixa de depender de bytes que estão depois dele — aqui, uma
+        // "segunda história" anexada ao fim do ficheiro selado, que o
+        // varrimento completo recusa com "bytes found after a valid RAW
+        // footer".
+        //
+        // Esta é a propriedade que a correcção troca conscientemente: uma
+        // leitura pontual deixa de validar, de passagem, o resto do ficheiro. O
+        // teste fixa as duas metades do negócio — a leitura passa a servir o
+        // registo que lhe pediram, E quem tem por missão apanhar a adulteração
+        // continua a apanhá-la. É também como o ramo PACKED sempre viveu.
+        let dir = tempfile::tempdir().unwrap();
+        let log = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
+        for i in 0..8 {
+            log.append(event(i)).unwrap();
+        }
+        log.seal_active().unwrap();
+
+        let raw = raw_path(&dir.path().join(SEGMENTS_DIR), 0);
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&raw).unwrap();
+            f.write_all(b"uma segunda historia anexada").unwrap();
+            f.sync_all().unwrap();
+        }
+
+        assert_eq!(
+            log.read(0).unwrap().unwrap().1.content,
+            b"payload-0".to_vec(),
+            "a leitura do primeiro registo não pode depender do fim do ficheiro"
+        );
+        assert!(
+            log.verify_sealed(IntegrityLevel::Physical).is_err(),
+            "a adulteração continua a ser apanhada por quem tem de a apanhar"
         );
     }
 
