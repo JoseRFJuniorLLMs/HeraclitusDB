@@ -331,6 +331,20 @@ pub mod column {
                 Some(out)
             }
             Codec::Rle => {
+                // Cada run ocupa 8 B de valor + 4 B de contagem no blob. Se
+                // esses bytes não estão lá, `n` é lixo do disco — recusar
+                // ANTES de o usar como capacidade, como já faz o ramo `Raw`.
+                // Auditoria 2026-09-05 (A53): a guarda `MAX_VALORES` foi
+                // dimensionada para valores DESCODIFICADOS de 8 B, mas um
+                // elemento da lista de runs custa 16 B (`(u64, u32)`
+                // alinhado), por isso o mesmo tecto autorizava 4 GiB de
+                // reserva a partir de 9 bytes de ficheiro — abort do alocador
+                // onde houver limite duro de memória. O resultado não muda:
+                // um blob que reprova aqui já reprovava dentro do laço, só
+                // que depois de alocar.
+                if blob.len().checked_sub(at)? < n.checked_mul(12)? {
+                    return None;
+                }
                 let mut runs = Vec::with_capacity(n);
                 let mut total = 0usize;
                 for _ in 0..n {
