@@ -210,6 +210,21 @@ pub struct Engine {
     /// semântica nenhuma: duas chaves distintas nunca interagem, portanto
     /// serializá-las juntas nunca foi um requisito, era um acidente.
     idempotency_locks: Vec<Mutex<()>>,
+    /// Serializa o par (reconstruir estado → apender) dos comandos de caso,
+    /// **por `case_id`** — o mesmo padrão de `idempotency_locks`, pela mesma
+    /// razão e com o mesmo custo residual de partilha de shard.
+    ///
+    /// Sem isto, dois comandos concorrentes liam a MESMA revisão, ambos
+    /// passavam a validação e ambos entravam no log; a partir daí a
+    /// reconstrução devolvia `Err(Conflito)` para sempre. Num log append-only
+    /// não há como retirar o segundo, portanto o caso ficava permanentemente
+    /// ilegível — é a falha sem reparação possível (auditoria 2026-09-05, A02).
+    ///
+    /// LIMITAÇÃO declarada: isto fecha a corrida no nó autónomo. Com replicação
+    /// activa o append passa pelo líder do raft e um mutex LOCAL não serializa
+    /// dois nós; fechar esse caso exige um CAS sobre a revisão observada no
+    /// aplicador do raft, que não está feito.
+    case_locks: Vec<Mutex<()>>,
     /// Estado regulatório dobrado uma vez e estendido pela cauda desde então.
     /// Vive aqui porque o `RegulatoryPolicyEngine` nasce e morre em cada RPC.
     pub regulatory_cache: Arc<heraclitus_compliance::RegulatoryStateCache>,
@@ -585,6 +600,7 @@ impl Engine {
             replication: std::sync::OnceLock::new(),
             hvm_lock: Mutex::new(()),
             idempotency_locks: (0..IDEMPOTENCY_SHARDS).map(|_| Mutex::new(())).collect(),
+            case_locks: (0..IDEMPOTENCY_SHARDS).map(|_| Mutex::new(())).collect(),
             regulatory_cache: Arc::new(heraclitus_compliance::RegulatoryStateCache::default()),
             cold_range_reads: std::sync::atomic::AtomicU64::new(0),
             cold_bytes_downloaded: std::sync::atomic::AtomicU64::new(0),
@@ -2135,6 +2151,19 @@ impl Engine {
             as usize
             % self.idempotency_locks.len();
         &self.idempotency_locks[indice]
+    }
+
+    /// O shard que serializa os comandos deste caso. Mesma ideia (e mesma
+    /// contenção residual) do `idempotency_shard`, mas em `case_locks` e não
+    /// nos mesmos shards: são dois invariantes distintos, e partilhá-los só
+    /// acrescentaria espera entre caminhos que nunca interagem
+    /// (auditoria 2026-09-05, A02).
+    fn case_shard(&self, case_id: &str) -> &Mutex<()> {
+        let digest = blake3::hash(case_id.as_bytes());
+        let indice = u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap_or_default())
+            as usize
+            % self.case_locks.len();
+        &self.case_locks[indice]
     }
 
     fn append_idempotent_validated(
@@ -5366,6 +5395,19 @@ impl Engine {
             .validar()
             .map_err(|e| HeraclitusError::Config(e.to_string()))?;
 
+        // Auditoria 2026-09-05, A02 — a validação abaixo só vale se o par
+        // (ler revisão → apender) for ATÓMICO para este `case_id`. Sem o
+        // guard, dois comandos concorrentes liam a mesma revisão, ambos
+        // passavam a comparação `expected_revision != e.revision` e ambos
+        // entravam no log; a reconstrução aplicava o primeiro e rejeitava o
+        // segundo com `Err(Conflito)` a cada leitura, para sempre. Num log
+        // append-only não há forma de retirar o segundo: o caso ficava
+        // ilegível de forma irreparável. O guard vive até depois do `append`
+        // por isso mesmo. Só um lock (largado no fim da função), portanto sem
+        // aninhamento e sem risco de deadlock — o `append` daqui não é o
+        // idempotente, não toca em `idempotency_locks`.
+        let _guarda = self.case_shard(&envelope.case_id).lock().unwrap();
+
         let (estado, lsn_do_comando) = self.case_state_interno(&envelope.case_id, None)?;
 
         // Idempotência antes de tudo (§8.3): um cliente que repete por timeout
@@ -5631,6 +5673,100 @@ mod testes_case_spec0071 {
             CaseStatus::Open,
             "AS OF nao pode ver o fecho que veio depois"
         );
+    }
+
+    /// ENVENENAMENTO PERMANENTE (auditoria 2026-09-05, A02).
+    ///
+    /// `case_command` lia o estado e apendia sem seccao critica nenhuma. Dois
+    /// POST /cases concorrentes (cada pedido corre no seu `spawn_blocking`)
+    /// liam a MESMA revisao, ambos validavam OK e ambos entravam no log. A
+    /// partir dai `reconstruir` aplica o primeiro (revisao +1) e o segundo,
+    /// cuja `expected_revision` ja nao bate, devolve `Err(Conflito)` — PARA
+    /// SEMPRE, porque o log e append-only e nao ha como retirar o segundo. O
+    /// caso morre nos dois sentidos: o GET responde 500 e todo o comando
+    /// seguinte falha na leitura antes de chegar a apender.
+    ///
+    /// O teste nao mede latencia nem contagens: mede se o caso continua
+    /// LEGIVEL depois da corrida, que e o invariante que se perdia.
+    #[test]
+    fn dois_comandos_concorrentes_na_mesma_revisao_nao_envenenam_o_caso() {
+        let (_t, engine) = motor();
+
+        // Varias rondas com case_id distintos: a janela e estreita e uma so
+        // tentativa apanha-a de forma pouco fiavel.
+        for ronda in 0..25 {
+            let caso = format!("case-corrida-{ronda}");
+            engine
+                .case_command(&CaseEnvelope::novo(
+                    &caso,
+                    "abrir",
+                    0,
+                    "analista-a",
+                    "sinal do Sentinel",
+                    CaseEvent::CaseOpened {
+                        title: "Acessos falhados".into(),
+                        priority: CasePriority::High,
+                        opened_by: "analista-a".into(),
+                        sla: sla(),
+                    },
+                ))
+                .unwrap();
+
+            // Dois comandos DISTINTOS (command_id diferentes, logo a guarda de
+            // idempotencia nao os cobre) validados contra a MESMA revisao 1.
+            let a = CaseEnvelope::novo(
+                &caso,
+                "cmd-a",
+                1,
+                "analista-a",
+                "dono",
+                CaseEvent::CaseOwnerAssigned {
+                    owner: "analista-a".into(),
+                },
+            );
+            let b = CaseEnvelope::novo(
+                &caso,
+                "cmd-b",
+                1,
+                "analista-b",
+                "titulo",
+                CaseEvent::CaseTitleChanged {
+                    title: "Acessos falhados (revisto)".into(),
+                },
+            );
+
+            let porta = std::sync::Barrier::new(2);
+            let (r_a, r_b) = std::thread::scope(|s| {
+                let ta = s.spawn(|| {
+                    porta.wait();
+                    engine.case_command(&a)
+                });
+                let tb = s.spawn(|| {
+                    porta.wait();
+                    engine.case_command(&b)
+                });
+                (ta.join().unwrap(), tb.join().unwrap())
+            });
+
+            let aplicados = [&r_a, &r_b]
+                .iter()
+                .filter(|r| matches!(r, Ok((_, true))))
+                .count();
+            assert_eq!(
+                aplicados, 1,
+                "ronda {ronda}: exactamente UM comando pode aplicar sobre a revisao 1 \
+                 (r_a={r_a:?}, r_b={r_b:?})"
+            );
+
+            let estado = engine
+                .case_state(&caso, None)
+                .unwrap_or_else(|e| panic!("ronda {ronda}: o caso ficou ILEGIVEL para sempre: {e}"))
+                .unwrap();
+            assert_eq!(
+                estado.revision, 2,
+                "ronda {ronda}: uma abertura + um comando aplicado = revisao 2"
+            );
+        }
     }
 }
 
