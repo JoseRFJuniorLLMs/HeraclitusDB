@@ -1891,6 +1891,93 @@ mod tests {
         assert!(s.contains("DIST_"), "{s}");
     }
 
+    /// Auditoria recursiva 2026-09-05 (A34): `DIST_HYP`/`DIST_SPH`/`DIST_EUC`
+    /// não validavam a dimensão do vetor da query contra a do embedding — as
+    /// funções do manifold usam `zip` e truncam pela mais curta, devolvendo uma
+    /// distância calculada só sobre o prefixo. `DIST_PRODUCT`, três linhas
+    /// abaixo no mesmo `match`, sempre rejeitou a mesma entrada.
+    #[test]
+    fn dist_dimensao_incompativel_nao_casa() {
+        use heraclitus_core::ProductPoint;
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        let mk = |nome: &str, hyp: Vec<f32>, sph: Vec<f32>, euc: Vec<f32>| {
+            let mut e = Episode::new("ag", EventKind::Observation, nome.as_bytes().to_vec());
+            e.embedding = Some(ProductPoint { hyp, sph, euc });
+            e
+        };
+        // A ORDEM importa: o "euc3" é semeado PRIMEIRO, por isso um empate de
+        // distâncias (o que a truncagem produzia) deixa-o à frente do "euc2".
+        log.append(mk("euc3", vec![], vec![], vec![0.1, 0.2, 5000.0]))
+            .unwrap();
+        log.append(mk("euc2", vec![], vec![], vec![0.1, 0.2]))
+            .unwrap();
+        log.append(mk("hyp1", vec![0.1], vec![], vec![])).unwrap();
+        // O "hyp2" tem a MESMA primeira coordenada do "hyp1": só um vetor de
+        // query com 2 dimensões o pode avaliar, e a truncagem confundia-os.
+        log.append(mk("hyp2", vec![0.1, 0.9], vec![], vec![]))
+            .unwrap();
+        log.append(mk("sph1", vec![], vec![1.0], vec![])).unwrap();
+        let be = LogBackend::new(log);
+
+        let conteudos = |q: &str| -> Vec<String> {
+            execute(q, &be)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["content"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // Vetor MAIS CURTO que o embedding: o "euc3" tem distância real ~5000
+        // e passava o corte porque só as 2 primeiras coordenadas eram somadas.
+        assert_eq!(
+            conteudos("MATCH (n) WHERE DIST_EUC([0.1, 0.2]) < 0.001 RETURN n"),
+            vec!["euc2"]
+        );
+        // Vetor MAIS LONGO: a outra direcção da truncagem (casava o "euc2").
+        assert!(
+            conteudos("MATCH (n) WHERE DIST_EUC([0.1, 0.2, 0.3, 0.4]) < 0.001 RETURN n").is_empty()
+        );
+        // Componente AUSENTE: `zip` de um vetor com um vazio dá distância 0 —
+        // o episódio sem componente hiperbólica era "o mais próximo de todos".
+        let hyp = conteudos("MATCH (n) WHERE DIST_HYP([0.12]) < 0.001 RETURN n");
+        assert!(!hyp.contains(&"euc3".to_string()), "{hyp:?}");
+        assert!(!hyp.contains(&"euc2".to_string()), "{hyp:?}");
+
+        // ORDER BY: sem embedding compatível vai para o FIM (INFINITY), não
+        // para a frente com um zero calculado sobre o prefixo.
+        assert_eq!(
+            conteudos("MATCH (n) RETURN n ORDER BY DIST_EUC([0.1, 0.2]) ASC")[0],
+            "euc2"
+        );
+
+        // NÃO REGRIDE: dimensões coincidentes continuam a ser avaliadas.
+        assert_eq!(
+            conteudos("MATCH (n) WHERE DIST_EUC([0.1, 0.2, 5000.0]) < 0.001 RETURN n"),
+            vec!["euc3"]
+        );
+        // ... e um vetor de 1 dimensão NÃO pode alcançar um embedding de 2, por
+        // muito parecida que seja a primeira coordenada.
+        assert_eq!(
+            conteudos("MATCH (n) WHERE DIST_HYP([0.12]) < 0.5 RETURN n"),
+            vec!["hyp1"]
+        );
+        assert_eq!(
+            conteudos("MATCH (n) WHERE DIST_HYP([0.12, 0.88]) < 0.5 RETURN n"),
+            vec!["hyp2"]
+        );
+        // A esfera tem a MESMA doença por outra via: `norm(v) == 0` num
+        // embedding sem componente esférica devolvia distância 0, e um vetor
+        // mais longo era comparado só no prefixo (com as normas completas).
+        assert!(conteudos("MATCH (n) WHERE DIST_SPH([1.0, 5.0]) < 2.0 RETURN n").is_empty());
+        assert_eq!(
+            conteudos("MATCH (n) WHERE DIST_SPH([1.0]) < 0.001 RETURN n"),
+            vec!["sph1"]
+        );
+    }
+
     #[test]
     fn recall_and_provenance() {
         let (_d, be) = seeded_backend();

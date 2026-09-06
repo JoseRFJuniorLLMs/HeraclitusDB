@@ -535,13 +535,28 @@ fn eval_operand(op: &Operand, lsn: Lsn, e: &Episode) -> Option<Json> {
 /// Distância do embedding do episódio ao vetor literal da query, na Variedade
 /// Produto (curvaturas da assinatura default do manifold). `None` quando o
 /// episódio não tem embedding — a condição simplesmente não casa.
+///
+/// Auditoria 2026-09-05: a dimensão é validada AQUI, o único ponto onde a
+/// query e o embedding se encontram (a gramática só exige `number (","
+/// number)*` e nunca vê os embeddings). As funções do manifold iteram com
+/// `zip`, truncam pela mais curta e devolvem `f64` — não têm como sinalizar
+/// erro —, portanto um vetor de dimensão errada produzia uma distância
+/// calculada só sobre o prefixo: um embedding `[0.1, 0.2, 5000.0]` casava
+/// `DIST_EUC([0.1, 0.2]) < 0.001`, e um episódio SEM componente hiperbólica
+/// dava `zip` vazio, distância 0.0, e era "o mais próximo de todos".
+/// Igualdade ESTRITA porque a truncagem é simétrica: um `q` mais longo mente
+/// tanto como um mais curto. `DIST_PRODUCT` já rejeitava a mesma entrada.
 fn eval_dist(kind: DistKind, q: &[f32], e: &Episode) -> Option<f64> {
     let emb = e.embedding.as_ref()?;
     let sig = &heraclitus_manifold::ProductMetric::default().sig;
     Some(match kind {
-        DistKind::Hyp => heraclitus_manifold::dist_hyp(q, &emb.hyp, -sig.k1),
-        DistKind::Sph => heraclitus_manifold::dist_sph(q, &emb.sph, sig.k2),
-        DistKind::Euc => heraclitus_manifold::dist_euc(q, &emb.euc),
+        DistKind::Hyp => (q.len() == emb.hyp.len())
+            .then(|| heraclitus_manifold::dist_hyp(q, &emb.hyp, -sig.k1))?,
+        DistKind::Sph => (q.len() == emb.sph.len())
+            .then(|| heraclitus_manifold::dist_sph(q, &emb.sph, sig.k2))?,
+        DistKind::Euc => {
+            (q.len() == emb.euc.len()).then(|| heraclitus_manifold::dist_euc(q, &emb.euc))?
+        }
         DistKind::Product => {
             // O vetor plano da query é fatiado pelas dimensões do PRÓPRIO
             // episódio (a mesma convenção do canal vetorial do FUSE).
