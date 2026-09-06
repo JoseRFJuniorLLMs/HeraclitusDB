@@ -172,6 +172,13 @@ impl MomentState {
         self.variance().map(f64::sqrt)
     }
 
+    /// Desvio absoluto em unidades de desvio-padrao.
+    ///
+    /// Auditoria 2026-09-05, A29: numa baseline sem dispersao alguma
+    /// (`stddev == 0`) qualquer amostra diferente da media devolve
+    /// `f64::INFINITY` de proposito — o desvio nao e exprimivel na escala do
+    /// perfil.  Quem pontua TEM de limitar esse valor (ver `score_profile`);
+    /// propaga-lo sem tecto satura a severidade a jusante.
     pub fn z_score(&self, sample: f64) -> Option<f64> {
         if !sample.is_finite() {
             return None;
@@ -868,6 +875,20 @@ fn score_profile(
             .get(feature)
             .and_then(|state| state.z_score(*value))
             .unwrap_or(0.0);
+        // Auditoria 2026-09-05, A29: variancia exactamente zero (feature
+        // constante na baseline, ex.: `event.failure` = 0.0 em todos os
+        // logins bem sucedidos) faz `z_score` devolver `f64::INFINITY`.  Isso
+        // nao e evidencia infinita: e o mesmo caso degenerado que o ramo IQR
+        // logo abaixo limita a `policy.outlier_z + 1.0`.  Sem este tecto o
+        // `z.max(robust)` so propaga o infinito e o primeiro desvio numa
+        // feature homogenea sai sempre com a severidade maxima da escala.  O
+        // tecto toca apenas no ramo nao-finito; qualquer z legitimo passa
+        // intacto.
+        let z = if z.is_finite() {
+            z
+        } else {
+            policy.outlier_z + 1.0
+        };
         let robust = profile.quantiles.get(feature).map_or(0.0, |state| {
             let q1 = state.quantile(0.25).unwrap_or(*value);
             let median = state.quantile(0.5).unwrap_or(*value);
@@ -1301,5 +1322,78 @@ mod tests {
             Err(BehaviorError::NonFiniteValue)
         ));
         assert!(FeatureId::new("\n").is_err());
+    }
+
+    /// Auditoria 2026-09-05, A29: uma feature constante na baseline (ex.:
+    /// `event.failure` = 0.0 em todos os logins bem sucedidos) deixa
+    /// `m2 = 0.0` exacto, logo `stddev = 0.0` e `z_score` devolve
+    /// `f64::INFINITY` para o primeiro desvio.  O caso degenerado tem de
+    /// ficar limitado — como ja acontece no ramo IQR — em vez de saltar
+    /// directamente para o topo da escala de severidade.
+    #[test]
+    fn feature_constante_nao_produz_score_infinito() {
+        let policy = BaselinePolicy::default();
+        let mut profile = BehavioralProfile::new(entity(), ProfileTrustState::Trusted);
+        for lsn in 1..=30 {
+            profile
+                .update(lsn, &feature("event.failure", 0.0), &policy, 1.0)
+                .unwrap();
+        }
+        let moments = profile
+            .moments
+            .get(&FeatureId::new("event.failure").unwrap())
+            .unwrap();
+        assert_eq!(
+            moments.stddev(),
+            Some(0.0),
+            "a baseline tem de ficar degenerada"
+        );
+
+        let score = score_profile(&profile, &feature("event.failure", 1.0), &policy);
+        assert!(
+            score.score.is_finite(),
+            "z degenerado escapou sem tecto: {}",
+            score.score
+        );
+        assert_eq!(
+            score.score,
+            policy.outlier_z + 1.0,
+            "o ramo dos momentos tem de dar o mesmo valor limitado que o ramo IQR"
+        );
+        assert!(score.anomalous, "o desvio continua a ter de ser anomalo");
+    }
+
+    /// Auditoria 2026-09-05, A29: o tecto do caso degenerado nao pode achatar
+    /// um outlier legitimo — so o ramo nao-finito muda de valor.
+    #[test]
+    fn tecto_degenerado_nao_achata_outlier_legitimo() {
+        let policy = BaselinePolicy::default();
+        let mut profile = BehavioralProfile::new(entity(), ProfileTrustState::Trusted);
+        let alvo = FeatureId::new("event.bytes").unwrap();
+        for lsn in 1..=30 {
+            // Peso < 1.0 deixa o reservatorio de quantis vazio (ver
+            // `BehavioralProfile::update`), portanto o ramo robusto vale 0.0 e
+            // quem decide o score e exclusivamente o z — sem esta condicao o
+            // `z.max(robust)` mascara qualquer achatamento do z.  Dispersao
+            // real: alterna 0.0/1.0.
+            profile
+                .update(lsn, &feature("event.bytes", (lsn % 2) as f64), &policy, 0.5)
+                .unwrap();
+        }
+        assert!(
+            !profile.quantiles.contains_key(&alvo),
+            "o ramo robusto tem de estar fora de jogo neste teste"
+        );
+
+        let esperado = profile.moments.get(&alvo).unwrap().z_score(50.0).unwrap();
+        assert!(
+            esperado > policy.outlier_z + 1.0,
+            "o z de referencia tem de exceder o tecto: {esperado}"
+        );
+        let score = score_profile(&profile, &feature("event.bytes", 50.0), &policy);
+        assert_eq!(
+            score.score, esperado,
+            "z legitimo tem de passar intacto pelo tecto"
+        );
     }
 }
