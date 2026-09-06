@@ -216,6 +216,45 @@ struct ActiveSegment {
     writer: RawSegmentWriter,
 }
 
+/// Um segmento candidato a uma varredura, **já resolvido**: leva o caminho, o
+/// layout e os metadados de que o I/O precisa, sem reter nada do manifesto.
+///
+/// Auditoria 2026-09-05, A55: as varreduras clonavam o `DatabaseManifest`
+/// INTEIRO — `Vec<SegmentDescriptorV2>`, cada um com o seu `Vec` de gerações e
+/// as `String` de localização — dentro do mutex do writer, para logo a seguir
+/// ficarem com um ou dois candidatos. O escritor esperava por O(nº total de
+/// segmentos) alocações a cada varredura. Aqui só sai do lock o que se vai
+/// mesmo ler.
+struct CandidatoVarredura {
+    segment_id: SegmentId,
+    path: PathBuf,
+    layout: PhysicalLayout,
+    first_lsn: Lsn,
+    last_lsn: Lsn,
+    record_count: u64,
+    physical_size: u64,
+    logical_root: [u8; 32],
+    hrki: Option<DerivedArtifactRef>,
+}
+
+/// Tudo o que uma varredura precisa do estado, capturado num **único**
+/// `lock_state()`.
+///
+/// Auditoria 2026-09-05, A55: o catálogo e a cauda activa eram lidos em dois
+/// lockings distintos, e um `seal` concorrente entre eles movia os registos da
+/// cauda para um segmento que o catálogo já capturado não continha — a
+/// varredura devolvia `Ok` com um buraco no meio. Um instante só fecha a
+/// janela.
+struct InstantaneoVarredura {
+    candidatos: Vec<CandidatoVarredura>,
+    /// Caminho e primeiro LSN da cauda activa, no mesmo instante.
+    cauda: Option<(PathBuf, Lsn)>,
+    /// `next_lsn` no mesmo instante — o tecto de qualquer varredura.
+    head: Lsn,
+    /// Total de segmentos catalogados (estatística de poda).
+    segmentos_total: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SegmentFile {
     Active(SegmentId),
@@ -763,6 +802,68 @@ impl V6Log {
         self.scan_capped(from, to, usize::MAX)
     }
 
+    /// Captura, num **único** locking, tudo o que uma varredura de `[from, to)`
+    /// precisa: os candidatos já resolvidos, a cauda activa e o `head`.
+    ///
+    /// Auditoria 2026-09-05, A55. Duas coisas de uma vez, e as duas
+    /// importantes:
+    ///
+    /// 1. **Consistência.** O catálogo e a cauda deixam de vir de dois
+    ///    instantes diferentes. Um `seal` concorrente entre eles selava a cauda
+    ///    para um segmento ausente do catálogo já capturado, enquanto o
+    ///    `active` novo passava a começar num LSN maior — os registos pelo meio
+    ///    não eram lidos por ramo nenhum e a varredura devolvia `Ok` com um
+    ///    buraco. Silencioso e permanente para quem avança cursor por linha.
+    /// 2. **Tempo de posse do mutex.** Filtrar os candidatos aqui, dentro do
+    ///    lock, em vez de clonar o manifesto inteiro e filtrar a cópia lá fora,
+    ///    troca O(nº total de segmentos) alocações por O(nº de candidatos).
+    ///
+    /// `resolve_location` é uma junção de caminhos pura (não toca no disco),
+    /// por isso pode correr aqui dentro sem alargar a secção crítica.
+    fn instantaneo_varredura(
+        &self,
+        from: Lsn,
+        to: Lsn,
+        contexto: &'static str,
+    ) -> Result<InstantaneoVarredura, HeraclitusError> {
+        let state = self.lock_state()?;
+        let head = state.next_lsn;
+        let end = to.min(head);
+        let mut candidatos = Vec::new();
+        if from < end {
+            for desc in state
+                .manifest
+                .segments_for_lsn_range(from, end.saturating_sub(1))
+            {
+                let generation = desc.active().ok_or_else(|| HeraclitusError::Corruption {
+                    context: contexto.into(),
+                    detail: format!("segmento {} sem geração ativa", desc.segment_id),
+                })?;
+                candidatos.push(CandidatoVarredura {
+                    segment_id: desc.segment_id,
+                    path: resolve_location(&self.root, &generation.location)?,
+                    layout: generation.layout,
+                    first_lsn: desc.first_lsn,
+                    last_lsn: desc.last_lsn,
+                    record_count: desc.record_count,
+                    physical_size: generation.physical_size,
+                    logical_root: desc.logical_root,
+                    hrki: desc.hrki.clone(),
+                });
+            }
+        }
+        let cauda = state
+            .active
+            .as_ref()
+            .map(|active| (active.path.clone(), active.writer.header().first_lsn));
+        Ok(InstantaneoVarredura {
+            candidatos,
+            cauda,
+            head,
+            segmentos_total: state.manifest.segments_v2.len() as u64,
+        })
+    }
+
     /// Varredura sequencial otimizada por lote de segmentos; lê blocos sequencialmente
     /// sem transformar a faixa de LSNs em point lookups individuais.
     pub fn scan_capped(
@@ -771,32 +872,58 @@ impl V6Log {
         to: Lsn,
         max: usize,
     ) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
-        let end = to.min(self.head());
-        if from >= end || max == 0 {
+        // Auditoria 2026-09-05, A55: com um instantâneo único, a corrida que
+        // sobra é a inversa — o ficheiro da cauda pode ter sido RENOMEADO por
+        // um `seal` antes de chegarmos ao I/O. Isso não é erro nem buraco: é o
+        // sinal de que o instantâneo envelheceu, e a resposta é repetir com
+        // estado fresco, exactamente como `read` já faz. Três tentativas
+        // cobrem rolos consecutivos; a partir daí é um ficheiro que falta
+        // mesmo.
+        const TENTATIVAS: usize = 3;
+        for tentativa in 1..=TENTATIVAS {
+            match self.tentar_varrer(from, to, max) {
+                Ok(saida) => return Ok(saida),
+                Err(TentativaFalhou::Rolou) if tentativa < TENTATIVAS => continue,
+                Err(TentativaFalhou::Rolou) => {
+                    return Err(HeraclitusError::StorageEngine(format!(
+                        "varredura [{from}, {to}): o segmento activo rolou {TENTATIVAS} vezes"
+                    )))
+                }
+                Err(TentativaFalhou::Erro(e)) => return Err(e),
+            }
+        }
+        unreachable!("o laço devolve sempre dentro de TENTATIVAS")
+    }
+
+    fn tentar_varrer(
+        &self,
+        from: Lsn,
+        to: Lsn,
+        max: usize,
+    ) -> Result<Vec<(Lsn, Episode)>, TentativaFalhou> {
+        if max == 0 {
             return Ok(Vec::new());
         }
-        let manifest = self.manifest();
-        let candidates: Vec<_> = manifest
-            .segments_for_lsn_range(from, end.saturating_sub(1))
-            .collect();
+        let instantaneo = self.instantaneo_varredura(from, to, "hrkl v6 scan_capped")?;
+        disparar_gancho_pos_instantaneo();
+        let end = to.min(instantaneo.head);
+        if from >= end {
+            return Ok(Vec::new());
+        }
         let mut out = Vec::with_capacity(max.min(1024));
         let mut counters = ScanCounters::default();
 
-        for desc in candidates {
+        for desc in &instantaneo.candidatos {
             if out.len() >= max {
                 break;
             }
-            let generation = desc.active().ok_or_else(|| HeraclitusError::Corruption {
-                context: "hrkl v6 scan_capped".into(),
-                detail: format!("segmento {} sem geração ativa", desc.segment_id),
-            })?;
-            let path = resolve_location(&self.root, &generation.location)?;
+            let path = &desc.path;
             let seg_from = from.max(desc.first_lsn);
             let seg_to = end.min(desc.first_lsn.saturating_add(desc.record_count));
 
-            match generation.layout {
+            match desc.layout {
                 PhysicalLayout::Raw => {
-                    let scan = scan_raw_segment(&path)?;
+                    let scan = scan_raw_segment(path)?;
                     for r in scan.records {
                         if r.lsn >= seg_from && r.lsn < seg_to {
                             let mut episode = crate::decode_episode_payload_with_meta(
@@ -816,7 +943,7 @@ impl V6Log {
                     }
                 }
                 PhysicalLayout::Packed => {
-                    let reader = open_packed(&path, HARD_MAX_BLOCK_BYTES)?;
+                    let reader = open_packed(path, HARD_MAX_BLOCK_BYTES)?;
                     // `seg_to` e EXCLUSIVO — e o que o ramo RAW acima aplica
                     // (`r.lsn < seg_to`). `scan_lsn_range` varre `[lo, hi]`
                     // INCLUSIVO (`r.lsn <= hi`). Entregar-lhe `seg_to` tal e qual
@@ -850,17 +977,21 @@ impl V6Log {
 
         // Se ainda não atingiu o limite max e o intervalo se estende para o segmento ativo (raw)
         if out.len() < max {
-            let active_info = {
-                let state = self.lock_state()?;
-                state
-                    .active
-                    .as_ref()
-                    .map(|active| (active.path.clone(), active.writer.header().first_lsn))
-            };
-            if let Some((path, active_first_lsn)) = active_info {
+            // Auditoria 2026-09-05, A55: a cauda vem do MESMO instantâneo dos
+            // candidatos, não de um segundo locking. Ver `instantaneo_varredura`.
+            if let Some((path, active_first_lsn)) = instantaneo.cauda.as_ref() {
+                let (path, active_first_lsn) = (path.as_path(), *active_first_lsn);
                 if end > active_first_lsn {
                     let seg_from = from.max(active_first_lsn);
-                    let scan = scan_raw_segment(&path)?;
+                    let scan = match scan_raw_segment(path) {
+                        Ok(scan) => scan,
+                        // O ficheiro deixou de existir: alguém selou a cauda
+                        // depois do instantâneo. Repetir com estado fresco — o
+                        // segmento está agora no catálogo, e é lá que os
+                        // registos aparecem.
+                        Err(_) if !path.exists() => return Err(TentativaFalhou::Rolou),
+                        Err(e) => return Err(TentativaFalhou::Erro(e)),
+                    };
                     for r in scan.records {
                         if r.lsn >= seg_from && r.lsn < end {
                             // Evitar duplicados caso já tenha sido incluído por um candidato selado
@@ -933,11 +1064,43 @@ impl V6Log {
         to: Lsn,
         max: usize,
     ) -> Result<crate::store::PrunedScan, HeraclitusError> {
+        // Auditoria 2026-09-05, A55: mesma janela de `scan_capped` — catálogo
+        // capturado num locking, cauda noutro — e por isso o mesmo laço de
+        // repetição quando o instantâneo envelhece.
+        const TENTATIVAS: usize = 3;
+        for tentativa in 1..=TENTATIVAS {
+            match self.tentar_varrer_builtin_eq(field, value, from, to, max) {
+                Ok(saida) => return Ok(saida),
+                Err(TentativaFalhou::Rolou) if tentativa < TENTATIVAS => continue,
+                Err(TentativaFalhou::Rolou) => {
+                    return Err(HeraclitusError::StorageEngine(format!(
+                        "varredura podada [{from}, {to}): o segmento activo rolou {TENTATIVAS} vezes"
+                    )))
+                }
+                Err(TentativaFalhou::Erro(e)) => return Err(e),
+            }
+        }
+        unreachable!("o laço devolve sempre dentro de TENTATIVAS")
+    }
+
+    fn tentar_varrer_builtin_eq(
+        &self,
+        field: &str,
+        value: &str,
+        from: Lsn,
+        to: Lsn,
+        max: usize,
+    ) -> Result<crate::store::PrunedScan, TentativaFalhou> {
         if !matches!(field, "agent_id" | "session_id") {
             return Ok(None);
         }
-        let end = to.min(self.head());
-        if from >= end || max == 0 {
+        if max == 0 {
+            return Ok(Some((Vec::new(), Default::default())));
+        }
+        let instantaneo = self.instantaneo_varredura(from, to, "hrkl v6 pruned scan")?;
+        disparar_gancho_pos_instantaneo();
+        let end = to.min(instantaneo.head);
+        if from >= end {
             return Ok(Some((Vec::new(), Default::default())));
         }
 
@@ -948,34 +1111,30 @@ impl V6Log {
             to: end,
             max,
         };
-        let manifest = self.manifest();
         let mut stats = crate::store::PrunedScanStats {
-            segments_total: manifest.segments_v2.len() as u64,
+            segments_total: instantaneo.segmentos_total,
             ..Default::default()
         };
         let mut out = Vec::with_capacity(max.min(1024));
-        let candidates: Vec<_> = manifest
-            .segments_for_lsn_range(from, end.saturating_sub(1))
-            .collect();
-        stats.manifest_pruned = stats.segments_total.saturating_sub(candidates.len() as u64);
-        for desc in candidates {
+        stats.manifest_pruned = stats
+            .segments_total
+            .saturating_sub(instantaneo.candidatos.len() as u64);
+        for desc in &instantaneo.candidatos {
             if out.len() >= max {
                 break;
             }
             stats.segments_candidate += 1;
-            let generation = desc.active().ok_or_else(|| HeraclitusError::Corruption {
-                context: "hrkl v6 pruned scan".into(),
-                detail: format!("segmento {} sem geração ativa", desc.segment_id),
-            })?;
-            let path = resolve_location(&self.root, &generation.location)?;
-            stats.bytes_candidate += generation.physical_size;
-            match generation.layout {
+            let path = desc.path.as_path();
+            stats.bytes_candidate += desc.physical_size;
+            match desc.layout {
                 PhysicalLayout::Raw => {
-                    let scan = scan_raw_segment(&path)?;
+                    let scan = scan_raw_segment(path)?;
                     stats.segments_read += 1;
                     stats.blocks_candidate += 1;
                     stats.blocks_read += 1;
-                    stats.bytes_physical_read += std::fs::metadata(&path)?.len();
+                    stats.bytes_physical_read += std::fs::metadata(path)
+                        .map_err(|e| TentativaFalhou::Erro(HeraclitusError::from(e)))?
+                        .len();
                     self.collect_builtin_matches(
                         scan.records.iter().map(|r| (r.lsn, r.payload.as_slice())),
                         &criterio,
@@ -983,8 +1142,8 @@ impl V6Log {
                     )?;
                 }
                 PhysicalLayout::Packed => {
-                    let reader = open_packed(&path, HARD_MAX_BLOCK_BYTES)?;
-                    let sidecar_path = caminho_sidecar(&path);
+                    let reader = open_packed(path, HARD_MAX_BLOCK_BYTES)?;
+                    let sidecar_path = caminho_sidecar(path);
                     let sidecar_declared = desc.hrki.as_ref();
                     let sidecar = sidecar_declared.and_then(|artifact| {
                         let catalog_path = resolve_location(&self.root, &artifact.location).ok()?;
@@ -994,7 +1153,7 @@ impl V6Log {
                         {
                             return None;
                         }
-                        Hrki::ler_validado(&path, desc.segment_id, &desc.logical_root)
+                        Hrki::ler_validado(path, desc.segment_id, &desc.logical_root)
                     });
                     if let Some(hrki) = sidecar {
                         stats.hrki_used += 1;
@@ -1003,7 +1162,7 @@ impl V6Log {
                             stats.hrki_pruned += 1;
                             stats.blocks_candidate += reader.block_count() as u64;
                             stats.blocks_pruned += reader.block_count() as u64;
-                            stats.bytes_pruned += generation.physical_size;
+                            stats.bytes_pruned += desc.physical_size;
                             continue;
                         }
                     } else if sidecar_declared.is_some() || sidecar_path.is_file() {
@@ -1040,6 +1199,21 @@ impl V6Log {
             // O tail é mutável: lê-se sob o mesmo mutex do writer para nunca
             // interpretar um frame parcialmente escrito.
             let state = self.lock_state()?;
+            // Auditoria 2026-09-05, A55: aqui a cauda continua a ser lida sob o
+            // lock (é a defesa contra um frame a meio da escrita), mas os
+            // candidatos vieram de um instante ANTERIOR. Se entretanto houve um
+            // `seal`, os registos que estavam na cauda foram para um segmento
+            // que os candidatos deste instantâneo não têm e a nova cauda começa
+            // mais à frente: ninguém os leria e a resposta sairia com um buraco.
+            // O `first_lsn` da cauda é a assinatura desse instante — se mudou,
+            // repete-se com estado fresco.
+            let cauda_actual = state
+                .active
+                .as_ref()
+                .map(|active| active.writer.header().first_lsn);
+            if cauda_actual != instantaneo.cauda.as_ref().map(|(_, lsn)| *lsn) {
+                return Err(TentativaFalhou::Rolou);
+            }
             if let Some(active) = state.active.as_ref() {
                 let first = active.writer.header().first_lsn;
                 if first < end && state.next_lsn > from {
@@ -1048,7 +1222,9 @@ impl V6Log {
                     stats.segments_read += 1;
                     stats.blocks_candidate += 1;
                     stats.blocks_read += 1;
-                    let active_bytes = std::fs::metadata(&active.path)?.len();
+                    let active_bytes = std::fs::metadata(&active.path)
+                        .map_err(|e| TentativaFalhou::Erro(HeraclitusError::from(e)))?
+                        .len();
                     stats.bytes_candidate += active_bytes;
                     stats.bytes_physical_read += active_bytes;
                     let scan = scan_raw_segment(&active.path)?;
@@ -2160,6 +2336,37 @@ enum ReadSource {
     Sealed(PathBuf, PhysicalLayout),
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Gancho SÓ DE TESTE, disparado entre o instantâneo do estado e o I/O de
+    /// uma varredura. Existe para provocar de forma determinística o `seal`
+    /// concorrente que a Auditoria 2026-09-05 (A55) mostrou abrir um buraco
+    /// silencioso no meio de `scan_capped`. Não há aqui `Mutex` nem campo novo
+    /// no `V6Log`: a varredura corre na thread de quem chama, portanto um
+    /// `thread_local` chega e não toca no estado de produção.
+    static GANCHO_POS_INSTANTANEO: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn instalar_gancho_pos_instantaneo(gancho: impl FnOnce() + 'static) {
+    GANCHO_POS_INSTANTANEO.with(|celula| *celula.borrow_mut() = Some(Box::new(gancho)));
+}
+
+/// Dispara o gancho de teste **uma única vez** (é consumido ao disparar, para
+/// que uma repetição da varredura não volte a rolar o segmento e entre em
+/// ciclo). Em release não existe código nenhum aqui.
+#[inline]
+fn disparar_gancho_pos_instantaneo() {
+    #[cfg(test)]
+    {
+        let gancho = GANCHO_POS_INSTANTANEO.with(|celula| celula.borrow_mut().take());
+        if let Some(gancho) = gancho {
+            gancho();
+        }
+    }
+}
+
 fn persisted_hasher(lsn: Lsn, hlc: u64, payload: &[u8]) -> V6Result<[u8; 32]> {
     crate::canonical_hash_storage_payload_v6(lsn, hlc, payload)
 }
@@ -3028,6 +3235,86 @@ mod tests {
         let capped = log.scan_capped(3, 40, 5).unwrap();
         let lsns: Vec<Lsn> = capped.iter().map(|(l, _)| *l).collect();
         assert_eq!(lsns, vec![3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn um_seal_entre_o_catalogo_e_a_cauda_nao_pode_abrir_buraco() {
+        // Auditoria 2026-09-05, A55. `scan_capped` capturava o catálogo num
+        // `lock` (o clone do manifesto) e a cauda activa NOUTRO, já depois de
+        // todo o I/O dos selados. Um `seal` concorrente entre os dois instantes
+        // move os registos da cauda para um segmento que o catálogo clonado
+        // ainda não tem, e o `active` novo já começa num LSN maior: esses LSNs
+        // deixam de ser lidos por qualquer um dos dois ramos e a varredura
+        // devolve `Ok` com um BURACO no meio. Quem avança cursor por linha
+        // (heraclitus-sentinel/src/state/replay.rs) salta-os para sempre.
+        let dir = tempfile::tempdir().unwrap();
+        // Cap pequeno para haver vários segmentos selados e uma cauda com
+        // registos — sem cauda não há nada para o `seal` deslocar.
+        let log = Arc::new(V6Log::open(dir.path(), 700, FsyncPolicy::Always).unwrap());
+        for i in 0..50u64 {
+            log.append(event(i)).unwrap();
+        }
+        let head = log.head();
+        assert_eq!(head, 50);
+        let primeiro_da_cauda = {
+            let state = log.lock_state().unwrap();
+            state.active.as_ref().unwrap().writer.header().first_lsn
+        };
+        assert!(
+            primeiro_da_cauda > 0 && primeiro_da_cauda < head,
+            "a montagem precisa de selados ({primeiro_da_cauda}) e de cauda (head {head})"
+        );
+
+        let gatilho = Arc::clone(&log);
+        instalar_gancho_pos_instantaneo(move || {
+            gatilho.seal_active().expect("seal concorrente simulado");
+        });
+
+        let linhas = log.scan_capped(0, head, usize::MAX).unwrap();
+        let lsns: Vec<Lsn> = linhas.iter().map(|(l, _)| *l).collect();
+        assert_eq!(
+            lsns,
+            (0..head).collect::<Vec<Lsn>>(),
+            "varredura com buraco: o segmento selado durante o scan desapareceu"
+        );
+    }
+
+    #[test]
+    fn um_seal_no_meio_da_varredura_podada_nao_pode_perder_matches() {
+        // Auditoria 2026-09-05, A55: `scan_builtin_eq_capped` tem exactamente a
+        // mesma estrutura de dois instantes — catálogo clonado no início, cauda
+        // lida sob o lock no fim. Um `seal` pelo meio faz desaparecer matches
+        // em silêncio, o que aqui é pior do que um erro: é um resultado de
+        // consulta incompleto que ninguém consegue distinguir de "não há".
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(V6Log::open(dir.path(), 700, FsyncPolicy::Always).unwrap());
+        for i in 0..50u64 {
+            let mut e = event(i);
+            e.agent_id = "alice".into();
+            log.append(e).unwrap();
+        }
+        let head = log.head();
+        let primeiro_da_cauda = {
+            let state = log.lock_state().unwrap();
+            state.active.as_ref().unwrap().writer.header().first_lsn
+        };
+        assert!(primeiro_da_cauda > 0 && primeiro_da_cauda < head);
+
+        let gatilho = Arc::clone(&log);
+        instalar_gancho_pos_instantaneo(move || {
+            gatilho.seal_active().expect("seal concorrente simulado");
+        });
+
+        let (linhas, _stats) = log
+            .scan_builtin_eq_capped("agent_id", "alice", 0, head, usize::MAX)
+            .unwrap()
+            .unwrap();
+        let lsns: Vec<Lsn> = linhas.iter().map(|(l, _)| *l).collect();
+        assert_eq!(
+            lsns,
+            (0..head).collect::<Vec<Lsn>>(),
+            "a varredura podada perdeu os registos que estavam na cauda"
+        );
     }
 
     #[test]
