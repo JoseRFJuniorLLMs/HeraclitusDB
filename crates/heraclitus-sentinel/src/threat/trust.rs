@@ -230,7 +230,17 @@ impl ThreatSourceRegistry {
                 });
             }
             let base = object.valid_from.unwrap_or(now_ms);
-            object.valid_until = Some(base.saturating_add(policy.default_ttl_secs * 1_000));
+            // Auditoria 2026-09-05: a soma já saturava, a multiplicação que a
+            // alimenta não. Com `overflow-checks = true` também em release, um
+            // `default_ttl_secs` acima de `u64::MAX / 1_000` matava o arranque
+            // do Sentinel no primeiro objecto sem `valid_until` — que é o caso
+            // normal, e a razão de existir o TTL por omissão. O extremo superior
+            // é tão configuração como o `== 0` acima; saturar aqui garante que
+            // nunca há pânico, e o tecto em `validate_security`
+            // (`sentinel.threat.default_ttl_secs`) garante que o valor absurdo
+            // é recusado com diagnóstico em vez de virar um indicador eterno.
+            object.valid_until =
+                Some(base.saturating_add(policy.default_ttl_secs.saturating_mul(1_000)));
         }
         if policy.trust_level == TrustLevel::Untrusted {
             object.state = IndicatorState::Quarantined;
@@ -659,5 +669,20 @@ mod tests {
             fraco.severity,
             forte.severity
         );
+    }
+
+    #[test]
+    fn um_ttl_de_configuracao_absurdo_satura_em_vez_de_matar_o_arranque() {
+        // Auditoria 2026-09-05 (A52): a soma já era `saturating_add`, mas a
+        // multiplicação que a alimenta (`default_ttl_secs * 1_000`) estava nua.
+        // Com `overflow-checks = true` também em release, um TTL de configuração
+        // acima de `u64::MAX/1000` matava o arranque do Sentinel no primeiro
+        // objecto sem `valid_until` — que é o caso normal, e a razão de existir
+        // o TTL por omissão.
+        let r = registry(TrustLevel::Commercial, 0, u64::MAX);
+        let admitido = r
+            .admit(object("feed", 80), 0)
+            .expect("a admissão não pode entrar em pânico por causa da configuração");
+        assert_eq!(admitido.object().valid_until, Some(u64::MAX));
     }
 }
