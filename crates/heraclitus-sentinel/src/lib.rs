@@ -682,7 +682,7 @@ impl SentinelRuntime {
         // snapshot, os conjuntos até ao watermark vêm de lá e esta passagem só
         // cobre a cauda.
         let relogio = Instant::now();
-        let (ids, derived_sources) = passagem_de_ids(
+        let (ids, derived_sources, sighting_keys) = passagem_de_ids(
             &log,
             desde,
             ate_exclusivo,
@@ -814,7 +814,11 @@ impl SentinelRuntime {
             fusion,
             fusion_state: Mutex::new(acumuladores_de_fusao),
             signal_ids: Mutex::new(signal_ids),
-            sighting_keys: Mutex::new(JanelaDeChaves::nova(TECTO_CHAVES_SIGHTING)),
+            // Auditoria 2026-09-05, A40 — vem da primeira passagem, como
+            // `derived_sources`. Antes nascia VAZIA, e o mesmo `SecurityEvent`
+            // reprocessado depois de um reinicio reapendava um sighting que ja
+            // estava no log.
+            sighting_keys: Mutex::new(sighting_keys),
             // A janela já vem cheia e com tecto da primeira passagem. O código
             // anterior construía um `HashSet<Lsn>` com uma entrada por evento
             // derivado da base inteira e só aqui o despejava nela: o tecto
@@ -2304,9 +2308,15 @@ fn passagem_de_ids(
     fusion_enabled: bool,
     snapshot: Option<&SentinelStateSnapshot>,
     contador: &std::sync::atomic::AtomicU64,
-) -> Result<(IdsDerivados, JanelaRecente<Lsn>), SentinelError> {
+) -> Result<(IdsDerivados, JanelaRecente<Lsn>, JanelaDeChaves), SentinelError> {
     let mut ids = IdsDerivados::default();
     let mut derived_sources = JanelaRecente::nova(TECTO_LSN_DERIVADOS);
+    // Auditoria 2026-09-05, A40 — as chaves de sighting eram a UNICA estrutura
+    // de deduplicacao do runtime que nao sobrevivia a um reinicio: nasciam
+    // vazias e nenhuma passagem as reenchia. Reconstroem-se aqui, pela mesma
+    // ordem do scan que a janela usa para despejar, como ja se faz para
+    // `derived_sources`.
+    let mut sighting_keys = JanelaDeChaves::nova(TECTO_CHAVES_SIGHTING);
     // Com snapshot, os conjuntos até ao watermark vêm de lá e a passagem só
     // varre a cauda. É o INV-5 aplicado também aos ids: sem isto, o "warm boot"
     // continuaria a ler a base inteira só para reconstruir conjuntos que o
@@ -2388,6 +2398,21 @@ fn passagem_de_ids(
                 }
                 ids.last_checkpoint_lsn = Some(lsn);
             }
+            // Auditoria 2026-09-05, A40 — a chave tem de ser IGUAL, caracter a
+            // caracter, a que `evaluate_threat` calcula; por isso reconstroi-se
+            // do CORPO (os tres campos que a formam) e nao dos atributos, que
+            // sao uma projeccao. Os sightings sao ordens de grandeza menos
+            // numerosos que os eventos, tal como os sinais logo acima, portanto
+            // desserializar aqui e barato.
+            "ThreatSighting" => {
+                if let Ok(sighting) = serde_json::from_slice::<ThreatSighting>(&episode.content) {
+                    sighting_keys.inserir(&chave_de_sighting(
+                        &sighting.indicator_id,
+                        &sighting.match_kind,
+                        sighting.event_id,
+                    ));
+                }
+            }
             outro if L4_KINDS.contains(&outro) => {
                 let (prefix, attr) = l4_prefixo_e_atributo(outro);
                 if let Some(id) = episode.attrs.get(attr) {
@@ -2403,7 +2428,17 @@ fn passagem_de_ids(
         }
         Ok(())
     })?;
-    Ok((ids, derived_sources))
+    Ok((ids, derived_sources, sighting_keys))
+}
+
+/// Auditoria 2026-09-05, A40 — a identidade de um sighting, num sitio so.
+///
+/// "Este indicador, casado desta forma, NESTE evento". Vive numa funcao para
+/// que a emissao (`evaluate_threat`) e a reconstrucao no arranque
+/// (`passagem_de_ids`) nao possam divergir: uma chave reconstruida de forma
+/// diferente e pior do que nenhuma — suprimiria um sighting legitimo.
+fn chave_de_sighting(indicator_id: &str, match_kind: &str, event_id: EventId) -> String {
+    format!("t:{indicator_id}:{match_kind}:{event_id}")
 }
 
 const L4_KINDS: [&str; 9] = [
@@ -2983,9 +3018,10 @@ fn evaluate_threat(
         // e o `event_id` e o mesmo qualquer que seja o caminho por onde o
         // evento chegou. Com o LSN na chave, a mesma observacao vista duas
         // vezes produzia dois sightings.
-        let key = format!(
-            "t:{}:{}:{}",
-            sighting.indicator_id, sighting.match_kind, sighting.event_id
+        let key = chave_de_sighting(
+            &sighting.indicator_id,
+            &sighting.match_kind,
+            sighting.event_id,
         );
         // A chave so se marca DEPOIS de o sighting estar mesmo no log — que e
         // a mesma ordem que o caminho dos signals, logo aqui abaixo, ja usava.
