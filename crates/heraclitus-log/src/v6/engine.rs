@@ -817,7 +817,18 @@ impl V6Log {
                 }
                 PhysicalLayout::Packed => {
                     let reader = open_packed(&path, HARD_MAX_BLOCK_BYTES)?;
-                    let rows = reader.scan_lsn_range(seg_from, seg_to, &mut counters)?;
+                    // `seg_to` e EXCLUSIVO — e o que o ramo RAW acima aplica
+                    // (`r.lsn < seg_to`). `scan_lsn_range` varre `[lo, hi]`
+                    // INCLUSIVO (`r.lsn <= hi`). Entregar-lhe `seg_to` tal e qual
+                    // devolvia um registo a mais: `AS OF LSN n` via o evento n num
+                    // segmento PACKED — o estado de producao — e nao num RAW.
+                    // Um registo do "futuro" numa consulta temporal, em silencio,
+                    // dependente do layout fisico. Corroborado por dois agentes
+                    // independentes na auditoria.
+                    if seg_to <= seg_from {
+                        continue;
+                    }
+                    let rows = reader.scan_lsn_range(seg_from, seg_to - 1, &mut counters)?;
                     for (lsn, _timestamp, payload) in rows {
                         let mut episode = crate::decode_episode_payload_with_meta(
                             crate::format::FORMAT_VERSION,
@@ -2951,6 +2962,72 @@ mod tests {
                 format!("payload-{i}").into_bytes()
             );
         }
+    }
+
+    /// Regressao da auditoria (corroborada por dois agentes): `scan_capped`
+    /// entregava ao `scan_lsn_range` (inclusivo) o limite superior EXCLUSIVO,
+    /// e um `scan(0, n)` sobre um segmento PACKED devolvia n+1 registos — o
+    /// evento `n`, do "futuro" da consulta. O ramo RAW nunca teve o defeito, e
+    /// e por isso que o teste que ja existia (so RAW) nao o apanhava.
+    #[test]
+    fn scan_capped_sobre_packed_respeita_o_limite_superior_exclusivo() {
+        let dir = tempfile::tempdir().unwrap();
+        // Cap generoso o bastante para varios registos por segmento: o defeito
+        // so aparece com um limite que cai NO INTERIOR de um segmento.
+        let log = V6Log::open(dir.path(), 700, FsyncPolicy::Always).unwrap();
+        let n: u64 = 50;
+        for i in 0..n {
+            log.append(event(i)).unwrap();
+        }
+        log.seal_active().unwrap();
+        assert!(!log
+            .pack_pending(PackingProfile::Balanced)
+            .unwrap()
+            .is_empty());
+        let manifest = log.manifest();
+        assert!(manifest
+            .segments_v2
+            .iter()
+            .all(|s| s.active().unwrap().layout == PhysicalLayout::Packed));
+        // Sem pelo menos um segmento com 2+ registos o teste seria vazio.
+        assert!(
+            manifest.segments_v2.iter().any(|s| s.record_count >= 2),
+            "a montagem tem de produzir segmentos com varios registos"
+        );
+
+        // Para todo o `to`, [0, to) tem exactamente `to` registos, 0..to-1.
+        for to in 1..=n {
+            let rows = log.scan(0, to).unwrap();
+            let lsns: Vec<Lsn> = rows.iter().map(|(l, _)| *l).collect();
+            let esperado: Vec<Lsn> = (0..to).collect();
+            assert_eq!(lsns, esperado, "scan(0, {to}) devolveu {lsns:?}");
+        }
+        // E com `from` no interior — limites dos dois lados.
+        for from in 0..n {
+            for to in (from + 1)..=n {
+                let rows = log.scan(from, to).unwrap();
+                assert_eq!(
+                    rows.first().map(|(l, _)| *l),
+                    Some(from),
+                    "scan({from}, {to}) nao comeca em {from}"
+                );
+                assert_eq!(
+                    rows.last().map(|(l, _)| *l),
+                    Some(to - 1),
+                    "scan({from}, {to}) nao acaba em {}",
+                    to - 1
+                );
+                assert_eq!(
+                    rows.len() as u64,
+                    to - from,
+                    "scan({from}, {to}) com tamanho errado"
+                );
+            }
+        }
+        // O tecto `max` continua a valer sobre o resultado correcto.
+        let capped = log.scan_capped(3, 40, 5).unwrap();
+        let lsns: Vec<Lsn> = capped.iter().map(|(l, _)| *l).collect();
+        assert_eq!(lsns, vec![3, 4, 5, 6, 7]);
     }
 
     #[test]
