@@ -166,6 +166,20 @@ pub struct Engine {
     /// RAM). Liga com HERACLITUS_LOG_ONLY=1 — permite cargas massivas (centenas
     /// de GB) com RAM limitada; as views se constroem depois via `view rebuild`.
     log_only: bool,
+    /// Views NÃO materializadas: o arranque saltou o catch-up
+    /// (HERACLITUS_SKIP_VIEW_REPLAY / HERACLITUS_LOG_ONLY), portanto o que está
+    /// em RAM é incompleto e os watermarks deixaram de o descrever. Enquanto
+    /// estiver ligado, `checkpoint_views` recusa-se a gravar o snapshot — ver o
+    /// PORQUÊ lá (auditoria 2026-09-05, A46). Limpa-se com um `view rebuild`
+    /// integral, que é o único caminho que as reconstrói do LSN 0.
+    views_nao_materializadas: std::sync::atomic::AtomicBool,
+    /// O mesmo, do lado do índice de atributos: o arranque carregou o
+    /// checkpoint dele (com o watermark antigo) mas saltou o replay da cauda.
+    /// Enquanto estiver ligado, `checkpoint_attr` recusa-se a gravar
+    /// (auditoria 2026-09-05, A47). Bandeira SEPARADA da das views de
+    /// propósito: `view rebuild` reconstrói as views e NÃO toca no índice de
+    /// atributos, logo limpar uma não pode limpar a outra.
+    attr_nao_materializado: std::sync::atomic::AtomicBool,
     /// Meta-auditoria de acessos (padrão immudb): cada query GQL executada
     /// gera um evento `AuditQuery` no próprio log — quem consultou o quê é,
     /// ele próprio, evidência imutável. Liga por config (audit_queries).
@@ -442,10 +456,25 @@ impl Engine {
                 // posterior (periódico ou de shutdown) gravar snapshots vazios
                 // sob watermarks altos, e o arranque seguinte replayava só a
                 // cauda: perda PERMANENTE e silenciosa de tudo ≤ watermark nas
-                // views derivadas. A zero, qualquer checkpoint é seguro e o
-                // próximo boot normal reconstrói do LSN 0.
+                // views derivadas.
+                //
+                // Auditoria 2026-09-05, A46: zerar os watermarks do registry
+                // NÃO chegava — era uma mitigação INERTE. Quem manda no
+                // arranque seguinte é o watermark INTERNO de cada view
+                // (`catch_up` adopta `v.watermark()` do snapshot como
+                // autoridade, e ignora o `watermarks.json`) e `View::apply`
+                // sobe-o incondicionalmente. Logo a PRIMEIRA escrita ao vivo
+                // desta sessão — que acontece, porque SKIP_VIEW_REPLAY sozinho
+                // não liga `log_only` — repunha o watermark da cauda sobre uma
+                // view VAZIA, e o checkpoint seguinte gravava esse par
+                // mentiroso. A defesa passa a ser não PERSISTIR: as bandeiras
+                // `views_nao_materializadas` / `attr_nao_materializado` fazem
+                // `checkpoint_views`/`checkpoint_attr` recusarem-se a gravar
+                // até um `view rebuild` integral. O `reset_watermarks` fica
+                // porque continua correcto (deixou de ser suficiente sozinho,
+                // não passou a estar errado).
                 registry.reset_watermarks();
-                p.ok("PULADO — HERACLITUS_SKIP_VIEW_REPLAY (views vazias; watermarks a zero)");
+                p.ok("PULADO — HERACLITUS_SKIP_VIEW_REPLAY (views vazias; checkpoint suspenso até `view rebuild`)");
             } else {
                 registry.catch_up(&log)?;
                 let wm = registry.min_watermark();
@@ -550,6 +579,8 @@ impl Engine {
             metric,
             keystore,
             log_only,
+            views_nao_materializadas: std::sync::atomic::AtomicBool::new(skip_replay),
+            attr_nao_materializado: std::sync::atomic::AtomicBool::new(skip_replay),
             audit_queries: config.audit_queries,
             replication: std::sync::OnceLock::new(),
             hvm_lock: Mutex::new(()),
@@ -637,6 +668,27 @@ impl Engine {
     /// Grava o checkpoint do índice de atributos (o servidor pode chamar
     /// periodicamente / no shutdown para o arranque seguinte só replayar a cauda).
     pub fn checkpoint_attr(&self) -> Result<(), HeraclitusError> {
+        // Auditoria 2026-09-05, A47 — a irmã de A46, do lado do índice de
+        // atributos. No arranque com o replay saltado carrega-se o checkpoint
+        // (`AttrIndex::open`, com o watermark antigo) e salta-se o catch-up: o
+        // índice fica com um buraco. A primeira escrita ao vivo empurra o
+        // watermark para além dele (`watermark = max(watermark, lsn)`) e gravar
+        // aqui consolidava a mentira — o arranque normal seguinte parte de
+        // `idx.watermark()` e o intervalo perdido NUNCA mais é indexado.
+        // Zerar o watermark no arranque não resolveria (o próximo `apply`
+        // repõe-o, foi essa a lição de A46): a defesa tem de ser não persistir.
+        // Não gravar mantém o checkpoint anterior, que descreve fielmente um
+        // estado mais antigo — o boot seguinte replaya mais log, e acerta.
+        if self
+            .attr_nao_materializado
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(
+                "índice de atributos não materializado (replay saltado no arranque): \
+                 checkpoint RECUSADO para não consolidar um buraco permanente"
+            );
+            return Ok(());
+        }
         self.attr.read().unwrap().save(&self.attr_dir)
     }
 
@@ -645,7 +697,28 @@ impl Engine {
     /// no shutdown gracioso e disponível para checkpoints periódicos — o
     /// arranque seguinte restaura e replaya só a cauda `(watermark, head]`.
     pub fn checkpoint_views(&self) -> Result<(), HeraclitusError> {
-        self.views.lock().unwrap().checkpoint()?;
+        // Auditoria 2026-09-05, A46: numa sessão que saltou o replay, gravar é
+        // PIOR do que não gravar. As views estão vazias e o watermark interno
+        // de cada uma volta à cauda do log à PRIMEIRA escrita ao vivo
+        // (`View::apply` faz `watermark = max(watermark, lsn)`), portanto o
+        // snapshot sairia quase vazio mas carimbado com um LSN alto — e é o
+        // watermark do snapshot que o `catch_up` toma como autoridade no
+        // arranque seguinte. Resultado: perda PERMANENTE e silenciosa de tudo o
+        // que ficasse abaixo dele. Zerar os watermarks no boot não chega (o
+        // próximo `apply` repõe-os): a defesa tem de estar aqui, na ESCRITA.
+        // Não gravar preserva o checkpoint anterior — mais log a replayar no
+        // arranque seguinte, mas correcto.
+        if self
+            .views_nao_materializadas
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(
+                "views não materializadas (replay saltado no arranque): checkpoint RECUSADO \
+                 para não persistir estado derivado incompleto; corre `view rebuild`"
+            );
+        } else {
+            self.views.lock().unwrap().checkpoint()?;
+        }
         self.checkpoint_attr()
     }
 
@@ -1868,6 +1941,14 @@ impl Engine {
         }
         rebuilt.save(&self.attr_dir)?;
         *self.attr.write().unwrap() = rebuilt;
+        // Este é o único caminho que reconstrói AMBOS os lados do estado
+        // derivado a partir do LSN 0 (views logo acima, índice de atributos
+        // aqui): depois dele nada está incompleto e os checkpoints voltam a ser
+        // persistíveis (auditoria 2026-09-05, A46/A47).
+        self.views_nao_materializadas
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.attr_nao_materializado
+            .store(false, std::sync::atomic::Ordering::Relaxed);
 
         let subject_hash = blake3::hash(agent_id.as_bytes()).to_hex().to_string();
         let mut receipt = Episode::new(
@@ -2234,7 +2315,18 @@ impl Engine {
     }
 
     pub fn rebuild(&self, view: Option<&str>) -> Result<(), HeraclitusError> {
-        self.views.lock().unwrap().rebuild(&self.log, view)
+        self.views.lock().unwrap().rebuild(&self.log, view)?;
+        // `view rebuild` SEM nome reconstrói todas as views do LSN 0: é a saída
+        // documentada de um arranque com o replay saltado, e é aqui que as
+        // views deixam de estar incompletas e voltam a poder ser persistidas
+        // (auditoria 2026-09-05, A46). Um rebuild de UMA view só não chega — as
+        // outras continuam vazias. O índice de atributos NÃO é tocado por este
+        // caminho, por isso a bandeira dele fica como está (A47).
+        if view.is_none() {
+            self.views_nao_materializadas
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     pub fn stats(&self) -> serde_json::Value {
