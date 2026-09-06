@@ -384,6 +384,20 @@ impl Superblock {
         let next_page_id = read_u64(data, 22)?;
         let free_list_head = read_u64(data, 30)?;
         let free_list_len = read_u32(data, 38)?;
+        // Auditoria 2026-09-05 (A43): o superbloco vem do DISCO e este campo é
+        // usado como índice directo no array de MAX_SB_FREE_LIST de
+        // `allocate_id` — um valor construído entrava em pânico de índice na
+        // primeira alocação, a meio de uma escrita. CRC32 e Blake3 não são com
+        // chave: provam integridade contra corrupção acidental, não contra um
+        // ficheiro fabricado. Mesmo critério de `DiskNode::deserialize`, que já
+        // recusa um `slot_count` que não cabe na página. A lista CHEIA
+        // (`== MAX_SB_FREE_LIST`) é legítima: só `>` é recusado.
+        if free_list_len as usize > MAX_SB_FREE_LIST {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "free_list_len do superbloco excede MAX_SB_FREE_LIST",
+            ));
+        }
         let mut free_list = [0u64; MAX_SB_FREE_LIST];
         let mut pos = 42;
         for slot in free_list.iter_mut() {
@@ -1492,9 +1506,17 @@ impl BEpsilonTree {
         let mut sb = self.superblock.write().unwrap();
 
         let id = if sb.free_list_len > 0 {
-            sb.free_list_len -= 1;
-            let slot = sb.free_list_len as usize;
-            let r_id = sb.free_list[slot];
+            // A43, defesa em profundidade: o slot é validado ANTES de mexer em
+            // `free_list_len` — falhar depois do decremento deixaria o
+            // superbloco em memória meio-mexido, com o contador já gasto.
+            let slot = (sb.free_list_len - 1) as usize;
+            let r_id = *sb.free_list.get(slot).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "slot da free list do superbloco fora dos limites",
+                )
+            })?;
+            sb.free_list_len = slot as u32;
             sb.free_list[slot] = 0;
             r_id
         } else if sb.free_list_head > 0 {
@@ -3022,6 +3044,101 @@ mod cache_evicao_tests {
             0,
             "{perdidas} de {} escritas por commitar perdidas — frame sujo despejado",
             sujas.len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod superbloco_tests {
+    //! Auditoria 2026-09-05 (A43): o superbloco vem do DISCO e os seus inteiros
+    //! têm de ser validados como os de `DiskNode::deserialize` já são. Precisa
+    //! de `MAX_SB_FREE_LIST`, privado, por isso vive dentro da crate.
+    use super::*;
+
+    /// Recalcula CRC32 + Blake3-28 de uma página. Nenhum dos dois é com chave:
+    /// quem consegue escrever no ficheiro refá-los à vontade — é por isso que os
+    /// checksums não substituem a validação dos campos.
+    fn reassina(pagina: &mut [u8]) {
+        let (data, sig) = pagina.split_at_mut(PAGE_SIZE - SIG_SIZE);
+        sig[0..4].copy_from_slice(&crc32fast::hash(data).to_le_bytes());
+        sig[4..32].copy_from_slice(&blake3::hash(data).as_bytes()[..HASH_LEN]);
+    }
+
+    /// Escreve `len` no campo `free_list_len` da página de superbloco ACTIVA
+    /// (a de maior geração — adulterar sempre a página 0 passaria por acidente).
+    fn adultera_free_list_len(path: &Path, len: u32) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let geracao = |p: &[u8]| {
+            Superblock::deserialize(p)
+                .map(|s| s.generation)
+                .unwrap_or(0)
+        };
+        let ini = if geracao(&bytes[0..PAGE_SIZE]) >= geracao(&bytes[PAGE_SIZE..2 * PAGE_SIZE]) {
+            0
+        } else {
+            PAGE_SIZE
+        };
+        bytes[ini + 38..ini + 42].copy_from_slice(&len.to_le_bytes());
+        reassina(&mut bytes[ini..ini + PAGE_SIZE]);
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    fn arvore_commitada(path: &Path) {
+        let mut t = BEpsilonTree::open(path, 1000, 128).unwrap();
+        t.upsert(b"a".to_vec(), b"1".to_vec()).unwrap();
+        t.commit().unwrap();
+    }
+
+    /// `free_list_len` era usado como índice directo num array de 32 elementos
+    /// em `allocate_id`: um valor construído entrava em pânico na primeira
+    /// alocação, a meio de uma escrita. Tem de ser recusado na desserialização
+    /// — e então `open` cai para o outro superbloco, válido (a mesma
+    /// resiliência que já existia para um write de superbloco rasgado).
+    #[test]
+    fn superbloco_com_free_list_len_impossivel_e_recusado_e_nao_panica() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sb-mau.hbt");
+        arvore_commitada(&path);
+        adultera_free_list_len(&path, 1000);
+
+        // A página adulterada tem CRC e Blake3 válidos: só a validação do campo
+        // a pode recusar.
+        let bytes = std::fs::read(&path).unwrap();
+        let recusas = (0..2)
+            .filter_map(|i| {
+                Superblock::deserialize(&bytes[i * PAGE_SIZE..(i + 1) * PAGE_SIZE]).err()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recusas.len(),
+            1,
+            "exactamente um superbloco (o adulterado) tem de ser recusado"
+        );
+        assert_eq!(recusas[0].kind(), io::ErrorKind::InvalidData);
+
+        let mut t = BEpsilonTree::load(&path).expect("o superbloco válido ainda serve");
+        assert!(t.superblock.read().unwrap().free_list_len as usize <= MAX_SB_FREE_LIST);
+        // A primeira alocação é o que entrava em pânico.
+        t.upsert(b"z".to_vec(), b"9".to_vec()).unwrap();
+        t.commit().unwrap();
+        assert_eq!(t.get(b"z"), Some(b"9".to_vec()));
+    }
+
+    /// Guarda do off-by-one: a lista CHEIA (`len == MAX_SB_FREE_LIST`) é um
+    /// estado legítimo que o `add_to_free_list` produz — recusá-la partiria
+    /// ficheiros válidos. (Não se faz upsert a seguir: a free list adulterada
+    /// só tem zeros e alocar dela é outro cenário, alheio a este guarda.)
+    #[test]
+    fn superbloco_com_free_list_cheia_continua_a_abrir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sb-cheia.hbt");
+        arvore_commitada(&path);
+        adultera_free_list_len(&path, MAX_SB_FREE_LIST as u32);
+
+        let t = BEpsilonTree::load(&path).expect("lista cheia é um valor legítimo");
+        assert_eq!(
+            t.superblock.read().unwrap().free_list_len as usize,
+            MAX_SB_FREE_LIST
         );
     }
 }
