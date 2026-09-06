@@ -421,20 +421,53 @@ pub fn render(plan: &Plan) -> String {
     }
 }
 
-/// Renderiza o plano e, para scans de igualdade em built-ins, pede ao backend
-/// a mesma decisão de pruning que a execução usaria. O probe é somente-leitura
-/// e os contadores viajam no próprio resultado, portanto queries concorrentes
-/// não partilham um slot global de estatísticas.
+/// Renderiza o plano e, quando o caminho de acesso escolhido é o skip-scan por
+/// zone maps, pede ao backend a mesma decisão de pruning que a execução usaria.
+/// Os contadores viajam no próprio resultado, portanto queries concorrentes não
+/// partilham um slot global de estatísticas — mas o probe NÃO é somente-leitura:
+/// `scan_builtin_eq` actualiza a EMA de caminhos de acesso e o slot
+/// `last_pruned_scan` do backend. Razão a mais para só o disparar no ramo em que
+/// a execução também o dispararia (auditoria 2026-09-05).
 pub fn explain_with_backend(plan: &Plan, be: &dyn QueryBackend) -> Result<String, HeraclitusError> {
     let mut out = render(plan);
     let Plan::ScanFilter {
-        conditions, as_of, ..
+        conditions,
+        as_of,
+        label,
+        ..
     } = plan
     else {
         return Ok(out);
     };
-    let Some((field, value)) = builtin_skip_hint(conditions) else {
-        return Ok(out);
+    // Auditoria 2026-09-05: o EXPLAIN consultava UM só hint — o do skip-scan —
+    // enquanto o executor decide por uma cascata de quatro. Para
+    // `WHERE n.kind = "X" AND n.agent_id = "a"` imprimia contadores de I/O de
+    // um plano que a query nunca faria (a execução resolve por `_kind` no
+    // índice de atributos) e escondia o caminho real. Agora os dois lados lêem
+    // a MESMA função.
+    let (field, value) = match caminho_de_acesso(conditions, label.as_deref()) {
+        CaminhoAcesso::AttrEq(chave, valor) => {
+            out.push_str(&format!("AttrIndex\n  key = {chave}\n  value = {valor}\n"));
+            return Ok(out);
+        }
+        CaminhoAcesso::AttrRange(chave, min, max) => {
+            out.push_str(&format!(
+                "AttrRangeIndex\n  key = {chave}\n  min = {min:?}\n  max = {max:?}\n"
+            ));
+            return Ok(out);
+        }
+        CaminhoAcesso::RotuloKind(rotulo) => {
+            out.push_str(&format!(
+                "AttrIndex\n  key = _kind\n  value = {rotulo}\n  \
+                 fallback = window scan (se o índice não tiver o rótulo)\n"
+            ));
+            return Ok(out);
+        }
+        CaminhoAcesso::Janela => {
+            out.push_str("WindowScan\n  (nenhum índice aplicável ao WHERE)\n");
+            return Ok(out);
+        }
+        CaminhoAcesso::BuiltinSkip(chave, valor) => (chave, valor),
     };
     let bound = resolve_as_of(as_of, be)?;
     let Some(probe) = be.scan_builtin_eq(&field, &value, bound)? else {
@@ -988,6 +1021,43 @@ fn builtin_skip_hint(conditions: &[(BoolOp, Condition)]) -> Option<(String, Stri
     None
 }
 
+/// O caminho de acesso que o `ScanFilter` prefere, decidido SÓ pelo `WHERE` e
+/// pelo rótulo do padrão.
+///
+/// Auditoria 2026-09-05: esta decisão vivia em dois sítios com regras
+/// diferentes — o executor tinha a cascata completa e o `explain_with_backend`
+/// só conhecia o skip-scan, pelo que o EXPLAIN descrevia (e sondava) um plano
+/// que a query não ia usar. Uma função, dois consumidores: não podem voltar a
+/// divergir.
+enum CaminhoAcesso {
+    /// Índice de atributos por igualdade (inclui o pseudo-atributo `_kind`).
+    AttrEq(String, String),
+    /// Índice ordenado, por range numérico.
+    AttrRange(String, NumBound, NumBound),
+    /// Skip-scan por zone maps num builtin (`agent_id`/`session_id`).
+    BuiltinSkip(String, String),
+    /// Sem hint no WHERE, mas o padrão tem rótulo: `_kind` no índice.
+    RotuloKind(String),
+    /// Varrimento da janela de LSNs, capado.
+    Janela,
+}
+
+fn caminho_de_acesso(conditions: &[(BoolOp, Condition)], label: Option<&str>) -> CaminhoAcesso {
+    if let Some((campo, valor)) = attr_eq_hint(conditions) {
+        return CaminhoAcesso::AttrEq(campo, valor);
+    }
+    if let Some((campo, min, max)) = attr_range_hint(conditions) {
+        return CaminhoAcesso::AttrRange(campo, min, max);
+    }
+    if let Some((campo, valor)) = builtin_skip_hint(conditions) {
+        return CaminhoAcesso::BuiltinSkip(campo, valor);
+    }
+    match label {
+        Some(rotulo) => CaminhoAcesso::RotuloKind(rotulo.to_string()),
+        None => CaminhoAcesso::Janela,
+    }
+}
+
 /// Derive the LSN scan window `[lo, hi)` from the `WHERE` clause and the `AS OF`
 /// bound, so `MATCH` pushes a time filter down to a pruned, capped scan
 /// (§query guard). Only conjunctive (`AND`) numeric `n.lsn` comparisons are
@@ -1147,27 +1217,30 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                 Lsns(Vec<Lsn>),
                 Linhas(Vec<(Lsn, Episode)>),
             }
-            let fonte: Option<Fonte> = match attr_eq_hint(conditions) {
-                Some((field, value)) => {
+            // A PREFERÊNCIA está em `caminho_de_acesso` — a mesma função que o
+            // EXPLAIN lê, para os dois não voltarem a divergir (auditoria
+            // 2026-09-05). A cascata DINÂMICA fica aqui e não muda: um caminho
+            // que dispare mas devolva `None` recua na mesma para o rótulo (a
+            // seguir) e daí para a janela.
+            let fonte: Option<Fonte> = match caminho_de_acesso(conditions, label.as_deref()) {
+                CaminhoAcesso::AttrEq(field, value) => {
                     be.attr_lookup_lsns(&field, &value, bound)?.map(Fonte::Lsns)
                 }
-                None => match attr_range_hint(conditions) {
-                    // ÍNDICE ORDENADO (C1.6): WHERE n.<campo> >/< número resolve
-                    // pelo range do índice de atributos em vez do scan.
-                    Some((field, min, max)) => be
-                        .attr_range_lookup_lsns(&field, min, max, bound)?
-                        .map(Fonte::Lsns),
-                    None => match builtin_skip_hint(conditions) {
-                        // SPEC-010 skip-I/O: WHERE agent_id/session_id = "v" salta
-                        // segmentos selados cujo zone map não contém o valor
-                        // (scan_builtin_eq). São builtins (fora do índice de
-                        // atributos); o pós-filtro `matches` revalida o exato.
-                        Some((field, value)) => be
-                            .scan_builtin_eq(&field, &value, bound)?
-                            .map(|result| Fonte::Linhas(result.rows)),
-                        None => None,
-                    },
-                },
+                // ÍNDICE ORDENADO (C1.6): WHERE n.<campo> >/< número resolve
+                // pelo range do índice de atributos em vez do scan.
+                CaminhoAcesso::AttrRange(field, min, max) => be
+                    .attr_range_lookup_lsns(&field, min, max, bound)?
+                    .map(Fonte::Lsns),
+                // SPEC-010 skip-I/O: WHERE agent_id/session_id = "v" salta
+                // segmentos selados cujo zone map não contém o valor
+                // (scan_builtin_eq). São builtins (fora do índice de
+                // atributos); o pós-filtro `matches` revalida o exato.
+                CaminhoAcesso::BuiltinSkip(field, value) => be
+                    .scan_builtin_eq(&field, &value, bound)?
+                    .map(|result| Fonte::Linhas(result.rows)),
+                // O rótulo é resolvido logo a seguir, no mesmo recuo que já
+                // apanha os hints que devolveram `None`.
+                CaminhoAcesso::RotuloKind(_) | CaminhoAcesso::Janela => None,
             };
             // ROTULO -> INDICE `_kind`. `MATCH (n:Despesas)` — a forma canonica
             // de Cypher — so era aplicado como POS-FILTRO sobre o varrimento
@@ -1634,7 +1707,13 @@ mod testes_rotulo_indice {
         )
     }
 
-    struct Divergente;
+    #[derive(Default)]
+    struct Divergente {
+        /// Auditoria 2026-09-05: quantas vezes o zone-map skip-scan foi
+        /// SONDADO. Um EXPLAIN que anuncia o indice de atributos nao pode
+        /// pagar (nem poluir a EMA com) um caminho que nao vai ser usado.
+        sondas: std::cell::Cell<u32>,
+    }
 
     impl QueryBackend for Divergente {
         fn head(&self) -> Result<Lsn, HeraclitusError> {
@@ -1662,6 +1741,20 @@ mod testes_rotulo_indice {
                 vec![ep("Despesas", "via-indice")]
             } else {
                 vec![] // indexavel mas ausente — como o Engine faz
+            }))
+        }
+        /// O skip-scan por zone maps CONTA as sondas e devolve o seu proprio
+        /// episodio: quem o tomar denuncia-se pelo conteudo.
+        fn scan_builtin_eq(
+            &self,
+            _field: &str,
+            _value: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<PrunedScanResult>, HeraclitusError> {
+            self.sondas.set(self.sondas.get() + 1);
+            Ok(Some(PrunedScanResult {
+                rows: vec![ep("Outro", "via-skip")],
+                stats: None,
             }))
         }
         fn graph(&self) -> Result<TemporalGraph, HeraclitusError> {
@@ -1958,7 +2051,7 @@ mod testes_rotulo_indice {
     /// indice, o resultado vem "via-indice".
     #[test]
     fn o_rotulo_do_padrao_chega_ao_indice_kind() {
-        let v = crate::execute("MATCH (n:Despesas) RETURN n", &Divergente).unwrap();
+        let v = crate::execute("MATCH (n:Despesas) RETURN n", &Divergente::default()).unwrap();
         assert_eq!(
             conteudos(&v),
             vec!["via-indice"],
@@ -1972,7 +2065,7 @@ mod testes_rotulo_indice {
     /// vazio como resposta final.
     #[test]
     fn rotulo_com_capitalizacao_diferente_recua_para_o_varrimento() {
-        let v = crate::execute("MATCH (n:despesas) RETURN n", &Divergente).unwrap();
+        let v = crate::execute("MATCH (n:despesas) RETURN n", &Divergente::default()).unwrap();
         assert_eq!(conteudos(&v), vec!["via-scan"]);
     }
 
@@ -1980,8 +2073,68 @@ mod testes_rotulo_indice {
     /// sem panico.
     #[test]
     fn kind_inexistente_da_zero_linhas() {
-        let v = crate::execute("MATCH (n:Fantasma) RETURN n", &Divergente).unwrap();
+        let v = crate::execute("MATCH (n:Fantasma) RETURN n", &Divergente::default()).unwrap();
         assert!(conteudos(&v).is_empty());
+    }
+
+    /// Auditoria 2026-09-05: o EXPLAIN consultava UM so hint (o do skip-scan)
+    /// enquanto o executor decide por uma cascata de quatro caminhos. Para
+    /// `WHERE n.kind = "X" AND n.agent_id = "a"` imprimia contadores de I/O de
+    /// um plano que a query nunca faz — e PAGAVA a sonda (ate 250 000 leituras),
+    /// que alem disso escreve no slot `last_pruned_scan` e na EMA que decide
+    /// caminhos de acesso FUTUROS.
+    #[test]
+    fn explain_anuncia_o_caminho_que_a_execucao_toma() {
+        let explicar = |q: &str, be: &Divergente| -> String {
+            crate::execute(&format!("EXPLAIN {q}"), be)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // (a) Indice de atributos vence o skip-scan — como no executor.
+        let be = Divergente::default();
+        let q = "MATCH (n) WHERE n.kind = \"Despesas\" AND n.agent_id = \"a\" RETURN n";
+        let saida = explicar(q, &be);
+        assert!(saida.contains("_kind"), "{saida}");
+        assert!(!saida.contains("StoragePruning"), "{saida}");
+        assert_eq!(
+            be.sondas.get(),
+            0,
+            "o EXPLAIN sondou um caminho que a execucao nao usa"
+        );
+        // EQUIVALENCIA: as LINHAS nao mudam e o conteudo denuncia o caminho —
+        // a execucao vai mesmo pelo indice, que e o que o EXPLAIN anuncia.
+        assert_eq!(
+            conteudos(&crate::execute(q, &be).unwrap()),
+            vec!["via-indice"]
+        );
+        assert_eq!(be.sondas.get(), 0, "a execucao tambem nao sonda o zone map");
+
+        // (b) Quando o skip-scan E o vencedor, o EXPLAIN continua a explica-lo
+        // (e a sonda-lo uma vez), como sempre fez.
+        let be = Divergente::default();
+        let q = "MATCH (n) WHERE n.agent_id = \"a\" RETURN n";
+        let saida = explicar(q, &be);
+        assert!(saida.contains("StoragePruning"), "{saida}");
+        assert_eq!(be.sondas.get(), 1);
+        assert_eq!(
+            conteudos(&crate::execute(q, &be).unwrap()),
+            vec!["via-skip"]
+        );
+
+        // (c) Rotulo do padrao, sem WHERE: o caminho e o indice `_kind`.
+        let be = Divergente::default();
+        let saida = explicar("MATCH (n:Despesas) RETURN n", &be);
+        assert!(saida.contains("_kind"), "{saida}");
+        assert_eq!(be.sondas.get(), 0);
+
+        // (d) Sem hint nenhum: varrimento por janela, anunciado como tal.
+        let be = Divergente::default();
+        let saida = explicar("MATCH (n) RETURN n", &be);
+        assert!(saida.contains("WindowScan"), "{saida}");
+        assert_eq!(be.sondas.get(), 0);
     }
 }
 
