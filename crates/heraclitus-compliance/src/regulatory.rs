@@ -614,6 +614,7 @@ impl RegulatoryState {
 #[derive(Clone)]
 pub struct RegulatoryPolicyEngine {
     log: Arc<AnyLog>,
+    sink: Arc<dyn crate::ComplianceSink>,
     cache: Option<Arc<RegulatoryStateCache>>,
 }
 
@@ -634,7 +635,18 @@ pub struct RegulatoryStateCache {
 
 impl RegulatoryPolicyEngine {
     pub fn new(log: Arc<AnyLog>) -> Self {
-        Self { log, cache: None }
+        Self {
+            sink: log.clone(),
+            log,
+            cache: None,
+        }
+    }
+
+    /// Redirige as escritas para o servidor (que as indexa ao vivo) em vez do
+    /// log cru. Ver [`crate::ComplianceSink`].
+    pub fn with_sink(mut self, sink: Arc<dyn crate::ComplianceSink>) -> Self {
+        self.sink = sink;
+        self
     }
 
     /// Liga esta instância a uma cache partilhada. Ver [`RegulatoryStateCache`].
@@ -700,8 +712,8 @@ impl RegulatoryPolicyEngine {
                 activation.policy.identity.policy_id, activation.policy.identity.version
             )));
         }
-        self.log
-            .append(activation.to_episode()?)
+        self.sink
+            .append_compliance(activation.to_episode()?)
             .map_err(|error| RegulatoryError::Storage(error.to_string()))
     }
 
@@ -728,8 +740,8 @@ impl RegulatoryPolicyEngine {
             return Ok((existing.lsn, existing.decision.clone()));
         }
         let lsn = self
-            .log
-            .append(decision.to_episode()?)
+            .sink
+            .append_compliance(decision.to_episode()?)
             .map_err(|error| RegulatoryError::Storage(error.to_string()))?;
         Ok((lsn, decision))
     }
@@ -757,8 +769,8 @@ impl RegulatoryPolicyEngine {
         v6.set_legal_hold_range(hold.scope.lsn_start, hold.scope.lsn_end, true)
             .map_err(|error| RegulatoryError::Storage(error.to_string()))?;
         let lsn = self
-            .log
-            .append(hold.to_episode()?)
+            .sink
+            .append_compliance(hold.to_episode()?)
             .map_err(|error| RegulatoryError::Storage(error.to_string()))?;
         self.reconcile_legal_holds()?;
         Ok(lsn)
@@ -787,8 +799,8 @@ impl RegulatoryPolicyEngine {
             ));
         }
         let lsn = self
-            .log
-            .append(release.to_episode()?)
+            .sink
+            .append_compliance(release.to_episode()?)
             .map_err(|error| RegulatoryError::Storage(error.to_string()))?;
         self.reconcile_legal_holds()?;
         Ok(lsn)

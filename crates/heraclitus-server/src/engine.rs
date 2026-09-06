@@ -2194,6 +2194,24 @@ impl Engine {
             .map(|(lsn, _, _)| lsn)
     }
 
+    /// Fronteira de append para o motor regulatório — a irmã de
+    /// `append_sentinel_derived`. Auditoria 2026-09-05 (`grpc.rs:521`): as
+    /// operações admin de compliance escreviam directo em `self.log`, e o
+    /// episódio não passava por `index_applied` — invisível às views e ao
+    /// índice de atributos até ao próximo arranque. Por aqui segue o caminho
+    /// unificado (e, com replicação activa, o consenso).
+    pub(crate) fn append_compliance_derived(
+        &self,
+        episode: Episode,
+    ) -> Result<Lsn, HeraclitusError> {
+        if !is_compliance_reserved(&episode) {
+            return Err(HeraclitusError::Query(
+                "append_compliance_derived exige episódio do domínio regulatório".into(),
+            ));
+        }
+        self.append_internal(episode)
+    }
+
     pub fn snapshot(&self) -> Lsn {
         self.log.head()
     }
@@ -2971,11 +2989,57 @@ impl heraclitus_sentinel::DerivedEventSink for Engine {
     }
 }
 
+impl heraclitus_compliance::ComplianceSink for Engine {
+    fn append_compliance(&self, episode: Episode) -> Result<Lsn, HeraclitusError> {
+        self.append_compliance_derived(episode)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use heraclitus_core::FsyncPolicy;
     use heraclitus_query::backend::{replay_graph, LogBackend};
+
+    /// Auditoria 2026-09-05 (`grpc.rs:521`, CONFIRMADO): as escritas do RPC
+    /// admin de compliance iam directas ao log, sem `index_applied`. Um
+    /// `LegalHold` acabado de colocar não existia para o índice `_kind` até ao
+    /// próximo arranque — e o planner tomava o `Some(vazio)` do índice como
+    /// resposta final: zero linhas sobre um episódio que ESTÁ no log.
+    #[test]
+    fn escrita_de_compliance_via_rpc_fica_visivel_ao_indice_sem_reiniciar() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            storage_format: heraclitus_core::StorageFormat::V6,
+            ..Default::default()
+        };
+        let engine = Arc::new(Engine::open(&cfg).unwrap());
+        let (ok, msg) = crate::grpc::legal_hold_op(
+            &engine,
+            "legal-hold-place",
+            r#"{"hold_id":"h1","lsn_start":0,"lsn_end":10,
+                "authority":"tribunal","reason":"prova"}"#,
+        );
+        assert!(ok, "{msg}");
+        assert_eq!(engine.head(), 1, "o hold está no log");
+
+        // O caminho do índice de atributos (`n.kind` → `_kind`), SEM reiniciar.
+        let v = heraclitus_query::execute(
+            "MATCH (n) WHERE n.kind = \"LegalHold\" RETURN n",
+            engine.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(
+            v.as_array().map(|a| a.len()),
+            Some(1),
+            "o índice `_kind` tem de ver o hold sem reiniciar: {v}"
+        );
+        // E por rótulo.
+        let v = heraclitus_query::execute("MATCH (n:LegalHold) RETURN n", engine.as_ref()).unwrap();
+        assert_eq!(v.as_array().map(|a| a.len()), Some(1), "{v}");
+    }
 
     /// Appends a provenance chain a←b←c plus a distilled fact f from {a,b}
     /// through the engine (which maintains the tgraph view incrementally).

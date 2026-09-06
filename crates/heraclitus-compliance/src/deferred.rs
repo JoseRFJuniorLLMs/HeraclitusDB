@@ -778,11 +778,22 @@ impl DeferredAnchorState {
 #[derive(Clone)]
 pub struct DeferredAnchorRegistry {
     log: Arc<AnyLog>,
+    sink: Arc<dyn crate::ComplianceSink>,
 }
 
 impl DeferredAnchorRegistry {
     pub fn new(log: Arc<AnyLog>) -> Self {
-        Self { log }
+        Self {
+            sink: log.clone(),
+            log,
+        }
+    }
+
+    /// Redirige as escritas para o servidor (que as indexa ao vivo) em vez do
+    /// log cru. Ver [`crate::ComplianceSink`].
+    pub fn with_sink(mut self, sink: Arc<dyn crate::ComplianceSink>) -> Self {
+        self.sink = sink;
+        self
     }
 
     pub fn state(&self) -> Result<DeferredAnchorState, DeferredAnchorError> {
@@ -809,8 +820,8 @@ impl DeferredAnchorRegistry {
                 "prev_anchor_digest não aponta para o último anchor persistido".into(),
             ));
         }
-        self.log
-            .append(anchor.to_episode()?)
+        self.sink
+            .append_compliance(anchor.to_episode()?)
             .map_err(|error| DeferredAnchorError::Storage(error.to_string()))
     }
 }
