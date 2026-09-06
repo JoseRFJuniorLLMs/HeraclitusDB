@@ -32,6 +32,15 @@ pub struct SentinelMetrics {
     pub(crate) normalization_errors_total: AtomicU64,
     pub(crate) queue_overflow_total: AtomicU64,
     pub(crate) catchup_passes_total: AtomicU64,
+    /// Auditoria 2026-09-05, A19 — varreduras completas do `RuleEngine` sobre a
+    /// janela L1.
+    ///
+    /// Sem este contador o trabalho redundante era INVISIVEL: `l1_latency_ms`
+    /// mede a ultima chamada, nao quantas houve, e uma reavaliacao de uma janela
+    /// que nao mudou custa exactamente o mesmo que uma legitima. E este numero
+    /// que tranca a regressao, e e ele que da ao operador a razao varreduras por
+    /// evento com que julgar o custo do L1.
+    pub(crate) l1_evaluations_total: AtomicU64,
     pub(crate) l0_latency_us: AtomicU64,
     pub(crate) l1_latency_ms: AtomicU64,
     pub(crate) l2_latency_ms: AtomicU64,
@@ -205,6 +214,9 @@ pub struct SentinelStatus {
     pub normalization_skipped_total: u64,
     pub normalization_errors_total: u64,
     pub catchup_passes_total: u64,
+    /// Auditoria 2026-09-05, A19 — varreduras completas do `RuleEngine`. Ver
+    /// `SentinelMetrics::l1_evaluations_total`.
+    pub l1_evaluations_total: u64,
     pub l0_latency_us: u64,
     pub l1_latency_ms: u64,
     pub l2_latency_ms: u64,
@@ -282,6 +294,7 @@ impl SentinelMetrics {
             normalization_skipped_total: self.normalization_skipped_total.load(Ordering::Acquire),
             normalization_errors_total: self.normalization_errors_total.load(Ordering::Acquire),
             catchup_passes_total: self.catchup_passes_total.load(Ordering::Acquire),
+            l1_evaluations_total: self.l1_evaluations_total.load(Ordering::Acquire),
             l0_latency_us: self.l0_latency_us.load(Ordering::Acquire),
             l1_latency_ms: self.l1_latency_ms.load(Ordering::Acquire),
             l2_latency_ms: self.l2_latency_ms.load(Ordering::Acquire),

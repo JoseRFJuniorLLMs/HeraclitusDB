@@ -289,7 +289,17 @@ struct RuntimeInner {
     /// SPEC-0047 — índice de IOC e políticas de fonte. `None` quando o plano
     /// de threat intel está desligado, que é o default.
     threat: Option<crate::threat::ThreatPlane>,
-    rule_history: Mutex<Vec<(Lsn, SecurityEvent)>>,
+    rule_history: Mutex<HistoricoL1>,
+    /// Auditoria 2026-09-05, A19 — o resultado da última varredura do L1, com a
+    /// versão da janela que o produziu.
+    ///
+    /// Gravado apenas DEPOIS de o ciclo de appends dos sinais terminar com
+    /// sucesso. Grava-lo antes seria pior do que não ter cache nenhuma: se um
+    /// append falhasse a meio, o erro subiria, o cursor não avançaria e o lote
+    /// seria reprocessado — mas nessa retentativa `remember_rule_event` veria
+    /// duplicado, a versão não mudaria, e a cache saltaria precisamente os
+    /// appends que faltavam. Sinais perdidos, em silêncio.
+    l1_cache: Mutex<Option<(u64, HashSet<EventId>)>>,
     behavior_engine: Option<Mutex<BehavioralEngine>>,
     fusion: Option<Mutex<EvidenceFusion>>,
     fusion_state: Mutex<BTreeMap<String, FusionAccumulator>>,
@@ -818,7 +828,11 @@ impl SentinelRuntime {
             threat,
             // Do snapshot quando ha um; senao vazio, e a segunda passagem
             // enche-o com poda a cada lote.
-            rule_history: Mutex::new(historico_de_regras),
+            rule_history: Mutex::new(HistoricoL1 {
+                linhas: historico_de_regras,
+                versao: 0,
+            }),
+            l1_cache: Mutex::new(None),
             behavior_engine,
             fusion,
             fusion_state: Mutex::new(acumuladores_de_fusao),
@@ -2070,6 +2084,7 @@ fn capturar_snapshot(inner: &RuntimeInner) -> SentinelStateSnapshot {
             .rule_history
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .linhas
             .clone();
         snapshot.behavior_state = inner
             .behavior_engine
@@ -2942,6 +2957,22 @@ fn compara_historico_l1(esquerda: (Lsn, EventId), direita: (Lsn, EventId)) -> st
     esquerda.cmp(&direita)
 }
 
+/// Auditoria 2026-09-05, A19 — a janela do L1 com um contador de versão.
+///
+/// A versão vive DENTRO do mutex, e não num `AtomicU64` ao lado, de propósito:
+/// quem muta as linhas tem fisicamente de passar por aqui, portanto nenhuma
+/// mutação futura pode esquecer-se de a incrementar e deixar a memoização de
+/// `evaluate_l1` a servir um conjunto de suspeitos velho. Essa seria uma falha
+/// SILENCIOSA — sinais deixavam de sair e nada o dizia —, que é a espécie que
+/// mais custa a descobrir.
+struct HistoricoL1 {
+    linhas: Vec<(Lsn, SecurityEvent)>,
+    /// Sobe uma vez por cada mutação de `linhas`. Monótona: nunca reutiliza um
+    /// valor, portanto uma entrada de cache com a versão actual só pode ter
+    /// sido produzida por esta janela.
+    versao: u64,
+}
+
 /// Auditoria 2026-09-05, A18 — repõe a ordem do histórico L1.
 ///
 /// Só é preciso no restauro do snapshot: é o único ponto de entrada do vector
@@ -2998,7 +3029,14 @@ fn remember_rule_event(inner: &RuntimeInner, source_lsn: Lsn, event: &SecurityEv
         .rule_history
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if inserir_no_historico_l1(&mut history, source_lsn, event) {
+    if inserir_no_historico_l1(&mut history.linhas, source_lsn, event) {
+        // Auditoria 2026-09-05, A19 — a janela mudou. O incremento fica DENTRO
+        // deste ramo de propósito: é exactamente aqui, e só aqui, que as linhas
+        // se alteram (a poda abaixo só corre quando houve inserção). Um evento
+        // que já lá estava — o `SecurityEvent` derivado a voltar pelo scan —
+        // deixa a versão quieta, e é isso que torna a segunda varredura
+        // dispensável em vez de apenas redundante.
+        history.versao = history.versao.saturating_add(1);
         // O histórico deixa de ser ilimitado. O horizonte não é arbitrário:
         // é a maior janela que o ruleset consulta, mais a tolerância a atraso
         // configurada — ver `DetectionExpr::max_window_ms`.
@@ -3006,7 +3044,7 @@ fn remember_rule_event(inner: &RuntimeInner, source_lsn: Lsn, event: &SecurityEv
             .required_window_ms()
             .saturating_add(inner.config.l1.max_lateness_ms);
         podar_historico_l1(
-            &mut history,
+            &mut history.linhas,
             horizonte,
             inner.config.l1.history_capacity,
             now_ms(),
@@ -3374,9 +3412,37 @@ fn evaluate_l1(inner: &RuntimeInner) -> Result<HashSet<EventId>, SentinelError> 
         .rule_history
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let signals = rule_engine.evaluate(&window);
+    let versao = window.versao;
+    // Auditoria 2026-09-05, A19 — a janela não mudou desde a última varredura,
+    // logo o resultado não pode ter mudado: `RuleEngine::evaluate` é uma função
+    // pura de `(self.rules, window)`, e `rule_engine` é um campo imutável sem
+    // mutabilidade interior. Os sinais dessa varredura já foram apendidos (a
+    // cache só é gravada depois disso) e os seus ids já estão em `signal_ids`,
+    // portanto o ciclo de appends abaixo não teria nada para fazer.
+    //
+    // Isto apanha, entre outras, a segunda avaliação de cada evento bruto: a do
+    // `SecurityEvent` derivado a voltar pelo scan. A comparação é por VERSÃO e
+    // não por "a chamada anterior foi a do mesmo evento" porque entre as duas
+    // podem ter passado muitos outros eventos, que mudam mesmo a janela.
+    //
+    // Ordem de locks: `rule_history` -> `l1_cache`, sempre nesta direcção.
+    if let Some((versao_em_cache, suspeitos)) = inner
+        .l1_cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+    {
+        if *versao_em_cache == versao {
+            return Ok(suspeitos.clone());
+        }
+    }
+    let signals = rule_engine.evaluate(&window.linhas);
+    inner
+        .metrics
+        .l1_evaluations_total
+        .fetch_add(1, Ordering::Relaxed);
     drop(window);
-    let suspicious_events = signals
+    let suspicious_events: HashSet<EventId> = signals
         .iter()
         .flat_map(|signal| signal.evidence.iter().map(|evidence| evidence.event_id))
         .collect();
@@ -3407,6 +3473,21 @@ fn evaluate_l1(inner: &RuntimeInner) -> Result<HashSet<EventId>, SentinelError> 
             .signals_emitted_total
             .fetch_add(1, Ordering::Relaxed);
     }
+    // Auditoria 2026-09-05, A19 — só AGORA, com todos os appends durados. Um
+    // `?` acima leva o erro para cima sem gravar nada, o cursor não avança e o
+    // lote é reprocessado: nessa retentativa a versão é a mesma (o evento já
+    // está no histórico), e uma cache gravada cedo demais saltaria os appends
+    // que faltavam.
+    //
+    // Se outra thread mudou a janela entretanto, esta entrada nasce obsoleta —
+    // `versao` já não é a corrente — e a próxima chamada volta a avaliar. É o
+    // pior caso possível: trabalho a mais, nunca resultado a menos. A versão é
+    // monótona, portanto nunca se pode confundir uma janela nova com uma velha.
+    *inner
+        .l1_cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some((versao, suspicious_events.clone()));
     Ok(suspicious_events)
 }
 
@@ -4324,6 +4405,247 @@ detection:
         assert_eq!(restarted.status().signals_emitted_total, 0);
         assert_eq!(reopened.head(), before_restart);
         restarted.shutdown();
+    }
+
+    /// Auditoria 2026-09-05, A19 — cada evento bruto provocava DUAS varreduras
+    /// completas do `RuleEngine` sobre a janela L1: uma na derivação, e outra
+    /// quando o `SecurityEvent` derivado volta a ser lido do log. A segunda é
+    /// estéril: `remember_rule_event` reconhece `(source_lsn, raw_event_id)`
+    /// como já presente — a chave é literalmente a mesma nos dois ramos, porque
+    /// o normalizador escreve `source_lsn = lsn` do episódio bruto —, portanto
+    /// não há inserção, não há poda, a janela não muda, e `RuleEngine::evaluate`
+    /// é uma função pura de `(regras, janela)`.
+    #[test]
+    fn l1_nao_reavalia_a_janela_inalterada() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let rules = temp.path().join("failed-login.yml");
+        std::fs::write(
+            &rules,
+            r#"title: Failed login
+id: test-failed-login
+level: high
+detection:
+  selection:
+    EventID: 4625
+  condition: selection
+"#,
+        )
+        .unwrap();
+        let runtime = SentinelRuntime::start(
+            log.clone(),
+            SentinelConfig {
+                enabled: true,
+                mode: SentinelMode::Observe,
+                queue_capacity: 8,
+                // Um worker só: com vários, a ordem entre o ramo bruto e o ramo
+                // derivado deixa de ser observável e o teste mediria o
+                // escalonador em vez do trabalho.
+                worker_threads: 1,
+                pipeline_version: 1,
+                catch_up_batch: 32,
+                l1: SentinelL1Config {
+                    enabled: true,
+                    rules_path: Some(rules),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        // O arranque a frio avalia uma vez (janela vazia) antes de o L2 correr.
+        let no_arranque = runtime.status().l1_evaluations_total;
+
+        const BRUTOS: u64 = 3;
+        for _ in 0..BRUTOS {
+            log.append(Episode::new(
+                "auditd",
+                EventKind::Observation,
+                br#"{"source":"auditd","EventID":4625}"#.to_vec(),
+            ))
+            .unwrap();
+        }
+        // 30 s pela mesma razão documentada nos testes vizinhos: o prazo mede
+        // carga da máquina, que o teste não controla. Esperar por
+        // `detection_lag_lsn == 0` é o que garante que os `SecurityEvent`
+        // DERIVADOS já voltaram pelo scan — é essa a segunda avaliação.
+        let prazo = std::time::Instant::now() + Duration::from_secs(30);
+        while (runtime.status().events_normalized_total < BRUTOS
+            || runtime.status().detection_lag_lsn > 0)
+            && std::time::Instant::now() < prazo
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let estado = runtime.status();
+
+        // O conjunto SERVIDO pela cache tem de ser o mesmo que uma varredura
+        // fresca produziria: é ele que diz ao L2 quais eventos já foram
+        // marcados por uma regra determinista, e um conjunto vazio devolvido
+        // por engano faria o L2 incorporar numa baseline activa exactamente os
+        // eventos que uma regra acabou de assinalar.
+        let servido_pela_cache = evaluate_l1(&runtime.inner).unwrap();
+        let fresco: HashSet<EventId> = {
+            let janela = runtime
+                .inner
+                .rule_history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            runtime
+                .inner
+                .rule_engine
+                .as_ref()
+                .unwrap()
+                .evaluate(&janela.linhas)
+                .iter()
+                .flat_map(|sinal| sinal.evidence.iter().map(|e| e.event_id))
+                .collect()
+        };
+        let depois_da_leitura = runtime.status().l1_evaluations_total;
+        runtime.shutdown();
+
+        assert_eq!(estado.events_normalized_total, BRUTOS);
+        assert_eq!(estado.detection_lag_lsn, 0, "o pipeline não chegou ao fim");
+        // Equivalência observável: o resultado não pode mudar. A regra reporta
+        // a PRIMEIRA correspondência, e o `signal_id` determinista deduplica-a.
+        assert_eq!(
+            estado.signals_emitted_total, 1,
+            "memoizar não pode mudar os sinais emitidos"
+        );
+        assert_eq!(
+            estado.l1_evaluations_total - no_arranque,
+            BRUTOS,
+            "uma varredura por evento que MUDA a janela, e nenhuma pela janela \
+             inalterada que o derivado traz de volta"
+        );
+        assert!(
+            !fresco.is_empty(),
+            "sem suspeitos a comparação seria vácua e não provaria nada"
+        );
+        assert_eq!(
+            servido_pela_cache, fresco,
+            "o acerto de cache tem de devolver o MESMO conjunto de suspeitos"
+        );
+        assert_eq!(
+            depois_da_leitura, estado.l1_evaluations_total,
+            "e tem de devolvê-lo sem voltar a varrer a janela"
+        );
+    }
+
+    /// Auditoria 2026-09-05, A19 — guarda da ORDEM: a cache de `evaluate_l1` só
+    /// pode ser gravada DEPOIS de os appends dos sinais durarem.
+    ///
+    /// Um append falhado sobe o erro, o cursor não avança e o lote é
+    /// reprocessado. Nessa retentativa `remember_rule_event` vê duplicado e a
+    /// versão da janela NÃO muda — portanto uma cache gravada antes do ciclo
+    /// faria a retentativa saltar exactamente os appends que faltavam, e o sinal
+    /// nunca chegaria ao log. Em silêncio, que é o que torna isto perigoso.
+    #[test]
+    fn um_append_falhado_de_sinal_nao_fica_preso_na_cache_do_l1() {
+        struct SinkQueFalhaOPrimeiroSinal {
+            log: Arc<AnyLog>,
+            ja_falhou: std::sync::atomic::AtomicBool,
+        }
+
+        impl DerivedEventSink for SinkQueFalhaOPrimeiroSinal {
+            fn append(
+                &self,
+                episode: Episode,
+                idempotency_key: &str,
+            ) -> Result<Lsn, HeraclitusError> {
+                // `s:` é o prefixo que `evaluate_l1` usa para os sinais; os
+                // `e:` (eventos derivados) passam sempre, senão nem havia
+                // `SecurityEvent` para a regra ver.
+                if idempotency_key.starts_with("s:") && !self.ja_falhou.swap(true, Ordering::SeqCst)
+                {
+                    return Err(HeraclitusError::StorageEngine(
+                        "falha injectada no primeiro append de sinal".into(),
+                    ));
+                }
+                self.log.append(episode)
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let rules = temp.path().join("failed-login.yml");
+        std::fs::write(
+            &rules,
+            r#"title: Failed login
+id: test-failed-login
+level: high
+detection:
+  selection:
+    EventID: 4625
+  condition: selection
+"#,
+        )
+        .unwrap();
+        let sink = Arc::new(SinkQueFalhaOPrimeiroSinal {
+            log: log.clone(),
+            ja_falhou: std::sync::atomic::AtomicBool::new(false),
+        });
+        let runtime = SentinelRuntime::start_with_sink(
+            log.clone(),
+            sink,
+            SentinelConfig {
+                enabled: true,
+                mode: SentinelMode::Observe,
+                queue_capacity: 8,
+                worker_threads: 1,
+                pipeline_version: 1,
+                catch_up_batch: 32,
+                l1: SentinelL1Config {
+                    enabled: true,
+                    rules_path: Some(rules),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        log.append(Episode::new(
+            "auditd",
+            EventKind::Observation,
+            br#"{"source":"auditd","EventID":4625}"#.to_vec(),
+        ))
+        .unwrap();
+        let prazo = std::time::Instant::now() + Duration::from_secs(30);
+        while runtime.status().signals_emitted_total < 1 && std::time::Instant::now() < prazo {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let emitidos = runtime.status().signals_emitted_total;
+        runtime.shutdown();
+        assert_eq!(
+            emitidos, 1,
+            "a retentativa depois do append falhado tem de reemitir o sinal"
+        );
+        assert!(
+            log.scan(0, log.head()).unwrap().iter().any(|(_, episode)| {
+                matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecuritySignal")
+            }),
+            "e o sinal tem de estar mesmo no log, nao so contado na metrica"
+        );
     }
 
     #[test]
@@ -5621,6 +5943,7 @@ mod testes_snapshot_spec0072 {
             .rule_history
             .lock()
             .unwrap()
+            .linhas
             .iter()
             .map(|(lsn, _)| *lsn)
             .collect();
