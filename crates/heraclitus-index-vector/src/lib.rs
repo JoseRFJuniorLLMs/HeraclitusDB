@@ -21,6 +21,23 @@ use std::path::Path;
 const DEFAULT_M: usize = 16;
 const DEFAULT_EF_CONSTRUCTION: usize = 200;
 
+/// Intervalos aceitáveis para os parâmetros do HNSW quando eles vêm de um
+/// ficheiro (auditoria 2026-09-05, A26).
+///
+/// `m` não é um número decorativo: é o divisor logarítmico de `random_level`
+/// e a régua de truncagem da poda de vizinhos. `m = 0` transforma
+/// `truncate(self.m * 2)` em `truncate(0)` — apaga a lista de adjacência de
+/// cada vizinho ligado, e o grafo erode em silêncio; `m = 1` faz
+/// `1/ln(1) = +inf`, o nível sorteado satura em `usize::MAX` e `level + 1`
+/// transborda. O tecto existe pela mesma razão que o chão: `m` grande faz
+/// `vec![Vec::new(); level + 1]` alocar sem relação com o corpus.
+const M_MIN: usize = 2;
+const M_MAX: usize = 1024;
+/// `ef_construction = 0` não panica (`search_layer` só devolve ~nada), mas
+/// constrói um grafo sem arestas úteis — degradação silenciosa de recall.
+const EF_CONSTRUCTION_MIN: usize = 1;
+const EF_CONSTRUCTION_MAX: usize = 65_536;
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Node {
     point: ProductPoint,
@@ -227,7 +244,19 @@ impl VectorIndex {
     }
 
     fn random_level(&mut self) -> usize {
-        let ml = 1.0 / (self.m as f64).ln();
+        // `1/ln(m)` só está definido para `m >= 2`: `ln(1) = 0` dá `+inf`, e
+        // `(+inf).floor() as usize` satura em `usize::MAX` (o cast float->int é
+        // saturante desde Rust 1.45), pelo que o `vec![Vec::new(); level + 1]`
+        // de `insert` transbordava — pânico com `overflow-checks = true`.
+        // `ln(0) = -inf` dá `-0.0` e prende todos os nós no nível 0.
+        // `load_checkpoint` já recusa `m` fora de `M_MIN..=M_MAX`; esta guarda
+        // é a segunda linha, para que a função seja TOTAL e nenhum caminho
+        // futuro a possa fazer panicar (auditoria 2026-09-05, A26).
+        let ml = if self.m >= M_MIN {
+            1.0 / (self.m as f64).ln()
+        } else {
+            1.0
+        };
         let r: f64 = self.rng.gen_range(f64::MIN_POSITIVE..1.0);
         ((-r.ln()) * ml).floor() as usize
     }
@@ -625,7 +654,22 @@ impl VectorIndex {
         // checkpoint decodável mas violado degrada para rebuild do log (I6),
         // nunca para um índice que panica.
         let n_nodes = snap.nodes.len();
-        let coherent = n_nodes == snap.ids.len()
+        let coherent =
+            // Os PARÂMETROS também vêm do ficheiro e também têm de ser
+            // validados (auditoria 2026-09-05, A26). `m` é adoptado sem filtro
+            // logo abaixo e passa a ser o divisor de `ln` em `random_level` e a
+            // régua de `truncate(self.m * 2)` na poda: `m = 0` apaga as listas
+            // de adjacência a cada inserção (perda de recall TOTAL e silenciosa)
+            // e `m = 1` faz o nível saturar em `usize::MAX` e `level + 1`
+            // transbordar na primeira inserção pós-restore. O ficheiro não tem
+            // magic nem CRC e `m` é o primeiro campo, um varint de um byte para
+            // 16 — uma troca de bit continua a descodificar. Nenhum checkpoint
+            // escrito por este código sai destes intervalos (DEFAULT_M = 16,
+            // DEFAULT_EF_CONSTRUCTION = 200), portanto isto só recusa ficheiros
+            // que já eram venenosos.
+            (M_MIN..=M_MAX).contains(&snap.m)
+            && (EF_CONSTRUCTION_MIN..=EF_CONSTRUCTION_MAX).contains(&snap.ef_construction)
+            && n_nodes == snap.ids.len()
             && n_nodes == snap.lsns.len()
             && snap
                 .nodes
@@ -1551,5 +1595,108 @@ mod testes_prepared_query {
         // E um checkpoint SÃO continua a restaurar.
         let mut bom = VectorIndex::new(ProductMetric::default());
         assert!(bom.restore(dir.path()).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod testes_coerencia_do_checkpoint {
+    use super::*;
+
+    fn indice_com_quatro_pontos(dir: &Path) -> VectorIndex {
+        let mut idx = VectorIndex::new(ProductMetric::default());
+        for i in 0..4u64 {
+            let id = EventId(ulid::Ulid::from_parts(i, i as u128));
+            idx.insert(
+                id,
+                i,
+                ProductPoint {
+                    hyp: vec![(i as f32) / 10.0, 0.1],
+                    sph: vec![],
+                    euc: vec![],
+                },
+            );
+        }
+        idx.save_checkpoint(dir).unwrap();
+        idx
+    }
+
+    /// Reescreve `vector.ckpt` com o snapshot decodificado e alterado por
+    /// `envenenar`, e devolve o que um indice fresco faz do ficheiro.
+    fn restaurar_com_snapshot_envenenado(
+        dir: &Path,
+        envenenar: impl FnOnce(&mut VectorSnapshot),
+    ) -> bool {
+        let bytes = std::fs::read(dir.join(VECTOR_CKPT_FILE)).unwrap();
+        let (mut snap, _): (VectorSnapshot, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        envenenar(&mut snap);
+        let envenenado = bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap();
+        std::fs::write(dir.join(VECTOR_CKPT_FILE), &envenenado).unwrap();
+        let mut fresco = VectorIndex::new(ProductMetric::default());
+        fresco.restore(dir).unwrap()
+    }
+
+    /// Auditoria 2026-09-05, A26. `m` e `ef_construction` sao restaurados do
+    /// ficheiro sem validacao nenhuma, e `m` e divisor de `ln` em
+    /// `random_level` e regua de truncagem em `insert`. Com `m = 0` a poda
+    /// vira `truncate(0)` e apaga as listas de adjacencia em silencio; com
+    /// `m = 1` o nivel sorteado satura em `usize::MAX` e `level + 1` transborda.
+    /// Um checkpoint assim tem de degradar para rebuild do log, como o
+    /// comentario de `load_checkpoint` ja promete.
+    #[test]
+    fn checkpoint_com_m_ou_ef_construction_degenerados_degrada() {
+        for degenerado in [0usize, 1] {
+            let dir = tempfile::tempdir().unwrap();
+            indice_com_quatro_pontos(dir.path());
+            assert!(
+                !restaurar_com_snapshot_envenenado(dir.path(), |snap| snap.m = degenerado),
+                "checkpoint com m = {degenerado} tem de degradar para rebuild"
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        indice_com_quatro_pontos(dir.path());
+        assert!(
+            !restaurar_com_snapshot_envenenado(dir.path(), |snap| snap.ef_construction = 0),
+            "checkpoint com ef_construction = 0 tem de degradar para rebuild"
+        );
+
+        // E um checkpoint SAO continua a restaurar — a guarda nao pode virar
+        // uma recusa cega.
+        let dir = tempfile::tempdir().unwrap();
+        indice_com_quatro_pontos(dir.path());
+        let mut bom = VectorIndex::new(ProductMetric::default());
+        assert!(
+            bom.restore(dir.path()).unwrap(),
+            "checkpoint intacto tem de restaurar"
+        );
+        assert_eq!(bom.len(), 4);
+    }
+
+    /// Auditoria 2026-09-05, A26 (defesa em profundidade). `random_level`
+    /// divide por `ln(m)`: com `m = 1` isso e `1/0 = +inf`, o `floor() as usize`
+    /// satura em `usize::MAX` e a alocacao `vec![Vec::new(); level + 1]` de
+    /// `insert` transborda — panico, nao degradacao. A funcao tem de ser total.
+    #[test]
+    fn random_level_e_total_quando_m_e_um() {
+        let mut idx = VectorIndex::new(ProductMetric::default());
+        idx.m = 1;
+        for i in 0..8u64 {
+            let id = EventId(ulid::Ulid::from_parts(i, i as u128));
+            idx.insert(
+                id,
+                i,
+                ProductPoint {
+                    hyp: vec![(i as f32) / 10.0, 0.1],
+                    sph: vec![],
+                    euc: vec![],
+                },
+            );
+        }
+        assert_eq!(idx.len(), 8);
+        assert!(
+            idx.nodes.iter().all(|n| n.level < 1024),
+            "nivel sorteado com m = 1 saturou"
+        );
     }
 }
