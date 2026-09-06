@@ -1960,9 +1960,34 @@ impl SentinelRuntime {
     /// Reconstruct the behavioral model known at a transaction LSN.  This is
     /// intentionally a bounded log scan: a caller asking historical questions
     /// must not observe today's profile after a rollback point.
+    ///
+    /// Auditoria 2026-09-05, A41 — o "bounded" era só o intervalo de LSN, nunca
+    /// a memória. O `scan(0, to)` anterior materializava TODOS os episódios do
+    /// intervalo — conteúdo incluído — num `Vec`, e mantinha-o vivo durante as
+    /// DUAS passagens: numa base de 20 M episódios de 1 KB são ~20 GB
+    /// residentes numa única chamada de leitura, porque o varrimento arranca
+    /// sempre em 0 por muito recente que seja o `as_of_lsn` pedido. É o mesmo
+    /// defeito que o gémeo `incident_revisions_as_of` já corrigiu, e usa-se a
+    /// MESMA janela de propósito, para não ficarem dois tectos a divergir.
     pub fn behavioral_snapshot_as_of(
         &self,
         as_of_lsn: Lsn,
+    ) -> Result<Option<BehavioralSnapshot>, SentinelError> {
+        const JANELA: usize = 20_000;
+        self.behavioral_snapshot_com_janela(as_of_lsn, JANELA)
+    }
+
+    /// O corpo de [`Self::behavioral_snapshot_as_of`], com a janela explícita.
+    ///
+    /// A janela é parâmetro só para o teste de equivalência poder exercitar as
+    /// fronteiras — janela 1, janela igual ao número de episódios — num log
+    /// pequeno. Medir as fronteiras com 20 000 exigiria escrever um log que
+    /// nenhum teste deve escrever, e a fronteira é onde o avanço do cursor
+    /// falha.
+    fn behavioral_snapshot_com_janela(
+        &self,
+        as_of_lsn: Lsn,
+        janela: usize,
     ) -> Result<Option<BehavioralSnapshot>, SentinelError> {
         if !self.inner.config.l2.enabled {
             return Ok(None);
@@ -1975,33 +2000,72 @@ impl SentinelRuntime {
         };
         let mut engine = BehavioralEngine::new(policy)?;
         let to_exclusive = self.inner.log.head().min(as_of_lsn.saturating_add(1));
-        let rows = self.inner.log.scan(0, to_exclusive)?;
+        // `scan_capped` com `max = 0` devolve sempre vazio: uma janela de zero
+        // reconstruiria um motor VAZIO em silêncio, em vez de falhar.
+        let janela = janela.max(1);
+
+        // As duas passagens continuam a ser duas, e não uma varredura só: um
+        // `SecuritySignal` é apendido DEPOIS do `SecurityEvent` que referencia,
+        // portanto a evidência tem de estar toda reunida antes do primeiro
+        // `observe` — senão o `suspicious` de um evento sai `false` e o perfil
+        // diverge. O que se troca é explícito: duas leituras do intervalo em vez
+        // de uma, contra memória O(janela) em vez de O(log). O tempo NÃO é o
+        // mesmo — é o dobro da leitura; o pico de memória é que deixa de
+        // crescer com a base.
         let mut rule_evidence = HashSet::new();
-        for (_, episode) in &rows {
-            if !episode_is_generated(episode)
-                || !matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecuritySignal")
-            {
-                continue;
-            }
-            if let Ok(signal) = serde_json::from_slice::<SecuritySignal>(&episode.content) {
-                if !signal.detector.id.starts_with("l2.") {
-                    rule_evidence.extend(signal.evidence.iter().map(|evidence| evidence.event_id));
+        let mut cursor: Lsn = 0;
+        while cursor < to_exclusive {
+            let lote = self.inner.log.scan_capped(cursor, to_exclusive, janela)?;
+            // Um lote vazio é o fim mesmo, e não uma lacuna a saltar:
+            // `scan_capped` percorre o intervalo INTEIRO até encher `max`, logo
+            // não devolver nada quer dizer que não há nada em `[cursor, to)`.
+            let Some(&(ultimo, _)) = lote.last() else {
+                break;
+            };
+            for (_, episode) in &lote {
+                if !episode_is_generated(episode)
+                    || !matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecuritySignal")
+                {
+                    continue;
+                }
+                if let Ok(signal) = serde_json::from_slice::<SecuritySignal>(&episode.content) {
+                    if !signal.detector.id.starts_with("l2.") {
+                        rule_evidence
+                            .extend(signal.evidence.iter().map(|evidence| evidence.event_id));
+                    }
                 }
             }
+            cursor = ultimo.saturating_add(1);
         }
-        for (lsn, episode) in rows {
-            if !episode_is_generated(&episode)
-                || !matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecurityEvent")
-            {
-                continue;
-            }
-            let Ok(event) = serde_json::from_slice::<SecurityEvent>(&episode.content) else {
-                continue;
+
+        // Os lotes são contíguos e `scan_capped` devolve por LSN crescente, logo
+        // a ordem dos `observe` é a mesma da varredura única — que é o que torna
+        // o resultado bit a bit igual, e o que um avanço errado do cursor
+        // (repetir ou saltar o último LSN de cada lote) quebraria em silêncio.
+        let mut cursor: Lsn = 0;
+        while cursor < to_exclusive {
+            let lote = self.inner.log.scan_capped(cursor, to_exclusive, janela)?;
+            let Some(&(ultimo, _)) = lote.last() else {
+                break;
             };
-            for input in security_event_inputs(&event, self.inner.config.l2.suspicious_severity)? {
-                let suspicious = input.suspicious || rule_evidence.contains(&event.raw_event_id);
-                let _ = engine.observe(lsn, input.entity, input.features, suspicious)?;
+            for (lsn, episode) in lote {
+                if !episode_is_generated(&episode)
+                    || !matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecurityEvent")
+                {
+                    continue;
+                }
+                let Ok(event) = serde_json::from_slice::<SecurityEvent>(&episode.content) else {
+                    continue;
+                };
+                for input in
+                    security_event_inputs(&event, self.inner.config.l2.suspicious_severity)?
+                {
+                    let suspicious =
+                        input.suspicious || rule_evidence.contains(&event.raw_event_id);
+                    let _ = engine.observe(lsn, input.entity, input.features, suspicious)?;
+                }
             }
+            cursor = ultimo.saturating_add(1);
         }
         Ok(Some(engine.snapshot()))
     }
@@ -4918,6 +4982,169 @@ detection:
             .unwrap()
             .profiles
             .is_empty());
+        runtime.shutdown();
+    }
+
+    /// Auditoria 2026-09-05, A41 — janelar a leitura não pode mudar o modelo
+    /// reconstruído.
+    ///
+    /// A montagem tem L1 e L2 ligados de propósito: o `SecuritySignal` da regra
+    /// é apendido DEPOIS do `SecurityEvent` que referencia, portanto é ele que
+    /// obriga a duas passagens. Fundir as duas numa só varredura janelada faria
+    /// o `suspicious` desse evento sair `false` e o perfil divergir.
+    #[test]
+    fn o_snapshot_comportamental_janelado_equivale_a_varredura_unica() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let rules = temp.path().join("failed-login.yml");
+        std::fs::write(
+            &rules,
+            r#"title: Failed login
+id: test-failed-login
+level: high
+detection:
+  selection:
+    EventID: 4625
+  condition: selection
+"#,
+        )
+        .unwrap();
+        let runtime = SentinelRuntime::start(
+            log.clone(),
+            SentinelConfig {
+                enabled: true,
+                mode: SentinelMode::Observe,
+                queue_capacity: 16,
+                worker_threads: 1,
+                pipeline_version: 3,
+                catch_up_batch: 32,
+                l1: SentinelL1Config {
+                    enabled: true,
+                    rules_path: Some(rules),
+                    ..Default::default()
+                },
+                l2: SentinelL2Config {
+                    enabled: true,
+                    minimum_support: 1,
+                    learning_delay_events: 1,
+                    shadow_only: false,
+                    suspicious_severity: 9,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        const BRUTOS: u64 = 12;
+        for i in 0..BRUTOS {
+            log.append(Episode::new(
+                "auditd",
+                EventKind::Observation,
+                format!(
+                    r#"{{"source":"auditd","EventID":4625,"user":"u{}","host":"h{}"}}"#,
+                    i % 3,
+                    i % 2
+                )
+                .into_bytes(),
+            ))
+            .unwrap();
+        }
+        let prazo = std::time::Instant::now() + Duration::from_secs(30);
+        while (runtime.status().events_normalized_total < BRUTOS
+            || runtime.status().detection_lag_lsn > 0)
+            && std::time::Instant::now() < prazo
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(runtime.status().events_normalized_total, BRUTOS);
+        assert!(
+            runtime.status().signals_emitted_total > 0,
+            "sem um sinal de regra no log a segunda passagem não é exercitada"
+        );
+
+        let head = log.head();
+        // `usize::MAX` É literalmente a varredura única anterior: `scan` delega
+        // em `scan_capped(from, to, usize::MAX)`. É esse o oráculo.
+        let referencia = runtime
+            .behavioral_snapshot_com_janela(head, usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !referencia.profiles.is_empty() || !referencia.shadow_profiles.is_empty(),
+            "sem perfis reconstruídos a comparação seria vácua"
+        );
+
+        let observacoes = |snapshot: &BehavioralSnapshot| -> u64 {
+            snapshot
+                .profiles
+                .values()
+                .chain(snapshot.shadow_profiles.values())
+                .map(|perfil| perfil.observation_count)
+                .sum()
+        };
+
+        // A PRIMEIRA passagem tem de ter efeito, e a igualdade entre janelas não
+        // o prova: os dois lados da comparação partilham a implementação, logo
+        // fundir as duas passagens numa só mudaria ambos por igual e passaria
+        // despercebido. O oráculo é independente: sem a evidência de regra,
+        // TODAS as observações seriam incorporadas; com ela, as do evento que o
+        // sinal nomeia saem `suspicious` e `observe` devolve sem tocar no
+        // perfil. Logo o total reconstruído tem de ficar ABAIXO do total de
+        // pares (evento, entidade) que existem no log.
+        let mut pares_no_log = 0u64;
+        for (_, episode) in log.scan(0, head).unwrap() {
+            if !episode_is_generated(&episode)
+                || !matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecurityEvent")
+            {
+                continue;
+            }
+            let Ok(event) = serde_json::from_slice::<SecurityEvent>(&episode.content) else {
+                continue;
+            };
+            pares_no_log += security_event_inputs(&event, 9).unwrap().len() as u64;
+        }
+        assert!(pares_no_log > 0, "o log tem de ter `SecurityEvent`s");
+        assert!(
+            observacoes(&referencia) < pares_no_log,
+            "a evidência de regra tem de suprimir pelo menos uma observação: \
+             {} incorporadas de {pares_no_log} pares",
+            observacoes(&referencia)
+        );
+
+        // Janelas pequenas e as fronteiras: 1 (cada episódio é um lote),
+        // divisores e não-divisores do total, e a janela exactamente igual ao
+        // número de episódios do log.
+        for janela in [1usize, 2, 3, 5, 7, head as usize, head as usize + 1] {
+            let obtido = runtime
+                .behavioral_snapshot_com_janela(head, janela)
+                .unwrap()
+                .unwrap();
+            assert!(
+                obtido == referencia,
+                "janela={janela}: o modelo reconstruído tem de ser igual ao da varredura única"
+            );
+        }
+
+        // E o `as_of` continua a limitar o que se vê: um ponto intermédio não
+        // pode devolver tanta observação como o head.
+        let intermedio = runtime
+            .behavioral_snapshot_com_janela(head / 2, 3)
+            .unwrap()
+            .unwrap();
+        assert!(
+            observacoes(&intermedio) < observacoes(&referencia),
+            "o `as_of` intermédio tem de ver menos do que o head"
+        );
+
         runtime.shutdown();
     }
 
