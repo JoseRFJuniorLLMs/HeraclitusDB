@@ -2815,6 +2815,17 @@ impl QueryBackend for Engine {
         // QUERY_SCAN_CAP episódios, para devolver 10).
         let mut lsns: Vec<Lsn> = {
             let idx = self.attr.read().unwrap();
+            // A mesma regra pelo lado do CAMPO (auditoria 2026-09-05, A49):
+            // `apply` só indexa `_agent`, `_kind` e as chaves de `event.attrs`
+            // — nunca campos do ENVELOPE. Mas o pós-filtro do planner serve
+            // `ts_hlc` do envelope, portanto o hint chega aqui e o `lookup`
+            // devolvia vazio por o dicionário nunca ter visto o campo. Um
+            // "não conheço" a fazer-se passar por "não há" faz a query
+            // responder ZERO linhas sobre dados que estão no log. É a guarda
+            // que o LogBackend de referência já tinha.
+            if !idx.conhece_campo(field) {
+                return Ok(None);
+            }
             idx.lookup(field, value).to_vec()
         };
         if let Some(bound) = as_of {
@@ -2881,6 +2892,15 @@ impl QueryBackend for Engine {
         }
         let mut lsns: Vec<Lsn> = {
             let idx = self.attr.read().unwrap();
+            // Auditoria 2026-09-05, A48 — a irmã da guarda do `attr_lookup`,
+            // pelo lado do intervalo. `lookup_range` também devolve vazio
+            // quando o dicionário não conhece o campo, e um `ts_hlc > x` (que
+            // nem cai no guard dos SKIP_VALUES `0`/`-1`) saía daqui como
+            // `Some(vazio)` autoritativo: zero linhas para o predicado mais
+            // natural que existe num banco de eventos, uma janela temporal.
+            if !idx.conhece_campo(field) {
+                return Ok(None);
+            }
             idx.lookup_range(field, to_bound(min), to_bound(max))
         };
         if let Some(bound) = as_of {
@@ -4046,6 +4066,38 @@ mod tests {
         assert_eq!(live.edges.len(), 2);
     }
 
+    /// GATE DIFERENCIAL sobre campos do ENVELOPE (auditoria 2026-09-05,
+    /// A48/A49). `ts_hlc` e servido do envelope pelo pos-filtro mas nunca entra
+    /// no indice de atributos; o Engine respondia `Some(vazio)` e a query dava
+    /// zero linhas, enquanto o backend de referencia (replay do log) devolvia
+    /// tudo. Os dois backends TEM de concordar sobre os MESMOS dados — e a
+    /// unica forma de apanhar esta classe de divergencia sem a inventar linha a
+    /// linha.
+    #[test]
+    fn ts_hlc_via_gql_bate_com_a_referencia() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path());
+        for i in 0..3 {
+            let mut e = Episode::new("ag", EventKind::Observation, format!("ep {i}").into_bytes());
+            e.attrs.insert("valor".into(), (i * 10 + 7).to_string());
+            engine.append(e).unwrap();
+        }
+        let ts = engine.log.read(0).unwrap().unwrap().1.ts_hlc;
+        let be = LogBackend::new(engine.log.clone());
+
+        for q in [
+            "MATCH (n) WHERE n.ts_hlc > 1 RETURN n".to_string(),
+            format!("MATCH (n) WHERE n.ts_hlc = \"{ts}\" RETURN n"),
+            // Controlo: um atributo a serio, que o indice conhece — nao pode
+            // regredir por causa da guarda nova.
+            "MATCH (n) WHERE n.valor > 5 RETURN n".to_string(),
+        ] {
+            let via_engine = heraclitus_query::execute(&q, &engine).unwrap();
+            let via_log = heraclitus_query::execute(&q, &be).unwrap();
+            assert_eq!(via_engine, via_log, "engine diverge da referencia em `{q}`");
+        }
+    }
+
     #[test]
     fn m10_fuse_runs_on_the_real_engine() {
         // FUSE is a default QueryBackend method, so the engine inherits it and
@@ -4622,6 +4674,113 @@ mod tests {
             r.as_array().unwrap().len(),
             2,
             "o intervalo abrange 0 (ignorado) e 5: {r:?}"
+        );
+    }
+
+    /// A MESMA classe de falha, pelo lado do CAMPO e nao do valor (auditoria
+    /// 2026-09-05, A48/A49). `AttrIndex::apply` so indexa `_agent`, `_kind` e
+    /// as chaves de `event.attrs` — nunca campos do ENVELOPE. Mas o pos-filtro
+    /// do planner serve `ts_hlc` do envelope, logo o hint gera-se e o Engine
+    /// respondia `Some(vazio)` (por `lookup`/`lookup_range` de um campo que o
+    /// dicionario nunca viu). O planner toma esse vazio como autoritativo e a
+    /// query devolve ZERO linhas sobre dados que estao no log — enquanto o
+    /// mesmo GQL sobre o backend de referencia devolve as linhas todas.
+    #[test]
+    fn procura_por_campo_do_envelope_nao_devolve_vazio() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            ..Default::default()
+        };
+        let engine = Engine::open(&cfg).unwrap();
+
+        let mut e = Episode::new("ana", EventKind::Observation, b"registo".to_vec());
+        e.attrs.insert("cpf".into(), "12345678900".into());
+        engine.append(e).unwrap();
+        let ts = engine.log.read(0).unwrap().unwrap().1.ts_hlc;
+        assert!(ts > 1, "premissa: o HLC de um episodio real e > 1");
+
+        // Igualdade sobre um campo do envelope (A49).
+        let r = heraclitus_query::execute(
+            &format!("MATCH (n) WHERE n.ts_hlc = \"{ts}\" RETURN n"),
+            &engine,
+        )
+        .unwrap();
+        assert_eq!(
+            r.as_array().unwrap().len(),
+            1,
+            "o episodio tem esse ts_hlc e tem de aparecer: {r:?}"
+        );
+
+        // Intervalo sobre o mesmo campo (A48) — fora do guard dos SKIP_VALUES
+        // (`0`/`-1`), portanto ia mesmo ao indice ordenado.
+        let r2 =
+            heraclitus_query::execute("MATCH (n) WHERE n.ts_hlc > 1 RETURN n", &engine).unwrap();
+        assert_eq!(
+            r2.as_array().unwrap().len(),
+            1,
+            "todo o episodio tem ts_hlc > 1: {r2:?}"
+        );
+
+        // NAO-REGRESSAO: o indice nao ficou desligado para os campos que ele
+        // conhece de verdade, e um valor genuinamente inexistente continua a
+        // dar zero.
+        let r3 =
+            heraclitus_query::execute("MATCH (n) WHERE n.cpf = \"12345678900\" RETURN n", &engine)
+                .unwrap();
+        assert_eq!(r3.as_array().unwrap().len(), 1, "{r3:?}");
+        let r4 =
+            heraclitus_query::execute("MATCH (n) WHERE n.cpf = \"00000000000\" RETURN n", &engine)
+                .unwrap();
+        assert_eq!(r4.as_array().unwrap().len(), 0, "{r4:?}");
+    }
+
+    /// A guarda ao nivel do backend, sem passar pelo planner: um campo que o
+    /// indice nunca viu tem de dar `None` ("nao sei responder; varre"), nunca
+    /// `Some(vazio)` ("nao ha nada"), que e o que o LogBackend de referencia ja
+    /// fazia (auditoria 2026-09-05, A48/A49).
+    #[test]
+    fn indice_que_nao_conhece_o_campo_recua_para_o_varrimento() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            ..Default::default()
+        };
+        let engine = Engine::open(&cfg).unwrap();
+        let mut e = Episode::new("ana", EventKind::Observation, b"registo".to_vec());
+        e.attrs.insert("cor".into(), "azul".into());
+        engine.append(e).unwrap();
+
+        assert!(
+            matches!(
+                QueryBackend::attr_lookup(&engine, "campo_fora_do_indice", "x", None),
+                Ok(None)
+            ),
+            "campo desconhecido: o indice nao pode responder"
+        );
+        assert!(
+            matches!(
+                QueryBackend::attr_range_lookup(
+                    &engine,
+                    "campo_fora_do_indice",
+                    Some((1.0, false)),
+                    None,
+                    None
+                ),
+                Ok(None)
+            ),
+            "campo desconhecido, pelo lado do range"
+        );
+        // Campo CONHECIDO sem correspondencias continua a ser vazio
+        // autoritativo — nao se trocou uma mentira por um varrimento sempre.
+        assert!(
+            matches!(
+                QueryBackend::attr_lookup(&engine, "cor", "vermelho", None),
+                Ok(Some(ref v)) if v.is_empty()
+            ),
+            "campo conhecido sem matches: o vazio E a resposta certa"
         );
     }
 }

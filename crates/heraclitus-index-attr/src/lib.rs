@@ -649,6 +649,20 @@ impl AttrIndex {
         }
     }
 
+    /// Este índice alguma vez viu este campo? O(1) — só o dicionário.
+    ///
+    /// Existe para quem consulta poder distinguir "não há correspondências" de
+    /// "este índice NÃO SABE responder a isto". `lookup`/`lookup_range`
+    /// devolvem vazio nos dois casos, e um chamador que trate esse vazio como
+    /// autoritativo responde ZERO linhas sobre dados que existem — foi o que
+    /// aconteceu com os campos do envelope (`ts_hlc`), que o pós-filtro do
+    /// planner serve mas que o `apply` daqui nunca indexa (auditoria
+    /// 2026-09-05, A48/A49). O `field_entries` faz a mesma distinção mas é
+    /// O(#chaves do índice): não serve para o caminho quente de uma query.
+    pub fn conhece_campo(&self, field: &str) -> bool {
+        self.inner.dictionary.fields.id(field).is_some()
+    }
+
     /// LSNs (ordenados) dos eventos cujo `field == value`. Vazio se nada bate.
     pub fn lookup(&self, field: &str, value: &str) -> &[Lsn] {
         self.inner
