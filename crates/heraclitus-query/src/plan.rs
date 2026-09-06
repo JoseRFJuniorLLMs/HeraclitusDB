@@ -750,13 +750,22 @@ fn cmp_order(a: &Json, b: &Json) -> std::cmp::Ordering {
 /// Um `OR` desqualifica o pushdown (correção R1): a igualdade pode valer só
 /// num ramo — empurrá-la restringiria o match antes do pós-filtro e perderia
 /// linhas dos outros ramos. O `edge_matches` revalida tudo na mesma.
+///
+/// Auditoria 2026-09-05: essa premissa — «o pós-filtro revalida» — só vale
+/// enquanto o pushdown for um SUPERCONJUNTO. A forma NUA de uma variável
+/// (`r`, sem `.campo`) resolve, no `eval_edge_operand`, para o id do nó
+/// (`a`/`b`) ou para o `edge_id` (`r`) — nunca para o tipo da aresta.
+/// Aceitá-la para o slot `"type"` empurrava um `edge_id` como se fosse uma
+/// chave de tipo: conjunto DISJUNTO, `match_edges` vazio, e o pós-filtro
+/// nunca chegava a ver a linha que teria aceite. Daí o ramo nu valer só para
+/// o slot `"id"`, o único em que é semanticamente equivalente.
 fn eq_filter(conditions: &[(BoolOp, Condition)], var: &str, field: &str) -> Option<String> {
     if conditions.iter().any(|(op, _)| matches!(op, BoolOp::Or)) {
         return None;
     }
     fn var_lit(a: &Operand, b: &Operand, var: &str, field: &str) -> Option<String> {
         let is_var = match a {
-            Operand::Ident(v) => v == var,
+            Operand::Ident(v) => v == var && field == "id",
             Operand::Prop(v, f) => v == var && f == field,
             _ => false,
         };
