@@ -490,6 +490,13 @@ impl RegulatoryState {
     /// É isto que torna o estado cacheável: como o log é append-only, um
     /// estado válido "até L" mais a dobra de `[L, head)` é, por construção, o
     /// estado em `head`. Não há invalidação — só extensão para a frente.
+    ///
+    /// **Não é atómica** (Auditoria 2026-09-05, A22): o varrimento é janelado e
+    /// cada episódio é aplicado de imediato, portanto um `Err` deixa o `self`
+    /// com o prefixo `[desde, X)` já dobrado, para um `X` desconhecido. Quem a
+    /// corre sobre estado PARTILHADO tem de a correr sobre uma cópia própria e
+    /// só publicar o resultado em caso de `Ok` — caso contrário a dobra
+    /// seguinte repete o prefixo e duplica registos.
     pub fn apply_range<L: EpisodeLog + ?Sized>(
         &mut self,
         log: &L,
@@ -665,28 +672,53 @@ impl RegulatoryPolicyEngine {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match guard.as_mut() {
+        // Auditoria 2026-09-05, A22: a entrada SAI da cache antes de se dobrar,
+        // e só volta se a dobra chegar ao fim. `apply_range` não é atómico —
+        // aplica episódio a episódio e não sabe desaplicar — portanto um erro a
+        // meio (um `scan_capped` que falha, um episódio de compliance
+        // malformado) deixa a cauda meio dobrada. Se essa mutação caísse dentro
+        // da cache, o marcador `até` ficava por avançar e a chamada seguinte
+        // redobrava exactamente as mesmas linhas: activações e decisões
+        // duplicadas, servidas depois com SUCESSO a um auditor. Em erro o guard
+        // fica vazio e a chamada seguinte faz um replay limpo — perde-se o
+        // calor da cache, nunca a correcção.
+        let entrada = guard.take();
+        match entrada {
             // Caminho quente: só a cauda desde a última dobra. Num sistema em
             // regime, isto são as poucas linhas escritas desde o pedido
             // anterior — não o log inteiro.
-            Some((ate, estado)) if *ate <= end => {
-                estado.apply_range(log, *ate, end)?;
-                *ate = end;
+            Some((ate, mut estado)) if ate <= end => {
+                estado.apply_range(log, ate, end)?;
                 let mut resposta = estado.clone();
                 resposta.finalizar();
+                *guard = Some((end, estado));
                 Ok(resposta)
             }
             // Consulta HISTÓRICA, abaixo da marca de água: não há como
             // desaplicar, faz-se do zero e a cache NÃO recua. Ou cache vazia.
-            _ => {
-                let fresco = RegulatoryState::replay(log, as_of_lsn)?;
-                let pode_semear = guard.as_ref().is_none_or(|(ate, _)| end >= *ate);
+            outra => {
+                let fresco = match RegulatoryState::replay(log, as_of_lsn) {
+                    Ok(fresco) => fresco,
+                    // A entrada que estava lá continua válida — o replay falhou
+                    // sem lhe tocar. Repõe-se, senão um erro numa consulta
+                    // histórica apagava a cache que existe para evitar o
+                    // replay completo a cada pedido.
+                    Err(erro) => {
+                        *guard = outra;
+                        return Err(erro);
+                    }
+                };
+                let pode_semear = outra.as_ref().is_none_or(|(ate, _)| end >= *ate);
                 if pode_semear {
                     let mut semente = fresco.clone();
                     // O clone é semeado por ordem de LSN; `finalizar` corre no
                     // clone devolvido, e a semente fica pronta a estender.
                     semente.finalizar();
                     *guard = Some((end, semente));
+                } else {
+                    // Marca de água mais à frente do que este pedido: repõe-se
+                    // a entrada intacta, a cache não recua.
+                    *guard = outra;
                 }
                 Ok(fresco)
             }
@@ -950,6 +982,123 @@ mod tests {
         assert_eq!(
             depois, com_segunda,
             "a consulta historica fez a cache recuar"
+        );
+    }
+
+    /// Uma dobra que falha a MEIO não pode deixar a cache meio-aplicada.
+    ///
+    /// `apply_range` avança episódio a episódio e não sabe desaplicar: se
+    /// rebentar no episódio N, os N-1 anteriores já foram dobrados. Quando a
+    /// dobra corre sobre o estado que vive DENTRO da cache, o marcador `até`
+    /// fica por avançar e a chamada seguinte redobra exactamente essas linhas —
+    /// activações e decisões duplicadas, devolvidas depois com SUCESSO a um
+    /// auditor, sem nada que assinale a divergência.
+    ///
+    /// Auditoria 2026-09-05, A22.
+    #[test]
+    fn a_dobra_falhada_nao_deixa_a_cache_meio_aplicada() {
+        let (_temp, log) = open_v6();
+        let cache = Arc::new(RegulatoryStateCache::default());
+        let motor =
+            |log: &Arc<AnyLog>| RegulatoryPolicyEngine::new(log.clone()).with_cache(cache.clone());
+
+        // 1. Duas activações. `activate_policy` chama `state()` ANTES de
+        //    appendar, portanto a cache fica semeada até ao LSN da segunda —
+        //    ou seja, com a segunda activação ainda POR dobrar.
+        let primeira = PolicyActivation {
+            policy: policy(31_536_000),
+            activated_by: "compliance-officer".into(),
+            approval_ref: "approval-2026-001".into(),
+        };
+        motor(&log).activate_policy(primeira).unwrap();
+        let regras = policy(60).rules.clone();
+        let segunda = PolicyActivation {
+            policy: ConfiguredRegulatoryPolicy::new("gov-br-retention", "2026.2", 200, regras)
+                .unwrap(),
+            activated_by: "compliance-officer".into(),
+            approval_ref: "approval-2026-002".into(),
+        };
+        motor(&log).activate_policy(segunda).unwrap();
+
+        // 2. Um episódio de compliance com conteúdo malformado: passa o filtro
+        //    do `compliance.generated` e rebenta no `serde_json::from_slice`.
+        //    É o veneno determinista que arma a falha a meio da dobra.
+        let mut envenenado = Episode::new(
+            "gov-compliance",
+            EventKind::Custom(POLICY_EVENT.to_owned()),
+            b"{".to_vec(),
+        );
+        envenenado
+            .attrs
+            .insert("compliance.generated".into(), "true".into());
+        let lsn_mau = log.append(envenenado).unwrap();
+
+        // 3. A dobra até à cauda falha — mas só DEPOIS de aplicar a segunda
+        //    activação. É aqui que a cache fica suja.
+        assert!(
+            motor(&log).state().is_err(),
+            "o episodio malformado tinha de fazer a dobra falhar"
+        );
+
+        // 4. Consulta ABAIXO do episódio venenoso: volta a satisfazer a guarda
+        //    do caminho quente e devolve com sucesso. Tem de coincidir com o
+        //    replay completo — nem mais um registo do que está no log.
+        let obtido = motor(&log).state_as_of(lsn_mau - 1).unwrap();
+        assert_eq!(
+            obtido.policy_activations.len(),
+            2,
+            "a cache devolveu activacoes duplicadas depois de uma dobra falhada"
+        );
+        assert_eq!(
+            obtido,
+            RegulatoryState::replay(log.as_ref(), lsn_mau - 1).unwrap(),
+            "a cache divergiu do replay completo depois de uma dobra falhada"
+        );
+    }
+
+    /// Uma consulta HISTÓRICA não pode apagar a cache.
+    ///
+    /// A entrada sai da cache antes de se dobrar (ver `state_as_of`), portanto
+    /// todo o caminho que não a repõe deita-a fora. No ramo histórico isso é
+    /// invisível para quem compara valores — um replay do zero devolve o mesmo
+    /// estado — mas o pedido seguinte volta a varrer o log inteiro, que é
+    /// exactamente o custo que esta cache existe para evitar e um vector de
+    /// amplificação trivial de armar (basta pedir AS OF antigos em sequência).
+    /// Só a marca de água o denuncia; é ela que se observa aqui.
+    ///
+    /// Auditoria 2026-09-05, A22.
+    #[test]
+    fn uma_consulta_historica_nao_apaga_a_cache() {
+        let (_temp, log) = open_v6();
+        let cache = Arc::new(RegulatoryStateCache::default());
+        let motor =
+            |log: &Arc<AnyLog>| RegulatoryPolicyEngine::new(log.clone()).with_cache(cache.clone());
+        let marca = || cache.inner.lock().unwrap().as_ref().map(|(ate, _)| *ate);
+
+        let primeira = PolicyActivation {
+            policy: policy(31_536_000),
+            activated_by: "compliance-officer".into(),
+            approval_ref: "approval-2026-001".into(),
+        };
+        let lsn_primeira = motor(&log).activate_policy(primeira).unwrap();
+        // Ruído para afastar a cauda do LSN da activação: sem isto a consulta
+        // histórica cairia no caminho quente e não exercitava o ramo em causa.
+        for i in 0..25u8 {
+            log.append(Episode::new("app", EventKind::Observation, vec![i]))
+                .unwrap();
+        }
+        motor(&log).state().unwrap();
+        let antes = marca().expect("a cache tinha de ficar semeada");
+
+        let historico = motor(&log).state_as_of(lsn_primeira).unwrap();
+        assert_eq!(
+            historico,
+            RegulatoryState::replay(log.as_ref(), lsn_primeira).unwrap()
+        );
+        assert_eq!(
+            marca(),
+            Some(antes),
+            "a consulta historica apagou (ou recuou) a marca de agua da cache"
         );
     }
 
