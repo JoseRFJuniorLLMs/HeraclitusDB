@@ -683,6 +683,84 @@ mod tests {
         assert!(s.contains("GraphMatch"), "{s}");
     }
 
+    /// Auditoria 2026-09-05 (§6 item 4): o planner parseava o ORDER BY de um
+    /// padrão de relação e DESCARTAVA-O, mas aplicava o LIMIT — `ORDER BY
+    /// r.belief DESC LIMIT 10` devolvia as 10 primeiras na ordem do BTreeMap
+    /// (lexicográfica do edge id), sem erro. O padrão de nó ordenava; o de
+    /// relação não, e o utilizador não tinha como suspeitar da assimetria.
+    #[test]
+    fn edge_match_ordena_antes_do_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        let mk = |to: &str, confidence: &str| {
+            let mut e = Episode::new("ag", EventKind::Observation, vec![]);
+            e.attrs.insert("edge_from".into(), "Alfa".into());
+            e.attrs.insert("edge_to".into(), to.into());
+            e.attrs.insert("edge_type".into(), "socio_de".into());
+            e.attrs.insert("confidence".into(), confidence.into());
+            e
+        };
+        // A ordem lexicográfica dos edge ids (Beto < Maria < Zeta) é
+        // DELIBERADAMENTE diferente da ordem por belief (Zeta < Maria < Beto):
+        // sem ordenação, o LIMIT devolve as primeiras do mapa.
+        log.append(mk("Zeta", "0.2")).unwrap();
+        log.append(mk("Beto", "0.9")).unwrap();
+        log.append(mk("Maria", "0.5")).unwrap();
+        let be = LogBackend::new(log);
+
+        let ids = |q: &str| -> Vec<String> {
+            execute(q, &be)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["b.id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // DESC + LIMIT 2: as DUAS de maior belief — não as duas primeiras do mapa.
+        assert_eq!(
+            ids("MATCH (a)-[r:socio_de]->(b) RETURN b.id, r.belief ORDER BY r.belief DESC LIMIT 2"),
+            vec!["Beto", "Maria"]
+        );
+        assert_eq!(
+            ids("MATCH (a)-[r:socio_de]->(b) RETURN b.id ORDER BY r.belief ASC"),
+            vec!["Zeta", "Maria", "Beto"]
+        );
+        // Por string: lexicográfica, nos dois sentidos.
+        assert_eq!(
+            ids("MATCH (a)-[r]->(b) RETURN b.id ORDER BY r.id DESC LIMIT 1"),
+            vec!["Zeta"]
+        );
+        assert_eq!(
+            ids("MATCH (a)-[r]->(b) RETURN b.id ORDER BY r.to ASC"),
+            vec!["Beto", "Maria", "Zeta"]
+        );
+        // Os beliefs projectados vêm mesmo por ordem decrescente.
+        let v = execute(
+            "MATCH (a)-[r]->(b) RETURN r.belief ORDER BY r.belief DESC",
+            &be,
+        )
+        .unwrap();
+        let beliefs: Vec<f64> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["r.belief"].as_f64().unwrap())
+            .collect();
+        assert!(beliefs.windows(2).all(|w| w[0] >= w[1]), "{beliefs:?}");
+        // Campo que uma aresta não tem, e DIST: ERRO explícito, nunca descarte.
+        assert!(execute("MATCH (a)-[r]->(b) RETURN * ORDER BY r.peso", &be).is_err());
+        assert!(execute(
+            "MATCH (a)-[r]->(b) RETURN * ORDER BY DIST_HYP([0.1]) ASC",
+            &be
+        )
+        .is_err());
+        // E o EXPLAIN mostra-o.
+        let s =
+            explain("MATCH (a)-[r:socio_de]->(b) RETURN * ORDER BY r.belief DESC LIMIT 2").unwrap();
+        assert!(s.contains("OrderBy(r.belief, asc=false)"), "{s}");
+    }
+
     /// Builds a tiny fraud-style dataset anchored on event A. Four candidates,
     /// each child of A, are designed so that each single channel is topped by a
     /// *different* candidate, while the consensus candidate X (strong on all

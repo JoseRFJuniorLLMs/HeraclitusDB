@@ -43,6 +43,7 @@ pub enum Plan {
         conditions: Vec<(BoolOp, Condition)>,
         valid_at: Option<u64>,
         as_of: Option<AsOf>,
+        order_by: Option<(OrderKey, bool)>,
         returns: Vec<RetItem>,
         limit: Option<u32>,
     },
@@ -134,6 +135,10 @@ pub fn plan(stmt: &Stmt) -> Plan {
                 conditions: m.conditions.clone(),
                 valid_at: m.valid_at,
                 as_of: m.as_of,
+                // Auditoria 2026-09-05: o ORDER BY era parseado e DESCARTADO
+                // aqui, mas o LIMIT continuava a aplicar-se — a query devolvia
+                // as N linhas erradas, sem erro. Agora segue para o executor.
+                order_by: m.order_by.clone(),
                 returns: m.returns.clone(),
                 limit: m.limit,
             }
@@ -310,6 +315,7 @@ pub fn render(plan: &Plan) -> String {
             conditions,
             valid_at,
             as_of,
+            order_by,
             limit,
             ..
         } => {
@@ -328,6 +334,14 @@ pub fn render(plan: &Plan) -> String {
             }
             if let Some(a) = as_of {
                 s += &format!("  AsOf({a:?})\n");
+            }
+            if let Some((key, asc)) = order_by {
+                match key {
+                    OrderKey::Field(f) => s += &format!("  OrderBy({rel_var}.{f}, asc={asc})\n"),
+                    OrderKey::Dist(kind, v) => {
+                        s += &format!("  OrderBy(DIST_{kind:?}[{} dims], asc={asc})\n", v.len())
+                    }
+                }
             }
             if let Some(l) = limit {
                 s += &format!("  Limit({l})\n");
@@ -645,6 +659,29 @@ fn eval_edge_operand(
                 None
             }
         }
+    }
+}
+
+/// Campos de aresta que o ORDER BY de um padrão de relação aceita. O parser
+/// perde o prefixo da variável (`r.belief` → `belief`), por isso a chave
+/// resolve sempre contra a ARESTA: `id` é o edge id (não `b.id`).
+fn edge_order_field(field: &str) -> Result<(), HeraclitusError> {
+    match field {
+        "id" | "type" | "etype" | "belief" | "from" | "to" => Ok(()),
+        outro => Err(HeraclitusError::Query(format!(
+            "ORDER BY {outro}: um padrão de relação só ordena por id, type, belief, from ou to"
+        ))),
+    }
+}
+
+fn edge_order_value(r: &EdgeRow, field: &str) -> Json {
+    match field {
+        "id" => json!(r.edge_id),
+        "type" | "etype" => json!(r.etype),
+        "belief" => json!(r.belief),
+        "from" => json!(r.from),
+        "to" => json!(r.to),
+        _ => Json::Null,
     }
 }
 
@@ -1150,6 +1187,7 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
             conditions,
             valid_at,
             as_of,
+            order_by,
             returns,
             limit,
         } => {
@@ -1163,7 +1201,7 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                 .clone()
                 .or_else(|| eq_filter(conditions, rel_var, "type"));
             let rows = be.match_edges(src.as_deref(), etype.as_deref(), dst.as_deref(), bound)?;
-            let mut out: Vec<Json> = rows
+            let mut kept: Vec<&EdgeRow> = rows
                 .iter()
                 // Bi-temporal em ARESTAS (V2.4): VALID AT filtra pelo valid
                 // time do mundo herdado do episódio que assertou a aresta.
@@ -1177,12 +1215,46 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                 // WHERE contra a aresta (o pushdown src/dst/etype é só um hint;
                 // antes, condições não-empurráveis eram ignoradas em silêncio).
                 .filter(|r| edge_matches(conditions, r, from_var, to_var, rel_var))
-                .map(|r| project_edge(r, returns, from_var, to_var, rel_var))
                 .collect();
-            if let Some(l) = limit {
-                out.truncate(*l as usize);
+            // Auditoria 2026-09-05: ORDER BY ANTES do LIMIT — com 5 000 arestas
+            // e `ORDER BY r.belief DESC LIMIT 10`, o planner devolvia as 10
+            // primeiras na ordem do BTreeMap (lexicográfica do edge id) como se
+            // fossem as de maior belief. O padrão de nó ordenava; o de relação
+            // não — e o utilizador não tinha como suspeitar da assimetria.
+            if let Some((key, asc)) = order_by {
+                match key {
+                    OrderKey::Field(field) => {
+                        // Validar o campo UMA vez antes de ordenar: um campo que
+                        // não existe numa aresta é erro do utilizador, não `Null`
+                        // a ir para o fim em silêncio (o conjunto é fechado).
+                        edge_order_field(field)?;
+                        kept.sort_by(|a, b| {
+                            let ord =
+                                cmp_order(&edge_order_value(a, field), &edge_order_value(b, field));
+                            if *asc {
+                                ord
+                            } else {
+                                ord.reverse()
+                            }
+                        });
+                    }
+                    OrderKey::Dist(..) => {
+                        return Err(HeraclitusError::Query(
+                            "ORDER BY DIST não é suportado num padrão de relação: \
+                             uma aresta não tem embedding"
+                                .into(),
+                        ));
+                    }
+                }
             }
-            Ok(Json::Array(out))
+            if let Some(l) = limit {
+                kept.truncate(*l as usize);
+            }
+            Ok(Json::Array(
+                kept.iter()
+                    .map(|r| project_edge(r, returns, from_var, to_var, rel_var))
+                    .collect(),
+            ))
         }
         Plan::Neighbors { node, etype, as_of } => {
             let bound = resolve_as_of(as_of, be)?;
