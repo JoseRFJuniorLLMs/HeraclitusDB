@@ -186,6 +186,11 @@ pub struct TreeMetrics {
     pub bloom_hits: AtomicUsize,
     pub bloom_misses: AtomicUsize,
     pub versions_pruned: AtomicUsize,
+    /// Fusões efectivas de um filho no irmão esquerdo (`merge_or_borrow_cascade`).
+    /// Existe para que o teste de shadow paging da Auditoria 2026-09-05 (A24)
+    /// possa provar que o caminho do merge foi mesmo exercitado — sem isto o
+    /// teste passaria por vacuidade se o orçamento nunca deixasse fundir.
+    pub merges_cascade: AtomicUsize,
 }
 
 pub trait PageStore: Send + Sync {
@@ -2164,12 +2169,32 @@ impl BEpsilonTree {
             left.high_key = child.high_key.clone();
             left.rebuild_bloom_filter();
 
+            // Auditoria 2026-09-05 (A24): R8 vale TAMBÉM para o irmão esquerdo.
+            // `left_id` vem de `parent.children[idx - 1]` e, ao contrário do
+            // filho (já re-identificado por CoW no `partial_flush_cascade`),
+            // pertence normalmente ao último estado DURÁVEL. Escrevê-lo
+            // in-place — o store não tem WAL nem journal de página — publicava
+            // as chaves do filho absorvido numa página que o superbloco durável
+            // ainda aponta: um crash antes da troca do superbloco deixava as
+            // mesmas chaves em dois ramos e um `high_key` incoerente com o
+            // separador do pai durável (e, com um write rasgado, a subárvore
+            // ilegível). Aqui damos-lhe a mesma disciplina de shadow paging do
+            // split: página nova, ponteiro do pai actualizado, id antigo
+            // reciclado (o `recycle_id` adia-o para depois do commit se for
+            // durável).
+            let old_left_id = left.id;
+            left.id = self.allocate_id()?;
+            self.rekey_cache_frame(old_left_id, left.id);
+
             self.store.write_page(left.id, &left.serialize()?)?;
             self.metrics
                 .write_amplification_count
                 .fetch_add(1, Ordering::Relaxed);
+            self.metrics.merges_cascade.fetch_add(1, Ordering::Relaxed);
             parent.keys.remove(idx - 1);
             parent.children.remove(idx);
+            parent.children[idx - 1] = left.id;
+            self.recycle_id(old_left_id)?;
             self.recycle_id(old_child_id)?;
             // O filho foi absorvido: remove o frame morto para que uma futura
             // realocação deste id não sirva o nó obsoleto do cache.
