@@ -488,13 +488,20 @@ impl DiskNode {
         size
     }
 
+    /// Auditoria 2026-09-05 (A42): o prefixo tem de cobrir TAMBÉM as chaves do
+    /// buffer, não só os separadores. `deserialize` reconstrói sempre
+    /// `prefixo ++ sufixo` e o layout v5 não guarda bit nenhum a dizer que o
+    /// corte não foi aplicado; um prefixo que não cobrisse uma chave do buffer
+    /// devolvia-a do disco como `prefixo ++ chave` (com um único separador o
+    /// prefixo era a chave separadora INTEIRA). O prefixo só encurta — as
+    /// páginas comprimem um pouco menos, o formato em disco não muda.
     fn calculate_common_prefix(&self) -> Vec<u8> {
-        if self.keys.is_empty() {
+        let mut candidatas = self.keys.iter().chain(self.buffer.keys());
+        let Some(first) = candidatas.next() else {
             return Vec::new();
-        }
-        let first = &self.keys[0];
+        };
         let mut prefix_len = first.len();
-        for key in self.keys.iter().skip(1) {
+        for key in candidatas {
             let match_len = key
                 .iter()
                 .zip(first.iter())
@@ -692,11 +699,18 @@ impl DiskNode {
                 .copy_from_slice(&(self.buffer.len() as u32).to_le_bytes());
             *slot_pos += 4;
             for (bk, msg_vec) in &self.buffer {
-                let bk_suffix = if bk.starts_with(prefix) {
-                    &bk[prefix.len()..]
-                } else {
-                    bk.as_slice()
-                };
+                // Auditoria 2026-09-05 (A42): gravar a chave INTEIRA quando ela
+                // não começava pelo prefixo era silenciosamente irreversível —
+                // `deserialize` prefixa sempre. Desde que o prefixo cobre também
+                // o buffer (ver `calculate_common_prefix`) o corte é sempre
+                // válido; o erro explícito guarda a invariante em vez de a
+                // presumir, e nunca dispara com um nó construído por esta crate.
+                let bk_suffix = bk.strip_prefix(prefix).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Chave do buffer fora do prefixo comum da página",
+                    )
+                })?;
                 if bk_suffix.len() > *payload_pos || *payload_pos - bk_suffix.len() < *slot_pos {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -2648,6 +2662,45 @@ mod page_roundtrip_tests {
             "mensagens do buffer (prefixo-stripped) preservadas"
         );
         assert_eq!(n2.serialize().unwrap(), buf);
+    }
+
+    /// Auditoria 2026-09-05 (A42): as chaves do BUFFER não têm de partilhar o
+    /// prefixo dos separadores. Com um único separador, o prefixo comum era a
+    /// chave separadora INTEIRA; a chave do buffer era gravada sem corte mas o
+    /// desserializador prefixa sempre — voltava do disco como `prefixo ++ chave`.
+    /// `internal_roundtrip_with_buffer` não apanha isto porque lá as chaves do
+    /// buffer começam pelo prefixo dos separadores.
+    #[test]
+    fn internal_roundtrip_com_chave_de_buffer_fora_do_prefixo() {
+        let mut buffer: BTreeMap<Key, Vec<Msg>> = BTreeMap::new();
+        buffer.insert(b"k0187".to_vec(), vec![Msg::Upsert(b"v".to_vec(), 9)]);
+        let node = DiskNode {
+            id: 3,
+            header: PageHeader {
+                page_type: PageType::Internal as u8,
+                version: VERSION,
+                generation: 1,
+                lsn: 10,
+                slot_count: 1,
+                free_start: 0,
+                payload_end: 0,
+            },
+            low_key: None,
+            high_key: None,
+            slots: Vec::new(),
+            keys: vec![b"k0250".to_vec()], // separador único → prefixo = "k0250"
+            vals: Vec::new(),
+            children: vec![10, 20],
+            buffer,
+            bloom: BloomFilter::default(),
+        };
+        let buf = node.serialize().unwrap();
+        let n2 = DiskNode::deserialize(node.id, &buf).unwrap();
+        assert_eq!(
+            n2.buffer, node.buffer,
+            "chave do buffer fora do prefixo tem de voltar intacta do disco"
+        );
+        assert_eq!(n2.keys, node.keys, "separadores reconstruídos");
     }
 
     // Regressão do bug M30 (corrigido): o CoW re-identificava o nó mas o frame
