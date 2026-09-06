@@ -516,12 +516,22 @@ const BUFFER_PERCURSO: usize = 256 * 1024;
 /// A máquina de estados é a de [`scan_raw_bytes`] e a descodificação é
 /// literalmente [`decode_raw_record`], para não haver duas noções de registo
 /// válido: mesmo CRC, mesmo tratamento de cauda rasgada, mesmo tecto de
-/// `HARD_MAX_RECORD_BYTES`. A diferença deliberada é o que **não** acontece: um
-/// percurso parcial não chega ao footer, portanto não corre
-/// `validate_raw_footer` nem a recusa de bytes depois do footer. Isso é agora
-/// exclusivo de quem tem de o fazer — `verify_sealed`/`verify_active_tail` e o
-/// boot, que confronta o tamanho do ficheiro com o manifesto — exactamente como
-/// o ramo PACKED já vivia.
+/// `HARD_MAX_RECORD_BYTES`. A diferença deliberada é o que **não** acontece:
+/// não corre `validate_raw_footer` nem a recusa de bytes depois do footer. Isso
+/// é agora exclusivo de quem tem de o fazer — `verify_sealed`/
+/// `verify_active_tail` e o boot, que confronta o tamanho do ficheiro com o
+/// manifesto — exactamente como o ramo PACKED já vivia.
+///
+/// Correcção honesta ao que A04/A13 escreveram (revisão de A55): a troca **não**
+/// se limita ao percurso parcial nem às leituras pontuais. Ao ver `FOOTER_MAGIC`
+/// este laço devolve `Ok(pos)` sem olhar para o resto do footer, portanto mesmo
+/// um percurso COMPLETO deixa de recusar um segmento selado cujo footer esteja
+/// completo mas malformado — o `Corruption("complete footer is malformed or
+/// corrupt")` que `scan_raw_bytes` dava ali deixa de acontecer. E, desde A13, o
+/// que perde essa validação incidental são também os dois ramos RAW de
+/// `scan_capped` (selados e cauda), não só o `read` pontual de A04. Nenhuma
+/// linha se perde por isto — o footer vem depois de todos os registos — mas
+/// quem quiser a garantia tem de pedir `verify_sealed`.
 pub fn percorrer_raw_segmento<F>(path: &Path, mut visitar: F) -> V6Result<u64>
 where
     F: FnMut(Lsn, u64, &[u8]) -> V6Result<ControloVarredura>,
