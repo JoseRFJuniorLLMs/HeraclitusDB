@@ -977,7 +977,12 @@ pub async fn serve_with(
                             .to_string()
                     };
                     (
-                        instalar_guarda_de_soberania(cliente, &config, engine.log.clone())?,
+                        instalar_guarda_de_soberania(
+                            cliente,
+                            &config,
+                            engine.log.clone(),
+                            engine.clone(),
+                        )?,
                         estado,
                     )
                 }
@@ -1158,6 +1163,7 @@ fn instalar_guarda_de_soberania(
     cliente: heraclitus_compliance::secure_tsa::SecureTsaClient,
     config: &heraclitus_core::HeraclitusConfig,
     log: std::sync::Arc<heraclitus_log::AnyLog>,
+    sink: std::sync::Arc<dyn heraclitus_compliance::ComplianceSink>,
 ) -> Result<std::sync::Arc<dyn heraclitus_compliance::TsaClient + Send + Sync>, HeraclitusError> {
     use heraclitus_compliance::sovereignty::{
         EgressEndpoint, EgressPurpose, GuardedTsaClient, SovereigntyMode, SovereigntyPolicy,
@@ -1224,8 +1230,11 @@ fn instalar_guarda_de_soberania(
         allow_local_network_models: false,
         allow_external_models: false,
     };
+    // As decisões de egresso/modelo são episódios de compliance: passam pelo
+    // servidor (index_applied), não pelo log cru — o mesmo desenho do RPC admin.
     let runtime = SovereigntyRuntime::new(policy, log)
-        .map_err(|e| HeraclitusError::Config(format!("política de soberania: {e}")))?;
+        .map_err(|e| HeraclitusError::Config(format!("política de soberania: {e}")))?
+        .with_sink(sink);
     let guarded = GuardedTsaClient::new(cliente, runtime, endpoint, "compliance-anchor-worker")
         .map_err(|e| HeraclitusError::Config(format!("guarda de egresso: {e}")))?;
     Ok(std::sync::Arc::new(guarded))

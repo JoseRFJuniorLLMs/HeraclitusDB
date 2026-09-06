@@ -186,13 +186,20 @@ impl EgressPermit {
 #[derive(Clone)]
 pub struct SovereigntyRuntime {
     policy: SovereigntyPolicy,
-    log: Arc<AnyLog>,
+    sink: Arc<dyn crate::ComplianceSink>,
 }
 
 impl SovereigntyRuntime {
     pub fn new(policy: SovereigntyPolicy, log: Arc<AnyLog>) -> Result<Self, SovereigntyError> {
         policy.validate()?;
-        Ok(Self { policy, log })
+        Ok(Self { policy, sink: log })
+    }
+
+    /// Redirige as decisões de egresso/modelo para o servidor (que as indexa
+    /// ao vivo) em vez do log cru. Ver [`crate::ComplianceSink`].
+    pub fn with_sink(mut self, sink: Arc<dyn crate::ComplianceSink>) -> Self {
+        self.sink = sink;
+        self
     }
 
     pub fn policy(&self) -> &SovereigntyPolicy {
@@ -311,8 +318,8 @@ impl SovereigntyRuntime {
             "compliance.egress_verdict".into(),
             format!("{:?}", decision.verdict).to_ascii_lowercase(),
         );
-        self.log
-            .append(episode)
+        self.sink
+            .append_compliance(episode)
             .map_err(|error| SovereigntyError::Audit(error.to_string()))
     }
 
@@ -325,8 +332,8 @@ impl SovereigntyRuntime {
         episode
             .attrs
             .insert("compliance.model_id".into(), decision.model_id.clone());
-        self.log
-            .append(episode)
+        self.sink
+            .append_compliance(episode)
             .map_err(|error| SovereigntyError::Audit(error.to_string()))
     }
 }
