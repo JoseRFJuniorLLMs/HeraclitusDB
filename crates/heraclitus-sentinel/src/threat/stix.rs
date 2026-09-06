@@ -682,6 +682,19 @@ fn parse_rfc3339_millis(value: &str) -> Option<u64> {
         0
     } else {
         let digits: String = frac.chars().take(3).collect();
+        // Auditoria 2026-09-05 (A01): `take(3)` limita CARACTERES mas
+        // `digits.len()` conta BYTES, e o expoente de `pow` é `u32` — uma
+        // fracção com um carácter multi-byte (".ééZ") dava `3 - 4u32`, uma
+        // subtracção que transborda. Com `overflow-checks = true` isso é um
+        // pânico no meio da importação de um feed de terceiros, que atravessa
+        // o `Err` que `ThreatPlane::load` apanha e derruba o arranque.
+        // Exigir dígitos ASCII antes de calcular a escala fecha o buraco na
+        // raiz (`digits.len() <= 3` passa a ser garantido) e ainda recusa o
+        // sinal que o `parse::<i64>` aceitava: ".-12" valia -12 ms e deslocava
+        // o instante para trás em silêncio.
+        if !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
         let scale = 10i64.pow(3 - digits.len() as u32);
         digits.parse::<i64>().ok()? * scale
     };
@@ -996,5 +1009,51 @@ mod tests {
             parse_rfc3339_millis("2024-03-01T00:00:00Z"),
             Some(19_783 * 86_400 * 1_000)
         );
+    }
+
+    #[test]
+    fn fraccao_de_segundo_com_bytes_nao_ascii_devolve_none_sem_panico() {
+        // Auditoria 2026-09-05 (A01): `take(3)` conta CARACTERES e `len()` conta
+        // BYTES. Duas letras acentuadas sao 2 caracteres e 4 bytes, logo o
+        // expoente `3 - digits.len() as u32` era uma subtraccao u32 que
+        // transbordava — panico, e nao `None`, num feed de terceiros.
+        assert_eq!(
+            parse_rfc3339_millis("2026-01-01T00:00:00.\u{e9}\u{e9}Z"),
+            None
+        );
+        assert_eq!(
+            parse_rfc3339_millis("2026-01-01T00:00:00.1\u{e9}\u{e9}Z"),
+            None
+        );
+        // Um sinal nao e um digito de fraccao: `parse::<i64>` aceitava-o e
+        // ".-12" deslocava o instante 12 ms para tras em silencio.
+        assert_eq!(parse_rfc3339_millis("2026-01-01T00:00:00.-12Z"), None);
+        assert_eq!(parse_rfc3339_millis("2026-01-01T00:00:00.+12Z"), None);
+        // As fraccoes legitimas continuam a valer o mesmo.
+        assert_eq!(
+            parse_rfc3339_millis("2026-01-01T00:00:00.250Z"),
+            Some(1_767_225_600_250)
+        );
+        assert_eq!(
+            parse_rfc3339_millis("2026-01-01T00:00:00.2Z"),
+            Some(1_767_225_600_200)
+        );
+    }
+
+    #[test]
+    fn bundle_com_fraccao_multibyte_e_importado_sem_derrubar_o_arranque() {
+        // O caminho real do achado: ThreatPlane::load promete que um feed
+        // malformado vai para `files_failed` e nao impede o arranque, e um
+        // panico atravessa esse `Err`.
+        let raw = bundle(
+            r#"{"type":"indicator","id":"indicator--1","spec_version":"2.1",
+                "pattern":"[domain-name:value = 'a.com']",
+                "valid_from":"2026-01-01T00:00:00.ééZ"}"#,
+        );
+        let (objects, _) = importer()
+            .import_with_report(&raw)
+            .expect("o bundle importa");
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].valid_from, None);
     }
 }
