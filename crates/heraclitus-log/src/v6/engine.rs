@@ -43,8 +43,8 @@ use super::manifest::{
 use super::packed::{open_packed, PackOptions, ScanCounters};
 use super::packer::{pack_segment, PackOutcome};
 use super::raw::{
-    find_raw_record, read_footer, repair_active_tail, scan_raw_segment, RawSegmentWriter,
-    SegmentInit,
+    find_raw_record, percorrer_raw_segmento, read_footer, repair_active_tail, scan_raw_segment,
+    ControloVarredura, RawSegmentWriter, SegmentInit,
 };
 use super::receipts::{persist_pack_receipt, physical_digest_of_file};
 use super::verify::{verify_segment as verify_segment_file, IntegrityLevel, VerifyReport};
@@ -877,6 +877,24 @@ impl V6Log {
         to: Lsn,
         max: usize,
     ) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
+        self.varrer_com_contadores(from, to, max)
+            .map(|(linhas, _)| linhas)
+    }
+
+    /// Como [`Self::scan_capped`], mas devolve também os contadores de I/O da
+    /// varredura.
+    ///
+    /// Auditoria 2026-09-05, A13: o ramo RAW não alimentava o `ScanCounters`
+    /// que o ramo PACKED já usava, e por isso o desperdício de I/O da janela
+    /// era invisível — não havia como escrever um teste que o observasse. Com
+    /// os bytes percorridos contados dos dois lados, "esta varredura leu o
+    /// segmento inteiro" passa a ser uma afirmação verificável.
+    fn varrer_com_contadores(
+        &self,
+        from: Lsn,
+        to: Lsn,
+        max: usize,
+    ) -> Result<(Vec<(Lsn, Episode)>, ScanCounters), HeraclitusError> {
         // Auditoria 2026-09-05, A55: com um instantâneo único, a corrida que
         // sobra é a inversa — o ficheiro da cauda pode ter sido RENOMEADO por
         // um `seal` antes de chegarmos ao I/O. Isso não é erro nem buraco: é o
@@ -905,15 +923,15 @@ impl V6Log {
         from: Lsn,
         to: Lsn,
         max: usize,
-    ) -> Result<Vec<(Lsn, Episode)>, TentativaFalhou> {
+    ) -> Result<(Vec<(Lsn, Episode)>, ScanCounters), TentativaFalhou> {
         if max == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), ScanCounters::default()));
         }
         let instantaneo = self.instantaneo_varredura(from, to, "hrkl v6 scan_capped")?;
         disparar_gancho_pos_instantaneo();
         let end = to.min(instantaneo.head);
         if from >= end {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), ScanCounters::default()));
         }
         let mut out = Vec::with_capacity(max.min(1024));
         let mut counters = ScanCounters::default();
@@ -928,24 +946,35 @@ impl V6Log {
 
             match desc.layout {
                 PhysicalLayout::Raw => {
-                    let scan = scan_raw_segment(path)?;
-                    for r in scan.records {
-                        if r.lsn >= seg_from && r.lsn < seg_to {
-                            let mut episode = crate::decode_episode_payload_with_meta(
-                                crate::format::FORMAT_VERSION,
-                                &r.payload,
-                            )?
-                            .episode;
-                            crate::decrypt_storage_episode_in_place(
-                                &mut episode,
-                                self.keystore.as_deref(),
-                            )?;
-                            out.push((r.lsn, episode));
-                            if out.len() >= max {
-                                break;
-                            }
+                    // Auditoria 2026-09-05, A13: era `scan_raw_segment` — o
+                    // ficheiro TODO em memória e um `Vec<u8>` por registo —
+                    // seguido de um filtro que deitava fora o que estava fora
+                    // da janela. Com streaming só se copia o que entra no
+                    // resultado, e o ficheiro deixa de ser lido além da janela.
+                    // Continua a percorrer-se além de `seg_to` (só `max` pára o
+                    // percurso) porque o `RawSegmentWriter` admite segmentos
+                    // esparsos e a filtragem anterior era independente da ordem.
+                    let percorrido = percorrer_raw_segmento(path, |lsn, _hlc, payload| {
+                        if lsn < seg_from || lsn >= seg_to {
+                            return Ok(ControloVarredura::Continuar);
                         }
-                    }
+                        let mut episode = crate::decode_episode_payload_with_meta(
+                            crate::format::FORMAT_VERSION,
+                            payload,
+                        )?
+                        .episode;
+                        crate::decrypt_storage_episode_in_place(
+                            &mut episode,
+                            self.keystore.as_deref(),
+                        )?;
+                        out.push((lsn, episode));
+                        Ok(if out.len() >= max {
+                            ControloVarredura::Parar
+                        } else {
+                            ControloVarredura::Continuar
+                        })
+                    })?;
+                    counters.bytes_physical_read += percorrido;
                 }
                 PhysicalLayout::Packed => {
                     let reader = open_packed(path, HARD_MAX_BLOCK_BYTES)?;
@@ -988,8 +1017,35 @@ impl V6Log {
                 let (path, active_first_lsn) = (path.as_path(), *active_first_lsn);
                 if end > active_first_lsn {
                     let seg_from = from.max(active_first_lsn);
-                    let scan = match scan_raw_segment(path) {
-                        Ok(scan) => scan,
+                    // Auditoria 2026-09-05, A13: a cauda activa é o segmento
+                    // mais varrido de todos (é sempre RAW e é onde o replay
+                    // acaba sempre por bater) e era relida por inteiro a cada
+                    // janela. Mesmo percurso em streaming dos selados.
+                    let percorrido = match percorrer_raw_segmento(path, |lsn, _hlc, payload| {
+                        if lsn < seg_from || lsn >= end {
+                            return Ok(ControloVarredura::Continuar);
+                        }
+                        // Evitar duplicados caso já tenha sido incluído por um candidato selado
+                        if out.last().map(|(l, _)| *l >= lsn).unwrap_or(false) {
+                            return Ok(ControloVarredura::Continuar);
+                        }
+                        let mut episode = crate::decode_episode_payload_with_meta(
+                            crate::format::FORMAT_VERSION,
+                            payload,
+                        )?
+                        .episode;
+                        crate::decrypt_storage_episode_in_place(
+                            &mut episode,
+                            self.keystore.as_deref(),
+                        )?;
+                        out.push((lsn, episode));
+                        Ok(if out.len() >= max {
+                            ControloVarredura::Parar
+                        } else {
+                            ControloVarredura::Continuar
+                        })
+                    }) {
+                        Ok(percorrido) => percorrido,
                         // O ficheiro deixou de existir: alguém selou a cauda
                         // depois do instantâneo. Repetir com estado fresco — o
                         // segmento está agora no catálogo, e é lá que os
@@ -997,32 +1053,12 @@ impl V6Log {
                         Err(_) if !path.exists() => return Err(TentativaFalhou::Rolou),
                         Err(e) => return Err(TentativaFalhou::Erro(e)),
                     };
-                    for r in scan.records {
-                        if r.lsn >= seg_from && r.lsn < end {
-                            // Evitar duplicados caso já tenha sido incluído por um candidato selado
-                            if out.last().map(|(l, _)| *l >= r.lsn).unwrap_or(false) {
-                                continue;
-                            }
-                            let mut episode = crate::decode_episode_payload_with_meta(
-                                crate::format::FORMAT_VERSION,
-                                &r.payload,
-                            )?
-                            .episode;
-                            crate::decrypt_storage_episode_in_place(
-                                &mut episode,
-                                self.keystore.as_deref(),
-                            )?;
-                            out.push((r.lsn, episode));
-                            if out.len() >= max {
-                                break;
-                            }
-                        }
-                    }
+                    counters.bytes_physical_read += percorrido;
                 }
             }
         }
 
-        Ok(out)
+        Ok((out, counters))
     }
 
     /// Fonte local exacta que pode ser publicada no cold tier v6.
@@ -3282,6 +3318,137 @@ mod tests {
         let capped = log.scan_capped(3, 40, 5).unwrap();
         let lsns: Vec<Lsn> = capped.iter().map(|(l, _)| *l).collect();
         assert_eq!(lsns, vec![3, 4, 5, 6, 7]);
+    }
+
+    /// Soma o tamanho de todos os `.hrkl` de um directório de segmentos.
+    fn bytes_dos_segmentos(segments_dir: &Path) -> u64 {
+        std::fs::read_dir(segments_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "hrkl"))
+            .map(|e| e.metadata().unwrap().len())
+            .sum()
+    }
+
+    #[test]
+    fn varredura_por_janelas_nao_rele_o_segmento_inteiro_a_cada_janela() {
+        // Auditoria 2026-09-05, A13: `scan_capped` com janela lia e
+        // materializava o segmento RAW INTEIRO a CADA chamada, e só depois
+        // descartava por comparação os registos fora da janela. Um replay em
+        // janelas de `w` sobre segmentos de `r` registos lê cada segmento
+        // ceil(r/w) vezes — e aloca `r` payloads para guardar `w`. É o padrão
+        // de todos os consumidores de replay (views, compliance, sentinel).
+        let dir = tempfile::tempdir().unwrap();
+        // Cap pequeno: vários segmentos, cada um com dezenas de registos, para
+        // a amplificação ser visível sem escrever megabytes.
+        let log = V6Log::open(dir.path(), 4096, FsyncPolicy::Always).unwrap();
+        let n: u64 = 400;
+        for i in 0..n {
+            log.append(event(i)).unwrap();
+        }
+        log.seal_active().unwrap();
+        // Os selados ficam RAW enquanto não houver `pack_pending` — é o ramo
+        // sob teste.
+        assert!(log
+            .manifest()
+            .segments_v2
+            .iter()
+            .all(|s| s.active().unwrap().layout == PhysicalLayout::Raw));
+        let segmentos = dir.path().join(SEGMENTS_DIR);
+        let bytes_no_disco = bytes_dos_segmentos(&segmentos);
+
+        const JANELA: usize = 8;
+        let head = log.head();
+
+        // A prova mais afiada: UMA janela no início de um segmento não pode
+        // custar o segmento inteiro. Antes custava — `scan_raw_segment` lê até
+        // ao footer aconteça o que acontecer.
+        let primeiro = log.manifest().segments_v2[0].clone();
+        let tamanho_primeiro = primeiro.active().unwrap().physical_size;
+        assert!(
+            primeiro.record_count >= 3 * JANELA as u64,
+            "o primeiro segmento tem de ter muito mais do que uma janela ({} registos)",
+            primeiro.record_count
+        );
+        let (linhas, contadores) = log.varrer_com_contadores(0, head, JANELA).unwrap();
+        assert_eq!(linhas.len(), JANELA);
+        assert!(
+            contadores.bytes_physical_read < tamanho_primeiro / 2,
+            "uma janela de {JANELA} leu {} bytes de um segmento de {tamanho_primeiro}",
+            contadores.bytes_physical_read
+        );
+
+        // E o replay completo em janelas: nem um LSN a menos, e um tecto de
+        // bytes muito abaixo do que a releitura integral custava. O tecto não
+        // é 1x, e não pode ser: sem um índice `lsn -> offset` (que o v6 não
+        // tem, e que não cabe neste fix) cada janela ainda percorre o segmento
+        // desde o início até ao fim da janela — sobra ~r/2w em vez de ~r/w.
+        let mut cur = 0u64;
+        let mut lidos = 0u64;
+        let mut lsns = Vec::new();
+        while cur < head {
+            let (linhas, contadores) = log.varrer_com_contadores(cur, head, JANELA).unwrap();
+            assert!(!linhas.is_empty(), "janela vazia em {cur}");
+            lidos += contadores.bytes_physical_read;
+            cur = linhas.last().unwrap().0 + 1;
+            lsns.extend(linhas.into_iter().map(|(l, _)| l));
+        }
+        assert_eq!(
+            lsns,
+            (0..head).collect::<Vec<Lsn>>(),
+            "o replay perdeu LSNs"
+        );
+        assert!(
+            lidos < 4 * bytes_no_disco,
+            "o replay em janelas de {JANELA} leu {lidos} bytes para {bytes_no_disco} bytes de segmentos"
+        );
+    }
+
+    #[test]
+    fn varredura_raw_janelada_bate_com_o_oraculo_em_toda_a_grelha() {
+        // Rede de segurança da refactorização do ramo RAW (Auditoria
+        // 2026-09-05, A13): o percurso em streaming tem de devolver exactamente
+        // as mesmas linhas, na mesma ordem, para todo o (from, to, max) — com
+        // segmentos selados RAW E cauda activa, e com o `max` a cair dentro de
+        // um segmento, na fronteira e no meio da cauda.
+        let dir = tempfile::tempdir().unwrap();
+        let log = V6Log::open(dir.path(), 700, FsyncPolicy::Always).unwrap();
+        let n: u64 = 40;
+        for i in 0..n {
+            log.append(event(i)).unwrap();
+        }
+        assert!(!log.manifest().segments_v2.is_empty(), "faltam selados");
+        // Oráculo: a história inteira, lida de uma vez.
+        let tudo: Vec<(Lsn, Vec<u8>)> = log
+            .scan(0, n)
+            .unwrap()
+            .into_iter()
+            .map(|(l, e)| (l, e.content))
+            .collect();
+        assert_eq!(tudo.len(), n as usize);
+
+        for from in 0..n {
+            for to in (from + 1)..=n {
+                for max in [1usize, 3, 7, usize::MAX] {
+                    let obtido: Vec<(Lsn, Vec<u8>)> = log
+                        .scan_capped(from, to, max)
+                        .unwrap()
+                        .into_iter()
+                        .map(|(l, e)| (l, e.content))
+                        .collect();
+                    let esperado: Vec<(Lsn, Vec<u8>)> = tudo
+                        .iter()
+                        .filter(|(l, _)| *l >= from && *l < to)
+                        .take(max)
+                        .cloned()
+                        .collect();
+                    assert_eq!(
+                        obtido, esperado,
+                        "scan_capped({from}, {to}, {max}) divergiu do oráculo"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
