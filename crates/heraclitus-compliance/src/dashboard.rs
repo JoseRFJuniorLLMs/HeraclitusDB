@@ -51,6 +51,14 @@ pub struct AnchorHealthSnapshot {
     pub last_icp_brasil_valid_anchor_lsn: Option<Lsn>,
     pub unanchored_lsn_range: Option<(Lsn, Lsn)>,
     pub deferred_anchors: usize,
+    /// Âncoras diferidas que aterraram no log sem encadear com a anterior.
+    /// Auditoria 2026-09-05 (A06): o replay deixou de abortar perante uma
+    /// bifurcação — num log append-only o episódio ofensor nunca desaparece, e
+    /// um `Err` matava este dashboard para sempre — logo a bifurcação tem de
+    /// ficar VISÍVEL aqui em vez de silenciosa. `#[serde(default)]` porque o
+    /// campo é aditivo: snapshots gravados por builds anteriores não o trazem.
+    #[serde(default)]
+    pub deferred_anchor_forks: usize,
     pub last_deferred_anchor_digest: Option<String>,
 }
 
@@ -133,6 +141,7 @@ impl ComplianceDashboardSnapshot {
             last_icp_brasil_valid_anchor_lsn: None,
             unanchored_lsn_range,
             deferred_anchors: deferred.anchors.len(),
+            deferred_anchor_forks: deferred.forks.len(),
             last_deferred_anchor_digest: deferred.latest_digest().map(|digest| hex(&digest)),
         };
 
