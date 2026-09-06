@@ -641,6 +641,14 @@ pub struct Log {
     /// por isso um descritor nunca fica obsoleto: só o `truncate` o invalidaria,
     /// e essa superfície já não existe.
     fds: std::sync::Mutex<std::collections::HashMap<SegmentId, Arc<File>>>,
+    /// Quantas leituras pontuais (`read`) já foram servidas.
+    ///
+    /// Existe para tornar OBSERVÁVEL o número de leituras que um caminho de
+    /// query faz — sem isto, "este caminho lê cada candidato duas vezes" não é
+    /// asseverável num teste, e uma regressão de desempenho volta em silêncio
+    /// (auditoria 2026-09-05, A56). O custo é um `fetch_add` relaxado ao lado
+    /// de dois preads + CRC-32C + desserialização + decifra: invisível.
+    leituras: AtomicU64,
 }
 
 /// Leitura posicional: não move o cursor do ficheiro, portanto aceita `&File` e
@@ -1353,6 +1361,7 @@ impl Log {
             keystore,
             stamp_lock: std::sync::Mutex::new(()),
             fds: std::sync::Mutex::new(std::collections::HashMap::new()),
+            leituras: AtomicU64::new(0),
         })
     }
 
@@ -1409,7 +1418,15 @@ impl Log {
         self.tail_tx.subscribe()
     }
 
+    /// Leituras pontuais servidas por este `Log` desde que foi aberto.
+    /// Instrumento para testes de desempenho asseverarem quantas leituras um
+    /// caminho de query faz (auditoria 2026-09-05, A56).
+    pub fn leituras_efectuadas(&self) -> u64 {
+        self.leituras.load(Ordering::Relaxed)
+    }
+
     pub fn read(&self, lsn: Lsn) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
+        self.leituras.fetch_add(1, Ordering::Relaxed);
         if lsn >= self.committed_lsn.load(Ordering::Acquire) {
             return Ok(None);
         }

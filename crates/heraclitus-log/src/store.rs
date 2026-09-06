@@ -333,6 +333,20 @@ impl AnyLog {
         }
     }
 
+    /// Leituras pontuais servidas por este log, quando há instrumento.
+    ///
+    /// `None` no v6 — o contador vive no log legado (`Log::leituras`) e não foi
+    /// replicado no motor v6, que pertence a outro caminho. Serve para um teste
+    /// asseverar quantas leituras um caminho de query faz; como esse caminho é
+    /// o mesmo nos dois formatos, medi-lo no legado chega para o provar
+    /// (auditoria 2026-09-05, A56).
+    pub fn leituras_efectuadas(&self) -> Option<u64> {
+        match self {
+            Self::Legacy(log) => Some(log.leituras_efectuadas()),
+            Self::V6(_) => None,
+        }
+    }
+
     pub fn v6_arc(&self) -> Option<Arc<V6Log>> {
         match self {
             Self::Legacy(_) => None,

@@ -2698,7 +2698,24 @@ impl Engine {
     }
 
     /// Two-stage recall (§3.8) over the real indexes + memtable merge.
-    pub fn recall(&self, text: &str, k: usize) -> Result<serde_json::Value, HeraclitusError> {
+    ///
+    /// Devolve, por candidato e pela ordem final: `(id, lsn a publicar,
+    /// episódio hidratado, score)`. O `Episode` é `None` quando a leitura
+    /// falhou o filtro `e.id == cand.id` — o ramo de fallback, onde o `lsn`
+    /// devolvido é o `cand.lsn` cru.
+    ///
+    /// Existe para os dois consumidores partilharem UMA leitura por candidato:
+    /// o JSON de `/recall` e o `QueryBackend::recall` do GQL. Antes o segundo
+    /// chamava o primeiro, deitava fora o JSON (incluindo uma cópia do
+    /// `content` inteiro) e relia cada LSN do log — dois preads + CRC + decifra
+    /// a mais por linha, num caminho de latência interactiva (auditoria
+    /// 2026-09-05, A56).
+    #[allow(clippy::type_complexity)]
+    fn recall_hidratado(
+        &self,
+        text: &str,
+        k: usize,
+    ) -> Result<Vec<(heraclitus_core::EventId, Lsn, Option<Episode>, f32)>, HeraclitusError> {
         // Recência ACT-R: `now` TEM de estar na mesma unidade que os tempos de
         // acesso gravados pelo `ActivationStore` (`ts_hlc >> 16`, ms físicos) —
         // NÃO o LSN, senão todas as idades colapsavam a 1 e o decay de recência
@@ -2767,7 +2784,7 @@ impl Engine {
         );
 
         // Hydrate rows from the log.
-        let mut rows = Vec::new();
+        let mut hidratados = Vec::with_capacity(ranked.len());
         for (cand, score) in ranked {
             // Candidato vindo SÓ do canal de ativação chega com lsn=0 (o canal
             // não transporta LSN) — a leitura em 0 falhava o filtro de id e a
@@ -2782,19 +2799,39 @@ impl Engine {
             } else {
                 cand.lsn
             };
-            if let Some((lsn, ep)) = self.log.read(lsn)?.filter(|(_, e)| e.id == cand.id) {
-                rows.push(serde_json::json!({
+            match self.log.read(lsn)?.filter(|(_, e)| e.id == cand.id) {
+                Some((lsn, ep)) => hidratados.push((cand.id, lsn, Some(ep), score)),
+                // Ramo de fallback: publica-se `cand.lsn` (NÃO o resolvido) —
+                // é o que a resposta pública sempre disse, e mudá-lo alteraria
+                // o JSON de /recall e do gRPC.
+                None => hidratados.push((cand.id, cand.lsn, None, score)),
+            }
+        }
+        Ok(hidratados)
+    }
+
+    /// `/recall` (REST e gRPC): a projecção JSON de `recall_hidratado`.
+    ///
+    /// A hidratação vive lá em cima porque o caminho do GQL precisa dos
+    /// `Episode` e não do JSON — antes chamava esta função, deitava fora tudo
+    /// menos `lsn`/`score` e RELIA cada candidato do log (auditoria
+    /// 2026-09-05, A56). Aqui não muda nada: mesmos bytes de saída.
+    pub fn recall(&self, text: &str, k: usize) -> Result<serde_json::Value, HeraclitusError> {
+        let rows: Vec<serde_json::Value> = self
+            .recall_hidratado(text, k)?
+            .into_iter()
+            .map(|(id, lsn, episodio, score)| match episodio {
+                Some(ep) => serde_json::json!({
                     "lsn": lsn,
                     "id": ep.id.to_string(),
                     "content": crate::rest::bytes_str(&ep.content),
                     "score": score,
-                }));
-            } else {
-                rows.push(serde_json::json!({
-                    "id": cand.id.to_string(), "lsn": cand.lsn, "score": score
-                }));
-            }
-        }
+                }),
+                None => serde_json::json!({
+                    "id": id.to_string(), "lsn": lsn, "score": score
+                }),
+            })
+            .collect();
         Ok(serde_json::Value::Array(rows))
     }
 }
@@ -2993,18 +3030,29 @@ impl QueryBackend for Engine {
         // are head-versioned in v0; a versioned-index time travel is the
         // planned upgrade). Over-fetch to compensate for filtered rows.
         let fetch = if as_of.is_some() { k * 4 } else { k };
-        let v = Engine::recall(self, text, fetch)?;
-        let empty = Vec::new();
+        // Auditoria 2026-09-05, A56: usa-se o `Episode` que a hidratação já
+        // trouxe, em vez de reler o mesmo LSN do log. Nada mais muda — mesmo
+        // ranking, mesmos scores, mesma resolução de `lsn == 0` pelo índice de
+        // grafo, mesmo filtro de id, mesmo `fetch = k*4` com AS OF, mesmo
+        // pós-filtro e mesmo `truncate(k)`.
         let mut out = Vec::new();
-        for row in v.as_array().unwrap_or(&empty) {
-            let lsn = row["lsn"].as_u64().unwrap_or(0);
+        for (_id, lsn, episodio, score) in self.recall_hidratado(text, fetch)? {
             if let Some(bound) = as_of {
                 if lsn >= bound {
                     continue;
                 }
             }
-            if let Some((l, e)) = self.log.read(lsn)? {
-                out.push((l, e, row["score"].as_f64().unwrap_or(0.0) as f32));
+            match episodio {
+                Some(ep) => out.push((lsn, ep, score)),
+                // Ramo de fallback preservado tal e qual, incluindo a leitura
+                // SEM filtro de id: aqui o `lsn` é o `cand.lsn` cru, que pode
+                // ser 0 e devolver outro episódio. É o comportamento de hoje;
+                // mudá-lo seria outra correcção, com outro achado.
+                None => {
+                    if let Some((l, e)) = self.log.read(lsn)? {
+                        out.push((l, e, score));
+                    }
+                }
             }
         }
         out.truncate(k);
@@ -4974,6 +5022,91 @@ mod tests {
             "o documento com o melhor BM25 do corpus foi cortado antes do reranker \
              ({} candidatos devolvidos)",
             ids.len()
+        );
+    }
+
+    /// O RECALL do GQL lia CADA candidato duas vezes do log (auditoria
+    /// 2026-09-05, A56): `QueryBackend::recall` chamava `Engine::recall`, que
+    /// ja hidratava cada candidato e construia um JSON com o `content`
+    /// completo, deitava tudo fora excepto `lsn`/`score`, e voltava a ler o
+    /// mesmo LSN para reconstruir o `Episode` que tinha existido dez linhas
+    /// antes. Cada leitura sao dois preads posicionais + CRC-32C +
+    /// desserializacao + decifra.
+    ///
+    /// O teste mede as duas coisas que importam: que o RESULTADO nao mudou (as
+    /// linhas do GQL continuam a ser exactamente as de `Engine::recall`, que e
+    /// o oraculo) e que o numero de leituras caiu para uma por linha.
+    #[test]
+    fn recall_do_gql_nao_le_cada_candidato_duas_vezes_do_log() {
+        let dir = tempfile::tempdir().unwrap();
+        // Formato legado de proposito: e ai que vive o contador de leituras. O
+        // caminho do RECALL e o mesmo nos dois formatos (`self.log.read`),
+        // portanto medi-lo aqui prova-o para ambos.
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            storage_format: heraclitus_core::StorageFormat::Legacy,
+            ..Default::default()
+        };
+        let engine = Engine::open(&cfg).unwrap();
+        for i in 0..20 {
+            engine
+                .append(Episode::new(
+                    "ag",
+                    EventKind::Observation,
+                    format!("rio caudaloso numero {i}").into_bytes(),
+                ))
+                .unwrap();
+        }
+
+        // ORACULO: as linhas que o caminho JSON (REST/gRPC) devolve. O caminho
+        // do GQL tem de concordar com ele, linha a linha e pela mesma ordem.
+        let esperado = engine.recall("rio", 10).unwrap();
+        let esperado: Vec<(u64, String, String)> = esperado
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["lsn"].as_u64().unwrap_or(0),
+                    r["id"].as_str().unwrap_or_default().to_string(),
+                    // Comparar o score como texto: o que importa e ser o MESMO
+                    // numero, e um f32 formatado nao tem ambiguidade de igualdade.
+                    format!("{:?}", r["score"].as_f64().unwrap_or(0.0) as f32),
+                )
+            })
+            .collect();
+        assert!(
+            !esperado.is_empty(),
+            "montagem: o recall tem de devolver algo"
+        );
+
+        let ler_contador = || {
+            engine
+                .log
+                .leituras_efectuadas()
+                .expect("o log legado tem o contador de leituras")
+        };
+        let antes = ler_contador();
+        let linhas = QueryBackend::recall(&engine, "rio", 10, None).unwrap();
+        let gastas = ler_contador() - antes;
+
+        let obtido: Vec<(u64, String, String)> = linhas
+            .iter()
+            .map(|(l, e, s)| (*l, e.id.to_string(), format!("{s:?}")))
+            .collect();
+        assert_eq!(obtido, esperado, "o refactor mexeu no que o RECALL devolve");
+
+        // `+1` e a leitura do head que fixa o relogio da recencia (ACT-R).
+        assert!(
+            gastas >= linhas.len() as u64,
+            "o contador de leituras tem de contar: {gastas} para {} linhas",
+            linhas.len()
+        );
+        assert!(
+            gastas <= linhas.len() as u64 + 1,
+            "RECALL leu {gastas} vezes para {} linhas (era 2x + 1)",
+            linhas.len()
         );
     }
 
