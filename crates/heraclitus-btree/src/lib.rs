@@ -33,6 +33,13 @@ const CACHE_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024; // 64MB Cache
 const BLOOM_FILTER_SIZE_BYTES: usize = 64; // Filtro de Bloom de 512 bits por página
 const SIG_SIZE: usize = 32;
 const NUM_SHARDS: usize = 32; // Expandido para 32 shards para alta concorrência multi-core
+/// Alvo da evicção em lote: uma varredura liberta até 90% do tecto, em vez de
+/// um frame de cada vez (Auditoria 2026-09-05, A44).
+const CACHE_EVICT_TARGET_PERCENT: usize = 90;
+/// Faltas de cache saltadas depois de uma varredura de evicção que não achou
+/// candidato nenhum (tudo sujo/pinado). Contagem, não flag: a evicção volta
+/// sozinha mesmo que ninguém limpe um bit de sujo.
+const EVICT_SCAN_BACKOFF: usize = 256;
 
 // Constantes de layout auto-documentadas para offsets físicos da página
 const OFF_PAGE_TYPE: usize = 0;
@@ -191,6 +198,10 @@ pub struct TreeMetrics {
     /// possa provar que o caminho do merge foi mesmo exercitado — sem isto o
     /// teste passaria por vacuidade se o orçamento nunca deixasse fundir.
     pub merges_cascade: AtomicUsize,
+    /// Frames visitados pelas varreduras de evicção do cache. Auditoria
+    /// 2026-09-05 (A44): é a única forma honesta de afirmar num teste
+    /// determinista que o custo por falta de cache é amortizado, e não O(F).
+    pub evict_scan_frames: AtomicUsize,
 }
 
 pub trait PageStore: Send + Sync {
@@ -1082,6 +1093,13 @@ pub struct BEpsilonTree {
     /// durável a apontar para uma página FreeList (árvore ilegível).
     pending_recycle: std::sync::Mutex<Vec<u64>>,
     pub metrics: Arc<TreeMetrics>,
+    /// Tecto de memória do cache de nós. Campo (e não a constante directa)
+    /// para que os testes de evicção possam baixá-lo — encher 64 MB de frames
+    /// levaria dezenas de milhares de páginas. Por omissão é sempre
+    /// `CACHE_MEMORY_BUDGET_BYTES`: nenhum caminho de produção o altera.
+    cache_budget_bytes: usize,
+    /// Varreduras de evicção a saltar (ver `evict_cache_batch`).
+    evict_scan_backoff: AtomicUsize,
 }
 
 impl BEpsilonTree {
@@ -1145,6 +1163,8 @@ impl BEpsilonTree {
                 dirty_page_table: std::sync::Mutex::new(HashSet::new()),
                 pending_recycle: std::sync::Mutex::new(Vec::new()),
                 metrics,
+                cache_budget_bytes: CACHE_MEMORY_BUDGET_BYTES,
+                evict_scan_backoff: AtomicUsize::new(0),
             };
             let size = root.estimate_memory_footprint();
             {
@@ -1201,6 +1221,8 @@ impl BEpsilonTree {
             dirty_page_table: std::sync::Mutex::new(HashSet::new()),
             pending_recycle: std::sync::Mutex::new(Vec::new()),
             metrics,
+            cache_budget_bytes: CACHE_MEMORY_BUDGET_BYTES,
+            evict_scan_backoff: AtomicUsize::new(0),
         })
     }
 
@@ -1310,6 +1332,89 @@ impl BEpsilonTree {
                 .fetch_sub(frame.byte_size, Ordering::Release);
         }
         self.dirty_page_table.lock().unwrap().remove(&id);
+        // A44: libertou-se espaço fora da evicção — a próxima falta pode voltar
+        // a varrer com proveito, por isso o backoff perde a razão de ser.
+        self.evict_scan_backoff.store(0, Ordering::Release);
+    }
+
+    /// Liberta memória de cache até ao ALVO, numa única varredura.
+    ///
+    /// Auditoria 2026-09-05 (A44): a versão anterior varria os 32 shards e
+    /// TODOS os frames para escolher UM candidato — O(F) por falta de cache,
+    /// e a varredura repetia-se em cada falta porque cada página nova punha o
+    /// cache logo acima do tecto outra vez. Pior, quando não havia candidato
+    /// limpo (regime de escrita do `from_map`, em que os internos estão sujos
+    /// até ao commit) a varredura completa era paga na mesma e não libertava
+    /// um único byte. Aqui uma varredura recolhe TODOS os candidatos e liberta
+    /// em lote até 90% do tecto — o custo passa a ser amortizado por milhares
+    /// de despejos — e uma varredura estéril arma um backoff por CONTAGEM
+    /// (nunca uma flag pegajosa: a evicção volta sozinha) que salta as
+    /// varreduras seguintes até haver de novo candidatos.
+    ///
+    /// Só decide QUE frames LIMPOS ficam em memória: nada do que se lê muda.
+    /// Mantém a regra R18 — nunca dois locks de shard ao mesmo tempo, e nunca
+    /// o do shard alvo durante a varredura.
+    fn evict_cache_batch(&self, root_id: u64) {
+        if self.current_cache_bytes.load(Ordering::Acquire) < self.cache_budget_bytes {
+            return;
+        }
+        let restante = self.evict_scan_backoff.load(Ordering::Acquire);
+        if restante > 0 {
+            // Decremento saturante: com corridas o pior caso é gastar o
+            // backoff mais depressa, nunca dar a volta ao contador.
+            let _ = self.evict_scan_backoff.compare_exchange(
+                restante,
+                restante - 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+            return;
+        }
+
+        let mut candidatos: Vec<(u64, usize, u64)> = Vec::new();
+        let mut visitados = 0usize;
+        for (s_idx, shard_lock) in self.cache_shards.iter().enumerate() {
+            let shard = shard_lock.lock().unwrap();
+            visitados += shard.len();
+            for (&cid, frame) in shard.iter() {
+                if cid != root_id
+                    && frame.pin_count.load(Ordering::Acquire) == 0
+                    && !frame.is_dirty.load(Ordering::Acquire)
+                {
+                    candidatos.push((frame.last_access.load(Ordering::Acquire), s_idx, cid));
+                }
+            }
+        }
+        self.metrics
+            .evict_scan_frames
+            .fetch_add(visitados, Ordering::Relaxed);
+
+        if candidatos.is_empty() {
+            self.evict_scan_backoff
+                .store(EVICT_SCAN_BACKOFF, Ordering::Release);
+            return;
+        }
+        candidatos.sort_unstable(); // LRU primeiro (last_access crescente)
+
+        let alvo = self.cache_budget_bytes / 100 * CACHE_EVICT_TARGET_PERCENT;
+        for (_, s_idx, cid) in candidatos {
+            if self.current_cache_bytes.load(Ordering::Acquire) <= alvo {
+                break;
+            }
+            let mut shard = self.cache_shards[s_idx].lock().unwrap();
+            // Revalida sob o lock: entre a varredura e agora outra thread pode
+            // ter pinado ou sujado o frame. Um candidato perdido salta-se —
+            // terminar o lote aqui traria de volta a varredura por despejo.
+            let evictable = shard.get(&cid).is_some_and(|f| {
+                f.pin_count.load(Ordering::Acquire) == 0 && !f.is_dirty.load(Ordering::Acquire)
+            });
+            if evictable {
+                if let Some(removed) = shard.remove(&cid) {
+                    self.current_cache_bytes
+                        .fetch_sub(removed.byte_size, Ordering::Release);
+                }
+            }
+        }
     }
 
     fn acquire_node_guard(&self, id: u64) -> io::Result<PageGuard> {
@@ -1337,41 +1442,7 @@ impl BEpsilonTree {
         // cruzado entre threads. Aqui cada shard é trancado transitoriamente,
         // um de cada vez.
         self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
-        while self.current_cache_bytes.load(Ordering::Acquire) >= CACHE_MEMORY_BUDGET_BYTES {
-            let mut lru_id = None;
-            let mut min_tick = u64::MAX;
-            let mut target_shard_idx = 0;
-            for (s_idx, shard_lock) in self.cache_shards.iter().enumerate() {
-                let shard = shard_lock.lock().unwrap();
-                for (&cid, frame) in shard.iter() {
-                    if frame.pin_count.load(Ordering::Acquire) == 0 && cid != root_id {
-                        let acc = frame.last_access.load(Ordering::Acquire);
-                        if acc < min_tick && !frame.is_dirty.load(Ordering::Acquire) {
-                            min_tick = acc;
-                            lru_id = Some(cid);
-                            target_shard_idx = s_idx;
-                        }
-                    }
-                }
-            }
-            if let Some(lid) = lru_id {
-                let mut shard = self.cache_shards[target_shard_idx].lock().unwrap();
-                // Revalida sob o lock (outra thread pode ter pinado entretanto).
-                let evictable = shard
-                    .get(&lid)
-                    .is_some_and(|f| f.pin_count.load(Ordering::Acquire) == 0);
-                if evictable {
-                    if let Some(removed) = shard.remove(&lid) {
-                        self.current_cache_bytes
-                            .fetch_sub(removed.byte_size, Ordering::Release);
-                    }
-                } else {
-                    break; // candidato desapareceu/foi pinado — evita loop
-                }
-            } else {
-                break;
-            }
-        }
+        self.evict_cache_batch(root_id);
 
         // Leitura + decode fora de qualquer lock.
         let mut buf = vec![0u8; PAGE_SIZE];
@@ -2391,6 +2462,9 @@ impl BEpsilonTree {
                 }
             }
         }
+        // A44: os bits de sujo acabaram de cair — há de novo candidatos a
+        // despejo. Rearma a evicção já, em vez de esperar o backoff esgotar.
+        self.evict_scan_backoff.store(0, Ordering::Release);
         self.store.sync()?;
 
         let offset = self.active_sb_offset.load(Ordering::Acquire);
@@ -2848,5 +2922,106 @@ mod page_roundtrip_tests {
         assert_eq!(OFF_BLOOM + BLOOM_FILTER_SIZE_BYTES, OFF_PFX_OFF);
         assert_eq!(OFF_PFX_OFF + 2, OFF_PFX_LEN);
         assert_eq!(OFF_PFX_LEN + 2, OFF_SLOTS_START);
+    }
+}
+
+#[cfg(test)]
+mod cache_evicao_tests {
+    //! Auditoria 2026-09-05 (A44): o custo da evicção. Precisa de campos
+    //! privados (o tecto do cache e a contagem de frames), por isso vive
+    //! dentro da crate e não em `tests/`.
+    use super::*;
+
+    fn frames_no_cache(t: &BEpsilonTree) -> usize {
+        t.cache_shards.iter().map(|s| s.lock().unwrap().len()).sum()
+    }
+
+    /// Com o cache no tecto, cada falta fazia uma varredura COMPLETA dos 32
+    /// shards para libertar UM frame — O(F) por page fault onde O(1) amortizado
+    /// basta. O teste mede os frames visitados por falta e exige que o custo
+    /// seja amortizado; verifica também que a evicção em lote não muda um único
+    /// valor lido (é uma melhoria de desempenho, não de semântica).
+    #[test]
+    fn evicao_tem_custo_amortizado_e_nao_altera_os_valores_lidos() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("evic.hbt");
+        let mut t = BEpsilonTree::open(&path, 1000, 128).unwrap();
+        // Tecto pequeno: encher os 64 MB reais exigiria dezenas de milhares
+        // de páginas e tornaria o teste inutilizável na suite.
+        t.cache_budget_bytes = 1024 * 1024;
+
+        let n = 8000u32;
+        let val = |i: u32| format!("v{i:06}").repeat(6).into_bytes();
+        for i in 0..n {
+            t.upsert(format!("k{i:06}").into_bytes(), val(i)).unwrap();
+        }
+        // O commit limpa os bits de sujo: sem candidatos elegíveis a evicção
+        // não corre e o teste não mediria nada.
+        t.commit().unwrap();
+
+        let frames = frames_no_cache(&t);
+        assert!(
+            frames >= 200,
+            "cache com poucos frames ({frames}) — o cenário não mede nada"
+        );
+
+        let varridos_antes = t.metrics.evict_scan_frames.load(Ordering::Relaxed);
+        let faltas_antes = t.metrics.cache_misses.load(Ordering::Relaxed);
+
+        // Leituras frias espalhadas por toda a árvore: garantem faltas de cache
+        // com o cache já no tecto.
+        let mut errados = 0usize;
+        let mut ausentes = 0usize;
+        for i in (0..n).step_by(3) {
+            match t.get(&format!("k{i:06}").into_bytes()) {
+                Some(lido) if lido == val(i) => {}
+                Some(_) => errados += 1,
+                None => ausentes += 1,
+            }
+        }
+        assert_eq!(
+            (errados, ausentes),
+            (0, 0),
+            "a evicção em lote não pode mudar o que se lê"
+        );
+
+        let varridos = t.metrics.evict_scan_frames.load(Ordering::Relaxed) - varridos_antes;
+        let faltas = t.metrics.cache_misses.load(Ordering::Relaxed) - faltas_antes;
+        assert!(faltas > 100, "poucas faltas de cache ({faltas}) para medir");
+        assert!(
+            varridos * 8 < faltas * frames,
+            "varredura O(F) por falta: {varridos} frames visitados em {faltas} faltas \
+             com {frames} frames em cache"
+        );
+        assert!(
+            t.current_cache_bytes.load(Ordering::Acquire) <= t.cache_budget_bytes,
+            "o lote deixou o cache acima do tecto"
+        );
+
+        // Escritas SEM commit com o cache no tecto: um frame SUJO despejado
+        // leva consigo alterações que ainda não estão em disco. O lote tem de
+        // manter o filtro `!is_dirty` que a versão de um-frame-por-varredura
+        // já tinha.
+        let novo = |i: u32| format!("N{i:06}").repeat(6).into_bytes();
+        let mut sujas: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        for i in (0..n).step_by(11) {
+            let k = format!("k{i:06}").into_bytes();
+            t.upsert(k.clone(), novo(i)).unwrap();
+            sujas.insert(k, novo(i));
+            // Leitura fria intercalada: força faltas de cache (e evicção) com
+            // frames sujos por commitar em memória.
+            let fria = (i + n / 2) % n;
+            t.get(&format!("k{fria:06}").into_bytes());
+        }
+        let perdidas = sujas
+            .iter()
+            .filter(|(k, v)| t.get(k).as_ref() != Some(*v))
+            .count();
+        assert_eq!(
+            perdidas,
+            0,
+            "{perdidas} de {} escritas por commitar perdidas — frame sujo despejado",
+            sujas.len()
+        );
     }
 }
