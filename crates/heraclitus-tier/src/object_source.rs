@@ -243,6 +243,12 @@ impl ColdSegmentReader {
             footer.block_count,
             footer.block_directory_offset,
         )?;
+        // Auditoria 2026-09-05 (A05): o mesmo confronto que o leitor local faz.
+        // Aqui era ainda mais frouxo — nem a soma dos `record_count` se
+        // verificava —, e o `get` frio poda pelo directório *antes* de
+        // transferir bloco nenhum: um `last_lsn` encolhido devolvia `Ok(None)`
+        // para um LSN comitado sem sequer tocar na rede.
+        directory.check_against_footer(&footer)?;
 
         Ok(Self {
             store,
@@ -360,6 +366,65 @@ pub(crate) fn store_err(path: &ObjPath, e: object_store::Error) -> HeraclitusErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Escreve um `.hrkl` PACKED real com vários blocos e devolve os bytes.
+    fn segmento_packed(dir: &std::path::Path) -> (Vec<u8>, FooterV6) {
+        use heraclitus_log::v6::packed::{PackOptions, PackedSegmentWriter};
+        use heraclitus_log::v6::SegmentInit;
+        let path = dir.join("frio.hrkl");
+        let opts = PackOptions {
+            block_target_bytes: 4096,
+            ..Default::default()
+        };
+        let init = SegmentInit {
+            segment_id: 7,
+            created_hlc: 1,
+            first_lsn: 1_000,
+            writer_epoch: 1,
+            storage_namespace_id: [0x22; 16],
+        };
+        let mut w = PackedSegmentWriter::create(&path, init, opts).unwrap();
+        for i in 0..2_000u64 {
+            let mut h = [0u8; 32];
+            h[..8].copy_from_slice(&i.to_le_bytes());
+            w.push(1_000 + i, 10_000 + i, format!("{i:0100}").into_bytes(), &h)
+                .unwrap();
+        }
+        let (footer, _) = w.finish().unwrap();
+        (std::fs::read(&path).unwrap(), footer)
+    }
+
+    #[tokio::test]
+    async fn directorio_com_intervalo_adulterado_e_recusado_ao_abrir_o_objecto() {
+        // Auditoria 2026-09-05 (A05): o caminho frio poda pelo directório
+        // ANTES de transferir bloco nenhum (`get` sai em `Ok(None)` sem tocar
+        // na rede), e aqui nem a soma dos `record_count` era confrontada com o
+        // footer. Um `last_lsn` encolhido — a região do directório não tem
+        // checksum — fazia o recall responder "esse evento não existe" para um
+        // LSN comitado.
+        let dir = tempfile::tempdir().unwrap();
+        let (bytes, footer) = segmento_packed(dir.path());
+        assert!(footer.block_count >= 2, "o teste precisa de vários blocos");
+
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let bom = ObjPath::from("canonical/bom.hrkl");
+        store.put(&bom, bytes.clone().into()).await.unwrap();
+        ColdSegmentReader::open(store.clone(), bom, 1 << 20)
+            .await
+            .unwrap();
+
+        // bytes 32..40 da entrada 0 do directório = `last_lsn`.
+        let mut adulterado = bytes;
+        let at = footer.block_directory_offset as usize + 32;
+        let encolhido = u64::from_le_bytes(adulterado[at..at + 8].try_into().unwrap()) - 8;
+        adulterado[at..at + 8].copy_from_slice(&encolhido.to_le_bytes());
+        let mau = ObjPath::from("canonical/mau.hrkl");
+        store.put(&mau, adulterado.into()).await.unwrap();
+        assert!(
+            ColdSegmentReader::open(store, mau, 1 << 20).await.is_err(),
+            "o objecto frio com o directório adulterado tinha de ser recusado ao abrir"
+        );
+    }
 
     #[test]
     fn origem_esparsa_serve_o_que_tem() {

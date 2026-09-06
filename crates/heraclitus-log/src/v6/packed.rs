@@ -452,20 +452,12 @@ impl<S: BlockSource> PackedSegmentReader<S> {
             footer.block_directory_offset,
         )?;
 
-        let declared: u64 = directory
-            .entries
-            .iter()
-            .map(|e| e.record_count as u64)
-            .sum();
-        if declared != footer.record_count {
-            return Err(corrupt(
-                CTX,
-                format!(
-                    "directory accounts for {declared} records, footer declares {}",
-                    footer.record_count
-                ),
-            ));
-        }
+        // Auditoria 2026-09-05 (A05): confrontar o directório com o footer, e
+        // não só a soma dos `record_count`. O directório é a única região sem
+        // checksum próprio, e encolher um `last_lsn` fazia o pruning descartar
+        // um bloco válido — `get` devolvia `Ok(None)` para um LSN comitado, em
+        // silêncio. O footer tem CRC e já foi confrontado com o manifesto.
+        directory.check_against_footer(&footer)?;
         Ok(Self {
             source,
             header,
@@ -838,6 +830,78 @@ mod tests {
         bytes[at] ^= 0xff; // mexe no offset do primeiro bloco
         assert!(PackedSegmentReader::open(MemorySource(bytes), HARD_MAX_BLOCK_BYTES).is_err());
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn directorio_com_last_lsn_encolhido_e_recusado_na_abertura() {
+        // Auditoria 2026-09-05 (A05): a região do directório é a única parte do
+        // `.hrkl` PACKED sem checksum próprio. Encolher o `last_lsn` de um bloco
+        // não viola nenhuma guarda de `BlockDirectory::decode` — os offsets
+        // continuam dentro do ficheiro, não há sobreposição, `first_lsn <=
+        // last_lsn` mantém-se e a ordem por `first_lsn` também — e a soma dos
+        // `record_count` continua a bater com o footer. Antes do confronto com
+        // o footer, o `open` devolvia `Ok` e `get(lsn)` respondia `Ok(None)`
+        // para um LSN comitado e durado: a pior falha possível num log
+        // auditável — "esse evento não existe", sem erro, sem `Corruption` e
+        // sem métrica.
+        let path = tmp("dir-lsn-encolhido.hrkl");
+        let opts = PackOptions {
+            block_target_bytes: super::super::block::MIN_BLOCK_TARGET,
+            ..PackOptions::default()
+        };
+        let (footer, _) = escreve(&path, 4_000, 100, opts);
+        assert!(footer.block_count >= 2, "o teste precisa de vários blocos");
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        // O LSN alvo existe mesmo no ficheiro: cai na cauda do bloco 0 que o
+        // encolhimento passa a esconder.
+        let r =
+            PackedSegmentReader::open(MemorySource(bytes.clone()), HARD_MAX_BLOCK_BYTES).unwrap();
+        let alvo = r.directory.entries[0].last_lsn;
+        let mut c = ScanCounters::default();
+        assert!(
+            r.get(alvo, &mut c).unwrap().is_some(),
+            "o LSN {alvo} existe no segmento intacto"
+        );
+
+        // bytes 32..40 da entrada = `last_lsn` (block_directory.rs).
+        let mut adulterado = bytes;
+        let at = footer.block_directory_offset as usize + 32;
+        adulterado[at..at + 8].copy_from_slice(&(alvo - 8).to_le_bytes());
+        assert!(
+            PackedSegmentReader::open(MemorySource(adulterado), HARD_MAX_BLOCK_BYTES).is_err(),
+            "um directório que declara um intervalo de LSN diferente do que o footer sela tem de ser recusado"
+        );
+    }
+
+    #[test]
+    fn directorio_com_last_lsn_do_ultimo_bloco_encolhido_e_recusado() {
+        // Auditoria 2026-09-05 (A05), a outra ponta: encolher o `last_lsn` da
+        // ÚLTIMA entrada esconde a cauda do segmento e nem sequer quebra a
+        // cadeia de contiguidade entre blocos — só o `max_lsn` do footer (que o
+        // arranque já confrontou com o HRKM) o denuncia.
+        let path = tmp("dir-lsn-encolhido-fim.hrkl");
+        let opts = PackOptions {
+            block_target_bytes: super::super::block::MIN_BLOCK_TARGET,
+            ..PackOptions::default()
+        };
+        let (footer, _) = escreve(&path, 4_000, 100, opts);
+        assert!(footer.block_count >= 2, "o teste precisa de vários blocos");
+        let mut bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let ultima = footer.block_count as usize - 1;
+        let at = footer.block_directory_offset as usize + ultima * DIR_ENTRY_LEN + 32;
+        assert_eq!(
+            u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()),
+            footer.max_lsn
+        );
+        bytes[at..at + 8].copy_from_slice(&(footer.max_lsn - 8).to_le_bytes());
+        assert!(
+            PackedSegmentReader::open(MemorySource(bytes), HARD_MAX_BLOCK_BYTES).is_err(),
+            "o último bloco tem de terminar exactamente no max_lsn selado no footer"
+        );
     }
 
     #[test]
