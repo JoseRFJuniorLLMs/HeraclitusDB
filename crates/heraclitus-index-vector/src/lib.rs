@@ -140,6 +140,10 @@ thread_local! {
     /// superiores nao passa silenciosamente pelo algoritmo geral.
     static SEARCH_LAYER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GREEDY_DESCENT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Contador de avaliacoes da metrica. Serve para provar que a poda de
+    /// vizinhos calcula a distancia UMA vez por vizinho e nao uma vez por
+    /// comparacao do `sort` (auditoria 2026-09-05, A27).
+    static DIST2_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl Eq for Candidate {}
@@ -239,6 +243,8 @@ impl VectorIndex {
 
     /// Distância AO QUADRADO do nó `a` à consulta preparada.
     fn dist2(&self, a: u32, q: &PreparedQuery) -> f64 {
+        #[cfg(test)]
+        DIST2_CALLS.with(|calls| calls.set(calls.get() + 1));
         let node = &self.nodes[a as usize];
         q.dist2_prepared(&node.point, &node.prepared)
     }
@@ -397,6 +403,41 @@ impl VectorIndex {
         })
     }
 
+    /// Poda a lista de adjacência do nó `n` no nível `l`, guardando os
+    /// `m * 2` vizinhos mais próximos de `n`.
+    ///
+    /// # Porque a chave é calculada ANTES de ordenar
+    ///
+    /// A versão anterior chamava `self.dist2(...)` dentro do comparador do
+    /// `sort_by`, ou seja DUAS avaliações da métrica por comparação: com os
+    /// 33 elementos do caso típico (`DEFAULT_M = 16`, poda em `m * 2 + 1`)
+    /// isso media-se em 510 avaliações onde 33 bastavam. E não é trabalho
+    /// barato — cada `dist2` percorre os vectores em f64 e paga um `acosh`
+    /// (`PreparedQuery::dist2_prepared`); o `PreparedPoint` residente só
+    /// poupa as normas, nunca o produto interno. Isto está no caminho quente
+    /// de escrita (`View::apply` -> `insert`, uma vez por episódio com
+    /// embedding) e repete-se para cada um dos até `m` vizinhos ligados, em
+    /// cada nível (auditoria 2026-09-05, A27).
+    ///
+    /// A ordenação continua ESTÁVEL e sem critério de desempate novo: `dist2`
+    /// é uma função pura do par (nó, consulta), portanto ordenar pelas mesmas
+    /// chaves dá exactamente a mesma lista. Um desempate por id — ou um
+    /// `select_nth_unstable_by`, que é uma partição instável — mudaria qual
+    /// dos empatados sobrevive ao `truncate`, e com ele o grafo, o resultado
+    /// das buscas e o checkpoint: uma alteração de semântica disfarçada de
+    /// optimização.
+    fn podar_vizinhos(&mut self, n: u32, l: usize) {
+        let np = PreparedQuery::new(&self.metric, &self.nodes[n as usize].point);
+        // `mem::take` liberta o empréstimo mutável de `self.nodes` antes de
+        // chamar `self.dist2`, que empresta `&self`.
+        let nb = std::mem::take(&mut self.nodes[n as usize].neighbors[l]);
+        let mut decorados: Vec<(f64, u32)> =
+            nb.into_iter().map(|v| (self.dist2(v, &np), v)).collect();
+        decorados.sort_by(|a, b| a.0.total_cmp(&b.0));
+        decorados.truncate(self.m * 2);
+        self.nodes[n as usize].neighbors[l] = decorados.into_iter().map(|(_, v)| v).collect();
+    }
+
     pub fn insert(&mut self, event_id: EventId, lsn: Lsn, point: ProductPoint) {
         if self.by_event.contains_key(&event_id) {
             return; // idempotent replay
@@ -454,13 +495,7 @@ impl VectorIndex {
                     if l < nl {
                         self.nodes[n as usize].neighbors[l].push(id);
                         if self.nodes[n as usize].neighbors[l].len() > self.m * 2 {
-                            // prune: keep the m*2 closest
-                            let np =
-                                PreparedQuery::new(&self.metric, &self.nodes[n as usize].point);
-                            let mut nb = std::mem::take(&mut self.nodes[n as usize].neighbors[l]);
-                            nb.sort_by(|&a, &b| self.dist2(a, &np).total_cmp(&self.dist2(b, &np)));
-                            nb.truncate(self.m * 2);
-                            self.nodes[n as usize].neighbors[l] = nb;
+                            self.podar_vizinhos(n, l);
                         }
                     }
                 }
@@ -1697,6 +1732,142 @@ mod testes_coerencia_do_checkpoint {
         assert!(
             idx.nodes.iter().all(|n| n.level < 1024),
             "nivel sorteado com m = 1 saturou"
+        );
+    }
+}
+
+#[cfg(test)]
+mod testes_poda_de_vizinhos {
+    use super::*;
+
+    fn ponto(i: u32) -> ProductPoint {
+        ProductPoint {
+            hyp: vec![(i as f32) / 25.0, 0.1],
+            sph: vec![],
+            euc: vec![],
+        }
+    }
+
+    /// 40 nos em que `i` e `i + 20` partilham EXACTAMENTE o mesmo ponto — e
+    /// portanto a mesma distancia a qualquer outro no. Os empates sao o que
+    /// prende a ESTABILIDADE da ordenacao da poda.
+    fn indice_com_pontos_repetidos() -> VectorIndex {
+        let mut idx = VectorIndex::new(ProductMetric::default());
+        for i in 0..40u32 {
+            let id = EventId(ulid::Ulid::from_parts(i as u64, i as u128));
+            idx.insert(id, i as u64, ponto(i % 20));
+        }
+        idx
+    }
+
+    /// Lista de 33 vizinhos (um a mais do que `m * 2 = 32`, logo a poda corta)
+    /// com os pares empatados deliberadamente pela ordem id-ALTO primeiro: se
+    /// alguem acrescentar um desempate por id, a ordem muda e o teste morre.
+    fn lista_de_vizinhos() -> Vec<u32> {
+        let mut lista = Vec::new();
+        for i in 1..=13u32 {
+            lista.push(i + 20);
+            lista.push(i);
+        }
+        lista.extend(14..=20u32);
+        assert_eq!(lista.len(), 33);
+        lista
+    }
+
+    /// Assinatura de TODO o grafo: niveis e listas de adjacencia de cada no.
+    /// Qualquer aresta diferente muda o valor.
+    fn assinatura_do_grafo(idx: &VectorIndex) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let misturar = |h: &mut u64, v: u64| {
+            *h ^= v;
+            *h = h.wrapping_mul(0x1000_0000_01b3);
+        };
+        for no in &idx.nodes {
+            misturar(&mut h, no.level as u64);
+            for camada in &no.neighbors {
+                misturar(&mut h, camada.len() as u64);
+                for &v in camada {
+                    misturar(&mut h, v as u64);
+                }
+            }
+        }
+        h
+    }
+
+    /// Auditoria 2026-09-05, A27. A poda recalculava a distancia DENTRO do
+    /// comparador do `sort_by` — duas avaliacoes da metrica por comparacao,
+    /// ~2·n·log2(n) onde n bastavam, no caminho quente de escrita (`View::apply`
+    /// -> `insert`, uma vez por episodio com embedding). Cada avaliacao percorre
+    /// os vectores em f64 e paga um `acosh`.
+    #[test]
+    fn poda_calcula_a_distancia_uma_vez_por_vizinho() {
+        let mut idx = indice_com_pontos_repetidos();
+        let lista = lista_de_vizinhos();
+        let n = 39u32;
+        idx.nodes[n as usize].neighbors[0] = lista.clone();
+
+        DIST2_CALLS.with(|c| c.set(0));
+        idx.podar_vizinhos(n, 0);
+        let chamadas = DIST2_CALLS.with(|c| c.get());
+
+        assert_eq!(
+            chamadas,
+            lista.len(),
+            "a poda tem de avaliar a metrica uma vez por vizinho ({} vizinhos), nao uma vez por comparacao",
+            lista.len()
+        );
+    }
+
+    /// Guarda de neutralidade: a poda optimizada tem de dar EXACTAMENTE a
+    /// mesma lista que o caminho antigo, incluindo a ordem dos empatados (o
+    /// `sort_by` e estavel, e a ordem da lista de adjacencia e observavel no
+    /// checkpoint e na travessia). Um desempate novo — por id ou por uma
+    /// particao instavel tipo `select_nth_unstable_by` — seria uma mudanca de
+    /// grafo travestida de optimizacao.
+    #[test]
+    fn poda_preserva_exactamente_a_ordem_do_caminho_antigo() {
+        let mut idx = indice_com_pontos_repetidos();
+        let lista = lista_de_vizinhos();
+        let n = 39u32;
+
+        // Oraculo: literalmente o caminho antigo (chave recalculada dentro do
+        // comparador, `sort_by` estavel, truncar).
+        let np = PreparedQuery::new(&idx.metric, &idx.nodes[n as usize].point);
+        let empatados = lista
+            .windows(2)
+            .filter(|par| idx.dist2(par[0], &np) == idx.dist2(par[1], &np))
+            .count();
+        assert!(
+            empatados >= 13,
+            "o teste so prende a estabilidade se houver empates; encontrei {empatados}"
+        );
+        let mut esperado = lista.clone();
+        esperado.sort_by(|&a, &b| idx.dist2(a, &np).total_cmp(&idx.dist2(b, &np)));
+        esperado.truncate(idx.m * 2);
+
+        idx.nodes[n as usize].neighbors[0] = lista;
+        idx.podar_vizinhos(n, 0);
+
+        assert_eq!(
+            idx.nodes[n as usize].neighbors[0], esperado,
+            "a poda mudou a lista de adjacencia — a optimizacao nao e neutra"
+        );
+    }
+
+    /// Golden capturado com o codigo ANTERIOR a optimizacao da poda: a
+    /// construcao de um indice de 300 nos (que satura as listas e passa pela
+    /// poda muitas vezes) tem de produzir o MESMO grafo, aresta a aresta.
+    #[test]
+    fn a_optimizacao_da_poda_nao_muda_o_grafo_construido() {
+        let mut idx = VectorIndex::new(ProductMetric::default());
+        for i in 0..300u32 {
+            let id = EventId(ulid::Ulid::from_parts(i as u64, i as u128));
+            idx.insert(id, i as u64, ponto(i % 20));
+        }
+        assert_eq!(
+            assinatura_do_grafo(&idx),
+            10_880_861_797_930_025_899,
+            "a construcao deixou de dar o mesmo grafo que o caminho antigo"
         );
     }
 }
