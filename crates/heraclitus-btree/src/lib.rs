@@ -1795,8 +1795,19 @@ impl BEpsilonTree {
                 Msg::Delete(_) => {
                     if let Ok(i) = root.keys.binary_search(&key) {
                         if (root.slots[i].flags & FLAG_OVERFLOW) != 0 {
+                            // Auditoria 2026-09-05 (A45): o slot deixou MESMO
+                            // de ter cadeia — além do ponteiro há que apagar o
+                            // bit e o valor em memória. FLAG_OVERFLOW com
+                            // `overflow_page == 0` é a combinação que
+                            // `verify_tree_integrity` classifica como
+                            // corrupção; e limpar só o bit faz o `serialize`
+                            // voltar a inline-izar o valor grande e estourar a
+                            // página. As três linhas são indissociáveis.
                             self.recycle_overflow_chain(root.slots[i].overflow_page)?;
                             root.slots[i].overflow_page = 0;
+                            root.slots[i].length = 0;
+                            root.slots[i].flags &= !FLAG_OVERFLOW;
+                            root.vals[i].clear();
                         }
                         root.slots[i].flags |= FLAG_GHOST;
                     }
@@ -2048,8 +2059,16 @@ impl BEpsilonTree {
                             Msg::Delete(_) => {
                                 if let Ok(i) = child.keys.binary_search(&k) {
                                     if (child.slots[i].flags & FLAG_OVERFLOW) != 0 {
+                                        // A45: ver o ramo gémeo raiz-folha. Aqui
+                                        // o defeito não era mascarado por
+                                        // compactação nenhuma — o slot fantasma
+                                        // ia para o disco a afirmar que tinha
+                                        // cadeia, com o ponteiro a zero.
                                         self.recycle_overflow_chain(child.slots[i].overflow_page)?;
                                         child.slots[i].overflow_page = 0;
+                                        child.slots[i].length = 0;
+                                        child.slots[i].flags &= !FLAG_OVERFLOW;
+                                        child.vals[i].clear();
                                     }
                                     child.slots[i].flags |= FLAG_GHOST;
                                 }
