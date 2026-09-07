@@ -1437,6 +1437,14 @@ mod tests {
     /// `f64::INFINITY` para o primeiro desvio.  O caso degenerado tem de
     /// ficar limitado — como ja acontece no ramo IQR — em vez de saltar
     /// directamente para o topo da escala de severidade.
+    ///
+    /// Auditoria 2026-09-05, vaga 2, R74: este teste cobre a FINITUDE e a
+    /// concordancia com o ramo IQR — mas nao o VALOR do tecto: com
+    /// `weight 1.0` o reservatorio de quantis fica populado (ver a guarda
+    /// `weight >= 1.0` em `BehavioralProfile::update`), logo o ramo robusto
+    /// devolve sozinho `outlier_z + 1.0` e o `z.max(robust)` mascara
+    /// qualquer tecto em [0.0, outlier_z + 1.0].  Quem pina o VALOR do tecto
+    /// e `tecto_do_z_degenerado_tem_valor_pinado_sem_ramo_robusto`.
     #[test]
     fn feature_constante_nao_produz_score_infinito() {
         let policy = BaselinePolicy::default();
@@ -1501,6 +1509,62 @@ mod tests {
         assert_eq!(
             score.score, esperado,
             "z legitimo tem de passar intacto pelo tecto"
+        );
+    }
+
+    /// Auditoria 2026-09-05, vaga 2, R74: o teste
+    /// `feature_constante_nao_produz_score_infinito` alimenta o perfil com
+    /// `weight 1.0`, o que POPULA o reservatorio de quantis (ver a guarda
+    /// `weight >= 1.0` em `BehavioralProfile::update`).  Com 30 amostras
+    /// iguais o sketch fica degenerado, `iqr.abs() <= EPSILON` e
+    /// `value != median`, portanto o ramo IQR devolve sozinho
+    /// `outlier_z + 1.0`; como o score da feature e `z.max(robust)`, qualquer
+    /// tecto mutado no intervalo [0.0, outlier_z + 1.0] fica MASCARADO e
+    /// aquele teste continua verde.  Aqui o peso < 1.0 deixa o reservatorio
+    /// vazio, o ramo robusto vale 0.0 e o VALOR do tecto do z degenerado fica
+    /// pinado sem mascara nenhuma — um tecto acidentalmente reduzido
+    /// silenciaria a anomalia numa feature homogenea (ex.: `event.failure`).
+    #[test]
+    fn tecto_do_z_degenerado_tem_valor_pinado_sem_ramo_robusto() {
+        let policy = BaselinePolicy::default();
+        let mut profile = BehavioralProfile::new(entity(), ProfileTrustState::Trusted);
+        let alvo = FeatureId::new("event.failure").unwrap();
+        for lsn in 1..=30 {
+            profile
+                .update(lsn, &feature("event.failure", 0.0), &policy, 0.5)
+                .unwrap();
+        }
+        assert!(
+            !profile.quantiles.contains_key(&alvo),
+            "o ramo robusto tem de estar fora de jogo neste teste"
+        );
+        let moments = profile.moments.get(&alvo).unwrap();
+        assert_eq!(
+            moments.stddev(),
+            Some(0.0),
+            "a baseline tem de ficar degenerada"
+        );
+        assert_eq!(
+            moments.z_score(1.0),
+            Some(f64::INFINITY),
+            "so o ramo nao-finito do z interessa aqui"
+        );
+
+        let score = score_profile(&profile, &feature("event.failure", 1.0), &policy);
+        assert_eq!(
+            score.score,
+            policy.outlier_z + 1.0,
+            "o tecto do z degenerado mudou de valor: {}",
+            score.score
+        );
+        assert_eq!(
+            score.feature_scores.get(&alvo).copied(),
+            Some(policy.outlier_z + 1.0),
+            "o tecto tem de aparecer tambem no score por feature"
+        );
+        assert!(
+            score.anomalous,
+            "um tecto abaixo de outlier_z silenciaria a anomalia"
         );
     }
 
