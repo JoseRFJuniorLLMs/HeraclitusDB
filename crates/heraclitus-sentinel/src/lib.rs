@@ -1522,6 +1522,29 @@ impl SentinelRuntime {
             None,
             10_000,
         )?;
+        // Auditoria recursiva 2026-09-05, vaga 2, R116 — hastear as duas
+        // varreduras invariantes (A39) tornou-as INCONDICIONAIS: com ZERO
+        // decisões persistidas pagavam-se 3 varreduras completas do log para
+        // devolver o MESMO erro que o ciclo vazio já devolvia. E o caso
+        // degenerado é o caminho de FALHA (incidente desconhecido ou ainda sem
+        // decisões), ou seja o mais fácil de disparar — por engano ou de
+        // propósito. A guarda repõe o custo do caso degenerado (1 varredura)
+        // sem tocar no ganho O(D × log) -> O(log): sem decisões o ciclo não
+        // itera, logo nenhum `return Ok(())` é alcançável e a equivalência é
+        // exacta — as varreduras hasteadas não escrevem no log nem mutam
+        // estado, só contam em `l4_scans_total`.
+        //
+        // O erro sai de UMA só fonte para os dois caminhos: o retorno
+        // antecipado não pode passar a devolver uma falha diferente da que o
+        // ciclo vazio devolvia.
+        let sem_autorizacao = || {
+            SentinelError::Policy(PolicyError::Invalid(
+                "ação não possui autorização de policy persistida".into(),
+            ))
+        };
+        if decisions.is_empty() {
+            return Err(sem_autorizacao());
+        }
         // Auditoria 2026-09-05, A39 — estas duas varreduras estavam DENTRO do
         // ciclo, com argumentos que só dependem de `authorized` e nunca da
         // decisão a ser examinada: o custo era O(D × log) para um trabalho que
@@ -1607,9 +1630,7 @@ impl SentinelRuntime {
                 }
             }
         }
-        Err(SentinelError::Policy(PolicyError::Invalid(
-            "ação não possui autorização de policy persistida".into(),
-        )))
+        Err(sem_autorizacao())
     }
 
     /// Persist an immutable model activation record.  This records artifact
@@ -5738,6 +5759,67 @@ detection:
         assert_eq!(
             com_seis, 3,
             "tres varreduras: decisoes, propostas, aprovacoes"
+        );
+        runtime.shutdown();
+    }
+
+    /// Auditoria recursiva 2026-09-05, vaga 2, R116 — hastear as varreduras
+    /// invariantes (A39) tornou-as INCONDICIONAIS: com ZERO decisões
+    /// persistidas, rejeitar uma acção passou a custar 3 varreduras do log
+    /// onde o ciclo vazio custava 1, para devolver exactamente o mesmo erro.
+    ///
+    /// O caso degenerado não é teórico: É o caminho de falha (incidente
+    /// desconhecido), o mais fácil de disparar por engano ou de propósito.
+    /// O teste tranca as DUAS coisas — o custo E a falha devolvida — porque
+    /// uma guarda que devolvesse `Ok(())` também baixaria o custo, e seria
+    /// fail-open.
+    #[test]
+    fn rejeitar_sem_decisoes_custa_uma_unica_varredura() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let runtime = SentinelRuntime::start(log, l3_config()).unwrap().unwrap();
+        // De propósito: NENHUM episódio de decisão é apendido ao log.
+        let autorizada = AuthorizedAction {
+            authorization_id: "authz-nao-existe".into(),
+            incident_id: "inc-inexistente".into(),
+            action: SecurityAction::BlockIp {
+                ip: "203.0.113.25".into(),
+                ttl_secs: 60,
+            },
+            constraints: ExecutionConstraints {
+                scope: "test".into(),
+                max_ttl_secs: Some(60),
+                requires_approval: false,
+                allow_retries: false,
+            },
+            evidence: Vec::new(),
+            policy_version: "response-policy-v1".into(),
+        };
+
+        let antes = runtime.status().l4_scans_total;
+        let erro = runtime
+            .ensure_persisted_authorization(&autorizada)
+            .unwrap_err();
+        let custo = runtime.status().l4_scans_total - antes;
+
+        assert_eq!(
+            custo, 1,
+            "sem decisoes nao ha nada para casar: 1 varredura, nao 3"
+        );
+        // A guarda só pode mudar o CUSTO, nunca a semântica: o retorno
+        // antecipado tem de devolver a mesma falha que o ciclo vazio devolvia.
+        assert!(
+            erro.to_string()
+                .contains("não possui autorização de policy persistida"),
+            "a falha do caso degenerado mudou: {erro}"
         );
         runtime.shutdown();
     }
