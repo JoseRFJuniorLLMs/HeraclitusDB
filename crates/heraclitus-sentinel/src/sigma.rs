@@ -550,6 +550,21 @@ fn scalar_value(node: &YamlNode) -> Result<Value, RuleCompileError> {
 fn parse_severity(node: &YamlNode) -> Result<u8, RuleCompileError> {
     let value = scalar(node, "level")?;
     if let Ok(number) = value.parse::<u8>() {
+        // Auditoria 2026-09-05, vaga 2, R78 (irmão de A12): um `level:` numérico
+        // entrava até 255 enquanto um `level:` textual desconhecido já era
+        // recusado. A severidade do sinal é persistida num log APPEND-ONLY
+        // (`SecuritySignal::into_episode`), logo um valor fora de escala fica
+        // gravado para sempre. Ao contrário do ingest de incidentes
+        // (`correlation.rs`, que LIMITA porque o passado já contém sinais fora de
+        // escala e recusar pararia o replay), aqui a origem é um ficheiro de
+        // regras do operador lido no arranque: a fronteira certa é recusar cedo,
+        // tal como já se faz para os níveis textuais.
+        if number > crate::correlation::SEVERITY_MAXIMA {
+            return Err(RuleCompileError::InvalidSigma(format!(
+                "Sigma level `{value}` fora da escala 0-{}",
+                crate::correlation::SEVERITY_MAXIMA
+            )));
+        }
         return Ok(number);
     }
     match value.to_ascii_lowercase().as_str() {
@@ -883,6 +898,26 @@ detection:
                 Err(RuleCompileError::UnsupportedFeature(_))
             ));
         }
+    }
+
+    #[test]
+    fn nivel_sigma_numerico_fora_de_escala_e_recusado() {
+        // Auditoria 2026-09-05, vaga 2, R78: um `level:` textual invalido ja
+        // falhava, mas o numerico passava ate 255 e ficava gravado no episodio
+        // SecuritySignal (log append-only).
+        let fora = RULE.replace("level: high", "level: 200");
+        let erro = compile_sigma(&fora).unwrap_err();
+        assert!(
+            matches!(&erro, RuleCompileError::InvalidSigma(m) if m.contains("200")),
+            "esperava recusa do nivel fora de escala; veio {erro:?}"
+        );
+        // A fronteira nao pode apertar de mais: o topo legitimo continua a entrar.
+        for (texto, esperado) in [("level: 10", 10u8), ("level: 0", 0), ("level: 7", 7)] {
+            let regra = compile_sigma(&RULE.replace("level: high", texto)).unwrap();
+            assert_eq!(regra.severity, esperado, "{texto}");
+        }
+        // E o mapeamento textual mantem-se intacto.
+        assert_eq!(compile_sigma(RULE).unwrap().severity, 8);
     }
 
     #[test]

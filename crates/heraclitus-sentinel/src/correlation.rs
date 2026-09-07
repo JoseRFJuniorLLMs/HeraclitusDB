@@ -1368,7 +1368,7 @@ fn validate_entity(entity: &EntityRef) -> Result<(), CorrelationError> {
 /// (`l2.suspicious_severity <= 10`) e o filtro de incidentes (`min_severity`
 /// recusa > 10) já o afirmavam cada um por si. Nomeá-lo aqui evita que o
 /// próximo produtor volte a inventar uma escala.
-const SEVERITY_MAXIMA: u8 = 10;
+pub(crate) const SEVERITY_MAXIMA: u8 = 10;
 
 fn validate_score(score: f32) -> Result<(), CorrelationError> {
     if score.is_finite() && (0.0..=1.0).contains(&score) {
