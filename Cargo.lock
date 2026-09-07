@@ -3094,6 +3094,7 @@ version = "1.0.5"
 dependencies = [
  "bytemuck",
  "heraclitus-core",
+ "heraclitus-manifold",
  "pollster",
  "wgpu",
 ]

@@ -14,8 +14,11 @@
 //! - **Product manifold** (M20.3.1b): [`product_dist_cpu`] / [`topm_product`]
 //!   with [`PRODUCT_MANIFOLD_DIST_WGSL`] — the real index metric
 //!   `H^a(k1) x S^b(k2) x E^c`, `dist = sqrt(w1*d_H^2 + w2*d_S^2 + w3*d_E^2)`,
-//!   a 1:1 port of `heraclitus_manifold::ProductMetric::dist` (GPU in f32; CPU
-//!   reference in f64; the quantization absorbs the f32/f64 gap).
+//!   a port of `heraclitus_manifold::ProductMetric::dist` (GPU in f32; CPU
+//!   reference in f64; the quantization absorbs the f32/f64 gap). Que o porte
+//!   continua equivalente ao original NAO se afirma aqui -- prova-se no modulo
+//!   `testes_equivalencia_manifold` (auditoria 2026-09-05, vaga 2: a copia
+//!   dizia-se "1:1" e tinha divergido em silencio).
 //!
 //! The real wgpu dispatch is gated behind the `gpu` feature and always keeps the
 //! CPU reference as fallback; it self-validates against the CPU on real hardware
@@ -125,10 +128,24 @@ fn norm64(a: &[f64]) -> f64 {
     a.iter().map(|x| x * x).sum::<f64>().sqrt()
 }
 
-/// Poincaré-ball geodesic distance (curvature -c). 1:1 with `manifold::dist_hyp`.
+/// Poincaré-ball geodesic distance (curvature -c).
+///
+/// Esta e a referencia f64 que o kernel WGSL tem de igualar. A equivalencia com
+/// `heraclitus_manifold::dist_hyp` NAO e uma afirmacao do comentario: e provada
+/// pelo teste `testes_equivalencia_manifold::cpu_do_gpu_e_1_1_com_o_manifold`.
+/// (Auditoria 2026-09-05, vaga 2: o comentario anterior dizia "1:1 with
+/// `manifold::dist_hyp`" e era falso -- faltavam aqui as duas recusas abaixo.)
 fn dist_hyp_cpu(u: &[f32], v: &[f32], c: f64, ball_eps: f64) -> f64 {
     if u.is_empty() {
         return 0.0;
+    }
+    // Auditoria 2026-09-05, vaga 2 (R59): informacao incomparavel = infinitamente
+    // longe. O `zip` mais abaixo TRUNCA pelo mais curto, e um candidato mais
+    // curto dava diff2 = 0 -> arg = 1.0 -> acosh(1) = 0: distancia ZERO de toda
+    // a gente. A guarda de vazio corre PRIMEIRO de proposito -- uma consulta
+    // parcial (so `hyp` preenchido) e legitima e continua a nao contribuir.
+    if u.len() != v.len() {
+        return f64::INFINITY;
     }
     let to64 = |x: &[f32]| -> Vec<f64> { x.iter().map(|&z| z as f64).collect() };
     let max_norm = (1.0 - ball_eps) / c.sqrt();
@@ -147,13 +164,31 @@ fn dist_hyp_cpu(u: &[f32], v: &[f32], c: f64, ball_eps: f64) -> f64 {
     let diff2: f64 = u.iter().zip(&v).map(|(a, b)| (a - b) * (a - b)).sum();
     let denom = (1.0 - c * nu * nu) * (1.0 - c * nv * nv);
     let arg = 1.0 + (2.0 * c * diff2 / denom);
+    // Auditoria 2026-09-05, vaga 2 (R59): guarda anti-NaN. Um embedding com NaN
+    // sobrevive a ingestao (`project_to_ball` so recorta a norma, e `n > max_norm`
+    // e falso para NaN) e dava aqui arg = NaN; como `NaN.max(1.0) == 1.0` em Rust
+    // e `acosh(1) = 0`, o vector corrompido ficava a distancia ZERO de tudo. Como
+    // `execute_op_quantize` converte NaN em 0 -- a chave MINIMA --, um NaN sem
+    // guarda GANHA o Top-M e expulsa os vizinhos verdadeiros do oversample.
+    if !arg.is_finite() {
+        return f64::INFINITY;
+    }
     (1.0 / c.sqrt()) * arg.max(1.0).acosh()
 }
 
-/// Spherical geodesic distance (radius 1/sqrt(k2)). 1:1 with `manifold::dist_sph`.
+/// Spherical geodesic distance (radius 1/sqrt(k2)).
+///
+/// Referencia f64 do kernel WGSL; a equivalencia com
+/// `heraclitus_manifold::dist_sph` e provada por
+/// `testes_equivalencia_manifold::cpu_do_gpu_e_1_1_com_o_manifold`.
 fn dist_sph_cpu(u: &[f32], v: &[f32], k2: f64) -> f64 {
     if u.is_empty() {
         return 0.0;
+    }
+    // Auditoria 2026-09-05, vaga 2 (R59): ver `dist_hyp_cpu` -- comprimentos
+    // diferentes sao incomparaveis, nao "iguais na parte comum".
+    if u.len() != v.len() {
+        return f64::INFINITY;
     }
     let to64 = |x: &[f32]| -> Vec<f64> { x.iter().map(|&z| z as f64).collect() };
     let (u, v) = (to64(u), to64(v));
@@ -163,19 +198,46 @@ fn dist_sph_cpu(u: &[f32], v: &[f32], k2: f64) -> f64 {
     }
     let dotp: f64 = u.iter().zip(&v).map(|(a, b)| a * b).sum();
     let cos = (dotp / (nu * nv)).clamp(-1.0, 1.0);
+    // Auditoria 2026-09-05, vaga 2 (R59): com NaN, `clamp(-1, 1)` devolve NaN e
+    // `acos(NaN) = NaN` -- e um NaN quantiza para 0, a chave minima. Recusar.
+    if !cos.is_finite() {
+        return f64::INFINITY;
+    }
     cos.acos() / k2.sqrt()
 }
 
-/// Euclidean distance. 1:1 with `manifold::dist_euc`.
+/// Euclidean distance.
+///
+/// Referencia f64 do kernel WGSL; a equivalencia com
+/// `heraclitus_manifold::dist_euc` e provada por
+/// `testes_equivalencia_manifold::cpu_do_gpu_e_1_1_com_o_manifold`.
 fn dist_euc_cpu(u: &[f32], v: &[f32]) -> f64 {
     if u.is_empty() {
         return 0.0;
     }
-    u.iter()
+    // Auditoria 2026-09-05, vaga 2 (R59): ver `dist_hyp_cpu` -- o `zip` truncava
+    // pelo mais curto e um candidato mais curto ficava a distancia zero de tudo.
+    if u.len() != v.len() {
+        return f64::INFINITY;
+    }
+    // Auditoria 2026-09-05, vaga 2 (R59): a diferenca e feita em f64, nao em f32.
+    // `(a - b) as f64` arredondava a subtraccao para f32 ANTES de a promover, o
+    // que afastava esta "referencia f64" do `manifold::dist_euc` em ~7e-9
+    // relativo (medido) -- pequeno, mas suficiente para a palavra "1:1" ser
+    // falsa e para o teste de equivalencia nao poder ser estrito.
+    let s: f64 = u
+        .iter()
         .zip(v)
-        .map(|(a, b)| ((a - b) as f64) * ((a - b) as f64))
-        .sum::<f64>()
-        .sqrt()
+        .map(|(a, b)| {
+            let t = *a as f64 - *b as f64;
+            t * t
+        })
+        .sum();
+    // Guarda anti-NaN/infinito: `sqrt(NaN) = NaN` e NaN quantiza para 0.
+    if !s.is_finite() {
+        return f64::INFINITY;
+    }
+    s.sqrt()
 }
 
 /// Batch product-manifold distance: the f64 reference the WGSL kernel must match.
@@ -213,6 +275,13 @@ pub fn product_dist_cpu(query: &[f32], vectors: &[f32], sig: &ProductSig) -> Vec
             let dh = dist_hyp_cpu(qh, rh, c1, ball_eps);
             let ds = dist_sph_cpu(qs, rs, k2);
             let de = dist_euc_cpu(qe, re);
+            // Auditoria 2026-09-05, vaga 2 (R59): propagar o nao-finito ANTES de
+            // aplicar os pesos. Com um peso a 0.0, `0.0 * inf` da NaN e o
+            // candidato recusado voltava a ordenar como o MELHOR de todos (NaN
+            // quantiza para 0). Mesma politica de `ProductMetric::dist`.
+            if !dh.is_finite() || !ds.is_finite() || !de.is_finite() {
+                return f64::INFINITY;
+            }
             (w1 * dh * dh + w2 * ds * ds + w3 * de * de).sqrt()
         })
         .collect()
@@ -822,4 +891,313 @@ mod limiar_tests {
         GPU_MIN_VECTORS <= 50_000,
         "a 10.000 a GPU ja ganha 1.5x -- um limiar alto demais desperdica isso"
     );
+}
+
+// ============================================================================
+// Auditoria recursiva 2026-09-05, vaga 2 (R59)
+// ----------------------------------------------------------------------------
+// As copias privadas da metrica (`dist_hyp_cpu`/`dist_sph_cpu`/`dist_euc_cpu`)
+// diziam ser "1:1 with manifold::dist_*" sem que nada o verificasse -- e nao
+// eram. Este modulo e a prova: enquanto ele existir, a copia nao pode voltar a
+// divergir do `heraclitus_manifold` em silencio. APAGA-LO E A MUTACAO A EVITAR.
+// ============================================================================
+#[cfg(test)]
+mod testes_equivalencia_manifold {
+    use super::*;
+    use heraclitus_core::ProductPoint;
+    use heraclitus_manifold::{dist_euc, dist_hyp, dist_sph, ProductMetric, BALL_EPS};
+
+    /// Gerador congruencial linear (Numerical Recipes). Deterministico e sem
+    /// dependencia nova: o caso de teste tem de ser reproduzivel byte a byte.
+    struct Lcg(u32);
+
+    impl Lcg {
+        fn passo(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            self.0
+        }
+        /// Uniforme em `[-amp, amp]`.
+        fn uniforme(&mut self, amp: f32) -> f32 {
+            let u = (self.passo() >> 8) as f32 / (1u32 << 24) as f32; // [0,1)
+            (u * 2.0 - 1.0) * amp
+        }
+    }
+
+    /// (a) mesma CLASSIFICACAO finito/nao-finito e (b) mesmo valor no caso
+    /// finito. A classificacao e comparada por `is_finite` (e nao por igualdade)
+    /// porque o manifold devolve NaN nalguns ramos onde nos devolvemos INFINITY:
+    /// ambos significam "recusado". O que conta para o ranking -- o valor da
+    /// recusa depois dos pesos -- e verificado a parte, em
+    /// `product_dist_cpu_e_1_1_com_product_metric`.
+    fn compara(componente: &str, i: usize, nosso: f64, manifold: f64) {
+        assert_eq!(
+            nosso.is_finite(),
+            manifold.is_finite(),
+            "[{componente} i={i}] classificacao divergente: copia do gpu = {nosso}, \
+             heraclitus_manifold = {manifold}"
+        );
+        if nosso.is_finite() {
+            // Tolerancia: o manifold dobra o clamp da bola em factores de escala
+            // sobre os f32 crus, a copia materializa vectores f64 ja clampados.
+            // Matematicamente identico, ultimos bits diferentes.
+            assert!(
+                (nosso - manifold).abs() <= 1e-9 * (1.0 + nosso.abs()),
+                "[{componente} i={i}] valor divergente: copia do gpu = {nosso}, \
+                 heraclitus_manifold = {manifold}"
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_do_gpu_e_1_1_com_o_manifold() {
+        const C1: f64 = 1.0;
+        const K2: f64 = 1.0;
+        let sig = ProductSig::default();
+        let mut rng = Lcg(0x5EED_1234);
+
+        for i in 0..200usize {
+            // Amplitude variavel: acima de ~0.31 a norma esperada de 32
+            // coordenadas passa `max_norm`, portanto boa parte dos casos exerce
+            // o clamp da bola de Poincare (o ramo onde as duas implementacoes
+            // mais podem divergir).
+            let amp = 0.05 + (i % 10) as f32 * 0.09;
+            let hu: Vec<f32> = (0..sig.a).map(|_| rng.uniforme(amp)).collect();
+            let mut hv: Vec<f32> = (0..sig.a).map(|_| rng.uniforme(amp)).collect();
+            let mut su: Vec<f32> = (0..sig.b).map(|_| rng.uniforme(1.0)).collect();
+            let mut sv: Vec<f32> = (0..sig.b).map(|_| rng.uniforme(1.0)).collect();
+            let eu: Vec<f32> = (0..sig.c).map(|_| rng.uniforme(3.0)).collect();
+            let mut ev: Vec<f32> = (0..sig.c).map(|_| rng.uniforme(3.0)).collect();
+
+            // Casos-limite deterministas, um por iteracao.
+            match i % 13 {
+                1 => hv[i % sig.a] = f32::NAN,
+                2 => sv[i % sig.b] = f32::NAN,
+                3 => ev[i % sig.c] = f32::NAN,
+                4 => hv[i % sig.a] = f32::INFINITY,
+                5 => sv[i % sig.b] = f32::INFINITY,
+                6 => ev[i % sig.c] = f32::INFINITY,
+                7 => su = vec![0.0; sig.b], // vector nulo na esfera
+                8 => sv = vec![0.0; sig.b],
+                _ => {}
+            }
+
+            // BALL_EPS exacto (f64): `ProductSig::ball_eps` e f32 e
+            // `1e-5f32 as f64 != BALL_EPS`, o que deslocaria o raio do clamp no
+            // 13.o digito -- ruido que nada tem a ver com a equivalencia.
+            compara(
+                "hyp",
+                i,
+                dist_hyp_cpu(&hu, &hv, C1, BALL_EPS),
+                dist_hyp(&hu, &hv, C1),
+            );
+            compara("sph", i, dist_sph_cpu(&su, &sv, K2), dist_sph(&su, &sv, K2));
+            compara("euc", i, dist_euc_cpu(&eu, &ev), dist_euc(&eu, &ev));
+        }
+    }
+
+    #[test]
+    fn product_dist_cpu_e_1_1_com_product_metric() {
+        let sig = ProductSig::default();
+        let dim = sig.a + sig.b + sig.c;
+        let metrica = ProductMetric::default();
+        let mut rng = Lcg(0x0BAD_F00D);
+
+        for i in 0..200usize {
+            // Amplitude pequena na componente hiperbolica DE PROPOSITO: aqui o
+            // `ball_eps` entra em f32 (via `ProductSig`) e o clamp seria a unica
+            // fonte de divergencia; o clamp ja e exercido com o eps exacto em
+            // `cpu_do_gpu_e_1_1_com_o_manifold`.
+            let ponto = |rng: &mut Lcg| ProductPoint {
+                hyp: (0..sig.a).map(|_| rng.uniforme(0.12)).collect(),
+                sph: (0..sig.b).map(|_| rng.uniforme(1.0)).collect(),
+                euc: (0..sig.c).map(|_| rng.uniforme(3.0)).collect(),
+            };
+            let q = ponto(&mut rng);
+            let mut r = ponto(&mut rng);
+            match i % 7 {
+                1 => r.hyp[i % sig.a] = f32::NAN,
+                2 => r.sph[i % sig.b] = f32::NAN,
+                3 => r.euc[i % sig.c] = f32::NAN,
+                _ => {}
+            }
+
+            let mut query = Vec::with_capacity(dim);
+            query.extend_from_slice(&q.hyp);
+            query.extend_from_slice(&q.sph);
+            query.extend_from_slice(&q.euc);
+            let mut linha = Vec::with_capacity(dim);
+            linha.extend_from_slice(&r.hyp);
+            linha.extend_from_slice(&r.sph);
+            linha.extend_from_slice(&r.euc);
+
+            let nosso = product_dist_cpu(&query, &linha, &sig)[0];
+            let deles = metrica.dist(&q, &r);
+            assert_eq!(
+                nosso.is_infinite(),
+                deles.is_infinite(),
+                "[produto i={i}] recusa divergente: copia do gpu = {nosso}, \
+                 ProductMetric::dist = {deles}"
+            );
+            if nosso.is_finite() {
+                assert!(
+                    (nosso - deles).abs() <= 1e-9 * (1.0 + nosso.abs()),
+                    "[produto i={i}] valor divergente: copia do gpu = {nosso}, \
+                     ProductMetric::dist = {deles}"
+                );
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Auditoria recursiva 2026-09-05, vaga 2 (R59) — recusa de candidatos
+// incomparaveis (NaN/infinito) e de dimensoes diferentes.
+// ============================================================================
+#[cfg(test)]
+mod testes_recusa {
+    use super::*;
+    use heraclitus_manifold::BALL_EPS;
+
+    /// Consulta valida + duas linhas: uma comparavel e afastada, outra igual a
+    /// consulta em tudo EXCEPTO um NaN numa coordenada hiperbolica -- assim so a
+    /// componente hyp decide o ranking.
+    fn cenario(sig: &ProductSig) -> (Vec<f32>, Vec<f32>) {
+        let dim = sig.a + sig.b + sig.c;
+        let mut query = vec![0.0f32; dim];
+        query[0] = 0.10;
+        query[sig.a] = 1.0; // esfera unitaria
+        query[sig.a + sig.b] = 0.5;
+
+        let mut boa = vec![0.0f32; dim];
+        boa[0] = 0.40;
+        boa[sig.a] = 1.0;
+        boa[sig.a + sig.b] = 0.9;
+
+        let mut envenenada = query.clone();
+        envenenada[1] = f32::NAN;
+
+        let mut vectors = Vec::with_capacity(2 * dim);
+        vectors.extend_from_slice(&boa); // indice 0
+        vectors.extend_from_slice(&envenenada); // indice 1
+        (query, vectors)
+    }
+
+    /// Sem a guarda anti-NaN, `arg` = NaN, `NaN.max(1.0) == 1.0` em Rust e
+    /// `acosh(1) = 0`: o vector envenenado ficava a distancia ZERO. Pior, uma
+    /// distancia final NaN quantiza para 0 (`execute_op_quantize`), a chave
+    /// MINIMA -- o envenenado ficava em PRIMEIRO lugar do Top-M e expulsava os
+    /// vizinhos verdadeiros do oversample antes de o rescore poder arbitrar.
+    #[test]
+    fn nan_no_candidato_nao_fica_a_distancia_zero() {
+        let sig = ProductSig::default();
+        let (query, vectors) = cenario(&sig);
+
+        let d = product_dist_cpu(&query, &vectors, &sig);
+        assert!(d[0].is_finite(), "a linha comparavel tem distancia finita");
+        assert!(
+            d[1].is_infinite(),
+            "candidato com NaN tem de ser recusado (infinito), nao {}",
+            d[1]
+        );
+
+        let top = topm_product_cpu(&query, &vectors, &sig, 1, 1e6);
+        assert_eq!(
+            top[0].index, 0,
+            "o Top-1 tem de ser a linha comparavel, nao a envenenada com NaN"
+        );
+    }
+
+    /// Um peso a 0.0 ressuscitava o candidato recusado: `0.0 * inf = NaN`, e NaN
+    /// quantiza para 0 (primeiro lugar). Por isso o nao-finito propaga-se ANTES
+    /// de os pesos serem aplicados -- mesma politica de `ProductMetric::dist`.
+    #[test]
+    fn peso_a_zero_nao_ressuscita_o_candidato_recusado() {
+        let sig = ProductSig {
+            weights: [0.0, 1.0, 1.0],
+            ..ProductSig::default()
+        };
+        let (query, vectors) = cenario(&sig);
+
+        let d = product_dist_cpu(&query, &vectors, &sig);
+        assert!(d[0].is_finite(), "a linha comparavel tem distancia finita");
+        assert!(
+            d[1].is_infinite(),
+            "com peso hyp a 0.0 o candidato recusado tem de continuar infinito, nao {}",
+            d[1]
+        );
+
+        let top = topm_product_cpu(&query, &vectors, &sig, 1, 1e6);
+        assert_eq!(
+            top[0].index, 0,
+            "um peso a zero nao pode devolver o primeiro lugar ao candidato com NaN"
+        );
+    }
+
+    /// O ramo que a API publica de hoje nao alcanca (`product_dist_cpu` fatia
+    /// query e linha com os mesmos offsets), mas que a copia tem de manter para
+    /// nao voltar a divergir do manifold quando alguem lhe mudar os chamadores.
+    #[test]
+    fn dist_de_comprimentos_diferentes_e_infinita() {
+        let u = [0.1f32, 0.2, 0.3];
+        for v in [&[][..], &[0.9f32][..], &[0.1f32, 0.2][..]] {
+            assert!(
+                dist_hyp_cpu(&u, v, 1.0, BALL_EPS).is_infinite(),
+                "hyp: comprimentos {} vs {} sao incomparaveis",
+                u.len(),
+                v.len()
+            );
+            assert!(
+                dist_sph_cpu(&u, v, 1.0).is_infinite(),
+                "sph: comprimentos {} vs {} sao incomparaveis",
+                u.len(),
+                v.len()
+            );
+            assert!(
+                dist_euc_cpu(&u, v).is_infinite(),
+                "euc: comprimentos {} vs {} sao incomparaveis",
+                u.len(),
+                v.len()
+            );
+        }
+    }
+
+    /// A guarda de vazio tem de correr ANTES da recusa por comprimento: uma
+    /// consulta parcial (so uma das componentes preenchida, como a que
+    /// `engine::nearest` constroi) e legitima e nao contribui com as componentes
+    /// que nao tem.
+    #[test]
+    fn consulta_parcial_continua_a_nao_contribuir() {
+        assert_eq!(dist_hyp_cpu(&[], &[0.1, 0.2], 1.0, BALL_EPS), 0.0);
+        assert_eq!(dist_sph_cpu(&[], &[0.1, 0.2], 1.0), 0.0);
+        assert_eq!(dist_euc_cpu(&[], &[0.1, 0.2]), 0.0);
+    }
+
+    /// A recusa tem de ser INFINITY e nao NaN. A diferenca nao e cosmetica: o
+    /// `execute_op_quantize` leva NaN a 0 (a chave MINIMA, primeiro lugar do
+    /// Top-M) e INFINITY a `u64::MAX` (ultimo lugar). Um `is_finite()` nao
+    /// distingue os dois -- por isso este teste usa `is_infinite()`.
+    #[test]
+    fn componente_com_nan_e_recusada_com_infinito_e_nao_com_nan() {
+        let u = [0.1f32, 0.2, 0.3];
+        for (nome, v) in [
+            ("NaN", [0.1f32, f32::NAN, 0.3]),
+            ("infinito", [0.1f32, f32::INFINITY, 0.3]),
+        ] {
+            assert!(
+                dist_hyp_cpu(&u, &v, 1.0, BALL_EPS).is_infinite(),
+                "hyp com {nome} tem de dar INFINITY, deu {}",
+                dist_hyp_cpu(&u, &v, 1.0, BALL_EPS)
+            );
+            assert!(
+                dist_sph_cpu(&u, &v, 1.0).is_infinite(),
+                "sph com {nome} tem de dar INFINITY, deu {}",
+                dist_sph_cpu(&u, &v, 1.0)
+            );
+            assert!(
+                dist_euc_cpu(&u, &v).is_infinite(),
+                "euc com {nome} tem de dar INFINITY, deu {}",
+                dist_euc_cpu(&u, &v)
+            );
+        }
+    }
 }

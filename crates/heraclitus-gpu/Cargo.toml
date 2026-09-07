@@ -12,6 +12,13 @@ wgpu = { version = "24", optional = true }
 pollster = { version = "0.4", optional = true }
 bytemuck = { version = "1", optional = true }
 
+[dev-dependencies]
+# Auditoria recursiva 2026-09-05, vaga 2 (R59): so para o teste de equivalencia
+# `cpu_do_gpu_e_1_1_com_o_manifold`. Dev-dep de proposito -- nao acrescenta
+# dependencia de runtime ao crate e nao ha ciclo (heraclitus-manifold nao
+# depende de heraclitus-gpu).
+heraclitus-manifold = { workspace = true }
+
 [features]
 # Default build is pure CPU (no GPU deps pulled). `gpu` enables the real wgpu
 # runtime dispatch (M20.3.1); it always keeps the CPU reference as fallback and
