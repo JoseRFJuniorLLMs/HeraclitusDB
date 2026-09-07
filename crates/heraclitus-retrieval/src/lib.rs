@@ -584,4 +584,45 @@ mod tests {
             saida.iter().map(|(c, s)| (c.bm25, *s)).collect::<Vec<_>>()
         );
     }
+
+    /// Auditoria 2026-09-05, vaga 2 (R71) — a guarda `piso > 0.0`.
+    ///
+    /// A calibração MULTIPLICA o tf pelo piso, logo um piso não-positivo
+    /// destruiria exactamente a informação que ela existe para preservar: com
+    /// piso = 0.0 todos os hits quentes colapsam em 0.0, e com piso < 0.0 saem
+    /// negativos e são todos achatados pelo `max(0.0)` do esmagamento — em
+    /// qualquer dos casos a ordem interna do canal quente morre e o `tf` deixa
+    /// de significar seja o que for. Um BM25 não-positivo é lixo do canal e não
+    /// uma medição (o índice usa o idf suavizado `ln((n-df+0.5)/(df+0.5) + 1)`,
+    /// estritamente positivo), pelo que a resposta certa é NÃO calibrar contra
+    /// ele e manter o tf cru — o mesmo que se faz quando não há canal medido de
+    /// todo. `retrieve` é API pública e sanea os dois canais precisamente por
+    /// eles virem de fora; esta guarda é a metade dessa defesa que faltava
+    /// provar.
+    #[test]
+    fn piso_nao_positivo_nao_achata_o_canal_quente() {
+        for piso_lixo in [0.0_f32, -2.0] {
+            let medido = EventId::new();
+            let forte = EventId::new();
+            let fraco = EventId::new();
+            let saida = retrieve(
+                "q",
+                lote_texto(vec![(medido, piso_lixo)], vec![(forte, 5.0), (fraco, 1.0)]),
+                &reranker_de_texto(),
+                3,
+            );
+            assert!(
+                score_de(&saida, forte) > score_de(&saida, fraco),
+                "piso={piso_lixo} achatou a ordem do canal quente (tf=5 vs tf=1): {:?}",
+                saida.iter().map(|(c, s)| (c.bm25, *s)).collect::<Vec<_>>()
+            );
+            for (c, s) in &saida {
+                assert!(
+                    s.is_finite(),
+                    "score não-finito com piso={piso_lixo} para {:?}: {s}",
+                    c.bm25
+                );
+            }
+        }
+    }
 }
