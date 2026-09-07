@@ -548,9 +548,16 @@ impl IcpBrasilTimestampVerifier {
             )
         })?;
         let attrs_der = reencode_signed_attrs(attrs)?;
-        verificar_assinatura(
+        // No CMS, o `signatureAlgorithm` para RSA PKCS#1 v1.5 e `rsaEncryption`
+        // (RFC 3370 §3.2) — um OID que NAO carrega digest. O digest vem do
+        // `signer.digest_alg`. Passa-se aqui de proposito; a verificacao de
+        // cadeia X.509 (que usa `verificar_assinatura` sem digest externo)
+        // continua a exigir o OID combinado.
+        let digest_cms = crate::algoritmos::Digest::do_oid(&signer.digest_alg.oid);
+        crate::algoritmos::verificar_com_digest(
             signer_cert,
             &signer.signature_algorithm,
+            digest_cms,
             &attrs_der,
             signer.signature.as_bytes(),
             &self.policy.algoritmos,
@@ -975,10 +982,21 @@ fn mesmo_certificado(a: &Certificate, b: &Certificate) -> bool {
 /// As extensões do `TSTInfo` chegam como um `Any` opaco. Descodifica-se o
 /// suficiente para ver a criticidade de cada uma.
 fn verificar_extensoes_tstinfo(exts: &der::Any) -> Result<(), CompError> {
-    let der_bytes = exts
-        .to_der()
+    // `extensions [1] IMPLICIT Extensions` — o `Any` guarda a etiqueta de
+    // CONTEXTO [1], nao a de SEQUENCE. `to_der()` devolvia-a com essa etiqueta
+    // posta e `Extensions::from_der` espera um SEQUENCE (0x30), portanto
+    // qualquer carimbo que trouxesse extensoes era recusado como ASN.1
+    // malformado — e a verificacao de criticidade que esta funcao existe para
+    // fazer nunca chegava a correr. A RFC 3161 §2.4.2 permite o campo, logo
+    // eram tokens legitimos a serem rejeitados.
+    //
+    // IMPLICIT quer dizer exactamente isto: o conteudo e o do SEQUENCE e so a
+    // etiqueta foi substituida. Repo-la e a leitura correcta, e nao uma
+    // tolerancia — um campo com outra etiqueta continua a falhar aqui.
+    let como_sequencia = der::asn1::AnyRef::new(der::Tag::Sequence, exts.value())
+        .and_then(|any| any.to_der())
         .map_err(|e| verify_err(format!("extensões do TSTInfo não recodificam: {e}")))?;
-    let lista = x509_cert::ext::Extensions::from_der(&der_bytes)
+    let lista = x509_cert::ext::Extensions::from_der(&como_sequencia)
         .map_err(|e| verify_err(format!("extensões do TSTInfo inválidas: {e}")))?;
     for ext in lista.iter() {
         if ext.critical {
@@ -2679,5 +2697,54 @@ mod testes_inspect {
             .inspect(&token, AGORA_S * 1_000)
             .unwrap_err();
         assert!(erro.to_string().contains("âncora"), "{erro}");
+    }
+}
+
+#[cfg(test)]
+mod testes_extensoes_tstinfo {
+    use super::*;
+    use x509_cert::ext::Extension;
+
+    /// Constrói o campo `extensions [1] IMPLICIT Extensions` como uma ACT o
+    /// emite: o conteúdo é o de um SEQUENCE, com a etiqueta trocada para [1].
+    fn campo(critica: bool) -> Any {
+        let ext = Extension {
+            extn_id: "1.3.6.1.4.1.99999.1".parse().unwrap(),
+            critical: critica,
+            extn_value: OctetString::new(vec![0x05, 0x00]).unwrap(),
+        };
+        let sequencia = vec![ext].to_der().unwrap();
+        // Salta o cabeçalho do SEQUENCE e fica com o conteúdo, que é o que a
+        // etiqueta IMPLICIT [1] passa a envolver.
+        let interior = der::asn1::AnyRef::from_der(&sequencia).unwrap();
+        Any::new(
+            der::Tag::ContextSpecific {
+                constructed: true,
+                number: der::TagNumber::N1,
+            },
+            interior.value(),
+        )
+        .unwrap()
+    }
+
+    /// A RFC 3161 §2.4.2 permite o campo `extensions`. Antes desta correcção,
+    /// qualquer carimbo que o trouxesse era recusado como ASN.1 malformado —
+    /// porque a etiqueta de contexto [1] era passada a um descodificador que
+    /// espera um SEQUENCE. Eram tokens legítimos a serem rejeitados.
+    #[test]
+    fn um_carimbo_com_extensoes_nao_criticas_e_aceite() {
+        verificar_extensoes_tstinfo(&campo(false))
+            .expect("extensão não crítica não invalida o carimbo");
+    }
+
+    /// E a verificação que a função existe para fazer passa mesmo a correr: uma
+    /// instrução crítica que não se sabe cumprir recusa-se. Antes, este caminho
+    /// era inalcançável — morria no parsing antes de chegar aqui.
+    #[test]
+    fn uma_extensao_critica_desconhecida_recusa_o_carimbo() {
+        let erro = verificar_extensoes_tstinfo(&campo(true))
+            .unwrap_err()
+            .to_string();
+        assert!(erro.contains("crítica"), "{erro}");
     }
 }

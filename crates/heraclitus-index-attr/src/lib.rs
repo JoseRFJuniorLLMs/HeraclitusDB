@@ -77,6 +77,24 @@ const SKIP_VALUES: &[&str] = &["", "0", "-1", "nao", "sim", "true", "false", "nu
 /// (CPF/CNPJ/códigos/razão social) ficam muito abaixo.
 const MAX_VALUE_LEN: usize = 80;
 
+/// Um par (campo, valor) de utilizador é indexável? Se NÃO, o índice de
+/// atributos nunca o guardou, e uma procura por ele NÃO PODE ser respondida
+/// pelo índice — quem perguntar tem de varrer.
+///
+/// Isto é a mesma decisão que o *ingest* toma ao construir o índice, extraída
+/// para uma função pública por uma razão concreta: quando o planner assumia que
+/// o índice sabia responder a tudo, uma procura por um valor ignorado
+/// (`sim`, `true`, `0`, ou um texto longo) devolvia ZERO linhas sobre dados que
+/// existem — o índice vazio era tomado como resposta final em vez de sinal de
+/// "pergunta o log". O `Engine` chama isto para decidir se pode usar o índice
+/// ou se tem de recuar para o varrimento.
+///
+/// O valor é comparado JÁ APARADO, como o *ingest* o guarda.
+pub fn valor_indexavel(valor: &str) -> bool {
+    let v = valor.trim();
+    v.len() <= MAX_VALUE_LEN && !SKIP_VALUES.iter().any(|s| s.eq_ignore_ascii_case(v))
+}
+
 /// Magic do checkpoint comprimido. Um ficheiro v1 (bincode cru) nunca começa
 /// por estes bytes, por isso a presença dele distingue os formatos sem ambiguidade.
 const MAGIC_V2: &[u8; 4] = b"HATR";
@@ -631,6 +649,20 @@ impl AttrIndex {
         }
     }
 
+    /// Este índice alguma vez viu este campo? O(1) — só o dicionário.
+    ///
+    /// Existe para quem consulta poder distinguir "não há correspondências" de
+    /// "este índice NÃO SABE responder a isto". `lookup`/`lookup_range`
+    /// devolvem vazio nos dois casos, e um chamador que trate esse vazio como
+    /// autoritativo responde ZERO linhas sobre dados que existem — foi o que
+    /// aconteceu com os campos do envelope (`ts_hlc`), que o pós-filtro do
+    /// planner serve mas que o `apply` daqui nunca indexa (auditoria
+    /// 2026-09-05, A48/A49). O `field_entries` faz a mesma distinção mas é
+    /// O(#chaves do índice): não serve para o caminho quente de uma query.
+    pub fn conhece_campo(&self, field: &str) -> bool {
+        self.inner.dictionary.fields.id(field).is_some()
+    }
+
     /// LSNs (ordenados) dos eventos cujo `field == value`. Vazio se nada bate.
     pub fn lookup(&self, field: &str, value: &str) -> &[Lsn] {
         self.inner
@@ -979,10 +1011,10 @@ impl View for AttrIndex {
 
         for (field, value) in &event.attrs {
             let v = value.trim();
-            // `to_ascii_lowercase()` alocava uma `String` por atributo de cada
-            // evento, so para a deitar fora a seguir. `eq_ignore_ascii_case`
-            // compara sem alocar e da a mesma resposta.
-            if v.len() > MAX_VALUE_LEN || SKIP_VALUES.iter().any(|s| s.eq_ignore_ascii_case(v)) {
+            // A MESMA decisão que `valor_indexavel` — e agora é literalmente
+            // ela, para o índice e a consulta nunca divergirem sobre o que está
+            // indexado. `eq_ignore_ascii_case` compara sem alocar.
+            if !valor_indexavel(v) {
                 continue;
             }
             let key = self.inner.upsert_exact(field, v, lsn);

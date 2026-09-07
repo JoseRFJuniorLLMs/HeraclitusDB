@@ -1,14 +1,16 @@
 //! Minimal admin REST (axum) — a thin layer over the same engine.
 
+use crate::auth::{Authenticator, Principal};
 use crate::engine::Engine;
 use axum::{
     extract::{Extension, Path, Query, Request, State},
-    http::{header, StatusCode},
+    http::{header, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
+use heraclitus_core::AccessRole;
 use heraclitus_sentinel::{IncidentFilter, IncidentState, SentinelRuntime};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -75,7 +77,7 @@ pub fn router(
     cors_origins: Vec<String>,
     allow_erasure: bool,
 ) -> Router {
-    router_with_sentinel(engine, None, basic_auth, cors_origins, allow_erasure)
+    router_with_sentinel(engine, None, basic_auth, cors_origins, allow_erasure, None)
 }
 
 /// Build the REST surface with an optional live Sentinel handle.  The legacy
@@ -88,6 +90,7 @@ pub fn router_with_sentinel(
     basic_auth: Option<String>,
     cors_origins: Vec<String>,
     allow_erasure: bool,
+    autenticador: Option<Arc<Authenticator>>,
 ) -> Router {
     let routes = Router::new()
         .route("/healthz", get(healthz))
@@ -166,22 +169,12 @@ pub fn router_with_sentinel(
         .route("/tier/demote", axum::routing::post(tier_demote))
         .route("/tier/receipts", get(tier_receipts))
         .route("/tier/fetch/:segment", get(tier_fetch));
-    // O aprovador de uma accao humana passa a ser a identidade AUTENTICADA (ver
-    // `IdentidadeRest`). Com Basic auth ha uma unica credencial partilhada, logo
-    // a identidade e o utilizador configurado; sem auth nao ha identidade
-    // nenhuma, e e ISSO que fica escrito no registo em vez de um nome bonito
-    // escolhido pelo chamador.
-    let identidade = IdentidadeRest(match basic_auth.as_deref() {
-        Some(creds) => creds.split(':').next().unwrap_or("rest").to_owned(),
-        None => "rest-sem-auth".to_owned(),
-    });
     let routes = routes
         .with_state(engine)
         .layer(Extension(sentinel))
-        .layer(Extension(identidade))
         .layer(Extension(ErasureAllowed(allow_erasure)));
 
-    let protegido = aplicar_auth(routes, basic_auth);
+    let protegido = aplicar_auth(routes, PoliticaRest::nova(basic_auth, autenticador));
     // O CORS fica por FORA da autenticação: o browser envia o preflight
     // `OPTIONS` sem credenciais nenhumas, portanto se a auth o apanhasse
     // primeiro devolveria 401 e o pedido real nem chegava a ser feito.
@@ -198,33 +191,223 @@ pub fn router_with_sentinel(
 #[derive(Clone, Debug)]
 pub struct IdentidadeRest(pub String);
 
-fn aplicar_auth(routes: Router, basic_auth: Option<String>) -> Router {
-    match basic_auth {
-        None => routes,
-        Some(creds) => {
-            let expected: Arc<String> = Arc::new(format!("Basic {}", b64(creds.as_bytes())));
-            routes.layer(middleware::from_fn(move |req: Request, next: Next| {
-                let expected = expected.clone();
-                async move {
-                    let ok = req
-                        .headers()
-                        .get(header::AUTHORIZATION)
-                        .and_then(|v| v.to_str().ok())
-                        .map(|v| ct_eq(v.as_bytes(), expected.as_bytes()))
-                        .unwrap_or(false);
-                    if ok {
-                        next.run(req).await
-                    } else {
-                        Response::builder()
-                            .status(StatusCode::UNAUTHORIZED)
-                            .header(header::WWW_AUTHENTICATE, "Basic realm=\"heraclitus\"")
-                            .body("unauthorized".into())
-                            .unwrap()
-                    }
+/// Papel exigido por (metodo, caminho), espelhando `grpc.rs`.
+///
+/// # A omissao e Admin, de proposito
+///
+/// Tal como no gRPC (`_ => AccessRole::Admin`), uma rota que ninguem
+/// classifique fica **protegida**, nao exposta. Era exactamente o contrario que
+/// produzia o defeito que isto corrige: o REST nao classificava rota nenhuma,
+/// portanto todas ficavam abertas — incluindo escritas duraveis e operacoes que
+/// o gRPC reserva a Admin.
+///
+/// `None` significa "sem papel nenhum": so o `/healthz`, que as sondas de
+/// liveness tem de alcancar sem credenciais.
+fn papel_exigido(metodo: &Method, caminho: &str) -> Option<AccessRole> {
+    let segmentos: Vec<&str> = caminho.split('/').filter(|s| !s.is_empty()).collect();
+    let escrita = matches!(
+        *metodo,
+        Method::POST | Method::PUT | Method::DELETE | Method::PATCH
+    );
+    match segmentos.as_slice() {
+        ["healthz"] => None,
+        // Leituras — o mesmo conjunto que o gRPC classifica como Auditor.
+        ["metrics"] | ["stats"] | ["state"] | ["atributos"] | ["diff"] | ["sql"] => {
+            Some(AccessRole::Auditor)
+        }
+        ["verify", ..] | ["compliance", "status"] | ["live", "events"] => Some(AccessRole::Auditor),
+        ["fontes", ..] | ["flight", "events"] => Some(AccessRole::Auditor),
+        ["telemetry", "health"] | ["security", "events", ..] => Some(AccessRole::Auditor),
+        // `/cases` e `/content` seguem a forma do `/replay`: o mesmo caminho
+        // serve uma leitura e uma escrita duravel. A escrita e um `append` como
+        // outro qualquer, logo Writer — nao Admin.
+        ["cases", ..] | ["content"] if !escrita => Some(AccessRole::Auditor),
+        ["cases"] | ["content"] => Some(AccessRole::Writer),
+        // `/replay` e a unica rota com dois metodos e dois papeis: o GET e a
+        // prova em seco; o POST reconstroi as views — o que o gRPC chama
+        // `rebuild` e reserva a Admin.
+        ["replay"] if !escrita => Some(AccessRole::Auditor),
+        ["replay"] => Some(AccessRole::Admin),
+        ["titular", _, "eliminar"] => Some(AccessRole::Admin),
+        ["titular", ..] => Some(AccessRole::Auditor),
+        ["hvm", "state"] => Some(AccessRole::Auditor),
+        // Escritas duraveis no log: `append` e Writer no gRPC.
+        ["hvm", ..] => Some(AccessRole::Writer),
+        ["sentinel", "incidents", _, "approve"] | ["sentinel", "incidents", _, "deny"] => {
+            Some(AccessRole::Admin)
+        }
+        ["sentinel", "checkpoint"] => Some(AccessRole::Admin),
+        ["sentinel", ..] => Some(AccessRole::Auditor),
+        ["tier", "demote"] => Some(AccessRole::Admin),
+        ["tier", ..] => Some(AccessRole::Auditor),
+        _ => Some(AccessRole::Admin),
+    }
+}
+
+/// Base64 padrao, descodificacao — para separar `utilizador:segredo` do Basic.
+///
+/// Ate aqui esta superficie so CODIFICAVA, comparando o header contra um valor
+/// esperado sem nunca descodificar input do cliente. Com credenciais que
+/// carregam papeis isso deixa de chegar: e preciso saber QUEM chama, nao so que
+/// conhece um segredo. A descodificacao e estrita — qualquer byte fora do
+/// alfabeto rejeita — e o resultado so serve para procurar o principal.
+fn b64_decode(entrada: &str) -> Option<Vec<u8>> {
+    const AB: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = entrada.as_bytes();
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for bloco in bytes.chunks(4) {
+        let mut valor = 0u32;
+        let mut uteis = 3usize;
+        for (i, &b) in bloco.iter().enumerate() {
+            if b == b'=' {
+                // Padding so e legitimo nas duas ultimas posicoes.
+                if i < 2 {
+                    return None;
                 }
-            }))
+                uteis -= 1;
+                valor <<= 6;
+            } else {
+                let idx = AB.iter().position(|&c| c == b)? as u32;
+                valor = (valor << 6) | idx;
+            }
+        }
+        for deslocamento in [16u32, 8, 0].iter().take(uteis) {
+            out.push(((valor >> deslocamento) & 0xFF) as u8);
         }
     }
+    Some(out)
+}
+
+/// `Basic <b64(utilizador:segredo)>` para `(utilizador, segredo)`.
+fn basic_partes(cabecalho: &str) -> Option<(String, String)> {
+    let cru = String::from_utf8(b64_decode(cabecalho.strip_prefix("Basic ")?)?).ok()?;
+    // O segredo pode conter ':'; o utilizador nao.
+    let (utilizador, segredo) = cru.split_once(':')?;
+    Some((utilizador.to_owned(), segredo.to_owned()))
+}
+
+/// Como o REST decide QUEM esta a chamar.
+///
+/// Junta as duas fontes de credenciais que o servidor conhece, por ordem de
+/// precedencia, e devolve sempre um `Principal` — nunca um booleano. Era o
+/// booleano que estava na raiz do defeito: "autenticado" responde a pergunta
+/// errada, porque a pergunta que as rotas precisam de fazer e "com que papel".
+#[derive(Clone)]
+struct PoliticaRest {
+    /// `Basic <b64>` esperado para a credencial UNICA legada (`rest_basic_auth`).
+    basic_legado: Option<Arc<String>>,
+    utilizador_legado: Arc<String>,
+    /// As credenciais com papeis, as mesmas que o gRPC usa.
+    autenticador: Option<Arc<Authenticator>>,
+}
+
+impl PoliticaRest {
+    fn nova(basic_auth: Option<String>, autenticador: Option<Arc<Authenticator>>) -> Self {
+        let utilizador_legado = basic_auth
+            .as_deref()
+            .and_then(|c| c.split(':').next())
+            .unwrap_or("rest")
+            .to_owned();
+        Self {
+            basic_legado: basic_auth.map(|c| Arc::new(format!("Basic {}", b64(c.as_bytes())))),
+            utilizador_legado: Arc::new(utilizador_legado),
+            autenticador,
+        }
+    }
+
+    /// `None` = recusar. `Some(principal)` = seguir com este papel.
+    fn resolver(&self, cabecalho: Option<&str>) -> Option<Principal> {
+        // 1. Credencial unica legada. Conserva poder de Admin, como sempre teve
+        //    — retirar-lho partiria implantacoes que dependem dela.
+        if let Some(esperado) = &self.basic_legado {
+            if cabecalho.is_some_and(|v| ct_eq(v.as_bytes(), esperado.as_bytes())) {
+                return Some(Principal {
+                    name: self.utilizador_legado.as_ref().clone(),
+                    roles: Arc::new(vec![AccessRole::Admin]),
+                });
+            }
+        }
+        // 2. Credenciais COM PAPEIS: `Basic <principal>:<token>`. O nome tem de
+        //    coincidir com o do principal a que o token pertence — senao o campo
+        //    do utilizador seria decorativo e o registo de auditoria passaria a
+        //    poder mentir sobre quem chamou.
+        if let Some(auth) = self.autenticador.as_ref().filter(|a| a.tem_papeis()) {
+            // Com papeis configurados NAO ha via aberta: ou a credencial e
+            // valida, ou recusa-se.
+            return cabecalho
+                .and_then(basic_partes)
+                .and_then(|(utilizador, segredo)| {
+                    auth.resolver(Some(&segredo))
+                        .filter(|p| p.name == utilizador)
+                });
+        }
+        // 3. Legado configurado e o header nao coincidiu.
+        if self.basic_legado.is_some() {
+            return None;
+        }
+        // 4. Nada configurado: aberto, exactamente como o gRPC faz em
+        //    `Authenticator::authenticate` quando nao ha credenciais. O nome diz
+        //    a verdade — ninguem provou nada — e e ele que fica nos registos de
+        //    aprovacao.
+        Some(Principal {
+            name: "rest-sem-auth".into(),
+            roles: Arc::new(vec![AccessRole::Admin]),
+        })
+    }
+}
+
+fn aplicar_auth(routes: Router, politica: PoliticaRest) -> Router {
+    routes.layer(middleware::from_fn(move |req: Request, next: Next| {
+        let politica = politica.clone();
+        async move {
+            let cabecalho = req
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            // A pergunta "que papel exige esta rota?" vem PRIMEIRO. Uma rota
+            // sem papel nenhum nao pode exigir credencial: o `/healthz` e para
+            // sondas de liveness, e um servico que se declara morto porque o
+            // monitor nao tem token e pior do que o problema que isto resolve.
+            let exigido = papel_exigido(req.method(), req.uri().path());
+            let principal = match (exigido, politica.resolver(cabecalho.as_deref())) {
+                (None, resolvido) => resolvido.unwrap_or_else(|| Principal {
+                    name: "anonimo".into(),
+                    roles: Arc::new(Vec::new()),
+                }),
+                (Some(_), None) => {
+                    return Response::builder()
+                        .status(StatusCode::UNAUTHORIZED)
+                        .header(header::WWW_AUTHENTICATE, "Basic realm=\"heraclitus\"")
+                        .body("unauthorized".into())
+                        .unwrap();
+                }
+                (Some(papel), Some(principal)) => {
+                    if !principal.allows(papel) {
+                        return (
+                            StatusCode::FORBIDDEN,
+                            Json(serde_json::json!({
+                                "error": format!(
+                                    "principal '{}' nao possui papel {papel:?}",
+                                    principal.name
+                                )
+                            })),
+                        )
+                            .into_response();
+                    }
+                    principal
+                }
+            };
+            let mut req = req;
+            req.extensions_mut()
+                .insert(IdentidadeRest(principal.name.clone()));
+            req.extensions_mut().insert(principal);
+            next.run(req).await
+        }
+    }))
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1046,7 +1229,15 @@ async fn titular(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
 ) -> Json<serde_json::Value> {
-    Json(engine.titular(&id, 50))
+    // `Engine::titular` toma o RwLock do indice de atributos e faz uma leitura
+    // de disco por LSN do titular — trabalho bloqueante que, corrido direto no
+    // future do axum, prende uma worker thread do reactor. Todos os outros
+    // handlers pesados deste ficheiro ja usam `spawn_blocking`; este era o unico
+    // fora do padrao.
+    let out = tokio::task::spawn_blocking(move || engine.titular(&id, 50))
+        .await
+        .unwrap_or_else(|e| serde_json::json!({ "error": format!("join: {e}") }));
+    Json(out)
 }
 
 /// `GET /titular/:id/acessos` — eventos de auditoria que mencionam este titular.
@@ -2183,6 +2374,7 @@ mod aprovacao_tests {
             basic_auth.map(str::to_owned),
             Vec::new(),
             false,
+            None,
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2503,5 +2695,278 @@ async fn content_state(
             Json(serde_json::json!({ "error": erro.to_string() })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod rbac_tests {
+    use super::*;
+    use heraclitus_core::{AccessCredential, FsyncPolicy, HeraclitusConfig};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// O defeito que estes testes fecham: o gRPC exigia um papel em cada
+    /// operacao (`auth::require`) e o REST nao tinha autorizacao NENHUMA — uma
+    /// unica credencial partilhada, ausente por omissao, e nenhuma nocao de
+    /// papel. Rotas que o gRPC reserva a Admin (aprovacoes, `tier/demote`,
+    /// `sentinel/checkpoint`) e escritas duraveis que exige a Writer (`/hvm/*`)
+    /// ficavam alcancaveis por quem chegasse ao socket.
+    fn credenciais() -> Vec<AccessCredential> {
+        let cred = |nome: &str, segredo: &str, papeis: Vec<AccessRole>| AccessCredential {
+            principal: nome.to_owned(),
+            token_blake3: blake3::hash(segredo.as_bytes()).to_hex().to_string(),
+            roles: papeis,
+        };
+        vec![
+            cred("leitor", "s-leitor", vec![AccessRole::Reader]),
+            cred("auditor", "s-auditor", vec![AccessRole::Auditor]),
+            cred("escritor", "s-escritor", vec![AccessRole::Writer]),
+            cred("chefe", "s-chefe", vec![AccessRole::Admin]),
+        ]
+    }
+
+    async fn servir(
+        com_papeis: bool,
+        basic_legado: Option<&str>,
+    ) -> (std::net::SocketAddr, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            access_credentials: if com_papeis {
+                credenciais()
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        };
+        let engine = Arc::new(Engine::open(&cfg).unwrap());
+        let autenticador = Arc::new(crate::auth::Authenticator::from_config(&cfg).unwrap());
+        let app = router_with_sentinel(
+            engine,
+            None,
+            basic_legado.map(str::to_owned),
+            Vec::new(),
+            false,
+            Some(autenticador),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, dir)
+    }
+
+    async fn pedir(
+        addr: std::net::SocketAddr,
+        metodo: &str,
+        caminho: &str,
+        auth: Option<&str>,
+    ) -> u16 {
+        let corpo = if metodo == "POST" {
+            r#"{"key":"a2V5","val":"dmFs"}"#
+        } else {
+            ""
+        };
+        let mut req = format!(
+            "{metodo} {caminho} HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n",
+            corpo.len()
+        );
+        if let Some(a) = auth {
+            req.push_str(&format!("Authorization: Basic {}\r\n", b64(a.as_bytes())));
+        }
+        req.push_str("\r\n");
+        req.push_str(corpo);
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(req.as_bytes()).await.unwrap();
+        let mut resposta = Vec::new();
+        sock.read_to_end(&mut resposta).await.unwrap();
+        String::from_utf8_lossy(&resposta)
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// O caso central: com papeis configurados, um Reader NAO escreve e NAO
+    /// administra, e um Writer nao administra. Antes disto, qualquer um dos
+    /// tres fazia tudo — e sem credencial nenhuma tambem.
+    #[tokio::test]
+    async fn os_papeis_sao_aplicados_no_rest() {
+        let (addr, _dir) = servir(true, None).await;
+
+        // Sem credencial: recusado, e nao apenas nas rotas de escrita.
+        assert_eq!(pedir(addr, "POST", "/hvm/upsert", None).await, 401);
+        assert_eq!(pedir(addr, "GET", "/stats", None).await, 401);
+
+        // Reader nao alcanca uma escrita duravel (Writer no gRPC)...
+        assert_eq!(
+            pedir(addr, "POST", "/hvm/upsert", Some("leitor:s-leitor")).await,
+            403
+        );
+        // ...nem uma operacao de Admin.
+        assert_eq!(
+            pedir(
+                addr,
+                "POST",
+                "/sentinel/checkpoint",
+                Some("leitor:s-leitor")
+            )
+            .await,
+            403
+        );
+        // Writer escreve, mas nao administra.
+        assert_ne!(
+            pedir(addr, "POST", "/hvm/upsert", Some("escritor:s-escritor")).await,
+            403,
+            "um Writer tem de passar a porta de /hvm/upsert"
+        );
+        assert_eq!(
+            pedir(
+                addr,
+                "POST",
+                "/sentinel/incidents/i1/approve",
+                Some("escritor:s-escritor")
+            )
+            .await,
+            403
+        );
+        // Admin passa em toda a parte.
+        assert_ne!(
+            pedir(addr, "POST", "/sentinel/checkpoint", Some("chefe:s-chefe")).await,
+            403
+        );
+        // Auditor le.
+        assert_ne!(
+            pedir(addr, "GET", "/stats", Some("auditor:s-auditor")).await,
+            403
+        );
+    }
+
+    /// O `/healthz` fica sem papel de proposito: uma sonda de liveness nao
+    /// carrega credenciais, e um servico que se declara morto porque o
+    /// monitor nao tem token e pior do que o problema que isto resolve.
+    #[tokio::test]
+    async fn o_healthz_continua_aberto() {
+        let (addr, _dir) = servir(true, None).await;
+        assert_eq!(pedir(addr, "GET", "/healthz", None).await, 200);
+    }
+
+    /// O nome no Basic tem de ser o do principal a que o segredo pertence. Sem
+    /// isto o campo do utilizador seria decorativo e o `IdentidadeRest` — que e
+    /// o que fica escrito num registo de aprovacao humana — podia mentir.
+    #[tokio::test]
+    async fn o_utilizador_tem_de_coincidir_com_o_dono_do_segredo() {
+        let (addr, _dir) = servir(true, None).await;
+        assert_eq!(
+            pedir(addr, "GET", "/stats", Some("chefe:s-leitor")).await,
+            401,
+            "segredo de um principal com o nome de outro"
+        );
+        assert_eq!(
+            pedir(addr, "GET", "/stats", Some("leitor:errado")).await,
+            401
+        );
+    }
+
+    /// Regressao deliberada: SEM credenciais com papeis nada muda. Era a
+    /// condicao para esta correccao poder entrar sem parar implantacoes — a
+    /// unica configuracao que passa a exigir autenticacao no REST e aquela em
+    /// que o operador ja declarou papeis e o REST os ignorava.
+    #[tokio::test]
+    async fn sem_credenciais_com_papeis_nada_muda() {
+        let (addr, _dir) = servir(false, None).await;
+        assert_eq!(pedir(addr, "GET", "/stats", None).await, 200);
+        assert_ne!(
+            pedir(addr, "POST", "/hvm/upsert", None).await,
+            401,
+            "sem nada configurado o REST continua aberto, como sempre esteve"
+        );
+    }
+
+    /// A credencial unica legada conserva poder de Admin.
+    #[tokio::test]
+    async fn a_credencial_legada_continua_a_valer_admin() {
+        let (addr, _dir) = servir(false, Some("op:senha")).await;
+        assert_eq!(pedir(addr, "GET", "/stats", None).await, 401);
+        assert_ne!(pedir(addr, "GET", "/stats", Some("op:senha")).await, 401);
+        assert_ne!(
+            pedir(addr, "POST", "/sentinel/checkpoint", Some("op:senha")).await,
+            403,
+            "a credencial legada sempre valeu tudo; retirar-lho partiria quem a usa"
+        );
+    }
+
+    /// A omissao do mapa e Admin. Uma rota nova que ninguem classifique fica
+    /// protegida em vez de exposta — que e o inverso do que produziu o defeito.
+    #[test]
+    fn a_omissao_do_mapa_de_papeis_e_admin() {
+        assert_eq!(
+            papel_exigido(&Method::GET, "/rota/que/ainda/nao/existe"),
+            Some(AccessRole::Admin)
+        );
+        assert_eq!(papel_exigido(&Method::GET, "/healthz"), None);
+        // O mesmo caminho com dois metodos exige dois papeis diferentes.
+        assert_eq!(
+            papel_exigido(&Method::GET, "/replay"),
+            Some(AccessRole::Auditor)
+        );
+        assert_eq!(
+            papel_exigido(&Method::POST, "/replay"),
+            Some(AccessRole::Admin)
+        );
+        // Parametros de caminho nao confundem a classificacao.
+        assert_eq!(
+            papel_exigido(&Method::POST, "/sentinel/incidents/abc-123/approve"),
+            Some(AccessRole::Admin)
+        );
+        assert_eq!(
+            papel_exigido(&Method::GET, "/sentinel/incidents/abc-123"),
+            Some(AccessRole::Auditor)
+        );
+        assert_eq!(
+            papel_exigido(&Method::POST, "/titular/xpto/eliminar"),
+            Some(AccessRole::Admin)
+        );
+        assert_eq!(
+            papel_exigido(&Method::GET, "/titular/xpto"),
+            Some(AccessRole::Auditor)
+        );
+        // Rotas que o primeiro mapa nao previa e caiam em Admin por omissao.
+        // Fechavam em vez de expor — mas exigir Admin a `/telemetry/health` ou
+        // a `/security/events` partia monitorizacao e consulta legitima.
+        for leitura in [
+            "/telemetry/health",
+            "/security/events",
+            "/security/events/counts",
+            "/cases",
+            "/cases/abc",
+            "/content",
+        ] {
+            assert_eq!(
+                papel_exigido(&Method::GET, leitura),
+                Some(AccessRole::Auditor),
+                "{leitura} e uma leitura"
+            );
+        }
+        // As escritas nos mesmos caminhos sao `append`: Writer, como no gRPC.
+        for escrita in ["/cases", "/content"] {
+            assert_eq!(
+                papel_exigido(&Method::POST, escrita),
+                Some(AccessRole::Writer),
+                "{escrita} POST escreve no log"
+            );
+        }
+    }
+
+    #[test]
+    fn o_base64_descodifica_e_rejeita_lixo() {
+        assert_eq!(b64_decode(&b64(b"ana:x")).unwrap(), b"ana:x");
+        assert_eq!(b64_decode(&b64(b"a")).unwrap(), b"a");
+        assert_eq!(b64_decode(&b64(b"ab")).unwrap(), b"ab");
+        assert!(b64_decode("!!!!").is_none(), "fora do alfabeto");
+        assert!(b64_decode("QQ").is_none(), "comprimento nao multiplo de 4");
+        assert!(b64_decode("=QQQ").is_none(), "padding em posicao ilegal");
     }
 }

@@ -463,6 +463,17 @@ pub struct HeraclitusConfig {
     pub auth_token: Option<String>,
     /// Credenciais multi-principal com RBAC. Podem vir do TOML ou de um JSON
     /// indicado por `HERACLITUS_CREDENTIALS_FILE`.
+    ///
+    /// Valem nas DUAS superfícies: no gRPC como `Authorization: Bearer
+    /// <token>`, no REST como `Authorization: Basic <principal>:<token>` — o
+    /// nome do utilizador tem de ser o do principal a que o token pertence.
+    ///
+    /// **Definir isto muda a postura do REST.** Enquanto está vazio, o REST
+    /// comporta-se como sempre (aberto, ou a credencial única de
+    /// [`Self::rest_basic_auth`]); assim que tem entradas, o REST passa a
+    /// exigir credencial e a aplicar os mesmos papéis que o gRPC. Era essa a
+    /// combinação incoerente que existia antes: papéis declarados, gRPC a
+    /// aplicá-los, e a outra superfície do mesmo processo a ignorá-los.
     pub access_credentials: Vec<AccessCredential>,
     /// Certificado/chain PEM e chave privada PEM do servidor gRPC.
     pub tls_cert_path: Option<PathBuf>,
@@ -475,6 +486,13 @@ pub struct HeraclitusConfig {
     /// call (`/state`, `/verify`, ...). `None` = no auth (default — localhost
     /// bind). Prefer `HERACLITUS_REST_AUTH_FILE`; the legacy inline
     /// `HERACLITUS_REST_AUTH` remains available outside production.
+    ///
+    /// É uma credencial ÚNICA e partilhada: autentica, mas não distingue
+    /// pessoas nem papéis — quem a conhece vale **Admin**. Mantém-se assim por
+    /// compatibilidade. Para autorização a sério use
+    /// [`Self::access_credentials`], que atribui papéis por principal e é
+    /// aceite nas duas superfícies. As duas podem coexistir: esta é tentada
+    /// primeiro, e continua a valer Admin.
     pub rest_basic_auth: Option<String>,
     /// Origens autorizadas a chamar o REST a partir de um browser (CORS).
     /// Vazio (default) = **nenhum** cabeçalho CORS, que é o comportamento
@@ -1214,6 +1232,23 @@ impl HeraclitusConfig {
                 "sentinel.l2.suspicious_severity deve estar entre 0 e 10".into(),
             ));
         }
+        // Auditoria 2026-09-05: `sentinel.threat.default_ttl_secs` chegava cru à
+        // política de admissão, onde vira milissegundos com `* 1_000`. Acima de
+        // `u64::MAX / 1_000` isso transbordava e matava o arranque em release
+        // (`overflow-checks = true`). A aritmética passou a saturar, mas saturar
+        // sozinho dá um indicador que nunca expira — exactamente o contrário do
+        // que a SPEC-0047 §12 promete. Um TTL acima de cem anos não é uma
+        // política de expiração: é um erro de digitação, e recusá-lo aqui diz
+        // qual é o campo, coisa que a saturação silenciosa não diria. Cem anos
+        // são duas ordens de grandeza acima de qualquer feed real (o valor por
+        // omissão são 30 dias; o maior usado no código são 90).
+        const TTL_MAXIMO_SECS: u64 = 100 * 365 * 24 * 3_600;
+        if self.sentinel.threat.enabled && self.sentinel.threat.default_ttl_secs > TTL_MAXIMO_SECS {
+            return Err(invalid(format!(
+                "sentinel.threat.default_ttl_secs deve ser no máximo {TTL_MAXIMO_SECS} (cem anos); veio {}",
+                self.sentinel.threat.default_ttl_secs
+            )));
+        }
         if self.sentinel.l3.enabled && !self.sentinel.enabled {
             return Err(invalid(
                 "sentinel.l3.enabled=true exige sentinel.enabled=true".into(),
@@ -1586,6 +1621,32 @@ max_graph_hops = 6
         assert!(cfg.validate_security().is_err());
         cfg.sentinel.l2.suspicious_severity = 7;
         assert!(cfg.validate_security().is_ok());
+    }
+
+    #[test]
+    fn ttl_de_threat_intel_absurdo_e_recusado_com_diagnostico() {
+        // Auditoria 2026-09-05 (A52): `sentinel.threat.default_ttl_secs` entrava
+        // cru do TOML na política de admissão, onde era multiplicado por 1_000
+        // para dar milissegundos. Um valor absurdo transbordava `u64` e matava o
+        // arranque com "attempt to multiply with overflow". Saturar a aritmética
+        // impede o pânico, mas sozinho troca-o por um indicador eterno — o
+        // oposto do que a §12 promete. O tecto aqui é a outra metade: transforma
+        // o erro de configuração numa recusa que diz qual é o campo.
+        let mut cfg = HeraclitusConfig::default();
+        cfg.sentinel.enabled = true;
+        cfg.sentinel.mode = SentinelMode::Observe;
+        cfg.sentinel.threat.enabled = true;
+        cfg.sentinel.threat.default_ttl_secs = u64::MAX;
+        let erro = cfg.validate_security().unwrap_err().to_string();
+        assert!(
+            erro.contains("default_ttl_secs"),
+            "a recusa tem de nomear o campo: {erro}"
+        );
+
+        // O default (30 dias) e um TTL longo mas plausível continuam válidos.
+        cfg.sentinel.threat.default_ttl_secs = 30 * 24 * 3_600;
+        cfg.validate_security()
+            .expect("o TTL por omissão tem de continuar a validar");
     }
 
     #[test]

@@ -586,3 +586,140 @@ fn com_o_plano_desligado_nao_ha_correlacao_nenhuma() {
         .any(|(_, e)| matches!(&e.kind, EventKind::Custom(k) if k == "ThreatSighting")));
     runtime.shutdown();
 }
+
+/// Auditoria 2026-09-05, A40 — a janela `sighting_keys` era a UNICA estrutura
+/// de deduplicacao do runtime que nao sobrevivia a um reinicio: nascia vazia e
+/// nenhuma das quatro passagens de arranque a reenchia (o `SentinelStateSnapshot`
+/// nem sequer tem o campo). O `DirectLogSink` IGNORA a chave de idempotencia,
+/// portanto a deduplicacao so existia em memoria.
+///
+/// Cenario: um processo apende o `SecurityEvent` derivado num LSN alto e o
+/// `ThreatSighting` correspondente, e morre antes de o cursor chegar a esse
+/// LSN. No arranque seguinte, o `SecurityEvent` e reprocessado com a janela a
+/// zero e o MESMO sighting — mesmo indicator_id, match_kind e event_id — e
+/// apendado uma segunda vez a um log append-only. Um auditor a contar
+/// observacoes locais de um IOC via N+1 avistamentos de uma so observacao.
+///
+/// O teste reproduz isso copiando o log ja povoado para um directorio NOVO, o
+/// que da um cursor a zero sobre um log que ja contem o derivado e o sighting.
+#[test]
+fn um_reinicio_nao_duplica_o_sighting_ja_persistido() {
+    use heraclitus_core::config::FsyncPolicy;
+    use heraclitus_core::{Episode, EventKind, SentinelConfig, SentinelMode, SentinelThreatConfig};
+    use heraclitus_log::AnyLog;
+    use heraclitus_sentinel::SentinelRuntime;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let temp = tempfile::tempdir().unwrap();
+    let feeds = temp.path().join("feeds");
+    std::fs::create_dir_all(&feeds).unwrap();
+    std::fs::write(
+        feeds.join("cert.json"),
+        br#"{
+          "type": "bundle",
+          "id": "bundle--runtime",
+          "objects": [
+            {"type":"marking-definition","id":"marking-definition--amber","name":"TLP:AMBER"},
+            {"type":"indicator","id":"indicator--net","spec_version":"2.1","confidence":90,
+             "pattern":"[ipv4-addr:value = '203.0.113.0/24']",
+             "object_marking_refs":["marking-definition--amber"]}
+          ]
+        }"#,
+    )
+    .unwrap();
+    let config = |feeds: &std::path::Path| SentinelConfig {
+        enabled: true,
+        mode: SentinelMode::Observe,
+        worker_threads: 1,
+        threat: SentinelThreatConfig {
+            enabled: true,
+            feeds_dir: feeds.to_string_lossy().into_owned(),
+            source_id: "cert".into(),
+            trust_level: "institutional".into(),
+            minimum_confidence: 50,
+            default_ttl_secs: 90 * 24 * 3_600,
+        },
+        ..SentinelConfig::default()
+    };
+    let conta_sightings = |log: &AnyLog| {
+        log.scan(0, log.head())
+            .unwrap()
+            .into_iter()
+            .filter(|(_, e)| matches!(&e.kind, EventKind::Custom(k) if k == "ThreatSighting"))
+            .count()
+    };
+    let estabilizar = |log: &AnyLog| {
+        let mut estavel = log.head();
+        let limite = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            let agora = log.head();
+            if agora == estavel {
+                break;
+            }
+            estavel = agora;
+            assert!(
+                std::time::Instant::now() < limite,
+                "o log nunca estabilizou"
+            );
+        }
+    };
+
+    // Primeira vida: um evento que casa o IOC produz um sighting.
+    let log1 = Arc::new(
+        AnyLog::open(
+            heraclitus_core::StorageFormat::Legacy,
+            temp.path().join("log1"),
+            1 << 20,
+            FsyncPolicy::Always,
+        )
+        .unwrap(),
+    );
+    let runtime1 = SentinelRuntime::start(log1.clone(), config(&feeds))
+        .unwrap()
+        .unwrap();
+    log1.append(Episode::new(
+        "collector",
+        EventKind::Observation,
+        br#"{"source":"nginx","category":"network","activity":"connect","outcome":"allowed",
+             "host":"web-01","dst":{"ip":"203.0.113.42","port":443}}"#
+            .to_vec(),
+    ))
+    .unwrap();
+    estabilizar(&log1);
+    assert_eq!(
+        conta_sightings(&log1),
+        1,
+        "a primeira vida tinha de produzir exactamente um sighting"
+    );
+    let episodios = log1.scan(0, log1.head()).unwrap();
+    runtime1.shutdown();
+
+    // Segunda vida: o MESMO log, mas com o cursor a zero — o processo morreu
+    // antes de o cursor alcancar o `SecurityEvent` derivado.
+    let log2 = Arc::new(
+        AnyLog::open(
+            heraclitus_core::StorageFormat::Legacy,
+            temp.path().join("log2"),
+            1 << 20,
+            FsyncPolicy::Always,
+        )
+        .unwrap(),
+    );
+    for (_, episodio) in episodios {
+        log2.append(episodio).unwrap();
+    }
+    assert_eq!(conta_sightings(&log2), 1, "a copia partiu de um sighting");
+
+    let runtime2 = SentinelRuntime::start(log2.clone(), config(&feeds))
+        .unwrap()
+        .unwrap();
+    estabilizar(&log2);
+    assert_eq!(
+        conta_sightings(&log2),
+        1,
+        "o reinicio duplicou um sighting que ja estava no log"
+    );
+    runtime2.shutdown();
+}

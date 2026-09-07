@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 const ANCHOR_EVENT: &str = "ComplianceEvidenceAnchor";
@@ -731,6 +731,11 @@ fn verify_transfer_signature(
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeferredAnchorState {
     pub anchors: Vec<(Lsn, EvidenceAnchor)>,
+    /// Ancoras que aterraram no log sem encadear com a anterior. Auditoria
+    /// 2026-09-05 (A06): num log append-only uma bifurcacao nunca desaparece,
+    /// logo ela e REGISTADA aqui em vez de abortar o replay, e publicada em
+    /// `AnchorHealthSnapshot::deferred_anchor_forks` para nao ficar silenciosa.
+    pub forks: Vec<(Lsn, EvidenceAnchor)>,
 }
 
 impl DeferredAnchorState {
@@ -758,9 +763,23 @@ impl DeferredAnchorState {
                 let anchor: EvidenceAnchor = serde_json::from_slice(&episode.content)?;
                 anchor.validate()?;
                 if anchor.previous_anchor_digest != previous {
-                    return Err(DeferredAnchorError::Invalid(format!(
-                        "cadeia de anchors quebrada no LSN {lsn}"
-                    )));
+                    // Auditoria 2026-09-05 (A06): uma bifurcacao NAO pode
+                    // abortar o replay. O log e append-only: o episodio ofensor
+                    // nunca desaparece, logo um `Err` aqui tornava o estado — e
+                    // com ele o dashboard de compliance
+                    // (`ComplianceDashboardSnapshot::build`) e a preparacao de
+                    // novas ancoras (`deferred-anchor-prepare`, que chama
+                    // `state()`) — irrecuperavel para SEMPRE. Mesmo raciocinio,
+                    // e mesma escolha conservadora, da gemea
+                    // `RegulatoryState::apply_range` para `hold_id` repetido:
+                    // fica o PRIMEIRO ramo, e o intruso vai para `forks`.
+                    tracing::warn!(
+                        lsn,
+                        anchor_id = %anchor.anchor_id,
+                        "âncora não encadeia com a anterior; mantido o primeiro ramo e ignorada esta"
+                    );
+                    state.forks.push((lsn, anchor));
+                    return Ok(());
                 }
                 previous = Some(anchor.anchor_digest);
                 state.anchors.push((lsn, anchor));
@@ -778,11 +797,22 @@ impl DeferredAnchorState {
 #[derive(Clone)]
 pub struct DeferredAnchorRegistry {
     log: Arc<AnyLog>,
+    sink: Arc<dyn crate::ComplianceSink>,
 }
 
 impl DeferredAnchorRegistry {
     pub fn new(log: Arc<AnyLog>) -> Self {
-        Self { log }
+        Self {
+            sink: log.clone(),
+            log,
+        }
+    }
+
+    /// Redirige as escritas para o servidor (que as indexa ao vivo) em vez do
+    /// log cru. Ver [`crate::ComplianceSink`].
+    pub fn with_sink(mut self, sink: Arc<dyn crate::ComplianceSink>) -> Self {
+        self.sink = sink;
+        self
     }
 
     pub fn state(&self) -> Result<DeferredAnchorState, DeferredAnchorError> {
@@ -791,6 +821,24 @@ impl DeferredAnchorRegistry {
 
     pub fn persist(&self, anchor: EvidenceAnchor) -> Result<Lsn, DeferredAnchorError> {
         anchor.validate()?;
+        // Auditoria 2026-09-05 (A06): a verificacao de encadeamento abaixo lia
+        // o estado (`state()`, que reproduz o log inteiro) e so DEPOIS fazia o
+        // append — uma janela TOCTOU larguissima. Duas importacoes concorrentes
+        // (dois operadores, ou um simples retry do cliente: cada RPC admin cai
+        // no seu proprio `spawn_blocking`) liam ambas o mesmo `latest_digest()`,
+        // passavam ambas a verificacao e gravavam ambas, partindo a cadeia num
+        // log de onde nada volta a sair.
+        //
+        // O lock e um `static` de processo, e nao um campo da estrutura, porque
+        // `deferred_anchor_op` constroi um `DeferredAnchorRegistry` NOVO a cada
+        // RPC: um `Mutex` por instancia nao serializaria nada. Serializar o
+        // processo inteiro nao custa nada — importar uma ancora e uma operacao
+        // administrativa, manual e rara — e nao ha reentrancia possivel:
+        // `append_compliance` nunca volta a chamar `persist`.
+        static CADEIA_DE_ANCORAS: Mutex<()> = Mutex::new(());
+        let _guarda = CADEIA_DE_ANCORAS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = self.state()?;
         if let Some((lsn, existing)) = state
             .anchors
@@ -809,8 +857,8 @@ impl DeferredAnchorRegistry {
                 "prev_anchor_digest não aponta para o último anchor persistido".into(),
             ));
         }
-        self.log
-            .append(anchor.to_episode()?)
+        self.sink
+            .append_compliance(anchor.to_episode()?)
             .map_err(|error| DeferredAnchorError::Storage(error.to_string()))
     }
 }
@@ -1060,5 +1108,133 @@ mod tests {
         .unwrap();
         response.response.timestamp_token[0] ^= 0xff;
         assert!(import_deferred_response(&request, &response, &policy).is_err());
+    }
+
+    /// Auditoria 2026-09-05 (A06): duas importacoes concorrentes gravavam duas
+    /// ancoras com o mesmo `previous_anchor_digest`. Como o log e append-only,
+    /// o episodio ofensor nunca desaparece — o replay TEM de conseguir ler um
+    /// log ja bifurcado, senao o dashboard de compliance e a preparacao de
+    /// novas ancoras ficam mortos para sempre. Aqui a bifurcacao e injetada
+    /// directamente no log: e a fotografia exacta do estado que a corrida deixa.
+    #[test]
+    fn replay_tolera_bifurcacao_e_mantem_o_primeiro_ramo() {
+        let exporter = SoftKeySigner::generate("air-gap-exporter");
+        let responder = SoftKeySigner::generate("connected-zone");
+        let policy = policy(&exporter, &responder);
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                StorageFormat::V6,
+                temp.path().join("log"),
+                4096,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let registry = DeferredAnchorRegistry::new(log.clone());
+        let (_, primeira) = roundtrip(
+            sample_commitment(0, 99, 42),
+            None,
+            &exporter,
+            &responder,
+            &policy,
+        );
+        registry.persist(primeira.clone()).unwrap();
+
+        // A gemea que a corrida gravaria: tambem com `previous_anchor_digest` a
+        // None, portanto a cadeia bifurca no segundo episodio de ancora.
+        let (_, bifurcada) = roundtrip(
+            sample_commitment(100, 199, 43),
+            None,
+            &exporter,
+            &responder,
+            &policy,
+        );
+        EpisodeLog::append(log.as_ref(), bifurcada.to_episode().unwrap()).unwrap();
+
+        let state = DeferredAnchorState::replay(log.as_ref(), log.head()).unwrap();
+        assert_eq!(state.anchors.len(), 1);
+        assert_eq!(state.latest_digest(), Some(primeira.anchor_digest));
+        assert_eq!(state.forks.len(), 1);
+        assert_eq!(state.forks[0].1.anchor_id, bifurcada.anchor_id);
+
+        // O dashboard inteiro dependia deste replay (dashboard.rs, `Anchors`).
+        let snapshot = crate::ComplianceDashboardSnapshot::build(
+            log.as_ref(),
+            temp.path().join("receipts"),
+            0,
+        )
+        .unwrap();
+        assert_eq!(snapshot.anchor_health.deferred_anchors, 1);
+        assert_eq!(snapshot.anchor_health.deferred_anchor_forks, 1);
+    }
+
+    /// Auditoria 2026-09-05 (A06): `persist` lia o estado inteiro e so depois
+    /// fazia o append, sem exclusao mutua. `deferred_anchor_op` constroi um
+    /// registry NOVO por RPC e cada RPC corre no seu proprio `spawn_blocking`,
+    /// logo duas importacoes simultaneas — dois operadores, ou um retry do
+    /// cliente — liam ambas o mesmo `latest_digest()` e gravavam ambas. As
+    /// repeticoes existem para tirar a flakiness ao teste, nao para procurar a
+    /// corrida: a janela e larga (o `state()` reproduz o log inteiro antes de um
+    /// append com fsync).
+    #[test]
+    fn persist_concorrente_nao_bifurca_a_cadeia() {
+        let exporter = SoftKeySigner::generate("air-gap-exporter");
+        let responder = SoftKeySigner::generate("connected-zone");
+        let policy = policy(&exporter, &responder);
+        for iteracao in 0..32u32 {
+            let temp = tempfile::tempdir().unwrap();
+            let log = Arc::new(
+                AnyLog::open(
+                    StorageFormat::V6,
+                    temp.path().join("log"),
+                    4096,
+                    FsyncPolicy::Always,
+                )
+                .unwrap(),
+            );
+            let (_, a) = roundtrip(
+                sample_commitment(0, 99, 42),
+                None,
+                &exporter,
+                &responder,
+                &policy,
+            );
+            let (_, b) = roundtrip(
+                sample_commitment(100, 199, 43),
+                None,
+                &exporter,
+                &responder,
+                &policy,
+            );
+            let barreira = std::sync::Barrier::new(2);
+            let resultados: Vec<_> = std::thread::scope(|escopo| {
+                let tarefas: Vec<_> = [a, b]
+                    .into_iter()
+                    .map(|anchor| {
+                        let log = log.clone();
+                        let barreira = &barreira;
+                        escopo.spawn(move || {
+                            // Registries SEPARADOS sobre o mesmo log: e
+                            // exactamente o que `deferred_anchor_op` faz a cada
+                            // RPC, logo um `Mutex` por instancia nao serializa
+                            // nada.
+                            let registry = DeferredAnchorRegistry::new(log);
+                            barreira.wait();
+                            registry.persist(anchor)
+                        })
+                    })
+                    .collect();
+                tarefas
+                    .into_iter()
+                    .map(|tarefa| tarefa.join().unwrap())
+                    .collect()
+            });
+            let aceites = resultados.iter().filter(|r| r.is_ok()).count();
+            assert_eq!(aceites, 1, "iteracao {iteracao}: {resultados:?}");
+            let state = DeferredAnchorState::replay(log.as_ref(), log.head()).unwrap();
+            assert_eq!(state.anchors.len(), 1, "iteracao {iteracao}");
+            assert!(state.forks.is_empty(), "iteracao {iteracao}");
+        }
     }
 }

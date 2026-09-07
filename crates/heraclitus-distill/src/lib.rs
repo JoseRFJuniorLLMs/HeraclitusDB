@@ -238,6 +238,60 @@ mod tests {
         e
     }
 
+    /// O índice de centróides promete, no seu próprio cabeçalho, que "o
+    /// agregado escolhido é idêntico ao de uma varredura exaustiva, incluindo
+    /// depois de os centróides se moverem". Isto verifica a promessa em vez de
+    /// acreditar nela.
+    ///
+    /// Duas armadilhas que este teste evita de propósito:
+    ///   - passar por o atalho nunca ter corrido (o índice só liga acima de 32
+    ///     agregados) — daí a asserção sobre `indexed_queries`;
+    ///   - passar por nunca ter havido reconstrução da árvore, que é onde a
+    ///     sobreposição `dirty` se esvazia e as cópias velhas voltam a poder
+    ///     ganhar — daí a asserção sobre `rebuilds`.
+    #[test]
+    fn indice_de_centroides_da_o_mesmo_agrupamento_que_a_varredura() {
+        // LCG explícito: um teste de equivalência tem de falhar SEMPRE que a
+        // equivalência quebrar, não às vezes.
+        let mut semente = 0x2545_F491_4F6C_DD1Du64;
+        let mut proximo = move || {
+            semente = semente
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (semente >> 33) as f32 / (1u64 << 31) as f32
+        };
+        let episodios: Vec<(Lsn, Episode)> = (0..600)
+            .map(|i| {
+                let hyp: Vec<f32> = (0..4).map(|_| (proximo() - 0.5) * 0.6).collect();
+                (i as Lsn, ep(&format!("episodio {i}"), hyp))
+            })
+            .collect();
+
+        let d = Distiller::new(ProductMetric::default(), DistillConfig::default());
+        let (com_indice, stats) = d.cluster_com(&episodios, true);
+        let (exaustivo, _) = d.cluster_com(&episodios, false);
+
+        assert!(
+            stats.indexed_queries > 0,
+            "o caminho indexado nunca correu — o teste não testou nada"
+        );
+        assert!(
+            stats.rebuilds > 0,
+            "a árvore nunca foi reconstruída — o caso das cópias velhas ficou por cobrir"
+        );
+        assert_eq!(
+            com_indice.len(),
+            exaustivo.len(),
+            "número de agregados difere"
+        );
+        for (i, (a, b)) in com_indice.iter().zip(&exaustivo).enumerate() {
+            assert_eq!(
+                a.members, b.members,
+                "agregado {i}: o atalho pôs membros diferentes"
+            );
+        }
+    }
+
     #[test]
     fn provenance_round_trip() {
         // M5 acceptance gate: fact -> log -> decode -> provenance intact.

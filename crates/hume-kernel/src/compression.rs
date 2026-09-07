@@ -77,9 +77,21 @@ pub mod frame_of_reference {
         (min, offsets)
     }
 
-    /// Reconstrói a sequência original.
-    pub fn decode(min: u64, offsets: &[u64]) -> Vec<u64> {
-        offsets.iter().map(|&o| min + o).collect()
+    /// Reconstrói a sequência original. `None` se `min + offset` transbordar.
+    ///
+    /// Auditoria 2026-09-05 (A25/A28): o `min` chega de bytes de disco pelo
+    /// ramo `ForBitpack` de [`super::column::decode`], e a soma verificada
+    /// (`overflow-checks = true` no perfil release) matava o processo no
+    /// arranque do índice de atributos — exatamente onde estava desenhada a
+    /// degradação para rebuild por replay. Num blob legítimo o [`encode`]
+    /// garante `offset = v - min` com `min` real, portanto a soma **nunca**
+    /// transborda: transbordo significa corrupção, e a resposta certa é
+    /// recusar a coluna. Ao contrário do irmão [`super::delta::decode`], aqui
+    /// envolver seria errado — fabricaria em silêncio postings plausíveis a
+    /// partir de lixo, que é precisamente o que o `overflow-checks` do perfil
+    /// release existe para não deixar acontecer.
+    pub fn decode(min: u64, offsets: &[u64]) -> Option<Vec<u64>> {
+        offsets.iter().map(|&o| min.checked_add(o)).collect()
     }
 }
 
@@ -319,6 +331,20 @@ pub mod column {
                 Some(out)
             }
             Codec::Rle => {
+                // Cada run ocupa 8 B de valor + 4 B de contagem no blob. Se
+                // esses bytes não estão lá, `n` é lixo do disco — recusar
+                // ANTES de o usar como capacidade, como já faz o ramo `Raw`.
+                // Auditoria 2026-09-05 (A53): a guarda `MAX_VALORES` foi
+                // dimensionada para valores DESCODIFICADOS de 8 B, mas um
+                // elemento da lista de runs custa 16 B (`(u64, u32)`
+                // alinhado), por isso o mesmo tecto autorizava 4 GiB de
+                // reserva a partir de 9 bytes de ficheiro — abort do alocador
+                // onde houver limite duro de memória. O resultado não muda:
+                // um blob que reprova aqui já reprovava dentro do laço, só
+                // que depois de alocar.
+                if blob.len().checked_sub(at)? < n.checked_mul(12)? {
+                    return None;
+                }
                 let mut runs = Vec::with_capacity(n);
                 let mut total = 0usize;
                 for _ in 0..n {
@@ -372,7 +398,7 @@ pub mod column {
                     Some(delta::decode(&deltas))
                 } else {
                     let offsets = bitpack::unpack(&words, bits, n);
-                    Some(frame_of_reference::decode(base, &offsets))
+                    Some(frame_of_reference::decode(base, &offsets)?)
                 }
             }
         }
@@ -416,7 +442,7 @@ mod tests {
         let (min, offs) = frame_of_reference::encode(&data);
         assert_eq!(min, 1000);
         assert_eq!(offs, vec![0, 5, 2, 10]);
-        assert_eq!(frame_of_reference::decode(min, &offs), data);
+        assert_eq!(frame_of_reference::decode(min, &offs).unwrap(), data);
     }
 
     #[test]
@@ -455,7 +481,7 @@ mod tests {
         assert!(bits <= 6, "offsets 0..49 cabem em 6 bits");
         let packed = bitpack::pack(&offs, bits);
         let unpacked = bitpack::unpack(&packed, bits, offs.len());
-        assert_eq!(frame_of_reference::decode(min, &unpacked), data);
+        assert_eq!(frame_of_reference::decode(min, &unpacked).unwrap(), data);
         // Densidade: 1000 valores em ~6 bits vs 64 bits ⇒ >10x menos palavras.
         assert!(packed.len() * 10 < data.len());
     }
@@ -561,5 +587,48 @@ mod column_tests {
             column::decode(&hostil).is_none(),
             "tem de recusar, nao alocar"
         );
+    }
+
+    /// O `base` do ramo FOR vem do DISCO e nao e confiavel: com `bits = 64` o
+    /// offset e a palavra crua do ficheiro, logo `base + offset` transborda.
+    /// Tem de devolver None -- o chamador (AttrIndex::open -> expand) degrada
+    /// para rebuild por replay -- em vez de panicar no arranque do no, e sem
+    /// envolver (que fabricaria postings plausiveis a partir de lixo).
+    /// Auditoria 2026-09-05, A25/A28.
+    #[test]
+    fn for_bitpack_com_base_hostil_devolve_none_em_vez_de_panicar() {
+        // n = 1, base = u64::MAX, bits = 64, offset = 1 -> MAX + 1.
+        let mut hostil = vec![Codec::ForBitpack as u8];
+        hostil.extend_from_slice(&1u64.to_le_bytes());
+        hostil.extend_from_slice(&u64::MAX.to_le_bytes());
+        hostil.push(64);
+        hostil.extend_from_slice(&1u64.to_le_bytes());
+        assert!(
+            column::decode(&hostil).is_none(),
+            "base hostil tem de recusar a coluna, nao transbordar nem envolver"
+        );
+
+        // n = 2, base = u64::MAX, bits = 1, offsets [0, 1]: o transbordo
+        // aparece so no segundo valor, depois de o primeiro ter corrido bem.
+        let mut hostil = vec![Codec::ForBitpack as u8];
+        hostil.extend_from_slice(&2u64.to_le_bytes());
+        hostil.extend_from_slice(&u64::MAX.to_le_bytes());
+        hostil.push(1);
+        hostil.extend_from_slice(&0b10u64.to_le_bytes());
+        assert!(
+            column::decode(&hostil).is_none(),
+            "transbordo a meio da coluna tem de recusar a coluna inteira"
+        );
+    }
+
+    /// A recusa acima e SO para o transbordo: uma coluna legitima com o minimo
+    /// encostado a u64::MAX continua a fazer roundtrip exacto pelo ramo FOR.
+    /// Auditoria 2026-09-05, A25/A28.
+    #[test]
+    fn for_bitpack_com_valores_no_topo_do_u64_faz_roundtrip() {
+        let data = vec![u64::MAX - 3, u64::MAX - 1, u64::MAX, u64::MAX - 2];
+        let blob = column::encode(&data);
+        assert_eq!(column::codec_of(&blob), Some(Codec::ForBitpack));
+        assert_eq!(column::decode(&blob).unwrap(), data);
     }
 }

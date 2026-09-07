@@ -291,6 +291,23 @@ impl View for ActivationStore {
                 for t in recent.into_iter().take(RECENT_K) {
                     rec.recent.push(t);
                 }
+                // `proximo_slot` NAO esta no snapshot, e nao precisa de estar:
+                // e derivavel de `n`.
+                //
+                // Enquanto o buffer nao enche, `access` usa `push` e nunca toca
+                // em `proximo_slot` — o valor e irrelevante. Depois de cheio,
+                // `proximo_slot` e `n` avancam sempre juntos, e o buffer enche
+                // exactamente em `n == RECENT_K` com `proximo_slot == 0`; logo
+                // `proximo_slot == n % RECENT_K`.
+                //
+                // Sem isto, um restore punha `proximo_slot` a 0 sobre um buffer
+                // cheio: `mais_antigo()` devolvia um instante recente em vez do
+                // mais velho (inflacionando a cauda do `score`) e o `access`
+                // seguinte sobrescrevia o slot errado. Derivar em vez de
+                // persistir mantem os checkpoints antigos legiveis.
+                if rec.recent.is_full() {
+                    rec.proximo_slot = (n % RECENT_K as u64) as usize;
+                }
                 (id, rec)
             })
             .collect();
@@ -560,5 +577,34 @@ mod testes_otimizacao {
                 assert_eq!(p.id, t.id, "k={k} posicao {i}");
             }
         }
+    }
+
+    /// O checkpoint nao persiste `proximo_slot`; o restore deriva-o de `n`. Se
+    /// nao o fizesse, um buffer cheio e rodado voltava com `proximo_slot = 0`,
+    /// `mais_antigo()` devolvia um instante recente em vez do mais velho, e o
+    /// `score` mudava a seguir a um restore — estado que diverge de si mesmo ao
+    /// atravessar o disco.
+    #[test]
+    fn restore_reconstroi_proximo_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = EventId::new();
+
+        let store = ActivationStore::new(0.5);
+        // 9 acessos com RECENT_K = 8: o buffer enche e roda uma vez, portanto
+        // `proximo_slot` fica em 1 (nao em 0).
+        for t in (1_000u64..=9_000).step_by(1_000) {
+            store.touch(id, t);
+        }
+        let antes = store.score(&id, 100_000).unwrap();
+        store.checkpoint(dir.path()).unwrap();
+
+        let mut recuperado = ActivationStore::new(0.5);
+        assert!(recuperado.restore(dir.path()).unwrap());
+        let depois = recuperado.score(&id, 100_000).unwrap();
+
+        assert!(
+            (antes - depois).abs() < 1e-9,
+            "o score nao pode mudar ao atravessar o checkpoint: {antes} vs {depois}"
+        );
     }
 }

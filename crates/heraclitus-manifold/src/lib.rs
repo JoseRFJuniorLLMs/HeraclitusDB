@@ -134,6 +134,20 @@ pub fn dist_hyp(u: &[f32], v: &[f32], c: f64) -> f64 {
     if u.is_empty() {
         return 0.0;
     }
+    // Auditoria 2026-09-05 (A03): o `zip` abaixo TRUNCA em silencio pelo mais
+    // curto dos dois vectores. Um candidato com menos dimensoes do que a
+    // consulta dava diff2 = 0 -> arg = 1.0 (FINITO, portanto a guarda anti-NaN
+    // mais abaixo nao dispara) -> acosh(1) = 0: ficava a distancia ZERO de toda
+    // a gente e dominava a busca vectorial (HNSW e knn exacto do memtable) a
+    // partir de um unico append. Nenhum caminho do servidor valida a dimensao
+    // do embedding, por isso a recusa tem de viver aqui. Mesma politica ja
+    // adoptada para o NaN: informacao incomparavel = infinitamente longe.
+    // A guarda de vazio acima corre PRIMEIRO de proposito: uma consulta
+    // parcial (so `hyp` preenchido, como a que `engine::nearest` constroi) e
+    // legitima e continua a nao contribuir com as componentes que nao tem.
+    if u.len() != v.len() {
+        return f64::INFINITY;
+    }
     let max_norm = (1.0 - BALL_EPS) / c.sqrt(); // boundary of the curvature-c ball
                                                 // Fold the boundary clamp into per-element scale factors instead of
                                                 // materializing clamped vectors: a point whose norm exceeds `max_norm` is
@@ -173,6 +187,11 @@ pub fn dist_sph(u: &[f32], v: &[f32], k2: f64) -> f64 {
     if u.is_empty() {
         return 0.0;
     }
+    // Auditoria 2026-09-05 (A03): ver `dist_hyp` — comprimentos diferentes sao
+    // incomparaveis, nao "iguais na parte comum".
+    if u.len() != v.len() {
+        return f64::INFINITY;
+    }
     let (nu, nv) = (norm_f32(u), norm_f32(v));
     if nu == 0.0 || nv == 0.0 {
         return 0.0;
@@ -185,6 +204,11 @@ pub fn dist_sph(u: &[f32], v: &[f32], k2: f64) -> f64 {
 pub fn dist_euc(u: &[f32], v: &[f32]) -> f64 {
     if u.is_empty() {
         return 0.0;
+    }
+    // Auditoria 2026-09-05 (A03): ver `dist_hyp` — o `zip` truncava pelo mais
+    // curto e um candidato mais curto ficava a distancia zero de tudo.
+    if u.len() != v.len() {
+        return f64::INFINITY;
     }
     let mut s = 0.0f64;
     for (x, y) in u.iter().zip(v) {
@@ -201,6 +225,13 @@ impl ProductMetric {
         let dh = dist_hyp(&a.hyp, &b.hyp, c1);
         let ds = dist_sph(&a.sph, &b.sph, self.sig.k2);
         let de = dist_euc(&a.euc, &b.euc);
+        // Auditoria 2026-09-05 (A03): propagar o nao-finito ANTES de aplicar os
+        // pesos. Com um peso a 0.0, `0.0 * inf` daria NaN e o candidato recusado
+        // voltava a ordenar como plausivel — exactamente o defeito que a recusa
+        // por dimensao existe para fechar.
+        if !dh.is_finite() || !ds.is_finite() || !de.is_finite() {
+            return f64::INFINITY;
+        }
         let [w1, w2, w3] = self.sig.weights;
         (w1 * dh * dh + w2 * ds * ds + w3 * de * de).sqrt()
     }
@@ -350,6 +381,12 @@ impl PreparedQuery {
         }
         let ds = self.dist_sph_prepared(&b.sph, prepared);
         let de2 = dist_euc2(&self.euc, &b.euc);
+        // Auditoria 2026-09-05 (A03): as outras duas componentes tambem podem
+        // recusar por dimensao incompativel; sem esta guarda um peso a 0.0
+        // transformaria o infinito em NaN antes de chegar ao chamador.
+        if !ds.is_finite() || !de2.is_finite() {
+            return f64::INFINITY;
+        }
         let [w1, w2, w3] = self.pesos;
         w1 * dh * dh + w2 * ds * ds + w3 * de2
     }
@@ -357,6 +394,11 @@ impl PreparedQuery {
     fn dist_hyp_prepared(&self, v: &[f32], prepared: &PreparedPoint) -> f64 {
         if self.hyp.is_empty() {
             return 0.0;
+        }
+        // Auditoria 2026-09-05 (A03): a mesma recusa de `dist_hyp`, aqui no
+        // caminho preparado que o HNSW percorre por candidato visitado.
+        if self.hyp.len() != v.len() {
+            return f64::INFINITY;
         }
         let nv_raw = prepared.hyp_norm;
         let sv = prepared.hyp_scale;
@@ -378,6 +420,10 @@ impl PreparedQuery {
         if self.sph.is_empty() {
             return 0.0;
         }
+        // Auditoria 2026-09-05 (A03): idem — ver `dist_sph`.
+        if self.sph.len() != v.len() {
+            return f64::INFINITY;
+        }
         let nv = prepared.sph_norm;
         if self.norma_sph == 0.0 || nv == 0.0 {
             return 0.0;
@@ -392,6 +438,11 @@ impl PreparedQuery {
 pub fn dist_euc2(u: &[f32], v: &[f32]) -> f64 {
     if u.is_empty() {
         return 0.0;
+    }
+    // Auditoria 2026-09-05 (A03): ver `dist_hyp` — o `zip` truncava pelo mais
+    // curto e um candidato mais curto ficava a distancia zero de tudo.
+    if u.len() != v.len() {
+        return f64::INFINITY;
     }
     let mut s = 0.0f64;
     for (x, y) in u.iter().zip(v) {
@@ -881,6 +932,136 @@ mod testes_prepared {
             euc: vec![],
         };
         assert!(!PreparedQuery::new(&metric, &q).dist2(&mau).is_finite());
+    }
+
+    /// Auditoria 2026-09-05 (A03): um candidato com uma componente mais CURTA
+    /// do que a da consulta era truncado em silencio pelo `zip` e ficava a
+    /// distancia ZERO de toda a gente — vizinho universal com um unico append.
+    ///
+    /// O caso `mau` e exactamente o que a barreira de ingestao deixa passar
+    /// hoje (`grpc.rs` so exige que os tres componentes nao estejam TODOS
+    /// vazios). Cada componente e testada por si: corrigir uma so das guardas
+    /// nao chega.
+    #[test]
+    fn um_candidato_de_dimensao_diferente_e_infinitamente_distante() {
+        let metric = ProductMetric::default();
+
+        // Componente hiperbolica: consulta de 3 dims contra candidatos mais curtos.
+        let q = ProductPoint {
+            hyp: vec![0.3, 0.4, 0.1],
+            sph: vec![],
+            euc: vec![],
+        };
+        let mau = ProductPoint {
+            hyp: vec![],
+            sph: vec![1.0],
+            euc: vec![],
+        };
+        let curto = ProductPoint {
+            hyp: vec![0.3],
+            sph: vec![],
+            euc: vec![],
+        };
+        for (nome, candidato) in [("hyp vazio", &mau), ("hyp curto", &curto)] {
+            let canonica = metric.dist(&q, candidato);
+            let preparada = PreparedQuery::new(&metric, &q).dist2(candidato);
+            assert!(
+                canonica.is_infinite(),
+                "{nome}: dist canonica devia ser infinita, foi {canonica}"
+            );
+            assert!(
+                preparada.is_infinite(),
+                "{nome}: dist2 preparada devia ser infinita, foi {preparada}"
+            );
+        }
+
+        // Componente esferica.
+        let q_sph = ProductPoint {
+            hyp: vec![],
+            sph: vec![1.0, 0.0],
+            euc: vec![],
+        };
+        let mau_sph = ProductPoint {
+            hyp: vec![],
+            sph: vec![1.0],
+            euc: vec![],
+        };
+        assert!(metric.dist(&q_sph, &mau_sph).is_infinite());
+        assert!(PreparedQuery::new(&metric, &q_sph)
+            .dist2(&mau_sph)
+            .is_infinite());
+
+        // Componente euclidiana.
+        let q_euc = ProductPoint {
+            hyp: vec![],
+            sph: vec![],
+            euc: vec![1.0, 2.0],
+        };
+        let mau_euc = ProductPoint {
+            hyp: vec![],
+            sph: vec![],
+            euc: vec![1.0],
+        };
+        assert!(metric.dist(&q_euc, &mau_euc).is_infinite());
+        assert!(PreparedQuery::new(&metric, &q_euc)
+            .dist2(&mau_euc)
+            .is_infinite());
+    }
+
+    /// Guarda de nao-regressao do fix acima: uma consulta PARCIAL — so `hyp`
+    /// preenchido, que e o formato que `engine::nearest` constroi — continua a
+    /// ignorar as componentes que a consulta nao tem, em vez de as declarar
+    /// infinitamente distantes. Este teste morre se a comparacao de
+    /// comprimentos passar a correr ANTES da guarda `is_empty`.
+    #[test]
+    fn consulta_parcial_continua_a_ignorar_as_componentes_vazias() {
+        let metric = ProductMetric::default();
+        let mut rng = Rng(0x0bad_c0de_0bad_c0de);
+        let q = ProductPoint {
+            hyp: (0..32).map(|_| rng.f32(0.1)).collect(),
+            sph: vec![],
+            euc: vec![],
+        };
+        let b = ProductPoint {
+            hyp: (0..32).map(|_| rng.f32(0.1)).collect(),
+            sph: (0..8).map(|_| rng.f32(1.0)).collect(),
+            euc: (0..8).map(|_| rng.f32(5.0)).collect(),
+        };
+        let dh = dist_hyp(&q.hyp, &b.hyp, -metric.sig.k1);
+        assert!(dh.is_finite() && dh > 0.0, "dh = {dh}");
+
+        let canonica = metric.dist(&q, &b);
+        assert!(canonica.is_finite(), "dist canonica = {canonica}");
+        assert!((canonica - dh).abs() < 1e-9, "{canonica} != {dh}");
+
+        let preparada = PreparedQuery::new(&metric, &q).dist2(&b);
+        assert!(preparada.is_finite(), "dist2 preparada = {preparada}");
+        assert!((preparada - dh * dh).abs() < 1e-9);
+
+        // E o simetrico: uma consulta que so tem `euc` contra o mesmo
+        // candidato completo. Cobre a ordem das guardas em `dist_hyp` e
+        // `dist_sph` (consulta vazia, candidato de 32 e 8 dims).
+        let so_euc = ProductPoint {
+            hyp: vec![],
+            sph: vec![],
+            euc: b.euc.iter().map(|x| x + 0.5).collect(),
+        };
+        let de = dist_euc(&so_euc.euc, &b.euc);
+        assert!(de.is_finite() && de > 0.0, "de = {de}");
+
+        let canonica_euc = metric.dist(&so_euc, &b);
+        assert!(
+            canonica_euc.is_finite(),
+            "consulta so com euc = {canonica_euc}"
+        );
+        assert!((canonica_euc - de).abs() < 1e-9, "{canonica_euc} != {de}");
+
+        let preparada_euc = PreparedQuery::new(&metric, &so_euc).dist2(&b);
+        assert!(
+            preparada_euc.is_finite(),
+            "consulta so com euc, preparada = {preparada_euc}"
+        );
+        assert!((preparada_euc - de * de).abs() < 1e-9);
     }
 }
 #[cfg(test)]

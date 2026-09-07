@@ -19,10 +19,38 @@ pub struct SentinelMetrics {
     pub(crate) risk_assessments_emitted_total: AtomicU64,
     pub(crate) incidents_created_total: AtomicU64,
     pub(crate) incident_revisions_emitted_total: AtomicU64,
+    /// Auditoria 2026-09-05, A36 — sinais que o motor de incidentes recusou
+    /// por saturacao (`CorrelationError::IncidentCapacity`).
+    ///
+    /// Deliberadamente SEPARADO de `normalization_errors_total`: perder
+    /// correlacao por um incidente cheio e materialmente diferente de saltar
+    /// um replay idempotente, e o operador tem de conseguir distinguir os
+    /// dois. Este contador a subir quer dizer que ha evidencia a ser
+    /// descartada — nao que o pipeline esta parado.
+    pub(crate) incident_capacity_drops_total: AtomicU64,
     pub(crate) normalization_skipped_total: AtomicU64,
     pub(crate) normalization_errors_total: AtomicU64,
     pub(crate) queue_overflow_total: AtomicU64,
     pub(crate) catchup_passes_total: AtomicU64,
+    /// Auditoria 2026-09-05, A19 — varreduras completas do `RuleEngine` sobre a
+    /// janela L1.
+    ///
+    /// Sem este contador o trabalho redundante era INVISIVEL: `l1_latency_ms`
+    /// mede a ultima chamada, nao quantas houve, e uma reavaliacao de uma janela
+    /// que nao mudou custa exactamente o mesmo que uma legitima. E este numero
+    /// que tranca a regressao, e e ele que da ao operador a razao varreduras por
+    /// evento com que julgar o custo do L1.
+    pub(crate) l1_evaluations_total: AtomicU64,
+    /// Auditoria 2026-09-05, A20 — perfis comportamentais copiados para o
+    /// candidato do L2.
+    ///
+    /// `evaluate_l2` trabalha sobre uma copia para que os sinais duraveis saiam
+    /// antes de o estado vivo avancar. Enquanto essa copia era o motor INTEIRO,
+    /// o custo crescia com o numero de entidades ja observadas e nada no sistema
+    /// o dizia. Dividido por `events_processed_total` da quanto estado se copia
+    /// por evento — que tem de ficar na ordem das unidades, nao da cardinalidade
+    /// do trafego.
+    pub(crate) l2_profiles_copied_total: AtomicU64,
     pub(crate) l0_latency_us: AtomicU64,
     pub(crate) l1_latency_ms: AtomicU64,
     pub(crate) l2_latency_ms: AtomicU64,
@@ -37,6 +65,15 @@ pub struct SentinelMetrics {
     pub(crate) actions_denied_total: AtomicU64,
     pub(crate) actions_executed_total: AtomicU64,
     pub(crate) action_failures_total: AtomicU64,
+    /// Auditoria 2026-09-05, A39 — quantas varreduras do log a leitura de
+    /// registos L4 custou.
+    ///
+    /// Existe porque a alternativa era invisível: `ensure_persisted_authorization`
+    /// fazia UMA varredura por decisão de política do incidente, com argumentos
+    /// invariantes do ciclo, e nada no sistema o dizia. É este contador que
+    /// tranca a regressão — o custo de autorizar uma acção não pode voltar a
+    /// crescer com o número de decisões já persistidas.
+    pub(crate) l4_scans_total: AtomicU64,
     /// SPEC-0072 §24 — instrumentação do arranque.
     ///
     /// O arranque era uma caixa preta: a linha era `starting sentinel...` e a
@@ -181,9 +218,18 @@ pub struct SentinelStatus {
     pub risk_assessments_emitted_total: u64,
     pub incidents_created_total: u64,
     pub incident_revisions_emitted_total: u64,
+    /// Auditoria 2026-09-05, A36 — sinais recusados por saturacao do motor de
+    /// incidentes. Ver `SentinelMetrics::incident_capacity_drops_total`.
+    pub incident_capacity_drops_total: u64,
     pub normalization_skipped_total: u64,
     pub normalization_errors_total: u64,
     pub catchup_passes_total: u64,
+    /// Auditoria 2026-09-05, A19 — varreduras completas do `RuleEngine`. Ver
+    /// `SentinelMetrics::l1_evaluations_total`.
+    pub l1_evaluations_total: u64,
+    /// Auditoria 2026-09-05, A20 — perfis copiados para o candidato do L2. Ver
+    /// `SentinelMetrics::l2_profiles_copied_total`.
+    pub l2_profiles_copied_total: u64,
     pub l0_latency_us: u64,
     pub l1_latency_ms: u64,
     pub l2_latency_ms: u64,
@@ -201,6 +247,8 @@ pub struct SentinelStatus {
     pub actions_denied_total: u64,
     pub actions_executed_total: u64,
     pub action_failures_total: u64,
+    /// Auditoria 2026-09-05, A39 — varreduras do log feitas por `l4_events`.
+    pub l4_scans_total: u64,
     /// SPEC-0072 §24/§25 — o que o arranque fez, e quanto tempo levou cada fase.
     pub boot: BootReport,
 }
@@ -253,9 +301,14 @@ impl SentinelMetrics {
             incident_revisions_emitted_total: self
                 .incident_revisions_emitted_total
                 .load(Ordering::Acquire),
+            incident_capacity_drops_total: self
+                .incident_capacity_drops_total
+                .load(Ordering::Acquire),
             normalization_skipped_total: self.normalization_skipped_total.load(Ordering::Acquire),
             normalization_errors_total: self.normalization_errors_total.load(Ordering::Acquire),
             catchup_passes_total: self.catchup_passes_total.load(Ordering::Acquire),
+            l1_evaluations_total: self.l1_evaluations_total.load(Ordering::Acquire),
+            l2_profiles_copied_total: self.l2_profiles_copied_total.load(Ordering::Acquire),
             l0_latency_us: self.l0_latency_us.load(Ordering::Acquire),
             l1_latency_ms: self.l1_latency_ms.load(Ordering::Acquire),
             l2_latency_ms: self.l2_latency_ms.load(Ordering::Acquire),
@@ -275,6 +328,7 @@ impl SentinelMetrics {
             actions_denied_total: self.actions_denied_total.load(Ordering::Acquire),
             actions_executed_total: self.actions_executed_total.load(Ordering::Acquire),
             action_failures_total: self.action_failures_total.load(Ordering::Acquire),
+            l4_scans_total: self.l4_scans_total.load(Ordering::Acquire),
             boot: self.boot.relatorio(),
         }
     }

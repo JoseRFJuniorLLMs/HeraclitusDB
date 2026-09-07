@@ -504,36 +504,89 @@ impl CaseState {
     }
 }
 
+/// Um envelope que a reconstrução NÃO conseguiu aplicar, e porquê.
+///
+/// Auditoria 2026-09-05, A08 — saltar um envelope não pode ser saltá-lo em
+/// silêncio: num caso de segurança, um comando que está no log mas não está na
+/// view é precisamente o que a auditoria precisa de ver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaseRejeitado {
+    pub command_id: String,
+    pub erro: CaseError,
+}
+
 /// Reconstrói o estado de um caso a partir dos envelopes, por ordem de LSN.
 ///
 /// É a única maneira de obter um `CaseState`. Não há construtor público que
 /// aceite um estado pronto, e isso é deliberado: se houvesse, alguém acabaria
 /// por o usar como fonte da verdade — que é exactamente o que a §8.2 proíbe.
+///
+/// Um envelope que não se aplica é SALTADO, não aborta — ver
+/// [`reconstruir_auditado`], que é onde está o porquê e onde os rejeitados
+/// ficam visíveis. Continua a devolver `Result` (hoje sempre `Ok`) por
+/// compatibilidade com quem já a chama: o erro que ela propagava ERA o defeito.
 pub fn reconstruir<'a>(
     case_id: &str,
     envelopes: impl IntoIterator<Item = &'a CaseEnvelope>,
 ) -> Result<Option<CaseState>, CaseError> {
+    Ok(reconstruir_auditado(case_id, envelopes).0)
+}
+
+/// O mesmo que [`reconstruir`], mas devolve também os envelopes rejeitados.
+///
+/// Auditoria 2026-09-05, A08 — porque é que um envelope mau é SALTADO em vez de
+/// abortar a reconstrução:
+///
+/// O log é append-only. Se um envelope que nunca devia lá ter entrado lá chegou
+/// — dois analistas em corrida (`Engine::case_command` lê a revisão e só depois
+/// apende, sem lock por `case_id`), ou um Writer a apender à mão um episódio
+/// com o kind `SecurityCase` e conteúdo à escolha — abortar aqui transformava
+/// uma linha antiga numa sentença perpétua: `case_state` e TODO o comando
+/// seguinte passam por esta função, e do log não se remove nada. O caso ficava
+/// ilegível e imutável para sempre, que é o oposto do gate CA0 ("estado do caso
+/// é reconstruído do log"). A crate irmã já tinha escrito este raciocínio:
+/// `heraclitus-content::reconstruir` ignora o evento que a spec proíbe porque
+/// «recusar-se a arrancar por causa de uma linha antiga tornaria o hub
+/// inutilizável para sempre».
+///
+/// O que NÃO se afrouxa: [`CaseState::aplicar`] continua a devolver
+/// `Err(Conflito)` numa revisão divergente, e é aí — e na fronteira do comando,
+/// antes de apender — que a §8.3 tem de morder. Saltar aqui é literalmente não
+/// aplicar: `aplicar` só muta o estado depois de todas as verificações
+/// passarem, portanto um envelope rejeitado não deixa metade de um efeito.
+pub fn reconstruir_auditado<'a>(
+    case_id: &str,
+    envelopes: impl IntoIterator<Item = &'a CaseEnvelope>,
+) -> (Option<CaseState>, Vec<CaseRejeitado>) {
     let mut estado: Option<CaseState> = None;
+    let mut rejeitados: Vec<CaseRejeitado> = Vec::new();
     for envelope in envelopes {
         if envelope.case_id != case_id {
             continue;
         }
-        match (&mut estado, &envelope.event) {
+        let resultado = match (&mut estado, &envelope.event) {
             (None, CaseEvent::CaseOpened { .. }) => {
                 let mut novo = CaseState::novo(case_id);
-                novo.aplicar(envelope)?;
-                estado = Some(novo);
+                let r = novo.aplicar(envelope);
+                if r.is_ok() {
+                    estado = Some(novo);
+                }
+                r
             }
             // Um evento antes do `CaseOpened` é ignorado, não inventa um caso.
             // Aceitá-lo criaria um caso sem abertura, sem SLA e sem dono — um
             // registo que parece um caso e não tem a proveniência de um.
             (None, _) => continue,
-            (Some(e), _) => {
-                e.aplicar(envelope)?;
-            }
+            (Some(e), _) => e.aplicar(envelope),
+        };
+        if let Err(erro) = resultado {
+            rejeitados.push(CaseRejeitado {
+                command_id: envelope.command_id.clone(),
+                erro,
+            });
         }
     }
-    Ok(estado)
+    (estado, rejeitados)
 }
 
 /// Projecta um episódio do log de volta a um envelope, se for um evento de caso.
@@ -974,5 +1027,133 @@ mod tests {
         for (evento, esperado) in amostras.iter().zip(nomes) {
             assert_eq!(evento.nome(), esperado);
         }
+    }
+
+    /// Auditoria 2026-09-05, A08 — o log e imutavel: um envelope que nunca
+    /// devia la ter entrado NAO pode tornar o caso ilegivel para sempre.
+    ///
+    /// Dois analistas em corrida (`case_command` le a revisao e so depois
+    /// apende, sem lock por `case_id`) deixam no log duas revisoes iguais com
+    /// `command_id` distintos. Abortar a reconstrucao por causa da segunda
+    /// mataria o caso: toda a leitura e todo o comando seguinte passam por
+    /// `reconstruir`.
+    #[test]
+    fn reconstruir_ignora_o_envelope_em_conflito_em_vez_de_abortar() {
+        let eventos = vec![
+            abrir(0, "c1"),
+            evento(
+                1,
+                "c2",
+                CaseEvent::CaseStatusChanged {
+                    status: CaseStatus::Contained,
+                },
+            ),
+            // O perdedor da corrida: mesma revisao esperada, comando diferente.
+            evento(
+                1,
+                "c3",
+                CaseEvent::CaseClosed {
+                    resolution: "fechado por engano".into(),
+                },
+            ),
+        ];
+
+        let estado = reconstruir("case-1", &eventos)
+            .expect("um envelope em conflito nao pode abortar a reconstrucao")
+            .expect("o caso foi aberto");
+        assert_eq!(estado.revision, 2, "o envelope em conflito nao conta");
+        assert_eq!(
+            estado.status,
+            CaseStatus::Contained,
+            "o comando em conflito NAO pode ter efeito"
+        );
+        assert!(
+            estado.resolution.is_none(),
+            "o perdedor da corrida nao pode fechar o caso"
+        );
+    }
+
+    /// Auditoria 2026-09-05, A08 — o mesmo, mas por `validar()`: qualquer
+    /// Writer pode apender um episodio com o kind `SecurityCase` e conteudo a
+    /// gosto, e um `schema` errado bastava para envenenar o caso.
+    #[test]
+    fn reconstruir_ignora_envelope_invalido_injectado_em_bruto() {
+        let mut forjado = evento(
+            1,
+            "c2",
+            CaseEvent::CaseClosed {
+                resolution: "injectado".into(),
+            },
+        );
+        forjado.schema = "spoof/9".into();
+        assert!(forjado.validar().is_err(), "o envelope tem de ser invalido");
+
+        let estado = reconstruir("case-1", &[abrir(0, "c1"), forjado])
+            .expect("um envelope invalido nao pode abortar a reconstrucao")
+            .expect("o caso foi aberto");
+        assert_eq!(estado.revision, 1);
+        assert_eq!(estado.status, CaseStatus::Open);
+    }
+
+    /// Auditoria 2026-09-05, A08 — envenenar ANTES da abertura era ainda pior:
+    /// um `CaseOpened` invalido bloqueava a criacao do caso para sempre.
+    #[test]
+    fn um_caseopened_invalido_nao_cria_caso_nem_aborta() {
+        let mut forjado = abrir(0, "c1");
+        forjado.principal = "   ".into();
+
+        assert!(
+            reconstruir("case-1", &[forjado])
+                .expect("nao pode abortar")
+                .is_none(),
+            "um CaseOpened invalido nao abre o caso"
+        );
+    }
+
+    /// Auditoria 2026-09-05, A08 — saltar nao pode ser saltar EM SILENCIO: num
+    /// caso de seguranca, um comando que esta no log mas nao esta na view e
+    /// exactamente o que a auditoria precisa de ver.
+    #[test]
+    fn reconstruir_auditado_expoe_os_envelopes_rejeitados() {
+        let mut forjado = evento(
+            1,
+            "c3",
+            CaseEvent::CaseClosed {
+                resolution: "injectado".into(),
+            },
+        );
+        forjado.schema = "spoof/9".into();
+        let eventos = vec![
+            abrir(0, "c1"),
+            evento(
+                1,
+                "c2",
+                CaseEvent::CaseStatusChanged {
+                    status: CaseStatus::Contained,
+                },
+            ),
+            forjado,
+            // E o perdedor de uma corrida, ja depois de "c2" ter passado.
+            evento(
+                1,
+                "c4",
+                CaseEvent::CaseClosed {
+                    resolution: "fechado por engano".into(),
+                },
+            ),
+        ];
+
+        let (estado, rejeitados) = reconstruir_auditado("case-1", &eventos);
+        assert_eq!(estado.unwrap().revision, 2);
+        assert_eq!(
+            rejeitados
+                .iter()
+                .map(|r| r.command_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c3", "c4"],
+            "os rejeitados nao podem desaparecer da auditoria"
+        );
+        assert!(matches!(rejeitados[0].erro, CaseError::Invalido(_)));
+        assert!(matches!(rejeitados[1].erro, CaseError::Conflito { .. }));
     }
 }

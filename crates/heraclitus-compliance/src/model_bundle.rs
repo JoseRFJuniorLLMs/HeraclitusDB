@@ -428,11 +428,22 @@ fn hex_digest(digest: &[u8; 32]) -> String {
 #[derive(Clone)]
 pub struct ModelBundleRegistry {
     log: Arc<AnyLog>,
+    sink: Arc<dyn crate::ComplianceSink>,
 }
 
 impl ModelBundleRegistry {
     pub fn new(log: Arc<AnyLog>) -> Self {
-        Self { log }
+        Self {
+            sink: log.clone(),
+            log,
+        }
+    }
+
+    /// Redirige as escritas para o servidor (que as indexa ao vivo) em vez do
+    /// log cru. Ver [`crate::ComplianceSink`].
+    pub fn with_sink(mut self, sink: Arc<dyn crate::ComplianceSink>) -> Self {
+        self.sink = sink;
+        self
     }
 
     pub fn activate(&self, verified: VerifiedModelBundle) -> Result<Lsn, ModelBundleError> {
@@ -463,8 +474,8 @@ impl ModelBundleRegistry {
             }
             cursor = ultimo.saturating_add(1);
         }
-        self.log
-            .append(verified.to_episode()?)
+        self.sink
+            .append_compliance(verified.to_episode()?)
             .map_err(|error| ModelBundleError::Storage(error.to_string()))
     }
 }

@@ -135,6 +135,26 @@ mod tests {
         assert_eq!(v.as_array().unwrap().len(), 4);
     }
 
+    /// Rótulos e colunas acentuados são dados reais (Portal da Transparência:
+    /// `Licitação`, `n.órgão`). O `ident` era ASCII-only e recusava-os com um
+    /// erro de parse — a query correcta sobre dados existentes não corria.
+    #[test]
+    fn rotulos_e_colunas_acentuados_parseiam() {
+        // Rótulo (kind) com cedilha e til.
+        assert!(
+            parse("MATCH (n:Licitação) RETURN n").is_ok(),
+            "rótulo acentuado tem de parsear"
+        );
+        assert!(parse("MATCH (n:Transferência) RETURN n").is_ok());
+        // Coluna com acento no WHERE.
+        assert!(
+            parse("MATCH (n) WHERE n.órgão = \"44000\" RETURN n").is_ok(),
+            "coluna acentuada tem de parsear"
+        );
+        // ASCII continua a funcionar (não partimos o caso comum).
+        assert!(parse("MATCH (n:Despesas) RETURN n").is_ok());
+    }
+
     #[test]
     fn rbac_query_classification_is_fail_closed_for_mutations() {
         assert_eq!(
@@ -663,6 +683,128 @@ mod tests {
         assert!(s.contains("GraphMatch"), "{s}");
     }
 
+    /// Auditoria 2026-09-05 (§6 item 4): o planner parseava o ORDER BY de um
+    /// padrão de relação e DESCARTAVA-O, mas aplicava o LIMIT — `ORDER BY
+    /// r.belief DESC LIMIT 10` devolvia as 10 primeiras na ordem do BTreeMap
+    /// (lexicográfica do edge id), sem erro. O padrão de nó ordenava; o de
+    /// relação não, e o utilizador não tinha como suspeitar da assimetria.
+    #[test]
+    fn edge_match_ordena_antes_do_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        let mk = |to: &str, confidence: &str| {
+            let mut e = Episode::new("ag", EventKind::Observation, vec![]);
+            e.attrs.insert("edge_from".into(), "Alfa".into());
+            e.attrs.insert("edge_to".into(), to.into());
+            e.attrs.insert("edge_type".into(), "socio_de".into());
+            e.attrs.insert("confidence".into(), confidence.into());
+            e
+        };
+        // A ordem lexicográfica dos edge ids (Beto < Maria < Zeta) é
+        // DELIBERADAMENTE diferente da ordem por belief (Zeta < Maria < Beto):
+        // sem ordenação, o LIMIT devolve as primeiras do mapa.
+        log.append(mk("Zeta", "0.2")).unwrap();
+        log.append(mk("Beto", "0.9")).unwrap();
+        log.append(mk("Maria", "0.5")).unwrap();
+        let be = LogBackend::new(log);
+
+        let ids = |q: &str| -> Vec<String> {
+            execute(q, &be)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["b.id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // DESC + LIMIT 2: as DUAS de maior belief — não as duas primeiras do mapa.
+        assert_eq!(
+            ids("MATCH (a)-[r:socio_de]->(b) RETURN b.id, r.belief ORDER BY r.belief DESC LIMIT 2"),
+            vec!["Beto", "Maria"]
+        );
+        assert_eq!(
+            ids("MATCH (a)-[r:socio_de]->(b) RETURN b.id ORDER BY r.belief ASC"),
+            vec!["Zeta", "Maria", "Beto"]
+        );
+        // Por string: lexicográfica, nos dois sentidos.
+        assert_eq!(
+            ids("MATCH (a)-[r]->(b) RETURN b.id ORDER BY r.id DESC LIMIT 1"),
+            vec!["Zeta"]
+        );
+        assert_eq!(
+            ids("MATCH (a)-[r]->(b) RETURN b.id ORDER BY r.to ASC"),
+            vec!["Beto", "Maria", "Zeta"]
+        );
+        // Os beliefs projectados vêm mesmo por ordem decrescente.
+        let v = execute(
+            "MATCH (a)-[r]->(b) RETURN r.belief ORDER BY r.belief DESC",
+            &be,
+        )
+        .unwrap();
+        let beliefs: Vec<f64> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["r.belief"].as_f64().unwrap())
+            .collect();
+        assert!(beliefs.windows(2).all(|w| w[0] >= w[1]), "{beliefs:?}");
+        // Campo que uma aresta não tem, e DIST: ERRO explícito, nunca descarte.
+        assert!(execute("MATCH (a)-[r]->(b) RETURN * ORDER BY r.peso", &be).is_err());
+        assert!(execute(
+            "MATCH (a)-[r]->(b) RETURN * ORDER BY DIST_HYP([0.1]) ASC",
+            &be
+        )
+        .is_err());
+        // E o EXPLAIN mostra-o.
+        let s =
+            explain("MATCH (a)-[r:socio_de]->(b) RETURN * ORDER BY r.belief DESC LIMIT 2").unwrap();
+        assert!(s.contains("OrderBy(r.belief, asc=false)"), "{s}");
+    }
+
+    /// Auditoria recursiva 2026-09-05 (A57): os rótulos dos nós de um padrão de
+    /// relação eram parseados e DESCARTADOS pelo planner. `MATCH
+    /// (a:Pessoa)-[r]->(b:Empresa)` devolvia exactamente as mesmas linhas que
+    /// `MATCH (a)-[r]->(b)` — até com rótulos que não existem em episódio
+    /// nenhum — e o EXPLAIN nem os imprimia, portanto o descarte era invisível.
+    /// Não se corrige filtrando por `_kind`: os extremos de uma aresta são ids
+    /// de ENTIDADE (nomes), não ids de episódio, e não têm kind; o que
+    /// `:Pessoa` significa aqui continua por definir. Enquanto não estiver,
+    /// recusar é a resposta honesta.
+    #[test]
+    fn rotulo_de_no_num_padrao_de_relacao_e_recusado() {
+        let (_d, be) = edge_backend();
+        // Sem rótulos: o padrão de relação continua a responder como sempre.
+        let v = execute("MATCH (a)-[r]->(b) AS OF LSN 2 RETURN *", &be).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 2);
+
+        // Rótulo no DESTINO: erro explícito, com o rótulo na mensagem.
+        let e = execute("MATCH (a)-[r]->(b:Empresa) AS OF LSN 2 RETURN *", &be).unwrap_err();
+        let msg = e.to_string();
+        assert!(
+            msg.contains("Empresa") && msg.contains("padrão de relação"),
+            "{msg}"
+        );
+        // Rótulo na ORIGEM: idem — os DOIS extremos eram descartados.
+        let e = execute("MATCH (a:Pessoa)-[r]->(b) AS OF LSN 2 RETURN *", &be).unwrap_err();
+        assert!(e.to_string().contains("Pessoa"), "{e}");
+        // Rótulo que não existe em episódio nenhum também é recusado — antes
+        // era inerte, e a query devolvia as 2 arestas na mesma.
+        assert!(execute("MATCH (a:NaoExisteMesmo)-[r]->(b) RETURN *", &be).is_err());
+
+        // NÃO REGRIDE: o rótulo num padrão de NÓ continua a filtrar.
+        let v = execute("MATCH (n:Observation) RETURN n", &be).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 3);
+        assert!(execute("MATCH (n:Fantasma) RETURN n", &be)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        // E o EXPLAIN deixa de esconder os rótulos que o planner recebeu.
+        let s = explain("MATCH (a:Pessoa)-[r:paga]->(b:Empresa) RETURN *").unwrap();
+        assert!(s.contains("(a:Pessoa)") && s.contains("(b:Empresa)"), "{s}");
+    }
+
     /// Builds a tiny fraud-style dataset anchored on event A. Four candidates,
     /// each child of A, are designed so that each single channel is topped by a
     /// *different* candidate, while the consensus candidate X (strong on all
@@ -1112,6 +1254,182 @@ mod tests {
                 .unwrap()
                 .contains("Counterfactual")
         );
+    }
+
+    #[test]
+    fn simulate_then_decide_ve_o_contrafactual() {
+        // Auditoria 2026-09-05 (A33): `SIMULATE ... THEN DECIDE` avaliava a
+        // politica contra o grafo REAL. O `decide` por omissao reconstruia o
+        // grafo com `scan_range` (que o VirtualBackend delega no log real) em
+        // vez de usar `graph()` (o overlay), pelo que a aresta contrafactual
+        // era invisivel: a resposta vinha bem formada e IGUAL a baseline, sem
+        // erro nem aviso — precisamente no caminho cujo unico proposito e
+        // "o que dispararia se esta aresta existisse".
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        let edge = |from: &str, to: &str, etype: &str, conf: &str| {
+            let mut e = Episode::new("ag", EventKind::Observation, vec![]);
+            e.attrs.insert("edge_from".into(), from.into());
+            e.attrs.insert("edge_to".into(), to.into());
+            e.attrs.insert("edge_type".into(), etype.into());
+            e.attrs.insert("confidence".into(), conf.into());
+            e
+        };
+        // Nenhuma aresta `fraud_partner` no log: a realidade nao dispara nada.
+        log.append(edge("p1", "p2", "socio_de", "1.0")).unwrap();
+        let be = LogBackend::new(log);
+
+        let ids = |v: &serde_json::Value| -> Vec<String> {
+            v["fired"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a["action_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let base = execute("DECIDE ()", &be).unwrap();
+        assert!(
+            ids(&base).is_empty(),
+            "baseline sem fraud_partner nao dispara: {:?}",
+            ids(&base)
+        );
+
+        // O contrafactual cria a aresta com confianca 1.0, muito acima do
+        // `fraud_belief_threshold` de 0.7 — a regra flag_fraud TEM de disparar.
+        let cf = execute(
+            "SIMULATE ADD EDGE (\"p1\", \"p2\", \"fraud_partner\") THEN DECIDE ()",
+            &be,
+        )
+        .unwrap();
+        assert!(
+            ids(&cf).contains(&"flag_fraud:p1->p2".to_string()),
+            "o DECIDE dentro do SIMULATE tem de ver a aresta contrafactual: {:?}",
+            ids(&cf)
+        );
+
+        // Simetria com as funcoes irmas: HYPOTHESES ja via o overlay.
+        let hyp = execute(
+            "SIMULATE ADD EDGE (\"p1\", \"p2\", \"fraud_partner\") \
+             THEN HYPOTHESES (\"p1\", \"p2\", \"fraud_partner\")",
+            &be,
+        )
+        .unwrap();
+        assert_eq!(hyp["alive"], serde_json::json!(true));
+
+        // E o inverso: remover a aresta que EXISTE tem de calar a regra.
+        let dir2 = tempfile::tempdir().unwrap();
+        let log2 = Arc::new(Log::open(dir2.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        log2.append(edge("p1", "p2", "fraud_partner", "0.9"))
+            .unwrap();
+        let be2 = LogBackend::new(log2);
+        let real = execute("DECIDE ()", &be2).unwrap();
+        assert!(
+            ids(&real).contains(&"flag_fraud:p1->p2".to_string()),
+            "a aresta real dispara: {:?}",
+            ids(&real)
+        );
+        let removed = execute(
+            "SIMULATE REMOVE EDGE (\"p1\", \"p2\", \"fraud_partner\") THEN DECIDE ()",
+            &be2,
+        )
+        .unwrap();
+        assert!(
+            !ids(&removed).contains(&"flag_fraud:p1->p2".to_string()),
+            "remover a aresta no contrafactual cala a regra: {:?}",
+            ids(&removed)
+        );
+    }
+
+    #[test]
+    fn simulate_then_decide_nao_toca_na_realidade() {
+        // Auditoria 2026-09-05 (A33): o DECIDE contrafactual passa a disparar,
+        // mas continua a ser uma pergunta: o `append` do VirtualBackend e
+        // no-op, logo nenhum evento Action entra no log e um DECIDE real
+        // seguinte nao o ve como ja tomado (nada em `skipped`).
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        let mut e = Episode::new("ag", EventKind::Observation, vec![]);
+        e.attrs.insert("edge_from".into(), "p1".into());
+        e.attrs.insert("edge_to".into(), "p2".into());
+        e.attrs.insert("edge_type".into(), "socio_de".into());
+        e.attrs.insert("confidence".into(), "1.0".into());
+        log.append(e).unwrap();
+        let be = LogBackend::new(log);
+
+        let cf = execute(
+            "SIMULATE ADD EDGE (\"p1\", \"p2\", \"fraud_partner\") THEN DECIDE ()",
+            &be,
+        )
+        .unwrap();
+        assert!(!cf["fired"].as_array().unwrap().is_empty());
+
+        let acoes = execute("MATCH (n:Action) RETURN n", &be).unwrap();
+        assert!(
+            acoes.as_array().unwrap().is_empty(),
+            "o contrafactual nao escreve no log: {acoes}"
+        );
+        let real = execute("DECIDE ()", &be).unwrap();
+        assert!(real["fired"].as_array().unwrap().is_empty());
+        assert!(
+            real["skipped"].as_array().unwrap().is_empty(),
+            "nada foi dado como ja decidido: {real}"
+        );
+    }
+
+    #[test]
+    fn decide_as_of_nao_ve_o_futuro() {
+        // Auditoria 2026-09-05 (A33): trocar o replay por `graph()` transfere o
+        // corte temporal do varrimento para o `as_of` de `decision::evaluate`.
+        // Este teste fixa a fronteira EXCLUSIVA (`AS OF LSN k` observa [0, k)),
+        // a mesma de todas as outras leituras — sem ele, o fix trocaria uma
+        // resposta errada (o contrafactual) por outra (o AS OF a ver o futuro).
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        let edge = |from: &str, to: &str, etype: &str, conf: &str| {
+            let mut e = Episode::new("ag", EventKind::Observation, vec![]);
+            e.attrs.insert("edge_from".into(), from.into());
+            e.attrs.insert("edge_to".into(), to.into());
+            e.attrs.insert("edge_type".into(), etype.into());
+            e.attrs.insert("confidence".into(), conf.into());
+            e
+        };
+        // LSN 0..3: estrela H com 4 folhas (dispara flag_anomaly:H).
+        for leaf in ["L1", "L2", "L3", "L4"] {
+            log.append(edge("H", leaf, "socio_de", "1.0")).unwrap();
+        }
+        // LSN 4: a aresta de fraude, DEPOIS da fronteira que vamos usar.
+        let lsn_fraude = log.append(edge("X", "Y", "fraud_partner", "0.9")).unwrap();
+        assert_eq!(lsn_fraude, 4);
+        let be = LogBackend::new(log);
+
+        let ids = |v: &serde_json::Value| -> Vec<String> {
+            v["fired"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a["action_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // AS OF LSN 4 = os LSN [0, 4): a estrela ja existe, a fraude ainda nao.
+        let antes = ids(&execute("DECIDE () AS OF LSN 4", &be).unwrap());
+        assert!(antes.contains(&"flag_anomaly:H".to_string()), "{antes:?}");
+        assert!(
+            !antes.contains(&"flag_fraud:X->Y".to_string()),
+            "a aresta do LSN 4 esta FORA de [0, 4): {antes:?}"
+        );
+
+        // AS OF LSN 5 ja a inclui.
+        let depois = ids(&execute("DECIDE () AS OF LSN 5", &be).unwrap());
+        assert!(
+            depois.contains(&"flag_fraud:X->Y".to_string()),
+            "a aresta do LSN 4 esta dentro de [0, 5): {depois:?}"
+        );
+
+        // AS OF LSN 0 = estado vazio.
+        let vazio = execute("DECIDE () AS OF LSN 0", &be).unwrap();
+        assert!(ids(&vazio).is_empty(), "estado vazio: {vazio}");
     }
 
     #[test]
@@ -1571,6 +1889,93 @@ mod tests {
         // EXPLAIN mostra a chave de ordenação por distância.
         let s = explain("MATCH (n) RETURN n ORDER BY DIST_PRODUCT([0.1, 0.2])").unwrap();
         assert!(s.contains("DIST_"), "{s}");
+    }
+
+    /// Auditoria recursiva 2026-09-05 (A34): `DIST_HYP`/`DIST_SPH`/`DIST_EUC`
+    /// não validavam a dimensão do vetor da query contra a do embedding — as
+    /// funções do manifold usam `zip` e truncam pela mais curta, devolvendo uma
+    /// distância calculada só sobre o prefixo. `DIST_PRODUCT`, três linhas
+    /// abaixo no mesmo `match`, sempre rejeitou a mesma entrada.
+    #[test]
+    fn dist_dimensao_incompativel_nao_casa() {
+        use heraclitus_core::ProductPoint;
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        let mk = |nome: &str, hyp: Vec<f32>, sph: Vec<f32>, euc: Vec<f32>| {
+            let mut e = Episode::new("ag", EventKind::Observation, nome.as_bytes().to_vec());
+            e.embedding = Some(ProductPoint { hyp, sph, euc });
+            e
+        };
+        // A ORDEM importa: o "euc3" é semeado PRIMEIRO, por isso um empate de
+        // distâncias (o que a truncagem produzia) deixa-o à frente do "euc2".
+        log.append(mk("euc3", vec![], vec![], vec![0.1, 0.2, 5000.0]))
+            .unwrap();
+        log.append(mk("euc2", vec![], vec![], vec![0.1, 0.2]))
+            .unwrap();
+        log.append(mk("hyp1", vec![0.1], vec![], vec![])).unwrap();
+        // O "hyp2" tem a MESMA primeira coordenada do "hyp1": só um vetor de
+        // query com 2 dimensões o pode avaliar, e a truncagem confundia-os.
+        log.append(mk("hyp2", vec![0.1, 0.9], vec![], vec![]))
+            .unwrap();
+        log.append(mk("sph1", vec![], vec![1.0], vec![])).unwrap();
+        let be = LogBackend::new(log);
+
+        let conteudos = |q: &str| -> Vec<String> {
+            execute(q, &be)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["content"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // Vetor MAIS CURTO que o embedding: o "euc3" tem distância real ~5000
+        // e passava o corte porque só as 2 primeiras coordenadas eram somadas.
+        assert_eq!(
+            conteudos("MATCH (n) WHERE DIST_EUC([0.1, 0.2]) < 0.001 RETURN n"),
+            vec!["euc2"]
+        );
+        // Vetor MAIS LONGO: a outra direcção da truncagem (casava o "euc2").
+        assert!(
+            conteudos("MATCH (n) WHERE DIST_EUC([0.1, 0.2, 0.3, 0.4]) < 0.001 RETURN n").is_empty()
+        );
+        // Componente AUSENTE: `zip` de um vetor com um vazio dá distância 0 —
+        // o episódio sem componente hiperbólica era "o mais próximo de todos".
+        let hyp = conteudos("MATCH (n) WHERE DIST_HYP([0.12]) < 0.001 RETURN n");
+        assert!(!hyp.contains(&"euc3".to_string()), "{hyp:?}");
+        assert!(!hyp.contains(&"euc2".to_string()), "{hyp:?}");
+
+        // ORDER BY: sem embedding compatível vai para o FIM (INFINITY), não
+        // para a frente com um zero calculado sobre o prefixo.
+        assert_eq!(
+            conteudos("MATCH (n) RETURN n ORDER BY DIST_EUC([0.1, 0.2]) ASC")[0],
+            "euc2"
+        );
+
+        // NÃO REGRIDE: dimensões coincidentes continuam a ser avaliadas.
+        assert_eq!(
+            conteudos("MATCH (n) WHERE DIST_EUC([0.1, 0.2, 5000.0]) < 0.001 RETURN n"),
+            vec!["euc3"]
+        );
+        // ... e um vetor de 1 dimensão NÃO pode alcançar um embedding de 2, por
+        // muito parecida que seja a primeira coordenada.
+        assert_eq!(
+            conteudos("MATCH (n) WHERE DIST_HYP([0.12]) < 0.5 RETURN n"),
+            vec!["hyp1"]
+        );
+        assert_eq!(
+            conteudos("MATCH (n) WHERE DIST_HYP([0.12, 0.88]) < 0.5 RETURN n"),
+            vec!["hyp2"]
+        );
+        // A esfera tem a MESMA doença por outra via: `norm(v) == 0` num
+        // embedding sem componente esférica devolvia distância 0, e um vetor
+        // mais longo era comparado só no prefixo (com as normas completas).
+        assert!(conteudos("MATCH (n) WHERE DIST_SPH([1.0, 5.0]) < 2.0 RETURN n").is_empty());
+        assert_eq!(
+            conteudos("MATCH (n) WHERE DIST_SPH([1.0]) < 0.001 RETURN n"),
+            vec!["sph1"]
+        );
     }
 
     #[test]

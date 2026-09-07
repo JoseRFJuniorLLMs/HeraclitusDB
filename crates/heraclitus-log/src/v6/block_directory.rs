@@ -27,6 +27,7 @@
 use heraclitus_core::Lsn;
 
 use super::error::{corrupt, V6Result, HARD_MAX_BLOCKS};
+use super::footer::FooterV6;
 
 pub const DIR_ENTRY_LEN: usize = 56;
 
@@ -178,6 +179,123 @@ impl BlockDirectory {
         Ok(Self { entries })
     }
 
+    /// Confronta o directório com o footer que sela o segmento.
+    ///
+    /// Auditoria 2026-09-05 (A05): o directório é a **única** região do `.hrkl`
+    /// PACKED sem checksum — o header tem CRC, cada bloco tem CRC sobre
+    /// header+payload, o footer tem CRC, o directório não tem nada. E as
+    /// guardas de [`BlockDirectory::decode`] (offsets dentro do ficheiro,
+    /// não-sobreposição física, `first_lsn <= last_lsn`, ordem por `first_lsn`)
+    /// não são violadas por um bit rot que apenas *encolha* um `last_lsn`. O
+    /// efeito é o pior possível num log auditável: `find_block_for_lsn` deixa de
+    /// encontrar o bloco e o point lookup responde `Ok(None)` para um LSN
+    /// comitado e durado — sem erro, sem `Corruption`, sem métrica. A guarda que
+    /// existia (`read_block` compara o header do bloco com a entrada) só corre
+    /// *depois* do pruning, portanto nunca é alcançada nesse caminho.
+    ///
+    /// O footer é a âncora certa para o confronto: tem CRC próprio e os seus
+    /// `record_count`/`min_lsn`/`max_lsn` já foram comparados com o manifesto no
+    /// arranque. Não se escreve nem se lê um byte novo — só se comparam campos
+    /// que já existem —, logo ficheiros antigos continuam a abrir.
+    ///
+    /// Limite conhecido: num segmento **sem** `CONTIGUOUS_LSN`, um encolhimento
+    /// no meio que continue disjunto e dentro das pontas fica por apanhar;
+    /// fechá-lo exige um CRC-32C da região do directório guardado no footer, o
+    /// que obriga a subir a versão do footer.
+    pub fn check_against_footer(&self, footer: &FooterV6) -> V6Result<()> {
+        const CTX: &str = "hrkl v6 block directory";
+        let declared: u64 = self.entries.iter().map(|e| e.record_count as u64).sum();
+        if declared != footer.record_count {
+            return Err(corrupt(
+                CTX,
+                format!(
+                    "directory accounts for {declared} records, footer declares {}",
+                    footer.record_count
+                ),
+            ));
+        }
+        // Entradas vazias não declaram intervalo nenhum: `contains_lsn` e
+        // `may_contain_lsn_range` já as ignoram, e ignorá-las aqui impede que um
+        // bloco sem registos invente pontas ou buracos.
+        let mut anterior: Option<&BlockDirectoryEntryV1> = None;
+        let mut primeiro_lsn: Option<Lsn> = None;
+        let mut ultimo_lsn: Lsn = 0;
+        let mut soma_dos_intervalos: u64 = 0;
+        for (i, e) in self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.record_count > 0)
+        {
+            if let Some(prev) = anterior {
+                // Intervalos disjuntos e estritamente crescentes é o que a busca
+                // binária de `find_block_for_lsn` (partition_point sobre
+                // `last_lsn`) pressupõe; pôr isso em causa é pôr em causa o
+                // point lookup.
+                if prev.last_lsn >= e.first_lsn {
+                    return Err(corrupt(
+                        CTX,
+                        format!(
+                            "block {i} starts at LSN {} but the previous block ends at {}",
+                            e.first_lsn, prev.last_lsn
+                        ),
+                    ));
+                }
+            }
+            if primeiro_lsn.is_none() {
+                primeiro_lsn = Some(e.first_lsn);
+            }
+            ultimo_lsn = e.last_lsn;
+            if footer.is_contiguous_lsn() {
+                // Só se soma quando o footer declara contiguidade, que é quando
+                // a soma é comparada: assim um segmento legítimo com buracos
+                // largos nunca corre o risco de ser recusado por transbordo. E
+                // aritmética VERIFICADA, e não `-` e `+ 1` crus: com
+                // `overflow-checks = true`, um directório forjado com
+                // `last_lsn = u64::MAX` trocaria a rejeição por um pânico ao
+                // abrir o log — o mesmo bug já corrigido em
+                // `FooterV6::lsn_span_is_contiguous`.
+                soma_dos_intervalos = e
+                    .last_lsn
+                    .checked_sub(e.first_lsn)
+                    .and_then(|span| span.checked_add(1))
+                    .and_then(|span| soma_dos_intervalos.checked_add(span))
+                    .ok_or_else(|| {
+                        corrupt(CTX, format!("block {i} declares an impossible LSN span"))
+                    })?;
+            }
+            anterior = Some(e);
+        }
+        // Sem blocos com registos o `declared` acima já provou que o footer
+        // também não declara nenhum.
+        let Some(primeiro_lsn) = primeiro_lsn else {
+            return Ok(());
+        };
+        if primeiro_lsn != footer.min_lsn || ultimo_lsn != footer.max_lsn {
+            return Err(corrupt(
+                CTX,
+                format!(
+                    "directory covers LSN {primeiro_lsn}..={ultimo_lsn}, footer seals {}..={}",
+                    footer.min_lsn, footer.max_lsn
+                ),
+            ));
+        }
+        // Com as pontas presas ao footer e os intervalos disjuntos, esta soma
+        // fecha a contiguidade sem precisar de comparar bloco a bloco: um
+        // buraco obrigaria os blocos a cobrir menos LSNs do que os registos que
+        // declaram, e sobrepô-los para compensar já foi recusado acima.
+        if footer.is_contiguous_lsn() && soma_dos_intervalos != footer.record_count {
+            return Err(corrupt(
+                CTX,
+                format!(
+                    "footer declares {} contiguous records but the directory spans {soma_dos_intervalos} LSNs",
+                    footer.record_count
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -301,6 +419,113 @@ mod tests {
     fn contagem_absurda_nao_aloca() {
         assert!(BlockDirectory::decode(&[], u32::MAX, 1_000_000).is_err());
         assert!(BlockDirectory::decode(&[0u8; 10], 1000, 1_000_000).is_err());
+    }
+
+    /// Footer que sela exactamente o que `d` declara — o que o
+    /// `PackedSegmentWriter::finish` produziria para este directório.
+    fn footer_de(d: &BlockDirectory, contiguo: bool) -> FooterV6 {
+        let cheias: Vec<_> = d.entries.iter().filter(|e| e.record_count > 0).collect();
+        FooterV6 {
+            record_count: d.entries.iter().map(|e| e.record_count as u64).sum(),
+            min_lsn: cheias.first().map(|e| e.first_lsn).unwrap_or(0),
+            max_lsn: cheias.last().map(|e| e.last_lsn).unwrap_or(0),
+            min_hlc: cheias.first().map(|e| e.min_hlc).unwrap_or(0),
+            max_hlc: cheias.last().map(|e| e.max_hlc).unwrap_or(0),
+            block_count: d.len() as u32,
+            flags: if contiguo {
+                super::super::footer::footer_flags::CONTIGUOUS_LSN
+            } else {
+                0
+            },
+            block_directory_offset: 4096,
+            block_directory_len: d.len() as u64 * DIR_ENTRY_LEN as u64,
+            logical_root: [0u8; 32],
+        }
+    }
+
+    #[test]
+    fn directorio_coerente_passa_o_confronto_com_o_footer() {
+        let d = dir();
+        d.check_against_footer(&footer_de(&d, true)).unwrap();
+        d.check_against_footer(&footer_de(&d, false)).unwrap();
+        // Um segmento vazio (sem blocos) também é coerente.
+        let vazio = BlockDirectory::default();
+        vazio
+            .check_against_footer(&footer_de(&vazio, false))
+            .unwrap();
+    }
+
+    #[test]
+    fn soma_de_record_count_diferente_do_footer_e_recusada() {
+        // Só o confronto das contagens apanha isto: os intervalos de LSN ficam
+        // intactos, logo as pontas e a soma dos intervalos continuam a bater.
+        let mut d = dir();
+        d.entries[2].record_count -= 5;
+        assert!(d.check_against_footer(&footer_de(&dir(), false)).is_err());
+        assert!(d.check_against_footer(&footer_de(&dir(), true)).is_err());
+    }
+
+    #[test]
+    fn intervalo_que_nao_bate_com_as_pontas_do_footer_e_recusado() {
+        // Auditoria 2026-09-05 (A05): sem o flag de contiguidade, são as pontas
+        // seladas no footer que denunciam um bloco cujo intervalo encolheu.
+        let mut d = dir();
+        d.entries[4].last_lsn -= 3;
+        assert!(d.check_against_footer(&footer_de(&dir(), false)).is_err());
+
+        let mut d = dir();
+        d.entries[0].first_lsn += 3;
+        assert!(d.check_against_footer(&footer_de(&dir(), false)).is_err());
+    }
+
+    #[test]
+    fn buraco_no_meio_e_recusado_quando_o_footer_declara_contiguidade() {
+        // Auditoria 2026-09-05 (A05): encolher o `last_lsn` de um bloco do meio
+        // mantém as pontas, a ordem e a não-sobreposição — só a contiguidade
+        // declarada no footer o apanha.
+        let mut d = dir();
+        d.entries[1].last_lsn -= 2;
+        assert!(d.check_against_footer(&footer_de(&dir(), true)).is_err());
+        // Dívida conhecida e deliberada: sem o flag CONTIGUOUS_LSN o mesmo
+        // encolhimento no meio passa. Fechá-lo exige um CRC do directório no
+        // footer, e isso obriga a subir a versão do footer.
+        assert!(d.check_against_footer(&footer_de(&dir(), false)).is_ok());
+    }
+
+    #[test]
+    fn blocos_com_intervalos_de_lsn_sobrepostos_sao_recusados() {
+        // A busca binária de `find_block_for_lsn` pressupõe intervalos
+        // disjuntos e crescentes; um directório que os sobreponha faz o point
+        // lookup responder pelo bloco errado.
+        let mut d = dir();
+        d.entries[2].first_lsn = d.entries[1].last_lsn;
+        assert!(d.check_against_footer(&footer_de(&dir(), false)).is_err());
+    }
+
+    #[test]
+    fn intervalo_absurdo_e_recusado_sem_entrar_em_panico() {
+        // `overflow-checks = true`: a aritmética do confronto tem de ser
+        // verificada, senão um directório forjado troca a rejeição por um
+        // pânico ao abrir o log — o mesmo bug já corrigido em
+        // `FooterV6::lsn_span_is_contiguous`.
+
+        // Um bloco só, a cobrir todo o espaço de LSN: `last - first + 1`
+        // transborda.
+        let mut d = BlockDirectory {
+            entries: vec![entry(0, 0, 10)],
+        };
+        d.entries[0].last_lsn = u64::MAX;
+        assert!(d.check_against_footer(&footer_de(&d, true)).is_err());
+
+        // Dois blocos cujos intervalos, somados, transbordam.
+        let meio = u64::MAX / 2;
+        let mut d = BlockDirectory {
+            entries: vec![entry(0, 0, 10), entry(1, 0, 10)],
+        };
+        d.entries[0].last_lsn = meio;
+        d.entries[1].first_lsn = meio + 1;
+        d.entries[1].last_lsn = u64::MAX;
+        assert!(d.check_against_footer(&footer_de(&d, true)).is_err());
     }
 
     #[test]

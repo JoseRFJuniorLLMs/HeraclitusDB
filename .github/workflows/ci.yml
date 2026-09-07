@@ -44,10 +44,25 @@ jobs:
           toolchain: 1.96.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+      # `debug_assert_with_mut_call` esta aqui por um defeito concreto:
+      # `debug_assert!(out.load_first_in_block())` no indice de texto. A macro
+      # nao avalia a expressao em release, portanto a chamada — que era a
+      # INICIALIZACAO do cursor, nao uma verificacao — desaparecia da build de
+      # producao. Todos os testes passavam, porque correm em debug.
       - name: clippy — workspace, targets e features (deny warnings)
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+        run: >-
+          cargo clippy --workspace --all-targets --all-features --locked --
+          -D warnings -D clippy::debug_assert_with_mut_call
       - name: tests — workspace e todas as features
         run: cargo test --workspace --all-features --locked
+      # O gate acima corre em DEBUG. Enquanto foi o unico, um bug que so existe
+      # em release (o mesmo do `debug_assert!`) ficou invisivel: o oraculo de
+      # equivalencia do BM25 existia, estava certo, e nunca tinha corrido no
+      # perfil em que o produto e enviado. `debug_assert!` esta ligado em debug
+      # e desligado em release — e a unica assimetria entre os dois perfis que
+      # muda SEMANTICA, e por isso precisa do seu proprio gate.
+      - name: tests — perfil release (o perfil em que o produto e enviado)
+        run: cargo test --workspace --all-features --locked --release
       - name: build check — gpu feature (wgpu dispatch; CI has no GPU, build only)
         run: cargo build -p heraclitus-server --features gpu --locked
       - name: crash-injection gate (M0)

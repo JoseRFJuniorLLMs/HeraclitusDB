@@ -21,6 +21,23 @@ use std::path::Path;
 const DEFAULT_M: usize = 16;
 const DEFAULT_EF_CONSTRUCTION: usize = 200;
 
+/// Intervalos aceitáveis para os parâmetros do HNSW quando eles vêm de um
+/// ficheiro (auditoria 2026-09-05, A26).
+///
+/// `m` não é um número decorativo: é o divisor logarítmico de `random_level`
+/// e a régua de truncagem da poda de vizinhos. `m = 0` transforma
+/// `truncate(self.m * 2)` em `truncate(0)` — apaga a lista de adjacência de
+/// cada vizinho ligado, e o grafo erode em silêncio; `m = 1` faz
+/// `1/ln(1) = +inf`, o nível sorteado satura em `usize::MAX` e `level + 1`
+/// transborda. O tecto existe pela mesma razão que o chão: `m` grande faz
+/// `vec![Vec::new(); level + 1]` alocar sem relação com o corpus.
+const M_MIN: usize = 2;
+const M_MAX: usize = 1024;
+/// `ef_construction = 0` não panica (`search_layer` só devolve ~nada), mas
+/// constrói um grafo sem arestas úteis — degradação silenciosa de recall.
+const EF_CONSTRUCTION_MIN: usize = 1;
+const EF_CONSTRUCTION_MAX: usize = 65_536;
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Node {
     point: ProductPoint,
@@ -123,6 +140,10 @@ thread_local! {
     /// superiores nao passa silenciosamente pelo algoritmo geral.
     static SEARCH_LAYER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GREEDY_DESCENT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Contador de avaliacoes da metrica. Serve para provar que a poda de
+    /// vizinhos calcula a distancia UMA vez por vizinho e nao uma vez por
+    /// comparacao do `sort` (auditoria 2026-09-05, A27).
+    static DIST2_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl Eq for Candidate {}
@@ -222,12 +243,26 @@ impl VectorIndex {
 
     /// Distância AO QUADRADO do nó `a` à consulta preparada.
     fn dist2(&self, a: u32, q: &PreparedQuery) -> f64 {
+        #[cfg(test)]
+        DIST2_CALLS.with(|calls| calls.set(calls.get() + 1));
         let node = &self.nodes[a as usize];
         q.dist2_prepared(&node.point, &node.prepared)
     }
 
     fn random_level(&mut self) -> usize {
-        let ml = 1.0 / (self.m as f64).ln();
+        // `1/ln(m)` só está definido para `m >= 2`: `ln(1) = 0` dá `+inf`, e
+        // `(+inf).floor() as usize` satura em `usize::MAX` (o cast float->int é
+        // saturante desde Rust 1.45), pelo que o `vec![Vec::new(); level + 1]`
+        // de `insert` transbordava — pânico com `overflow-checks = true`.
+        // `ln(0) = -inf` dá `-0.0` e prende todos os nós no nível 0.
+        // `load_checkpoint` já recusa `m` fora de `M_MIN..=M_MAX`; esta guarda
+        // é a segunda linha, para que a função seja TOTAL e nenhum caminho
+        // futuro a possa fazer panicar (auditoria 2026-09-05, A26).
+        let ml = if self.m >= M_MIN {
+            1.0 / (self.m as f64).ln()
+        } else {
+            1.0
+        };
         let r: f64 = self.rng.gen_range(f64::MIN_POSITIVE..1.0);
         ((-r.ln()) * ml).floor() as usize
     }
@@ -368,6 +403,41 @@ impl VectorIndex {
         })
     }
 
+    /// Poda a lista de adjacência do nó `n` no nível `l`, guardando os
+    /// `m * 2` vizinhos mais próximos de `n`.
+    ///
+    /// # Porque a chave é calculada ANTES de ordenar
+    ///
+    /// A versão anterior chamava `self.dist2(...)` dentro do comparador do
+    /// `sort_by`, ou seja DUAS avaliações da métrica por comparação: com os
+    /// 33 elementos do caso típico (`DEFAULT_M = 16`, poda em `m * 2 + 1`)
+    /// isso media-se em 510 avaliações onde 33 bastavam. E não é trabalho
+    /// barato — cada `dist2` percorre os vectores em f64 e paga um `acosh`
+    /// (`PreparedQuery::dist2_prepared`); o `PreparedPoint` residente só
+    /// poupa as normas, nunca o produto interno. Isto está no caminho quente
+    /// de escrita (`View::apply` -> `insert`, uma vez por episódio com
+    /// embedding) e repete-se para cada um dos até `m` vizinhos ligados, em
+    /// cada nível (auditoria 2026-09-05, A27).
+    ///
+    /// A ordenação continua ESTÁVEL e sem critério de desempate novo: `dist2`
+    /// é uma função pura do par (nó, consulta), portanto ordenar pelas mesmas
+    /// chaves dá exactamente a mesma lista. Um desempate por id — ou um
+    /// `select_nth_unstable_by`, que é uma partição instável — mudaria qual
+    /// dos empatados sobrevive ao `truncate`, e com ele o grafo, o resultado
+    /// das buscas e o checkpoint: uma alteração de semântica disfarçada de
+    /// optimização.
+    fn podar_vizinhos(&mut self, n: u32, l: usize) {
+        let np = PreparedQuery::new(&self.metric, &self.nodes[n as usize].point);
+        // `mem::take` liberta o empréstimo mutável de `self.nodes` antes de
+        // chamar `self.dist2`, que empresta `&self`.
+        let nb = std::mem::take(&mut self.nodes[n as usize].neighbors[l]);
+        let mut decorados: Vec<(f64, u32)> =
+            nb.into_iter().map(|v| (self.dist2(v, &np), v)).collect();
+        decorados.sort_by(|a, b| a.0.total_cmp(&b.0));
+        decorados.truncate(self.m * 2);
+        self.nodes[n as usize].neighbors[l] = decorados.into_iter().map(|(_, v)| v).collect();
+    }
+
     pub fn insert(&mut self, event_id: EventId, lsn: Lsn, point: ProductPoint) {
         if self.by_event.contains_key(&event_id) {
             return; // idempotent replay
@@ -402,24 +472,30 @@ impl VectorIndex {
             // connect at each level from min(level, top) down to 0
             for l in (0..=level.min(top)).rev() {
                 let neighbors = self.search_layer(&pq, ep, l, self.ef_construction, None);
-                let selected: Vec<u32> = neighbors
+                let mut selected: Vec<u32> = neighbors
                     .iter()
                     .filter(|c| c.id != id)
                     .take(self.m)
                     .map(|c| c.id)
                     .collect::<Vec<u32>>();
+                // ÓRFÃO: `search_layer` nunca devolve tombstoned nos resultados.
+                // Se TODOS os nós alcançáveis a partir do entry estão
+                // tombstoned, `selected` fica vazio — e sem back-links o nó novo
+                // fica sem UMA aresta sequer, inalcançável em qualquer busca
+                // futura (uma inserção que se perde a si própria). Ligar ao
+                // `ep` garante a entrada no grafo: o `ep` é alcançável a partir
+                // da raiz por construção, e os tombstoned CONTINUAM a ser
+                // atravessados na busca (só não entram nos resultados), portanto
+                // um back-link através dele preserva a conectividade.
+                if selected.is_empty() && ep != id {
+                    selected.push(ep);
+                }
                 for &n in &selected {
                     let nl = self.nodes[n as usize].neighbors.len();
                     if l < nl {
                         self.nodes[n as usize].neighbors[l].push(id);
                         if self.nodes[n as usize].neighbors[l].len() > self.m * 2 {
-                            // prune: keep the m*2 closest
-                            let np =
-                                PreparedQuery::new(&self.metric, &self.nodes[n as usize].point);
-                            let mut nb = std::mem::take(&mut self.nodes[n as usize].neighbors[l]);
-                            nb.sort_by(|&a, &b| self.dist2(a, &np).total_cmp(&self.dist2(b, &np)));
-                            nb.truncate(self.m * 2);
-                            self.nodes[n as usize].neighbors[l] = nb;
+                            self.podar_vizinhos(n, l);
                         }
                     }
                 }
@@ -612,16 +688,49 @@ impl VectorIndex {
         // e um vec vazio dava underflow/panic em TODA pesquisa futura). Um
         // checkpoint decodável mas violado degrada para rebuild do log (I6),
         // nunca para um índice que panica.
-        let coherent = snap.nodes.len() == snap.ids.len()
-            && snap.nodes.len() == snap.lsns.len()
+        let n_nodes = snap.nodes.len();
+        let coherent =
+            // Os PARÂMETROS também vêm do ficheiro e também têm de ser
+            // validados (auditoria 2026-09-05, A26). `m` é adoptado sem filtro
+            // logo abaixo e passa a ser o divisor de `ln` em `random_level` e a
+            // régua de `truncate(self.m * 2)` na poda: `m = 0` apaga as listas
+            // de adjacência a cada inserção (perda de recall TOTAL e silenciosa)
+            // e `m = 1` faz o nível saturar em `usize::MAX` e `level + 1`
+            // transbordar na primeira inserção pós-restore. O ficheiro não tem
+            // magic nem CRC e `m` é o primeiro campo, um varint de um byte para
+            // 16 — uma troca de bit continua a descodificar. Nenhum checkpoint
+            // escrito por este código sai destes intervalos (DEFAULT_M = 16,
+            // DEFAULT_EF_CONSTRUCTION = 200), portanto isto só recusa ficheiros
+            // que já eram venenosos.
+            (M_MIN..=M_MAX).contains(&snap.m)
+            && (EF_CONSTRUCTION_MIN..=EF_CONSTRUCTION_MAX).contains(&snap.ef_construction)
+            && n_nodes == snap.ids.len()
+            && n_nodes == snap.lsns.len()
+            // A comparação é feita do lado do COMPRIMENTO, nunca somando sobre
+            // `level` (auditoria 2026-09-05, A51). `level` é um varint sem
+            // tecto lido do ficheiro: com `usize::MAX`, o `level + 1` que aqui
+            // estava transbordava e o próprio guarda anti-pânico entrava em
+            // pânico — dentro de `load_checkpoint`, ou seja no boot, por causa
+            // de um ficheiro puramente derivado. `checked_sub` sobre
+            // `neighbors.len()` (esse sim, o comprimento real de um Vec já
+            // alocado) devolve `None` para o vec vazio, pelo que subsume também
+            // a defesa do `!is_empty()` que aqui estava.
             && snap
                 .nodes
                 .iter()
-                .all(|n| n.neighbors.len() == n.level + 1 && !n.neighbors.is_empty())
+                .all(|n| n.neighbors.len().checked_sub(1) == Some(n.level))
             && snap
                 .entry
-                .map(|e| (e as usize) < snap.nodes.len())
-                .unwrap_or(true);
+                .map(|e| (e as usize) < n_nodes)
+                .unwrap_or(true)
+            // Cada id de vizinho, em TODAS as camadas, tem de existir. Um id
+            // fora de `nodes.len()` decodifica sem erro e só rebenta depois, num
+            // `self.nodes[vizinho]` fora de limites durante a pesquisa — pânico
+            // que envenena o índice inteiro. Faltava esta parte da coerência.
+            && snap
+                .nodes
+                .iter()
+                .all(|n| n.neighbors.iter().flatten().all(|&v| (v as usize) < n_nodes));
         if !coherent {
             return Ok(false);
         }
@@ -844,6 +953,36 @@ mod tests {
         );
     }
 
+    /// Um nó inserido quando TODOS os nós alcançáveis estão tombstoned não pode
+    /// ficar órfão. `search_layer` nunca devolve tombstoned nos resultados,
+    /// portanto os vizinhos candidatos vinham vazios e o nó novo ficava sem uma
+    /// aresta sequer — invisível a qualquer busca futura. Tem de ligar-se ao
+    /// grafo à mesma.
+    #[test]
+    fn no_novo_nao_fica_orfao_com_tudo_tombstoned() {
+        let mut idx = VectorIndex::new(ProductMetric::default());
+        // Muitos nós: o entry fica estável num nível alto, para que o B
+        // inserido depois NÃO se torne o entry (o que trivializaria a busca).
+        let mut ids = Vec::new();
+        for i in 0..64u64 {
+            let e = EventId::new();
+            ids.push(e);
+            idx.insert(e, i, pt(vec![i as f32 / 64.0]));
+        }
+        // Tombstone de TODOS: qualquer caminho a partir do entry é só tombstoned.
+        for e in &ids {
+            assert!(idx.tombstone_event(e));
+        }
+        // Inserir B nesse estado.
+        let b = EventId::new();
+        idx.insert(b, 64, pt(vec![0.5]));
+
+        // B TEM de ser encontrável — senão a inserção perdeu-se a si própria.
+        let hits = idx.search(&pt(vec![0.5]), 1, 32, None);
+        assert_eq!(hits.len(), 1, "B tem de aparecer, não ficar órfão");
+        assert_eq!(hits[0].id, b);
+    }
+
     #[test]
     fn tombstones_hide_from_results_but_preserve_graph() {
         // C2.1 (padrão Qdrant): o vetor retirado sai dos RESULTADOS sem
@@ -985,6 +1124,62 @@ mod tests {
                 node.prepared,
                 PreparedPoint::new(&restored.metric, &node.point),
                 "restore deixou um cache de normas vazio ou obsoleto"
+            );
+        }
+    }
+
+    fn xorshift(estado: &mut u64) -> u64 {
+        *estado ^= *estado << 13;
+        *estado ^= *estado >> 7;
+        *estado ^= *estado << 17;
+        *estado
+    }
+
+    /// Vetor de 32 dims dentro da bola, o formato real dos embeddings.
+    fn hyp32(semente: &mut u64) -> Vec<f32> {
+        let mut v: Vec<f32> = (0..32)
+            .map(|_| ((xorshift(semente) % 20_001) as f32 / 10_000.0 - 1.0) * 0.1)
+            .collect();
+        heraclitus_manifold::project_to_ball(&mut v);
+        v
+    }
+
+    /// Auditoria 2026-09-05 (A03): UM append com um embedding de dimensao
+    /// diferente — `hyp` vazio e so `sph` preenchido, que e exactamente o que a
+    /// barreira de ingestao do gRPC deixa passar — envenenava a busca INTEIRA.
+    /// A metrica truncava o par pelo mais curto, o no ficava a distancia ZERO
+    /// de qualquer consulta e saia em primeiro lugar em quase todas. Como o log
+    /// e append-only, ficava la ate alguem lhe fazer tombstone.
+    #[test]
+    fn um_embedding_de_dimensao_diferente_nao_envenena_a_busca() {
+        let mut idx = VectorIndex::new(ProductMetric::default());
+        let mut semente = 0x243f_6a88_85a3_08d3u64;
+        for i in 0..200u64 {
+            idx.insert(EventId::new(), i, pt(hyp32(&mut semente)));
+        }
+        let envenenado = EventId::new();
+        idx.insert(
+            envenenado,
+            200,
+            ProductPoint {
+                hyp: vec![],
+                sph: vec![1.0],
+                euc: vec![],
+            },
+        );
+
+        let mut primeiros = 0usize;
+        for _ in 0..50 {
+            let hits = idx.search(&pt(hyp32(&mut semente)), 5, 128, None);
+            assert_eq!(hits.len(), 5);
+            if hits[0].id == envenenado {
+                primeiros += 1;
+            }
+            assert!(
+                hits.iter().all(|h| h.id != envenenado),
+                "o no de dimensao diferente voltou aos resultados (foi 1o em \
+                 {primeiros} consultas); distancias: {:?}",
+                hits.iter().map(|h| h.dist).collect::<Vec<_>>()
             );
         }
     }
@@ -1401,5 +1596,329 @@ mod testes_prepared_query {
         for par in hits.windows(2) {
             assert!(par[0].dist <= par[1].dist);
         }
+    }
+
+    /// Um checkpoint decodável mas com um id de vizinho fora de `nodes.len()`
+    /// passava a verificação de coerência e só rebentava depois, num
+    /// `self.nodes[vizinho]` fora de limites durante a pesquisa — pânico que
+    /// envenena o índice inteiro. Agora degrada para rebuild (`Ok(false)`).
+    #[test]
+    fn checkpoint_com_vizinho_fora_de_intervalo_degrada() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = VectorIndex::new(ProductMetric::default());
+        for i in 0..4u64 {
+            let id = EventId::new();
+            idx.insert(
+                id,
+                i,
+                ProductPoint {
+                    hyp: vec![(i as f32) / 10.0, 0.1],
+                    sph: vec![],
+                    euc: vec![],
+                },
+            );
+        }
+        idx.save_checkpoint(dir.path()).unwrap();
+
+        // Decodificar, envenenar um id de vizinho, re-escrever.
+        let bytes = std::fs::read(dir.path().join(VECTOR_CKPT_FILE)).unwrap();
+        let (mut snap, _): (VectorSnapshot, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        // Um vizinho que aponta muito para lá do fim.
+        snap.nodes[0].neighbors[0] = vec![9_999];
+        let envenenado = bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap();
+        std::fs::write(dir.path().join(VECTOR_CKPT_FILE), &envenenado).unwrap();
+
+        // Restore tem de degradar, nao adoptar o estado que panica.
+        let mut fresco = VectorIndex::new(ProductMetric::default());
+        assert!(
+            !fresco.restore(dir.path()).unwrap(),
+            "checkpoint com vizinho fora de intervalo degrada para rebuild"
+        );
+
+        // E um checkpoint SÃO continua a restaurar.
+        let mut bom = VectorIndex::new(ProductMetric::default());
+        assert!(bom.restore(dir.path()).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod testes_coerencia_do_checkpoint {
+    use super::*;
+
+    fn indice_com_quatro_pontos(dir: &Path) -> VectorIndex {
+        let mut idx = VectorIndex::new(ProductMetric::default());
+        for i in 0..4u64 {
+            let id = EventId(ulid::Ulid::from_parts(i, i as u128));
+            idx.insert(
+                id,
+                i,
+                ProductPoint {
+                    hyp: vec![(i as f32) / 10.0, 0.1],
+                    sph: vec![],
+                    euc: vec![],
+                },
+            );
+        }
+        idx.save_checkpoint(dir).unwrap();
+        idx
+    }
+
+    /// Reescreve `vector.ckpt` com o snapshot decodificado e alterado por
+    /// `envenenar`, e devolve o que um indice fresco faz do ficheiro.
+    fn restaurar_com_snapshot_envenenado(
+        dir: &Path,
+        envenenar: impl FnOnce(&mut VectorSnapshot),
+    ) -> bool {
+        let bytes = std::fs::read(dir.join(VECTOR_CKPT_FILE)).unwrap();
+        let (mut snap, _): (VectorSnapshot, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        envenenar(&mut snap);
+        let envenenado = bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap();
+        std::fs::write(dir.join(VECTOR_CKPT_FILE), &envenenado).unwrap();
+        let mut fresco = VectorIndex::new(ProductMetric::default());
+        fresco.restore(dir).unwrap()
+    }
+
+    /// Auditoria 2026-09-05, A26. `m` e `ef_construction` sao restaurados do
+    /// ficheiro sem validacao nenhuma, e `m` e divisor de `ln` em
+    /// `random_level` e regua de truncagem em `insert`. Com `m = 0` a poda
+    /// vira `truncate(0)` e apaga as listas de adjacencia em silencio; com
+    /// `m = 1` o nivel sorteado satura em `usize::MAX` e `level + 1` transborda.
+    /// Um checkpoint assim tem de degradar para rebuild do log, como o
+    /// comentario de `load_checkpoint` ja promete.
+    #[test]
+    fn checkpoint_com_m_ou_ef_construction_degenerados_degrada() {
+        for degenerado in [0usize, 1] {
+            let dir = tempfile::tempdir().unwrap();
+            indice_com_quatro_pontos(dir.path());
+            assert!(
+                !restaurar_com_snapshot_envenenado(dir.path(), |snap| snap.m = degenerado),
+                "checkpoint com m = {degenerado} tem de degradar para rebuild"
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        indice_com_quatro_pontos(dir.path());
+        assert!(
+            !restaurar_com_snapshot_envenenado(dir.path(), |snap| snap.ef_construction = 0),
+            "checkpoint com ef_construction = 0 tem de degradar para rebuild"
+        );
+
+        // E um checkpoint SAO continua a restaurar — a guarda nao pode virar
+        // uma recusa cega.
+        let dir = tempfile::tempdir().unwrap();
+        indice_com_quatro_pontos(dir.path());
+        let mut bom = VectorIndex::new(ProductMetric::default());
+        assert!(
+            bom.restore(dir.path()).unwrap(),
+            "checkpoint intacto tem de restaurar"
+        );
+        assert_eq!(bom.len(), 4);
+    }
+
+    /// Auditoria 2026-09-05, A51. O PROPRIO guarda de coerencia somava sobre um
+    /// valor nao confiavel: `n.neighbors.len() == n.level + 1`, com `level` a
+    /// vir do ficheiro como varint sem tecto. Com `level = usize::MAX` a soma
+    /// transbordava — e `overflow-checks = true` tambem no perfil release, logo
+    /// panico dentro de `load_checkpoint`, que sobe por `View::restore` ->
+    /// `ViewRegistry::catch_up` -> `Engine::open_with_boot`: o servidor nao
+    /// arrancava por causa de um ficheiro puramente derivado. Tem de degradar
+    /// para rebuild do log, como a funcao promete.
+    #[test]
+    fn checkpoint_com_nivel_absurdo_degrada_em_vez_de_transbordar() {
+        let dir = tempfile::tempdir().unwrap();
+        indice_com_quatro_pontos(dir.path());
+        assert!(
+            !restaurar_com_snapshot_envenenado(dir.path(), |snap| snap.nodes[0].level = usize::MAX),
+            "nivel absurdo degrada para rebuild, nao panica"
+        );
+
+        // O vec de vizinhos vazio continua recusado — `search_layer` indexa
+        // `neighbors[..len()-1]` e um vec vazio dava underflow em toda pesquisa
+        // futura. O `checked_sub` subsume esta defesa; o teste prende-a.
+        let dir = tempfile::tempdir().unwrap();
+        indice_com_quatro_pontos(dir.path());
+        assert!(
+            !restaurar_com_snapshot_envenenado(dir.path(), |snap| snap.nodes[0].neighbors.clear()),
+            "checkpoint com lista de vizinhos vazia degrada para rebuild"
+        );
+
+        // E a combinacao das duas: vec vazio COM `level = usize::MAX`. Um
+        // `wrapping_sub(1)` daria `usize::MAX`, que casa com o `level` do
+        // ficheiro — o snapshot passava a coerencia e `search_layer` ia
+        // indexar `neighbors[..len()-1]` num vec vazio.
+        let dir = tempfile::tempdir().unwrap();
+        indice_com_quatro_pontos(dir.path());
+        assert!(
+            !restaurar_com_snapshot_envenenado(dir.path(), |snap| {
+                snap.nodes[0].level = usize::MAX;
+                snap.nodes[0].neighbors.clear();
+            }),
+            "vec vazio com nivel usize::MAX nao pode passar por dar a volta"
+        );
+    }
+
+    /// Auditoria 2026-09-05, A26 (defesa em profundidade). `random_level`
+    /// divide por `ln(m)`: com `m = 1` isso e `1/0 = +inf`, o `floor() as usize`
+    /// satura em `usize::MAX` e a alocacao `vec![Vec::new(); level + 1]` de
+    /// `insert` transborda — panico, nao degradacao. A funcao tem de ser total.
+    #[test]
+    fn random_level_e_total_quando_m_e_um() {
+        let mut idx = VectorIndex::new(ProductMetric::default());
+        idx.m = 1;
+        for i in 0..8u64 {
+            let id = EventId(ulid::Ulid::from_parts(i, i as u128));
+            idx.insert(
+                id,
+                i,
+                ProductPoint {
+                    hyp: vec![(i as f32) / 10.0, 0.1],
+                    sph: vec![],
+                    euc: vec![],
+                },
+            );
+        }
+        assert_eq!(idx.len(), 8);
+        assert!(
+            idx.nodes.iter().all(|n| n.level < 1024),
+            "nivel sorteado com m = 1 saturou"
+        );
+    }
+}
+
+#[cfg(test)]
+mod testes_poda_de_vizinhos {
+    use super::*;
+
+    fn ponto(i: u32) -> ProductPoint {
+        ProductPoint {
+            hyp: vec![(i as f32) / 25.0, 0.1],
+            sph: vec![],
+            euc: vec![],
+        }
+    }
+
+    /// 40 nos em que `i` e `i + 20` partilham EXACTAMENTE o mesmo ponto — e
+    /// portanto a mesma distancia a qualquer outro no. Os empates sao o que
+    /// prende a ESTABILIDADE da ordenacao da poda.
+    fn indice_com_pontos_repetidos() -> VectorIndex {
+        let mut idx = VectorIndex::new(ProductMetric::default());
+        for i in 0..40u32 {
+            let id = EventId(ulid::Ulid::from_parts(i as u64, i as u128));
+            idx.insert(id, i as u64, ponto(i % 20));
+        }
+        idx
+    }
+
+    /// Lista de 33 vizinhos (um a mais do que `m * 2 = 32`, logo a poda corta)
+    /// com os pares empatados deliberadamente pela ordem id-ALTO primeiro: se
+    /// alguem acrescentar um desempate por id, a ordem muda e o teste morre.
+    fn lista_de_vizinhos() -> Vec<u32> {
+        let mut lista = Vec::new();
+        for i in 1..=13u32 {
+            lista.push(i + 20);
+            lista.push(i);
+        }
+        lista.extend(14..=20u32);
+        assert_eq!(lista.len(), 33);
+        lista
+    }
+
+    /// Assinatura de TODO o grafo: niveis e listas de adjacencia de cada no.
+    /// Qualquer aresta diferente muda o valor.
+    fn assinatura_do_grafo(idx: &VectorIndex) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let misturar = |h: &mut u64, v: u64| {
+            *h ^= v;
+            *h = h.wrapping_mul(0x1000_0000_01b3);
+        };
+        for no in &idx.nodes {
+            misturar(&mut h, no.level as u64);
+            for camada in &no.neighbors {
+                misturar(&mut h, camada.len() as u64);
+                for &v in camada {
+                    misturar(&mut h, v as u64);
+                }
+            }
+        }
+        h
+    }
+
+    /// Auditoria 2026-09-05, A27. A poda recalculava a distancia DENTRO do
+    /// comparador do `sort_by` — duas avaliacoes da metrica por comparacao,
+    /// ~2·n·log2(n) onde n bastavam, no caminho quente de escrita (`View::apply`
+    /// -> `insert`, uma vez por episodio com embedding). Cada avaliacao percorre
+    /// os vectores em f64 e paga um `acosh`.
+    #[test]
+    fn poda_calcula_a_distancia_uma_vez_por_vizinho() {
+        let mut idx = indice_com_pontos_repetidos();
+        let lista = lista_de_vizinhos();
+        let n = 39u32;
+        idx.nodes[n as usize].neighbors[0] = lista.clone();
+
+        DIST2_CALLS.with(|c| c.set(0));
+        idx.podar_vizinhos(n, 0);
+        let chamadas = DIST2_CALLS.with(|c| c.get());
+
+        assert_eq!(
+            chamadas,
+            lista.len(),
+            "a poda tem de avaliar a metrica uma vez por vizinho ({} vizinhos), nao uma vez por comparacao",
+            lista.len()
+        );
+    }
+
+    /// Guarda de neutralidade: a poda optimizada tem de dar EXACTAMENTE a
+    /// mesma lista que o caminho antigo, incluindo a ordem dos empatados (o
+    /// `sort_by` e estavel, e a ordem da lista de adjacencia e observavel no
+    /// checkpoint e na travessia). Um desempate novo — por id ou por uma
+    /// particao instavel tipo `select_nth_unstable_by` — seria uma mudanca de
+    /// grafo travestida de optimizacao.
+    #[test]
+    fn poda_preserva_exactamente_a_ordem_do_caminho_antigo() {
+        let mut idx = indice_com_pontos_repetidos();
+        let lista = lista_de_vizinhos();
+        let n = 39u32;
+
+        // Oraculo: literalmente o caminho antigo (chave recalculada dentro do
+        // comparador, `sort_by` estavel, truncar).
+        let np = PreparedQuery::new(&idx.metric, &idx.nodes[n as usize].point);
+        let empatados = lista
+            .windows(2)
+            .filter(|par| idx.dist2(par[0], &np) == idx.dist2(par[1], &np))
+            .count();
+        assert!(
+            empatados >= 13,
+            "o teste so prende a estabilidade se houver empates; encontrei {empatados}"
+        );
+        let mut esperado = lista.clone();
+        esperado.sort_by(|&a, &b| idx.dist2(a, &np).total_cmp(&idx.dist2(b, &np)));
+        esperado.truncate(idx.m * 2);
+
+        idx.nodes[n as usize].neighbors[0] = lista;
+        idx.podar_vizinhos(n, 0);
+
+        assert_eq!(
+            idx.nodes[n as usize].neighbors[0], esperado,
+            "a poda mudou a lista de adjacencia — a optimizacao nao e neutra"
+        );
+    }
+
+    /// Golden capturado com o codigo ANTERIOR a optimizacao da poda: a
+    /// construcao de um indice de 300 nos (que satura as listas e passa pela
+    /// poda muitas vezes) tem de produzir o MESMO grafo, aresta a aresta.
+    #[test]
+    fn a_optimizacao_da_poda_nao_muda_o_grafo_construido() {
+        let mut idx = VectorIndex::new(ProductMetric::default());
+        for i in 0..300u32 {
+            let id = EventId(ulid::Ulid::from_parts(i as u64, i as u128));
+            idx.insert(id, i as u64, ponto(i % 20));
+        }
+        assert_eq!(
+            assinatura_do_grafo(&idx),
+            10_880_861_797_930_025_899,
+            "a construcao deixou de dar o mesmo grafo que o caminho antigo"
+        );
     }
 }

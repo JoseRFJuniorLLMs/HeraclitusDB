@@ -86,7 +86,12 @@ simulate_op = { ^"ADD" | ^"REMOVE" }
 adapt_stmt = { ^"ADAPT" ~ "(" ~ ")" ~ as_of? }
 
 // ---- terminals ----
-ident = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_")* }
+// `ASCII_ALPHA` recusava rótulos e colunas acentuados — `MATCH (n:Licitação)`
+// e `WHERE n.órgão = ...` são dados reais (Portal da Transparência). `ALPHABETIC`
+// é a propriedade Unicode "letra", portanto ç/ã/é passam; a primeira posição
+// continua a ser uma letra (não dígito) para não colidir com `number` nem com
+// as palavras-chave.
+ident = @{ ALPHABETIC ~ (ALPHABETIC | ASCII_DIGIT | "_")* }
 prop = ${ ident ~ "." ~ ident }
 int = @{ ASCII_DIGIT+ }
 number = @{ "-"? ~ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? }

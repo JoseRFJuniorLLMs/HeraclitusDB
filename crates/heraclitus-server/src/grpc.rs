@@ -519,6 +519,7 @@ pub(crate) fn legal_hold_op(
                 created_at_lsn: head,
             };
             match heraclitus_compliance::RegulatoryPolicyEngine::new(engine.log.clone())
+                .with_sink(engine.clone())
                 .with_cache(engine.regulatory_cache.clone())
                 .place_legal_hold(hold)
             {
@@ -534,6 +535,7 @@ pub(crate) fn legal_hold_op(
                 released_at_lsn: engine.log.head(),
             };
             match heraclitus_compliance::RegulatoryPolicyEngine::new(engine.log.clone())
+                .with_sink(engine.clone())
                 .with_cache(engine.regulatory_cache.clone())
                 .release_legal_hold(release)
             {
@@ -587,6 +589,7 @@ pub(crate) fn regulatory_policy_op(
     }
 
     let regulatory = heraclitus_compliance::RegulatoryPolicyEngine::new(engine.log.clone())
+        .with_sink(engine.clone())
         .with_cache(engine.regulatory_cache.clone());
     match op {
         "regulatory-policy-activate" => {
@@ -676,7 +679,8 @@ pub(crate) fn privacy_incident_op(
                 .into(),
         );
     }
-    let privacy = heraclitus_compliance::PrivacyIncidentEngine::new(engine.log.clone());
+    let privacy = heraclitus_compliance::PrivacyIncidentEngine::new(engine.log.clone())
+        .with_sink(engine.clone());
     match op {
         "privacy-assessment" => {
             let assessment =
@@ -800,7 +804,8 @@ pub(crate) fn deferred_anchor_op(
                 .into(),
         );
     }
-    let registry = heraclitus_compliance::DeferredAnchorRegistry::new(engine.log.clone());
+    let registry = heraclitus_compliance::DeferredAnchorRegistry::new(engine.log.clone())
+        .with_sink(engine.clone());
     match op {
         "deferred-anchor-prepare" => {
             #[derive(serde::Deserialize)]
@@ -909,6 +914,7 @@ pub(crate) fn model_bundle_op(
                     Err(error) => return (false, error.to_string()),
                 };
             match heraclitus_compliance::ModelBundleRegistry::new(engine.log.clone())
+                .with_sink(engine.clone())
                 .activate(verified.clone())
             {
                 Ok(lsn) => (

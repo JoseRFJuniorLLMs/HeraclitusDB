@@ -293,6 +293,77 @@ const OID_AUTHORITY_KEY_ID: der::asn1::ObjectIdentifier =
 
 /// §5.2 — o âmbito da CRL. Uma CRL parcial usada como se fosse completa
 /// responde "não revogado" sobre certificados que ela nunca teve de cobrir.
+/// As seis perguntas do `issuingDistributionPoint` (§5.2.5), separadas de
+/// [`verificar_ambito`] para poderem ser verificadas sem construir uma CRL DER
+/// inteira — é aqui que se decide se uma CRL responde sequer à pergunta que lhe
+/// estamos a fazer, e essa decisão merece testes directos.
+///
+/// A regra em todas elas é a mesma: se a CRL declara um âmbito que este
+/// validador não sabe casar com o certificado em mãos, recusa-se. Aceitar
+/// significaria responder "não revogado" a partir de uma lista que nunca teve
+/// de conter aquele serial.
+fn verificar_idp(
+    idp: &x509_cert::ext::pkix::IssuingDistributionPoint,
+    e_ca: bool,
+) -> Result<(), CompError> {
+    // §5.2.5 — uma CRL com `distributionPoint` cobre SO os
+    // certificados cujo `cRLDistributionPoints` aponta para ali.
+    // Tratar uma particao como se fosse a lista completa do emissor
+    // e responder "nao revogado" sobre seriais que ela nunca teve de
+    // listar — exactamente a falha que o cabecalho desta funcao
+    // descreve, e que faltava implementar.
+    //
+    // Saber se ESTE certificado pertence a esta particao exige
+    // comparar `GeneralNames` com o CDP do proprio certificado.
+    // Enquanto isso nao existir, a resposta honesta e recusar: o
+    // resto da funcao ja segue esta regra para tudo o que nao sabe
+    // interpretar.
+    if idp.distribution_point.is_some() {
+        return Err(CompError::Verify(
+            "CRL de uma PARTICAO: o issuingDistributionPoint traz distributionPoint, logo ela cobre so os certificados que apontam para esse ponto. Usa-la como completa daria 'nao revogado' a quem esta revogado noutra particao. Instale a CRL completa do emissor"
+                .into(),
+        ));
+    }
+    // Uma CRL so de certificados de atributo nao diz nada sobre
+    // certificados de chave publica, que sao os unicos que este
+    // validador verifica.
+    if idp.only_contains_attribute_certs {
+        return Err(CompError::Verify(
+            "CRL so de certificados de atributo (onlyContainsAttributeCerts) consultada para um certificado de chave publica"
+                .into(),
+        ));
+    }
+    if idp.only_some_reasons.is_some() {
+        return Err(CompError::Verify(
+            "CRL limitada a alguns motivos de revogação (onlySomeReasons): não \
+             cobre todos os casos e usá-la como completa esconderia os restantes"
+                .into(),
+        ));
+    }
+    if idp.indirect_crl {
+        return Err(CompError::Verify(
+            "CRL indirecta (indirectCRL): as entradas podem pertencer a outros \
+             emissores via certificateIssuer, que este validador não interpreta"
+                .into(),
+        ));
+    }
+    // Uma CRL só de utilizadores não diz nada sobre uma AC, e
+    // vice-versa. Responder com ela é responder à pergunta errada.
+    if idp.only_contains_ca_certs && !e_ca {
+        return Err(CompError::Verify(
+            "CRL só de certificados de AC consultada para um certificado de fim de \
+             entidade"
+                .into(),
+        ));
+    }
+    if idp.only_contains_user_certs && e_ca {
+        return Err(CompError::Verify(
+            "CRL só de certificados de utilizador consultada para uma AC".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn verificar_ambito(crl: &CertificateList, e_ca: bool) -> Result<(), CompError> {
     let Some(exts) = crl.tbs_cert_list.crl_extensions.as_ref() else {
         return Ok(());
@@ -317,34 +388,7 @@ fn verificar_ambito(crl: &CertificateList, e_ca: bool) -> Result<(), CompError> 
                 .map_err(|e| {
                     CompError::Verify(format!("issuingDistributionPoint inválido: {e}"))
                 })?;
-                if idp.only_some_reasons.is_some() {
-                    return Err(CompError::Verify(
-                        "CRL limitada a alguns motivos de revogação (onlySomeReasons): não \
-                         cobre todos os casos e usá-la como completa esconderia os restantes"
-                            .into(),
-                    ));
-                }
-                if idp.indirect_crl {
-                    return Err(CompError::Verify(
-                        "CRL indirecta (indirectCRL): as entradas podem pertencer a outros \
-                         emissores via certificateIssuer, que este validador não interpreta"
-                            .into(),
-                    ));
-                }
-                // Uma CRL só de utilizadores não diz nada sobre uma AC, e
-                // vice-versa. Responder com ela é responder à pergunta errada.
-                if idp.only_contains_ca_certs && !e_ca {
-                    return Err(CompError::Verify(
-                        "CRL só de certificados de AC consultada para um certificado de fim de \
-                         entidade"
-                            .into(),
-                    ));
-                }
-                if idp.only_contains_user_certs && e_ca {
-                    return Err(CompError::Verify(
-                        "CRL só de certificados de utilizador consultada para uma AC".into(),
-                    ));
-                }
+                verificar_idp(&idp, e_ca)?;
             }
             // Conhecidas e sem efeito na decisão.
             OID_CRL_NUMBER | OID_AUTHORITY_KEY_ID => {}
@@ -604,4 +648,81 @@ fn motivo_de(entrada: &x509_cert::crl::RevokedCert) -> Result<RevocationReason, 
         .copied()
         .ok_or_else(|| CompError::Verify("reasonCode ENUMERATED vazio".into()))?;
     Ok(RevocationReason::from_u8(v))
+}
+
+#[cfg(test)]
+mod testes_ambito {
+    use super::*;
+    use x509_cert::ext::pkix::{
+        name::{DistributionPointName, GeneralName, GeneralNames},
+        IssuingDistributionPoint,
+    };
+
+    fn idp() -> IssuingDistributionPoint {
+        IssuingDistributionPoint {
+            distribution_point: None,
+            only_contains_user_certs: false,
+            only_contains_ca_certs: false,
+            only_some_reasons: None,
+            indirect_crl: false,
+            only_contains_attribute_certs: false,
+        }
+    }
+
+    /// Uma CRL sem âmbito declarado cobre o emissor inteiro: é a única que
+    /// responde à pergunta que lhe fazemos.
+    #[test]
+    fn sem_ambito_declarado_serve() {
+        assert!(verificar_idp(&idp(), false).is_ok());
+        assert!(verificar_idp(&idp(), true).is_ok());
+    }
+
+    /// O buraco que isto fecha: uma CRL de UMA partição era aceite como se
+    /// listasse tudo o que o emissor revogou. Um serial revogado noutra
+    /// partição respondia "não revogado" — a pior resposta possível de um
+    /// verificador de revogação, porque é silenciosa e parece um sucesso.
+    #[test]
+    fn uma_particao_nao_passa_por_lista_completa() {
+        let mut p = idp();
+        p.distribution_point = Some(DistributionPointName::FullName(GeneralNames::from(vec![
+            GeneralName::UniformResourceIdentifier(
+                "http://ac.example/actcrl-1.crl"
+                    .to_owned()
+                    .try_into()
+                    .unwrap(),
+            ),
+        ])));
+        let erro = verificar_idp(&p, false).unwrap_err().to_string();
+        assert!(erro.contains("PARTICAO"), "{erro}");
+    }
+
+    /// Certificados de atributo são outra coisa; esta CRL não diz nada sobre
+    /// os certificados de chave pública que este validador verifica.
+    #[test]
+    fn crl_so_de_certificados_de_atributo_nao_serve() {
+        let mut p = idp();
+        p.only_contains_attribute_certs = true;
+        assert!(verificar_idp(&p, false).is_err());
+    }
+
+    /// Os âmbitos que já eram recusados continuam a sê-lo — a extracção não
+    /// pode ter perdido nenhum pelo caminho.
+    #[test]
+    fn os_ambitos_ja_cobertos_continuam_recusados() {
+        let mut indirecta = idp();
+        indirecta.indirect_crl = true;
+        assert!(verificar_idp(&indirecta, false).is_err());
+
+        // Só de AC, perguntada sobre uma entidade final: pergunta errada.
+        let mut so_ac = idp();
+        so_ac.only_contains_ca_certs = true;
+        assert!(verificar_idp(&so_ac, false).is_err());
+        assert!(verificar_idp(&so_ac, true).is_ok(), "sobre uma AC serve");
+
+        // E o simétrico.
+        let mut so_utilizador = idp();
+        so_utilizador.only_contains_user_certs = true;
+        assert!(verificar_idp(&so_utilizador, true).is_err());
+        assert!(verificar_idp(&so_utilizador, false).is_ok());
+    }
 }

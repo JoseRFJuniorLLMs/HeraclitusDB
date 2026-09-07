@@ -367,7 +367,18 @@ impl<'a> WandCursor<'a> {
             current_doc: None,
             current_tf: 0,
         };
-        debug_assert!(out.load_first_in_block());
+        // `debug_assert!` NAO avalia a expressao em release. Estando a chamada
+        // aqui dentro, `load_first_in_block` simplesmente desaparecia da build
+        // de producao: todos os cursores nasciam com `current_doc = None` e a
+        // pesquisa WAND devolvia resultados errados — enquanto os testes, que
+        // correm em debug, passavam todos. O oraculo de equivalencia existia e
+        // estava certo; nunca tinha corrido em release.
+        //
+        // A carga faz parte da construcao, nao e uma verificacao: se o primeiro
+        // bloco nao carrega, nao ha cursor.
+        if !out.load_first_in_block() {
+            return None;
+        }
         Some(out)
     }
 
@@ -692,6 +703,24 @@ impl View for TextIndex {
             total_len,
             watermark,
         } = snap;
+        // COERÊNCIA antes de adoptar o checkpoint. Um checkpoint que descodifica
+        // mas é inconsistente — um `doc_id` numa posting além do número de
+        // documentos, ou os arrays por-documento com tamanhos diferentes — não
+        // falhava aqui: falhava DEPOIS, num índice fora de limites durante a
+        // pesquisa, que entra em pânico e ENVENENA o RwLock do índice (todas as
+        // pesquisas seguintes abortam). O contrato do checkpoint é degradar para
+        // rebuild quando é inutilizável; validar aqui honra-o.
+        let n_docs = ids.len();
+        if doc_len.len() != n_docs || lsns.len() != n_docs {
+            return Ok(false);
+        }
+        if postings
+            .values()
+            .flatten()
+            .any(|(doc_id, _tf)| *doc_id as usize >= n_docs)
+        {
+            return Ok(false);
+        }
         self.by_event = ids
             .iter()
             .enumerate()
@@ -789,6 +818,49 @@ mod tests {
         assert!(hits.iter().all(|h| h.id == ids[0] || h.id == ids[1]));
         let fire = idx.search("fire change", 3);
         assert_eq!(fire[0].id, ids[2]);
+    }
+
+    /// Um checkpoint decodável mas INCOERENTE — um `doc_id` numa posting além
+    /// do número de documentos — não falhava no restore: falhava depois, num
+    /// índice fora de limites durante a pesquisa, que entra em pânico e envenena
+    /// o RwLock do índice. Agora o restore valida a coerência e degrada para
+    /// rebuild (`Ok(false)`).
+    #[test]
+    fn checkpoint_incoerente_degrada_em_vez_de_panicar() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = TextIndex::new();
+        for (i, d) in ["gato preto", "gato branco"].iter().enumerate() {
+            let e = Episode::new("a", EventKind::Observation, d.as_bytes().to_vec());
+            idx.apply(i as u64, &e);
+        }
+        idx.checkpoint(dir.path()).unwrap();
+
+        // Escrever um checkpoint INCOERENTE à mão: dois documentos, mas uma
+        // posting que aponta para o documento 99 (fora de `ids.len()`).
+        let mut postings: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
+        postings.insert("gato".into(), vec![(0, 1), (1, 1)]);
+        postings.insert("fantasma".into(), vec![(99, 1)]);
+        heraclitus_views::ckpt::save(
+            dir.path(),
+            "text",
+            &TextSnapshot {
+                postings,
+                doc_len: vec![2, 2],
+                ids: vec![EventId::new(), EventId::new()],
+                lsns: vec![0, 1],
+                total_len: 4,
+                watermark: 1,
+            },
+        )
+        .unwrap();
+
+        let mut fresco = TextIndex::new();
+        assert!(
+            !fresco.restore(dir.path()).unwrap(),
+            "checkpoint com doc_id fora de intervalo degrada para rebuild"
+        );
+        // E uma pesquisa no índice fresco não panica (ficou vazio, a reconstruir).
+        let _ = fresco.search("gato", 3);
     }
 }
 

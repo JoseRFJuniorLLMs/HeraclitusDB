@@ -98,6 +98,7 @@ pub use threat::{
     ThreatSighting, ThreatSourcePolicy, ThreatSourceRegistry, TlpLevel, TrustLevel,
 };
 
+use behavior::chaves_de_entidades;
 use heraclitus_core::{Episode, EventId, EventKind, HeraclitusError, Lsn};
 use heraclitus_log::subscribe::attach_subscriber_with_stop;
 use heraclitus_log::AnyLog;
@@ -218,6 +219,52 @@ pub(crate) const TECTO_CHAVES_SIGHTING: usize = 65_536;
 /// a derivacao e o derivado a voltar pelo subscriber.
 pub(crate) const TECTO_LSN_DERIVADOS: usize = 262_144;
 
+/// Auditoria 2026-09-05, A38 — tecto da evidencia acumulada por sujeito na
+/// fusao (L3).
+///
+/// O `FusionAccumulator` nunca decai nem e reposto, e cada sinal novo do mesmo
+/// sujeito traz uma `EvidenceRef` INEDITA (o `event_id` e o `raw_event_id` do
+/// evento de origem, distinto por evento). Como a evidencia acumulada e
+/// reserializada por INTEIRO em cada `SecurityRiskAssessment` persistido — e
+/// ainda vai um `EventId` por referencia em `episode.parents` —, N sinais do
+/// mesmo sujeito escreviam 1+2+...+N referencias: O(N^2) bytes num log
+/// append-only. O mesmo vector ia integral em cada snapshot publicado.
+///
+/// O irmao do mesmo pipeline ja tinha tecto (`max_evidence_per_incident`), tal
+/// como as duas janelas aqui em cima; so o `fusion_state` ficara de fora.
+/// Guardam-se as mais RECENTES por LSN: a evidencia completa continua no log,
+/// nos episodios `SecuritySignal`, e o assessment e uma vista sobre ela.
+pub(crate) const TECTO_EVIDENCIA_POR_SUJEITO: usize = 4_096;
+
+/// Auditoria 2026-09-05, A38 — acumula evidencia mantendo a ordem e o tecto.
+///
+/// O vector esta SEMPRE ordenado por `(lsn, event_id)` — e a mesma ordem que
+/// `sorted_evidence` produz e de que a serializacao byte a byte do assessment
+/// depende —, logo a deduplicacao e a insercao sao a MESMA busca binaria, e
+/// nao um `contains` linear seguido de reordenar um vector que ja estava
+/// ordenado. No caso comum (LSN monotono) a posicao cai no fim e o `insert`
+/// degenera num `push`.
+///
+/// O tecto corta pelo PREFIXO porque o vector cresce em LSN: o que se descarta
+/// e sempre a evidencia mais antiga. E deterministico sob replay e sob
+/// restauro de snapshot, porque a ordem de processamento e sempre a ordem de
+/// LSN do log.
+fn acumular_evidencia(acumulado: &mut Vec<EvidenceRef>, novas: &[EvidenceRef], tecto: usize) {
+    for evidencia in novas {
+        if let Err(posicao) = acumulado.binary_search_by(|item| {
+            item.lsn
+                .cmp(&evidencia.lsn)
+                .then_with(|| item.event_id.cmp(&evidencia.event_id))
+        }) {
+            acumulado.insert(posicao, evidencia.clone());
+        }
+    }
+    if tecto > 0 && acumulado.len() > tecto {
+        let excesso = acumulado.len() - tecto;
+        acumulado.drain(..excesso);
+    }
+}
+
 struct RuntimeInner {
     log: Arc<AnyLog>,
     derived_sink: Arc<dyn DerivedEventSink>,
@@ -243,7 +290,17 @@ struct RuntimeInner {
     /// SPEC-0047 — índice de IOC e políticas de fonte. `None` quando o plano
     /// de threat intel está desligado, que é o default.
     threat: Option<crate::threat::ThreatPlane>,
-    rule_history: Mutex<Vec<(Lsn, SecurityEvent)>>,
+    rule_history: Mutex<HistoricoL1>,
+    /// Auditoria 2026-09-05, A19 — o resultado da última varredura do L1, com a
+    /// versão da janela que o produziu.
+    ///
+    /// Gravado apenas DEPOIS de o ciclo de appends dos sinais terminar com
+    /// sucesso. Grava-lo antes seria pior do que não ter cache nenhuma: se um
+    /// append falhasse a meio, o erro subiria, o cursor não avançaria e o lote
+    /// seria reprocessado — mas nessa retentativa `remember_rule_event` veria
+    /// duplicado, a versão não mudaria, e a cache saltaria precisamente os
+    /// appends que faltavam. Sinais perdidos, em silêncio.
+    l1_cache: Mutex<Option<(u64, HashSet<EventId>)>>,
     behavior_engine: Option<Mutex<BehavioralEngine>>,
     fusion: Option<Mutex<EvidenceFusion>>,
     fusion_state: Mutex<BTreeMap<String, FusionAccumulator>>,
@@ -294,9 +351,23 @@ struct RuntimeInner {
     /// SPEC-0072 §44 — quantos eventos foram processados desde a ultima
     /// publicacao. E a cadencia do snapshot; zero logo a seguir a publicar.
     eventos_desde_snapshot: std::sync::atomic::AtomicU64,
-    /// SPEC-0072 §44 — quando saiu o ultimo snapshot. O `try_lock` sobre isto
-    /// e tambem o rate limiting entre workers.
+    /// SPEC-0072 §44 — quando saiu o ultimo snapshot.
     ultimo_snapshot: Mutex<Instant>,
+    /// Auditoria 2026-09-05, A37 — a exclusao entre publicadores.
+    ///
+    /// Existe um so ficheiro temporario, de caminho FIXO
+    /// (`state.snapshot.tmp`, SPEC-0072 §6), aberto com `truncate`: dois
+    /// publicadores em simultaneo escrevem ambos a partir do offset 0 do MESMO
+    /// inode. Antes, a unica coisa que se parecia com exclusao era um
+    /// `try_lock` sobre `ultimo_snapshot` que morria antes de a publicacao
+    /// comecar — um TOCTOU. Este mutex e segurado durante a publicacao
+    /// INTEIRA, e cobre os tres caminhos: os workers, a API publica
+    /// `Runtime::publicar_snapshot()` e o `shutdown`.
+    ///
+    /// Ordem de locks: publicacao -> cursor -> motores. NUNCA pegar neste com
+    /// o mutex do cursor na mao — `capturar_snapshot` volta a pegar no cursor,
+    /// e seria abraco mortal.
+    publicacao_snapshot: Mutex<()>,
 }
 
 /// Guarda RAII da permissão do circuit breaker do plano L4.
@@ -622,7 +693,7 @@ impl SentinelRuntime {
         // snapshot, os conjuntos até ao watermark vêm de lá e esta passagem só
         // cobre a cauda.
         let relogio = Instant::now();
-        let (ids, derived_sources) = passagem_de_ids(
+        let (ids, derived_sources, sighting_keys) = passagem_de_ids(
             &log,
             desde,
             ate_exclusivo,
@@ -699,6 +770,18 @@ impl SentinelRuntime {
                 s.fusion_accumulators
                     .iter()
                     .map(|(chave, estado)| {
+                        // Auditoria 2026-09-05, A38 — o snapshot vem de disco
+                        // e a insercao ordenada de `acumular_evidencia` EXIGE
+                        // a ordem por `(lsn, event_id)`. Antes, o `sort_by`
+                        // por sinal reparava-a de graca; agora ordena-se uma
+                        // vez no arranque (custo unico, irrelevante).
+                        let mut evidence = estado.evidence.clone();
+                        evidence.sort_by(|esquerda, direita| {
+                            esquerda
+                                .lsn
+                                .cmp(&direita.lsn)
+                                .then_with(|| esquerda.event_id.cmp(&direita.event_id))
+                        });
                         (
                             chave.clone(),
                             FusionAccumulator {
@@ -707,7 +790,7 @@ impl SentinelRuntime {
                                 behavioral_score: estado.behavioral_score,
                                 graph_score: estado.graph_score,
                                 threat_intel_score: estado.threat_intel_score,
-                                evidence: estado.evidence.clone(),
+                                evidence,
                                 detectors: estado.detectors.clone(),
                             },
                         )
@@ -715,10 +798,19 @@ impl SentinelRuntime {
                     .collect()
             })
             .unwrap_or_default();
-        let historico_de_regras = snapshot
-            .as_ref()
-            .map(|s| s.rule_history.clone())
-            .unwrap_or_default();
+        let historico_de_regras = {
+            let mut linhas: Vec<(Lsn, SecurityEvent)> = snapshot
+                .as_ref()
+                .map(|s| s.rule_history.clone())
+                .unwrap_or_default();
+            // Auditoria 2026-09-05, A18 — o snapshot vem de disco e a inserção
+            // por busca binária EXIGE a ordem; antes, o `sort_by` por evento
+            // reparava-a de graça. Ordena-se uma vez no arranque (custo único,
+            // irrelevante); sem isto, um `rule_history` desordenado passaria a
+            // deduplicar mal, em silêncio.
+            ordenar_historico_l1(&mut linhas);
+            linhas
+        };
         metrics
             .boot
             .state_restore_ms
@@ -737,12 +829,20 @@ impl SentinelRuntime {
             threat,
             // Do snapshot quando ha um; senao vazio, e a segunda passagem
             // enche-o com poda a cada lote.
-            rule_history: Mutex::new(historico_de_regras),
+            rule_history: Mutex::new(HistoricoL1 {
+                linhas: historico_de_regras,
+                versao: 0,
+            }),
+            l1_cache: Mutex::new(None),
             behavior_engine,
             fusion,
             fusion_state: Mutex::new(acumuladores_de_fusao),
             signal_ids: Mutex::new(signal_ids),
-            sighting_keys: Mutex::new(JanelaDeChaves::nova(TECTO_CHAVES_SIGHTING)),
+            // Auditoria 2026-09-05, A40 — vem da primeira passagem, como
+            // `derived_sources`. Antes nascia VAZIA, e o mesmo `SecurityEvent`
+            // reprocessado depois de um reinicio reapendava um sighting que ja
+            // estava no log.
+            sighting_keys: Mutex::new(sighting_keys),
             // A janela já vem cheia e com tecto da primeira passagem. O código
             // anterior construía um `HashSet<Lsn>` com uma entrada por evento
             // derivado da base inteira e só aqui o despejava nela: o tecto
@@ -764,6 +864,7 @@ impl SentinelRuntime {
             snapshot_store,
             eventos_desde_snapshot: std::sync::atomic::AtomicU64::new(0),
             ultimo_snapshot: Mutex::new(Instant::now()),
+            publicacao_snapshot: Mutex::new(()),
         });
 
         let relogio = Instant::now();
@@ -1421,6 +1522,44 @@ impl SentinelRuntime {
             None,
             10_000,
         )?;
+        // Auditoria 2026-09-05, A39 — estas duas varreduras estavam DENTRO do
+        // ciclo, com argumentos que só dependem de `authorized` e nunca da
+        // decisão a ser examinada: o custo era O(D × log) para um trabalho que
+        // é O(log). O compilador não as podia içar, porque `l4_events` faz I/O.
+        //
+        // A equivalência é exacta e não é acidental: o predicado antigo era
+        // `.filter(proposal_id igual).any(acção igual)`, e `authorized.action`
+        // é constante no ciclo — logo o conjunto dos `proposal_id` cuja
+        // proposta tem ESTA acção decide o mesmo que o `.any(...)` decidia,
+        // incluindo o caso de várias propostas partilharem o mesmo id.
+        let propostas_com_a_accao: std::collections::BTreeSet<String> = self
+            .l4_events(
+                Some("SecurityActionProposal"),
+                Some(&authorized.incident_id),
+                None,
+                10_000,
+            )?
+            .into_iter()
+            .filter_map(|(_, episode)| {
+                let proposal_id = episode.attrs.get("sentinel.action_proposal_id")?.clone();
+                let proposal = serde_json::from_slice::<ActionProposal>(&episode.content).ok()?;
+                (proposal.action == authorized.action).then_some(proposal_id)
+            })
+            .collect();
+        let aprovacoes_concedidas: std::collections::BTreeSet<String> = self
+            .l4_events(
+                Some("SecurityApproval"),
+                Some(&authorized.incident_id),
+                None,
+                10_000,
+            )?
+            .into_iter()
+            .filter_map(|(_, episode)| {
+                (episode.attrs.get("sentinel.approved").map(String::as_str) == Some("true"))
+                    .then(|| episode.attrs.get("sentinel.approval_id").cloned())
+                    .flatten()
+            })
+            .collect();
         for (_, decision_episode) in decisions {
             let Ok(payload) =
                 serde_json::from_slice::<serde_json::Value>(&decision_episode.content)
@@ -1440,26 +1579,7 @@ impl SentinelRuntime {
             else {
                 continue;
             };
-            let proposal_matches = self
-                .l4_events(
-                    Some("SecurityActionProposal"),
-                    Some(&authorized.incident_id),
-                    None,
-                    10_000,
-                )?
-                .into_iter()
-                .filter(|(_, episode)| {
-                    episode
-                        .attrs
-                        .get("sentinel.action_proposal_id")
-                        .map(String::as_str)
-                        == Some(proposal_id)
-                })
-                .any(|(_, episode)| {
-                    serde_json::from_slice::<ActionProposal>(&episode.content)
-                        .map(|proposal| proposal.action == authorized.action)
-                        .unwrap_or(false)
-                });
+            let proposal_matches = propostas_com_a_accao.contains(proposal_id);
             if !proposal_matches {
                 continue;
             }
@@ -1481,23 +1601,7 @@ impl SentinelRuntime {
                 if authorized.authorization_id != format!("authz-{approval_id}") {
                     continue;
                 }
-                let approved = self
-                    .l4_events(
-                        Some("SecurityApproval"),
-                        Some(&authorized.incident_id),
-                        None,
-                        10_000,
-                    )?
-                    .into_iter()
-                    .any(|(_, episode)| {
-                        episode
-                            .attrs
-                            .get("sentinel.approval_id")
-                            .map(String::as_str)
-                            == Some(approval_id)
-                            && episode.attrs.get("sentinel.approved").map(String::as_str)
-                                == Some("true")
-                    });
+                let approved = aprovacoes_concedidas.contains(approval_id);
                 if approved {
                     return Ok(());
                 }
@@ -1687,50 +1791,93 @@ impl SentinelRuntime {
         as_of_lsn: Option<Lsn>,
         limit: usize,
     ) -> Result<Vec<(Lsn, Episode)>, SentinelError> {
+        // A MESMA janela de `incident_revisions_as_of`, de propósito: dois
+        // tectos diferentes para o mesmo padrão divergiriam com o tempo.
+        const JANELA: usize = 20_000;
+        self.l4_events_com_janela(kind, incident_id, as_of_lsn, limit, JANELA)
+    }
+
+    /// Auditoria 2026-09-05, A39 — o corpo de `l4_events`, com a janela
+    /// injectável para o teste de equivalência poder exercitar as fronteiras
+    /// dos lotes com um log pequeno.
+    ///
+    /// O que se corrige é a materialização, exactamente como já se corrigiu em
+    /// `incident_revisions_as_of`: o `scan(0, upper)` anterior devolvia um
+    /// `Vec` com TODOS os episódios do log — conteúdo incluído — antes de
+    /// filtrar a fracção minúscula que interessa, e o `limit` (validado a
+    /// entrada, cortado no `break`) só limitava a SAÍDA, nunca a leitura. Isto
+    /// é disparável por quatro rotas REST e um RPC de leitura, e a SPEC-0072
+    /// §10 proíbe `log.scan(0, head())` por escrito.
+    ///
+    /// O resultado é bit a bit o mesmo: `scan_capped` devolve por LSN
+    /// crescente, os lotes são contíguos e o predicado não mudou, portanto
+    /// saem as mesmas primeiras `limit` linhas na mesma ordem. O que muda é o
+    /// pico de memória: de O(log inteiro) para O(janela + resultado).
+    fn l4_events_com_janela(
+        &self,
+        kind: Option<&str>,
+        incident_id: Option<&str>,
+        as_of_lsn: Option<Lsn>,
+        limit: usize,
+        janela: usize,
+    ) -> Result<Vec<(Lsn, Episode)>, SentinelError> {
         if limit == 0 || limit > 10_000 {
             return Err(SentinelError::Config(
                 "l4 event limit deve estar entre 1 e 10000".into(),
             ));
         }
+        let janela = janela.max(1);
         let upper = as_of_lsn
             .map(|lsn| self.inner.log.head().min(lsn.saturating_add(1)))
             .unwrap_or_else(|| self.inner.log.head());
+        self.inner
+            .metrics
+            .l4_scans_total
+            .fetch_add(1, Ordering::Relaxed);
         let mut rows = Vec::new();
-        for (lsn, episode) in self.inner.log.scan(0, upper)? {
-            let EventKind::Custom(event_kind) = &episode.kind else {
-                continue;
-            };
-            if !matches!(
-                event_kind.as_str(),
-                "SecurityInvestigation"
-                    | "SecurityAiInvocation"
-                    | "SecurityActionProposal"
-                    | "SecurityPolicyDecision"
-                    | "SecurityApproval"
-                    | "SecurityActionResult"
-                    | "SecurityModelUpdate"
-                    | "SecurityRulesetUpdate"
-                    | "SecurityFeedback"
-            ) || !episode_is_generated(&episode)
-            {
-                continue;
-            }
-            if kind.is_some_and(|wanted| wanted != event_kind) {
-                continue;
-            }
-            if incident_id.is_some_and(|wanted| {
-                episode
-                    .attrs
-                    .get("sentinel.incident_id")
-                    .map(String::as_str)
-                    != Some(wanted)
-            }) {
-                continue;
-            }
-            rows.push((lsn, episode));
-            if rows.len() >= limit {
+        let mut cursor: Lsn = 0;
+        'fora: while cursor < upper {
+            let lote = self.inner.log.scan_capped(cursor, upper, janela)?;
+            let Some(&(ultimo, _)) = lote.last() else {
                 break;
+            };
+            for (lsn, episode) in lote {
+                let EventKind::Custom(event_kind) = &episode.kind else {
+                    continue;
+                };
+                if !matches!(
+                    event_kind.as_str(),
+                    "SecurityInvestigation"
+                        | "SecurityAiInvocation"
+                        | "SecurityActionProposal"
+                        | "SecurityPolicyDecision"
+                        | "SecurityApproval"
+                        | "SecurityActionResult"
+                        | "SecurityModelUpdate"
+                        | "SecurityRulesetUpdate"
+                        | "SecurityFeedback"
+                ) || !episode_is_generated(&episode)
+                {
+                    continue;
+                }
+                if kind.is_some_and(|wanted| wanted != event_kind) {
+                    continue;
+                }
+                if incident_id.is_some_and(|wanted| {
+                    episode
+                        .attrs
+                        .get("sentinel.incident_id")
+                        .map(String::as_str)
+                        != Some(wanted)
+                }) {
+                    continue;
+                }
+                rows.push((lsn, episode));
+                if rows.len() >= limit {
+                    break 'fora;
+                }
             }
+            cursor = ultimo.saturating_add(1);
         }
         Ok(rows)
     }
@@ -1813,9 +1960,34 @@ impl SentinelRuntime {
     /// Reconstruct the behavioral model known at a transaction LSN.  This is
     /// intentionally a bounded log scan: a caller asking historical questions
     /// must not observe today's profile after a rollback point.
+    ///
+    /// Auditoria 2026-09-05, A41 — o "bounded" era só o intervalo de LSN, nunca
+    /// a memória. O `scan(0, to)` anterior materializava TODOS os episódios do
+    /// intervalo — conteúdo incluído — num `Vec`, e mantinha-o vivo durante as
+    /// DUAS passagens: numa base de 20 M episódios de 1 KB são ~20 GB
+    /// residentes numa única chamada de leitura, porque o varrimento arranca
+    /// sempre em 0 por muito recente que seja o `as_of_lsn` pedido. É o mesmo
+    /// defeito que o gémeo `incident_revisions_as_of` já corrigiu, e usa-se a
+    /// MESMA janela de propósito, para não ficarem dois tectos a divergir.
     pub fn behavioral_snapshot_as_of(
         &self,
         as_of_lsn: Lsn,
+    ) -> Result<Option<BehavioralSnapshot>, SentinelError> {
+        const JANELA: usize = 20_000;
+        self.behavioral_snapshot_com_janela(as_of_lsn, JANELA)
+    }
+
+    /// O corpo de [`Self::behavioral_snapshot_as_of`], com a janela explícita.
+    ///
+    /// A janela é parâmetro só para o teste de equivalência poder exercitar as
+    /// fronteiras — janela 1, janela igual ao número de episódios — num log
+    /// pequeno. Medir as fronteiras com 20 000 exigiria escrever um log que
+    /// nenhum teste deve escrever, e a fronteira é onde o avanço do cursor
+    /// falha.
+    fn behavioral_snapshot_com_janela(
+        &self,
+        as_of_lsn: Lsn,
+        janela: usize,
     ) -> Result<Option<BehavioralSnapshot>, SentinelError> {
         if !self.inner.config.l2.enabled {
             return Ok(None);
@@ -1828,33 +2000,72 @@ impl SentinelRuntime {
         };
         let mut engine = BehavioralEngine::new(policy)?;
         let to_exclusive = self.inner.log.head().min(as_of_lsn.saturating_add(1));
-        let rows = self.inner.log.scan(0, to_exclusive)?;
+        // `scan_capped` com `max = 0` devolve sempre vazio: uma janela de zero
+        // reconstruiria um motor VAZIO em silêncio, em vez de falhar.
+        let janela = janela.max(1);
+
+        // As duas passagens continuam a ser duas, e não uma varredura só: um
+        // `SecuritySignal` é apendido DEPOIS do `SecurityEvent` que referencia,
+        // portanto a evidência tem de estar toda reunida antes do primeiro
+        // `observe` — senão o `suspicious` de um evento sai `false` e o perfil
+        // diverge. O que se troca é explícito: duas leituras do intervalo em vez
+        // de uma, contra memória O(janela) em vez de O(log). O tempo NÃO é o
+        // mesmo — é o dobro da leitura; o pico de memória é que deixa de
+        // crescer com a base.
         let mut rule_evidence = HashSet::new();
-        for (_, episode) in &rows {
-            if !episode_is_generated(episode)
-                || !matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecuritySignal")
-            {
-                continue;
-            }
-            if let Ok(signal) = serde_json::from_slice::<SecuritySignal>(&episode.content) {
-                if !signal.detector.id.starts_with("l2.") {
-                    rule_evidence.extend(signal.evidence.iter().map(|evidence| evidence.event_id));
+        let mut cursor: Lsn = 0;
+        while cursor < to_exclusive {
+            let lote = self.inner.log.scan_capped(cursor, to_exclusive, janela)?;
+            // Um lote vazio é o fim mesmo, e não uma lacuna a saltar:
+            // `scan_capped` percorre o intervalo INTEIRO até encher `max`, logo
+            // não devolver nada quer dizer que não há nada em `[cursor, to)`.
+            let Some(&(ultimo, _)) = lote.last() else {
+                break;
+            };
+            for (_, episode) in &lote {
+                if !episode_is_generated(episode)
+                    || !matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecuritySignal")
+                {
+                    continue;
+                }
+                if let Ok(signal) = serde_json::from_slice::<SecuritySignal>(&episode.content) {
+                    if !signal.detector.id.starts_with("l2.") {
+                        rule_evidence
+                            .extend(signal.evidence.iter().map(|evidence| evidence.event_id));
+                    }
                 }
             }
+            cursor = ultimo.saturating_add(1);
         }
-        for (lsn, episode) in rows {
-            if !episode_is_generated(&episode)
-                || !matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecurityEvent")
-            {
-                continue;
-            }
-            let Ok(event) = serde_json::from_slice::<SecurityEvent>(&episode.content) else {
-                continue;
+
+        // Os lotes são contíguos e `scan_capped` devolve por LSN crescente, logo
+        // a ordem dos `observe` é a mesma da varredura única — que é o que torna
+        // o resultado bit a bit igual, e o que um avanço errado do cursor
+        // (repetir ou saltar o último LSN de cada lote) quebraria em silêncio.
+        let mut cursor: Lsn = 0;
+        while cursor < to_exclusive {
+            let lote = self.inner.log.scan_capped(cursor, to_exclusive, janela)?;
+            let Some(&(ultimo, _)) = lote.last() else {
+                break;
             };
-            for input in security_event_inputs(&event, self.inner.config.l2.suspicious_severity)? {
-                let suspicious = input.suspicious || rule_evidence.contains(&event.raw_event_id);
-                let _ = engine.observe(lsn, input.entity, input.features, suspicious)?;
+            for (lsn, episode) in lote {
+                if !episode_is_generated(&episode)
+                    || !matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecurityEvent")
+                {
+                    continue;
+                }
+                let Ok(event) = serde_json::from_slice::<SecurityEvent>(&episode.content) else {
+                    continue;
+                };
+                for input in
+                    security_event_inputs(&event, self.inner.config.l2.suspicious_severity)?
+                {
+                    let suspicious =
+                        input.suspicious || rule_evidence.contains(&event.raw_event_id);
+                    let _ = engine.observe(lsn, input.entity, input.features, suspicious)?;
+                }
             }
+            cursor = ultimo.saturating_add(1);
         }
         Ok(Some(engine.snapshot()))
     }
@@ -1938,6 +2149,7 @@ fn capturar_snapshot(inner: &RuntimeInner) -> SentinelStateSnapshot {
             .rule_history
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .linhas
             .clone();
         snapshot.behavior_state = inner
             .behavior_engine
@@ -2025,7 +2237,22 @@ fn capturar_snapshot(inner: &RuntimeInner) -> SentinelStateSnapshot {
 }
 
 /// Captura e publica atomicamente (§7). Devolve o watermark publicado.
+///
+/// Espera pela vez se outro publicador estiver a meio: quem chama isto —
+/// `shutdown`, o rebuild do arranque, a API publica — quer o snapshot, nao um
+/// "talvez". A cadencia periodica usa `talvez_publicar_snapshot`, que desiste.
 fn publicar_snapshot(inner: &RuntimeInner) -> Result<Lsn, SentinelError> {
+    let _guarda = inner
+        .publicacao_snapshot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    publicar_snapshot_com_guarda(inner)
+}
+
+/// Auditoria 2026-09-05, A37 — o corpo da publicacao. So pode ser chamado com
+/// `publicacao_snapshot` na mao: e esse mutex que impede dois escritores no
+/// mesmo `state.snapshot.tmp`.
+fn publicar_snapshot_com_guarda(inner: &RuntimeInner) -> Result<Lsn, SentinelError> {
     let snapshot = capturar_snapshot(inner);
     let watermark = snapshot.applied_until_exclusive;
     inner.snapshot_store.publicar(&snapshot)?;
@@ -2051,9 +2278,15 @@ fn publicar_snapshot(inner: &RuntimeInner) -> Result<Lsn, SentinelError> {
 /// crash desfaz, o de tempo garante que uma base com pouco tráfego não fica
 /// indefinidamente sem snapshot.
 ///
-/// Com vários workers, só um publica de cada vez: o `try_lock` sobre o relógio
-/// é o rate limiting. Quem não consegue o lock não espera — já há um snapshot
-/// a sair, e o dele seria redundante.
+/// Com vários workers, só um publica de cada vez — e é o `publicacao_snapshot`
+/// que o garante, segurado durante a publicação inteira. Quem não consegue o
+/// lock não espera: já há um snapshot a sair, e o dele seria redundante.
+///
+/// Auditoria 2026-09-05, A37 — o comentário anterior afirmava esta mesma
+/// exclusão, mas o código não a implementava: o `MutexGuard` do relógio nascia
+/// e morria dentro da expressão `let por_tempo = ...` e `publicar_snapshot`
+/// corria a seguir sem guarda nenhum. TOCTOU clássico, com dois publicadores a
+/// truncar o mesmo `state.snapshot.tmp`.
 fn talvez_publicar_snapshot(inner: &RuntimeInner, processados: u64) {
     let desde = inner
         .eventos_desde_snapshot
@@ -2062,20 +2295,33 @@ fn talvez_publicar_snapshot(inner: &RuntimeInner, processados: u64) {
 
     let por_eventos =
         inner.config.snapshot_interval_events > 0 && desde >= inner.config.snapshot_interval_events;
-    let por_tempo = inner.config.snapshot_interval_secs > 0 && {
-        let Ok(ultimo) = inner.ultimo_snapshot.try_lock() else {
-            return;
-        };
-        ultimo.elapsed().as_secs() >= inner.config.snapshot_interval_secs
-    };
+    // O relógio ocupado significa "não sei", não "não publiques": antes, o
+    // `else { return; }` daqui abortava a publicação mesmo com o limiar de
+    // EVENTOS já atingido, deixando-o refém de um lock que nada tem a ver com
+    // ele.
+    let por_tempo = inner.config.snapshot_interval_secs > 0
+        && inner
+            .ultimo_snapshot
+            .try_lock()
+            .map(|ultimo| ultimo.elapsed().as_secs() >= inner.config.snapshot_interval_secs)
+            .unwrap_or(false);
     if !por_eventos && !por_tempo {
         return;
     }
-    if let Err(erro) = publicar_snapshot(inner) {
+    let guarda = match inner.publicacao_snapshot.try_lock() {
+        Ok(guarda) => guarda,
+        // Um `Mutex<()>` sem código a correr lá dentro que possa entornar não
+        // devia envenenar; se envenenar, tomamos a posse e seguimos, como em
+        // todos os outros locks deste ficheiro.
+        Err(std::sync::TryLockError::Poisoned(envenenado)) => envenenado.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    if let Err(erro) = publicar_snapshot_com_guarda(inner) {
         // Um snapshot que não sai não é uma falha de consistência (§45): custa
         // um arranque mais lento, não correcção. O que não pode é ser mudo.
         tracing::warn!(erro = %erro, "falha ao publicar o snapshot periódico do Sentinel");
     }
+    drop(guarda);
 }
 
 /// SPEC-0072 §10/§11 — percorre `[de, ate)` em lotes, sem nunca materializar
@@ -2151,9 +2397,15 @@ fn passagem_de_ids(
     fusion_enabled: bool,
     snapshot: Option<&SentinelStateSnapshot>,
     contador: &std::sync::atomic::AtomicU64,
-) -> Result<(IdsDerivados, JanelaRecente<Lsn>), SentinelError> {
+) -> Result<(IdsDerivados, JanelaRecente<Lsn>, JanelaDeChaves), SentinelError> {
     let mut ids = IdsDerivados::default();
     let mut derived_sources = JanelaRecente::nova(TECTO_LSN_DERIVADOS);
+    // Auditoria 2026-09-05, A40 — as chaves de sighting eram a UNICA estrutura
+    // de deduplicacao do runtime que nao sobrevivia a um reinicio: nasciam
+    // vazias e nenhuma passagem as reenchia. Reconstroem-se aqui, pela mesma
+    // ordem do scan que a janela usa para despejar, como ja se faz para
+    // `derived_sources`.
+    let mut sighting_keys = JanelaDeChaves::nova(TECTO_CHAVES_SIGHTING);
     // Com snapshot, os conjuntos até ao watermark vêm de lá e a passagem só
     // varre a cauda. É o INV-5 aplicado também aos ids: sem isto, o "warm boot"
     // continuaria a ler a base inteira só para reconstruir conjuntos que o
@@ -2235,6 +2487,21 @@ fn passagem_de_ids(
                 }
                 ids.last_checkpoint_lsn = Some(lsn);
             }
+            // Auditoria 2026-09-05, A40 — a chave tem de ser IGUAL, caracter a
+            // caracter, a que `evaluate_threat` calcula; por isso reconstroi-se
+            // do CORPO (os tres campos que a formam) e nao dos atributos, que
+            // sao uma projeccao. Os sightings sao ordens de grandeza menos
+            // numerosos que os eventos, tal como os sinais logo acima, portanto
+            // desserializar aqui e barato.
+            "ThreatSighting" => {
+                if let Ok(sighting) = serde_json::from_slice::<ThreatSighting>(&episode.content) {
+                    sighting_keys.inserir(&chave_de_sighting(
+                        &sighting.indicator_id,
+                        &sighting.match_kind,
+                        sighting.event_id,
+                    ));
+                }
+            }
             outro if L4_KINDS.contains(&outro) => {
                 let (prefix, attr) = l4_prefixo_e_atributo(outro);
                 if let Some(id) = episode.attrs.get(attr) {
@@ -2250,7 +2517,17 @@ fn passagem_de_ids(
         }
         Ok(())
     })?;
-    Ok((ids, derived_sources))
+    Ok((ids, derived_sources, sighting_keys))
+}
+
+/// Auditoria 2026-09-05, A40 — a identidade de um sighting, num sitio so.
+///
+/// "Este indicador, casado desta forma, NESTE evento". Vive numa funcao para
+/// que a emissao (`evaluate_threat`) e a reconstrucao no arranque
+/// (`passagem_de_ids`) nao possam divergir: uma chave reconstruida de forma
+/// diferente e pior do que nenhuma — suprimiria um sighting legitimo.
+fn chave_de_sighting(indicator_id: &str, match_kind: &str, event_id: EventId) -> String {
+    format!("t:{indicator_id}:{match_kind}:{event_id}")
 }
 
 const L4_KINDS: [&str; 9] = [
@@ -2712,6 +2989,103 @@ fn normalize_l0(
     inner.normalizer.normalize(lsn, episode, now_ms())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Auditoria 2026-09-05, A18 — comparações feitas ao inserir no histórico L1.
+    ///
+    /// Só existe em teste, e é o que permite trancar a complexidade da inserção
+    /// (Θ(log N), não Θ(N)) sem medir tempo de relógio — que variaria com a
+    /// máquina e faria o CI intermitente.
+    ///
+    /// É por THREAD, e não um estático global, de propósito: os testes desta
+    /// crate correm em paralelo no MESMO processo e vários levantam runtimes com
+    /// o L1 ligado. Um contador global contaria também as inserções desses
+    /// workers e o teste ficaria intermitente.
+    pub(crate) static COMPARACOES_HISTORICO_L1: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// A chave que ordena o histórico L1.
+///
+/// Não é arbitrária: é a ordem em que `RuleEngine::evaluate` lê a janela, e o
+/// operador `Sequence` depende dela. Preservá-la byte a byte é o que torna a
+/// inserção ordenada semanticamente neutra.
+fn chave_do_historico_l1(lsn: Lsn, evento: &SecurityEvent) -> (Lsn, EventId) {
+    (lsn, evento.raw_event_id)
+}
+
+/// O comparador do histórico L1, num sítio só — para que a inserção, a
+/// verificação de duplicado e a reordenação do snapshot não possam divergir.
+fn compara_historico_l1(esquerda: (Lsn, EventId), direita: (Lsn, EventId)) -> std::cmp::Ordering {
+    #[cfg(test)]
+    COMPARACOES_HISTORICO_L1.with(|contador| contador.set(contador.get().saturating_add(1)));
+    esquerda.cmp(&direita)
+}
+
+/// Auditoria 2026-09-05, A19 — a janela do L1 com um contador de versão.
+///
+/// A versão vive DENTRO do mutex, e não num `AtomicU64` ao lado, de propósito:
+/// quem muta as linhas tem fisicamente de passar por aqui, portanto nenhuma
+/// mutação futura pode esquecer-se de a incrementar e deixar a memoização de
+/// `evaluate_l1` a servir um conjunto de suspeitos velho. Essa seria uma falha
+/// SILENCIOSA — sinais deixavam de sair e nada o dizia —, que é a espécie que
+/// mais custa a descobrir.
+struct HistoricoL1 {
+    linhas: Vec<(Lsn, SecurityEvent)>,
+    /// Sobe uma vez por cada mutação de `linhas`. Monótona: nunca reutiliza um
+    /// valor, portanto uma entrada de cache com a versão actual só pode ter
+    /// sido produzida por esta janela.
+    versao: u64,
+}
+
+/// Auditoria 2026-09-05, A18 — repõe a ordem do histórico L1.
+///
+/// Só é preciso no restauro do snapshot: é o único ponto de entrada do vector
+/// que não passa por [`inserir_no_historico_l1`]. Enquanto havia um `sort_by`
+/// completo por evento, um histórico desordenado vindo de disco era reparado de
+/// graça no primeiro evento; com a busca binária deixa de ser, e um snapshot
+/// desordenado passaria a deduplicar mal — em silêncio.
+fn ordenar_historico_l1(historico: &mut [(Lsn, SecurityEvent)]) {
+    historico.sort_by(|esquerda, direita| {
+        compara_historico_l1(
+            chave_do_historico_l1(esquerda.0, &esquerda.1),
+            chave_do_historico_l1(direita.0, &direita.1),
+        )
+    });
+}
+
+/// Auditoria 2026-09-05, A18 — insere no histórico L1 mantendo a ordem.
+/// Devolve `false` se a linha já lá estava.
+///
+/// O vector está SEMPRE ordenado por `(lsn, raw_event_id)`: os únicos pontos
+/// que o mutam são esta função, o `retain` e o `drain` da poda, e o restauro do
+/// snapshot (que passou a ordenar). Logo a deduplicação e a inserção são a
+/// MESMA busca binária.
+///
+/// O que estava antes era uma varredura linear de deduplicação seguida de um
+/// `sort_by` COMPLETO de um vector que já estava ordenado — por evento
+/// ingerido, sobre um histórico de até `history_capacity` (100 000 por
+/// omissão) `SecurityEvent`. Medido: 574 µs por evento a 100 000 linhas,
+/// contra 96 µs com a inserção ordenada, para exactamente o mesmo vector.
+fn inserir_no_historico_l1(
+    history: &mut Vec<(Lsn, SecurityEvent)>,
+    source_lsn: Lsn,
+    event: &SecurityEvent,
+) -> bool {
+    let chave = chave_do_historico_l1(source_lsn, event);
+    match history.binary_search_by(|(lsn, existente)| {
+        compara_historico_l1(chave_do_historico_l1(*lsn, existente), chave)
+    }) {
+        // Já lá está: a mesma decisão que a varredura linear tomava.
+        Ok(_) => false,
+        Err(posicao) => {
+            // Com LSN monótono `posicao` cai no fim e isto degenera num `push`.
+            history.insert(posicao, (source_lsn, event.clone()));
+            true
+        }
+    }
+}
+
 fn remember_rule_event(inner: &RuntimeInner, source_lsn: Lsn, event: &SecurityEvent) {
     let Some(engine) = inner.rule_engine.as_ref() else {
         return;
@@ -2720,23 +3094,26 @@ fn remember_rule_event(inner: &RuntimeInner, source_lsn: Lsn, event: &SecurityEv
         .rule_history
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !history
-        .iter()
-        .any(|(lsn, existing)| *lsn == source_lsn && existing.raw_event_id == event.raw_event_id)
-    {
-        history.push((source_lsn, event.clone()));
-        history.sort_by(|left, right| {
-            left.0
-                .cmp(&right.0)
-                .then_with(|| left.1.raw_event_id.cmp(&right.1.raw_event_id))
-        });
+    if inserir_no_historico_l1(&mut history.linhas, source_lsn, event) {
+        // Auditoria 2026-09-05, A19 — a janela mudou. O incremento fica DENTRO
+        // deste ramo de propósito: é exactamente aqui, e só aqui, que as linhas
+        // se alteram (a poda abaixo só corre quando houve inserção). Um evento
+        // que já lá estava — o `SecurityEvent` derivado a voltar pelo scan —
+        // deixa a versão quieta, e é isso que torna a segunda varredura
+        // dispensável em vez de apenas redundante.
+        history.versao = history.versao.saturating_add(1);
         // O histórico deixa de ser ilimitado. O horizonte não é arbitrário:
         // é a maior janela que o ruleset consulta, mais a tolerância a atraso
         // configurada — ver `DetectionExpr::max_window_ms`.
         let horizonte = engine
             .required_window_ms()
             .saturating_add(inner.config.l1.max_lateness_ms);
-        podar_historico_l1(&mut history, horizonte, inner.config.l1.history_capacity);
+        podar_historico_l1(
+            &mut history.linhas,
+            horizonte,
+            inner.config.l1.history_capacity,
+            now_ms(),
+        );
     }
 }
 
@@ -2756,9 +3133,28 @@ fn podar_historico_l1(
     history: &mut Vec<(Lsn, SecurityEvent)>,
     horizonte_ms: u64,
     capacidade: usize,
+    agora_ms: u64,
 ) -> usize {
     let antes = history.len();
-    if let Some(mais_recente) = history.iter().map(|(_, e)| e.observed_at).max() {
+    // A fronteira sai do evento mais recente que NAO esteja no futuro.
+    //
+    // Sem o filtro, `observed_at` — que vem do JSON ingerido, sem limite — era
+    // ao mesmo tempo o dado podado e a regua que decide a poda. UM evento com
+    // `observed_at` gigante (um relogio adiantado, um shipper avariado, um
+    // sensor comprometido) punha a fronteira no futuro e o `retain` apagava
+    // TODO o resto do historico do L1, de forma permanente e silenciosa.
+    //
+    // Continua a medir-se em tempo de EVENTO e nao no relogio local, para o
+    // replay de dados historicos nao se auto-destruir; o relogio local entra so
+    // como tecto do que pode contar como "mais recente". Se TODOS os eventos
+    // estiverem no futuro, nao ha poda temporal nenhuma — sobra o tecto de
+    // linhas, que guarda dados em vez de os deitar fora.
+    let mais_recente = history
+        .iter()
+        .map(|(_, e)| e.observed_at)
+        .filter(|observado| *observado <= agora_ms)
+        .max();
+    if let Some(mais_recente) = mais_recente {
         let limite = mais_recente.saturating_sub(horizonte_ms);
         history.retain(|(_, e)| e.observed_at >= limite);
     }
@@ -2806,19 +3202,34 @@ fn evaluate_threat(
         // e o `event_id` e o mesmo qualquer que seja o caminho por onde o
         // evento chegou. Com o LSN na chave, a mesma observacao vista duas
         // vezes produzia dois sightings.
-        let key = format!(
-            "t:{}:{}:{}",
-            sighting.indicator_id, sighting.match_kind, sighting.event_id
+        let key = chave_de_sighting(
+            &sighting.indicator_id,
+            &sighting.match_kind,
+            sighting.event_id,
         );
-        let novo = inner
+        // A chave so se marca DEPOIS de o sighting estar mesmo no log — que e
+        // a mesma ordem que o caminho dos signals, logo aqui abaixo, ja usava.
+        //
+        // Marca-la ANTES (como estava) tinha uma consequencia silenciosa: um
+        // `Err` transitorio do sink propagava pelo `?` com a chave ja marcada,
+        // e a re-execucao do mesmo evento caia no `continue` — a evidencia
+        // desaparecia para sempre, sem erro, sem metrica, sem rasto. Num
+        // produto de seguranca, perder uma observacao por causa de um EIO
+        // passageiro e pior do que emiti-la duas vezes.
+        let ja_visto = inner
             .sighting_keys
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .inserir(&key.to_string());
-        if !novo {
+            .contem(&key);
+        if ja_visto {
             continue;
         }
         inner.derived_sink.append(sighting.into_episode()?, &key)?;
+        inner
+            .sighting_keys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .inserir(&key);
         inner
             .metrics
             .threat_sightings_emitted_total
@@ -2884,10 +3295,23 @@ fn evaluate_l2(
     // Work on a candidate copy.  Durable derived signals are appended before
     // the candidate replaces live state, closing the crash window where an
     // in-memory baseline advanced but its anomaly signal did not reach the log.
+    //
+    // Auditoria 2026-09-05, A20 — a cópia é SÓ das entidades que este evento
+    // toca (no máximo oito), e não do motor inteiro. As entradas passaram para
+    // antes da cópia porque são elas que dizem quais são essas entidades; o
+    // `Err` de `security_event_inputs` já era devolvido antes de qualquer
+    // mutação do motor vivo, portanto nada muda no comportamento observável
+    // além de se poupar a cópia. Ver `BehavioralEngine::extrair_entidades`.
+    let entradas = security_event_inputs(event, inner.config.l2.suspicious_severity)?;
+    let chaves = chaves_de_entidades(entradas.iter().map(|entrada| &entrada.entity));
     let mut candidate = engine
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
+        .extrair_entidades(&chaves);
+    inner
+        .metrics
+        .l2_profiles_copied_total
+        .fetch_add(candidate.numero_de_perfis() as u64, Ordering::Relaxed);
     let source_lsn = event
         .attributes
         .get("sec.source_lsn")
@@ -2909,7 +3333,7 @@ fn evaluate_l2(
         ),
     };
     let mut derived = Vec::new();
-    for mut input in security_event_inputs(event, inner.config.l2.suspicious_severity)? {
+    for mut input in entradas {
         input.suspicious |= rule_suspicious;
         let observation = match candidate.observe(
             security_event_lsn,
@@ -2997,13 +3421,15 @@ fn evaluate_l2(
             severity: ((score * 10.0).ceil() as u8).clamp(1, 10),
             score,
             subject: Some(input.entity),
-            evidence: vec![
-                evidence.clone(),
-                EvidenceRef {
-                    lsn: 1,
-                    event_id: EventId::new(),
-                },
-            ],
+            // Auditoria 2026-09-05 (CONFIRMADO): aqui ia uma SEGUNDA referência
+            // de evidência FABRICADA — `EvidenceRef { lsn: 1, event_id:
+            // EventId::new() }` — que apontava para um evento que nunca
+            // existiu. Ficava em `episode.parents` (pai causal pendurado, que
+            // nenhuma consulta de proveniência resolve) e inflacionava a
+            // contagem que a política de resposta usa como quórum
+            // (`minimum_evidence`). A evidência de um sinal L2 é a observação
+            // que o produziu; mais do que uma só se for real.
+            evidence: vec![evidence.clone()],
             created_at_lsn: source_lsn,
             labels,
         });
@@ -3038,9 +3464,14 @@ fn evaluate_l2(
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    *engine
+    // Auditoria 2026-09-05, A20 — no MESMO ponto de antes, depois de todos os
+    // appends duráveis, e a escrever de volta só as entidades trabalhadas. Um
+    // erro no ciclo acima sai pelo `?` e deita fora o parcial, deixando o motor
+    // vivo intocado — exactamente como o `*engine = candidate` fazia.
+    engine
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = candidate;
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .fundir_entidades(&chaves, candidate);
     Ok(())
 }
 
@@ -3064,9 +3495,37 @@ fn evaluate_l1(inner: &RuntimeInner) -> Result<HashSet<EventId>, SentinelError> 
         .rule_history
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let signals = rule_engine.evaluate(&window);
+    let versao = window.versao;
+    // Auditoria 2026-09-05, A19 — a janela não mudou desde a última varredura,
+    // logo o resultado não pode ter mudado: `RuleEngine::evaluate` é uma função
+    // pura de `(self.rules, window)`, e `rule_engine` é um campo imutável sem
+    // mutabilidade interior. Os sinais dessa varredura já foram apendidos (a
+    // cache só é gravada depois disso) e os seus ids já estão em `signal_ids`,
+    // portanto o ciclo de appends abaixo não teria nada para fazer.
+    //
+    // Isto apanha, entre outras, a segunda avaliação de cada evento bruto: a do
+    // `SecurityEvent` derivado a voltar pelo scan. A comparação é por VERSÃO e
+    // não por "a chamada anterior foi a do mesmo evento" porque entre as duas
+    // podem ter passado muitos outros eventos, que mudam mesmo a janela.
+    //
+    // Ordem de locks: `rule_history` -> `l1_cache`, sempre nesta direcção.
+    if let Some((versao_em_cache, suspeitos)) = inner
+        .l1_cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+    {
+        if *versao_em_cache == versao {
+            return Ok(suspeitos.clone());
+        }
+    }
+    let signals = rule_engine.evaluate(&window.linhas);
+    inner
+        .metrics
+        .l1_evaluations_total
+        .fetch_add(1, Ordering::Relaxed);
     drop(window);
-    let suspicious_events = signals
+    let suspicious_events: HashSet<EventId> = signals
         .iter()
         .flat_map(|signal| signal.evidence.iter().map(|evidence| evidence.event_id))
         .collect();
@@ -3097,6 +3556,21 @@ fn evaluate_l1(inner: &RuntimeInner) -> Result<HashSet<EventId>, SentinelError> 
             .signals_emitted_total
             .fetch_add(1, Ordering::Relaxed);
     }
+    // Auditoria 2026-09-05, A19 — só AGORA, com todos os appends durados. Um
+    // `?` acima leva o erro para cima sem gravar nada, o cursor não avança e o
+    // lote é reprocessado: nessa retentativa a versão é a mesma (o evento já
+    // está no histórico), e uma cache gravada cedo demais saltaria os appends
+    // que faltavam.
+    //
+    // Se outra thread mudou a janela entretanto, esta entrada nasce obsoleta —
+    // `versao` já não é a corrente — e a próxima chamada volta a avaliar. É o
+    // pior caso possível: trabalho a mais, nunca resultado a menos. A versão é
+    // monótona, portanto nunca se pode confundir uma janela nova com uma velha.
+    *inner
+        .l1_cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        Some((versao, suspicious_events.clone()));
     Ok(suspicious_events)
 }
 
@@ -3153,16 +3627,16 @@ fn evaluate_fusion(
             DetectorChannel::Custom(_) => {}
         }
         state.detectors.insert(signal.detector.id.clone(), channel);
-        for evidence in &signal.evidence {
-            if !state.evidence.contains(evidence) {
-                state.evidence.push(evidence.clone());
-            }
-        }
-        state.evidence.sort_by(|left, right| {
-            left.lsn
-                .cmp(&right.lsn)
-                .then_with(|| left.event_id.cmp(&right.event_id))
-        });
+        // Auditoria 2026-09-05, A38 — ver `acumular_evidencia`: o `contains`
+        // linear + `push` + `sort_by` de um vector ja ordenado passou a uma
+        // insercao ordenada, e a acumulacao passou a ter tecto. Sem o tecto, a
+        // evidencia deste sujeito crescia sem limite e era reserializada por
+        // inteiro em cada assessment persistido.
+        acumular_evidencia(
+            &mut state.evidence,
+            &signal.evidence,
+            TECTO_EVIDENCIA_POR_SUJEITO,
+        );
         let fusion = fusion
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3226,19 +3700,70 @@ fn evaluate_l3(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     });
-    let (ingest, incident) = {
+    let resultado = {
         let mut engine = incident_engine
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let ingest =
-            engine.ingest_signal_with_graph_as_of(signal, graph.as_deref(), signal_episode_lsn)?;
-        let incident = engine
-            .incident(&ingest.incident_id)
-            .cloned()
-            .ok_or_else(|| SentinelError::Worker("incidente ingerido não encontrado".into()))?;
-        (ingest, incident)
+        match engine.ingest_signal_with_graph_as_of(signal, graph.as_deref(), signal_episode_lsn) {
+            Ok(ingest) => {
+                let incident = engine
+                    .incident(&ingest.incident_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        SentinelError::Worker("incidente ingerido não encontrado".into())
+                    })?;
+                Some((ingest, incident))
+            }
+            // ISTO ERA O IMPASSE DO L3 — Auditoria 2026-09-05, A36. É o irmão
+            // exacto do impasse do L2 tratado em `evaluate_l2`, e ficara por
+            // corrigir aqui.
+            //
+            // Mecanismo: `IncidentEngine` recusa com `IncidentCapacity` quando
+            // o incidente atinge `max_signals_per_incident` (ou o mapa atinge
+            // `max_incidents`). O `?` transformava essa recusa do MOTOR numa
+            // falha do LOTE; como `process_until` só comita o cursor no fim do
+            // trabalho de cada LSN, o cursor ficava NESSE LSN e o
+            // `worker_loop` limitava-se a repetir. E a repetição dá o MESMO
+            // erro: `signal_index` — que deduplica os sinais já ingeridos — só
+            // é escrito DEPOIS do teste de capacidade, portanto o sinal
+            // recusado nunca lá entra. Estado absorvente: a detecção inteira
+            // (L0, L1, L2, normalização) parava, e reiniciar piorava, porque
+            // `passagem_de_sinais` reproduz o mesmo sinal no arranque.
+            //
+            // Uma recusa por saturação é determinística e irrecuperável por
+            // retentativa: tratá-la como falha do lote nunca pode progredir.
+            // Avançamos o cursor e contamos a perda numa métrica DEDICADA —
+            // não em `normalization_errors_total`, porque perder correlação é
+            // materialmente diferente de saltar um replay idempotente e o
+            // operador tem de conseguir distinguir os dois.
+            //
+            // Isto resolve o IMPASSE, não a SATURAÇÃO: um incidente cheio
+            // continua a nunca mais enriquecer e nunca é purgado. A rotação do
+            // incidente saturado muda semântica de correlação e formato de
+            // snapshot — fica para achado próprio.
+            Err(CorrelationError::IncidentCapacity(limite)) => {
+                inner
+                    .metrics
+                    .incident_capacity_drops_total
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    signal_id = %signal.signal_id,
+                    lsn = signal_episode_lsn,
+                    limite,
+                    "L3: motor de incidentes saturado; sinal não foi correlacionado — o cursor avança"
+                );
+                None
+            }
+            // Qualquer outro `CorrelationError` (score inválido, entidade
+            // inválida) é erro de DADOS do sinal, não saturação de estado, e
+            // continua a subir. Engolir tudo aqui esconderia defeitos reais.
+            Err(outro) => return Err(outro.into()),
+        }
     };
     drop(graph);
+    let Some((ingest, incident)) = resultado else {
+        return Ok(());
+    };
 
     let revision_id = incident.revision_id()?;
     let mut revisions = inner
@@ -3965,6 +4490,337 @@ detection:
         restarted.shutdown();
     }
 
+    /// Auditoria 2026-09-05, A19 — cada evento bruto provocava DUAS varreduras
+    /// completas do `RuleEngine` sobre a janela L1: uma na derivação, e outra
+    /// quando o `SecurityEvent` derivado volta a ser lido do log. A segunda é
+    /// estéril: `remember_rule_event` reconhece `(source_lsn, raw_event_id)`
+    /// como já presente — a chave é literalmente a mesma nos dois ramos, porque
+    /// o normalizador escreve `source_lsn = lsn` do episódio bruto —, portanto
+    /// não há inserção, não há poda, a janela não muda, e `RuleEngine::evaluate`
+    /// é uma função pura de `(regras, janela)`.
+    #[test]
+    fn l1_nao_reavalia_a_janela_inalterada() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let rules = temp.path().join("failed-login.yml");
+        std::fs::write(
+            &rules,
+            r#"title: Failed login
+id: test-failed-login
+level: high
+detection:
+  selection:
+    EventID: 4625
+  condition: selection
+"#,
+        )
+        .unwrap();
+        let runtime = SentinelRuntime::start(
+            log.clone(),
+            SentinelConfig {
+                enabled: true,
+                mode: SentinelMode::Observe,
+                queue_capacity: 8,
+                // Um worker só: com vários, a ordem entre o ramo bruto e o ramo
+                // derivado deixa de ser observável e o teste mediria o
+                // escalonador em vez do trabalho.
+                worker_threads: 1,
+                pipeline_version: 1,
+                catch_up_batch: 32,
+                l1: SentinelL1Config {
+                    enabled: true,
+                    rules_path: Some(rules),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        // O arranque a frio avalia uma vez (janela vazia) antes de o L2 correr.
+        let no_arranque = runtime.status().l1_evaluations_total;
+
+        const BRUTOS: u64 = 3;
+        for _ in 0..BRUTOS {
+            log.append(Episode::new(
+                "auditd",
+                EventKind::Observation,
+                br#"{"source":"auditd","EventID":4625}"#.to_vec(),
+            ))
+            .unwrap();
+        }
+        // 30 s pela mesma razão documentada nos testes vizinhos: o prazo mede
+        // carga da máquina, que o teste não controla. Esperar por
+        // `detection_lag_lsn == 0` é o que garante que os `SecurityEvent`
+        // DERIVADOS já voltaram pelo scan — é essa a segunda avaliação.
+        let prazo = std::time::Instant::now() + Duration::from_secs(30);
+        while (runtime.status().events_normalized_total < BRUTOS
+            || runtime.status().detection_lag_lsn > 0)
+            && std::time::Instant::now() < prazo
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let estado = runtime.status();
+
+        // O conjunto SERVIDO pela cache tem de ser o mesmo que uma varredura
+        // fresca produziria: é ele que diz ao L2 quais eventos já foram
+        // marcados por uma regra determinista, e um conjunto vazio devolvido
+        // por engano faria o L2 incorporar numa baseline activa exactamente os
+        // eventos que uma regra acabou de assinalar.
+        let servido_pela_cache = evaluate_l1(&runtime.inner).unwrap();
+        let fresco: HashSet<EventId> = {
+            let janela = runtime
+                .inner
+                .rule_history
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            runtime
+                .inner
+                .rule_engine
+                .as_ref()
+                .unwrap()
+                .evaluate(&janela.linhas)
+                .iter()
+                .flat_map(|sinal| sinal.evidence.iter().map(|e| e.event_id))
+                .collect()
+        };
+        let depois_da_leitura = runtime.status().l1_evaluations_total;
+        runtime.shutdown();
+
+        assert_eq!(estado.events_normalized_total, BRUTOS);
+        assert_eq!(estado.detection_lag_lsn, 0, "o pipeline não chegou ao fim");
+        // Equivalência observável: o resultado não pode mudar. A regra reporta
+        // a PRIMEIRA correspondência, e o `signal_id` determinista deduplica-a.
+        assert_eq!(
+            estado.signals_emitted_total, 1,
+            "memoizar não pode mudar os sinais emitidos"
+        );
+        assert_eq!(
+            estado.l1_evaluations_total - no_arranque,
+            BRUTOS,
+            "uma varredura por evento que MUDA a janela, e nenhuma pela janela \
+             inalterada que o derivado traz de volta"
+        );
+        assert!(
+            !fresco.is_empty(),
+            "sem suspeitos a comparação seria vácua e não provaria nada"
+        );
+        assert_eq!(
+            servido_pela_cache, fresco,
+            "o acerto de cache tem de devolver o MESMO conjunto de suspeitos"
+        );
+        assert_eq!(
+            depois_da_leitura, estado.l1_evaluations_total,
+            "e tem de devolvê-lo sem voltar a varrer a janela"
+        );
+    }
+
+    /// Auditoria 2026-09-05, A19 — guarda da ORDEM: a cache de `evaluate_l1` só
+    /// pode ser gravada DEPOIS de os appends dos sinais durarem.
+    ///
+    /// Um append falhado sobe o erro, o cursor não avança e o lote é
+    /// reprocessado. Nessa retentativa `remember_rule_event` vê duplicado e a
+    /// versão da janela NÃO muda — portanto uma cache gravada antes do ciclo
+    /// faria a retentativa saltar exactamente os appends que faltavam, e o sinal
+    /// nunca chegaria ao log. Em silêncio, que é o que torna isto perigoso.
+    #[test]
+    fn um_append_falhado_de_sinal_nao_fica_preso_na_cache_do_l1() {
+        struct SinkQueFalhaOPrimeiroSinal {
+            log: Arc<AnyLog>,
+            ja_falhou: std::sync::atomic::AtomicBool,
+        }
+
+        impl DerivedEventSink for SinkQueFalhaOPrimeiroSinal {
+            fn append(
+                &self,
+                episode: Episode,
+                idempotency_key: &str,
+            ) -> Result<Lsn, HeraclitusError> {
+                // `s:` é o prefixo que `evaluate_l1` usa para os sinais; os
+                // `e:` (eventos derivados) passam sempre, senão nem havia
+                // `SecurityEvent` para a regra ver.
+                if idempotency_key.starts_with("s:") && !self.ja_falhou.swap(true, Ordering::SeqCst)
+                {
+                    return Err(HeraclitusError::StorageEngine(
+                        "falha injectada no primeiro append de sinal".into(),
+                    ));
+                }
+                self.log.append(episode)
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let rules = temp.path().join("failed-login.yml");
+        std::fs::write(
+            &rules,
+            r#"title: Failed login
+id: test-failed-login
+level: high
+detection:
+  selection:
+    EventID: 4625
+  condition: selection
+"#,
+        )
+        .unwrap();
+        let sink = Arc::new(SinkQueFalhaOPrimeiroSinal {
+            log: log.clone(),
+            ja_falhou: std::sync::atomic::AtomicBool::new(false),
+        });
+        let runtime = SentinelRuntime::start_with_sink(
+            log.clone(),
+            sink,
+            SentinelConfig {
+                enabled: true,
+                mode: SentinelMode::Observe,
+                queue_capacity: 8,
+                worker_threads: 1,
+                pipeline_version: 1,
+                catch_up_batch: 32,
+                l1: SentinelL1Config {
+                    enabled: true,
+                    rules_path: Some(rules),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        log.append(Episode::new(
+            "auditd",
+            EventKind::Observation,
+            br#"{"source":"auditd","EventID":4625}"#.to_vec(),
+        ))
+        .unwrap();
+        let prazo = std::time::Instant::now() + Duration::from_secs(30);
+        while runtime.status().signals_emitted_total < 1 && std::time::Instant::now() < prazo {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let emitidos = runtime.status().signals_emitted_total;
+        runtime.shutdown();
+        assert_eq!(
+            emitidos, 1,
+            "a retentativa depois do append falhado tem de reemitir o sinal"
+        );
+        assert!(
+            log.scan(0, log.head()).unwrap().iter().any(|(_, episode)| {
+                matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecuritySignal")
+            }),
+            "e o sinal tem de estar mesmo no log, nao so contado na metrica"
+        );
+    }
+
+    /// Auditoria 2026-09-05, A20 — o custo de uma avaliação L2 não pode crescer
+    /// com o número de entidades já observadas.
+    ///
+    /// `evaluate_l2` clonava o `BehavioralEngine` INTEIRO por evento — sete
+    /// mapas indexados por entidade, cada perfil com três mapas de features e um
+    /// `Vec<f64>` de até 4096 amostras —, e não há evicção de perfis: a
+    /// cardinalidade do tráfego é o único limite. O trabalho útil é no máximo
+    /// oito entidades, que é o que `security_event_inputs` devolve.
+    #[test]
+    fn evaluate_l2_nao_escala_com_a_cardinalidade() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let runtime = SentinelRuntime::start(
+            log,
+            SentinelConfig {
+                enabled: true,
+                mode: SentinelMode::Observe,
+                queue_capacity: 8,
+                worker_threads: 1,
+                pipeline_version: 2,
+                catch_up_batch: 32,
+                l2: SentinelL2Config {
+                    enabled: true,
+                    minimum_support: 1,
+                    learning_delay_events: 1,
+                    shadow_only: false,
+                    suspicious_severity: 9,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        // Semear as entidades DIRECTAMENTE no motor vivo: o que se mede é o
+        // custo da cópia, que só depende de quantas lá estão, e fazê-las passar
+        // pelo pipeline só acrescentaria espera e não-determinismo.
+        const RUIDO: u64 = 500;
+        {
+            let mut motor = runtime
+                .inner
+                .behavior_engine
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap();
+            for i in 0..RUIDO {
+                motor
+                    .observe(
+                        i + 1,
+                        EntityRef::new("user", format!("ruido-{i}")),
+                        BTreeMap::from([(FeatureId::new("bytes").unwrap(), i as f64)]),
+                        false,
+                    )
+                    .unwrap();
+            }
+        }
+
+        let antes = runtime.status().l2_profiles_copied_total;
+        let mut evento = SecurityEvent::unmapped(EventId::new(), SecuritySource::Auditd);
+        evento.user = Some(EntityRef::new("user", "alvo"));
+        evento.host = Some(EntityRef::new("host", "alvo"));
+        evaluate_l2(&runtime.inner, RUIDO + 1_000, &evento, false).unwrap();
+        let copiados = runtime.status().l2_profiles_copied_total - antes;
+        // A segunda chamada prova que o número não é um acaso da primeira: o
+        // motor já tem os perfis das duas entidades do evento, e continua a
+        // copiar-se só a si próprio.
+        let antes_da_segunda = runtime.status().l2_profiles_copied_total;
+        evaluate_l2(&runtime.inner, RUIDO + 2_000, &evento, false).unwrap();
+        let copiados_na_segunda = runtime.status().l2_profiles_copied_total - antes_da_segunda;
+        runtime.shutdown();
+
+        assert!(
+            copiados <= 8,
+            "o evento toca 2 entidades e o motor tem {RUIDO}: copiaram-se {copiados} perfis"
+        );
+        assert!(
+            copiados_na_segunda <= 8,
+            "na segunda passagem copiaram-se {copiados_na_segunda} perfis"
+        );
+    }
+
     #[test]
     fn l2_behavioral_adapter_emits_replayable_signal_after_shadow_promotion() {
         // O `worker_loop` regista o erro que o faz repetir a passagem de
@@ -4087,13 +4943,38 @@ detection:
                 s.l2_latency_ms,
             );
         }
-        assert!(log.scan(0, log.head()).unwrap().iter().any(|(_, episode)| {
-            matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecuritySignal")
-                && episode
-                    .attrs
-                    .get("sentinel.detector")
-                    .is_some_and(|value| value == "l2.behavioral.baseline")
-        }));
+        let tudo = log.scan(0, log.head()).unwrap();
+        let sinais: Vec<&Episode> = tudo
+            .iter()
+            .map(|(_, episode)| episode)
+            .filter(|episode| {
+                matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecuritySignal")
+                    && episode
+                        .attrs
+                        .get("sentinel.detector")
+                        .is_some_and(|value| value == "l2.behavioral.baseline")
+            })
+            .collect();
+        assert!(!sinais.is_empty());
+        // Auditoria 2026-09-05: o sinal L2 levava uma segunda evidência
+        // FABRICADA (`EventId::new()`), que virava um pai causal pendurado.
+        // Cada pai tem de ser um episódio REAL do log, e há exactamente um:
+        // a observação que produziu o sinal.
+        let ids: std::collections::HashSet<EventId> = tudo.iter().map(|(_, e)| e.id).collect();
+        for sinal in &sinais {
+            assert_eq!(
+                sinal.parents.len(),
+                1,
+                "um sinal L2 tem UMA evidência: {:?}",
+                sinal.parents
+            );
+            for pai in &sinal.parents {
+                assert!(ids.contains(pai), "pai causal {pai} não existe no log");
+            }
+            let decod: SecuritySignal = serde_json::from_slice(&sinal.content).unwrap();
+            assert_eq!(decod.evidence.len(), 1);
+            assert_eq!(decod.evidence[0].event_id, sinal.parents[0]);
+        }
         assert!(runtime.behavioral_snapshot().is_some());
         assert!(runtime
             .behavioral_snapshot_as_of(0)
@@ -4101,6 +4982,169 @@ detection:
             .unwrap()
             .profiles
             .is_empty());
+        runtime.shutdown();
+    }
+
+    /// Auditoria 2026-09-05, A41 — janelar a leitura não pode mudar o modelo
+    /// reconstruído.
+    ///
+    /// A montagem tem L1 e L2 ligados de propósito: o `SecuritySignal` da regra
+    /// é apendido DEPOIS do `SecurityEvent` que referencia, portanto é ele que
+    /// obriga a duas passagens. Fundir as duas numa só varredura janelada faria
+    /// o `suspicious` desse evento sair `false` e o perfil divergir.
+    #[test]
+    fn o_snapshot_comportamental_janelado_equivale_a_varredura_unica() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let rules = temp.path().join("failed-login.yml");
+        std::fs::write(
+            &rules,
+            r#"title: Failed login
+id: test-failed-login
+level: high
+detection:
+  selection:
+    EventID: 4625
+  condition: selection
+"#,
+        )
+        .unwrap();
+        let runtime = SentinelRuntime::start(
+            log.clone(),
+            SentinelConfig {
+                enabled: true,
+                mode: SentinelMode::Observe,
+                queue_capacity: 16,
+                worker_threads: 1,
+                pipeline_version: 3,
+                catch_up_batch: 32,
+                l1: SentinelL1Config {
+                    enabled: true,
+                    rules_path: Some(rules),
+                    ..Default::default()
+                },
+                l2: SentinelL2Config {
+                    enabled: true,
+                    minimum_support: 1,
+                    learning_delay_events: 1,
+                    shadow_only: false,
+                    suspicious_severity: 9,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        const BRUTOS: u64 = 12;
+        for i in 0..BRUTOS {
+            log.append(Episode::new(
+                "auditd",
+                EventKind::Observation,
+                format!(
+                    r#"{{"source":"auditd","EventID":4625,"user":"u{}","host":"h{}"}}"#,
+                    i % 3,
+                    i % 2
+                )
+                .into_bytes(),
+            ))
+            .unwrap();
+        }
+        let prazo = std::time::Instant::now() + Duration::from_secs(30);
+        while (runtime.status().events_normalized_total < BRUTOS
+            || runtime.status().detection_lag_lsn > 0)
+            && std::time::Instant::now() < prazo
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(runtime.status().events_normalized_total, BRUTOS);
+        assert!(
+            runtime.status().signals_emitted_total > 0,
+            "sem um sinal de regra no log a segunda passagem não é exercitada"
+        );
+
+        let head = log.head();
+        // `usize::MAX` É literalmente a varredura única anterior: `scan` delega
+        // em `scan_capped(from, to, usize::MAX)`. É esse o oráculo.
+        let referencia = runtime
+            .behavioral_snapshot_com_janela(head, usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !referencia.profiles.is_empty() || !referencia.shadow_profiles.is_empty(),
+            "sem perfis reconstruídos a comparação seria vácua"
+        );
+
+        let observacoes = |snapshot: &BehavioralSnapshot| -> u64 {
+            snapshot
+                .profiles
+                .values()
+                .chain(snapshot.shadow_profiles.values())
+                .map(|perfil| perfil.observation_count)
+                .sum()
+        };
+
+        // A PRIMEIRA passagem tem de ter efeito, e a igualdade entre janelas não
+        // o prova: os dois lados da comparação partilham a implementação, logo
+        // fundir as duas passagens numa só mudaria ambos por igual e passaria
+        // despercebido. O oráculo é independente: sem a evidência de regra,
+        // TODAS as observações seriam incorporadas; com ela, as do evento que o
+        // sinal nomeia saem `suspicious` e `observe` devolve sem tocar no
+        // perfil. Logo o total reconstruído tem de ficar ABAIXO do total de
+        // pares (evento, entidade) que existem no log.
+        let mut pares_no_log = 0u64;
+        for (_, episode) in log.scan(0, head).unwrap() {
+            if !episode_is_generated(&episode)
+                || !matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecurityEvent")
+            {
+                continue;
+            }
+            let Ok(event) = serde_json::from_slice::<SecurityEvent>(&episode.content) else {
+                continue;
+            };
+            pares_no_log += security_event_inputs(&event, 9).unwrap().len() as u64;
+        }
+        assert!(pares_no_log > 0, "o log tem de ter `SecurityEvent`s");
+        assert!(
+            observacoes(&referencia) < pares_no_log,
+            "a evidência de regra tem de suprimir pelo menos uma observação: \
+             {} incorporadas de {pares_no_log} pares",
+            observacoes(&referencia)
+        );
+
+        // Janelas pequenas e as fronteiras: 1 (cada episódio é um lote),
+        // divisores e não-divisores do total, e a janela exactamente igual ao
+        // número de episódios do log.
+        for janela in [1usize, 2, 3, 5, 7, head as usize, head as usize + 1] {
+            let obtido = runtime
+                .behavioral_snapshot_com_janela(head, janela)
+                .unwrap()
+                .unwrap();
+            assert!(
+                obtido == referencia,
+                "janela={janela}: o modelo reconstruído tem de ser igual ao da varredura única"
+            );
+        }
+
+        // E o `as_of` continua a limitar o que se vê: um ponto intermédio não
+        // pode devolver tanta observação como o head.
+        let intermedio = runtime
+            .behavioral_snapshot_com_janela(head / 2, 3)
+            .unwrap()
+            .unwrap();
+        assert!(
+            observacoes(&intermedio) < observacoes(&referencia),
+            "o `as_of` intermédio tem de ver menos do que o head"
+        );
+
         runtime.shutdown();
     }
 
@@ -4279,6 +5323,468 @@ detection:
         assert_eq!(runtime.status().incidents_created_total, 1);
         runtime.shutdown();
     }
+
+    /// Auditoria 2026-09-05, A36 — um motor de incidentes SATURADO recusava o
+    /// sinal com `IncidentCapacity`, o `?` de `evaluate_l3` transformava isso
+    /// em falha do LOTE, o cursor congelava nesse LSN e o worker repetia para
+    /// sempre. Como `signal_index` so guarda os sinais que ENTRARAM, a
+    /// retentativa reapresentava o mesmo sinal e recebia o mesmo erro: estado
+    /// absorvente, com a deteccao inteira parada.
+    #[test]
+    fn l3_saturado_nao_congela_o_cursor() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let runtime = SentinelRuntime::start(log.clone(), l3_config())
+            .unwrap()
+            .unwrap();
+        // Tecto de 1 sinal por incidente: o segundo sinal do mesmo sujeito
+        // (`User:alice`, que o helper `signal` ja usa) cai no ramo de
+        // enriquecimento e bate na capacidade. Sem isto, o teste precisaria de
+        // 4096 sinais para exercitar o mesmo caminho.
+        {
+            let mut engine = runtime
+                .inner
+                .incident_engine
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap();
+            *engine = IncidentEngine::new(IncidentPolicy {
+                max_signals_per_incident: 1,
+                graph_path_depth: 6,
+                ..IncidentPolicy::default()
+            });
+        }
+
+        log.append(
+            signal("sig-1", 0, EventId::new(), 0.75)
+                .into_episode()
+                .unwrap(),
+        )
+        .unwrap();
+        log.append(
+            signal("sig-2", 1, EventId::new(), 0.75)
+                .into_episode()
+                .unwrap(),
+        )
+        .unwrap();
+        wait_for_catch_up(&runtime, &log);
+
+        assert_eq!(
+            runtime.status().incident_capacity_drops_total,
+            1,
+            "o sinal recusado por saturacao tem de ser contado na metrica dedicada"
+        );
+        assert_eq!(
+            runtime.status().normalization_errors_total,
+            0,
+            "saturacao do L3 nao e erro de normalizacao — era essa a pista enganadora"
+        );
+
+        // O pipeline continua vivo depois da recusa: nao ficou so a saltar
+        // aquele LSN por acaso.
+        log.append(
+            signal("sig-3", 2, EventId::new(), 0.75)
+                .into_episode()
+                .unwrap(),
+        )
+        .unwrap();
+        wait_for_catch_up(&runtime, &log);
+        runtime.shutdown();
+    }
+
+    /// Auditoria 2026-09-05, A36 — guarda anti-sobre-correccao: engolir TODO o
+    /// `SentinelError::Correlation` faria desaparecer erros de dados reais. So
+    /// a saturacao (`IncidentCapacity`) pode ser recusa tolerada.
+    #[test]
+    fn l3_erro_de_dados_nao_conta_como_saturacao() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let runtime = SentinelRuntime::start(log.clone(), l3_config())
+            .unwrap()
+            .unwrap();
+        // Score fora de [0,1] dispara `validate_score` (a PRIMEIRA linha de
+        // `ingest_signal_with_graph_as_of`) -> `CorrelationError::InvalidScore`,
+        // que NAO e saturacao. Sem sujeito, para que `evaluate_fusion` saia
+        // logo no inicio e o erro venha provadamente do L3.
+        let mut mau = signal("sig-mau", 0, EventId::new(), 0.5);
+        mau.score = 1.5;
+        mau.subject = None;
+        log.append(mau.into_episode().unwrap()).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            runtime.status().incident_capacity_drops_total,
+            0,
+            "um erro de dados nao pode ser contabilizado como saturacao"
+        );
+        assert!(
+            runtime.status().normalization_errors_total > 0,
+            "o erro de dados TEM de continuar a subir ate ao worker"
+        );
+        runtime.shutdown();
+    }
+
+    /// Auditoria 2026-09-05, A38 — a evidencia acumulada por sujeito nao tinha
+    /// tecto e era reserializada por INTEIRO em cada `SecurityRiskAssessment`
+    /// persistido: N sinais do mesmo sujeito escreviam O(N^2) bytes no log.
+    ///
+    /// Usam-se poucos sinais com MUITA evidencia cada (em vez de muitos sinais
+    /// com uma evidencia cada) para atravessar o tecto sem escrever centenas de
+    /// MB no log de teste.
+    #[test]
+    fn a_evidencia_de_fusao_tem_tecto_e_guarda_as_mais_recentes() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 22,
+                FsyncPolicy::GroupCommit { interval_ms: 50 },
+            )
+            .unwrap(),
+        );
+        let runtime = SentinelRuntime::start(log.clone(), l3_config())
+            .unwrap()
+            .unwrap();
+
+        let bloco = |nome: &str, de: Lsn, ate: Lsn| {
+            let mut s = signal(nome, ate, EventId::new(), 0.5);
+            s.evidence = (de..ate)
+                .map(|lsn| EvidenceRef {
+                    lsn,
+                    event_id: EventId::new(),
+                })
+                .collect();
+            s
+        };
+        // 2000 + 2000 + 300 = 4300 referencias distintas para `User:alice`,
+        // que e 204 acima do tecto.
+        for s in [
+            bloco("sig-a", 0, 2_000),
+            bloco("sig-b", 2_000, 4_000),
+            bloco("sig-c", 4_000, 4_300),
+        ] {
+            log.append(s.into_episode().unwrap()).unwrap();
+        }
+        wait_for_catch_up(&runtime, &log);
+
+        let ultimo = log
+            .scan(0, log.head())
+            .unwrap()
+            .into_iter()
+            .rfind(|(_, episode)| {
+                matches!(&episode.kind, EventKind::Custom(kind) if kind == "SecurityRiskAssessment")
+            })
+            .expect("tem de haver pelo menos um assessment persistido");
+        let assessment: RiskAssessment = serde_json::from_slice(&ultimo.1.content).unwrap();
+
+        assert_eq!(
+            assessment.evidence.len(),
+            TECTO_EVIDENCIA_POR_SUJEITO,
+            "a evidencia persistida tem de parar no tecto"
+        );
+        assert_eq!(
+            assessment.evidence.first().unwrap().lsn,
+            4_300 - TECTO_EVIDENCIA_POR_SUJEITO as Lsn,
+            "o que se descarta e o PREFIXO (a evidencia mais antiga)"
+        );
+        assert_eq!(
+            assessment.evidence.last().unwrap().lsn,
+            4_299,
+            "a evidencia mais recente tem de sobreviver"
+        );
+        assert_eq!(
+            ultimo.1.parents.len(),
+            TECTO_EVIDENCIA_POR_SUJEITO,
+            "os pais causais seguem a evidencia; era por aqui que o episodio inchava"
+        );
+        runtime.shutdown();
+    }
+
+    /// Um episodio derivado pelo Sentinel, do tipo pedido. `l4_events` so
+    /// aceita episodios que passem `episode_is_generated`.
+    fn episodio_l4(kind: &str, incident_id: &str, conteudo: Vec<u8>) -> Episode {
+        let mut episode = Episode::new("sentinel", EventKind::Custom(kind.into()), conteudo);
+        episode
+            .attrs
+            .insert("sentinel.generated".into(), "true".into());
+        episode
+            .attrs
+            .insert("sentinel.incident_id".into(), incident_id.into());
+        episode
+    }
+
+    /// Auditoria 2026-09-05, A39 — `l4_events` passou de `scan(0, upper)` (o
+    /// log INTEIRO em RAM antes de filtrar) para lotes de `scan_capped`. E uma
+    /// mudanca de memoria, nao de resultado: este teste prova a igualdade
+    /// contra o caminho antigo (janela = `usize::MAX` e literalmente a
+    /// varredura unica) com a janela a cair em cima, antes e depois de cada
+    /// fronteira de lote.
+    #[test]
+    fn l4_events_janelado_equivale_a_varredura_unica() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let runtime = SentinelRuntime::start(log.clone(), l3_config())
+            .unwrap()
+            .unwrap();
+        // Ruido tambem derivado, para nao ser normalizado e nao fazer o log
+        // crescer sozinho durante o teste.
+        for i in 0..40u32 {
+            if i % 3 == 0 {
+                log.append(episodio_l4(
+                    "SecurityApproval",
+                    if i % 2 == 0 { "inc-1" } else { "inc-2" },
+                    b"{}".to_vec(),
+                ))
+                .unwrap();
+            } else if i % 7 == 0 {
+                log.append(episodio_l4(
+                    "SecurityActionProposal",
+                    "inc-1",
+                    b"{}".to_vec(),
+                ))
+                .unwrap();
+            } else {
+                log.append(episodio_l4("Ruido", "inc-1", b"{}".to_vec()))
+                    .unwrap();
+            }
+        }
+        wait_for_catch_up(&runtime, &log);
+        let head = log.head();
+
+        for (kind, incidente) in [
+            (None, None),
+            (Some("SecurityApproval"), None),
+            (Some("SecurityApproval"), Some("inc-1")),
+            (None, Some("inc-2")),
+        ] {
+            for limite in [1usize, 3, 10_000] {
+                for as_of in [None, Some(0), Some(head / 2), Some(head)] {
+                    let chaves = |linhas: Vec<(Lsn, Episode)>| -> Vec<(Lsn, String, Vec<u8>)> {
+                        linhas
+                            .into_iter()
+                            .map(|(lsn, e)| (lsn, format!("{:?}", e.kind), e.content))
+                            .collect()
+                    };
+                    let oraculo = chaves(
+                        runtime
+                            .l4_events_com_janela(kind, incidente, as_of, limite, usize::MAX)
+                            .unwrap(),
+                    );
+                    for janela in [1usize, 2, 3, 7, 39, 40, 41, 20_000] {
+                        let janelado = chaves(
+                            runtime
+                                .l4_events_com_janela(kind, incidente, as_of, limite, janela)
+                                .unwrap(),
+                        );
+                        assert_eq!(
+                            janelado, oraculo,
+                            "janela={janela} kind={kind:?} inc={incidente:?} limite={limite} as_of={as_of:?}"
+                        );
+                    }
+                }
+            }
+        }
+        runtime.shutdown();
+    }
+
+    /// Auditoria 2026-09-05, A39 — `ensure_persisted_authorization` fazia DUAS
+    /// varreduras completas do log POR DECISAO de politica do incidente, com
+    /// argumentos invariantes do ciclo. O custo tem de ser independente do
+    /// numero de decisoes ja persistidas.
+    #[test]
+    fn autorizar_uma_accao_nao_escala_com_o_numero_de_decisoes() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let runtime = SentinelRuntime::start(log.clone(), l3_config())
+            .unwrap()
+            .unwrap();
+        let autorizada = AuthorizedAction {
+            authorization_id: "authz-nao-existe".into(),
+            incident_id: "inc-1".into(),
+            action: SecurityAction::BlockIp {
+                ip: "203.0.113.25".into(),
+                ttl_secs: 60,
+            },
+            constraints: ExecutionConstraints {
+                scope: "test".into(),
+                max_ttl_secs: Some(60),
+                requires_approval: false,
+                allow_retries: false,
+            },
+            evidence: Vec::new(),
+            policy_version: "response-policy-v1".into(),
+        };
+        let decisao = |i: usize| {
+            episodio_l4(
+                "SecurityPolicyDecision",
+                "inc-1",
+                serde_json::to_vec(&serde_json::json!({
+                    "policy_version": "response-policy-v1",
+                    "proposal_id": format!("p-{i}"),
+                    "decision": { "Approve": { "authorization_id": "authz-outra" } },
+                }))
+                .unwrap(),
+            )
+        };
+
+        let custo = |runtime: &SentinelRuntime| {
+            let antes = runtime.status().l4_scans_total;
+            // Falha de propósito (nenhuma proposta casa): o que se mede é o
+            // custo do caminho COMPLETO, que percorre todas as decisões.
+            assert!(runtime.ensure_persisted_authorization(&autorizada).is_err());
+            runtime.status().l4_scans_total - antes
+        };
+
+        log.append(decisao(0)).unwrap();
+        wait_for_catch_up(&runtime, &log);
+        let com_uma = custo(&runtime);
+
+        for i in 1..6 {
+            log.append(decisao(i)).unwrap();
+        }
+        wait_for_catch_up(&runtime, &log);
+        let com_seis = custo(&runtime);
+
+        assert_eq!(
+            com_uma, com_seis,
+            "o custo de autorizar tem de ser independente do numero de decisoes: {com_uma} vs {com_seis}"
+        );
+        assert_eq!(
+            com_seis, 3,
+            "tres varreduras: decisoes, propostas, aprovacoes"
+        );
+        runtime.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod testes_acumulacao_de_evidencia {
+    use super::{acumular_evidencia, EvidenceRef};
+    use heraclitus_core::{EventId, Lsn};
+
+    fn refs(pares: &[(Lsn, u8)], ids: &[EventId]) -> Vec<EvidenceRef> {
+        pares
+            .iter()
+            .map(|(lsn, i)| EvidenceRef {
+                lsn: *lsn,
+                event_id: ids[*i as usize],
+            })
+            .collect()
+    }
+
+    /// Implementacao de referencia: o codigo EXACTO que existia antes da
+    /// correccao (`contains` linear + `push` + `sort_by`).
+    fn referencia_antiga(acumulado: &mut Vec<EvidenceRef>, novas: &[EvidenceRef]) {
+        for evidencia in novas {
+            if !acumulado.contains(evidencia) {
+                acumulado.push(evidencia.clone());
+            }
+        }
+        acumulado.sort_by(|esquerda, direita| {
+            esquerda
+                .lsn
+                .cmp(&direita.lsn)
+                .then_with(|| esquerda.event_id.cmp(&direita.event_id))
+        });
+    }
+
+    /// Auditoria 2026-09-05, A38 — a insercao ordenada tem de dar o MESMO
+    /// vector que o `push` + `sort_by` dava. A ordem nao e cosmetica: e a
+    /// ordem que `sorted_evidence` produz e de que a identidade do assessment
+    /// (`revision_id`, um digest do JSON) depende.
+    #[test]
+    fn insercao_ordenada_da_o_mesmo_vector_que_push_mais_sort() {
+        let ids: Vec<EventId> = (0..4).map(|_| EventId::new()).collect();
+        let lotes = [
+            // LSN monotono
+            refs(&[(10, 0), (20, 1)], &ids),
+            // LSN atrasado: insercao no MEIO, nao no fim
+            refs(&[(15, 2)], &ids),
+            // mesmo LSN, event_id diferente: desempate
+            refs(&[(15, 3)], &ids),
+            // duplicado exacto: nao faz nada
+            refs(&[(10, 0)], &ids),
+        ];
+
+        let mut novo = Vec::new();
+        let mut antigo = Vec::new();
+        for lote in &lotes {
+            acumular_evidencia(&mut novo, lote, 0);
+            referencia_antiga(&mut antigo, lote);
+            assert_eq!(novo, antigo, "divergiu do comportamento anterior");
+        }
+        assert_eq!(novo.len(), 4, "o duplicado exacto nao entra");
+    }
+
+    /// Auditoria 2026-09-05, A38 — o tecto corta pelo PREFIXO: descarta-se a
+    /// evidencia mais antiga, guarda-se a mais recente.
+    #[test]
+    fn o_tecto_descarta_a_evidencia_mais_antiga() {
+        let mut acumulado = Vec::new();
+        for lsn in 0..10u64 {
+            let nova = vec![EvidenceRef {
+                lsn,
+                event_id: EventId::new(),
+            }];
+            acumular_evidencia(&mut acumulado, &nova, 4);
+            assert!(acumulado.len() <= 4, "o tecto nunca pode ser ultrapassado");
+        }
+        assert_eq!(acumulado.len(), 4);
+        assert_eq!(
+            acumulado.iter().map(|e| e.lsn).collect::<Vec<_>>(),
+            vec![6, 7, 8, 9],
+            "sobrevivem as quatro mais recentes"
+        );
+    }
+
+    /// Auditoria 2026-09-05, A38 — um lote unico maior que o tecto tambem tem
+    /// de ser cortado, senao um so sinal com muita evidencia furava o limite.
+    #[test]
+    fn um_lote_maior_que_o_tecto_tambem_e_cortado() {
+        let novas: Vec<EvidenceRef> = (0..100u64)
+            .map(|lsn| EvidenceRef {
+                lsn,
+                event_id: EventId::new(),
+            })
+            .collect();
+        let mut acumulado = Vec::new();
+        acumular_evidencia(&mut acumulado, &novas, 10);
+        assert_eq!(acumulado.len(), 10);
+        assert_eq!(acumulado.first().unwrap().lsn, 90);
+    }
 }
 
 #[cfg(test)]
@@ -4422,7 +5928,7 @@ mod poda_l1_tests {
             falha(3, 10_000),
             falha(4, 20_000),
         ];
-        assert_eq!(podar_historico_l1(&mut h, 10_000, 0), 2);
+        assert_eq!(podar_historico_l1(&mut h, 10_000, 0, u64::MAX), 2);
         let restantes: Vec<u64> = h.iter().map(|(l, _)| *l).collect();
         assert_eq!(
             restantes,
@@ -4431,16 +5937,44 @@ mod poda_l1_tests {
         );
     }
 
+    /// UM evento datado no futuro apagava TODO o historico do L1: a fronteira
+    /// da poda saia do `max(observed_at)` do proprio historico, e `observed_at`
+    /// vem do JSON ingerido sem limite nenhum. Bastava um shipper com o relogio
+    /// adiantado — ou um sensor comprometido — para o motor de regras perder a
+    /// memoria toda, em silencio e sem retorno.
+    #[test]
+    fn um_carimbo_do_futuro_nao_apaga_o_historico() {
+        let agora = 100_000u64;
+        let mut h = vec![
+            falha(1, 90_000),
+            falha(2, 95_000),
+            // O veneno: muito alem do relogio local.
+            falha(3, u64::MAX),
+        ];
+        podar_historico_l1(&mut h, 10_000, 0, agora);
+        let restantes: Vec<u64> = h.iter().map(|(l, _)| *l).collect();
+        assert_eq!(
+            restantes,
+            vec![1, 2, 3],
+            "o evento do futuro nao pode empurrar a fronteira e apagar os reais"
+        );
+
+        // E se TODOS estiverem no futuro nao ha poda temporal — guardar dados e
+        // sempre melhor do que deita-los fora com base num relogio que mente.
+        let mut todos_futuros = vec![falha(1, u64::MAX - 1), falha(2, u64::MAX)];
+        assert_eq!(podar_historico_l1(&mut todos_futuros, 10_000, 0, agora), 0);
+    }
+
     #[test]
     fn o_tecto_de_linhas_solta_os_lsn_mais_antigos() {
         let mut h: Vec<_> = (1..=10).map(|i| falha(i, 1_000 * i)).collect();
-        assert_eq!(podar_historico_l1(&mut h, u64::MAX, 4), 6);
+        assert_eq!(podar_historico_l1(&mut h, u64::MAX, 4, u64::MAX), 6);
         let restantes: Vec<u64> = h.iter().map(|(l, _)| *l).collect();
         assert_eq!(restantes, vec![7, 8, 9, 10]);
 
         let mut sem_tecto: Vec<_> = (1..=10).map(|i| falha(i, 1_000 * i)).collect();
         assert_eq!(
-            podar_historico_l1(&mut sem_tecto, u64::MAX, 0),
+            podar_historico_l1(&mut sem_tecto, u64::MAX, 0, u64::MAX),
             0,
             "zero desliga o tecto"
         );
@@ -4485,7 +6019,7 @@ mod poda_l1_tests {
             "com historico ilimitado so a rajada #1 e reportada; a #2 fica presa atras dela"
         );
 
-        podar_historico_l1(&mut historico, engine.required_window_ms(), 0);
+        podar_historico_l1(&mut historico, engine.required_window_ms(), 0, u64::MAX);
         assert_eq!(
             historico.len(),
             2,
@@ -4495,6 +6029,167 @@ mod poda_l1_tests {
             engine.evaluate(&historico),
             so_a_segunda,
             "podado ao horizonte; o sinal da rajada #2 e exactamente o que ela produz sozinha"
+        );
+    }
+}
+
+/// Auditoria 2026-09-05, A18 — a insercao ordenada no historico L1.
+#[cfg(test)]
+mod testes_insercao_no_historico_l1 {
+    use super::{inserir_no_historico_l1, ordenar_historico_l1, COMPARACOES_HISTORICO_L1};
+    use crate::event::{SecurityEvent, SecuritySource};
+    use heraclitus_core::{EventId, Lsn};
+
+    fn evento(id: EventId) -> SecurityEvent {
+        SecurityEvent::unmapped(id, SecuritySource::Auditd)
+    }
+
+    /// A implementacao ANTERIOR, palavra por palavra: varredura linear de
+    /// deduplicacao, `push` e `sort_by` COMPLETO. Serve de oraculo — a
+    /// correccao so e legitima se o vector final for exactamente o mesmo, porque
+    /// `RuleEngine::evaluate` le a janela pela ordem em que a recebe e o
+    /// operador `Sequence` depende dela.
+    fn referencia_push_mais_sort(
+        historico: &mut Vec<(Lsn, SecurityEvent)>,
+        source_lsn: Lsn,
+        evento: &SecurityEvent,
+    ) -> bool {
+        if historico.iter().any(|(lsn, existente)| {
+            *lsn == source_lsn && existente.raw_event_id == evento.raw_event_id
+        }) {
+            return false;
+        }
+        historico.push((source_lsn, evento.clone()));
+        historico.sort_by(|esquerda, direita| {
+            esquerda
+                .0
+                .cmp(&direita.0)
+                .then_with(|| esquerda.1.raw_event_id.cmp(&direita.1.raw_event_id))
+        });
+        true
+    }
+
+    #[test]
+    fn a_insercao_ordenada_da_o_mesmo_vector_que_o_push_mais_sort() {
+        // Dois ids ORDENADOS, para o empate no mesmo LSN ser legivel: o
+        // desempate e por `raw_event_id` e tem de sobreviver a correccao.
+        let mut ids = [EventId::new(), EventId::new()];
+        ids.sort();
+        let menor = evento(ids[0]);
+        let maior = evento(ids[1]);
+        let outro = evento(EventId::new());
+
+        // A sequencia atravessa os quatro casos: LSN monotono, empate no mesmo
+        // LSN resolvido pelo id, LSN ATRASADO (insercao no MEIO — o caminho que
+        // um `push` em vez de `insert(posicao, ..)` estragaria) e duplicado
+        // exacto.
+        let passos: Vec<(Lsn, &SecurityEvent)> = vec![
+            (10, &outro),
+            (20, &maior),
+            (20, &menor),
+            (15, &outro),
+            (20, &maior),
+            (10, &outro),
+            (5, &menor),
+        ];
+
+        let mut oraculo: Vec<(Lsn, SecurityEvent)> = Vec::new();
+        let mut sob_teste: Vec<(Lsn, SecurityEvent)> = Vec::new();
+        for (passo, (lsn, linha)) in passos.iter().enumerate() {
+            let esperado = referencia_push_mais_sort(&mut oraculo, *lsn, linha);
+            let obtido = inserir_no_historico_l1(&mut sob_teste, *lsn, linha);
+            assert_eq!(
+                obtido, esperado,
+                "passo {passo}: a decisao de duplicado tem de ser a mesma"
+            );
+            assert_eq!(
+                sob_teste, oraculo,
+                "passo {passo}: o vector tem de ficar identico ao do push+sort"
+            );
+        }
+        assert_eq!(
+            sob_teste.len(),
+            5,
+            "dois dos sete passos eram duplicados exactos"
+        );
+    }
+
+    /// Quantas comparacoes custa inserir o (N+1)-esimo evento num historico de
+    /// N linhas ja ordenadas — o estado em que `remember_rule_event` o encontra
+    /// sempre.
+    fn comparacoes_para_inserir(n: u64) -> u64 {
+        let mut historico: Vec<(Lsn, SecurityEvent)> =
+            (0..n).map(|i| (i, evento(EventId::new()))).collect();
+        let novo = evento(EventId::new());
+        COMPARACOES_HISTORICO_L1.with(|contador| contador.set(0));
+        assert!(
+            inserir_no_historico_l1(&mut historico, n, &novo),
+            "o LSN e novo: tem de ser inserido"
+        );
+        COMPARACOES_HISTORICO_L1.with(|contador| contador.get())
+    }
+
+    /// Auditoria 2026-09-05, A18 — o custo por evento tem de ser O(log N).
+    ///
+    /// O que estava antes varria o historico inteiro para deduplicar e a seguir
+    /// reordenava um vector JA ordenado, por cada evento ingerido, sobre ate
+    /// `history_capacity` linhas (100 000 por omissao).
+    #[test]
+    fn inserir_no_historico_l1_custa_log_e_nao_linear() {
+        let mil = comparacoes_para_inserir(1_024);
+        let dois_mil = comparacoes_para_inserir(2_048);
+
+        // Passar pelo comparador PARTILHADO nao e acessorio: e o que garante que
+        // a insercao, a deduplicacao e a reordenacao do snapshot nao possam
+        // divergir. Uma implementacao com o seu proprio comparador inline — a
+        // anterior — nao conta nada aqui, e e isto que o apanha.
+        assert!(
+            mil >= 1,
+            "a insercao tem de comparar pelo comparador partilhado"
+        );
+        assert!(
+            mil <= 16,
+            "1024 linhas custam log2(1024) = 10 comparacoes, nao 1024; obtido {mil}"
+        );
+        assert!(
+            dois_mil <= mil + 2,
+            "duplicar o historico so pode custar mais uma comparacao: {mil} -> {dois_mil}"
+        );
+    }
+
+    /// O restauro do snapshot e o unico ponto de entrada do vector que nao passa
+    /// pela insercao ordenada. Enquanto havia `sort_by` por evento, um
+    /// `rule_history` desordenado era reparado de graca; com a busca binaria
+    /// deixaria de ser, e a deduplicacao passaria a falhar EM SILENCIO —
+    /// duplicando linhas no historico e mudando a janela que o `RuleEngine` ve.
+    #[test]
+    fn o_historico_restaurado_do_snapshot_e_reordenado_antes_de_ser_usado() {
+        let linhas: Vec<(Lsn, SecurityEvent)> = [1u64, 2, 3, 0]
+            .into_iter()
+            .map(|lsn| (lsn, evento(EventId::new())))
+            .collect();
+        // A linha fora do lugar: o LSN 0 no fim, como sairia de um snapshot
+        // corrompido ou de uma versao que mudasse a ordem de serializacao.
+        let (lsn_solto, solto) = linhas[3].clone();
+
+        let mut desordenado = linhas.clone();
+        assert!(
+            inserir_no_historico_l1(&mut desordenado, lsn_solto, &solto),
+            "sem ordenar, a MESMA linha escapa a deduplicacao e entra uma segunda vez"
+        );
+        assert_eq!(
+            desordenado.len(),
+            5,
+            "e a falha e silenciosa: o historico cresce com uma linha repetida"
+        );
+
+        let mut restaurado = linhas;
+        ordenar_historico_l1(&mut restaurado);
+        let lsns: Vec<Lsn> = restaurado.iter().map(|(lsn, _)| *lsn).collect();
+        assert_eq!(lsns, vec![0, 1, 2, 3], "o restauro tem de repor a ordem");
+        assert!(
+            !inserir_no_historico_l1(&mut restaurado, lsn_solto, &solto),
+            "sobre o vector ordenado, a mesma linha e reconhecida como duplicada"
         );
     }
 }
@@ -4540,6 +6235,59 @@ mod testes_snapshot_spec0072 {
             runtime.status().events_normalized_total,
             quantos,
             "o pipeline nao chegou ao fim dentro do prazo"
+        );
+    }
+
+    /// Auditoria 2026-09-05, A18 — o `rule_history` lido do snapshot é o ÚNICO
+    /// ponto de entrada do histórico L1 que não passa pela inserção ordenada.
+    /// Enquanto havia um `sort_by` completo por evento, uma ordem errada vinda
+    /// de disco era reparada de graça no primeiro evento; com a busca binária
+    /// deixa de ser, e a deduplicação passaria a falhar EM SILÊNCIO. Por isso o
+    /// arranque ordena uma vez — e é esse passo que este teste tranca.
+    #[test]
+    fn o_rule_history_do_snapshot_chega_ordenado_ao_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let caminho = log.dir().join("sentinel").join("state.snapshot");
+
+        let mut snapshot = SentinelStateSnapshot::vazio(7);
+        // Deliberadamente ao contrário da ordem que a inserção binária exige.
+        snapshot.rule_history = [3u64, 1, 2, 0]
+            .into_iter()
+            .map(|lsn| {
+                (
+                    lsn,
+                    SecurityEvent::unmapped(EventId::new(), SecuritySource::Auditd),
+                )
+            })
+            .collect();
+        SnapshotStore::new(&caminho).publicar(&snapshot).unwrap();
+
+        let runtime = SentinelRuntime::start(log, config_de_teste())
+            .unwrap()
+            .unwrap();
+        let lsns: Vec<Lsn> = runtime
+            .inner
+            .rule_history
+            .lock()
+            .unwrap()
+            .linhas
+            .iter()
+            .map(|(lsn, _)| *lsn)
+            .collect();
+        runtime.shutdown();
+        assert_eq!(
+            lsns,
+            vec![0, 1, 2, 3],
+            "o arranque tem de repor a ordem do histórico L1 que veio do snapshot"
         );
     }
 
@@ -4715,6 +6463,150 @@ mod testes_snapshot_spec0072 {
             caminho.exists(),
             "com snapshot_interval_events=1 o worker tinha de publicar sozinho"
         );
+    }
+
+    /// Auditoria 2026-09-05, A37 — o `try_lock` que o comentario dizia ser a
+    /// exclusao entre publicadores morria no fim da expressao `let por_tempo =
+    /// ...`, e a publicacao acontecia a seguir SEM guarda nenhum. Dois
+    /// publicadores abriam o MESMO `state.snapshot.tmp` (caminho fixo) com
+    /// `truncate`, cada um a escrever a partir do offset 0: o corpo publicado
+    /// saia emendado (digest invalido -> rebuild canonico desde o LSN 0) ou o
+    /// `state.snapshot` desaparecia de vez, porque o segundo movia o snapshot
+    /// bom do primeiro para `.prev` e depois falhava o seu proprio rename.
+    #[test]
+    fn publicacoes_concorrentes_nunca_deixam_um_snapshot_invalido() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let mut config = config_de_teste();
+        // O worker nao entra na experiencia: quem publica sao as threads
+        // abaixo, pela API publica, que e o segundo caminho concorrente
+        // (independente do numero de workers) do mesmo defeito.
+        config.snapshot_interval_events = 0;
+        config.snapshot_interval_secs = 0;
+        let caminho = log.dir().join("sentinel").join("state.snapshot");
+        let runtime = Arc::new(
+            SentinelRuntime::start(log.clone(), config)
+                .unwrap()
+                .unwrap(),
+        );
+        // Estado grande de proposito: a janela da corrida e a duracao da
+        // escrita do corpo serializado, e com cinco eventos ela e curta de
+        // mais para o defeito aparecer de forma fiavel.
+        for i in 0..600 {
+            log.append(evento_bruto(&format!("utilizador-{i}")))
+                .unwrap();
+        }
+        esperar_normalizados(&runtime, 600);
+
+        // Duas publicacoes em simultaneo colidem no MESMO `state.snapshot.tmp`
+        // (caminho fixo, aberto com `truncate`). O sintoma deterministico dessa
+        // colisao e o `rename(temp, path)` a falhar porque o outro publicador
+        // ja consumiu o temporario — ninguem mais lhe toca. Contamos isso.
+        //
+        // NAO se poe aqui uma thread a ler o ficheiro em ciclo: no Windows um
+        // leitor com o handle aberto faz o proprio `rename` falhar, e o teste
+        // passaria a medir a interferencia do observador em vez do defeito.
+        let publicadores: Vec<_> = (0..4)
+            .map(|_| {
+                let runtime = runtime.clone();
+                std::thread::spawn(move || {
+                    let mut erros = 0usize;
+                    for _ in 0..60 {
+                        if let Err(erro) = runtime.publicar_snapshot() {
+                            erros += 1;
+                            eprintln!("publicacao falhada: {erro}");
+                        }
+                    }
+                    erros
+                })
+            })
+            .collect();
+        let erros: usize = publicadores
+            .into_iter()
+            .map(|publicador| publicador.join().unwrap())
+            .sum();
+
+        assert_eq!(
+            erros, 0,
+            "publicacoes concorrentes colidiram no mesmo `state.snapshot.tmp`"
+        );
+        assert!(
+            caminho.exists(),
+            "o `state.snapshot` desapareceu: a cadeia dupla de renames destruiu-o"
+        );
+        assert!(
+            matches!(
+                SnapshotStore::new(&caminho).carregar(7).unwrap(),
+                SnapshotLoad::Utilizavel(_)
+            ),
+            "o snapshot final tem de servir"
+        );
+        assert!(
+            !caminho.with_extension("snapshot.tmp").exists(),
+            "nenhum temporario pode ficar para tras"
+        );
+        runtime.shutdown();
+    }
+
+    /// Auditoria 2026-09-05, A37 — o limiar de EVENTOS nao pode ficar refem do
+    /// relogio. O `else { return; }` que vivia dentro da expressao de
+    /// `por_tempo` abortava a publicacao inteira quando o `try_lock` sobre
+    /// `ultimo_snapshot` falhava, mesmo com `snapshot_interval_events` ja
+    /// atingido — um lock que nada tem a ver com esse limiar.
+    #[test]
+    fn o_limiar_de_eventos_nao_fica_refem_do_relogio() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let mut config = config_de_teste();
+        config.snapshot_interval_events = 1;
+        // Limiar temporal LIGADO e longe de disparar: e o que faz o `&&` da
+        // linha de `por_tempo` ser avaliado em vez de curto-circuitar.
+        config.snapshot_interval_secs = 300;
+        let caminho = log.dir().join("sentinel").join("state.snapshot");
+        let runtime = SentinelRuntime::start(log.clone(), config)
+            .unwrap()
+            .unwrap();
+        log.append(evento_bruto("heidi")).unwrap();
+        esperar_normalizados(&runtime, 1);
+        let _ = std::fs::remove_file(&caminho);
+
+        // Prender o relogio a partir de outra thread, com sinalizacao, para o
+        // `try_lock` falhar de forma determinista.
+        let (avisou, espera) = std::sync::mpsc::channel();
+        let interno = runtime.inner.clone();
+        let prendedor = std::thread::spawn(move || {
+            let _preso = interno
+                .ultimo_snapshot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            avisou.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        espera.recv().unwrap();
+        talvez_publicar_snapshot(&runtime.inner, 1);
+        prendedor.join().unwrap();
+
+        assert!(
+            caminho.exists(),
+            "com o limiar de eventos atingido, um relogio ocupado nao pode cancelar o snapshot"
+        );
+        runtime.shutdown();
     }
 }
 

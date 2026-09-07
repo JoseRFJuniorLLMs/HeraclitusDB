@@ -166,6 +166,14 @@ pub struct Engine {
     /// RAM). Liga com HERACLITUS_LOG_ONLY=1 — permite cargas massivas (centenas
     /// de GB) com RAM limitada; as views se constroem depois via `view rebuild`.
     log_only: bool,
+    /// Índice de atributos NÃO materializado: o arranque carregou o
+    /// checkpoint dele (com o watermark antigo) mas saltou o replay da cauda.
+    /// Enquanto estiver ligado, `checkpoint_attr` recusa-se a gravar
+    /// (auditoria 2026-09-05, A47). É a IRMÃ da marca das views, mas vive aqui
+    /// e não no `ViewRegistry` (auditoria 2026-09-05, A50): o índice de
+    /// atributos é um componente à parte, e `view rebuild` materializa as views
+    /// sem lhe tocar — logo baixar uma marca não pode baixar a outra.
+    attr_nao_materializado: std::sync::atomic::AtomicBool,
     /// Meta-auditoria de acessos (padrão immudb): cada query GQL executada
     /// gera um evento `AuditQuery` no próprio log — quem consultou o quê é,
     /// ele próprio, evidência imutável. Liga por config (audit_queries).
@@ -177,6 +185,22 @@ pub struct Engine {
     /// R16: serializa o par (ler head → append) das escritas H-VM, para que
     /// dois upserts concorrentes nunca carimbem o mesmo lsn na VmInstruction.
     hvm_lock: Mutex<()>,
+    /// Ponto de consistência para o checkpoint: nenhum append pode estar EM VOO
+    /// (já no log, ainda por indexar) quando um snapshot é tirado.
+    ///
+    /// O LSN é atribuído dentro da secção crítica do worker do log, mas a
+    /// INDEXAÇÃO corre fora dela e fora de ordem: com escrita concorrente, o
+    /// LSN 6 pode ser aplicado (watermark → 6) antes do 5. Um checkpoint que
+    /// caia nessa janela persiste um watermark que já ultrapassou um LSN por
+    /// aplicar, e o arranque seguinte replaya só a cauda — o episódio 5 nunca
+    /// mais entra nas views nem no índice de atributos, em silêncio e para
+    /// sempre. Auditoria 2026-09-05, A07.
+    ///
+    /// `read` no caminho de escrita (appends continuam concorrentes entre si,
+    /// custo zero), `write` no checkpoint. Truncar o watermark PERSISTIDO em
+    /// watermarks.json não serviria: quem manda no arranque é o watermark do
+    /// snapshot (`View::watermark`) e o do `AttrIndex`, não o JSON.
+    index_gate: std::sync::RwLock<()>,
     /// Serializa check+append de uma chave externa. O índice de atributos é
     /// persistente/reconstruível pelo log, portanto isto fecha tanto corridas
     /// concorrentes quanto retries depois de crash/restart.
@@ -196,6 +220,21 @@ pub struct Engine {
     /// semântica nenhuma: duas chaves distintas nunca interagem, portanto
     /// serializá-las juntas nunca foi um requisito, era um acidente.
     idempotency_locks: Vec<Mutex<()>>,
+    /// Serializa o par (reconstruir estado → apender) dos comandos de caso,
+    /// **por `case_id`** — o mesmo padrão de `idempotency_locks`, pela mesma
+    /// razão e com o mesmo custo residual de partilha de shard.
+    ///
+    /// Sem isto, dois comandos concorrentes liam a MESMA revisão, ambos
+    /// passavam a validação e ambos entravam no log; a partir daí a
+    /// reconstrução devolvia `Err(Conflito)` para sempre. Num log append-only
+    /// não há como retirar o segundo, portanto o caso ficava permanentemente
+    /// ilegível — é a falha sem reparação possível (auditoria 2026-09-05, A02).
+    ///
+    /// LIMITAÇÃO declarada: isto fecha a corrida no nó autónomo. Com replicação
+    /// activa o append passa pelo líder do raft e um mutex LOCAL não serializa
+    /// dois nós; fechar esse caso exige um CAS sobre a revisão observada no
+    /// aplicador do raft, que não está feito.
+    case_locks: Vec<Mutex<()>>,
     /// Estado regulatório dobrado uma vez e estendido pela cauda desde então.
     /// Vive aqui porque o `RegulatoryPolicyEngine` nasce e morre em cada RPC.
     pub regulatory_cache: Arc<heraclitus_compliance::RegulatoryStateCache>,
@@ -310,6 +349,18 @@ impl Engine {
         // views pesadas (que vivem 100% em RAM) e a (re)construção do índice de
         // atributos. O banco sobe servindo o log (a fonte da verdade); as views
         // ficam vazias até um `view rebuild`. Liga com HERACLITUS_SKIP_VIEW_REPLAY=1.
+        //
+        // O que este modo NÃO faz, desde as auditorias 2026-09-05 A46/A47/A50:
+        // persistir estado derivado. As views arrancam marcadas como não
+        // materializadas (`ViewRegistry::mark_unmaterialized`) e o índice de
+        // atributos com a bandeira `attr_nao_materializado` — nenhum dos dois
+        // vai a disco enquanto não voltar a descrever o log, porque um snapshot
+        // que mente sobre o seu watermark é PIOR do que snapshot nenhum. Um
+        // `view rebuild` integral levanta a inibição do lado das VIEWS (o
+        // fast-boot delas volta), mas não do lado do índice de atributos, que
+        // esse comando não reconstrói: o attr só volta a ser gravado num
+        // arranque sem a variável (ou depois de um crypto-shred, que reconstrói
+        // os dois do LSN 0).
         let truthy = |k: &str| {
             std::env::var(k)
                 .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
@@ -442,10 +493,32 @@ impl Engine {
                 // posterior (periódico ou de shutdown) gravar snapshots vazios
                 // sob watermarks altos, e o arranque seguinte replayava só a
                 // cauda: perda PERMANENTE e silenciosa de tudo ≤ watermark nas
-                // views derivadas. A zero, qualquer checkpoint é seguro e o
-                // próximo boot normal reconstrói do LSN 0.
-                registry.reset_watermarks();
-                p.ok("PULADO — HERACLITUS_SKIP_VIEW_REPLAY (views vazias; watermarks a zero)");
+                // views derivadas.
+                //
+                // Auditoria 2026-09-05, A46: zerar os watermarks do registry
+                // NÃO chegava — era uma mitigação INERTE. Quem manda no
+                // arranque seguinte é o watermark INTERNO de cada view
+                // (`catch_up` adopta `v.watermark()` do snapshot como
+                // autoridade, e ignora o `watermarks.json`) e `View::apply`
+                // sobe-o incondicionalmente. Logo a PRIMEIRA escrita ao vivo
+                // desta sessão — que acontece, porque SKIP_VIEW_REPLAY sozinho
+                // não liga `log_only` — repunha o watermark da cauda sobre uma
+                // view VAZIA, e o checkpoint seguinte gravava esse par
+                // mentiroso. A defesa tem de ser não PERSISTIR.
+                //
+                // Auditoria 2026-09-05, A50: essa marca vive DENTRO do
+                // `ViewRegistry`, não numa bandeira do Engine — é o registry o
+                // dono dos snapshots, e há quem chame `ViewRegistry::checkpoint`
+                // sem passar por `Engine::checkpoint_views` (o `Engine::shred`).
+                // Uma bandeira do lado do Engine não cobria esses caminhos, e
+                // duas marcas com o mesmo significado podiam divergir.
+                // `mark_unmaterialized` faz as DUAS coisas que
+                // `reset_watermarks` sozinho não fazia: zera também o watermark
+                // INTERNO de cada view (a autoridade) e levanta a marca que
+                // inibe o checkpoint enquanto as views não descreverem o log —
+                // até um `catch_up` ou um `view rebuild` integral.
+                registry.mark_unmaterialized();
+                p.ok("PULADO — HERACLITUS_SKIP_VIEW_REPLAY (views vazias; checkpoint inibido até `view rebuild`)");
             } else {
                 registry.catch_up(&log)?;
                 let wm = registry.min_watermark();
@@ -550,10 +623,13 @@ impl Engine {
             metric,
             keystore,
             log_only,
+            attr_nao_materializado: std::sync::atomic::AtomicBool::new(skip_replay),
             audit_queries: config.audit_queries,
             replication: std::sync::OnceLock::new(),
             hvm_lock: Mutex::new(()),
+            index_gate: std::sync::RwLock::new(()),
             idempotency_locks: (0..IDEMPOTENCY_SHARDS).map(|_| Mutex::new(())).collect(),
+            case_locks: (0..IDEMPOTENCY_SHARDS).map(|_| Mutex::new(())).collect(),
             regulatory_cache: Arc::new(heraclitus_compliance::RegulatoryStateCache::default()),
             cold_range_reads: std::sync::atomic::AtomicU64::new(0),
             cold_bytes_downloaded: std::sync::atomic::AtomicU64::new(0),
@@ -578,6 +654,18 @@ impl Engine {
     /// Indexação síncrona de um episódio já no log (memtable + views + attr).
     /// É o núcleo partilhado por `append` e pelo hook de apply do consenso — ao
     /// replicar, cada nó indexa localmente o que aplica (read-your-writes).
+    /// Marca um append como EM VOO até o guard cair. O `append_internal`
+    /// segura-o entre `append_stamped` e `index_applied`; o checkpoint pede o
+    /// lado exclusivo do mesmo `RwLock` e espera por todos os que estiverem em
+    /// voo antes de tirar o snapshot (auditoria 2026-09-05, A07).
+    ///
+    /// Público porque quem indexa por fora do `append_internal` (o aplicador do
+    /// consenso, ou um teste que materialize a janela) tem de poder abrir a
+    /// mesma janela — o `index_applied` sozinho não a delimita.
+    pub fn begin_indexing(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+        self.index_gate.read().unwrap()
+    }
+
     pub fn index_applied(&self, lsn: Lsn, episode: &Episode) {
         if self.log_only {
             return;
@@ -637,7 +725,38 @@ impl Engine {
     /// Grava o checkpoint do índice de atributos (o servidor pode chamar
     /// periodicamente / no shutdown para o arranque seguinte só replayar a cauda).
     pub fn checkpoint_attr(&self) -> Result<(), HeraclitusError> {
-        self.attr.read().unwrap().save(&self.attr_dir)
+        // Auditoria 2026-09-05, A47 — a irmã de A46, do lado do índice de
+        // atributos. No arranque com o replay saltado carrega-se o checkpoint
+        // (`AttrIndex::open`, com o watermark antigo) e salta-se o catch-up: o
+        // índice fica com um buraco. A primeira escrita ao vivo empurra o
+        // watermark para além dele (`watermark = max(watermark, lsn)`) e gravar
+        // aqui consolidava a mentira — o arranque normal seguinte parte de
+        // `idx.watermark()` e o intervalo perdido NUNCA mais é indexado.
+        // Zerar o watermark no arranque não resolveria (o próximo `apply`
+        // repõe-o, foi essa a lição de A46): a defesa tem de ser não persistir.
+        // Não gravar mantém o checkpoint anterior, que descreve fielmente um
+        // estado mais antigo — o boot seguinte replaya mais log, e acerta.
+        if self
+            .attr_nao_materializado
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(
+                "índice de atributos não materializado (replay saltado no arranque): \
+                 checkpoint RECUSADO para não consolidar um buraco permanente"
+            );
+            return Ok(());
+        }
+        // Auditoria 2026-09-05, A07 — barreira de consistência. Esperar pelo
+        // lado exclusivo do `index_gate` garante que NENHUM append está entre o
+        // log e o `index_applied`; tomar o lock do índice ANTES de largar a
+        // barreira impede que um append novo se intrometa. Larga-se a barreira
+        // logo a seguir para não bloquear a escrita durante o `save` inteiro:
+        // um append que entre a partir daí fica à espera do lock do índice, e o
+        // LSN dele é maior que o watermark gravado — o replay da cauda cobre-o.
+        let voo = self.index_gate.write().unwrap();
+        let idx = self.attr.read().unwrap();
+        drop(voo);
+        idx.save(&self.attr_dir)
     }
 
     /// Fast boot: persiste o snapshot de TODAS as views (vector/text/graph/
@@ -645,7 +764,38 @@ impl Engine {
     /// no shutdown gracioso e disponível para checkpoints periódicos — o
     /// arranque seguinte restaura e replaya só a cauda `(watermark, head]`.
     pub fn checkpoint_views(&self) -> Result<(), HeraclitusError> {
-        self.views.lock().unwrap().checkpoint()?;
+        {
+            // Auditoria 2026-09-05, A07 — barreira de consistência: esperar
+            // pelo lado exclusivo do `index_gate` garante que nenhum append
+            // está entre o log e o `index_applied`. Ordem única de locks em
+            // todo o Engine (index_gate → views → attr) e o lock das views é
+            // LARGADO antes do `checkpoint_attr`: quem segura views nunca pode
+            // ficar à espera do `index_gate`, senão cruzava-se com um append
+            // (que segura o gate e quer views).
+            //
+            // Auditoria 2026-09-05, A46/A50 — numa sessão que saltou o replay,
+            // gravar é PIOR do que não gravar: as views estão vazias e o
+            // watermark interno de cada uma volta à cauda do log à PRIMEIRA
+            // escrita ao vivo (`View::apply` faz `watermark = max(watermark,
+            // lsn)`), portanto o snapshot sairia quase vazio mas carimbado com
+            // um LSN alto — e é o watermark do snapshot que o `catch_up` toma
+            // como autoridade no arranque seguinte. Quem RECUSA é o próprio
+            // `ViewRegistry::checkpoint` (no-op com warn enquanto a marca
+            // estiver de pé): a guarda vive com quem é dono dos snapshots, para
+            // valer também em quem chama o registry sem passar por aqui — é o
+            // caso do `Engine::shred`. Não gravar preserva o checkpoint
+            // anterior, que descreve fielmente um estado mais antigo: o boot
+            // seguinte replaya mais log e acerta.
+            let voo = self.index_gate.write().unwrap();
+            let mut views = self.views.lock().unwrap();
+            drop(voo);
+            views.checkpoint()?;
+        }
+        // O índice de atributos tem a sua PRÓPRIA marca e a sua própria guarda
+        // (A47), e esta chamada não pode ser saltada só porque as views
+        // estavam por materializar: `view rebuild` materializa as views e não
+        // toca no attr, portanto há um estado legítimo em que só uma das duas
+        // já pode ser gravada.
         self.checkpoint_attr()
     }
 
@@ -1868,6 +2018,16 @@ impl Engine {
         }
         rebuilt.save(&self.attr_dir)?;
         *self.attr.write().unwrap() = rebuilt;
+        // Este é o único caminho que reconstrói AMBOS os lados do estado
+        // derivado a partir do LSN 0 (views logo acima, índice de atributos
+        // aqui): depois dele nada está incompleto e os checkpoints voltam a ser
+        // persistíveis (auditoria 2026-09-05, A46/A47). A marca das views já
+        // caiu no `rebuild(&log, None)` acima — tinha de cair ANTES do
+        // `views.checkpoint()`, senão os snapshots PRÉ-shred (com o plaintext
+        // da titular) ficavam em disco e o `remove_file(marker)` no fim
+        // apagava a única pista de que era preciso reconstruir (A50).
+        self.attr_nao_materializado
+            .store(false, std::sync::atomic::Ordering::Relaxed);
 
         let subject_hash = blake3::hash(agent_id.as_bytes()).to_hex().to_string();
         let mut receipt = Episode::new(
@@ -2056,6 +2216,19 @@ impl Engine {
         &self.idempotency_locks[indice]
     }
 
+    /// O shard que serializa os comandos deste caso. Mesma ideia (e mesma
+    /// contenção residual) do `idempotency_shard`, mas em `case_locks` e não
+    /// nos mesmos shards: são dois invariantes distintos, e partilhá-los só
+    /// acrescentaria espera entre caminhos que nunca interagem
+    /// (auditoria 2026-09-05, A02).
+    fn case_shard(&self, case_id: &str) -> &Mutex<()> {
+        let digest = blake3::hash(case_id.as_bytes());
+        let indice = u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap_or_default())
+            as usize
+            % self.case_locks.len();
+        &self.case_locks[indice]
+    }
+
     fn append_idempotent_validated(
         &self,
         mut episode: Episode,
@@ -2171,6 +2344,12 @@ impl Engine {
         // real: as views vivas divergiam das reconstruídas do LSN 0 — quebra do
         // invariante I6 (a `activation` usa `ts_hlc >> 16` como instante de acesso,
         // logo ao vivo registava tudo no instante 0).
+        // O append fica marcado como EM VOO desde antes de receber o LSN até
+        // depois de indexado: é a janela em que o log já sabe do episódio e as
+        // views ainda não. Um checkpoint que caísse aqui persistia um watermark
+        // à frente de um LSN por aplicar (auditoria 2026-09-05, A07). Read
+        // lock: dois appends nunca esperam um pelo outro.
+        let _voo = self.begin_indexing();
         let (lsn, stamped) = self.log.append_stamped(episode)?;
         self.index_applied(lsn, &stamped);
         Ok(lsn)
@@ -2194,12 +2373,55 @@ impl Engine {
             .map(|(lsn, _, _)| lsn)
     }
 
+    /// Fronteira de append para o motor regulatório — a irmã de
+    /// `append_sentinel_derived`. Auditoria 2026-09-05 (`grpc.rs:521`): as
+    /// operações admin de compliance escreviam directo em `self.log`, e o
+    /// episódio não passava por `index_applied` — invisível às views e ao
+    /// índice de atributos até ao próximo arranque. Por aqui segue o caminho
+    /// unificado (e, com replicação activa, o consenso).
+    pub(crate) fn append_compliance_derived(
+        &self,
+        episode: Episode,
+    ) -> Result<Lsn, HeraclitusError> {
+        if !is_compliance_reserved(&episode) {
+            return Err(HeraclitusError::Query(
+                "append_compliance_derived exige episódio do domínio regulatório".into(),
+            ));
+        }
+        self.append_internal(episode)
+    }
+
+    /// Hidratação capada para os caminhos que ainda pedem episódios ao
+    /// índice (`attr_lookup`/`attr_range_lookup`). O planner do GQL já não
+    /// passa por aqui: pede os LSNs e hidrata um a um até ao LIMIT.
+    fn hidratar(&self, lsns: Vec<Lsn>) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
+        let mut out: Vec<(Lsn, Episode)> =
+            Vec::with_capacity(lsns.len().min(heraclitus_query::backend::QUERY_SCAN_CAP));
+        for l in lsns {
+            if let Some(hit) = self.log.read(l)? {
+                out.push(hit);
+            }
+            if out.len() >= heraclitus_query::backend::QUERY_SCAN_CAP {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     pub fn snapshot(&self) -> Lsn {
         self.log.head()
     }
 
     pub fn rebuild(&self, view: Option<&str>) -> Result<(), HeraclitusError> {
-        self.views.lock().unwrap().rebuild(&self.log, view)
+        // `view rebuild` SEM nome reconstrói todas as views do LSN 0: é a
+        // saída documentada de um arranque com o replay saltado, e é aí que as
+        // views deixam de estar incompletas e voltam a poder ser persistidas
+        // (auditoria 2026-09-05, A46/A50). Quem baixa a marca é o próprio
+        // `ViewRegistry::rebuild` — um rebuild de UMA view só não a baixa,
+        // porque as outras continuam vazias. O índice de atributos NÃO é tocado
+        // por este caminho, por isso a bandeira dele fica como está (A47).
+        self.views.lock().unwrap().rebuild(&self.log, view)?;
+        Ok(())
     }
 
     pub fn stats(&self) -> serde_json::Value {
@@ -2489,7 +2711,24 @@ impl Engine {
     }
 
     /// Two-stage recall (§3.8) over the real indexes + memtable merge.
-    pub fn recall(&self, text: &str, k: usize) -> Result<serde_json::Value, HeraclitusError> {
+    ///
+    /// Devolve, por candidato e pela ordem final: `(id, lsn a publicar,
+    /// episódio hidratado, score)`. O `Episode` é `None` quando a leitura
+    /// falhou o filtro `e.id == cand.id` — o ramo de fallback, onde o `lsn`
+    /// devolvido é o `cand.lsn` cru.
+    ///
+    /// Existe para os dois consumidores partilharem UMA leitura por candidato:
+    /// o JSON de `/recall` e o `QueryBackend::recall` do GQL. Antes o segundo
+    /// chamava o primeiro, deitava fora o JSON (incluindo uma cópia do
+    /// `content` inteiro) e relia cada LSN do log — dois preads + CRC + decifra
+    /// a mais por linha, num caminho de latência interactiva (auditoria
+    /// 2026-09-05, A56).
+    #[allow(clippy::type_complexity)]
+    fn recall_hidratado(
+        &self,
+        text: &str,
+        k: usize,
+    ) -> Result<Vec<(heraclitus_core::EventId, Lsn, Option<Episode>, f32)>, HeraclitusError> {
         // Recência ACT-R: `now` TEM de estar na mesma unidade que os tempos de
         // acesso gravados pelo `ActivationStore` (`ts_hlc >> 16`, ms físicos) —
         // NÃO o LSN, senão todas as idades colapsavam a 1 e o decay de recência
@@ -2523,19 +2762,34 @@ impl Engine {
             .map(|h| (h.id, h.lsn, h.score))
             .collect();
 
-        // Memtable hits join the text channel (freshest truth first).
-        let mut text_channel = mem_hits;
-        text_channel.extend(txt_hits);
-
         let reranker = LinearReranker {
             head_lsn: self.log.head(),
             ..Default::default()
         };
+        // Auditoria 2026-09-05, A10: a memtable entra como CANAL PRÓPRIO, não
+        // como cauda do canal BM25.
+        //
+        // Antes concatenavam-se as duas listas (`mem_hits` seguido de
+        // `txt_hits`) e entregava-se o resultado ao RRF como se fosse UM
+        // ranking. Mas o RRF lê a POSIÇÃO como relevância dentro da lista: os
+        // 200 hits da memtable ocupavam os ranks 0..199 e o TOPO do BM25
+        // começava no rank 200 — pior do que o último hit da memtable. Com mais
+        // de `RECALL_N` correspondências, o melhor documento do corpus por BM25
+        // ficava em 201.º e era eliminado pelo `.take(RECALL_N)` ANTES de o
+        // reranker o ver; quem decidia o corte era a contagem crua de
+        // substrings da memtable (que nem fronteiras de token respeita).
+        //
+        // Como canais separados, o topo de cada um fica no topo, e um id
+        // presente nos dois soma duas contribuições legítimas — o acordo entre
+        // canais que o RRF existe para premiar. Os sinais do reranker não
+        // mudam: o `retrieve` reconstrói `txt_by` na mesma ordem de precedência
+        // (memtable primeiro, BM25 a sobrepor-se).
         let ranked = retrieve(
             text,
             RecallInputs {
                 vector: Vec::new(), // no query embedding for raw text (no LLM in the engine)
-                text: text_channel,
+                text: txt_hits,
+                memtable_text: mem_hits,
                 activation: act_hits,
             },
             &reranker,
@@ -2543,7 +2797,7 @@ impl Engine {
         );
 
         // Hydrate rows from the log.
-        let mut rows = Vec::new();
+        let mut hidratados = Vec::with_capacity(ranked.len());
         for (cand, score) in ranked {
             // Candidato vindo SÓ do canal de ativação chega com lsn=0 (o canal
             // não transporta LSN) — a leitura em 0 falhava o filtro de id e a
@@ -2558,19 +2812,39 @@ impl Engine {
             } else {
                 cand.lsn
             };
-            if let Some((lsn, ep)) = self.log.read(lsn)?.filter(|(_, e)| e.id == cand.id) {
-                rows.push(serde_json::json!({
+            match self.log.read(lsn)?.filter(|(_, e)| e.id == cand.id) {
+                Some((lsn, ep)) => hidratados.push((cand.id, lsn, Some(ep), score)),
+                // Ramo de fallback: publica-se `cand.lsn` (NÃO o resolvido) —
+                // é o que a resposta pública sempre disse, e mudá-lo alteraria
+                // o JSON de /recall e do gRPC.
+                None => hidratados.push((cand.id, cand.lsn, None, score)),
+            }
+        }
+        Ok(hidratados)
+    }
+
+    /// `/recall` (REST e gRPC): a projecção JSON de `recall_hidratado`.
+    ///
+    /// A hidratação vive lá em cima porque o caminho do GQL precisa dos
+    /// `Episode` e não do JSON — antes chamava esta função, deitava fora tudo
+    /// menos `lsn`/`score` e RELIA cada candidato do log (auditoria
+    /// 2026-09-05, A56). Aqui não muda nada: mesmos bytes de saída.
+    pub fn recall(&self, text: &str, k: usize) -> Result<serde_json::Value, HeraclitusError> {
+        let rows: Vec<serde_json::Value> = self
+            .recall_hidratado(text, k)?
+            .into_iter()
+            .map(|(id, lsn, episodio, score)| match episodio {
+                Some(ep) => serde_json::json!({
                     "lsn": lsn,
                     "id": ep.id.to_string(),
                     "content": crate::rest::bytes_str(&ep.content),
                     "score": score,
-                }));
-            } else {
-                rows.push(serde_json::json!({
-                    "id": cand.id.to_string(), "lsn": cand.lsn, "score": score
-                }));
-            }
-        }
+                }),
+                None => serde_json::json!({
+                    "id": id.to_string(), "lsn": lsn, "score": score
+                }),
+            })
+            .collect();
         Ok(serde_json::Value::Array(rows))
     }
 }
@@ -2632,26 +2906,56 @@ impl QueryBackend for Engine {
         value: &str,
         as_of: Option<Lsn>,
     ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
-        // O índice dá os LSNs exatos; cada `log.read` é O(1) via o índice de
-        // offset por-LSN do log (seek directo). Hidratação = nº de matches × O(1).
+        let Some(lsns) = self.attr_lookup_lsns(field, value, as_of)? else {
+            return Ok(None);
+        };
+        self.hidratar(lsns).map(Some)
+    }
+
+    fn attr_lookup_lsns(
+        &self,
+        field: &str,
+        value: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
+        // `None` = "o índice não pode responder a isto; varre o log". Um
+        // valor que o índice nunca indexou (SKIP_VALUES como `sim`/`true`/`0`,
+        // ou texto acima de MAX_VALUE_LEN) daria aqui um resultado VAZIO
+        // indistinguível de "não há matches" — e o planner tomava esse vazio
+        // como resposta final, devolvendo zero linhas sobre dados existentes.
+        // Recuar para o varrimento é a resposta certa; o pós-filtro do planner
+        // faz o resto.
+        if !heraclitus_index_attr::valor_indexavel(value) {
+            return Ok(None);
+        }
+        // Só os LSNs: a hidratação fica no planner, que a pára ao encher o
+        // LIMIT (auditoria 2026-09-05 — antes lia-se TODO o posting, até
+        // QUERY_SCAN_CAP episódios, para devolver 10).
         let mut lsns: Vec<Lsn> = {
             let idx = self.attr.read().unwrap();
+            // A mesma regra pelo lado do CAMPO (auditoria 2026-09-05, A49):
+            // `apply` só indexa `_agent`, `_kind` e as chaves de `event.attrs`
+            // — nunca campos do ENVELOPE. Mas o pós-filtro do planner serve
+            // `ts_hlc` do envelope, portanto o hint chega aqui e o `lookup`
+            // devolvia vazio por o dicionário nunca ter visto o campo. Um
+            // "não conheço" a fazer-se passar por "não há" faz a query
+            // responder ZERO linhas sobre dados que estão no log. É a guarda
+            // que o LogBackend de referência já tinha.
+            if !idx.conhece_campo(field) {
+                return Ok(None);
+            }
             idx.lookup(field, value).to_vec()
         };
         if let Some(bound) = as_of {
             lsns.retain(|l| *l < bound);
         }
         lsns.sort_unstable();
-        let mut out: Vec<(Lsn, Episode)> = Vec::with_capacity(lsns.len());
-        for l in lsns {
-            if let Some(hit) = self.log.read(l)? {
-                out.push(hit);
-            }
-            if out.len() >= heraclitus_query::backend::QUERY_SCAN_CAP {
-                break;
-            }
-        }
-        Ok(Some(out))
+        Ok(Some(lsns))
+    }
+
+    fn read_lsn(&self, lsn: Lsn) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
+        // O(1) via o índice de offset por-LSN do log (seek directo).
+        self.log.read(lsn)
     }
 
     /// Range numérico (C1.6): resolvido pelo BTreeMap ordenado do índice de
@@ -2664,29 +2968,63 @@ impl QueryBackend for Engine {
         max: Option<(f64, bool)>,
         as_of: Option<Lsn>,
     ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
+        let Some(lsns) = self.attr_range_lookup_lsns(field, min, max, as_of)? else {
+            return Ok(None);
+        };
+        self.hidratar(lsns).map(Some)
+    }
+
+    fn attr_range_lookup_lsns(
+        &self,
+        field: &str,
+        min: Option<(f64, bool)>,
+        max: Option<(f64, bool)>,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
         use std::ops::Bound;
         let to_bound = |b: Option<(f64, bool)>| match b {
             None => Bound::Unbounded,
             Some((v, true)) => Bound::Included(v),
             Some((v, false)) => Bound::Excluded(v),
         };
+        // Os valores numéricos em SKIP_VALUES (`0`, `-1`) NUNCA entram no índice
+        // ordenado. Um intervalo que os abranja perderia esses episódios em
+        // silêncio — a mesma falha do `attr_lookup`, pelo lado do range. Se o
+        // intervalo pedido puder conter um valor ignorado, o índice não pode
+        // responder: recua-se para o varrimento.
+        let inclui = |x: f64| {
+            let acima = match min {
+                None => true,
+                Some((v, true)) => x >= v,
+                Some((v, false)) => x > v,
+            };
+            let abaixo = match max {
+                None => true,
+                Some((v, true)) => x <= v,
+                Some((v, false)) => x < v,
+            };
+            acima && abaixo
+        };
+        if [0.0f64, -1.0].iter().any(|x| inclui(*x)) {
+            return Ok(None);
+        }
         let mut lsns: Vec<Lsn> = {
             let idx = self.attr.read().unwrap();
+            // Auditoria 2026-09-05, A48 — a irmã da guarda do `attr_lookup`,
+            // pelo lado do intervalo. `lookup_range` também devolve vazio
+            // quando o dicionário não conhece o campo, e um `ts_hlc > x` (que
+            // nem cai no guard dos SKIP_VALUES `0`/`-1`) saía daqui como
+            // `Some(vazio)` autoritativo: zero linhas para o predicado mais
+            // natural que existe num banco de eventos, uma janela temporal.
+            if !idx.conhece_campo(field) {
+                return Ok(None);
+            }
             idx.lookup_range(field, to_bound(min), to_bound(max))
         };
         if let Some(bound) = as_of {
             lsns.retain(|l| *l < bound);
         }
-        let mut out: Vec<(Lsn, Episode)> = Vec::with_capacity(lsns.len());
-        for l in lsns {
-            if let Some(hit) = self.log.read(l)? {
-                out.push(hit);
-            }
-            if out.len() >= heraclitus_query::backend::QUERY_SCAN_CAP {
-                break;
-            }
-        }
-        Ok(Some(out))
+        Ok(Some(lsns))
     }
 
     fn head(&self) -> Result<Lsn, HeraclitusError> {
@@ -2705,18 +3043,29 @@ impl QueryBackend for Engine {
         // are head-versioned in v0; a versioned-index time travel is the
         // planned upgrade). Over-fetch to compensate for filtered rows.
         let fetch = if as_of.is_some() { k * 4 } else { k };
-        let v = Engine::recall(self, text, fetch)?;
-        let empty = Vec::new();
+        // Auditoria 2026-09-05, A56: usa-se o `Episode` que a hidratação já
+        // trouxe, em vez de reler o mesmo LSN do log. Nada mais muda — mesmo
+        // ranking, mesmos scores, mesma resolução de `lsn == 0` pelo índice de
+        // grafo, mesmo filtro de id, mesmo `fetch = k*4` com AS OF, mesmo
+        // pós-filtro e mesmo `truncate(k)`.
         let mut out = Vec::new();
-        for row in v.as_array().unwrap_or(&empty) {
-            let lsn = row["lsn"].as_u64().unwrap_or(0);
+        for (_id, lsn, episodio, score) in self.recall_hidratado(text, fetch)? {
             if let Some(bound) = as_of {
                 if lsn >= bound {
                     continue;
                 }
             }
-            if let Some((l, e)) = self.log.read(lsn)? {
-                out.push((l, e, row["score"].as_f64().unwrap_or(0.0) as f32));
+            match episodio {
+                Some(ep) => out.push((lsn, ep, score)),
+                // Ramo de fallback preservado tal e qual, incluindo a leitura
+                // SEM filtro de id: aqui o `lsn` é o `cand.lsn` cru, que pode
+                // ser 0 e devolver outro episódio. É o comportamento de hoje;
+                // mudá-lo seria outra correcção, com outro achado.
+                None => {
+                    if let Some((l, e)) = self.log.read(lsn)? {
+                        out.push((l, e, score));
+                    }
+                }
             }
         }
         out.truncate(k);
@@ -2940,11 +3289,101 @@ impl heraclitus_sentinel::DerivedEventSink for Engine {
     }
 }
 
+impl heraclitus_compliance::ComplianceSink for Engine {
+    fn append_compliance(&self, episode: Episode) -> Result<Lsn, HeraclitusError> {
+        self.append_compliance_derived(episode)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use heraclitus_core::FsyncPolicy;
     use heraclitus_query::backend::{replay_graph, LogBackend};
+
+    /// Auditoria 2026-09-05 (`grpc.rs:521`, CONFIRMADO): as escritas do RPC
+    /// admin de compliance iam directas ao log, sem `index_applied`. Um
+    /// `LegalHold` acabado de colocar não existia para o índice `_kind` até ao
+    /// próximo arranque — e o planner tomava o `Some(vazio)` do índice como
+    /// resposta final: zero linhas sobre um episódio que ESTÁ no log.
+    #[test]
+    fn escrita_de_compliance_via_rpc_fica_visivel_ao_indice_sem_reiniciar() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            storage_format: heraclitus_core::StorageFormat::V6,
+            ..Default::default()
+        };
+        let engine = Arc::new(Engine::open(&cfg).unwrap());
+        let (ok, msg) = crate::grpc::legal_hold_op(
+            &engine,
+            "legal-hold-place",
+            r#"{"hold_id":"h1","lsn_start":0,"lsn_end":10,
+                "authority":"tribunal","reason":"prova"}"#,
+        );
+        assert!(ok, "{msg}");
+        assert_eq!(engine.head(), 1, "o hold está no log");
+
+        // O caminho do índice de atributos (`n.kind` → `_kind`), SEM reiniciar.
+        let v = heraclitus_query::execute(
+            "MATCH (n) WHERE n.kind = \"LegalHold\" RETURN n",
+            engine.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(
+            v.as_array().map(|a| a.len()),
+            Some(1),
+            "o índice `_kind` tem de ver o hold sem reiniciar: {v}"
+        );
+        // E por rótulo.
+        let v = heraclitus_query::execute("MATCH (n:LegalHold) RETURN n", engine.as_ref()).unwrap();
+        assert_eq!(v.as_array().map(|a| a.len()), Some(1), "{v}");
+    }
+
+    /// Auditoria 2026-09-05 (LIMIT não empurrado): o índice devolve LSNs sem
+    /// hidratar e a leitura pontual é O(1); `attr_lookup` continua a ser
+    /// exactamente a hidratação desses LSNs.
+    #[test]
+    fn attr_lookup_lsns_e_read_lsn_batem_com_attr_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            storage_format: heraclitus_core::StorageFormat::V6,
+            ..Default::default()
+        };
+        let engine = Engine::open(&cfg).unwrap();
+        for cor in ["azul", "azul", "verde", "azul"] {
+            let mut e = Episode::new("a", EventKind::Observation, cor.as_bytes().to_vec());
+            e.attrs.insert("cor".into(), cor.into());
+            engine.append(e).unwrap();
+        }
+        let lsns = engine
+            .attr_lookup_lsns("cor", "azul", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lsns, vec![0, 1, 3]);
+        let hidratados = engine.attr_lookup("cor", "azul", None).unwrap().unwrap();
+        assert_eq!(
+            hidratados.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+            lsns,
+            "attr_lookup é a hidratação de attr_lookup_lsns"
+        );
+        // AS OF corta pelo LSN, e a leitura pontual devolve o episódio certo.
+        assert_eq!(
+            engine
+                .attr_lookup_lsns("cor", "azul", Some(2))
+                .unwrap()
+                .unwrap(),
+            vec![0, 1]
+        );
+        let (l, e) = engine.read_lsn(3).unwrap().unwrap();
+        assert_eq!((l, e.content.as_slice()), (3, b"azul".as_slice()));
+        assert!(engine.read_lsn(99).unwrap().is_none());
+        // Valor que o índice nunca indexa (SKIP_VALUES): o índice não responde.
+        assert!(engine.attr_lookup_lsns("cor", "0", None).unwrap().is_none());
+    }
 
     /// Appends a provenance chain a←b←c plus a distilled fact f from {a,b}
     /// through the engine (which maintains the tgraph view incrementally).
@@ -3756,6 +4195,38 @@ mod tests {
         assert_eq!(live.edges.len(), 2);
     }
 
+    /// GATE DIFERENCIAL sobre campos do ENVELOPE (auditoria 2026-09-05,
+    /// A48/A49). `ts_hlc` e servido do envelope pelo pos-filtro mas nunca entra
+    /// no indice de atributos; o Engine respondia `Some(vazio)` e a query dava
+    /// zero linhas, enquanto o backend de referencia (replay do log) devolvia
+    /// tudo. Os dois backends TEM de concordar sobre os MESMOS dados — e a
+    /// unica forma de apanhar esta classe de divergencia sem a inventar linha a
+    /// linha.
+    #[test]
+    fn ts_hlc_via_gql_bate_com_a_referencia() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path());
+        for i in 0..3 {
+            let mut e = Episode::new("ag", EventKind::Observation, format!("ep {i}").into_bytes());
+            e.attrs.insert("valor".into(), (i * 10 + 7).to_string());
+            engine.append(e).unwrap();
+        }
+        let ts = engine.log.read(0).unwrap().unwrap().1.ts_hlc;
+        let be = LogBackend::new(engine.log.clone());
+
+        for q in [
+            "MATCH (n) WHERE n.ts_hlc > 1 RETURN n".to_string(),
+            format!("MATCH (n) WHERE n.ts_hlc = \"{ts}\" RETURN n"),
+            // Controlo: um atributo a serio, que o indice conhece — nao pode
+            // regredir por causa da guarda nova.
+            "MATCH (n) WHERE n.valor > 5 RETURN n".to_string(),
+        ] {
+            let via_engine = heraclitus_query::execute(&q, &engine).unwrap();
+            let via_log = heraclitus_query::execute(&q, &be).unwrap();
+            assert_eq!(via_engine, via_log, "engine diverge da referencia em `{q}`");
+        }
+    }
+
     #[test]
     fn m10_fuse_runs_on_the_real_engine() {
         // FUSE is a default QueryBackend method, so the engine inherits it and
@@ -4243,6 +4714,460 @@ mod tests {
                 .count(),
             0,
             "sobrou um segmento no intervalo do hold sem proteccao no HRKM"
+        );
+    }
+
+    /// Uma procura por um valor que o indice de atributos NUNCA guarda —
+    /// SKIP_VALUES como `sim`, ou texto acima de MAX_VALUE_LEN — devolvia ZERO
+    /// linhas sobre dados existentes: o `attr_lookup` do Engine dava `Some(vazio)`
+    /// e o planner tomava-o como resposta final em vez de varrer.
+    ///
+    /// Isto e do CAMINHO POR OMISSAO (no unico), nao so do cluster.
+    #[test]
+    fn procura_por_valor_nao_indexavel_nao_devolve_vazio() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            ..Default::default()
+        };
+        let engine = Engine::open(&cfg).unwrap();
+
+        // `sim` esta em SKIP_VALUES — nunca e indexado.
+        let mut e = Episode::new("ana", EventKind::Observation, b"registo".to_vec());
+        e.attrs.insert("ativo".into(), "sim".into());
+        engine.append(e).unwrap();
+        // Um valor longo (> 80 bytes) tambem nao e indexado.
+        let mut longo = Episode::new("ana", EventKind::Observation, b"outro".to_vec());
+        let texto = "x".repeat(120);
+        longo.attrs.insert("descricao".into(), texto.clone());
+        engine.append(longo).unwrap();
+
+        let r = heraclitus_query::execute("MATCH (n) WHERE n.ativo = \"sim\" RETURN n", &engine)
+            .unwrap();
+        assert_eq!(
+            r.as_array().unwrap().len(),
+            1,
+            "o episodio com ativo=sim tem de aparecer: {r:?}"
+        );
+
+        let r2 = heraclitus_query::execute(
+            &format!("MATCH (n) WHERE n.descricao = \"{texto}\" RETURN n"),
+            &engine,
+        )
+        .unwrap();
+        assert_eq!(
+            r2.as_array().unwrap().len(),
+            1,
+            "valor longo tambem tem de aparecer"
+        );
+
+        // E um valor indexavel legitimo continua a funcionar (o indice nao ficou
+        // desligado por engano).
+        let mut c = Episode::new("ana", EventKind::Observation, b"c".to_vec());
+        c.attrs.insert("cpf".into(), "12345678900".into());
+        engine.append(c).unwrap();
+        let r3 =
+            heraclitus_query::execute("MATCH (n) WHERE n.cpf = \"12345678900\" RETURN n", &engine)
+                .unwrap();
+        assert_eq!(r3.as_array().unwrap().len(), 1);
+    }
+
+    /// O mesmo pelo lado do indice ORDENADO: um intervalo que abrange um valor
+    /// numerico ignorado (`0`, `-1`) tem de varrer, senao perde esses episodios.
+    #[test]
+    fn range_que_abrange_valor_ignorado_nao_perde_linhas() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            ..Default::default()
+        };
+        let engine = Engine::open(&cfg).unwrap();
+
+        // saldo = 0 esta em SKIP_VALUES; nunca entra no indice ordenado.
+        let mut zero = Episode::new("ana", EventKind::Observation, b"z".to_vec());
+        zero.attrs.insert("saldo".into(), "0".into());
+        engine.append(zero).unwrap();
+        let mut cinco = Episode::new("ana", EventKind::Observation, b"c".to_vec());
+        cinco.attrs.insert("saldo".into(), "5".into());
+        engine.append(cinco).unwrap();
+
+        // O intervalo [-10, 10] abrange o 0 ignorado: tem de os apanhar aos dois.
+        let r = heraclitus_query::execute(
+            "MATCH (n) WHERE n.saldo > -10 AND n.saldo < 10 RETURN n",
+            &engine,
+        )
+        .unwrap();
+        assert_eq!(
+            r.as_array().unwrap().len(),
+            2,
+            "o intervalo abrange 0 (ignorado) e 5: {r:?}"
+        );
+    }
+
+    /// A MESMA classe de falha, pelo lado do CAMPO e nao do valor (auditoria
+    /// 2026-09-05, A48/A49). `AttrIndex::apply` so indexa `_agent`, `_kind` e
+    /// as chaves de `event.attrs` — nunca campos do ENVELOPE. Mas o pos-filtro
+    /// do planner serve `ts_hlc` do envelope, logo o hint gera-se e o Engine
+    /// respondia `Some(vazio)` (por `lookup`/`lookup_range` de um campo que o
+    /// dicionario nunca viu). O planner toma esse vazio como autoritativo e a
+    /// query devolve ZERO linhas sobre dados que estao no log — enquanto o
+    /// mesmo GQL sobre o backend de referencia devolve as linhas todas.
+    #[test]
+    fn procura_por_campo_do_envelope_nao_devolve_vazio() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            ..Default::default()
+        };
+        let engine = Engine::open(&cfg).unwrap();
+
+        let mut e = Episode::new("ana", EventKind::Observation, b"registo".to_vec());
+        e.attrs.insert("cpf".into(), "12345678900".into());
+        engine.append(e).unwrap();
+        let ts = engine.log.read(0).unwrap().unwrap().1.ts_hlc;
+        assert!(ts > 1, "premissa: o HLC de um episodio real e > 1");
+
+        // Igualdade sobre um campo do envelope (A49).
+        let r = heraclitus_query::execute(
+            &format!("MATCH (n) WHERE n.ts_hlc = \"{ts}\" RETURN n"),
+            &engine,
+        )
+        .unwrap();
+        assert_eq!(
+            r.as_array().unwrap().len(),
+            1,
+            "o episodio tem esse ts_hlc e tem de aparecer: {r:?}"
+        );
+
+        // Intervalo sobre o mesmo campo (A48) — fora do guard dos SKIP_VALUES
+        // (`0`/`-1`), portanto ia mesmo ao indice ordenado.
+        let r2 =
+            heraclitus_query::execute("MATCH (n) WHERE n.ts_hlc > 1 RETURN n", &engine).unwrap();
+        assert_eq!(
+            r2.as_array().unwrap().len(),
+            1,
+            "todo o episodio tem ts_hlc > 1: {r2:?}"
+        );
+
+        // NAO-REGRESSAO: o indice nao ficou desligado para os campos que ele
+        // conhece de verdade, e um valor genuinamente inexistente continua a
+        // dar zero.
+        let r3 =
+            heraclitus_query::execute("MATCH (n) WHERE n.cpf = \"12345678900\" RETURN n", &engine)
+                .unwrap();
+        assert_eq!(r3.as_array().unwrap().len(), 1, "{r3:?}");
+        let r4 =
+            heraclitus_query::execute("MATCH (n) WHERE n.cpf = \"00000000000\" RETURN n", &engine)
+                .unwrap();
+        assert_eq!(r4.as_array().unwrap().len(), 0, "{r4:?}");
+    }
+
+    /// PERDA SILENCIOSA POR CHECKPOINT NA JANELA ERRADA (auditoria 2026-09-05,
+    /// A07).
+    ///
+    /// O LSN e atribuido dentro da seccao critica do worker do log, mas a
+    /// indexacao corre FORA dela: com escrita concorrente, o LSN 1 pode ser
+    /// aplicado (watermark -> 1) antes do 0. Um checkpoint que caia nessa
+    /// janela grava um snapshot que declara watermark 1 mas nao contem o 0; no
+    /// arranque seguinte o `catch_up` replaya so `(1, head]` e o episodio 0
+    /// nunca mais entra nas views nem no indice de atributos — some do NEAREST,
+    /// RECALL, MATCH e do `WHERE n.campo = "x"`, sem erro nem aviso, ate um
+    /// rebuild manual.
+    ///
+    /// O teste materializa a janela em vez de a caçar por escalonamento:
+    /// `begin_indexing` (o MESMO guard que o `append_internal` usa, nao uma
+    /// costura de teste) mantem o episodio A em voo enquanto o B e indexado e
+    /// o checkpoint corre noutra thread.
+    #[test]
+    fn checkpoint_nao_persiste_watermark_a_frente_de_um_append_em_voo() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(engine_in(dir.path()));
+
+        let mut a = Episode::new("ag", EventKind::Observation, b"alfa rio".to_vec());
+        a.attrs.insert("dossie".into(), "alfa".into());
+        let mut b = Episode::new("ag", EventKind::Observation, b"beta rio".to_vec());
+        b.attrs.insert("dossie".into(), "beta".into());
+
+        let voo = engine.begin_indexing();
+        // A leva o LSN MENOR e fica por indexar; B leva o maior e e indexado
+        // primeiro — a ordem que faz o watermark ultrapassar um buraco.
+        let (lsn_a, a_carimbado) = engine.log.append_stamped(a).unwrap();
+        let (lsn_b, b_carimbado) = engine.log.append_stamped(b).unwrap();
+        engine.index_applied(lsn_b, &b_carimbado);
+
+        let e2 = engine.clone();
+        let h = std::thread::spawn(move || e2.checkpoint_views().unwrap());
+        // Margem larga: com dados minusculos, sem a barreira o checkpoint
+        // termina muito antes disto.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        engine.index_applied(lsn_a, &a_carimbado);
+        drop(voo);
+        h.join().unwrap();
+        drop(engine);
+
+        // Arranque seguinte: o episodio A tem de estar no estado derivado.
+        let engine2 = engine_in(dir.path());
+        assert_eq!(
+            engine2.stats()["text_indexed"].as_u64(),
+            Some(2),
+            "o episodio em voo desapareceu das views"
+        );
+        let v = heraclitus_query::execute("MATCH (n) WHERE n.dossie = \"alfa\" RETURN n", &engine2)
+            .unwrap();
+        assert_eq!(
+            v.as_array().unwrap().len(),
+            1,
+            "o episodio em voo desapareceu do indice de atributos: {v}"
+        );
+    }
+
+    /// A MESMA barreira, pelo lado do `checkpoint_attr` chamado SOZINHO — que e
+    /// API publica e nao passa pelo `checkpoint_views` (auditoria 2026-09-05,
+    /// A07). Sem ela, o `AttrIndex::save` grava um watermark que ja ultrapassou
+    /// o LSN em voo e o arranque seguinte parte de `idx.watermark()`: o
+    /// episodio A nunca mais e indexado.
+    #[test]
+    fn checkpoint_do_indice_de_atributos_espera_pelo_append_em_voo() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(engine_in(dir.path()));
+
+        let mut a = Episode::new("ag", EventKind::Observation, b"alfa".to_vec());
+        a.attrs.insert("dossie".into(), "alfa".into());
+        let mut b = Episode::new("ag", EventKind::Observation, b"beta".to_vec());
+        b.attrs.insert("dossie".into(), "beta".into());
+
+        let voo = engine.begin_indexing();
+        let (lsn_a, a_carimbado) = engine.log.append_stamped(a).unwrap();
+        let (lsn_b, b_carimbado) = engine.log.append_stamped(b).unwrap();
+        engine.index_applied(lsn_b, &b_carimbado);
+
+        let e2 = engine.clone();
+        let h = std::thread::spawn(move || e2.checkpoint_attr().unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        engine.index_applied(lsn_a, &a_carimbado);
+        drop(voo);
+        h.join().unwrap();
+        drop(engine);
+
+        let engine2 = engine_in(dir.path());
+        let v = heraclitus_query::execute("MATCH (n) WHERE n.dossie = \"alfa\" RETURN n", &engine2)
+            .unwrap();
+        assert_eq!(
+            v.as_array().unwrap().len(),
+            1,
+            "o episodio em voo ficou fora do indice de atributos para sempre: {v}"
+        );
+    }
+
+    /// O MELHOR documento por BM25 desaparecia do `/recall` (auditoria
+    /// 2026-09-05, A10).
+    ///
+    /// O canal de texto era a CONCATENACAO de dois rankings independentes — a
+    /// memtable (contagem crua de ocorrencias) seguida do indice BM25 — numa
+    /// unica "lista" entregue ao RRF. Como o RRF le a POSICAO como relevancia
+    /// dentro da lista, os 200 hits da memtable ocupavam os ranks 0..199 e o
+    /// topo do canal BM25 comecava no rank 200: pior do que o ULTIMO hit da
+    /// memtable. Com mais de RECALL_N correspondencias, o melhor documento do
+    /// corpus por BM25 caia fora do corte `.take(RECALL_N)` ANTES de o
+    /// reranker o ver, e quem decidia o corte era a contagem crua de
+    /// substrings.
+    ///
+    /// Montagem: UM episodio curtissimo com o termo uma vez (topo do BM25 pela
+    /// normalizacao de comprimento, fundo da memtable que so conta
+    /// ocorrencias) e 250 episodios LONGOS com o termo tres vezes. O canal de
+    /// ativacao e neutralizado de proposito — um `touch` extra em cada
+    /// episodio de ruido poe o alvo em ultimo nesse canal — para o teste medir
+    /// SO o corte do canal de texto e nao a lotaria dos empates de recencia ao
+    /// milissegundo.
+    #[test]
+    fn o_melhor_do_canal_bm25_sobrevive_ao_corte_do_recall() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path());
+
+        // Curto e com UMA ocorrencia: o melhor BM25 do corpus, e o pior da
+        // memtable. Primeiro, para ser tambem o menos recente.
+        let alvo = Episode::new("ag", EventKind::Observation, b"fraude".to_vec());
+        let id_alvo = alvo.id.to_string();
+        engine.append(alvo).unwrap();
+
+        let enchimento = "processo administrativo interno arquivado ".repeat(40);
+        let mut ruido = Vec::new();
+        for i in 0..250 {
+            let corpo = format!("{enchimento} fraude fraude fraude caso {i}");
+            let e = Episode::new("ag", EventKind::Observation, corpo.into_bytes());
+            ruido.push(e.id);
+            engine.append(e).unwrap();
+        }
+
+        // Um acesso a mais em cada episodio de ruido: com dois acessos contra
+        // um, a massa de ativacao deles fica ESTRITAMENTE acima da do alvo, e o
+        // top-200 do canal de ativacao deixa o alvo de fora sem depender de
+        // desempates.
+        let recente = engine
+            .log
+            .read(engine.log.head() - 1)
+            .unwrap()
+            .unwrap()
+            .1
+            .ts_hlc
+            >> 16;
+        {
+            let act = engine.activation.read().unwrap();
+            for id in &ruido {
+                act.touch(*id, recente);
+            }
+        }
+
+        // k acima de RECALL_N: o que sai e exactamente o conjunto que
+        // sobreviveu ao corte da fusao, sem truncagem posterior.
+        let v = engine.recall("fraude", 250).unwrap();
+        let ids: Vec<String> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            ids.contains(&id_alvo),
+            "o documento com o melhor BM25 do corpus foi cortado antes do reranker \
+             ({} candidatos devolvidos)",
+            ids.len()
+        );
+    }
+
+    /// O RECALL do GQL lia CADA candidato duas vezes do log (auditoria
+    /// 2026-09-05, A56): `QueryBackend::recall` chamava `Engine::recall`, que
+    /// ja hidratava cada candidato e construia um JSON com o `content`
+    /// completo, deitava tudo fora excepto `lsn`/`score`, e voltava a ler o
+    /// mesmo LSN para reconstruir o `Episode` que tinha existido dez linhas
+    /// antes. Cada leitura sao dois preads posicionais + CRC-32C +
+    /// desserializacao + decifra.
+    ///
+    /// O teste mede as duas coisas que importam: que o RESULTADO nao mudou (as
+    /// linhas do GQL continuam a ser exactamente as de `Engine::recall`, que e
+    /// o oraculo) e que o numero de leituras caiu para uma por linha.
+    #[test]
+    fn recall_do_gql_nao_le_cada_candidato_duas_vezes_do_log() {
+        let dir = tempfile::tempdir().unwrap();
+        // Formato legado de proposito: e ai que vive o contador de leituras. O
+        // caminho do RECALL e o mesmo nos dois formatos (`self.log.read`),
+        // portanto medi-lo aqui prova-o para ambos.
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            storage_format: heraclitus_core::StorageFormat::Legacy,
+            ..Default::default()
+        };
+        let engine = Engine::open(&cfg).unwrap();
+        for i in 0..20 {
+            engine
+                .append(Episode::new(
+                    "ag",
+                    EventKind::Observation,
+                    format!("rio caudaloso numero {i}").into_bytes(),
+                ))
+                .unwrap();
+        }
+
+        // ORACULO: as linhas que o caminho JSON (REST/gRPC) devolve. O caminho
+        // do GQL tem de concordar com ele, linha a linha e pela mesma ordem.
+        let esperado = engine.recall("rio", 10).unwrap();
+        let esperado: Vec<(u64, String, String)> = esperado
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["lsn"].as_u64().unwrap_or(0),
+                    r["id"].as_str().unwrap_or_default().to_string(),
+                    // Comparar o score como texto: o que importa e ser o MESMO
+                    // numero, e um f32 formatado nao tem ambiguidade de igualdade.
+                    format!("{:?}", r["score"].as_f64().unwrap_or(0.0) as f32),
+                )
+            })
+            .collect();
+        assert!(
+            !esperado.is_empty(),
+            "montagem: o recall tem de devolver algo"
+        );
+
+        let ler_contador = || {
+            engine
+                .log
+                .leituras_efectuadas()
+                .expect("o log legado tem o contador de leituras")
+        };
+        let antes = ler_contador();
+        let linhas = QueryBackend::recall(&engine, "rio", 10, None).unwrap();
+        let gastas = ler_contador() - antes;
+
+        let obtido: Vec<(u64, String, String)> = linhas
+            .iter()
+            .map(|(l, e, s)| (*l, e.id.to_string(), format!("{s:?}")))
+            .collect();
+        assert_eq!(obtido, esperado, "o refactor mexeu no que o RECALL devolve");
+
+        // `+1` e a leitura do head que fixa o relogio da recencia (ACT-R).
+        assert!(
+            gastas >= linhas.len() as u64,
+            "o contador de leituras tem de contar: {gastas} para {} linhas",
+            linhas.len()
+        );
+        assert!(
+            gastas <= linhas.len() as u64 + 1,
+            "RECALL leu {gastas} vezes para {} linhas (era 2x + 1)",
+            linhas.len()
+        );
+    }
+
+    /// A guarda ao nivel do backend, sem passar pelo planner: um campo que o
+    /// indice nunca viu tem de dar `None` ("nao sei responder; varre"), nunca
+    /// `Some(vazio)` ("nao ha nada"), que e o que o LogBackend de referencia ja
+    /// fazia (auditoria 2026-09-05, A48/A49).
+    #[test]
+    fn indice_que_nao_conhece_o_campo_recua_para_o_varrimento() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            ..Default::default()
+        };
+        let engine = Engine::open(&cfg).unwrap();
+        let mut e = Episode::new("ana", EventKind::Observation, b"registo".to_vec());
+        e.attrs.insert("cor".into(), "azul".into());
+        engine.append(e).unwrap();
+
+        assert!(
+            matches!(
+                QueryBackend::attr_lookup(&engine, "campo_fora_do_indice", "x", None),
+                Ok(None)
+            ),
+            "campo desconhecido: o indice nao pode responder"
+        );
+        assert!(
+            matches!(
+                QueryBackend::attr_range_lookup(
+                    &engine,
+                    "campo_fora_do_indice",
+                    Some((1.0, false)),
+                    None,
+                    None
+                ),
+                Ok(None)
+            ),
+            "campo desconhecido, pelo lado do range"
+        );
+        // Campo CONHECIDO sem correspondencias continua a ser vazio
+        // autoritativo — nao se trocou uma mentira por um varrimento sempre.
+        assert!(
+            matches!(
+                QueryBackend::attr_lookup(&engine, "cor", "vermelho", None),
+                Ok(Some(ref v)) if v.is_empty()
+            ),
+            "campo conhecido sem matches: o vazio E a resposta certa"
         );
     }
 }
@@ -5016,6 +5941,19 @@ impl Engine {
             .validar()
             .map_err(|e| HeraclitusError::Config(e.to_string()))?;
 
+        // Auditoria 2026-09-05, A02 — a validação abaixo só vale se o par
+        // (ler revisão → apender) for ATÓMICO para este `case_id`. Sem o
+        // guard, dois comandos concorrentes liam a mesma revisão, ambos
+        // passavam a comparação `expected_revision != e.revision` e ambos
+        // entravam no log; a reconstrução aplicava o primeiro e rejeitava o
+        // segundo com `Err(Conflito)` a cada leitura, para sempre. Num log
+        // append-only não há forma de retirar o segundo: o caso ficava
+        // ilegível de forma irreparável. O guard vive até depois do `append`
+        // por isso mesmo. Só um lock (largado no fim da função), portanto sem
+        // aninhamento e sem risco de deadlock — o `append` daqui não é o
+        // idempotente, não toca em `idempotency_locks`.
+        let _guarda = self.case_shard(&envelope.case_id).lock().unwrap();
+
         let (estado, lsn_do_comando) = self.case_state_interno(&envelope.case_id, None)?;
 
         // Idempotência antes de tudo (§8.3): um cliente que repete por timeout
@@ -5281,6 +6219,100 @@ mod testes_case_spec0071 {
             CaseStatus::Open,
             "AS OF nao pode ver o fecho que veio depois"
         );
+    }
+
+    /// ENVENENAMENTO PERMANENTE (auditoria 2026-09-05, A02).
+    ///
+    /// `case_command` lia o estado e apendia sem seccao critica nenhuma. Dois
+    /// POST /cases concorrentes (cada pedido corre no seu `spawn_blocking`)
+    /// liam a MESMA revisao, ambos validavam OK e ambos entravam no log. A
+    /// partir dai `reconstruir` aplica o primeiro (revisao +1) e o segundo,
+    /// cuja `expected_revision` ja nao bate, devolve `Err(Conflito)` — PARA
+    /// SEMPRE, porque o log e append-only e nao ha como retirar o segundo. O
+    /// caso morre nos dois sentidos: o GET responde 500 e todo o comando
+    /// seguinte falha na leitura antes de chegar a apender.
+    ///
+    /// O teste nao mede latencia nem contagens: mede se o caso continua
+    /// LEGIVEL depois da corrida, que e o invariante que se perdia.
+    #[test]
+    fn dois_comandos_concorrentes_na_mesma_revisao_nao_envenenam_o_caso() {
+        let (_t, engine) = motor();
+
+        // Varias rondas com case_id distintos: a janela e estreita e uma so
+        // tentativa apanha-a de forma pouco fiavel.
+        for ronda in 0..25 {
+            let caso = format!("case-corrida-{ronda}");
+            engine
+                .case_command(&CaseEnvelope::novo(
+                    &caso,
+                    "abrir",
+                    0,
+                    "analista-a",
+                    "sinal do Sentinel",
+                    CaseEvent::CaseOpened {
+                        title: "Acessos falhados".into(),
+                        priority: CasePriority::High,
+                        opened_by: "analista-a".into(),
+                        sla: sla(),
+                    },
+                ))
+                .unwrap();
+
+            // Dois comandos DISTINTOS (command_id diferentes, logo a guarda de
+            // idempotencia nao os cobre) validados contra a MESMA revisao 1.
+            let a = CaseEnvelope::novo(
+                &caso,
+                "cmd-a",
+                1,
+                "analista-a",
+                "dono",
+                CaseEvent::CaseOwnerAssigned {
+                    owner: "analista-a".into(),
+                },
+            );
+            let b = CaseEnvelope::novo(
+                &caso,
+                "cmd-b",
+                1,
+                "analista-b",
+                "titulo",
+                CaseEvent::CaseTitleChanged {
+                    title: "Acessos falhados (revisto)".into(),
+                },
+            );
+
+            let porta = std::sync::Barrier::new(2);
+            let (r_a, r_b) = std::thread::scope(|s| {
+                let ta = s.spawn(|| {
+                    porta.wait();
+                    engine.case_command(&a)
+                });
+                let tb = s.spawn(|| {
+                    porta.wait();
+                    engine.case_command(&b)
+                });
+                (ta.join().unwrap(), tb.join().unwrap())
+            });
+
+            let aplicados = [&r_a, &r_b]
+                .iter()
+                .filter(|r| matches!(r, Ok((_, true))))
+                .count();
+            assert_eq!(
+                aplicados, 1,
+                "ronda {ronda}: exactamente UM comando pode aplicar sobre a revisao 1 \
+                 (r_a={r_a:?}, r_b={r_b:?})"
+            );
+
+            let estado = engine
+                .case_state(&caso, None)
+                .unwrap_or_else(|e| panic!("ronda {ronda}: o caso ficou ILEGIVEL para sempre: {e}"))
+                .unwrap();
+            assert_eq!(
+                estado.revision, 2,
+                "ronda {ronda}: uma abertura + um comando aplicado = revisao 2"
+            );
+        }
     }
 }
 

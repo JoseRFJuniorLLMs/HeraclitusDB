@@ -228,7 +228,14 @@ impl SnapshotStore {
         }
         let esperado: [u8; 32] = bytes[12..44].try_into().expect("32 bytes");
         let corpo_len = u64::from_le_bytes(bytes[44..52].try_into().expect("8 bytes")) as usize;
-        let Some(corpo) = bytes.get(HEADER_LEN..HEADER_LEN + corpo_len) else {
+        // `checked_add`: `corpo_len` vem do ficheiro. A soma transbordava antes
+        // do `get`, e com `overflow-checks` na release isso matava o ARRANQUE do
+        // Sentinel — um snapshot corrompido tem de ser descartado (o estado
+        // reconstroi-se do log), nunca fatal.
+        let Some(corpo) = HEADER_LEN
+            .checked_add(corpo_len)
+            .and_then(|fim| bytes.get(HEADER_LEN..fim))
+        else {
             return SnapshotLoad::Descartado(RebuildReason::Ilegivel(format!(
                 "corpo truncado: anunciados {corpo_len} bytes, existem {}",
                 bytes.len().saturating_sub(HEADER_LEN)

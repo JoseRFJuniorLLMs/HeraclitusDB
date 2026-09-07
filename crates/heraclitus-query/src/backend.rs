@@ -519,6 +519,46 @@ pub trait QueryBackend {
         value: &str,
         as_of: Option<Lsn>,
     ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError>;
+    /// Os LSNs dos postings de `field = value`, SEM hidratar. É o que permite
+    /// ao planner empurrar o LIMIT para a hidratação (auditoria 2026-09-05:
+    /// `MATCH ... WHERE n.kind = "X" LIMIT 10` lia do disco TODOS os episódios
+    /// do posting — até `QUERY_SCAN_CAP` — antes de cortar 10; sobre 9 M de
+    /// episódios, 9 GB de RAM). Mesma semântica do `attr_lookup`: `Ok(None)`
+    /// = "o índice não pode responder; varre". O default deriva de
+    /// `attr_lookup` — correcto, sem o ganho; os backends com índice real
+    /// sobrepõem-no.
+    fn attr_lookup_lsns(
+        &self,
+        field: &str,
+        value: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
+        Ok(self
+            .attr_lookup(field, value, as_of)?
+            .map(|hits| hits.into_iter().map(|(l, _)| l).collect()))
+    }
+    /// O mesmo para o range numérico (ver `attr_range_lookup`).
+    fn attr_range_lookup_lsns(
+        &self,
+        field: &str,
+        min: Option<(f64, bool)>,
+        max: Option<(f64, bool)>,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
+        Ok(self
+            .attr_range_lookup(field, min, max, as_of)?
+            .map(|hits| hits.into_iter().map(|(l, _)| l).collect()))
+    }
+    /// Hidrata UM LSN — a unidade em que o planner pára ao encher o LIMIT.
+    /// `None` se o LSN não existir (fora do log, ou apagado por shred). O
+    /// default varre uma janela de uma unidade; os backends com leitura
+    /// pontual O(1) sobrepõem-no.
+    fn read_lsn(&self, lsn: Lsn) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
+        Ok(self
+            .scan_range(lsn, lsn.saturating_add(1))?
+            .into_iter()
+            .find(|(l, _)| *l == lsn))
+    }
     /// Range NUMÉRICO sobre um atributo (`WHERE n.campo > x AND n.campo < y`)
     /// resolvido pelo índice ordenado em vez do scan. Bounds `(valor,
     /// inclusivo?)`. Default `Ok(None)` = backend sem a capacidade → o planner
@@ -674,19 +714,42 @@ pub trait QueryBackend {
         as_of: Option<Lsn>,
     ) -> Result<DecisionReport, HeraclitusError> {
         let bound = self.resolve_as_of_bound(as_of)?;
-        let mut g = TemporalGraph::new();
+
+        // Auditoria 2026-09-05 (A33): o grafo vem de `graph()` e NÃO de um
+        // replay de `scan_range`. Dentro de `SIMULATE ... THEN DECIDE`, `self`
+        // é o `VirtualBackend`, cujo `scan_range` delega no log REAL (só
+        // `graph()` devolve o overlay): o replay ignorava por completo a aresta
+        // contrafactual e a política era avaliada contra a realidade. O
+        // resultado vinha bem formado e idêntico à baseline — sem erro nem
+        // aviso — no único caminho cujo propósito é «o que dispararia se esta
+        // aresta existisse», e em desacordo com as funções irmãs (COMMUNITY,
+        // NEIGHBORS, METRICS, HYPOTHESES) que já liam o overlay. É a mesma
+        // razão pela qual o SIMULATE usa `be.graph()` em vez de um replay
+        // (plan.rs) — `graph()` é obrigatório no trait, logo qualquer backend
+        // que sirva um grafo fica correcto por construção.
+        //
+        // Sem o replay a truncar o log, o corte temporal passa a ser feito pelo
+        // `as_of` de `decision::evaluate` (`alive_at`/`aggregate_as_of`), com a
+        // MESMA convenção de fronteira exclusiva de todas as outras leituras
+        // (`as_of_point`): `AS OF LSN k` observa os LSN `[0, k)`. O
+        // `scan_range(0, bound)` fica APENAS para o conjunto de idempotência,
+        // que é semântica de log e não de grafo.
+        let g = self.graph()?;
         let mut existing = BTreeSet::new();
 
         let snapshot_events = self.scan_range(0, bound)?;
-        for (lsn, e) in snapshot_events {
-            g.apply_episode(lsn, &e);
+        for (_, e) in snapshot_events {
             if e.kind == EventKind::Action {
                 if let Some(act_id) = e.attrs.get("action_id") {
                     existing.insert(act_id.clone());
                 }
             }
         }
-        let decisions = decision::evaluate(&g, u64::MAX, &policy);
+        let decisions = match as_of_point(as_of) {
+            Some(point) => decision::evaluate(&g, point, &policy),
+            // `AS OF LSN 0` = estado vazio (não existe LSN < 0): nada a decidir.
+            None => Vec::new(),
+        };
 
         let mut report = DecisionReport::default();
         for d in decisions {
@@ -1120,6 +1183,24 @@ impl QueryBackend for LogBackend {
         value: &str,
         as_of: Option<Lsn>,
     ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
+        let Some(lsns) = self.attr_lookup_lsns(field, value, as_of)? else {
+            return Ok(None);
+        };
+        let mut results = Vec::with_capacity(lsns.len());
+        for lsn in lsns {
+            if let Some((_, ep)) = self.log.read(lsn)? {
+                results.push((lsn, ep));
+            }
+        }
+        Ok(Some(results))
+    }
+
+    fn attr_lookup_lsns(
+        &self,
+        field: &str,
+        value: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
         let b = self.sync_bundle()?;
         let bound = self.resolve_as_of_bound(as_of)?;
 
@@ -1139,14 +1220,11 @@ impl QueryBackend for LogBackend {
         if target_lsns.is_empty() {
             return Ok(None);
         }
+        Ok(Some(target_lsns.to_vec()))
+    }
 
-        let mut results = Vec::with_capacity(target_lsns.len());
-        for &lsn in target_lsns {
-            if let Some((_, ep)) = self.log.read(lsn)? {
-                results.push((lsn, ep));
-            }
-        }
-        Ok(Some(results))
+    fn read_lsn(&self, lsn: Lsn) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
+        self.log.read(lsn)
     }
 
     /// Range numérico de referência: varre os VALORES distintos do campo no
@@ -2140,6 +2218,26 @@ impl QueryBackend for VirtualBackend<'_> {
         as_of: Option<Lsn>,
     ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
         self.base.attr_lookup(field, value, as_of)
+    }
+    fn attr_lookup_lsns(
+        &self,
+        field: &str,
+        value: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
+        self.base.attr_lookup_lsns(field, value, as_of)
+    }
+    fn attr_range_lookup_lsns(
+        &self,
+        field: &str,
+        min: Option<(f64, bool)>,
+        max: Option<(f64, bool)>,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
+        self.base.attr_range_lookup_lsns(field, min, max, as_of)
+    }
+    fn read_lsn(&self, lsn: Lsn) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
+        self.base.read_lsn(lsn)
     }
     fn recall(
         &self,

@@ -280,6 +280,15 @@ pub fn persist_migration_receipt(
     file.sync_all()?;
     drop(file);
     std::fs::rename(&tmp, &path)?;
+    // `sync_all` durabiliza o CONTEUDO do ficheiro; nao durabiliza a entrada de
+    // directorio que o `rename` acabou de criar. Sem isto, um corte de energia
+    // logo a seguir podia deixar um recibo com bytes intactos e sem nome — ou
+    // seja, inexistente — apesar de esta funcao ja ter devolvido Ok.
+    //
+    // A gemea `persist_pack_receipt` (mais acima) ja fazia isto; era so esta
+    // que faltava, e a assimetria entre duas funcoes irmas e precisamente o
+    // tipo de lacuna que ninguem ve a ler uma delas de cada vez.
+    sync_parent_dir(dir)?;
     Ok(path)
 }
 

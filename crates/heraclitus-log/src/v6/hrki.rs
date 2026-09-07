@@ -265,6 +265,11 @@ pub fn keyed_equality_digest(index_key: &[u8; 32], valor: &[u8]) -> [u8; 32] {
 /// `valid_*` usam `Option` porque um evento sem valid time não é o mesmo que
 /// um evento com valid time zero: um bloco onde ninguém declarou tempo do
 /// mundo não pode ser eliminado por um predicado sobre tempo do mundo.
+/// Os dois limites não são simétricos, e isso é deliberado (A54): `valid_to`
+/// ausente é "ainda válido" e liga `tem_valid_aberto`, enquanto `valid_from`
+/// ausente é "válido desde sempre" e é gravado como `Some(0)` — o mínimo do
+/// domínio, indistinguível de "sempre" para o teste `t < min_valid_from`.
+/// `min_valid_from: None` fica só para zonas que não observaram nada.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BlockZoneMap {
     pub first_lsn: Lsn,
@@ -869,6 +874,11 @@ impl HrkiBuilder {
             z.min_hlc = z.min_hlc.min(hlc);
             z.max_hlc = z.max_hlc.max(hlc);
             // Sem saber o valid time, o bloco não pode ser excluído por ele.
+            // Auditoria 2026-09-05 (A54): isso são DUAS marcas, não uma. Sem
+            // `min_valid_from = 0`, um registo opaco num bloco onde outro
+            // registo declarou `valid_from = 1000` continuava a ser podado por
+            // um `VALID AT 5` — o limite inferior ignorava-o por completo.
+            z.min_valid_from = Some(0);
             z.tem_valid_aberto = true;
         }
     }
@@ -883,8 +893,19 @@ impl HrkiBuilder {
             z.last_lsn = z.last_lsn.max(lsn);
             z.min_hlc = z.min_hlc.min(hlc);
             z.max_hlc = z.max_hlc.max(hlc);
-            if let Some(v) = ep.valid_from {
-                z.min_valid_from = Some(z.min_valid_from.map_or(v, |m| m.min(v)));
+            // Auditoria 2026-09-05 (A54): `valid_from` ausente quer dizer
+            // "válido desde sempre" (`Episode::valid_from`), não "sem
+            // informação" — e o ramo em falta produzia falsos negativos: um
+            // bloco que misturasse um facto atemporal com um facto datado em
+            // 1000 selava `min_valid_from = Some(1000)` e era podado por um
+            // `VALID AT 5`, apesar de o atemporal ser válido nesse instante.
+            // 0 é o mínimo do domínio, logo `t < 0` é falso para todo o
+            // `t: u64`: marcá-lo desliga o limite inferior sem mexer no
+            // formato em disco, e é mais preciso do que deixar `None` — que
+            // desligaria também o limite SUPERIOR, que aqui é conhecido.
+            match ep.valid_from {
+                Some(v) => z.min_valid_from = Some(z.min_valid_from.map_or(v, |m| m.min(v))),
+                None => z.min_valid_from = Some(0),
             }
             match ep.valid_to {
                 Some(v) => z.max_valid_to = Some(z.max_valid_to.map_or(v, |m| m.max(v))),
@@ -1100,7 +1121,88 @@ mod tests {
             tem_valid_aberto: true,
         };
         assert!(!z.pode_estar_valido_em(49), "antes do minimo: excluivel");
+        assert!(z.pode_estar_valido_em(50), "o proprio minimo esta dentro");
         assert!(z.pode_estar_valido_em(1_000_000), "ha intervalo aberto");
+    }
+
+    #[test]
+    fn bloco_com_facto_atemporal_nao_pode_ser_podado_no_passado() {
+        // Auditoria 2026-09-05 (A54): `valid_from = None` quer dizer "valido
+        // desde sempre". Um bloco que mistura um facto atemporal com um facto
+        // datado no futuro tem de sobreviver a um `VALID AT` anterior ao datado.
+        let mut b = HrkiBuilder::novo(1, [0u8; 32], politica(), Some([3u8; 32])).unwrap();
+        b.iniciar_bloco();
+        b.observar(0, 1, &ep("Atemporal", "SP")); // valid_from = None
+        let mut datado = ep("Datado", "RJ");
+        datado.valid_from = Some(1000);
+        b.observar(1, 2, &datado);
+        let h = b.construir(0.01);
+
+        assert_eq!(
+            h.blocos_validos_em(5),
+            vec![0],
+            "o bloco tem um facto valido desde sempre: podar e um falso negativo"
+        );
+    }
+
+    #[test]
+    fn bloco_com_registo_opaco_nao_pode_ser_podado_no_passado() {
+        // Auditoria 2026-09-05 (A54): o registo opaco nao declara valid time
+        // nenhum, portanto o bloco tambem nao pode ser excluido pelo limite
+        // INFERIOR — nao so pelo superior.
+        let mut b = HrkiBuilder::novo(1, [0u8; 32], politica(), Some([3u8; 32])).unwrap();
+        b.iniciar_bloco();
+        b.observar_opaco(0, 1);
+        let mut datado = ep("Datado", "RJ");
+        datado.valid_from = Some(1000);
+        b.observar(1, 2, &datado);
+        let h = b.construir(0.01);
+
+        assert_eq!(
+            h.blocos_validos_em(5),
+            vec![0],
+            "nao se conhece o valid time do registo opaco: nao pode ser excluido"
+        );
+    }
+
+    #[test]
+    fn bloco_todo_datado_no_futuro_continua_a_ser_podado() {
+        // Nao-regressao: alargar o limite inferior nao pode desligar o pruning
+        // legitimo. Aqui NENHUM facto e valido em t = 5.
+        let mut b = HrkiBuilder::novo(1, [0u8; 32], politica(), Some([3u8; 32])).unwrap();
+        b.iniciar_bloco();
+        for i in 0..4u64 {
+            let mut e = ep("Datado", "SP");
+            e.valid_from = Some(1000 + i);
+            b.observar(i, i, &e);
+        }
+        let h = b.construir(0.01);
+
+        assert!(
+            h.blocos_validos_em(5).is_empty(),
+            "nenhum facto e valido em t=5: o pruning tem de continuar a funcionar"
+        );
+    }
+
+    #[test]
+    fn bloco_atemporal_todo_fechado_pode_ser_podado_no_futuro() {
+        // Auditoria 2026-09-05 (A54): marcar "desde sempre" como min = 0 e
+        // ESTRITAMENTE mais preciso do que nao marcar nada. Antes, um bloco sem
+        // nenhum `valid_from` escapava cegamente pelo ramo `None => true`;
+        // agora, se todos os factos fecharam em t = 100, `VALID AT 200` poda-o.
+        let mut b = HrkiBuilder::novo(1, [0u8; 32], politica(), Some([3u8; 32])).unwrap();
+        b.iniciar_bloco();
+        for i in 0..4u64 {
+            let mut e = ep("Fechado", "SP");
+            e.valid_to = Some(100);
+            b.observar(i, i, &e);
+        }
+        let h = b.construir(0.01);
+
+        assert!(
+            h.blocos_validos_em(200).is_empty(),
+            "todos os factos terminaram em t=100: nada e valido em t=200"
+        );
     }
 
     #[test]

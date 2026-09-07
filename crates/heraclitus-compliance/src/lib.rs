@@ -53,6 +53,33 @@ pub(crate) mod test_pki;
 pub mod verify;
 pub mod worker;
 
+/// Destino das ESCRITAS derivadas do motor regulatório — o gémeo do
+/// `DerivedEventSink` do Sentinel.
+///
+/// Auditoria 2026-09-05 (`grpc.rs:521`, CONFIRMADO): os motores de compliance
+/// escreviam directamente em `AnyLog::append`, contornando a indexação viva do
+/// servidor (memtable, views, índice de atributos). Um `LegalHold` acabado de
+/// colocar via RPC admin não existia para `MATCH (n) WHERE n.kind = "LegalHold"`
+/// até ao próximo arranque — o índice `_kind` respondia `Some(vazio)` com
+/// autoridade e o planner tomava-o como resposta final. O servidor injecta-se
+/// a si próprio como sink (`with_sink`); a biblioteca sem servidor continua a
+/// escrever no log (o `AnyLog` implementa o trait).
+pub trait ComplianceSink: Send + Sync {
+    fn append_compliance(
+        &self,
+        episode: heraclitus_core::Episode,
+    ) -> Result<heraclitus_core::Lsn, heraclitus_core::HeraclitusError>;
+}
+
+impl ComplianceSink for heraclitus_log::AnyLog {
+    fn append_compliance(
+        &self,
+        episode: heraclitus_core::Episode,
+    ) -> Result<heraclitus_core::Lsn, heraclitus_core::HeraclitusError> {
+        heraclitus_log::EpisodeLog::append(self, episode)
+    }
+}
+
 pub use classification::{
     classify_derived_episode, ClassificationControls, ClassificationDecision,
     ClassificationDowngradeAuthorization, ClassificationError, ClassificationPolicy,

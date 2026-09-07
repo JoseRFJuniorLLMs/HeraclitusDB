@@ -946,11 +946,22 @@ impl PrivacyState {
 #[derive(Clone)]
 pub struct PrivacyIncidentEngine {
     log: Arc<AnyLog>,
+    sink: Arc<dyn crate::ComplianceSink>,
 }
 
 impl PrivacyIncidentEngine {
     pub fn new(log: Arc<AnyLog>) -> Self {
-        Self { log }
+        Self {
+            sink: log.clone(),
+            log,
+        }
+    }
+
+    /// Redirige as escritas para o servidor (que as indexa ao vivo) em vez do
+    /// log cru. Ver [`crate::ComplianceSink`].
+    pub fn with_sink(mut self, sink: Arc<dyn crate::ComplianceSink>) -> Self {
+        self.sink = sink;
+        self
     }
 
     pub fn state(&self) -> Result<PrivacyState, PrivacyError> {
@@ -976,8 +987,8 @@ impl PrivacyIncidentEngine {
                 assessment.assessment_id
             )));
         }
-        self.log
-            .append(assessment.to_episode()?)
+        self.sink
+            .append_compliance(assessment.to_episode()?)
             .map_err(|error| PrivacyError::Storage(error.to_string()))
     }
 
@@ -997,8 +1008,8 @@ impl PrivacyIncidentEngine {
             return Ok((*lsn, existing.clone()));
         }
         let lsn = self
-            .log
-            .append(deadline.to_episode()?)
+            .sink
+            .append_compliance(deadline.to_episode()?)
             .map_err(|error| PrivacyError::Storage(error.to_string()))?;
         Ok((lsn, deadline))
     }
@@ -1022,8 +1033,8 @@ impl PrivacyIncidentEngine {
             return Ok((*lsn, existing.clone()));
         }
         let lsn = self
-            .log
-            .append(receipt.to_episode()?)
+            .sink
+            .append_compliance(receipt.to_episode()?)
             .map_err(|error| PrivacyError::Storage(error.to_string()))?;
         Ok((lsn, receipt))
     }

@@ -174,3 +174,60 @@ fn probe_edge_reassert_after_retract_revives() {
     let v = execute("MATCH (a)-[r]->(b) AS OF LSN 1 RETURN *", &be).unwrap();
     assert_eq!(v.as_array().unwrap().len(), 1, "história antiga intacta");
 }
+
+/// Auditoria recursiva 2026-09-05 (A23): a forma NUA de uma variável de padrão
+/// (`r`, sem `.campo`) resolve para o `edge_id` no pós-filtro, mas o pushdown
+/// empurrava-a como TIPO da aresta. Um `edge_id` nunca é igual a uma chave de
+/// tipo, portanto `match_edges` devolvia vazio e o pós-filtro — que teria
+/// aceite a linha — nunca a via: o pushdown era DISJUNTO, não superconjunto.
+#[test]
+fn padrao_de_relacao_aceita_r_nu_igual_ao_edge_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+    log.append(edge_ep("alice", "bob", "socio_de")).unwrap();
+    log.append(edge_ep("alice", "carla", "pagou")).unwrap();
+    let be = LogBackend::new(log);
+
+    let linhas = |q: &str| -> Vec<serde_json::Value> {
+        execute(q, &be).unwrap().as_array().unwrap().clone()
+    };
+
+    // O `edge_id` vem do próprio RETURN — se o formato mudar, o teste morre.
+    let todas = linhas("MATCH (a)-[r]->(b) RETURN *");
+    assert_eq!(todas.len(), 2);
+    let edge_id = todas.iter().find(|r| r["to"] == "bob").unwrap()["edge_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Reutilizar o valor devolvido tem de casar a MESMA aresta. Antes: 0 linhas.
+    let v = linhas(&format!(
+        "MATCH (a)-[r]->(b) WHERE r = \"{edge_id}\" RETURN *"
+    ));
+    assert_eq!(v.len(), 1, "`r = <edge_id>` tem de casar a aresta: {v:?}");
+    assert_eq!(v[0]["to"].as_str().unwrap(), "bob");
+
+    // NÃO REGRIDE: a forma nua de um nó continua a ser empurrada como id (o
+    // slot pedido é "id"), e filtra mesmo — com 2 arestas, devolve 1.
+    let v = linhas("MATCH (a)-[r]->(b) WHERE b = \"bob\" RETURN *");
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0]["to"].as_str().unwrap(), "bob");
+
+    // NÃO REGRIDE: `r.type` (Prop com o campo certo) continua empurrado.
+    assert_eq!(
+        linhas("MATCH (a)-[r]->(b) WHERE r.type = \"pagou\" RETURN *").len(),
+        1
+    );
+    assert_eq!(
+        linhas("MATCH (a)-[r]->(b) WHERE r.type = \"inexistente\" RETURN *").len(),
+        0
+    );
+    // NÃO REGRIDE: `r.id` já funcionava (o slot "type" não casava o campo).
+    assert_eq!(
+        linhas(&format!(
+            "MATCH (a)-[r]->(b) WHERE r.id = \"{edge_id}\" RETURN *"
+        ))
+        .len(),
+        1
+    );
+}

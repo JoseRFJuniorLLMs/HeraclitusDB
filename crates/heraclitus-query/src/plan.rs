@@ -4,7 +4,7 @@
 //! planner has statistics to feed on (§3.12).
 
 use crate::ast::*;
-use crate::backend::{materialize_virtual, EdgeRow, QueryBackend, VirtualBackend};
+use crate::backend::{materialize_virtual, EdgeRow, QueryBackend, VirtualBackend, QUERY_SCAN_CAP};
 use crate::fusion::FusionWeights;
 use heraclitus_core::{Episode, EventKind, HeraclitusError, Lsn};
 use heraclitus_index_graph::decision::DecisionPolicy;
@@ -37,12 +37,19 @@ pub enum Plan {
     },
     GraphMatch {
         from_var: String,
+        /// Rótulo do nó de origem (`MATCH (a:Pessoa)-[r]->(b)`). Auditoria
+        /// 2026-09-05: era parseado e descartado no lowering — sem campo onde
+        /// viver, nenhum passo seguinte o podia recuperar.
+        from_label: Option<String>,
         to_var: String,
+        /// Rótulo do nó de destino (`->(b:Empresa)`). Ver `from_label`.
+        to_label: Option<String>,
         rel_var: String,
         rel_type: Option<String>,
         conditions: Vec<(BoolOp, Condition)>,
         valid_at: Option<u64>,
         as_of: Option<AsOf>,
+        order_by: Option<(OrderKey, bool)>,
         returns: Vec<RetItem>,
         limit: Option<u32>,
     },
@@ -128,12 +135,24 @@ pub fn plan(stmt: &Stmt) -> Plan {
             let e = m.edge.as_ref().unwrap();
             Plan::GraphMatch {
                 from_var: m.var.clone(),
+                // Auditoria 2026-09-05: os rótulos dos DOIS nós do padrão eram
+                // parseados (`node_pat` aceita `(a:Pessoa)`) e descartados aqui
+                // em silêncio — `MATCH (a:Pessoa)-[r]->(b:Empresa)` devolvia
+                // arestas entre nós de QUALQUER kind, e o EXPLAIN nem os
+                // imprimia. Agora seguem para o executor, que os recusa
+                // explicitamente enquanto a semântica não estiver definida.
+                from_label: m.label.clone(),
                 to_var: e.to_var.clone(),
+                to_label: e.to_label.clone(),
                 rel_var: e.rel_var.clone(),
                 rel_type: e.rel_type.clone(),
                 conditions: m.conditions.clone(),
                 valid_at: m.valid_at,
                 as_of: m.as_of,
+                // Auditoria 2026-09-05: o ORDER BY era parseado e DESCARTADO
+                // aqui, mas o LIMIT continuava a aplicar-se — a query devolvia
+                // as N linhas erradas, sem erro. Agora segue para o executor.
+                order_by: m.order_by.clone(),
                 returns: m.returns.clone(),
                 limit: m.limit,
             }
@@ -304,21 +323,31 @@ pub fn render(plan: &Plan) -> String {
         Plan::Provenance { id } => format!("ProvenanceExpand\n  id = {id}\n"),
         Plan::GraphMatch {
             from_var,
+            from_label,
             to_var,
+            to_label,
             rel_var,
             rel_type,
             conditions,
             valid_at,
             as_of,
+            order_by,
             limit,
             ..
         } => {
+            // Auditoria 2026-09-05: o EXPLAIN escondia os rótulos dos nós — o
+            // utilizador escrevia `(a:Pessoa)`, o planner descartava-o e o
+            // plano impresso dizia só `(a)`. O que o planner recebeu tem de
+            // aparecer aqui, mesmo (sobretudo) quando não é suportado.
+            let rotulo = |l: &Option<String>| l.as_ref().map(|t| format!(":{t}")).unwrap_or_default();
             let mut s = format!(
-                "GraphMatch\n  ({from_var})-[{rel_var}{}]->({to_var})\n",
+                "GraphMatch\n  ({from_var}{})-[{rel_var}{}]->({to_var}{})\n",
+                rotulo(from_label),
                 rel_type
                     .as_ref()
                     .map(|t| format!(":{t}"))
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                rotulo(to_label),
             );
             for (op, c) in conditions {
                 s += &format!("  cond[{op:?}] {:?} {:?} {:?}\n", c.lhs, c.cmp, c.rhs);
@@ -328,6 +357,14 @@ pub fn render(plan: &Plan) -> String {
             }
             if let Some(a) = as_of {
                 s += &format!("  AsOf({a:?})\n");
+            }
+            if let Some((key, asc)) = order_by {
+                match key {
+                    OrderKey::Field(f) => s += &format!("  OrderBy({rel_var}.{f}, asc={asc})\n"),
+                    OrderKey::Dist(kind, v) => {
+                        s += &format!("  OrderBy(DIST_{kind:?}[{} dims], asc={asc})\n", v.len())
+                    }
+                }
             }
             if let Some(l) = limit {
                 s += &format!("  Limit({l})\n");
@@ -384,20 +421,53 @@ pub fn render(plan: &Plan) -> String {
     }
 }
 
-/// Renderiza o plano e, para scans de igualdade em built-ins, pede ao backend
-/// a mesma decisão de pruning que a execução usaria. O probe é somente-leitura
-/// e os contadores viajam no próprio resultado, portanto queries concorrentes
-/// não partilham um slot global de estatísticas.
+/// Renderiza o plano e, quando o caminho de acesso escolhido é o skip-scan por
+/// zone maps, pede ao backend a mesma decisão de pruning que a execução usaria.
+/// Os contadores viajam no próprio resultado, portanto queries concorrentes não
+/// partilham um slot global de estatísticas — mas o probe NÃO é somente-leitura:
+/// `scan_builtin_eq` actualiza a EMA de caminhos de acesso e o slot
+/// `last_pruned_scan` do backend. Razão a mais para só o disparar no ramo em que
+/// a execução também o dispararia (auditoria 2026-09-05).
 pub fn explain_with_backend(plan: &Plan, be: &dyn QueryBackend) -> Result<String, HeraclitusError> {
     let mut out = render(plan);
     let Plan::ScanFilter {
-        conditions, as_of, ..
+        conditions,
+        as_of,
+        label,
+        ..
     } = plan
     else {
         return Ok(out);
     };
-    let Some((field, value)) = builtin_skip_hint(conditions) else {
-        return Ok(out);
+    // Auditoria 2026-09-05: o EXPLAIN consultava UM só hint — o do skip-scan —
+    // enquanto o executor decide por uma cascata de quatro. Para
+    // `WHERE n.kind = "X" AND n.agent_id = "a"` imprimia contadores de I/O de
+    // um plano que a query nunca faria (a execução resolve por `_kind` no
+    // índice de atributos) e escondia o caminho real. Agora os dois lados lêem
+    // a MESMA função.
+    let (field, value) = match caminho_de_acesso(conditions, label.as_deref()) {
+        CaminhoAcesso::AttrEq(chave, valor) => {
+            out.push_str(&format!("AttrIndex\n  key = {chave}\n  value = {valor}\n"));
+            return Ok(out);
+        }
+        CaminhoAcesso::AttrRange(chave, min, max) => {
+            out.push_str(&format!(
+                "AttrRangeIndex\n  key = {chave}\n  min = {min:?}\n  max = {max:?}\n"
+            ));
+            return Ok(out);
+        }
+        CaminhoAcesso::RotuloKind(rotulo) => {
+            out.push_str(&format!(
+                "AttrIndex\n  key = _kind\n  value = {rotulo}\n  \
+                 fallback = window scan (se o índice não tiver o rótulo)\n"
+            ));
+            return Ok(out);
+        }
+        CaminhoAcesso::Janela => {
+            out.push_str("WindowScan\n  (nenhum índice aplicável ao WHERE)\n");
+            return Ok(out);
+        }
+        CaminhoAcesso::BuiltinSkip(chave, valor) => (chave, valor),
     };
     let bound = resolve_as_of(as_of, be)?;
     let Some(probe) = be.scan_builtin_eq(&field, &value, bound)? else {
@@ -498,13 +568,28 @@ fn eval_operand(op: &Operand, lsn: Lsn, e: &Episode) -> Option<Json> {
 /// Distância do embedding do episódio ao vetor literal da query, na Variedade
 /// Produto (curvaturas da assinatura default do manifold). `None` quando o
 /// episódio não tem embedding — a condição simplesmente não casa.
+///
+/// Auditoria 2026-09-05: a dimensão é validada AQUI, o único ponto onde a
+/// query e o embedding se encontram (a gramática só exige `number (","
+/// number)*` e nunca vê os embeddings). As funções do manifold iteram com
+/// `zip`, truncam pela mais curta e devolvem `f64` — não têm como sinalizar
+/// erro —, portanto um vetor de dimensão errada produzia uma distância
+/// calculada só sobre o prefixo: um embedding `[0.1, 0.2, 5000.0]` casava
+/// `DIST_EUC([0.1, 0.2]) < 0.001`, e um episódio SEM componente hiperbólica
+/// dava `zip` vazio, distância 0.0, e era "o mais próximo de todos".
+/// Igualdade ESTRITA porque a truncagem é simétrica: um `q` mais longo mente
+/// tanto como um mais curto. `DIST_PRODUCT` já rejeitava a mesma entrada.
 fn eval_dist(kind: DistKind, q: &[f32], e: &Episode) -> Option<f64> {
     let emb = e.embedding.as_ref()?;
     let sig = &heraclitus_manifold::ProductMetric::default().sig;
     Some(match kind {
-        DistKind::Hyp => heraclitus_manifold::dist_hyp(q, &emb.hyp, -sig.k1),
-        DistKind::Sph => heraclitus_manifold::dist_sph(q, &emb.sph, sig.k2),
-        DistKind::Euc => heraclitus_manifold::dist_euc(q, &emb.euc),
+        DistKind::Hyp => (q.len() == emb.hyp.len())
+            .then(|| heraclitus_manifold::dist_hyp(q, &emb.hyp, -sig.k1))?,
+        DistKind::Sph => (q.len() == emb.sph.len())
+            .then(|| heraclitus_manifold::dist_sph(q, &emb.sph, sig.k2))?,
+        DistKind::Euc => {
+            (q.len() == emb.euc.len()).then(|| heraclitus_manifold::dist_euc(q, &emb.euc))?
+        }
         DistKind::Product => {
             // O vetor plano da query é fatiado pelas dimensões do PRÓPRIO
             // episódio (a mesma convenção do canal vetorial do FUSE).
@@ -559,12 +644,43 @@ fn cmp_json(a: &Json, b: &Json, cmp: Cmp) -> bool {
 /// intervalos de LSN. Um facto sem valid time é atemporal e passa sempre.
 /// Lê primeiro os campos NATIVOS do Episode (FORMAT v4); attrs são o
 /// fallback de compatibilidade (a convenção pré-v4).
+///
+/// Auditoria 2026-09-05: a comparação é EXACTA em `u64`. O tempo do mundo é
+/// escolhido pelo cliente e não é validado em lado nenhum — em nanossegundos
+/// desde a época (~1,8e18) passa 2^53 e a mantissa de 53 bits do `f64`
+/// colapsava todos os valores de um mesmo quantum (256 ns), invertendo a
+/// comparação nas duas fronteiras: `valid_from = 2^53+1` casava em `t = 2^53`
+/// (o facto ainda não começou) e `valid_to = 2^53+1` deixava de casar em
+/// `t = 2^53` (ainda dentro do intervalo). As funções irmãs — o filtro de
+/// arestas aqui ao lado e o `temporal.rs` — sempre compararam em `u64`. O
+/// `f64` fica reservado ao único caso que o exige: um attr não inteiro
+/// ("1000.5"), que antes era aceite e não pode passar silenciosamente a
+/// atemporal.
 fn valid_at_matches(e: &Episode, t: u64) -> bool {
-    let num = |k: &str| e.attrs.get(k).and_then(|v| v.trim().parse::<f64>().ok());
-    let from = e.valid_from.map(|v| v as f64).or_else(|| num("valid_from"));
-    let to = e.valid_to.map(|v| v as f64).or_else(|| num("valid_to"));
-    let from_ok = from.is_none_or(|from| from <= t as f64);
-    let to_ok = to.is_none_or(|to| (t as f64) < to);
+    enum Limite {
+        Exacto(u64),
+        Aprox(f64),
+    }
+    let limite = |nativo: Option<u64>, chave: &str| -> Option<Limite> {
+        if let Some(v) = nativo {
+            return Some(Limite::Exacto(v));
+        }
+        let s = e.attrs.get(chave)?.trim();
+        s.parse::<u64>()
+            .ok()
+            .map(Limite::Exacto)
+            .or_else(|| s.parse::<f64>().ok().map(Limite::Aprox))
+    };
+    let from_ok = match limite(e.valid_from, "valid_from") {
+        None => true,
+        Some(Limite::Exacto(from)) => from <= t,
+        Some(Limite::Aprox(from)) => from <= t as f64,
+    };
+    let to_ok = match limite(e.valid_to, "valid_to") {
+        None => true,
+        Some(Limite::Exacto(to)) => t < to,
+        Some(Limite::Aprox(to)) => (t as f64) < to,
+    };
     from_ok && to_ok
 }
 
@@ -648,6 +764,29 @@ fn eval_edge_operand(
     }
 }
 
+/// Campos de aresta que o ORDER BY de um padrão de relação aceita. O parser
+/// perde o prefixo da variável (`r.belief` → `belief`), por isso a chave
+/// resolve sempre contra a ARESTA: `id` é o edge id (não `b.id`).
+fn edge_order_field(field: &str) -> Result<(), HeraclitusError> {
+    match field {
+        "id" | "type" | "etype" | "belief" | "from" | "to" => Ok(()),
+        outro => Err(HeraclitusError::Query(format!(
+            "ORDER BY {outro}: um padrão de relação só ordena por id, type, belief, from ou to"
+        ))),
+    }
+}
+
+fn edge_order_value(r: &EdgeRow, field: &str) -> Json {
+    match field {
+        "id" => json!(r.edge_id),
+        "type" | "etype" => json!(r.etype),
+        "belief" => json!(r.belief),
+        "from" => json!(r.from),
+        "to" => json!(r.to),
+        _ => Json::Null,
+    }
+}
+
 /// Pós-filtro do GraphMatch (correção R1): TODAS as condições do WHERE são
 /// revalidadas contra cada aresta — antes, só as igualdades src/dst/etype eram
 /// empurradas e o resto era silenciosamente ignorado (resultados errados).
@@ -690,13 +829,22 @@ fn cmp_order(a: &Json, b: &Json) -> std::cmp::Ordering {
 /// Um `OR` desqualifica o pushdown (correção R1): a igualdade pode valer só
 /// num ramo — empurrá-la restringiria o match antes do pós-filtro e perderia
 /// linhas dos outros ramos. O `edge_matches` revalida tudo na mesma.
+///
+/// Auditoria 2026-09-05: essa premissa — «o pós-filtro revalida» — só vale
+/// enquanto o pushdown for um SUPERCONJUNTO. A forma NUA de uma variável
+/// (`r`, sem `.campo`) resolve, no `eval_edge_operand`, para o id do nó
+/// (`a`/`b`) ou para o `edge_id` (`r`) — nunca para o tipo da aresta.
+/// Aceitá-la para o slot `"type"` empurrava um `edge_id` como se fosse uma
+/// chave de tipo: conjunto DISJUNTO, `match_edges` vazio, e o pós-filtro
+/// nunca chegava a ver a linha que teria aceite. Daí o ramo nu valer só para
+/// o slot `"id"`, o único em que é semanticamente equivalente.
 fn eq_filter(conditions: &[(BoolOp, Condition)], var: &str, field: &str) -> Option<String> {
     if conditions.iter().any(|(op, _)| matches!(op, BoolOp::Or)) {
         return None;
     }
     fn var_lit(a: &Operand, b: &Operand, var: &str, field: &str) -> Option<String> {
         let is_var = match a {
-            Operand::Ident(v) => v == var,
+            Operand::Ident(v) => v == var && field == "id",
             Operand::Prop(v, f) => v == var && f == field,
             _ => false,
         };
@@ -873,6 +1021,43 @@ fn builtin_skip_hint(conditions: &[(BoolOp, Condition)]) -> Option<(String, Stri
     None
 }
 
+/// O caminho de acesso que o `ScanFilter` prefere, decidido SÓ pelo `WHERE` e
+/// pelo rótulo do padrão.
+///
+/// Auditoria 2026-09-05: esta decisão vivia em dois sítios com regras
+/// diferentes — o executor tinha a cascata completa e o `explain_with_backend`
+/// só conhecia o skip-scan, pelo que o EXPLAIN descrevia (e sondava) um plano
+/// que a query não ia usar. Uma função, dois consumidores: não podem voltar a
+/// divergir.
+enum CaminhoAcesso {
+    /// Índice de atributos por igualdade (inclui o pseudo-atributo `_kind`).
+    AttrEq(String, String),
+    /// Índice ordenado, por range numérico.
+    AttrRange(String, NumBound, NumBound),
+    /// Skip-scan por zone maps num builtin (`agent_id`/`session_id`).
+    BuiltinSkip(String, String),
+    /// Sem hint no WHERE, mas o padrão tem rótulo: `_kind` no índice.
+    RotuloKind(String),
+    /// Varrimento da janela de LSNs, capado.
+    Janela,
+}
+
+fn caminho_de_acesso(conditions: &[(BoolOp, Condition)], label: Option<&str>) -> CaminhoAcesso {
+    if let Some((campo, valor)) = attr_eq_hint(conditions) {
+        return CaminhoAcesso::AttrEq(campo, valor);
+    }
+    if let Some((campo, min, max)) = attr_range_hint(conditions) {
+        return CaminhoAcesso::AttrRange(campo, min, max);
+    }
+    if let Some((campo, valor)) = builtin_skip_hint(conditions) {
+        return CaminhoAcesso::BuiltinSkip(campo, valor);
+    }
+    match label {
+        Some(rotulo) => CaminhoAcesso::RotuloKind(rotulo.to_string()),
+        None => CaminhoAcesso::Janela,
+    }
+}
+
 /// Derive the LSN scan window `[lo, hi)` from the `WHERE` clause and the `AS OF`
 /// bound, so `MATCH` pushes a time filter down to a pruned, capped scan
 /// (§query guard). Only conjunctive (`AND`) numeric `n.lsn` comparisons are
@@ -1022,43 +1207,112 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
             // campo não-builtin, resolve pelo índice de atributos (global,
             // O(postings)) em vez de varrer a janela capada. O pós-filtro
             // `matches` revalida tudo, por isso a correção nunca depende disto.
-            let indexed: Option<Vec<(Lsn, Episode)>> = match attr_eq_hint(conditions) {
-                Some((field, value)) => be.attr_lookup(&field, &value, bound)?,
-                None => match attr_range_hint(conditions) {
-                    // ÍNDICE ORDENADO (C1.6): WHERE n.<campo> >/< número resolve
-                    // pelo range do índice de atributos em vez do scan.
-                    Some((field, min, max)) => be.attr_range_lookup(&field, min, max, bound)?,
-                    None => match builtin_skip_hint(conditions) {
-                        // SPEC-010 skip-I/O: WHERE agent_id/session_id = "v" salta
-                        // segmentos selados cujo zone map não contém o valor
-                        // (scan_builtin_eq). São builtins (fora do índice de
-                        // atributos); o pós-filtro `matches` revalida o exato.
-                        Some((field, value)) => be
-                            .scan_builtin_eq(&field, &value, bound)?
-                            .map(|result| result.rows),
-                        None => None,
-                    },
-                },
+            // Auditoria 2026-09-05: o índice devolve LSNs, NÃO episódios. A
+            // hidratação (uma leitura do log por LSN) fica aqui, e pára ao
+            // encher o LIMIT — antes, `attr_lookup` lia do disco TODOS os
+            // episódios do posting (até QUERY_SCAN_CAP = 250 000) para um
+            // `LIMIT 10`; sobre os 9 M de episódios da carga do governo, 9 GB
+            // de RAM e minutos, para devolver 5 linhas.
+            enum Fonte {
+                Lsns(Vec<Lsn>),
+                Linhas(Vec<(Lsn, Episode)>),
+            }
+            // A PREFERÊNCIA está em `caminho_de_acesso` — a mesma função que o
+            // EXPLAIN lê, para os dois não voltarem a divergir (auditoria
+            // 2026-09-05). A cascata DINÂMICA fica aqui e não muda: um caminho
+            // que dispare mas devolva `None` recua na mesma para o rótulo (a
+            // seguir) e daí para a janela.
+            let fonte: Option<Fonte> = match caminho_de_acesso(conditions, label.as_deref()) {
+                CaminhoAcesso::AttrEq(field, value) => {
+                    be.attr_lookup_lsns(&field, &value, bound)?.map(Fonte::Lsns)
+                }
+                // ÍNDICE ORDENADO (C1.6): WHERE n.<campo> >/< número resolve
+                // pelo range do índice de atributos em vez do scan.
+                CaminhoAcesso::AttrRange(field, min, max) => be
+                    .attr_range_lookup_lsns(&field, min, max, bound)?
+                    .map(Fonte::Lsns),
+                // SPEC-010 skip-I/O: WHERE agent_id/session_id = "v" salta
+                // segmentos selados cujo zone map não contém o valor
+                // (scan_builtin_eq). São builtins (fora do índice de
+                // atributos); o pós-filtro `matches` revalida o exato.
+                CaminhoAcesso::BuiltinSkip(field, value) => be
+                    .scan_builtin_eq(&field, &value, bound)?
+                    .map(|result| Fonte::Linhas(result.rows)),
+                // O rótulo é resolvido logo a seguir, no mesmo recuo que já
+                // apanha os hints que devolveram `None`.
+                CaminhoAcesso::RotuloKind(_) | CaminhoAcesso::Janela => None,
             };
-            let candidates: Vec<(Lsn, Episode)> = match indexed {
-                Some(hit) => hit,
+            // ROTULO -> INDICE `_kind`. `MATCH (n:Despesas)` — a forma canonica
+            // de Cypher — so era aplicado como POS-FILTRO sobre o varrimento
+            // capado (QUERY_SCAN_CAP): o `attr_eq_hint` so ve o WHERE, e o
+            // rotulo do padrao nunca chegava ao indice `_kind`, apesar de o
+            // indice o guardar. Medido sobre 8 968 663 episodios reais do
+            // Portal da Transparencia: `MATCH (n:Despesas) RETURN n LIMIT 5`
+            // devolvia 0 linhas — os episodios existem, mas vivem todos para
+            // la dos primeiros 250 000 LSN. Resposta errada, em silencio.
+            //
+            // Usa-se o indice so quando devolve ALGO: o indice e exacto e o
+            // pos-filtro e insensivel a capitalizacao, portanto um rotulo com
+            // capitalizacao diferente (ou um kind ausente) recua para o
+            // varrimento de hoje — sem regressao — em vez de tomar `Some(vazio)`
+            // como resposta final, que e a classe do bug critico ja corrigido.
+            let fonte = match (fonte, label.as_deref()) {
+                (None, Some(rotulo)) => be
+                    .attr_lookup_lsns("_kind", rotulo, bound)?
+                    .filter(|lsns| !lsns.is_empty())
+                    .map(Fonte::Lsns),
+                (outra, _) => outra,
+            };
+            let aceita = |l: Lsn, e: &Episode| -> bool {
+                label
+                    .as_ref()
+                    .map(|rotulo| kind_label(&e.kind).eq_ignore_ascii_case(rotulo))
+                    .unwrap_or(true)
+                    && valid_at.is_none_or(|t| valid_at_matches(e, t))
+                    && matches(conditions, l, e)
+            };
+            // LIMIT empurrado para a hidratação: sem ORDER BY — ou com
+            // `ORDER BY n.lsn`, que é a ordem natural dos LSNs — pára-se ao
+            // encher o LIMIT. Com outro ORDER BY é preciso o conjunto inteiro,
+            // capado como sempre. O pós-filtro `aceita` corre ANTES de contar,
+            // por isso o corte é sempre sobre linhas que passam.
+            let (tecto, inverter) = match (order_by, limit) {
+                (None, Some(k)) => (Some(*k as usize), false),
+                (Some((OrderKey::Field(f), asc)), Some(k)) if f == "lsn" => {
+                    (Some(*k as usize), !*asc)
+                }
+                _ => (None, false),
+            };
+            let mut rows: Vec<(Lsn, Episode)> = match fonte {
+                Some(Fonte::Lsns(mut lsns)) => {
+                    if inverter {
+                        lsns.reverse();
+                    }
+                    let mut out = Vec::new();
+                    for l in lsns.into_iter().take(QUERY_SCAN_CAP) {
+                        if tecto.is_some_and(|k| out.len() >= k) {
+                            break;
+                        }
+                        if let Some((l, e)) = be.read_lsn(l)? {
+                            if aceita(l, &e) {
+                                out.push((l, e));
+                            }
+                        }
+                    }
+                    out
+                }
+                Some(Fonte::Linhas(linhas)) => {
+                    linhas.into_iter().filter(|(l, e)| aceita(*l, e)).collect()
+                }
                 None => {
                     // Push any `n.lsn` bounds down to a pruned, capped scan window.
                     let (lo, hi) = lsn_window(conditions, bound);
                     be.scan_range(lo, hi)?
+                        .into_iter()
+                        .filter(|(l, e)| aceita(*l, e))
+                        .collect()
                 }
             };
-            let mut rows: Vec<(Lsn, Episode)> = candidates
-                .into_iter()
-                .filter(|(_, e)| {
-                    label
-                        .as_ref()
-                        .map(|l| kind_label(&e.kind).eq_ignore_ascii_case(l))
-                        .unwrap_or(true)
-                })
-                .filter(|(_, e)| valid_at.is_none_or(|t| valid_at_matches(e, t)))
-                .filter(|(l, e)| matches(conditions, *l, e))
-                .collect();
             if let Some((key, asc)) = order_by {
                 match key {
                     // Correção R3: comparação numérica (com coerção) em vez de
@@ -1124,15 +1378,37 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
         }
         Plan::GraphMatch {
             from_var,
+            from_label,
             to_var,
+            to_label,
             rel_var,
             rel_type,
             conditions,
             valid_at,
             as_of,
+            order_by,
             returns,
             limit,
         } => {
+            // Auditoria 2026-09-05: um rótulo num extremo do padrão era aceite
+            // pela gramática e ignorado em silêncio — `MATCH (a:Pessoa)-[r]->
+            // (b:Empresa)` devolvia exactamente as mesmas linhas que
+            // `MATCH (a)-[r]->(b)`, mesmo com rótulos que não existem em
+            // episódio nenhum, e o LIMIT cortava N linhas de um conjunto já
+            // contaminado. Não se corrige filtrando: os extremos de uma aresta
+            // são ids de ENTIDADE (`temporal.rs`: `pub type EntityId = String`,
+            // arestas entre entidades nomeadas), não ids de episódio, e não
+            // têm kind — o que `:Pessoa` significaria aqui continua por
+            // definir (docs/AUDITORIA-2026-09-05.md, "Vaga 3 — em aberto").
+            // Enquanto não estiver definido, errar alto é a única resposta
+            // honesta; responder errado em silêncio não é.
+            if let Some(rotulo) = from_label.as_deref().or(to_label.as_deref()) {
+                return Err(HeraclitusError::Query(format!(
+                    "rótulo de nó (:{rotulo}) não é suportado num padrão de relação: \
+                     os extremos de uma aresta são ids de entidade, sem kind — \
+                     filtre por rótulo num padrão de nó, `MATCH (n:{rotulo})`"
+                )));
+            }
             let bound = resolve_as_of(as_of, be)?;
             // Pattern variables constrained in WHERE become graph filters; the
             // inline `[r:type]` label is the default edge type (a WHERE
@@ -1143,7 +1419,7 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                 .clone()
                 .or_else(|| eq_filter(conditions, rel_var, "type"));
             let rows = be.match_edges(src.as_deref(), etype.as_deref(), dst.as_deref(), bound)?;
-            let mut out: Vec<Json> = rows
+            let mut kept: Vec<&EdgeRow> = rows
                 .iter()
                 // Bi-temporal em ARESTAS (V2.4): VALID AT filtra pelo valid
                 // time do mundo herdado do episódio que assertou a aresta.
@@ -1157,12 +1433,46 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                 // WHERE contra a aresta (o pushdown src/dst/etype é só um hint;
                 // antes, condições não-empurráveis eram ignoradas em silêncio).
                 .filter(|r| edge_matches(conditions, r, from_var, to_var, rel_var))
-                .map(|r| project_edge(r, returns, from_var, to_var, rel_var))
                 .collect();
-            if let Some(l) = limit {
-                out.truncate(*l as usize);
+            // Auditoria 2026-09-05: ORDER BY ANTES do LIMIT — com 5 000 arestas
+            // e `ORDER BY r.belief DESC LIMIT 10`, o planner devolvia as 10
+            // primeiras na ordem do BTreeMap (lexicográfica do edge id) como se
+            // fossem as de maior belief. O padrão de nó ordenava; o de relação
+            // não — e o utilizador não tinha como suspeitar da assimetria.
+            if let Some((key, asc)) = order_by {
+                match key {
+                    OrderKey::Field(field) => {
+                        // Validar o campo UMA vez antes de ordenar: um campo que
+                        // não existe numa aresta é erro do utilizador, não `Null`
+                        // a ir para o fim em silêncio (o conjunto é fechado).
+                        edge_order_field(field)?;
+                        kept.sort_by(|a, b| {
+                            let ord =
+                                cmp_order(&edge_order_value(a, field), &edge_order_value(b, field));
+                            if *asc {
+                                ord
+                            } else {
+                                ord.reverse()
+                            }
+                        });
+                    }
+                    OrderKey::Dist(..) => {
+                        return Err(HeraclitusError::Query(
+                            "ORDER BY DIST não é suportado num padrão de relação: \
+                             uma aresta não tem embedding"
+                                .into(),
+                        ));
+                    }
+                }
             }
-            Ok(Json::Array(out))
+            if let Some(l) = limit {
+                kept.truncate(*l as usize);
+            }
+            Ok(Json::Array(
+                kept.iter()
+                    .map(|r| project_edge(r, returns, from_var, to_var, rel_var))
+                    .collect(),
+            ))
         }
         Plan::Neighbors { node, etype, as_of } => {
             let bound = resolve_as_of(as_of, be)?;
@@ -1373,5 +1683,524 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
             let lsn = be.append(label.as_deref(), props)?;
             Ok(json!({ "lsn": lsn }))
         }
+    }
+}
+
+#[cfg(test)]
+mod testes_rotulo_indice {
+    //! `MATCH (n:Kind)` tem de chegar ao indice `_kind`. Aqui o indice e o
+    //! varrimento DIVERGEM de proposito: o conteudo devolvido denuncia o
+    //! caminho que o planner tomou.
+    use super::*;
+    use crate::backend::*;
+    use heraclitus_core::{Episode, EventKind};
+    use heraclitus_index_graph::temporal::TemporalGraph;
+
+    fn ep(kind: &str, conteudo: &str) -> (Lsn, Episode) {
+        (
+            1,
+            Episode::new(
+                "a",
+                EventKind::Custom(kind.into()),
+                conteudo.as_bytes().to_vec(),
+            ),
+        )
+    }
+
+    #[derive(Default)]
+    struct Divergente {
+        /// Auditoria 2026-09-05: quantas vezes o zone-map skip-scan foi
+        /// SONDADO. Um EXPLAIN que anuncia o indice de atributos nao pode
+        /// pagar (nem poluir a EMA com) um caminho que nao vai ser usado.
+        sondas: std::cell::Cell<u32>,
+    }
+
+    impl QueryBackend for Divergente {
+        fn head(&self) -> Result<Lsn, HeraclitusError> {
+            Ok(10)
+        }
+        fn scan(&self, _as_of: Option<Lsn>) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
+            self.scan_range(0, 10)
+        }
+        /// O varrimento so conhece "via-scan".
+        fn scan_range(&self, _from: Lsn, _to: Lsn) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
+            Ok(vec![ep("Despesas", "via-scan"), ep("Outro", "ruido")])
+        }
+        /// A hidratacao de um LSN vindo do indice devolve o episodio do indice.
+        fn read_lsn(&self, lsn: Lsn) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
+            Ok((lsn == 1).then(|| ep("Despesas", "via-indice")))
+        }
+        /// O indice `_kind` so conhece "via-indice" — e so para o rotulo exacto.
+        fn attr_lookup(
+            &self,
+            field: &str,
+            value: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
+            Ok(Some(if field == "_kind" && value == "Despesas" {
+                vec![ep("Despesas", "via-indice")]
+            } else {
+                vec![] // indexavel mas ausente — como o Engine faz
+            }))
+        }
+        /// O skip-scan por zone maps CONTA as sondas e devolve o seu proprio
+        /// episodio: quem o tomar denuncia-se pelo conteudo.
+        fn scan_builtin_eq(
+            &self,
+            _field: &str,
+            _value: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<PrunedScanResult>, HeraclitusError> {
+            self.sondas.set(self.sondas.get() + 1);
+            Ok(Some(PrunedScanResult {
+                rows: vec![ep("Outro", "via-skip")],
+                stats: None,
+            }))
+        }
+        fn graph(&self) -> Result<TemporalGraph, HeraclitusError> {
+            unimplemented!("graph: fora do ambito deste mock")
+        }
+        fn append(
+            &self,
+            _label: Option<&str>,
+            _props: &[(String, Value)],
+        ) -> Result<Lsn, HeraclitusError> {
+            unimplemented!("append: fora do ambito deste mock")
+        }
+        fn recall(
+            &self,
+            _text: &str,
+            _k: usize,
+            _as_of: Option<Lsn>,
+        ) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError> {
+            unimplemented!("recall: fora do ambito deste mock")
+        }
+        fn nearest(
+            &self,
+            _vector: &[f32],
+            _k: usize,
+            _as_of: Option<Lsn>,
+        ) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError> {
+            unimplemented!("nearest: fora do ambito deste mock")
+        }
+        fn provenance(&self, _id: &str) -> Result<Vec<String>, HeraclitusError> {
+            unimplemented!("provenance: fora do ambito deste mock")
+        }
+        fn neighbors(
+            &self,
+            _node: &str,
+            _etype: Option<&str>,
+            _as_of: Option<Lsn>,
+            _min_confidence: f32,
+        ) -> Result<Vec<NeighborRow>, HeraclitusError> {
+            unimplemented!("neighbors: fora do ambito deste mock")
+        }
+        fn traverse(
+            &self,
+            _start: &str,
+            _max_depth: usize,
+            _as_of: Option<Lsn>,
+            _min_confidence: f32,
+        ) -> Result<Vec<(String, usize)>, HeraclitusError> {
+            unimplemented!("traverse: fora do ambito deste mock")
+        }
+        fn match_edges(
+            &self,
+            _src: Option<&str>,
+            _etype: Option<&str>,
+            _dst: Option<&str>,
+            _as_of: Option<Lsn>,
+        ) -> Result<Vec<EdgeRow>, HeraclitusError> {
+            unimplemented!("match_edges: fora do ambito deste mock")
+        }
+        fn community(
+            &self,
+            _node: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<CommunityResult>, HeraclitusError> {
+            unimplemented!("community: fora do ambito deste mock")
+        }
+        fn node_metrics(
+            &self,
+            _node: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<MetricsResult>, HeraclitusError> {
+            unimplemented!("node_metrics: fora do ambito deste mock")
+        }
+        fn edge_hypotheses(
+            &self,
+            _from: &str,
+            _to: &str,
+            _etype: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<EdgeHypotheses>, HeraclitusError> {
+            unimplemented!("edge_hypotheses: fora do ambito deste mock")
+        }
+        fn lsn_for_timestamp(&self, _ts_ms: u64) -> Result<Lsn, HeraclitusError> {
+            unimplemented!("lsn_for_timestamp: fora do ambito deste mock")
+        }
+        fn resolve_entity(
+            &self,
+            _key: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<String>, HeraclitusError> {
+            unimplemented!("resolve_entity: fora do ambito deste mock")
+        }
+        fn entity_cluster(
+            &self,
+            _entity_id: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Vec<String>, HeraclitusError> {
+            unimplemented!("entity_cluster: fora do ambito deste mock")
+        }
+    }
+
+    /// Auditoria 2026-09-05: o LIMIT tem de ser empurrado para a hidratação.
+    /// Um posting com 1 000 LSNs e `LIMIT 5` custa 5 leituras — não 1 000.
+    struct Contador {
+        leituras: std::cell::Cell<usize>,
+    }
+
+    impl QueryBackend for Contador {
+        fn head(&self) -> Result<Lsn, HeraclitusError> {
+            Ok(1000)
+        }
+        fn scan(&self, _as_of: Option<Lsn>) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
+            unimplemented!("o planner tem de ir pelo indice, nao pelo varrimento")
+        }
+        fn scan_range(&self, _from: Lsn, _to: Lsn) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
+            unimplemented!("o planner tem de ir pelo indice, nao pelo varrimento")
+        }
+        fn attr_lookup(
+            &self,
+            _field: &str,
+            _value: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
+            unimplemented!("o planner pede LSNs, nao episodios hidratados")
+        }
+        fn attr_lookup_lsns(
+            &self,
+            field: &str,
+            value: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
+            Ok((field == "cor" && value == "azul").then(|| (0..1000).collect()))
+        }
+        fn read_lsn(&self, lsn: Lsn) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
+            self.leituras.set(self.leituras.get() + 1);
+            let mut e = Episode::new("a", EventKind::Observation, vec![]);
+            e.attrs.insert("cor".into(), "azul".into());
+            Ok(Some((lsn, e)))
+        }
+        fn graph(&self) -> Result<TemporalGraph, HeraclitusError> {
+            unimplemented!("graph: fora do ambito deste mock")
+        }
+        fn append(
+            &self,
+            _label: Option<&str>,
+            _props: &[(String, Value)],
+        ) -> Result<Lsn, HeraclitusError> {
+            unimplemented!("append: fora do ambito deste mock")
+        }
+        fn recall(
+            &self,
+            _text: &str,
+            _k: usize,
+            _as_of: Option<Lsn>,
+        ) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError> {
+            unimplemented!("recall: fora do ambito deste mock")
+        }
+        fn nearest(
+            &self,
+            _vector: &[f32],
+            _k: usize,
+            _as_of: Option<Lsn>,
+        ) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError> {
+            unimplemented!("nearest: fora do ambito deste mock")
+        }
+        fn provenance(&self, _id: &str) -> Result<Vec<String>, HeraclitusError> {
+            unimplemented!("provenance: fora do ambito deste mock")
+        }
+        fn neighbors(
+            &self,
+            _node: &str,
+            _etype: Option<&str>,
+            _as_of: Option<Lsn>,
+            _min_confidence: f32,
+        ) -> Result<Vec<NeighborRow>, HeraclitusError> {
+            unimplemented!("neighbors: fora do ambito deste mock")
+        }
+        fn traverse(
+            &self,
+            _start: &str,
+            _max_depth: usize,
+            _as_of: Option<Lsn>,
+            _min_confidence: f32,
+        ) -> Result<Vec<(String, usize)>, HeraclitusError> {
+            unimplemented!("traverse: fora do ambito deste mock")
+        }
+        fn match_edges(
+            &self,
+            _src: Option<&str>,
+            _etype: Option<&str>,
+            _dst: Option<&str>,
+            _as_of: Option<Lsn>,
+        ) -> Result<Vec<EdgeRow>, HeraclitusError> {
+            unimplemented!("match_edges: fora do ambito deste mock")
+        }
+        fn community(
+            &self,
+            _node: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<CommunityResult>, HeraclitusError> {
+            unimplemented!("community: fora do ambito deste mock")
+        }
+        fn node_metrics(
+            &self,
+            _node: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<MetricsResult>, HeraclitusError> {
+            unimplemented!("node_metrics: fora do ambito deste mock")
+        }
+        fn edge_hypotheses(
+            &self,
+            _from: &str,
+            _to: &str,
+            _etype: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<EdgeHypotheses>, HeraclitusError> {
+            unimplemented!("edge_hypotheses: fora do ambito deste mock")
+        }
+        fn lsn_for_timestamp(&self, _ts_ms: u64) -> Result<Lsn, HeraclitusError> {
+            unimplemented!("lsn_for_timestamp: fora do ambito deste mock")
+        }
+        fn resolve_entity(
+            &self,
+            _key: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<String>, HeraclitusError> {
+            unimplemented!("resolve_entity: fora do ambito deste mock")
+        }
+        fn entity_cluster(
+            &self,
+            _entity_id: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Vec<String>, HeraclitusError> {
+            unimplemented!("entity_cluster: fora do ambito deste mock")
+        }
+    }
+
+    #[test]
+    fn limit_e_empurrado_para_a_hidratacao_do_indice() {
+        let be = Contador {
+            leituras: std::cell::Cell::new(0),
+        };
+        let lsns = |q: &str| -> Vec<u64> {
+            crate::execute(q, &be)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["lsn"].as_u64().unwrap())
+                .collect()
+        };
+        // Sem ORDER BY: 5 linhas, 5 leituras.
+        assert_eq!(
+            lsns("MATCH (n) WHERE n.cor = \"azul\" RETURN n LIMIT 5"),
+            vec![0, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            be.leituras.get(),
+            5,
+            "LIMIT 5 tem de custar 5 leituras, nao o posting inteiro"
+        );
+        // ORDER BY n.lsn DESC e a ordem natural invertida: 3 leituras, do fim.
+        be.leituras.set(0);
+        assert_eq!(
+            lsns("MATCH (n) WHERE n.cor = \"azul\" RETURN n ORDER BY n.lsn DESC LIMIT 3"),
+            vec![999, 998, 997]
+        );
+        assert_eq!(be.leituras.get(), 3);
+        // Um pos-filtro que rejeita: continua-se a ler ate encher — o corte
+        // e sobre linhas que PASSAM, nunca sobre candidatos.
+        be.leituras.set(0);
+        assert_eq!(
+            lsns("MATCH (n) WHERE n.cor = \"azul\" AND n.lsn >= 10 RETURN n LIMIT 2"),
+            vec![10, 11]
+        );
+        assert_eq!(be.leituras.get(), 12);
+        // Outro ORDER BY precisa do conjunto inteiro: hidrata tudo, como sempre.
+        be.leituras.set(0);
+        let v = lsns("MATCH (n) WHERE n.cor = \"azul\" RETURN n ORDER BY n.agent_id ASC LIMIT 2");
+        assert_eq!(v.len(), 2);
+        assert_eq!(be.leituras.get(), 1000);
+    }
+
+    fn conteudos(v: &serde_json::Value) -> Vec<String> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["content"].as_str().unwrap_or("").to_string())
+            .collect()
+    }
+
+    /// O defeito medido sobre 8 968 663 episodios reais: o rotulo so era
+    /// pos-filtro sobre o varrimento capado, e `MATCH (n:Despesas)` devolvia 0
+    /// linhas com os episodios a existirem. Com o rotulo encaminhado ao
+    /// indice, o resultado vem "via-indice".
+    #[test]
+    fn o_rotulo_do_padrao_chega_ao_indice_kind() {
+        let v = crate::execute("MATCH (n:Despesas) RETURN n", &Divergente::default()).unwrap();
+        assert_eq!(
+            conteudos(&v),
+            vec!["via-indice"],
+            "tinha de vir do indice, veio do varrimento"
+        );
+    }
+
+    /// Sem regressao: o indice e exacto, o pos-filtro nao. Um rotulo com outra
+    /// capitalizacao da `Some(vazio)` no indice e tem de RECUAR para o
+    /// varrimento (onde o pos-filtro insensivel o encontra) — nunca tomar o
+    /// vazio como resposta final.
+    #[test]
+    fn rotulo_com_capitalizacao_diferente_recua_para_o_varrimento() {
+        let v = crate::execute("MATCH (n:despesas) RETURN n", &Divergente::default()).unwrap();
+        assert_eq!(conteudos(&v), vec!["via-scan"]);
+    }
+
+    /// Um kind que nao existe: indice vazio, varrimento sem ele -> 0 linhas,
+    /// sem panico.
+    #[test]
+    fn kind_inexistente_da_zero_linhas() {
+        let v = crate::execute("MATCH (n:Fantasma) RETURN n", &Divergente::default()).unwrap();
+        assert!(conteudos(&v).is_empty());
+    }
+
+    /// Auditoria 2026-09-05: o EXPLAIN consultava UM so hint (o do skip-scan)
+    /// enquanto o executor decide por uma cascata de quatro caminhos. Para
+    /// `WHERE n.kind = "X" AND n.agent_id = "a"` imprimia contadores de I/O de
+    /// um plano que a query nunca faz — e PAGAVA a sonda (ate 250 000 leituras),
+    /// que alem disso escreve no slot `last_pruned_scan` e na EMA que decide
+    /// caminhos de acesso FUTUROS.
+    #[test]
+    fn explain_anuncia_o_caminho_que_a_execucao_toma() {
+        let explicar = |q: &str, be: &Divergente| -> String {
+            crate::execute(&format!("EXPLAIN {q}"), be)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        // (a) Indice de atributos vence o skip-scan — como no executor.
+        let be = Divergente::default();
+        let q = "MATCH (n) WHERE n.kind = \"Despesas\" AND n.agent_id = \"a\" RETURN n";
+        let saida = explicar(q, &be);
+        assert!(saida.contains("_kind"), "{saida}");
+        assert!(!saida.contains("StoragePruning"), "{saida}");
+        assert_eq!(
+            be.sondas.get(),
+            0,
+            "o EXPLAIN sondou um caminho que a execucao nao usa"
+        );
+        // EQUIVALENCIA: as LINHAS nao mudam e o conteudo denuncia o caminho —
+        // a execucao vai mesmo pelo indice, que e o que o EXPLAIN anuncia.
+        assert_eq!(
+            conteudos(&crate::execute(q, &be).unwrap()),
+            vec!["via-indice"]
+        );
+        assert_eq!(be.sondas.get(), 0, "a execucao tambem nao sonda o zone map");
+
+        // (b) Quando o skip-scan E o vencedor, o EXPLAIN continua a explica-lo
+        // (e a sonda-lo uma vez), como sempre fez.
+        let be = Divergente::default();
+        let q = "MATCH (n) WHERE n.agent_id = \"a\" RETURN n";
+        let saida = explicar(q, &be);
+        assert!(saida.contains("StoragePruning"), "{saida}");
+        assert_eq!(be.sondas.get(), 1);
+        assert_eq!(
+            conteudos(&crate::execute(q, &be).unwrap()),
+            vec!["via-skip"]
+        );
+
+        // (c) Rotulo do padrao, sem WHERE: o caminho e o indice `_kind`.
+        let be = Divergente::default();
+        let saida = explicar("MATCH (n:Despesas) RETURN n", &be);
+        assert!(saida.contains("_kind"), "{saida}");
+        assert_eq!(be.sondas.get(), 0);
+
+        // (d) Sem hint nenhum: varrimento por janela, anunciado como tal.
+        let be = Divergente::default();
+        let saida = explicar("MATCH (n) RETURN n", &be);
+        assert!(saida.contains("WindowScan"), "{saida}");
+        assert_eq!(be.sondas.get(), 0);
+    }
+}
+
+#[cfg(test)]
+mod testes_valid_at_precisao {
+    //! Auditoria 2026-09-05: o VALID AT chega ao comparador como `u64` exacto,
+    //! mas `valid_at_matches` degradava as fronteiras para `f64` — a mantissa
+    //! de 53 bits colapsa todos os valores de um mesmo quantum e a comparacao
+    //! inverte-se acima de 2^53 (tempo do mundo em nanossegundos: ~1,8e18).
+    use super::*;
+    use heraclitus_core::{Episode, EventKind};
+
+    const DOIS_53: u64 = 9_007_199_254_740_992; // 2^53
+    const DOIS_53_MAIS_1: u64 = 9_007_199_254_740_993; // nao representavel em f64
+
+    fn facto() -> Episode {
+        Episode::new("ag", EventKind::Observation, b"facto".to_vec())
+    }
+
+    /// `2^53+1 as f64` arredonda para `2^53`, logo `from <= t` dava true onde a
+    /// semantica exacta diz false: o facto AINDA NAO comecou.
+    #[test]
+    fn fronteira_inferior_acima_de_2_53_e_exacta() {
+        let mut e = facto();
+        e.valid_from = Some(DOIS_53_MAIS_1);
+        assert!(
+            !valid_at_matches(&e, DOIS_53),
+            "o facto so passa a valer em 2^53+1"
+        );
+        assert!(valid_at_matches(&e, DOIS_53_MAIS_1));
+    }
+
+    /// O erro corta nos DOIS sentidos: aqui o f64 excluia um facto ainda valido.
+    #[test]
+    fn fronteira_superior_acima_de_2_53_e_exacta() {
+        let mut e = facto();
+        e.valid_to = Some(DOIS_53_MAIS_1);
+        assert!(
+            valid_at_matches(&e, DOIS_53),
+            "2^53 ainda esta dentro de [from, to)"
+        );
+        assert!(
+            !valid_at_matches(&e, DOIS_53_MAIS_1),
+            "[from, to) e meio-aberto"
+        );
+    }
+
+    /// O fallback de compatibilidade (attrs, convencao pre-v4) e inteiro na
+    /// esmagadora maioria dos casos — tem de ser lido em u64, como ja acontece
+    /// do lado do grafo (`temporal.rs`).
+    #[test]
+    fn fallback_por_attrs_inteiro_e_exacto() {
+        let mut e = facto();
+        e.attrs
+            .insert("valid_from".into(), DOIS_53_MAIS_1.to_string());
+        assert!(!valid_at_matches(&e, DOIS_53));
+        assert!(valid_at_matches(&e, DOIS_53_MAIS_1));
+    }
+
+    /// Sem regressao: um attr NAO inteiro continua a ser aceite pelo f64 — se
+    /// deixasse de o ser, o facto passava silenciosamente a atemporal.
+    #[test]
+    fn fallback_por_attrs_nao_inteiro_continua_a_valer() {
+        let mut e = facto();
+        e.attrs.insert("valid_from".into(), "1000.5".into());
+        assert!(!valid_at_matches(&e, 1000), "1000.5 <= 1000 e falso");
+        assert!(valid_at_matches(&e, 1001));
     }
 }

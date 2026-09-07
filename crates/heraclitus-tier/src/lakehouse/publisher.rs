@@ -5,7 +5,7 @@
 //! cair depois do Delta e antes dele, a reabertura encontra o `add` no log
 //! Delta e conclui apenas o watermark; nunca cria uma segunda adição lógica.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -13,10 +13,10 @@ use heraclitus_core::HeraclitusError;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions};
 
-use super::delta::{self, DeltaCommit};
+use super::delta::{self, Action, Add, DeltaCommit};
 use super::iceberg::{self, IcebergDataFile, IcebergTable};
 use super::parquet_export::{data_path, read_lsns, read_provenance};
-use super::{ExportDecision, ExportWatermark, ExportedFile};
+use super::{ExportDecision, ExportProvenance, ExportWatermark, ExportedFile};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishResult {
@@ -150,7 +150,9 @@ impl LakehousePublisher {
             next_live.remove(old);
         }
         next_live.insert(file.path.clone());
-        let data_files = self.load_live_metadata(&next_live, Some(file)).await?;
+        let data_files = self
+            .load_live_metadata(&next_live, Some(file), &commits)
+            .await?;
 
         let (last_iceberg_sequence, parent_snapshot, _) = self
             .latest_iceberg_state()
@@ -326,11 +328,28 @@ impl LakehousePublisher {
     }
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, HeraclitusError> {
+        Ok(self
+            .list_prefix_com_tamanho(prefix)
+            .await?
+            .into_iter()
+            .map(|(caminho, _)| caminho)
+            .collect())
+    }
+
+    /// O mesmo LIST, guardando o `size` que o `ObjectMeta` já traz.
+    ///
+    /// Auditoria 2026-09-05, A16: um LIST diz, num único pedido e sem
+    /// transferir dados, que objectos existem e quanto pesam. É o que
+    /// substitui o GET integral de cada Parquet vivo a cada publicação.
+    async fn list_prefix_com_tamanho(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, u64)>, HeraclitusError> {
         let mut stream = self.store.list(Some(&ObjPath::from(prefix)));
         let mut out = Vec::new();
         while let Some(item) = stream.next().await {
             let meta = item.map_err(|e| store_error(prefix, e))?;
-            out.push(meta.location.to_string());
+            out.push((meta.location.to_string(), meta.size));
         }
         out.sort();
         Ok(out)
@@ -374,38 +393,120 @@ impl LakehousePublisher {
         Ok(out)
     }
 
+    /// Os metadados dos Parquet vivos que entram no snapshot Iceberg.
+    ///
+    /// Auditoria 2026-09-05, A16: isto fazia um GET integral de CADA ficheiro
+    /// vivo e duas passagens de Parquet por cima (`read_provenance` +
+    /// `read_lsns`) a cada publicação. Como o conjunto vivo cresce um ficheiro
+    /// por segmento e só encolhe num repack, publicar N segmentos custava
+    /// O(N²) bytes de rede — com o `segment_max_bytes` por omissão de 8 MiB,
+    /// publicar 625 segmentos lia centenas de GB só para preencher quatro
+    /// campos que o log Delta já guarda em cada acção `add` e que
+    /// `load_delta_commits` já trouxe para RAM: `path`, `size`,
+    /// `stats.numRecords` e as `tags` de proveniência. Passam a ser derivados
+    /// daí.
+    ///
+    /// O que se perde, e onde foi parar: o GET era também a única
+    /// reverificação dos bytes dos ficheiros ANTIGOS. Presença e tamanho
+    /// continuam verificados — agora por um único LIST, O(1) em pedidos — e a
+    /// verificação interna (LSNs contra a proveniência) passa a viver em
+    /// [`Self::verificar_ficheiros_vivos`], que um `doctor` corre quando
+    /// quiser em vez de N vezes ao publicar N segmentos. O ficheiro que ENTRA
+    /// continua verificado byte a byte por `validate_export` e `put_parquet`.
     async fn load_live_metadata(
         &self,
         paths: &BTreeSet<String>,
         incoming: Option<&ExportedFile>,
+        commits: &[DeltaCommit],
     ) -> Result<Vec<IcebergDataFile>, HeraclitusError> {
+        let adds = ultimos_adds(commits);
+        let mut tamanhos: BTreeMap<String, u64> = BTreeMap::new();
+        let mut listado = false;
         let mut out = Vec::with_capacity(paths.len());
         for path in paths {
             if let Some(file) = incoming.filter(|f| &f.path == path) {
                 out.push(IcebergDataFile::from(file));
                 continue;
             }
-            let bytes = self
-                .get(path)
-                .await?
-                .ok_or_else(|| HeraclitusError::Corruption {
-                    context: "catálogo lakehouse".into(),
-                    detail: format!("Parquet vivo `{path}` está ausente"),
-                })?;
-            let provenance = read_provenance(&bytes)?;
-            let lsns = read_lsns(&bytes)?;
-            if lsns.len() as u64 != provenance.record_count {
+            let derivado = match adds.get(path.as_str()) {
+                Some(add) => data_file_do_add(path, add)?,
+                None => None,
+            };
+            let Some(data_file) = derivado else {
+                // Acção `add` sem tudo o que é preciso (log escrito por uma
+                // versão anterior): lê-se o ficheiro, e só este.
+                out.push(self.data_file_do_store(path).await?);
+                continue;
+            };
+            if !listado {
+                tamanhos = self
+                    .list_prefix_com_tamanho("data")
+                    .await?
+                    .into_iter()
+                    .collect();
+                listado = true;
+            }
+            let Some(tamanho) = tamanhos.get(path.as_str()).copied() else {
                 return Err(HeraclitusError::Corruption {
                     context: "catálogo lakehouse".into(),
-                    detail: format!("Parquet vivo `{path}` tem contagem inválida"),
+                    detail: format!("Parquet vivo `{path}` está ausente"),
+                });
+            };
+            if tamanho != data_file.file_size {
+                return Err(HeraclitusError::Corruption {
+                    context: "catálogo lakehouse".into(),
+                    detail: format!(
+                        "Parquet vivo `{path}` tem {tamanho} bytes, o log Delta declara {}",
+                        data_file.file_size
+                    ),
                 });
             }
-            out.push(IcebergDataFile {
-                path: path.clone(),
-                file_size: bytes.len() as u64,
-                rows: lsns.len() as u64,
-                provenance,
+            out.push(data_file);
+        }
+        out.sort_by_key(|f| (f.provenance.segment_id, f.provenance.generation));
+        Ok(out)
+    }
+
+    /// Os metadados de um Parquet vivo lidos dos próprios bytes.
+    ///
+    /// O caminho lento e completo: vivia inline em `load_live_metadata` e
+    /// continua a ser o oráculo contra o qual a derivação pelas acções `add` é
+    /// comparada nos testes.
+    async fn data_file_do_store(&self, path: &str) -> Result<IcebergDataFile, HeraclitusError> {
+        let bytes = self
+            .get(path)
+            .await?
+            .ok_or_else(|| HeraclitusError::Corruption {
+                context: "catálogo lakehouse".into(),
+                detail: format!("Parquet vivo `{path}` está ausente"),
+            })?;
+        let provenance = read_provenance(&bytes)?;
+        let lsns = read_lsns(&bytes)?;
+        if lsns.len() as u64 != provenance.record_count {
+            return Err(HeraclitusError::Corruption {
+                context: "catálogo lakehouse".into(),
+                detail: format!("Parquet vivo `{path}` tem contagem inválida"),
             });
+        }
+        Ok(IcebergDataFile {
+            path: path.to_string(),
+            file_size: bytes.len() as u64,
+            rows: lsns.len() as u64,
+            provenance,
+        })
+    }
+
+    /// Relê, byte a byte, todos os Parquet vivos da tabela.
+    ///
+    /// Auditoria 2026-09-05, A16: é aqui que passa a viver a verificação
+    /// completa que a publicação deixou de fazer por cada segmento. Não está
+    /// no caminho de escrita de propósito: custa O(bytes da tabela) e um
+    /// `doctor` corre-a quando quer, não N vezes ao publicar N segmentos.
+    pub async fn verificar_ficheiros_vivos(&self) -> Result<Vec<IcebergDataFile>, HeraclitusError> {
+        let commits = self.load_delta_commits().await?;
+        let mut out = Vec::new();
+        for path in delta::estado_dos_ficheiros(&commits) {
+            out.push(self.data_file_do_store(&path).await?);
         }
         out.sort_by_key(|f| (f.provenance.segment_id, f.provenance.generation));
         Ok(out)
@@ -457,6 +558,69 @@ impl LakehousePublisher {
         let current = json["current-snapshot-id"].as_i64();
         Ok(Some((sequence, current, path)))
     }
+}
+
+/// A última acção `add` de cada caminho, por ordem de versão do log.
+///
+/// Um repack reescreve o segmento numa geração nova, logo num caminho novo;
+/// mas um caminho removido e mais tarde readicionado tem de ficar com o `add`
+/// mais recente, e é por isso que a iteração é ordenada por versão.
+fn ultimos_adds(commits: &[DeltaCommit]) -> BTreeMap<&str, &Add> {
+    let mut ordenados: Vec<&DeltaCommit> = commits.iter().collect();
+    ordenados.sort_by_key(|c| c.version);
+    let mut out: BTreeMap<&str, &Add> = BTreeMap::new();
+    for commit in ordenados {
+        for accao in &commit.actions {
+            if let Action::Add(add) = accao {
+                out.insert(add.path.as_str(), add.as_ref());
+            }
+        }
+    }
+    out
+}
+
+/// Reconstrói os metadados Iceberg de um Parquet vivo a partir da acção `add`
+/// que o log Delta já guarda — sem tocar nos bytes do ficheiro.
+///
+/// `Ok(None)` significa "esta acção não chega": quem chama lê o Parquet. Nunca
+/// se inventa um valor por omissão, porque estes quatro campos entram nos
+/// bytes do manifest Iceberg e um `unwrap_or(0)` mudaria o `snapshot_id` sem
+/// barulho nenhum.
+fn data_file_do_add(path: &str, add: &Add) -> Result<Option<IcebergDataFile>, HeraclitusError> {
+    let Some(tags) = add.tags.as_ref() else {
+        return Ok(None);
+    };
+    let Ok(provenance) = ExportProvenance::from_key_values(tags) else {
+        return Ok(None);
+    };
+    let Some(stats) = add.stats.as_ref() else {
+        return Ok(None);
+    };
+    let Ok(stats) = serde_json::from_str::<serde_json::Value>(stats) else {
+        return Ok(None);
+    };
+    let Some(rows) = stats.get("numRecords").and_then(|v| v.as_u64()) else {
+        return Ok(None);
+    };
+    // O que o GET apurava de caminho sobre os ficheiros antigos: contagem e
+    // proveniência têm de concordar. Aqui a comparação é entre duas partes do
+    // MESMO `add`, e uma discordância significa um log Delta incoerente.
+    if rows != provenance.record_count {
+        return Err(HeraclitusError::Corruption {
+            context: "catálogo lakehouse".into(),
+            detail: format!(
+                "Parquet vivo `{path}` tem contagem inválida: o `add` declara {rows} registos \
+                 e a proveniência {}",
+                provenance.record_count
+            ),
+        });
+    }
+    Ok(Some(IcebergDataFile {
+        path: path.to_string(),
+        file_size: add.size,
+        rows,
+        provenance,
+    }))
 }
 
 fn snapshot_id(sequence: i64, files: &[IcebergDataFile]) -> i64 {
@@ -619,6 +783,126 @@ mod tests {
         );
         let live = delta::estado_dos_ficheiros(&p.load_delta_commits().await.unwrap());
         assert_eq!(live, vec![g1.path]);
+    }
+
+    #[tokio::test]
+    async fn publicar_nao_rele_os_bytes_dos_parquet_ja_publicados() {
+        // Auditoria 2026-09-05, A16: a publicação derivava os metadados de
+        // TODOS os Parquet vivos relendo-os do object store, o que torna
+        // publicar N segmentos O(N^2) em bytes. Prova-se aqui pela
+        // consequência observável: substituir os bytes dos ficheiros ANTIGOS
+        // por lixo do MESMO tamanho não pode mudar um único byte da metadata
+        // publicada — se mudasse (ou rebentasse), é porque foram lidos.
+        let ficheiros = [exported(1, 0, 0), exported(2, 0, 2), exported(3, 0, 4)];
+
+        let store_ref: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let p_ref = publisher(Arc::clone(&store_ref));
+        for (i, f) in ficheiros.iter().enumerate() {
+            p_ref.publish(f, 1000 + i as i64).await.unwrap();
+        }
+        let esperado = p_ref
+            .get("metadata/v00003.metadata.json")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let p = publisher(Arc::clone(&store));
+        for (i, f) in ficheiros.iter().enumerate() {
+            for anterior in &ficheiros[..i] {
+                store
+                    .put(
+                        &ObjPath::from(anterior.path.as_str()),
+                        vec![0xAB; anterior.bytes.len()].into(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            p.publish(f, 1000 + i as i64).await.unwrap();
+        }
+        let obtido = p
+            .get("metadata/v00003.metadata.json")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            obtido, esperado,
+            "a metadata publicada dependeu dos bytes dos Parquet antigos"
+        );
+    }
+
+    #[tokio::test]
+    async fn parquet_vivo_ausente_ou_com_tamanho_errado_continua_a_ser_detectado() {
+        // Auditoria 2026-09-05, A16: deixar de reler os bytes não pode
+        // significar deixar de olhar. Presença e tamanho de cada Parquet vivo
+        // passam a ser verificados por um único LIST, e continuam a ser
+        // `Corruption` — não um snapshot Iceberg a apontar para o vazio.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let p = publisher(Arc::clone(&store));
+        let f1 = exported(1, 0, 0);
+        let f2 = exported(2, 0, 2);
+        p.publish(&f1, 1000).await.unwrap();
+
+        store
+            .put(&ObjPath::from(f1.path.as_str()), vec![0xAB; 7].into())
+            .await
+            .unwrap();
+        let e = p.publish(&f2, 2000).await.unwrap_err().to_string();
+        assert!(e.contains("tem 7 bytes"), "erro inesperado: {e}");
+
+        store
+            .delete(&ObjPath::from(f1.path.as_str()))
+            .await
+            .unwrap();
+        let e = p.publish(&f2, 2000).await.unwrap_err().to_string();
+        assert!(e.contains("está ausente"), "erro inesperado: {e}");
+    }
+
+    #[tokio::test]
+    async fn metadados_das_accoes_add_sao_iguais_aos_lidos_do_parquet() {
+        // Auditoria 2026-09-05, A16: a optimização só é legítima se o
+        // resultado for o MESMO. O oráculo é o caminho antigo, que continua a
+        // existir em `verificar_ficheiros_vivos`; a comparação é campo a campo
+        // e por ordem, porque é a ordem que fixa os bytes do manifest.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let p = publisher(Arc::clone(&store));
+        p.publish(&exported(1, 0, 0), 1000).await.unwrap();
+        p.publish(&exported(2, 0, 2), 2000).await.unwrap();
+        // Um repack, para o conjunto vivo não ser só uma lista de `add`.
+        p.publish(&exported(9, 0, 4), 3000).await.unwrap();
+        p.publish(&exported(9, 1, 4), 4000).await.unwrap();
+
+        let commits = p.load_delta_commits().await.unwrap();
+        let vivos: BTreeSet<String> = delta::estado_dos_ficheiros(&commits).into_iter().collect();
+        assert_eq!(vivos.len(), 3, "o repack não removeu a geração anterior");
+
+        let derivado = p.load_live_metadata(&vivos, None, &commits).await.unwrap();
+        let do_store = p.verificar_ficheiros_vivos().await.unwrap();
+        assert_eq!(derivado, do_store);
+    }
+
+    #[tokio::test]
+    async fn o_doctor_rele_os_bytes_e_apanha_o_parquet_corrompido() {
+        // Auditoria 2026-09-05, A16: a verificação byte a byte dos ficheiros
+        // antigos saiu do caminho de escrita, mas não desapareceu. Este é o
+        // sítio onde ela passou a viver.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let p = publisher(Arc::clone(&store));
+        let f = exported(4, 0, 8);
+        p.publish(&f, 1000).await.unwrap();
+        assert_eq!(p.verificar_ficheiros_vivos().await.unwrap().len(), 1);
+
+        // Lixo do MESMO tamanho: o LIST da publicação não o distingue, o
+        // `doctor` sim.
+        store
+            .put(
+                &ObjPath::from(f.path.as_str()),
+                vec![0xAB; f.bytes.len()].into(),
+            )
+            .await
+            .unwrap();
+        let e = p.verificar_ficheiros_vivos().await.unwrap_err().to_string();
+        assert!(e.contains("Parquet"), "erro inesperado: {e}");
     }
 
     #[test]

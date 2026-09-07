@@ -33,6 +33,13 @@ const CACHE_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024; // 64MB Cache
 const BLOOM_FILTER_SIZE_BYTES: usize = 64; // Filtro de Bloom de 512 bits por página
 const SIG_SIZE: usize = 32;
 const NUM_SHARDS: usize = 32; // Expandido para 32 shards para alta concorrência multi-core
+/// Alvo da evicção em lote: uma varredura liberta até 90% do tecto, em vez de
+/// um frame de cada vez (Auditoria 2026-09-05, A44).
+const CACHE_EVICT_TARGET_PERCENT: usize = 90;
+/// Faltas de cache saltadas depois de uma varredura de evicção que não achou
+/// candidato nenhum (tudo sujo/pinado). Contagem, não flag: a evicção volta
+/// sozinha mesmo que ninguém limpe um bit de sujo.
+const EVICT_SCAN_BACKOFF: usize = 256;
 
 // Constantes de layout auto-documentadas para offsets físicos da página
 const OFF_PAGE_TYPE: usize = 0;
@@ -186,6 +193,15 @@ pub struct TreeMetrics {
     pub bloom_hits: AtomicUsize,
     pub bloom_misses: AtomicUsize,
     pub versions_pruned: AtomicUsize,
+    /// Fusões efectivas de um filho no irmão esquerdo (`merge_or_borrow_cascade`).
+    /// Existe para que o teste de shadow paging da Auditoria 2026-09-05 (A24)
+    /// possa provar que o caminho do merge foi mesmo exercitado — sem isto o
+    /// teste passaria por vacuidade se o orçamento nunca deixasse fundir.
+    pub merges_cascade: AtomicUsize,
+    /// Frames visitados pelas varreduras de evicção do cache. Auditoria
+    /// 2026-09-05 (A44): é a única forma honesta de afirmar num teste
+    /// determinista que o custo por falta de cache é amortizado, e não O(F).
+    pub evict_scan_frames: AtomicUsize,
 }
 
 pub trait PageStore: Send + Sync {
@@ -368,6 +384,20 @@ impl Superblock {
         let next_page_id = read_u64(data, 22)?;
         let free_list_head = read_u64(data, 30)?;
         let free_list_len = read_u32(data, 38)?;
+        // Auditoria 2026-09-05 (A43): o superbloco vem do DISCO e este campo é
+        // usado como índice directo no array de MAX_SB_FREE_LIST de
+        // `allocate_id` — um valor construído entrava em pânico de índice na
+        // primeira alocação, a meio de uma escrita. CRC32 e Blake3 não são com
+        // chave: provam integridade contra corrupção acidental, não contra um
+        // ficheiro fabricado. Mesmo critério de `DiskNode::deserialize`, que já
+        // recusa um `slot_count` que não cabe na página. A lista CHEIA
+        // (`== MAX_SB_FREE_LIST`) é legítima: só `>` é recusado.
+        if free_list_len as usize > MAX_SB_FREE_LIST {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "free_list_len do superbloco excede MAX_SB_FREE_LIST",
+            ));
+        }
         let mut free_list = [0u64; MAX_SB_FREE_LIST];
         let mut pos = 42;
         for slot in free_list.iter_mut() {
@@ -488,13 +518,20 @@ impl DiskNode {
         size
     }
 
+    /// Auditoria 2026-09-05 (A42): o prefixo tem de cobrir TAMBÉM as chaves do
+    /// buffer, não só os separadores. `deserialize` reconstrói sempre
+    /// `prefixo ++ sufixo` e o layout v5 não guarda bit nenhum a dizer que o
+    /// corte não foi aplicado; um prefixo que não cobrisse uma chave do buffer
+    /// devolvia-a do disco como `prefixo ++ chave` (com um único separador o
+    /// prefixo era a chave separadora INTEIRA). O prefixo só encurta — as
+    /// páginas comprimem um pouco menos, o formato em disco não muda.
     fn calculate_common_prefix(&self) -> Vec<u8> {
-        if self.keys.is_empty() {
+        let mut candidatas = self.keys.iter().chain(self.buffer.keys());
+        let Some(first) = candidatas.next() else {
             return Vec::new();
-        }
-        let first = &self.keys[0];
+        };
         let mut prefix_len = first.len();
-        for key in self.keys.iter().skip(1) {
+        for key in candidatas {
             let match_len = key
                 .iter()
                 .zip(first.iter())
@@ -692,11 +729,18 @@ impl DiskNode {
                 .copy_from_slice(&(self.buffer.len() as u32).to_le_bytes());
             *slot_pos += 4;
             for (bk, msg_vec) in &self.buffer {
-                let bk_suffix = if bk.starts_with(prefix) {
-                    &bk[prefix.len()..]
-                } else {
-                    bk.as_slice()
-                };
+                // Auditoria 2026-09-05 (A42): gravar a chave INTEIRA quando ela
+                // não começava pelo prefixo era silenciosamente irreversível —
+                // `deserialize` prefixa sempre. Desde que o prefixo cobre também
+                // o buffer (ver `calculate_common_prefix`) o corte é sempre
+                // válido; o erro explícito guarda a invariante em vez de a
+                // presumir, e nunca dispara com um nó construído por esta crate.
+                let bk_suffix = bk.strip_prefix(prefix).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Chave do buffer fora do prefixo comum da página",
+                    )
+                })?;
                 if bk_suffix.len() > *payload_pos || *payload_pos - bk_suffix.len() < *slot_pos {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -1063,6 +1107,13 @@ pub struct BEpsilonTree {
     /// durável a apontar para uma página FreeList (árvore ilegível).
     pending_recycle: std::sync::Mutex<Vec<u64>>,
     pub metrics: Arc<TreeMetrics>,
+    /// Tecto de memória do cache de nós. Campo (e não a constante directa)
+    /// para que os testes de evicção possam baixá-lo — encher 64 MB de frames
+    /// levaria dezenas de milhares de páginas. Por omissão é sempre
+    /// `CACHE_MEMORY_BUDGET_BYTES`: nenhum caminho de produção o altera.
+    cache_budget_bytes: usize,
+    /// Varreduras de evicção a saltar (ver `evict_cache_batch`).
+    evict_scan_backoff: AtomicUsize,
 }
 
 impl BEpsilonTree {
@@ -1126,6 +1177,8 @@ impl BEpsilonTree {
                 dirty_page_table: std::sync::Mutex::new(HashSet::new()),
                 pending_recycle: std::sync::Mutex::new(Vec::new()),
                 metrics,
+                cache_budget_bytes: CACHE_MEMORY_BUDGET_BYTES,
+                evict_scan_backoff: AtomicUsize::new(0),
             };
             let size = root.estimate_memory_footprint();
             {
@@ -1182,6 +1235,8 @@ impl BEpsilonTree {
             dirty_page_table: std::sync::Mutex::new(HashSet::new()),
             pending_recycle: std::sync::Mutex::new(Vec::new()),
             metrics,
+            cache_budget_bytes: CACHE_MEMORY_BUDGET_BYTES,
+            evict_scan_backoff: AtomicUsize::new(0),
         })
     }
 
@@ -1291,6 +1346,89 @@ impl BEpsilonTree {
                 .fetch_sub(frame.byte_size, Ordering::Release);
         }
         self.dirty_page_table.lock().unwrap().remove(&id);
+        // A44: libertou-se espaço fora da evicção — a próxima falta pode voltar
+        // a varrer com proveito, por isso o backoff perde a razão de ser.
+        self.evict_scan_backoff.store(0, Ordering::Release);
+    }
+
+    /// Liberta memória de cache até ao ALVO, numa única varredura.
+    ///
+    /// Auditoria 2026-09-05 (A44): a versão anterior varria os 32 shards e
+    /// TODOS os frames para escolher UM candidato — O(F) por falta de cache,
+    /// e a varredura repetia-se em cada falta porque cada página nova punha o
+    /// cache logo acima do tecto outra vez. Pior, quando não havia candidato
+    /// limpo (regime de escrita do `from_map`, em que os internos estão sujos
+    /// até ao commit) a varredura completa era paga na mesma e não libertava
+    /// um único byte. Aqui uma varredura recolhe TODOS os candidatos e liberta
+    /// em lote até 90% do tecto — o custo passa a ser amortizado por milhares
+    /// de despejos — e uma varredura estéril arma um backoff por CONTAGEM
+    /// (nunca uma flag pegajosa: a evicção volta sozinha) que salta as
+    /// varreduras seguintes até haver de novo candidatos.
+    ///
+    /// Só decide QUE frames LIMPOS ficam em memória: nada do que se lê muda.
+    /// Mantém a regra R18 — nunca dois locks de shard ao mesmo tempo, e nunca
+    /// o do shard alvo durante a varredura.
+    fn evict_cache_batch(&self, root_id: u64) {
+        if self.current_cache_bytes.load(Ordering::Acquire) < self.cache_budget_bytes {
+            return;
+        }
+        let restante = self.evict_scan_backoff.load(Ordering::Acquire);
+        if restante > 0 {
+            // Decremento saturante: com corridas o pior caso é gastar o
+            // backoff mais depressa, nunca dar a volta ao contador.
+            let _ = self.evict_scan_backoff.compare_exchange(
+                restante,
+                restante - 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+            return;
+        }
+
+        let mut candidatos: Vec<(u64, usize, u64)> = Vec::new();
+        let mut visitados = 0usize;
+        for (s_idx, shard_lock) in self.cache_shards.iter().enumerate() {
+            let shard = shard_lock.lock().unwrap();
+            visitados += shard.len();
+            for (&cid, frame) in shard.iter() {
+                if cid != root_id
+                    && frame.pin_count.load(Ordering::Acquire) == 0
+                    && !frame.is_dirty.load(Ordering::Acquire)
+                {
+                    candidatos.push((frame.last_access.load(Ordering::Acquire), s_idx, cid));
+                }
+            }
+        }
+        self.metrics
+            .evict_scan_frames
+            .fetch_add(visitados, Ordering::Relaxed);
+
+        if candidatos.is_empty() {
+            self.evict_scan_backoff
+                .store(EVICT_SCAN_BACKOFF, Ordering::Release);
+            return;
+        }
+        candidatos.sort_unstable(); // LRU primeiro (last_access crescente)
+
+        let alvo = self.cache_budget_bytes / 100 * CACHE_EVICT_TARGET_PERCENT;
+        for (_, s_idx, cid) in candidatos {
+            if self.current_cache_bytes.load(Ordering::Acquire) <= alvo {
+                break;
+            }
+            let mut shard = self.cache_shards[s_idx].lock().unwrap();
+            // Revalida sob o lock: entre a varredura e agora outra thread pode
+            // ter pinado ou sujado o frame. Um candidato perdido salta-se —
+            // terminar o lote aqui traria de volta a varredura por despejo.
+            let evictable = shard.get(&cid).is_some_and(|f| {
+                f.pin_count.load(Ordering::Acquire) == 0 && !f.is_dirty.load(Ordering::Acquire)
+            });
+            if evictable {
+                if let Some(removed) = shard.remove(&cid) {
+                    self.current_cache_bytes
+                        .fetch_sub(removed.byte_size, Ordering::Release);
+                }
+            }
+        }
     }
 
     fn acquire_node_guard(&self, id: u64) -> io::Result<PageGuard> {
@@ -1318,41 +1456,7 @@ impl BEpsilonTree {
         // cruzado entre threads. Aqui cada shard é trancado transitoriamente,
         // um de cada vez.
         self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
-        while self.current_cache_bytes.load(Ordering::Acquire) >= CACHE_MEMORY_BUDGET_BYTES {
-            let mut lru_id = None;
-            let mut min_tick = u64::MAX;
-            let mut target_shard_idx = 0;
-            for (s_idx, shard_lock) in self.cache_shards.iter().enumerate() {
-                let shard = shard_lock.lock().unwrap();
-                for (&cid, frame) in shard.iter() {
-                    if frame.pin_count.load(Ordering::Acquire) == 0 && cid != root_id {
-                        let acc = frame.last_access.load(Ordering::Acquire);
-                        if acc < min_tick && !frame.is_dirty.load(Ordering::Acquire) {
-                            min_tick = acc;
-                            lru_id = Some(cid);
-                            target_shard_idx = s_idx;
-                        }
-                    }
-                }
-            }
-            if let Some(lid) = lru_id {
-                let mut shard = self.cache_shards[target_shard_idx].lock().unwrap();
-                // Revalida sob o lock (outra thread pode ter pinado entretanto).
-                let evictable = shard
-                    .get(&lid)
-                    .is_some_and(|f| f.pin_count.load(Ordering::Acquire) == 0);
-                if evictable {
-                    if let Some(removed) = shard.remove(&lid) {
-                        self.current_cache_bytes
-                            .fetch_sub(removed.byte_size, Ordering::Release);
-                    }
-                } else {
-                    break; // candidato desapareceu/foi pinado — evita loop
-                }
-            } else {
-                break;
-            }
-        }
+        self.evict_cache_batch(root_id);
 
         // Leitura + decode fora de qualquer lock.
         let mut buf = vec![0u8; PAGE_SIZE];
@@ -1402,9 +1506,17 @@ impl BEpsilonTree {
         let mut sb = self.superblock.write().unwrap();
 
         let id = if sb.free_list_len > 0 {
-            sb.free_list_len -= 1;
-            let slot = sb.free_list_len as usize;
-            let r_id = sb.free_list[slot];
+            // A43, defesa em profundidade: o slot é validado ANTES de mexer em
+            // `free_list_len` — falhar depois do decremento deixaria o
+            // superbloco em memória meio-mexido, com o contador já gasto.
+            let slot = (sb.free_list_len - 1) as usize;
+            let r_id = *sb.free_list.get(slot).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "slot da free list do superbloco fora dos limites",
+                )
+            })?;
+            sb.free_list_len = slot as u32;
             sb.free_list[slot] = 0;
             r_id
         } else if sb.free_list_head > 0 {
@@ -1683,8 +1795,19 @@ impl BEpsilonTree {
                 Msg::Delete(_) => {
                     if let Ok(i) = root.keys.binary_search(&key) {
                         if (root.slots[i].flags & FLAG_OVERFLOW) != 0 {
+                            // Auditoria 2026-09-05 (A45): o slot deixou MESMO
+                            // de ter cadeia — além do ponteiro há que apagar o
+                            // bit e o valor em memória. FLAG_OVERFLOW com
+                            // `overflow_page == 0` é a combinação que
+                            // `verify_tree_integrity` classifica como
+                            // corrupção; e limpar só o bit faz o `serialize`
+                            // voltar a inline-izar o valor grande e estourar a
+                            // página. As três linhas são indissociáveis.
                             self.recycle_overflow_chain(root.slots[i].overflow_page)?;
                             root.slots[i].overflow_page = 0;
+                            root.slots[i].length = 0;
+                            root.slots[i].flags &= !FLAG_OVERFLOW;
+                            root.vals[i].clear();
                         }
                         root.slots[i].flags |= FLAG_GHOST;
                     }
@@ -1764,7 +1887,15 @@ impl BEpsilonTree {
         }
 
         let mut right_keys = old_keys.split_off(mid);
-        let right_slots = old_slots.split_off(mid);
+        // Os slots de um no INTERNO sao derivados: `serialize_slots_and_payload`
+        // itera `keys` e le `slots.get(i)` com omissao, e um pivo que sobe ao
+        // pai entra em `keys`/`children` sem slot. Logo um no interno pode ter
+        // `slots.len() < keys.len()` — a raiz depois do primeiro split, ou um
+        // filho que recebeu pivos — e `split_off(mid)` sobre um Vec curto ou
+        // vazio com `mid > len` e PANICO deterministico assim que a arvore
+        // cresce. Dividir por `min(mid, len)` nunca rebenta e continua alinhado
+        // quando os slots existem.
+        let mut right_slots = old_slots.split_off(mid.min(old_slots.len()));
         let right_vals = if root.is_leaf() {
             old_vals.split_off(mid)
         } else {
@@ -1779,6 +1910,11 @@ impl BEpsilonTree {
         // CORREÇÃO E ENRIJECIMENTO DO SPLIT INTERNAL: O pivot sobe e é removido da chave do filho direito
         if !root.is_leaf() && !right_keys.is_empty() {
             right_keys.remove(0);
+            // O slot do pivo sai com ele — senao `keys` e `slots` do filho
+            // direito ficam desalinhados por um.
+            if !right_slots.is_empty() {
+                right_slots.remove(0);
+            }
         }
 
         let start_idx = if root.is_leaf() { mid } else { mid + 1 };
@@ -1923,8 +2059,16 @@ impl BEpsilonTree {
                             Msg::Delete(_) => {
                                 if let Ok(i) = child.keys.binary_search(&k) {
                                     if (child.slots[i].flags & FLAG_OVERFLOW) != 0 {
+                                        // A45: ver o ramo gémeo raiz-folha. Aqui
+                                        // o defeito não era mascarado por
+                                        // compactação nenhuma — o slot fantasma
+                                        // ia para o disco a afirmar que tinha
+                                        // cadeia, com o ponteiro a zero.
                                         self.recycle_overflow_chain(child.slots[i].overflow_page)?;
                                         child.slots[i].overflow_page = 0;
+                                        child.slots[i].length = 0;
+                                        child.slots[i].flags &= !FLAG_OVERFLOW;
+                                        child.vals[i].clear();
                                     }
                                     child.slots[i].flags |= FLAG_GHOST;
                                 }
@@ -2015,7 +2159,15 @@ impl BEpsilonTree {
         }
 
         let mut right_keys = old_keys.split_off(mid);
-        let right_slots = old_slots.split_off(mid);
+        // Os slots de um no INTERNO sao derivados: `serialize_slots_and_payload`
+        // itera `keys` e le `slots.get(i)` com omissao, e um pivo que sobe ao
+        // pai entra em `keys`/`children` sem slot. Logo um no interno pode ter
+        // `slots.len() < keys.len()` — a raiz depois do primeiro split, ou um
+        // filho que recebeu pivos — e `split_off(mid)` sobre um Vec curto ou
+        // vazio com `mid > len` e PANICO deterministico assim que a arvore
+        // cresce. Dividir por `min(mid, len)` nunca rebenta e continua alinhado
+        // quando os slots existem.
+        let mut right_slots = old_slots.split_off(mid.min(old_slots.len()));
         let right_vals = if child.is_leaf() {
             old_vals.split_off(mid)
         } else {
@@ -2030,6 +2182,11 @@ impl BEpsilonTree {
         // CORREÇÃO E ENRIJECIMENTO DO SPLIT DE FILHO INTERNAL: Remove o pivot do filho direito
         if !child.is_leaf() && !right_keys.is_empty() {
             right_keys.remove(0);
+            // O slot do pivo sai com ele — senao `keys` e `slots` do filho
+            // direito ficam desalinhados por um.
+            if !right_slots.is_empty() {
+                right_slots.remove(0);
+            }
         }
 
         let mut left = DiskNode {
@@ -2124,12 +2281,32 @@ impl BEpsilonTree {
             left.high_key = child.high_key.clone();
             left.rebuild_bloom_filter();
 
+            // Auditoria 2026-09-05 (A24): R8 vale TAMBÉM para o irmão esquerdo.
+            // `left_id` vem de `parent.children[idx - 1]` e, ao contrário do
+            // filho (já re-identificado por CoW no `partial_flush_cascade`),
+            // pertence normalmente ao último estado DURÁVEL. Escrevê-lo
+            // in-place — o store não tem WAL nem journal de página — publicava
+            // as chaves do filho absorvido numa página que o superbloco durável
+            // ainda aponta: um crash antes da troca do superbloco deixava as
+            // mesmas chaves em dois ramos e um `high_key` incoerente com o
+            // separador do pai durável (e, com um write rasgado, a subárvore
+            // ilegível). Aqui damos-lhe a mesma disciplina de shadow paging do
+            // split: página nova, ponteiro do pai actualizado, id antigo
+            // reciclado (o `recycle_id` adia-o para depois do commit se for
+            // durável).
+            let old_left_id = left.id;
+            left.id = self.allocate_id()?;
+            self.rekey_cache_frame(old_left_id, left.id);
+
             self.store.write_page(left.id, &left.serialize()?)?;
             self.metrics
                 .write_amplification_count
                 .fetch_add(1, Ordering::Relaxed);
+            self.metrics.merges_cascade.fetch_add(1, Ordering::Relaxed);
             parent.keys.remove(idx - 1);
             parent.children.remove(idx);
+            parent.children[idx - 1] = left.id;
+            self.recycle_id(old_left_id)?;
             self.recycle_id(old_child_id)?;
             // O filho foi absorvido: remove o frame morto para que uma futura
             // realocação deste id não sirva o nó obsoleto do cache.
@@ -2326,6 +2503,9 @@ impl BEpsilonTree {
                 }
             }
         }
+        // A44: os bits de sujo acabaram de cair — há de novo candidatos a
+        // despejo. Rearma a evicção já, em vez de esperar o backoff esgotar.
+        self.evict_scan_backoff.store(0, Ordering::Release);
         self.store.sync()?;
 
         let offset = self.active_sb_offset.load(Ordering::Acquire);
@@ -2624,6 +2804,45 @@ mod page_roundtrip_tests {
         assert_eq!(n2.serialize().unwrap(), buf);
     }
 
+    /// Auditoria 2026-09-05 (A42): as chaves do BUFFER não têm de partilhar o
+    /// prefixo dos separadores. Com um único separador, o prefixo comum era a
+    /// chave separadora INTEIRA; a chave do buffer era gravada sem corte mas o
+    /// desserializador prefixa sempre — voltava do disco como `prefixo ++ chave`.
+    /// `internal_roundtrip_with_buffer` não apanha isto porque lá as chaves do
+    /// buffer começam pelo prefixo dos separadores.
+    #[test]
+    fn internal_roundtrip_com_chave_de_buffer_fora_do_prefixo() {
+        let mut buffer: BTreeMap<Key, Vec<Msg>> = BTreeMap::new();
+        buffer.insert(b"k0187".to_vec(), vec![Msg::Upsert(b"v".to_vec(), 9)]);
+        let node = DiskNode {
+            id: 3,
+            header: PageHeader {
+                page_type: PageType::Internal as u8,
+                version: VERSION,
+                generation: 1,
+                lsn: 10,
+                slot_count: 1,
+                free_start: 0,
+                payload_end: 0,
+            },
+            low_key: None,
+            high_key: None,
+            slots: Vec::new(),
+            keys: vec![b"k0250".to_vec()], // separador único → prefixo = "k0250"
+            vals: Vec::new(),
+            children: vec![10, 20],
+            buffer,
+            bloom: BloomFilter::default(),
+        };
+        let buf = node.serialize().unwrap();
+        let n2 = DiskNode::deserialize(node.id, &buf).unwrap();
+        assert_eq!(
+            n2.buffer, node.buffer,
+            "chave do buffer fora do prefixo tem de voltar intacta do disco"
+        );
+        assert_eq!(n2.keys, node.keys, "separadores reconstruídos");
+    }
+
     // Regressão do bug M30 (corrigido): o CoW re-identificava o nó mas o frame
     // de cache ficava sob o id antigo — o 2.º upsert ia ao disco ler uma página
     // nunca escrita (Storage(EOF)). Ver `rekey_cache_frame`.
@@ -2691,6 +2910,44 @@ mod page_roundtrip_tests {
         }
     }
 
+    /// O segundo split da raiz entrava em panico: depois do primeiro, a raiz
+    /// interna fica com `slots` vazio (sao derivados) e `split_off(mid)` sobre
+    /// um Vec vazio rebenta. `from_map` (carga em massa) nao o apanhava; so o
+    /// caminho de `upsert`, que faz a arvore crescer split a split. Valores
+    /// grandes baixam o fanout das folhas para a raiz encher e voltar a partir
+    /// com poucos milhares de chaves.
+    #[test]
+    fn a_raiz_parte_duas_vezes_sem_panico_e_a_arvore_fica_integra() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cresce.hbt");
+        let mut t =
+            super::BEpsilonTree::from_map(&path, std::collections::BTreeMap::new()).unwrap();
+        let n = 20_000u32;
+        let val = |i: u32| format!("{i:08}-").repeat(24).into_bytes(); // ~216 B
+        for i in 0..n {
+            t.upsert(format!("k{i:08}").into_bytes(), val(i)).unwrap();
+        }
+        for i in (0..n).step_by(97) {
+            assert_eq!(
+                t.get(&format!("k{i:08}").into_bytes()).as_ref(),
+                Some(&val(i)),
+                "chave {i} legivel depois dos splits"
+            );
+        }
+        // A durabilidade e por `commit()` explicito: sem ele a cache guarda
+        // paginas sujas, o disco esta incompleto, e tanto o `verify` (que le o
+        // disco) como o reload veem um estado parcial.
+        t.commit().unwrap();
+        assert!(t.verify_tree_integrity().unwrap(), "arvore integra");
+        drop(t);
+        let mut t2 = super::BEpsilonTree::load(&path).unwrap();
+        assert_eq!(
+            t2.get(&format!("k{:08}", n - 1).into_bytes()).as_ref(),
+            Some(&val(n - 1))
+        );
+        assert!(t2.verify_tree_integrity().unwrap(), "integra apos reload");
+    }
+
     #[test]
     fn from_map_empty_fresh_path() {
         let dir = tempfile::tempdir().unwrap();
@@ -2706,5 +2963,201 @@ mod page_roundtrip_tests {
         assert_eq!(OFF_BLOOM + BLOOM_FILTER_SIZE_BYTES, OFF_PFX_OFF);
         assert_eq!(OFF_PFX_OFF + 2, OFF_PFX_LEN);
         assert_eq!(OFF_PFX_LEN + 2, OFF_SLOTS_START);
+    }
+}
+
+#[cfg(test)]
+mod cache_evicao_tests {
+    //! Auditoria 2026-09-05 (A44): o custo da evicção. Precisa de campos
+    //! privados (o tecto do cache e a contagem de frames), por isso vive
+    //! dentro da crate e não em `tests/`.
+    use super::*;
+
+    fn frames_no_cache(t: &BEpsilonTree) -> usize {
+        t.cache_shards.iter().map(|s| s.lock().unwrap().len()).sum()
+    }
+
+    /// Com o cache no tecto, cada falta fazia uma varredura COMPLETA dos 32
+    /// shards para libertar UM frame — O(F) por page fault onde O(1) amortizado
+    /// basta. O teste mede os frames visitados por falta e exige que o custo
+    /// seja amortizado; verifica também que a evicção em lote não muda um único
+    /// valor lido (é uma melhoria de desempenho, não de semântica).
+    #[test]
+    fn evicao_tem_custo_amortizado_e_nao_altera_os_valores_lidos() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("evic.hbt");
+        let mut t = BEpsilonTree::open(&path, 1000, 128).unwrap();
+        // Tecto pequeno: encher os 64 MB reais exigiria dezenas de milhares
+        // de páginas e tornaria o teste inutilizável na suite.
+        t.cache_budget_bytes = 1024 * 1024;
+
+        let n = 8000u32;
+        let val = |i: u32| format!("v{i:06}").repeat(6).into_bytes();
+        for i in 0..n {
+            t.upsert(format!("k{i:06}").into_bytes(), val(i)).unwrap();
+        }
+        // O commit limpa os bits de sujo: sem candidatos elegíveis a evicção
+        // não corre e o teste não mediria nada.
+        t.commit().unwrap();
+
+        let frames = frames_no_cache(&t);
+        assert!(
+            frames >= 200,
+            "cache com poucos frames ({frames}) — o cenário não mede nada"
+        );
+
+        let varridos_antes = t.metrics.evict_scan_frames.load(Ordering::Relaxed);
+        let faltas_antes = t.metrics.cache_misses.load(Ordering::Relaxed);
+
+        // Leituras frias espalhadas por toda a árvore: garantem faltas de cache
+        // com o cache já no tecto.
+        let mut errados = 0usize;
+        let mut ausentes = 0usize;
+        for i in (0..n).step_by(3) {
+            match t.get(&format!("k{i:06}").into_bytes()) {
+                Some(lido) if lido == val(i) => {}
+                Some(_) => errados += 1,
+                None => ausentes += 1,
+            }
+        }
+        assert_eq!(
+            (errados, ausentes),
+            (0, 0),
+            "a evicção em lote não pode mudar o que se lê"
+        );
+
+        let varridos = t.metrics.evict_scan_frames.load(Ordering::Relaxed) - varridos_antes;
+        let faltas = t.metrics.cache_misses.load(Ordering::Relaxed) - faltas_antes;
+        assert!(faltas > 100, "poucas faltas de cache ({faltas}) para medir");
+        assert!(
+            varridos * 8 < faltas * frames,
+            "varredura O(F) por falta: {varridos} frames visitados em {faltas} faltas \
+             com {frames} frames em cache"
+        );
+        assert!(
+            t.current_cache_bytes.load(Ordering::Acquire) <= t.cache_budget_bytes,
+            "o lote deixou o cache acima do tecto"
+        );
+
+        // Escritas SEM commit com o cache no tecto: um frame SUJO despejado
+        // leva consigo alterações que ainda não estão em disco. O lote tem de
+        // manter o filtro `!is_dirty` que a versão de um-frame-por-varredura
+        // já tinha.
+        let novo = |i: u32| format!("N{i:06}").repeat(6).into_bytes();
+        let mut sujas: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        for i in (0..n).step_by(11) {
+            let k = format!("k{i:06}").into_bytes();
+            t.upsert(k.clone(), novo(i)).unwrap();
+            sujas.insert(k, novo(i));
+            // Leitura fria intercalada: força faltas de cache (e evicção) com
+            // frames sujos por commitar em memória.
+            let fria = (i + n / 2) % n;
+            t.get(&format!("k{fria:06}").into_bytes());
+        }
+        let perdidas = sujas
+            .iter()
+            .filter(|(k, v)| t.get(k).as_ref() != Some(*v))
+            .count();
+        assert_eq!(
+            perdidas,
+            0,
+            "{perdidas} de {} escritas por commitar perdidas — frame sujo despejado",
+            sujas.len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod superbloco_tests {
+    //! Auditoria 2026-09-05 (A43): o superbloco vem do DISCO e os seus inteiros
+    //! têm de ser validados como os de `DiskNode::deserialize` já são. Precisa
+    //! de `MAX_SB_FREE_LIST`, privado, por isso vive dentro da crate.
+    use super::*;
+
+    /// Recalcula CRC32 + Blake3-28 de uma página. Nenhum dos dois é com chave:
+    /// quem consegue escrever no ficheiro refá-los à vontade — é por isso que os
+    /// checksums não substituem a validação dos campos.
+    fn reassina(pagina: &mut [u8]) {
+        let (data, sig) = pagina.split_at_mut(PAGE_SIZE - SIG_SIZE);
+        sig[0..4].copy_from_slice(&crc32fast::hash(data).to_le_bytes());
+        sig[4..32].copy_from_slice(&blake3::hash(data).as_bytes()[..HASH_LEN]);
+    }
+
+    /// Escreve `len` no campo `free_list_len` da página de superbloco ACTIVA
+    /// (a de maior geração — adulterar sempre a página 0 passaria por acidente).
+    fn adultera_free_list_len(path: &Path, len: u32) {
+        let mut bytes = std::fs::read(path).unwrap();
+        let geracao = |p: &[u8]| {
+            Superblock::deserialize(p)
+                .map(|s| s.generation)
+                .unwrap_or(0)
+        };
+        let ini = if geracao(&bytes[0..PAGE_SIZE]) >= geracao(&bytes[PAGE_SIZE..2 * PAGE_SIZE]) {
+            0
+        } else {
+            PAGE_SIZE
+        };
+        bytes[ini + 38..ini + 42].copy_from_slice(&len.to_le_bytes());
+        reassina(&mut bytes[ini..ini + PAGE_SIZE]);
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    fn arvore_commitada(path: &Path) {
+        let mut t = BEpsilonTree::open(path, 1000, 128).unwrap();
+        t.upsert(b"a".to_vec(), b"1".to_vec()).unwrap();
+        t.commit().unwrap();
+    }
+
+    /// `free_list_len` era usado como índice directo num array de 32 elementos
+    /// em `allocate_id`: um valor construído entrava em pânico na primeira
+    /// alocação, a meio de uma escrita. Tem de ser recusado na desserialização
+    /// — e então `open` cai para o outro superbloco, válido (a mesma
+    /// resiliência que já existia para um write de superbloco rasgado).
+    #[test]
+    fn superbloco_com_free_list_len_impossivel_e_recusado_e_nao_panica() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sb-mau.hbt");
+        arvore_commitada(&path);
+        adultera_free_list_len(&path, 1000);
+
+        // A página adulterada tem CRC e Blake3 válidos: só a validação do campo
+        // a pode recusar.
+        let bytes = std::fs::read(&path).unwrap();
+        let recusas = (0..2)
+            .filter_map(|i| {
+                Superblock::deserialize(&bytes[i * PAGE_SIZE..(i + 1) * PAGE_SIZE]).err()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recusas.len(),
+            1,
+            "exactamente um superbloco (o adulterado) tem de ser recusado"
+        );
+        assert_eq!(recusas[0].kind(), io::ErrorKind::InvalidData);
+
+        let mut t = BEpsilonTree::load(&path).expect("o superbloco válido ainda serve");
+        assert!(t.superblock.read().unwrap().free_list_len as usize <= MAX_SB_FREE_LIST);
+        // A primeira alocação é o que entrava em pânico.
+        t.upsert(b"z".to_vec(), b"9".to_vec()).unwrap();
+        t.commit().unwrap();
+        assert_eq!(t.get(b"z"), Some(b"9".to_vec()));
+    }
+
+    /// Guarda do off-by-one: a lista CHEIA (`len == MAX_SB_FREE_LIST`) é um
+    /// estado legítimo que o `add_to_free_list` produz — recusá-la partiria
+    /// ficheiros válidos. (Não se faz upsert a seguir: a free list adulterada
+    /// só tem zeros e alocar dela é outro cenário, alheio a este guarda.)
+    #[test]
+    fn superbloco_com_free_list_cheia_continua_a_abrir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sb-cheia.hbt");
+        arvore_commitada(&path);
+        adultera_free_list_len(&path, MAX_SB_FREE_LIST as u32);
+
+        let t = BEpsilonTree::load(&path).expect("lista cheia é um valor legítimo");
+        assert_eq!(
+            t.superblock.read().unwrap().free_list_len as usize,
+            MAX_SB_FREE_LIST
+        );
     }
 }

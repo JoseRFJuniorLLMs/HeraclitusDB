@@ -664,7 +664,17 @@ fn parse_rfc3339_millis(value: &str) -> Option<u64> {
     let year: i64 = d.next()?.parse().ok()?;
     let month: i64 = d.next()?.parse().ok()?;
     let day: i64 = d.next()?.parse().ok()?;
-    if d.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    // Auditoria 2026-09-05 (A11): o ano tem de ser limitado AQUI, antes de
+    // `days_from_civil`, porque essa função já transborda sozinha no `y - 1`
+    // com um ano perto de `i64::MAX`.  `0..=9999` é exactamente o perfil que o
+    // STIX 2.1 permite (`date-fullyear = 4DIGIT`), por isso não recusa nenhum
+    // timestamp legítimo — e mantém `days` abaixo de ~2,9 milhões, o que põe a
+    // aritmética de baixo fora do alcance do transbordo.
+    if d.next().is_some()
+        || !(0..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+    {
         return None;
     }
     let (hms, frac) = match time.split_once('.') {
@@ -675,19 +685,47 @@ fn parse_rfc3339_millis(value: &str) -> Option<u64> {
     let hour: i64 = t.next()?.parse().ok()?;
     let minute: i64 = t.next()?.parse().ok()?;
     let second: i64 = t.next()?.parse().ok()?;
-    if t.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+    // Auditoria 2026-09-05 (A11): faltava o lado de baixo.  `hour > 23` deixa
+    // passar `-9000000000000000`, que transborda em `hour * 3_600`; e um
+    // minuto negativo nem chegava a transbordar — devolvia em silêncio um
+    // instante anterior ao que a data diz, que é pior do que recusar.
+    if t.next().is_some()
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=60).contains(&second)
+    {
         return None;
     }
     let millis: i64 = if frac.is_empty() {
         0
     } else {
         let digits: String = frac.chars().take(3).collect();
+        // Auditoria 2026-09-05 (A01): `take(3)` limita CARACTERES mas
+        // `digits.len()` conta BYTES, e o expoente de `pow` é `u32` — uma
+        // fracção com um carácter multi-byte (".ééZ") dava `3 - 4u32`, uma
+        // subtracção que transborda. Com `overflow-checks = true` isso é um
+        // pânico no meio da importação de um feed de terceiros, que atravessa
+        // o `Err` que `ThreatPlane::load` apanha e derruba o arranque.
+        // Exigir dígitos ASCII antes de calcular a escala fecha o buraco na
+        // raiz (`digits.len() <= 3` passa a ser garantido) e ainda recusa o
+        // sinal que o `parse::<i64>` aceitava: ".-12" valia -12 ms e deslocava
+        // o instante para trás em silêncio.
+        if !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
         let scale = 10i64.pow(3 - digits.len() as u32);
         digits.parse::<i64>().ok()? * scale
     };
     let days = days_from_civil(year, month, day);
-    let total = days * 86_400 + hour * 3_600 + minute * 60 + second;
-    u64::try_from(total * 1_000 + millis).ok()
+    // Aritmética verificada como cinto e suspensórios: com os domínios acima
+    // nada disto pode transbordar, mas a entrada vem de um feed de terceiros e
+    // `overflow-checks = true` transforma qualquer folga futura num pânico —
+    // que atravessa o `Err` de `ThreatPlane::load` e derruba o arranque.
+    // `None` é o que o chamador (`and_then`, em `convert`) já sabe tratar.
+    let total = days
+        .checked_mul(86_400)?
+        .checked_add(hour * 3_600 + minute * 60 + second)?;
+    u64::try_from(total.checked_mul(1_000)?.checked_add(millis)?).ok()
 }
 
 /// Howard Hinnant's `days_from_civil`: civil date to days since 1970-01-01.
@@ -996,5 +1034,92 @@ mod tests {
             parse_rfc3339_millis("2024-03-01T00:00:00Z"),
             Some(19_783 * 86_400 * 1_000)
         );
+    }
+
+    #[test]
+    fn fraccao_de_segundo_com_bytes_nao_ascii_devolve_none_sem_panico() {
+        // Auditoria 2026-09-05 (A01): `take(3)` conta CARACTERES e `len()` conta
+        // BYTES. Duas letras acentuadas sao 2 caracteres e 4 bytes, logo o
+        // expoente `3 - digits.len() as u32` era uma subtraccao u32 que
+        // transbordava — panico, e nao `None`, num feed de terceiros.
+        assert_eq!(
+            parse_rfc3339_millis("2026-01-01T00:00:00.\u{e9}\u{e9}Z"),
+            None
+        );
+        assert_eq!(
+            parse_rfc3339_millis("2026-01-01T00:00:00.1\u{e9}\u{e9}Z"),
+            None
+        );
+        // Um sinal nao e um digito de fraccao: `parse::<i64>` aceitava-o e
+        // ".-12" deslocava o instante 12 ms para tras em silencio.
+        assert_eq!(parse_rfc3339_millis("2026-01-01T00:00:00.-12Z"), None);
+        assert_eq!(parse_rfc3339_millis("2026-01-01T00:00:00.+12Z"), None);
+        // As fraccoes legitimas continuam a valer o mesmo.
+        assert_eq!(
+            parse_rfc3339_millis("2026-01-01T00:00:00.250Z"),
+            Some(1_767_225_600_250)
+        );
+        assert_eq!(
+            parse_rfc3339_millis("2026-01-01T00:00:00.2Z"),
+            Some(1_767_225_600_200)
+        );
+    }
+
+    #[test]
+    fn bundle_com_fraccao_multibyte_e_importado_sem_derrubar_o_arranque() {
+        // O caminho real do achado: ThreatPlane::load promete que um feed
+        // malformado vai para `files_failed` e nao impede o arranque, e um
+        // panico atravessa esse `Err`.
+        let raw = bundle(
+            r#"{"type":"indicator","id":"indicator--1","spec_version":"2.1",
+                "pattern":"[domain-name:value = 'a.com']",
+                "valid_from":"2026-01-01T00:00:00.ééZ"}"#,
+        );
+        let (objects, _) = importer()
+            .import_with_report(&raw)
+            .expect("o bundle importa");
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].valid_from, None);
+    }
+
+    #[test]
+    fn ano_sem_tecto_e_campos_negativos_devolvem_none_em_vez_de_panico() {
+        // Auditoria 2026-09-05 (A11): o ano era `parse::<i64>()` sem limite e
+        // hora/minuto/segundo so eram testados pelo lado de cima. Um ano de 9
+        // digitos transborda em `total * 1_000`, i64::MAX transborda mais cedo
+        // dentro de `days_from_civil` (`y - 1`), e uma hora negativa transborda
+        // em `hour * 3_600`.
+        assert_eq!(parse_rfc3339_millis("300000000-01-01T00:00:00Z"), None);
+        assert_eq!(
+            parse_rfc3339_millis("9223372036854775807-01-01T00:00:00Z"),
+            None
+        );
+        assert_eq!(
+            parse_rfc3339_millis("1970-01-01T-9000000000000000:00:00Z"),
+            None
+        );
+        // Um minuto negativo nem sequer entrava em panico: devolvia um instante
+        // que nunca existiu (60 s antes da meia-noite de 2026-01-01).
+        assert_eq!(parse_rfc3339_millis("2026-01-01T00:-1:00Z"), None);
+        assert_eq!(parse_rfc3339_millis("2026-01-01T00:00:-1Z"), None);
+        // As fronteiras legitimas do perfil RFC 3339 do STIX continuam a passar.
+        assert!(parse_rfc3339_millis("9999-12-31T23:59:60Z").is_some());
+        assert_eq!(parse_rfc3339_millis("1970-01-01T00:00:00Z"), Some(0));
+    }
+
+    #[test]
+    fn bundle_com_valid_until_absurdo_e_importado_sem_panico() {
+        // Sem janela de validade e um estado que o registo ja trata; um panico
+        // no meio da importacao de um feed de terceiros nao e.
+        let raw = bundle(
+            r#"{"type":"indicator","id":"indicator--1","spec_version":"2.1",
+                "pattern":"[ipv4-addr:value = '1.2.3.4']",
+                "valid_until":"300000000-01-01T00:00:00Z"}"#,
+        );
+        let (objects, _) = importer()
+            .import_with_report(&raw)
+            .expect("o bundle importa");
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].valid_until, None);
     }
 }
