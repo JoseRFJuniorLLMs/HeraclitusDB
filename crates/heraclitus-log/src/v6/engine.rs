@@ -1071,7 +1071,7 @@ impl V6Log {
             // candidatos, não de um segundo locking. Ver `instantaneo_varredura`.
             if let Some((path, active_first_lsn)) = instantaneo.cauda.as_ref() {
                 let (path, active_first_lsn) = (path.as_path(), *active_first_lsn);
-                if end > active_first_lsn {
+                if janela_toca_a_cauda(Some(active_first_lsn), end) {
                     let seg_from = from.max(active_first_lsn);
                     // Auditoria 2026-09-05, A13: a cauda activa é o segmento
                     // mais varrido de todos (é sempre RAW e é onde o replay
@@ -1318,13 +1318,8 @@ impl V6Log {
             // fora todo o I/O já feito e, ao terceiro, devolver erro duro sobre
             // uma resposta que estava correcta. É a mesma condição que o ramo
             // da cauda de `tentar_varrer` já aplica (`end > active_first_lsn`).
-            // Instantâneo sem cauda: mantém-se a comparação, que é o lado
-            // conservador (não se sabe onde a cauda nova começa).
-            let janela_toca_a_cauda = instantaneo
-                .cauda
-                .as_ref()
-                .is_none_or(|(_, primeiro)| end > *primeiro);
-            if janela_toca_a_cauda {
+            // O ramo sem cauda está documentado em `janela_toca_a_cauda`.
+            if janela_toca_a_cauda(instantaneo.cauda.as_ref().map(|(_, lsn)| *lsn), end) {
                 let cauda_actual = state
                     .active
                     .as_ref()
@@ -2433,6 +2428,22 @@ impl V6Log {
             .lock()
             .map_err(|_| HeraclitusError::StorageEngine("mutex do V6Log envenenado".into()))
     }
+}
+
+/// A janela `[from, end)` pode ter registos na cauda activa?
+///
+/// Auditoria 2026-09-05, vaga 2, R119. `cauda_first_lsn` a `None` significa que
+/// o instantâneo não apanhou cauda nenhuma. Isso só acontece num motor já
+/// degradado — um `seal` que falhe DEPOIS do `take()` deixa `state.active` a
+/// `None` de forma permanente (ver a nota honesta em `seal_active_locked`) e
+/// nada o repõe sem reiniciar. Nesse estado a releitura sob o lock devolve
+/// também `None`, portanto a comparação que este `true` habilita é uma
+/// igualdade `None == None` e NUNCA dispara `Rolou`: o ramo é inerte, não é
+/// uma defesa activa. Devolve-se `true` na mesma por conservadorismo — se algum
+/// dia o motor voltar a repor a cauda sozinho, o `Rolou` passa a ser a resposta
+/// certa sem mais nenhuma alteração aqui.
+fn janela_toca_a_cauda(cauda_first_lsn: Option<Lsn>, end: Lsn) -> bool {
+    cauda_first_lsn.is_none_or(|primeiro| end > primeiro)
 }
 
 /// Porque e que uma tentativa de leitura nao produziu o registo.
@@ -3690,6 +3701,34 @@ mod tests {
             lsns,
             (0..5).collect::<Vec<Lsn>>(),
             "a janela só toca segmentos selados: o rolo não lhe pode mexer"
+        );
+    }
+
+    #[test]
+    fn a_janela_so_evita_a_comparacao_da_cauda_quando_fica_toda_abaixo_dela() {
+        // Auditoria 2026-09-05, vaga 2, R119 (resíduo de A55). O ramo sem cauda
+        // do predicado não tinha teste nenhum: `is_none_or` -> `is_some_and`
+        // passava despercebido. Tabela dos três casos que decidem se um rolo
+        // concorrente é relevante para a janela pedida.
+        assert!(
+            janela_toca_a_cauda(None, 0),
+            "sem cauda tem de manter a comparação"
+        );
+        assert!(
+            janela_toca_a_cauda(None, 5),
+            "sem cauda tem de manter a comparação"
+        );
+        assert!(
+            janela_toca_a_cauda(Some(5), 6),
+            "end > first_lsn intersecta a cauda"
+        );
+        assert!(
+            !janela_toca_a_cauda(Some(5), 5),
+            "end == first_lsn é exclusivo: não toca"
+        );
+        assert!(
+            !janela_toca_a_cauda(Some(5), 1),
+            "janela toda abaixo da cauda não toca"
         );
     }
 
