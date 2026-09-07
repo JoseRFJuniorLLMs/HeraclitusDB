@@ -41,9 +41,11 @@ fn probe_big_value_after_tree_grows() {
 /// vizinhas leem-se todas) era declarada corrompida pelo próprio verificador,
 /// e um operador podia deitar fora um checkpoint bom.
 ///
-/// A asserção é na MESMA instância, sem drop+load: um `verify_tree_integrity`
-/// depois de `load` devolve false em qualquer árvore com cadeias overflow,
-/// por outra razão (contabilidade de páginas) alheia a este defeito.
+/// A asserção é na MESMA instância, sem drop+load. Quando este teste nasceu um
+/// `verify_tree_integrity` depois de `load` devolvia false em qualquer árvore,
+/// por outra razão (contabilidade de páginas) alheia a este defeito — foi o
+/// R40 da vaga 2 da Auditoria 2026-09-05 que a corrigiu; a contabilidade tem
+/// agora os seus próprios testes em `tests/integridade_contabilidade.rs`.
 #[test]
 fn apagar_valor_com_cadeia_overflow_no_cascade_deixa_a_arvore_integra() {
     let dir = tempfile::tempdir().unwrap();

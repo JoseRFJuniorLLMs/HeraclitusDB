@@ -202,6 +202,25 @@ pub struct TreeMetrics {
     /// 2026-09-05 (A44): é a única forma honesta de afirmar num teste
     /// determinista que o custo por falta de cache é amortizado, e não O(F).
     pub evict_scan_frames: AtomicUsize,
+    /// Paginas fisicas que nem a arvore nem a free list alcancam, medidas pelo
+    /// ultimo `verify_tree_integrity_report`. Auditoria recursiva 2026-09-05,
+    /// vaga 2 (R40): a fuga de espaco do R8 deixa de ser invisivel (antes saia
+    /// como "arvore corrompida") e passa a ser um numero observavel.
+    pub orphan_pages: AtomicUsize,
+}
+
+/// Auditoria recursiva 2026-09-05, vaga 2 (R40): resultado detalhado do
+/// verificador. `verify_tree_integrity` colapsa isto num booleano; quem precisa
+/// de decidir se deita fora um checkpoint le o relatorio e distingue corrupcao
+/// de fuga de espaco benigna.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntegrityReport {
+    /// `false` so quando a estrutura esta mesmo partida (ou ha paginas a mais).
+    pub integra: bool,
+    pub paginas_fisicas: u64,
+    pub contabilizadas: usize,
+    /// Paginas fisicas inalcancaveis: fuga de espaco, nao corrupcao.
+    pub orfas: usize,
 }
 
 pub trait PageStore: Send + Sync {
@@ -2535,7 +2554,15 @@ impl BEpsilonTree {
         Ok(())
     }
 
-    pub fn verify_tree_integrity(&mut self) -> io::Result<bool> {
+    /// Motor do verificador: percorre arvore, cadeias overflow e free list e
+    /// devolve `(paginas fisicas, Some(paginas contabilizadas))`, ou `None`
+    /// no lugar da contagem quando encontrou CORRUPCAO estrutural.
+    ///
+    /// Auditoria recursiva 2026-09-05, vaga 2 (R40): separar a estrutura da
+    /// contabilidade e o que permite distinguir "arvore corrompida" de
+    /// "fuga de espaco" - antes a comparacao final era um `!=` cru e as duas
+    /// coisas saiam como o mesmo `false`.
+    fn verify_structure(&mut self) -> io::Result<(u64, Option<usize>)> {
         let total_physical_pages = self.store.total_pages()?;
         let mut visited_nodes = HashSet::new();
         let mut visited_overflow = HashSet::new();
@@ -2549,76 +2576,76 @@ impl BEpsilonTree {
 
         while let Some((id, low_bound, high_bound, depth)) = stack.pop() {
             if !visited_nodes.insert(id) {
-                return Ok(false);
+                return Ok((total_physical_pages, None));
             }
             if id >= sb.next_page_id {
-                return Ok(false);
+                return Ok((total_physical_pages, None));
             }
 
             self.store.read_page(id, &mut buf)?;
             let node = DiskNode::deserialize(id, &buf)?;
 
             if node.header.generation > sb.generation {
-                return Ok(false);
+                return Ok((total_physical_pages, None));
             }
             if !node.keys.windows(2).all(|w| w[0] < w[1]) {
-                return Ok(false);
+                return Ok((total_physical_pages, None));
             }
             if let (Some(l), Some(nl)) = (&low_bound, &node.low_key) {
                 if l != nl {
-                    return Ok(false);
+                    return Ok((total_physical_pages, None));
                 }
             }
             if let (Some(h), Some(nh)) = (&high_bound, &node.high_key) {
                 if h != nh {
-                    return Ok(false);
+                    return Ok((total_physical_pages, None));
                 }
             }
 
             let free_start = read_u16(&buf, OFF_FREE_START)? as usize;
             let payload_end = read_u16(&buf, OFF_PAYLOAD_END)? as usize;
             if free_start > payload_end || payload_end > PAYLOAD_END_MAX {
-                return Ok(false);
+                return Ok((total_physical_pages, None));
             }
 
             for slot in node.slots.iter() {
                 if (slot.flags & FLAG_OVERFLOW) != 0 {
                     if slot.overflow_page == 0 {
-                        return Ok(false);
+                        return Ok((total_physical_pages, None));
                     }
                     let mut ov_id = slot.overflow_page;
                     let mut total_bytes_chain = 0usize;
                     while ov_id > 0 {
                         if !visited_overflow.insert(ov_id) {
-                            return Ok(false);
+                            return Ok((total_physical_pages, None));
                         }
                         let mut ov_buf = vec![0u8; PAGE_SIZE];
                         self.store.read_page(ov_id, &mut ov_buf)?;
                         if ov_buf[0] != PageType::Overflow as u8 {
-                            return Ok(false);
+                            return Ok((total_physical_pages, None));
                         }
                         total_bytes_chain += read_u16(&ov_buf, 9)? as usize;
                         ov_id = read_u64(&ov_buf, 1)?;
                     }
                     if total_bytes_chain != slot.length as usize {
-                        return Ok(false);
+                        return Ok((total_physical_pages, None));
                     }
                 }
             }
             if node.is_leaf() {
                 leaf_depths.insert(depth);
                 if leaf_depths.len() > 1 {
-                    return Ok(false);
+                    return Ok((total_physical_pages, None));
                 }
             } else {
                 if node.children.len() != node.keys.len() + 1 {
-                    return Ok(false);
+                    return Ok((total_physical_pages, None));
                 }
                 for (idx, &child_id) in node.children.iter().enumerate() {
                     let entry = page_to_parents.entry(child_id).or_default();
                     entry.push(id);
                     if entry.len() > 1 {
-                        return Ok(false);
+                        return Ok((total_physical_pages, None));
                     }
                     let child_low = if idx == 0 {
                         node.low_key.clone()
@@ -2638,11 +2665,41 @@ impl BEpsilonTree {
         let mut free_id = sb.free_list_head;
         while free_id > 0 {
             if !visited_freelist.insert(free_id) || free_id >= sb.next_page_id {
-                return Ok(false);
+                return Ok((total_physical_pages, None));
             }
             self.store.read_page(free_id, &mut buf)?;
             if buf[0] != PageType::FreeList as u8 {
-                return Ok(false);
+                return Ok((total_physical_pages, None));
+            }
+            // Auditoria recursiva 2026-09-05, vaga 2 (R40): uma pagina de
+            // SPILL guarda ate MAX_SB_FREE_LIST ids EM LOTE no proprio payload
+            // (`count` no offset 9, ids a partir do 11 - o mesmo layout que
+            // `allocate_id` rele) alem de ser ela propria uma pagina livre.
+            // Sem os contar, cada spill escondia 32 paginas da contabilidade e
+            // o verificador declarava corrompida uma arvore intacta a partir da
+            // 33.a pagina reciclada. Um tombstone simples tem zeros em 9..11,
+            // logo `count == 0` e a via nao-spill fica inalterada.
+            let count = read_u16(&buf, 9)? as usize;
+            if count > MAX_SB_FREE_LIST {
+                // Uma pagina de spill nunca guarda mais do que o array do
+                // superbloco. Recusar e melhor do que truncar em silencio:
+                // sem isto o `read_u64` corria fora da pagina e o verificador
+                // devolvia `Err` (excepcao) onde devia dizer "corrompida".
+                return Ok((total_physical_pages, None));
+            }
+            let mut pos = 11;
+            for _ in 0..count {
+                let batched = read_u64(&buf, pos)?;
+                pos += 8;
+                if batched == 0 {
+                    continue;
+                }
+                // O id em lote tem de ser uma pagina real e so pode aparecer
+                // uma vez: fora de alcance ou repetido e corrupcao (duplo-free
+                // ou leitura desalinhada do layout).
+                if batched >= sb.next_page_id || !visited_freelist.insert(batched) {
+                    return Ok((total_physical_pages, None));
+                }
             }
             free_id = read_u64(&buf, 1)?;
         }
@@ -2670,10 +2727,30 @@ impl BEpsilonTree {
             + visited_freelist.len()
             + 2
             + genesis_orphan;
-        if total_accounted != total_physical_pages as usize {
-            return Ok(false);
-        }
-        Ok(true)
+        Ok((total_physical_pages, Some(total_accounted)))
+    }
+
+    /// Relatorio do verificador de integridade. Auditoria recursiva
+    /// 2026-09-05, vaga 2 (R40): paginas a MENOS que as fisicas sao uma FUGA
+    /// de espaco (documentada no R8: o dreno do `pending_recycle` do ultimo
+    /// commit antes do fecho nunca chega a nenhum superbloco duravel), nao
+    /// corrupcao - expoem-se em `orfas` em vez de disfarcadas de `false`.
+    /// Paginas a MAIS continuam a ser corrupcao: um id em dois papeis.
+    pub fn verify_tree_integrity_report(&mut self) -> io::Result<IntegrityReport> {
+        let (paginas_fisicas, contagem) = self.verify_structure()?;
+        let contabilizadas = contagem.unwrap_or(0);
+        let orfas = (paginas_fisicas as usize).saturating_sub(contabilizadas);
+        self.metrics.orphan_pages.store(orfas, Ordering::Relaxed);
+        Ok(IntegrityReport {
+            integra: contagem.is_some() && contabilizadas <= paginas_fisicas as usize,
+            paginas_fisicas,
+            contabilizadas,
+            orfas,
+        })
+    }
+
+    pub fn verify_tree_integrity(&mut self) -> io::Result<bool> {
+        Ok(self.verify_tree_integrity_report()?.integra)
     }
 }
 
