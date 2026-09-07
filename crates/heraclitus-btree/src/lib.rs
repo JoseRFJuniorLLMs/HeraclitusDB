@@ -1391,16 +1391,22 @@ impl BEpsilonTree {
         if self.current_cache_bytes.load(Ordering::Acquire) < self.cache_budget_bytes {
             return;
         }
-        let restante = self.evict_scan_backoff.load(Ordering::Acquire);
-        if restante > 0 {
-            // Decremento saturante: com corridas o pior caso é gastar o
-            // backoff mais depressa, nunca dar a volta ao contador.
-            let _ = self.evict_scan_backoff.compare_exchange(
-                restante,
-                restante - 1,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            );
+        if self.evict_scan_backoff.load(Ordering::Acquire) > 0 {
+            // Auditoria recursiva 2026-09-05, vaga 2 (R44): era um
+            // `compare_exchange` de tentativa ÚNICA, com um comentário que
+            // afirmava o contrário do que o código fazia ("o pior caso é gastar
+            // o backoff mais depressa"). Quem perdia o CAS voltava sem varrer E
+            // sem decrementar: o contador gastava-se mais DEVAGAR do que o
+            // número de varreduras saltadas, e o overshoot passava a escalar
+            // com a concorrência (~EVICT_SCAN_BACKOFF x threads). O
+            // `fetch_update` decrementa exactamente uma vez por varredura
+            // saltada, sem underflow — o overshoot volta a ser
+            // ~EVICT_SCAN_BACKOFF frames, seja qual for o número de threads.
+            let _ =
+                self.evict_scan_backoff
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+                        Some(v.saturating_sub(1))
+                    });
             return;
         }
 
@@ -3167,6 +3173,110 @@ mod cache_evicao_tests {
             0,
             "{perdidas} de {} escritas por commitar perdidas — frame sujo despejado",
             sujas.len()
+        );
+    }
+
+    /// Auditoria recursiva 2026-09-05, vaga 2 (R44): o backoff por CONTAGEM é
+    /// armado quando uma varredura é estéril (tudo sujo/pinado) e, a partir daí,
+    /// as `EVICT_SCAN_BACKOFF` faltas seguintes saltam a varredura — mas cada
+    /// uma dessas faltas insere um frame NOVO e LIMPO, portanto elegível. O
+    /// cache fica até ~EVICT_SCAN_BACKOFF frames acima do tecto e não havia UMA
+    /// única asserção que o cobrisse: o `assert` de tecto do teste vizinho corre
+    /// depois de `commit()`, no regime todo-limpo em que o backoff nunca chega a
+    /// armar. Aqui o overshoot tolerado passa a INVARIANTE medido.
+    #[test]
+    fn evicao_com_backoff_nao_ultrapassa_o_tecto_por_mais_de_um_lote() {
+        // Guarda de ORÇAMENTO da constante (não é medição): o pior caso do
+        // backoff é ~EVICT_SCAN_BACKOFF frames de página acima do tecto. Subir
+        // a constante sem medir o custo em memória tem de partir aqui.
+        const {
+            assert!(
+                EVICT_SCAN_BACKOFF * PAGE_SIZE <= CACHE_MEMORY_BUDGET_BYTES / 32,
+                "EVICT_SCAN_BACKOFF custa ate EVICT_SCAN_BACKOFF*PAGE_SIZE bytes acima do tecto do cache, e isso passou de 1/32 do tecto de producao: subir a constante exige medir o custo em memoria"
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("evic_backoff.hbt");
+        let mut t = BEpsilonTree::open(&path, 1000, 128).unwrap();
+        t.cache_budget_bytes = 512 * 1024;
+
+        let n = 20000u32;
+        let chave = |i: u32| format!("k{i:06}").into_bytes();
+        for i in 0..n {
+            t.upsert(chave(i), vec![b'v'; 140]).unwrap();
+        }
+        t.commit().unwrap();
+        // Aquecer: leituras espalhadas até o cache bater no tecto.
+        for i in (0..n).step_by(3) {
+            t.get(&chave(i));
+        }
+        // O cache nao FICA acima do tecto (a evicao traz-no a 90%), por isso a
+        // guarda anti-vacuidade e ter frames que cheguem e a evicao ter corrido.
+        let frames = frames_no_cache(&t);
+        assert!(
+            frames >= 200 && t.metrics.evict_scan_frames.load(Ordering::Relaxed) > 0,
+            "cache com {frames} frames e sem evicao — o cenario nao mede nada"
+        );
+
+        // FASE DE ESCRITA: simula o regime do `from_map`, em que cada página
+        // carregada fica logo suja. Com tudo sujo a varredura é estéril e o
+        // backoff arma.
+        for i in 0..400u32 {
+            for shard in t.cache_shards.iter() {
+                for frame in shard.lock().unwrap().values() {
+                    frame.is_dirty.store(true, Ordering::Release);
+                }
+            }
+            t.get(&chave((i * 37) % n));
+        }
+        assert!(
+            t.evict_scan_backoff.load(Ordering::Acquire) > 0,
+            "o backoff nao chegou a armar — o cenario nao mede o que o R44 descreve"
+        );
+
+        // FASE DE LEITURA: só frames novos e LIMPOS. É aqui que o backoff deixa
+        // o cache crescer sem varrer.
+        let mut min = usize::MAX;
+        let mut max = 0usize;
+        for i in 0..9000u32 {
+            t.get(&chave((i * 7919) % n));
+            let agora = t.current_cache_bytes.load(Ordering::Acquire);
+            min = min.min(agora);
+            max = max.max(agora);
+        }
+
+        let amplitude = max - min;
+        let tecto_do_overshoot = EVICT_SCAN_BACKOFF * PAGE_SIZE;
+        assert!(
+            amplitude <= tecto_do_overshoot,
+            "o backoff deixou o cache oscilar {amplitude} B (max {max}, min {min}) — mais do que os {tecto_do_overshoot} B de um lote de EVICT_SCAN_BACKOFF paginas"
+        );
+
+        // Rearmar de propósito antes do commit: no fim da fase de leitura o
+        // contador já se gastou sozinho, e sem isto o assert seguinte passaria
+        // por vacuidade (mediria um contador a zero, não o rearme).
+        for i in 0..400u32 {
+            for shard in t.cache_shards.iter() {
+                for frame in shard.lock().unwrap().values() {
+                    frame.is_dirty.store(true, Ordering::Release);
+                }
+            }
+            t.get(&chave((i * 53) % n));
+        }
+        assert!(
+            t.evict_scan_backoff.load(Ordering::Acquire) > 0,
+            "o backoff nao rearmou — o assert do commit ficaria vacuo"
+        );
+
+        // O rearme do `commit` (os bits de sujo caem todos) tem de zerar o
+        // backoff: senão as faltas seguintes continuam a saltar varreduras que
+        // teriam candidatos de sobra.
+        t.commit().unwrap();
+        assert_eq!(
+            t.evict_scan_backoff.load(Ordering::Acquire),
+            0,
+            "o commit limpou os bits de sujo mas deixou o backoff armado"
         );
     }
 }
