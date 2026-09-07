@@ -245,3 +245,93 @@ fn contar_zmaps(log_dir: &std::path::Path) -> usize {
         .filter(|e| e.path().extension().map(|x| x == "zmap").unwrap_or(false))
         .count()
 }
+
+/// Resíduos `.zmap` órfãos e `.zmap.tmp` de crash também têm de desaparecer
+/// num log cifrado.
+///
+/// O fix A21 apagava o sidecar em claro APENAS do segmento que o
+/// `zone_map_for` estava a resolver naquele instante (`remove_file` por id), e
+/// tanto o `warm()` como o `scan_pruned` só iteram `sealed_segments()`. Dois
+/// resíduos escapavam a essa limpeza e ficavam no disco, ao lado de um WAL
+/// cifrado, com min/max de `agent_id`/`session_id`/`attrs` em CLARO e sem
+/// dependerem de chave nenhuma — logo sobreviviam ao `KeyStore::shred`, que é
+/// exactamente o invariante que A21 diz fechar:
+///   (a) `<id>.zmap` de um id que já não consta de `sealed_segments()`
+///       (segmento removido pela recuperação de `truncate.intent`, restauro
+///       parcial de backup, ou remoção manual);
+///   (b) `<id>.zmap.tmp` deixado por um crash entre o `sync_all` e o `rename`
+///       do `persist_sidecar` — esse nunca era apagado por caminho nenhum.
+/// Auditoria 2026-09-05, vaga 2, R51.
+#[test]
+fn residuos_zmap_orfao_e_tmp_sao_apagados_num_log_cifrado() {
+    use heraclitus_log::skip_scan::SkipScanner;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let log_dir = dir.path().join("log");
+    let keys_dir = dir.path().join("keys");
+    let keys = KeyStore::open(&keys_dir).unwrap();
+    // Segmentos pequenos: o skip-scan só constrói zone maps para segmentos
+    // SELADOS.
+    let log = Arc::new(
+        Log::open_with_keystore(&log_dir, 2048, FsyncPolicy::Always, Some(keys.clone())).unwrap(),
+    );
+
+    for i in 0..80 {
+        let mut episode = Episode::new(
+            "titular:hmac-sha256:abc",
+            EventKind::Custom("OperationalFact".into()),
+            format!("Carlos autenticou no servidor pessoal {i:04}").into_bytes(),
+        );
+        episode
+            .attrs
+            .insert("actor_name".into(), "Carlos Silva".into());
+        episode
+            .attrs
+            .insert("source_ip".into(), "203.0.113.45".into());
+        log.append(episode).unwrap();
+    }
+    log.flush().unwrap();
+    let selados = log.sealed_segments().len();
+    assert!(selados >= 2, "o teste precisa de segmentos selados");
+
+    // Injectar os dois resíduos que uma versão pré-fix (ou um período sem
+    // keystore, ou um crash a meio do `persist_sidecar`) deixava no disco.
+    // Bytes em claro de propósito: é isso que um sidecar bincode é.
+    let orfao = log_dir.join("00000000000000000999.zmap");
+    let tmp = log_dir.join("00000000000000000000.zmap.tmp");
+    let lixo_com_pii = b"ZMAP\x01\x00Carlos Silva ... 203.0.113.45".to_vec();
+    std::fs::write(&orfao, &lixo_com_pii).unwrap();
+    std::fs::write(&tmp, &lixo_com_pii).unwrap();
+    assert!(
+        !log.sealed_segments().iter().any(|m| m.id == 999),
+        "o resíduo órfão tem de ser de um id que o scanner NUNCA visita"
+    );
+
+    let scanner = SkipScanner::new(log.clone());
+    scanner.warm().unwrap();
+    let (encontrados, _) = scanner
+        .scan_pruned(|z| z.may_contain_agent("titular:hmac-sha256:abc"))
+        .unwrap();
+    assert!(
+        !encontrados.is_empty(),
+        "a consulta tinha de encontrar os episódios do titular"
+    );
+
+    // Crypto-shredding: apagar a chave tem de apagar o ACESSO ao dado. Um
+    // resíduo em claro não depende de chave nenhuma, logo sobreviveria.
+    assert!(keys.shred("titular:hmac-sha256:abc").unwrap());
+    // Os dois resíduos são verificados JUNTOS e nomeados na mensagem: uma
+    // limpeza que só apanhe um deles (p.ex. filtrar por `extension() == "zmap"`,
+    // que deixa o `.zmap.tmp` para trás) tem de dizer QUAL sobreviveu.
+    let sobreviventes: Vec<String> = [&orfao, &tmp]
+        .iter()
+        .filter(|p| p.exists())
+        .map(|p| p.display().to_string())
+        .collect();
+    assert!(
+        sobreviventes.is_empty(),
+        "resíduos de sidecar sobreviveram ao shred: {sobreviventes:?}"
+    );
+    varrer_log_dir_sem_pii(&log_dir);
+}

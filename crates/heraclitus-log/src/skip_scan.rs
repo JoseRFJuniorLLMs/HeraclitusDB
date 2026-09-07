@@ -89,6 +89,9 @@ pub struct SkipScanner {
     built: AtomicUsize,
     /// Zone maps loaded from the persisted `.zmap` sidecar (cheap).
     loaded: AtomicUsize,
+    /// Guarda da varredura exaustiva de sidecars residuais (só corre em log
+    /// cifrado): uma vez por scanner, não uma vez por segmento.
+    varrido: std::sync::Once,
 }
 
 impl SkipScanner {
@@ -101,6 +104,7 @@ impl SkipScanner {
             cache: Mutex::new(HashMap::new()),
             built: AtomicUsize::new(0),
             loaded: AtomicUsize::new(0),
+            varrido: std::sync::Once::new(),
         }
     }
 
@@ -132,6 +136,43 @@ impl SkipScanner {
         self.log.dir().join(format!("{id:020}.zmap"))
     }
 
+    /// Apaga TODOS os sidecars residuais do directório do log — `<id>.zmap` e
+    /// `<id>.zmap.tmp` — uma única vez por scanner. Só é chamado no ramo
+    /// cifrado, portanto o caminho NÃO cifrado (onde o sidecar é legítimo)
+    /// nunca a vê.
+    ///
+    /// Auditoria 2026-09-05, vaga 2, R51: o A21 apagava o sidecar em claro
+    /// APENAS do segmento que o `zone_map_for` estava a resolver naquele
+    /// instante (`remove_file` por id), e tanto o `warm()` como o `scan_pruned`
+    /// só iteram `sealed_segments()`. Escapavam-lhe (a) um `<id>.zmap` órfão,
+    /// de um id que já não consta de `sealed_segments()` — segmento removido
+    /// pela recuperação de `truncate.intent`, restauro parcial de backup, ou
+    /// remoção manual — e (b) um `<id>.zmap.tmp` deixado por um crash entre o
+    /// `sync_all` e o `rename` do `persist_sidecar`, que nunca era apagado por
+    /// caminho nenhum. Ambos guardam min/max de `agent_id`/`session_id`/`attrs`
+    /// em CLARO e não dependem de chave nenhuma, logo SOBREVIVIAM ao
+    /// `KeyStore::shred` — ou seja, o crypto-shredding deixava de apagar o
+    /// acesso ao dado, que é exactamente o invariante que o A21 diz fechar.
+    ///
+    /// O predicado olha para o `file_name()` e não para o `extension()` porque
+    /// a extensão de `<id>.zmap.tmp` é `tmp`: filtrar por extensão deixava o
+    /// temporário para trás. Best-effort, como todo o resto do sidecar — é
+    /// cache derivada, apagá-la só força a reconstrução.
+    fn limpar_sidecars_residuais(&self) {
+        self.varrido.call_once(|| {
+            let Ok(entradas) = std::fs::read_dir(self.log.dir()) else {
+                return;
+            };
+            for entrada in entradas.flatten() {
+                let nome = entrada.file_name();
+                let Some(nome) = nome.to_str() else { continue };
+                if nome.ends_with(".zmap") || nome.ends_with(".zmap.tmp") {
+                    let _ = std::fs::remove_file(entrada.path());
+                }
+            }
+        });
+    }
+
     /// Zone map for a sealed segment. Resolution order: in-RAM cache → persisted
     /// `.zmap` sidecar (small read, no segment scan) → build from the segment
     /// once and persist the sidecar for next time.
@@ -159,6 +200,14 @@ impl SkipScanner {
         let cifrado = self.log.cifrado_em_repouso();
         let path = self.sidecar_path(meta.id);
         if cifrado {
+            // Primeiro a varredura exaustiva do directório (uma vez por
+            // scanner): o `remove_file` por id logo abaixo só alcança os
+            // segmentos que o scanner chega a visitar, e resíduos órfãos ou
+            // `.zmap.tmp` de crash ficavam para trás com PII em claro que
+            // sobrevivia ao shred (vaga 2, R51). O remove por caminho fica na
+            // mesma — é barato e cobre um sidecar que apareça DEPOIS da
+            // varredura.
+            self.limpar_sidecars_residuais();
             // Um `.zmap` deixado por uma abertura anterior SEM keystore
             // continuaria a servir esses min/max em claro ao pruning (e a
             // sobreviver a um shred). O ficheiro é derivado e descartável:
