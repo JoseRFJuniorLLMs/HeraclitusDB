@@ -125,7 +125,90 @@ const MAGIC_V2: &[u8; 4] = b"HATR";
 const FORMAT_LEGACY_COMPRESSED: u16 = 4;
 /// v5 troca apenas o checkpoint DERIVADO para IDs densos. O log canónico não
 /// muda; checkpoints v4 e v1 continuam legíveis e são internados ao abrir.
-const FORMAT_CURRENT: u16 = 5;
+///
+/// Continua aceite em leitura por decisão explícita — ver [`FORMAT_CURRENT`].
+const FORMAT_V5_SEM_CRC: u16 = 5;
+/// **v6**: o cabeçalho passa a trazer um CRC-32 do resto do ficheiro.
+///
+/// Auditoria 2026-09-05, vaga 2 (R89). Até à v5 o checkpoint era
+/// `MAGIC || versão || bincode`, sem uma única verificação de integridade, e a
+/// corrupção era SILENCIOSA e COERENTE: um bit invertido no campo `base` de um
+/// bloco DeltaBitpack faz `hume_kernel::compression` devolver `Some(..)` com o
+/// comprimento certo e a lista inteira deslocada; um bit num byte ASCII do
+/// dicionário muda o valor indexado (`cpf` -> `cpg`) e descodifica sem erro.
+/// No GQL o pós-filtro `matches` do planner revalida e isso vira falsos
+/// negativos; mas `Engine::titular` (resposta LGPD art. 18 I/II) usa o
+/// `lookup("_agent", …)` cru — uma contagem errada e metadados de eventos de
+/// OUTROS titulares apresentados como sendo deste. É exactamente a classe que
+/// o perfil de release do workspace nomeia: "um índice silenciosamente errado
+/// custa mais".
+///
+/// Layout: `MAGIC_V2 (4) || versão u16 LE (2) || crc u32 LE (4) || corpo`.
+/// O CRC cobre `versão || corpo` (e não só o corpo) para que uma troca de byte
+/// no número de versão também seja apanhada.
+///
+/// **Âmbito honesto**: isto detecta corrupção ACIDENTAL (bit rot, meio
+/// degradado, escrita rasgada fora da janela do rename). NÃO é assinatura nem
+/// MAC — quem adultera o corpo de propósito recalcula o CRC. Defesa contra
+/// adulteração deliberada fica fora deste fix.
+///
+/// **Porque é que v5/v4/v1 continuam a ser aceites** (e isto não contradiz a
+/// doutrina "subir versão = rejeitar" das v3/v4 acima):
+/// (a) esses ficheiros foram escritos por uma versão que nunca calculou CRC —
+///     recusá-los não detecta corrupção nenhuma, só força um replay total no
+///     primeiro arranque após a actualização, que é precisamente o custo que
+///     o comentário do `open` diz que se quis evitar;
+/// (b) a janela de exposição é de UM arranque: o `checkpoint()` seguinte
+///     reescreve o ficheiro em v6, já com CRC;
+/// (c) as subidas v3/v4 existiam para CORRIGIR conteúdo em falta (`_agent`,
+///     `_kind`) e por isso TINHAM de rejeitar. Aqui o conteúdo da v5 é
+///     semanticamente correcto; só lhe falta a prova.
+const FORMAT_CURRENT: u16 = 6;
+
+/// Tabela do CRC-32 **IEEE 802.3** (polinómio reflectido `0xEDB88320`) — o
+/// mesmo do `crc32fast`/zip/gzip. NÃO é CRC-32**C** (Castagnoli, `0x82F63B78`),
+/// que é o que o log usa em `heraclitus-log::cpm`; os nomes são trocados com
+/// frequência e aqui não se repete esse erro.
+///
+/// Feito à mão em vez de puxar `crc32fast`: são 4 bytes de checksum gravados
+/// uma vez por checkpoint, e a dependência nova mexeria na entrada deste crate
+/// no `Cargo.lock` do workspace por zero benefício de desempenho aqui. A
+/// correcção da tabela está presa pelo vector conhecido em
+/// `crc32_bate_com_o_vector_conhecido`.
+const TABELA_CRC32: [u32; 256] = {
+    let mut tabela = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
+            bit += 1;
+        }
+        tabela[i] = c;
+        i += 1;
+    }
+    tabela
+};
+
+/// CRC-32 IEEE sobre a concatenação de `partes` — sem as concatenar em memória
+/// (o corpo do checkpoint pode ter centenas de MB).
+fn crc32_ieee(partes: &[&[u8]]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for parte in partes {
+        for &byte in *parte {
+            crc = TABELA_CRC32[((crc ^ byte as u32) & 0xFF) as usize] ^ (crc >> 8);
+        }
+    }
+    !crc
+}
+
+/// Dimensão do cabeçalho v6: magic (4) + versão (2) + CRC (4).
+const CABECALHO_V6: usize = 10;
 
 /// Espelho do [`ResidentSnapshot`] com os postings **comprimidos**.
 ///
@@ -618,12 +701,42 @@ impl AttrIndex {
                 // índice inteiro por replay — correto, mas caro e silencioso.
                 let snap = if bytes.starts_with(MAGIC_V2) {
                     match bytes.get(4..6).map(|v| u16::from_le_bytes([v[0], v[1]])) {
-                        Some(FORMAT_CURRENT) => bincode::serde::decode_from_slice::<
-                            CompressedSnapshot,
-                            _,
-                        >(&bytes[6..], BINCODE_CFG)
-                        .ok()
-                        .and_then(|(snapshot, _)| snapshot.expand()),
+                        Some(FORMAT_CURRENT) => {
+                            // R89: o CRC é verificado ANTES de descodificar. Um
+                            // corpo corrompido descodifica-se sem erro e serve
+                            // postings errados (ver `FORMAT_CURRENT`); verificar
+                            // depois seria verificar tarde de mais. Tudo por
+                            // `get(..)` — o ficheiro pode ter < 10 bytes.
+                            let crc_lido = bytes
+                                .get(6..CABECALHO_V6)
+                                .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]));
+                            let corpo = bytes.get(CABECALHO_V6..);
+                            match (crc_lido, corpo) {
+                                (Some(crc_lido), Some(corpo))
+                                    if crc_lido == crc32_ieee(&[&bytes[4..6], corpo]) =>
+                                {
+                                    bincode::serde::decode_from_slice::<CompressedSnapshot, _>(
+                                        corpo,
+                                        BINCODE_CFG,
+                                    )
+                                    .ok()
+                                    .and_then(|(snapshot, _)| snapshot.expand())
+                                }
+                                // CRC não bate (ou cabeçalho truncado): cai no
+                                // `None` -> índice vazio -> rebuild por replay.
+                                _ => None,
+                            }
+                        }
+                        // v5: escrita por uma versão que nunca calculou CRC.
+                        // Aceite de propósito — ver `FORMAT_CURRENT`, ponto (a).
+                        Some(FORMAT_V5_SEM_CRC) => {
+                            bincode::serde::decode_from_slice::<CompressedSnapshot, _>(
+                                &bytes[6..],
+                                BINCODE_CFG,
+                            )
+                            .ok()
+                            .and_then(|(snapshot, _)| snapshot.expand())
+                        }
                         Some(FORMAT_LEGACY_COMPRESSED) => {
                             bincode::serde::decode_from_slice::<LegacyCompressedSnapshot, _>(
                                 &bytes[6..],
@@ -930,13 +1043,18 @@ impl AttrIndex {
     /// Grava o checkpoint em `dir` (escrita atómica tmp+rename).
     pub fn save(&self, dir: impl AsRef<Path>) -> Result<(), HeraclitusError> {
         std::fs::create_dir_all(dir.as_ref())?;
-        // v2: magic + versão + bincode do snapshot com as colunas comprimidas.
+        // v6: magic + versão + CRC-32 + bincode do snapshot com as colunas
+        // comprimidas. O CRC cobre `versão || corpo` (R89 — ver
+        // `FORMAT_CURRENT`), para que um byte trocado na versão não passe.
         let comprimido = CompressedSnapshot::from(&self.inner);
         let corpo = bincode::serde::encode_to_vec(&comprimido, BINCODE_CFG)
             .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
-        let mut bytes = Vec::with_capacity(corpo.len() + 6);
+        let cabeca = FORMAT_CURRENT.to_le_bytes();
+        let crc = crc32_ieee(&[&cabeca, &corpo]);
+        let mut bytes = Vec::with_capacity(corpo.len() + CABECALHO_V6);
         bytes.extend_from_slice(MAGIC_V2);
-        bytes.extend_from_slice(&FORMAT_CURRENT.to_le_bytes());
+        bytes.extend_from_slice(&cabeca);
+        bytes.extend_from_slice(&crc.to_le_bytes());
         bytes.extend_from_slice(&corpo);
         let dst = dir.as_ref().join(SNAPSHOT_FILE);
         let tmp = dir.as_ref().join(format!("{SNAPSHOT_FILE}.tmp"));
@@ -1438,8 +1556,19 @@ mod compressao_tests {
         assert_eq!(depois.lookup("campo", "valor").len(), 5_000);
     }
 
+    /// Vector conhecido do CRC-32 IEEE: `crc32("123456789") == 0xCBF43926`.
+    /// A tabela é gerada à mão (sem `crc32fast`); sem este teste, um erro no
+    /// polinómio dava um checksum internamente coerente e nunca se notava.
     #[test]
-    fn o_ficheiro_gravado_e_v5() {
+    fn crc32_bate_com_o_vector_conhecido() {
+        assert_eq!(crc32_ieee(&[b"123456789"]), 0xCBF4_3926);
+        // Fatiar não pode mudar o resultado (o `save` passa versão + corpo).
+        assert_eq!(crc32_ieee(&[b"1234", b"56789"]), 0xCBF4_3926);
+        assert_eq!(crc32_ieee(&[]), 0);
+    }
+
+    #[test]
+    fn save_grava_v6_com_crc_verificavel() {
         let dir = tempfile::tempdir().unwrap();
         indice_com(10).save(dir.path()).unwrap();
         let bytes = std::fs::read(dir.path().join(SNAPSHOT_FILE)).unwrap();
@@ -1450,8 +1579,42 @@ mod compressao_tests {
         assert_eq!(
             u16::from_le_bytes([bytes[4], bytes[5]]),
             FORMAT_CURRENT,
-            "checkpoint novo deve usar dictionary IDs"
+            "checkpoint novo deve usar dictionary IDs + CRC (v6)"
         );
+        let crc_gravado = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]);
+        assert_eq!(
+            crc_gravado,
+            crc32_ieee(&[&bytes[4..6], &bytes[CABECALHO_V6..]]),
+            "o CRC gravado tem de cobrir versao + corpo"
+        );
+        // Mata a mutacao "gravar um CRC constante/zero".
+        assert_ne!(crc_gravado, 0, "CRC de um corpo real nao e zero");
+    }
+
+    /// Protege a decisão de compatibilidade do R89: v5 (sem CRC) continua a
+    /// ser lida. Sem este teste, uma "limpeza" futura que exija CRC a todas as
+    /// versões passa despercebida e custa um replay total a toda a gente.
+    #[test]
+    fn checkpoint_v5_sem_crc_continua_a_ser_lido() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = indice_com(1_000);
+        let corpo =
+            bincode::serde::encode_to_vec(CompressedSnapshot::from(&original.inner), BINCODE_CFG)
+                .unwrap();
+        let mut bytes = Vec::with_capacity(corpo.len() + 6);
+        bytes.extend_from_slice(MAGIC_V2);
+        bytes.extend_from_slice(&FORMAT_V5_SEM_CRC.to_le_bytes());
+        bytes.extend_from_slice(&corpo);
+        std::fs::write(dir.path().join(SNAPSHOT_FILE), bytes).unwrap();
+
+        let lido = AttrIndex::open(dir.path());
+        assert_eq!(
+            lido.lookup("campo", "valor"),
+            original.lookup("campo", "valor"),
+            "v5 sem CRC tem de continuar legivel"
+        );
+        assert_eq!(lido.watermark(), original.watermark());
+        assert_eq!(lido.fields(), original.fields());
     }
 
     /// Sem isto, o primeiro arranque depois desta mudanca deitava fora um
@@ -1527,7 +1690,58 @@ mod compressao_tests {
         std::fs::write(&p, &bytes).unwrap();
 
         let lido = AttrIndex::open(dir.path()); // nao pode entrar em panico
-        assert!(lido.is_empty() || !lido.lookup("campo", "valor").is_empty());
+                                                // Auditoria 2026-09-05, vaga 2 (R89): a forma antiga deste assert era
+                                                // `lido.is_empty() || !lookup(..).is_empty()`, que ACEITAVA
+                                                // explicitamente o resultado errado -- servir postings de um ficheiro
+                                                // corrompido passava no teste. Por isso o R89 nunca foi apanhado aqui.
+        assert!(
+            lido.is_empty(),
+            "checkpoint corrompido tem de degradar para rebuild, nao servir postings"
+        );
+    }
+
+    /// Auditoria 2026-09-05, vaga 2 (R89): um unico bit invertido no corpo do
+    /// checkpoint nao pode virar postings ERRADOS servidos como bons.
+    ///
+    /// O codec de colunas (`hume_kernel::compression`) descodifica corpo
+    /// corrompido sem se queixar: um bit no campo `base` de um bloco
+    /// DeltaBitpack desloca a lista inteira e devolve `Some(..)` com o
+    /// comprimento certo e os valores errados. `Engine::titular` (resposta
+    /// LGPD art. 18) NAO pos-filtra o `lookup`, por isso isso seria contagem
+    /// errada e eventos de OUTROS titulares apresentados como sendo deste.
+    /// A propriedade exigida e binaria: ou o checkpoint e recusado (indice
+    /// vazio -> rebuild por replay), ou devolve EXACTAMENTE o original.
+    #[test]
+    fn corrupcao_de_um_bit_no_checkpoint_nunca_devolve_postings_errados() {
+        let dir = tempfile::tempdir().unwrap();
+        let ix = indice_postings_longos(2_000, 4);
+        ix.save(dir.path()).unwrap();
+        let esperado = ix.lookup("classe", "c0").to_vec();
+        assert_eq!(esperado.len(), 500, "postings longos: 2000/4 valores");
+
+        let p = dir.path().join(SNAPSHOT_FILE);
+        let original = std::fs::read(&p).unwrap();
+        // So o CORPO (a partir do fim do cabecalho v6: magic 4 + versao 2 +
+        // crc 4). Determinista: ~200 posicoes espacadas, bit 0 em cada.
+        let inicio = 10usize;
+        let passo = ((original.len() - inicio) / 200).max(1);
+
+        let mut errados = Vec::new();
+        let mut offset = inicio;
+        while offset < original.len() {
+            let mut bytes = original.clone();
+            bytes[offset] ^= 0x01;
+            std::fs::write(&p, &bytes).unwrap();
+            let lido = AttrIndex::open(dir.path());
+            if !lido.is_empty() && lido.lookup("classe", "c0") != esperado.as_slice() {
+                errados.push(offset);
+            }
+            offset += passo;
+        }
+        assert!(
+            errados.is_empty(),
+            "checkpoint corrompido serviu postings errados nos offsets {errados:?}"
+        );
     }
 
     /// Indice onde os POSTINGS dominam: poucos valores distintos, muitos
