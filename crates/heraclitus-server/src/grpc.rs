@@ -864,9 +864,19 @@ pub(crate) fn deferred_anchor_op(
             }
         }
         "deferred-anchors" => match registry.state() {
+            // Auditoria 2026-09-05, vaga 2 (R31): depois de A06 o replay passou
+            // a TOLERAR bifurcações — a âncora que não encadeia vai para
+            // `state.forks` em vez de abortar o replay com um erro ruidoso.
+            // Listar só `anchors` escondia por completo o ramo descartado: o
+            // auditor deixou de receber o erro e passou a ver uma cadeia
+            // aparentemente imaculada. O par (LSN, EvidenceAnchor) tem de sair
+            // AQUI — o contador `deferred_anchor_forks` do dashboard não diz
+            // QUAL âncora nem em que LSN, e nem sequer existe na superfície
+            // gRPC, que é a que o cliente de auditoria da SPEC-0046 fala.
+            // Forma de objecto pelo precedente do `privacy-state` acima.
             Ok(state) => (
                 true,
-                serde_json::to_string(&state.anchors).unwrap_or_default(),
+                serde_json::json!({ "anchors": state.anchors, "forks": state.forks }).to_string(),
             ),
             Err(error) => (false, error.to_string()),
         },

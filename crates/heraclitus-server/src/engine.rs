@@ -5676,12 +5676,153 @@ mod regulatory_entrypoint_tests {
         let (ok, anchors) = crate::grpc::deferred_anchor_op(&engine, "deferred-anchors", "");
         assert!(ok, "{anchors}");
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&anchors)
-                .unwrap()
+            serde_json::from_str::<serde_json::Value>(&anchors).unwrap()["anchors"]
                 .as_array()
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    /// Auditoria 2026-09-05, vaga 2 (R31): o commit A06 (b4b8831) tornou o
+    /// replay TOLERANTE a bifurcacoes — a ancora intrusa deixou de abortar
+    /// `DeferredAnchorState::replay` e passou a ficar em `state.forks`. Só que
+    /// o RPC `deferred-anchors` serializava EXCLUSIVAMENTE `state.anchors`: o
+    /// auditor que antes recebia um erro ruidoso passou a ver uma cadeia
+    /// aparentemente imaculada. O par (LSN, EvidenceAnchor) descartado ficava
+    /// apenas em memória — o contador `deferred_anchor_forks` do dashboard só
+    /// é alcançável pelo REST e nem sequer diz QUAL âncora nem em que LSN.
+    /// Numa superfície de prova regulatória, invisível é pior do que ruidoso.
+    #[test]
+    fn rpc_deferred_anchors_expoe_a_bifurcacao_e_nao_so_a_cadeia() {
+        use heraclitus_compliance::{
+            import_deferred_response, stamp_deferred_request, BundleSignatureScheme,
+            EvidenceCommitment,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            storage_format: heraclitus_core::StorageFormat::V6,
+            ..Default::default()
+        };
+        let engine = Arc::new(Engine::open(&cfg).unwrap());
+        engine
+            .append(Episode::new(
+                "evidence-source",
+                EventKind::Observation,
+                b"prova bruta que nunca atravessa a fronteira".to_vec(),
+            ))
+            .unwrap();
+        let v6 = engine.log.v6_arc().unwrap();
+        v6.seal_active().unwrap();
+        let sealed = v6.manifest().segments_v2[0].clone();
+
+        let export_signer = SoftKeySigner::generate("offline-zone");
+        let response_signer = SoftKeySigner::generate("connected-zone");
+        let response_key = response_signer
+            .sign_snapshot(b"key-discovery")
+            .unwrap()
+            .public_key_sec1;
+        let tsa = LocalTsa::generate("ACT-dev");
+        let assinar = |hlc: u64| {
+            SignedDeferredAnchorRequest::sign(
+                DeferredAnchorRequest::new(
+                    EvidenceCommitment::from_log(
+                        engine.log.as_ref(),
+                        sealed.first_lsn,
+                        sealed.last_lsn,
+                        hlc,
+                    )
+                    .unwrap(),
+                    // `previous_anchor_digest` a None nas DUAS: é exactamente
+                    // isto que a corrida de A06 deixava no log.
+                    None,
+                )
+                .unwrap(),
+                &export_signer,
+                BundleSignatureScheme::P256Development,
+            )
+            .unwrap()
+        };
+
+        let primeira_assinada = assinar(42);
+        let policy = DeferredTransferPolicy {
+            policy_id: "air-gap-transfer".into(),
+            version: "2026.1".into(),
+            approved_export_key_digests: [
+                *blake3::hash(&primeira_assinada.signature.public_key).as_bytes()
+            ]
+            .into_iter()
+            .collect(),
+            approved_response_key_digests: [*blake3::hash(&response_key).as_bytes()]
+                .into_iter()
+                .collect(),
+            allowed_signature_schemes: [BundleSignatureScheme::P256Development]
+                .into_iter()
+                .collect(),
+            max_timestamp_token_bytes: 1024 * 1024,
+        };
+        let carimbar = |assinada: &SignedDeferredAnchorRequest| {
+            stamp_deferred_request(
+                assinada,
+                &policy,
+                &tsa,
+                &response_signer,
+                BundleSignatureScheme::P256Development,
+            )
+            .unwrap()
+        };
+
+        let import = serde_json::json!({
+            "signed_request": primeira_assinada,
+            "signed_response": carimbar(&primeira_assinada),
+            "policy": policy,
+        });
+        let (ok, imported) =
+            crate::grpc::deferred_anchor_op(&engine, "deferred-anchor-import", &import.to_string());
+        assert!(ok, "{imported}");
+
+        // A gémea que a corrida gravaria. `persist` recusá-la-ia — essa guarda
+        // NÃO se enfraquece — por isso a âncora entra directamente no log, que
+        // é o único sítio de onde nada volta a sair.
+        let segunda_assinada = assinar(43);
+        let bifurcada =
+            import_deferred_response(&segunda_assinada, &carimbar(&segunda_assinada), &policy)
+                .unwrap();
+        let mut episodio = Episode::new(
+            "gov-compliance",
+            EventKind::Custom("ComplianceEvidenceAnchor".into()),
+            serde_json::to_vec(&bifurcada).unwrap(),
+        );
+        // As duas condições que `DeferredAnchorState::replay` exige para sequer
+        // olhar para o episódio (deferred.rs).
+        episodio
+            .attrs
+            .insert("compliance.generated".into(), "true".into());
+        let lsn_da_bifurcada = EpisodeLog::append(engine.log.as_ref(), episodio).unwrap();
+
+        let (ok, payload) = crate::grpc::deferred_anchor_op(&engine, "deferred-anchors", "");
+        assert!(ok, "{payload}");
+        let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            payload["anchors"].as_array().unwrap().len(),
+            1,
+            "a cadeia mantém o primeiro ramo: {payload}"
+        );
+        let forks = payload["forks"].as_array().unwrap();
+        assert_eq!(
+            forks.len(),
+            1,
+            "a bifurcação não chegou ao auditor pelo gRPC: {payload}"
+        );
+        // O par serializa como [lsn, anchor]: sem o LSN o auditor sabe que houve
+        // bifurcação mas não onde, e a âncora descartada continua irrastreável.
+        assert_eq!(forks[0][0], serde_json::json!(lsn_da_bifurcada));
+        assert_eq!(
+            forks[0][1]["anchor_id"],
+            serde_json::json!(bifurcada.anchor_id)
         );
     }
 
