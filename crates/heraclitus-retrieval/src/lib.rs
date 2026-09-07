@@ -149,7 +149,9 @@ pub struct RecallInputs {
     pub text: Vec<(EventId, Lsn, f32)>,   // (id, lsn, bm25)
     /// Cauda quente por contagem crua de ocorrências (`Memtable::text_search`).
     /// Canal PRÓPRIO e não a cauda de `text`: a escala é incomparável com a do
-    /// BM25, e o RRF funde rankings sem precisar de escalas comuns.
+    /// BM25, e o RRF funde rankings sem precisar de escalas comuns. Para o
+    /// RERANKER, que só tem um campo `bm25`, o `retrieve` calibra estes valores
+    /// contra o pior BM25 medido do lote (auditoria 2026-09-05, vaga 2, R71).
     pub memtable_text: Vec<(EventId, Lsn, f32)>,
     pub activation: Vec<(EventId, f32)>, // (id, score)
 }
@@ -174,15 +176,74 @@ pub fn retrieve(
         .into_iter()
         .map(|(i, l, d)| (i, (l, d)))
         .collect();
-    // Sinais do reranker: a memtable primeiro e o BM25 da view a sobrepor-se
-    // (é `collect` num HashMap, logo a última entrada de cada id vence). É
-    // EXACTAMENTE o que a lista concatenada dava antes — o candidato que só
-    // existe na memtable continua a levar o seu tf cru como `bm25`, e quem
-    // está nos dois continua a levar o BM25 verdadeiro. Só a FUSÃO mudou; a
-    // pontuação de cada candidato, não.
+    // Auditoria 2026-09-05, vaga 2 (R71): CALIBRAR o canal quente antes de o
+    // deixar entrar no campo `bm25` do reranker.
+    //
+    // A fusão já está certa (A10: a memtable é canal próprio e o RRF, sendo
+    // baseado em POSIÇÃO, é imune à escala), mas o SINAL não estava: o mesmo
+    // `Candidate::bm25` recebia BM25 medido (Σ idf*(K1+1), normalizado por
+    // comprimento, sobre TOKENS) e a contagem crua de SUBSTRINGS da memtable
+    // (`Memtable::text_search`: tf, sem idf, sem normalização, sem fronteiras
+    // de token). O esmagamento `b/(1+b)` do reranker não distingue as duas
+    // unidades — tf=3 e BM25=3.0 dão literalmente o mesmo 0.75 — logo um falso
+    // positivo por substring com tf=10 (0.909) batia o melhor documento real
+    // do corpus com BM25=3.0 (0.75). Isto só toca em candidatos EXCLUSIVOS da
+    // memtable, que existem por duas razões concretas: (a) a memtable casa por
+    // substring ("ana" dentro de "banana") e o índice só casa tokens exactos;
+    // (b) um documento cujo rank BM25 real cai fora do top-`RECALL_N` mas que
+    // está no top-N da memtable.
+    //
+    // A cura é por LOTE e cabe aqui: `retrieve` tem as DUAS listas em mãos, ao
+    // contrário de `Reranker::score`, que vê um candidato de cada vez — nenhuma
+    // assinatura pública muda. Um candidato que NÃO aparece no top-`RECALL_N`
+    // do BM25 não tem BM25 medido, e o único limite superior honesto que se lhe
+    // pode atribuir é o do documento mais fraco que FOI medido neste lote (o
+    // `piso`). Daí `piso * tf / (tf_max + 1.0)`: fica ESTRITAMENTE abaixo do
+    // piso (o `+1.0` evita o empate exacto com um BM25 real) e mantém-se
+    // estritamente monótono em `tf`, preservando a ordem interna do canal
+    // quente. Sem canal BM25 no lote não há segunda escala com que ser
+    // incoerente, e o tf fica como está — a sua ordem é a única informação
+    // disponível. O `piso` tem de ser positivo: com piso <= 0 o produto
+    // inverteria (ou achataria) essa ordem, e um BM25 não-positivo é lixo do
+    // canal, não uma medição.
+    let piso = inputs
+        .text
+        .iter()
+        .map(|(_, _, s)| *s)
+        .filter(|s| s.is_finite())
+        .fold(f32::INFINITY, f32::min);
+    // O canal vem de fora: um `+inf` no lote colapsaria todos os outros tf a ~0
+    // e um NaN contaminaria o `tf_max`. Saneia-se ANTES de medir o máximo; o
+    // `max(0.0)`/`is_finite` do esmagamento fica como segunda linha de defesa,
+    // não como única.
+    fn tf_saneado(tf: f32) -> f32 {
+        if tf.is_finite() {
+            tf.max(0.0)
+        } else {
+            0.0
+        }
+    }
+    let tf_max = inputs
+        .memtable_text
+        .iter()
+        .map(|(_, _, tf)| tf_saneado(*tf))
+        .fold(0.0f32, f32::max);
+    let calibrar = piso.is_finite() && piso > 0.0 && tf_max > 0.0;
+    // Precedência inalterada: a memtable (calibrada) primeiro e o BM25 da view
+    // a sobrepor-se (é `collect` num HashMap, logo a última entrada de cada id
+    // vence). Quem está nos dois canais continua a levar o BM25 verdadeiro.
     let txt_by: HashMap<EventId, (Lsn, f32)> = inputs
         .memtable_text
         .into_iter()
+        .map(|(i, l, tf)| {
+            let tf = tf_saneado(tf);
+            let sinal = if calibrar {
+                piso * tf / (tf_max + 1.0)
+            } else {
+                tf
+            };
+            (i, l, sinal)
+        })
         .chain(inputs.text)
         .map(|(i, l, s)| (i, (l, s)))
         .collect();
@@ -340,5 +401,187 @@ mod tests {
             assert!(s.is_finite(), "score não-finito para bm25={b}: {s}");
             assert!(s >= 0.0, "score negativo para bm25={b}: {s}");
         }
+    }
+
+    /// Constrói o lote de recall com um só canal de texto medido e um só canal
+    /// quente, com LSN IGUAL em todos os hits para anular a recência.
+    fn lote_texto(texto: Vec<(EventId, f32)>, memtable: Vec<(EventId, f32)>) -> RecallInputs {
+        const LSN: Lsn = 7;
+        RecallInputs {
+            vector: Vec::new(),
+            text: texto.into_iter().map(|(i, s)| (i, LSN, s)).collect(),
+            memtable_text: memtable.into_iter().map(|(i, s)| (i, LSN, s)).collect(),
+            activation: Vec::new(),
+        }
+    }
+
+    fn reranker_de_texto() -> LinearReranker {
+        LinearReranker {
+            head_lsn: 1_000,
+            ..Default::default()
+        }
+    }
+
+    /// Score final de um id no resultado reordenado.
+    ///
+    /// As asserções destes testes comparam SCORES e não posições de propósito:
+    /// `sort_by` é estável, logo um empate preserva a ordem do RRF e um teste
+    /// posicional deixaria passar exactamente as mutações que achatam a escala
+    /// do canal quente (auditoria 2026-09-05, vaga 2, R71).
+    fn score_de(saida: &[(Candidate, f32)], id: EventId) -> f32 {
+        saida
+            .iter()
+            .find(|(c, _)| c.id == id)
+            .map(|(_, s)| *s)
+            .expect("candidato ausente do top-k")
+    }
+
+    /// Auditoria 2026-09-05, vaga 2 (R71) — a PROVA do defeito.
+    ///
+    /// O canal quente da memtable pontua por contagem crua de SUBSTRINGS
+    /// (`Memtable::text_search`: tf, sem idf, sem normalização de comprimento e
+    /// sem fronteiras de token) e entrava no reranker pelo MESMO campo `bm25`
+    /// do canal medido. Com os pesos por omissão: tf=10 ⇒ 10/11 = 0.909 ⇒
+    /// 0.4545, contra o melhor documento real do corpus com BM25=3.0 ⇒ 0.75 ⇒
+    /// 0.375. O falso positivo por substring ("ana" dentro de "banana") ganhava
+    /// ao topo textual verdadeiro só por as duas escalas serem incomparáveis.
+    #[test]
+    fn um_hit_so_da_memtable_nao_bate_o_topo_do_bm25() {
+        let a = EventId::new();
+        let b = EventId::new();
+        let saida = retrieve(
+            "q",
+            lote_texto(vec![(a, 3.0)], vec![(b, 10.0)]),
+            &reranker_de_texto(),
+            2,
+        );
+        // ESTRITAMENTE maior, não apenas à frente: um `piso * tf / tf_max`
+        // (sem o +1.0) daria exactamente o mesmo score que o topo do BM25 e a
+        // ordem passaria a depender só da estabilidade do sort.
+        assert!(
+            score_de(&saida, a) > score_de(&saida, b),
+            "o tf cru da memtable (10) não ficou abaixo do BM25 medido (3.0): {:?}",
+            saida.iter().map(|(c, s)| (c.bm25, *s)).collect::<Vec<_>>()
+        );
+        assert_eq!(saida[0].0.id, a, "o topo do BM25 não saiu em primeiro");
+    }
+
+    /// A calibração é uma MUDANÇA DE ESCALA, não um achatamento: dentro do
+    /// canal quente a ordem por tf tem de sobreviver. Mata a mutação preguiçosa
+    /// de dar a todos os hits da memtable o mesmo valor (o piso, ou 0.0), que
+    /// passaria no teste acima (auditoria 2026-09-05, vaga 2, R71).
+    #[test]
+    fn a_calibracao_preserva_a_ordem_dentro_do_canal_quente() {
+        let medido = EventId::new();
+        let quente_forte = EventId::new();
+        let quente_fraco = EventId::new();
+        let saida = retrieve(
+            "q",
+            lote_texto(
+                vec![(medido, 3.0)],
+                vec![(quente_forte, 10.0), (quente_fraco, 2.0)],
+            ),
+            &reranker_de_texto(),
+            3,
+        );
+        assert!(
+            score_de(&saida, quente_forte) > score_de(&saida, quente_fraco),
+            "tf=10 não ficou acima de tf=2 depois da calibração: {:?}",
+            saida.iter().map(|(c, s)| (c.bm25, *s)).collect::<Vec<_>>()
+        );
+        // E continua a ser um canal SUBORDINADO ao medido.
+        assert!(
+            score_de(&saida, medido) > score_de(&saida, quente_forte),
+            "o canal quente calibrado ultrapassou o BM25 medido"
+        );
+    }
+
+    /// Sem canal BM25 não há piso medido, logo não há segunda escala com que
+    /// ser incoerente: o tf fica como está e continua a ordenar. Mata a mutação
+    /// de zerar (ou descartar) o canal quente quando `text` vem vazio
+    /// (auditoria 2026-09-05, vaga 2, R71).
+    #[test]
+    fn sem_canal_bm25_o_tf_da_memtable_ordena_na_mesma() {
+        let forte = EventId::new();
+        let fraco = EventId::new();
+        let saida = retrieve(
+            "q",
+            lote_texto(Vec::new(), vec![(forte, 5.0), (fraco, 1.0)]),
+            &reranker_de_texto(),
+            2,
+        );
+        assert!(
+            score_de(&saida, forte) > score_de(&saida, fraco),
+            "tf=5 não ficou acima de tf=1 sem canal medido: {:?}",
+            saida.iter().map(|(c, s)| (c.bm25, *s)).collect::<Vec<_>>()
+        );
+        assert!(
+            score_de(&saida, fraco) > 0.0,
+            "o canal quente foi zerado por não haver piso medido"
+        );
+    }
+
+    /// A precedência do `chain` não muda: quem está nos DOIS canais leva o BM25
+    /// medido, não o tf calibrado. Trava a regressão de inverter a ordem do
+    /// `chain` ao mexer no bloco (auditoria 2026-09-05, vaga 2, R71).
+    #[test]
+    fn candidato_presente_nos_dois_canais_continua_a_levar_o_bm25_medido() {
+        let x = EventId::new();
+        let saida = retrieve(
+            "q",
+            lote_texto(vec![(x, 3.0)], vec![(x, 10.0)]),
+            &reranker_de_texto(),
+            1,
+        );
+        assert_eq!(
+            saida[0].0.bm25,
+            Some(3.0),
+            "o candidato presente nos dois canais deixou de levar o BM25 medido"
+        );
+    }
+
+    /// O canal quente vem de fora; um único valor não-finito no lote envenenaria
+    /// o `tf_max` (um `+inf` colapsaria todos os outros a ~0) e, sem saneamento,
+    /// chegaria ao esmagamento como 1.0 — o máximo do sinal textual — pondo lixo
+    /// à frente do topo medido (auditoria 2026-09-05, vaga 2, R71).
+    #[test]
+    fn tf_nao_finito_ou_negativo_nao_envenena_a_calibracao() {
+        let medido = EventId::new();
+        let nan = EventId::new();
+        let inf = EventId::new();
+        let negativo = EventId::new();
+        let limpo = EventId::new();
+        let saida = retrieve(
+            "q",
+            lote_texto(
+                vec![(medido, 3.0)],
+                vec![
+                    (nan, f32::NAN),
+                    (inf, f32::INFINITY),
+                    (negativo, -1.0),
+                    (limpo, 10.0),
+                ],
+            ),
+            &reranker_de_texto(),
+            5,
+        );
+        for (c, s) in &saida {
+            assert!(s.is_finite(), "score não-finito para {:?}: {s}", c.bm25);
+        }
+        let s_medido = score_de(&saida, medido);
+        for (rotulo, sujo) in [("NaN", nan), ("+inf", inf), ("negativo", negativo)] {
+            assert!(
+                s_medido > score_de(&saida, sujo),
+                "o tf {rotulo} passou à frente do topo do BM25: {:?}",
+                saida.iter().map(|(c, s)| (c.bm25, *s)).collect::<Vec<_>>()
+            );
+        }
+        // O lote sujo não pode alterar a calibração do hit legítimo: continua
+        // abaixo do piso medido e acima dos que foram saneados para 0.
+        assert!(
+            s_medido > score_de(&saida, limpo) && score_de(&saida, limpo) > score_de(&saida, nan),
+            "a calibração do tf=10 legítimo foi contaminada pelo lote sujo: {:?}",
+            saida.iter().map(|(c, s)| (c.bm25, *s)).collect::<Vec<_>>()
+        );
     }
 }
