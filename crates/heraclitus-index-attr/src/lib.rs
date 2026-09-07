@@ -679,6 +679,41 @@ impl ResidentSnapshot {
 // finito ≠ -0.0 a codificação é bit-idêntica à anterior, logo os checkpoints
 // existentes permanecem legíveis.
 
+/// Como é que o checkpoint foi (ou não foi) aproveitado.
+///
+/// Auditoria 2026-09-05, vaga 2 (R90). Existe para o chamador poder AVISAR.
+/// Até aqui, `open` devolvia um índice vazio tanto para "não há ficheiro"
+/// (primeiro arranque, normal) como para "havia e foi recusado" (corrompido,
+/// formato desconhecido, CRC v6 que não bate) — e as duas degradações eram
+/// mudas. Não há incorrecção: o `Engine::open` replaya o log inteiro e o índice
+/// fica certo. O que há é CUSTO e SILÊNCIO: um checkpoint corrompido
+/// transforma um arranque de cauda num rebuild integral (minutos ou horas num
+/// log grande) e a fase de boot imprimia exactamente a mesma linha nos dois
+/// casos, pelo que o operador não conseguia distinguir "lento porque o
+/// checkpoint estava corrompido" de "lento por outra razão" — e uma corrupção
+/// recorrente (disco, fsync, downgrade de formato) nunca chegava a ser notada.
+///
+/// O precedente está no crate irmão: `ViewRegistry::open` degrada de forma
+/// equivalente MAS avisa (`heraclitus-views/src/lib.rs:122`, "watermarks.json
+/// ilegível; as views vão ser reconstruídas do LSN 0").
+///
+/// O aviso não é emitido aqui: este crate não depende de `tracing` e não vale
+/// uma dependência nova por uma linha de log. Quem chama (`heraclitus-server`)
+/// já a tem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AberturaCheckpoint {
+    /// Snapshot lido; só a cauda `(watermark, head]` vai ser replayada.
+    Carregado,
+    /// Não havia ficheiro: primeiro arranque ou log virgem. Normal, não avisa.
+    Ausente,
+    /// O ficheiro existia e foi RECUSADO (magic/versão/bincode/expand/CRC).
+    /// O índice vai ser reconstruído desde o LSN 0.
+    Ilegivel,
+    /// O ficheiro existe mas não se leu (permissão, EIO, ...). Distinto de
+    /// [`AberturaCheckpoint::Ausente`] de propósito: é sintoma de hardware.
+    ErroIo(String),
+}
+
 /// Índice invertido de atributos. Persistido e reconstruível por replay.
 #[derive(Default)]
 pub struct AttrIndex {
@@ -692,6 +727,13 @@ impl AttrIndex {
 
     /// Abre o índice carregando o checkpoint de `dir` (vazio se não existir).
     pub fn open(dir: impl AsRef<Path>) -> Self {
+        Self::open_reportando(dir).0
+    }
+
+    /// Como [`AttrIndex::open`], mas **diz o que aconteceu ao checkpoint**.
+    ///
+    /// Auditoria 2026-09-05, vaga 2 (R90).
+    pub fn open_reportando(dir: impl AsRef<Path>) -> (Self, AberturaCheckpoint) {
         let path = dir.as_ref().join(SNAPSHOT_FILE);
         match std::fs::read(&path) {
             Ok(bytes) => {
@@ -754,11 +796,18 @@ impl AttrIndex {
                         .and_then(|(snapshot, _)| ResidentSnapshot::from_legacy(snapshot))
                 };
                 match snap {
-                    Some(inner) => AttrIndex { inner },
-                    None => AttrIndex::new(), // corrompido -> rebuild por replay
+                    Some(inner) => (AttrIndex { inner }, AberturaCheckpoint::Carregado),
+                    // Corrompido / formato desconhecido -> rebuild por replay.
+                    None => (AttrIndex::new(), AberturaCheckpoint::Ilegivel),
                 }
             }
-            Err(_) => AttrIndex::new(),
+            // "Não existe" é o primeiro arranque e NÃO é um aviso. Qualquer
+            // outro erro (permissão negada, EIO) é sintoma de disco a morrer e
+            // não pode ser confundido com um log virgem.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                (AttrIndex::new(), AberturaCheckpoint::Ausente)
+            }
+            Err(e) => (AttrIndex::new(), AberturaCheckpoint::ErroIo(e.to_string())),
         }
     }
 
@@ -1697,6 +1746,64 @@ mod compressao_tests {
         assert!(
             lido.is_empty(),
             "checkpoint corrompido tem de degradar para rebuild, nao servir postings"
+        );
+    }
+
+    /// Auditoria 2026-09-05, vaga 2 (R90): a degradacao tem de deixar rasto.
+    ///
+    /// `open` devolvia um indice vazio tanto para "nao ha ficheiro" (primeiro
+    /// arranque, normal) como para "havia e foi recusado" (corrupcao), e o
+    /// chamador nao tinha por onde distinguir os dois -- logo nao podia avisar.
+    /// Um checkpoint corrompido transforma um arranque de cauda num rebuild
+    /// integral (minutos/horas num log grande) e a fase de boot imprimia
+    /// exactamente a mesma linha nos dois casos.
+    #[test]
+    fn checkpoint_corrompido_e_reportado_como_ilegivel_e_nao_como_ausente() {
+        let dir = tempfile::tempdir().unwrap();
+        // 1) sem ficheiro -> Ausente (nao pode gerar aviso no primeiro arranque)
+        assert_eq!(
+            AttrIndex::open_reportando(dir.path()).1,
+            AberturaCheckpoint::Ausente
+        );
+        // 2) checkpoint valido -> Carregado
+        indice_com(100).save(dir.path()).unwrap();
+        let (ok, estado) = AttrIndex::open_reportando(dir.path());
+        assert_eq!(estado, AberturaCheckpoint::Carregado);
+        assert!(!ok.is_empty());
+        // 3) corpo estragado com o magic intacto -> Ilegivel + indice vazio
+        let p = dir.path().join(SNAPSHOT_FILE);
+        let mut bytes = std::fs::read(&p).unwrap();
+        let meio = bytes.len() / 2;
+        bytes[meio] ^= 0xFF;
+        bytes.truncate(bytes.len() - 3);
+        std::fs::write(&p, &bytes).unwrap();
+        let (lido, estado) = AttrIndex::open_reportando(dir.path());
+        assert_eq!(
+            estado,
+            AberturaCheckpoint::Ilegivel,
+            "corrupcao tem de ser distinguivel de ausencia"
+        );
+        assert!(lido.is_empty());
+        // 4) formato futuro desconhecido (magic ok, versao 999) -> Ilegivel
+        let mut futuro = MAGIC_V2.to_vec();
+        futuro.extend_from_slice(&999u16.to_le_bytes());
+        futuro.extend_from_slice(&[0u8; 32]);
+        std::fs::write(&p, &futuro).unwrap();
+        assert_eq!(
+            AttrIndex::open_reportando(dir.path()).1,
+            AberturaCheckpoint::Ilegivel
+        );
+        // 5) erro de I/O real (o "ficheiro" e um DIRECTORIO) -> ErroIo, nao
+        //    Ausente: permissao negada / EIO sao sintoma de disco a morrer e
+        //    nao podem ser confundidos com "primeiro arranque".
+        let dir_io = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir_io.path().join(SNAPSHOT_FILE)).unwrap();
+        assert!(
+            matches!(
+                AttrIndex::open_reportando(dir_io.path()).1,
+                AberturaCheckpoint::ErroIo(_)
+            ),
+            "erro de I/O nao pode ser reportado como ausencia"
         );
     }
 

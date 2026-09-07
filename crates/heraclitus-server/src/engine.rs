@@ -8,7 +8,7 @@ use heraclitus_core::{
     Episode, EventKind, HeraclitusConfig, HeraclitusError, Lsn, ProductPoint, SegmentId,
 };
 use heraclitus_crypto::KeyStore;
-use heraclitus_index_attr::AttrIndex;
+use heraclitus_index_attr::{AberturaCheckpoint, AttrIndex};
 use heraclitus_index_graph::entity::EntityResolver;
 use heraclitus_index_graph::temporal::TemporalGraph;
 use heraclitus_index_graph::GraphIndex;
@@ -541,11 +541,34 @@ impl Engine {
         let attr_dir = config.data_dir.join("views");
         let attr = {
             let p = boot.phase("Índice de atributos (campo → LSN)");
-            let attr = Arc::new(RwLock::new(if privacy_rebuild {
-                AttrIndex::new()
+            // Auditoria 2026-09-05, vaga 2 (R90): abrir REPORTANDO. Um
+            // checkpoint recusado troca um arranque de cauda por um rebuild
+            // integral; sem este aviso a linha da fase é idêntica nos dois
+            // casos e uma corrupção recorrente nunca é notada. Mesmo padrão do
+            // `ViewRegistry::open` (heraclitus-views/src/lib.rs:122).
+            let (indice, estado) = if privacy_rebuild {
+                // Rebuild forçado não chega a ler ficheiro nenhum: nada a
+                // reportar (e nada a avisar — a lentidão foi pedida).
+                (AttrIndex::new(), AberturaCheckpoint::Ausente)
             } else {
-                AttrIndex::open(&attr_dir)
-            }));
+                AttrIndex::open_reportando(&attr_dir)
+            };
+            match &estado {
+                AberturaCheckpoint::Ilegivel => tracing::warn!(
+                    path = %attr_dir.join("attr_index.bin").display(),
+                    "checkpoint do índice de atributos ILEGÍVEL (corrompido/formato \
+                     desconhecido); o índice vai ser reconstruído desde o LSN 0 — \
+                     arranque mais lento, sem perda de dados"
+                ),
+                AberturaCheckpoint::ErroIo(erro) => tracing::warn!(
+                    erro = %erro,
+                    path = %attr_dir.display(),
+                    "checkpoint do índice de atributos existe mas não se leu; \
+                     rebuild desde o LSN 0"
+                ),
+                AberturaCheckpoint::Carregado | AberturaCheckpoint::Ausente => {}
+            }
+            let attr = Arc::new(RwLock::new(indice));
             let keys = {
                 let mut idx = attr.write().unwrap();
                 if !skip_replay {
@@ -581,7 +604,17 @@ impl Engine {
                     group(keys as u64)
                 ));
             } else {
-                p.ok(format!("{} chaves indexadas", group(keys as u64)));
+                // R90: o operador que só vê o boot também tem de perceber
+                // porque é que este arranque demorou.
+                p.ok(format!(
+                    "{} chaves indexadas{}",
+                    group(keys as u64),
+                    match estado {
+                        AberturaCheckpoint::Ilegivel | AberturaCheckpoint::ErroIo(_) =>
+                            " (checkpoint ilegível — rebuild integral)",
+                        _ => "",
+                    }
+                ));
             }
             attr
         };
