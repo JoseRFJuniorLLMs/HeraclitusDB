@@ -2424,6 +2424,17 @@ impl Engine {
         Ok(())
     }
 
+    /// Dimensão do produto (H⊗S⊗E) EM VIGOR no índice vectorial, ou `None`
+    /// enquanto nenhum embedding entrou.
+    ///
+    /// Auditoria 2026-09-05, vaga 2 (R60): existe para a ingestão poder
+    /// recusar um embedding incomparável. O campo `vector` é privado, e a
+    /// referência tem de ser esta — NUNCA a assinatura de `ProductMetric`,
+    /// que é decorativa (default 32/8/8, que nenhum cliente real usa).
+    pub fn embedding_layout(&self) -> Option<(usize, usize, usize)> {
+        self.vector.read().unwrap().layout()
+    }
+
     pub fn stats(&self) -> serde_json::Value {
         serde_json::json!({
             "head": self.log.head(),

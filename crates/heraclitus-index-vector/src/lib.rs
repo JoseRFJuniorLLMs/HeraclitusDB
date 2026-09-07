@@ -637,6 +637,21 @@ impl VectorIndex {
         self.nodes.is_empty()
     }
 
+    /// Dimensão do produto (H⊗S⊗E) dos pontos residentes, ou `None` se o
+    /// índice está vazio.
+    ///
+    /// Auditoria 2026-09-05, vaga 2 (R60): a dimensão de um corpus é definida
+    /// pelo PRIMEIRO embedding que entrou, não por uma constante de
+    /// configuração — a assinatura da `ProductMetric` é decorativa e nada em
+    /// produção a impõe (o default 32⊗8⊗8 rejeitaria todos os clientes reais).
+    /// Ler o nó 0 é O(1) e não mexe no formato do `vector.ckpt`: a dimensão já
+    /// lá estava, só não era consultável.
+    pub fn layout(&self) -> Option<(usize, usize, usize)> {
+        self.nodes
+            .first()
+            .map(|n| (n.point.hyp.len(), n.point.sph.len(), n.point.euc.len()))
+    }
+
     /// #12 — Persiste o estado completo do HNSW (`<dir>/vector.ckpt`) com escrita
     /// atómica (tmp + rename). Correção nunca depende disto: sem checkpoint, a
     /// view reconstrói-se do LSN 0 (ver `heraclitus_views`).
@@ -830,6 +845,42 @@ mod tests {
             sph: vec![],
             euc: vec![],
         }
+    }
+
+    /// Auditoria 2026-09-05, vaga 2 (R60): `layout()` é a referência contra a
+    /// qual a ingestão recusa um embedding incomparável, e tem de reportar a
+    /// dimensão que o corpus ESTABELECEU — a do primeiro embedding — não a do
+    /// último intruso. O índice em si não guarda dimensões (é a métrica que põe
+    /// o par a INFINITY), por isso um índice heterogéneo é construível aqui e
+    /// serve de banco de ensaio.
+    #[test]
+    fn layout_reporta_a_dimensao_do_primeiro_embedding() {
+        let mut idx = VectorIndex::new(ProductMetric::default());
+        assert_eq!(idx.layout(), None, "índice vazio não fixa dimensão nenhuma");
+
+        idx.insert(EventId::new(), 0, pt(vec![0.1, 0.2, 0.3]));
+        assert_eq!(idx.layout(), Some((3, 0, 0)));
+
+        // Um ponto de outra dimensão NÃO redefine a referência.
+        idx.insert(EventId::new(), 1, pt(vec![0.1; 5]));
+        assert_eq!(
+            idx.layout(),
+            Some((3, 0, 0)),
+            "o intruso passou a definir a dimensão do corpus"
+        );
+
+        // As três componentes contam, não só a hiperbólica.
+        let mut outro = VectorIndex::new(ProductMetric::default());
+        outro.insert(
+            EventId::new(),
+            0,
+            ProductPoint {
+                hyp: vec![0.1, 0.2],
+                sph: vec![1.0],
+                euc: vec![0.5, 0.5, 0.5],
+            },
+        );
+        assert_eq!(outro.layout(), Some((2, 1, 3)));
     }
 
     #[test]

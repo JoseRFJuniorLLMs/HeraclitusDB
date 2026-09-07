@@ -69,6 +69,32 @@ impl pb::heraclitus_server::Heraclitus for Service {
         let mut e = Episode::new(r.agent_id, kind, r.content);
         e.session_id = r.session_id;
         if !(r.hyp.is_empty() && r.sph.is_empty() && r.euc.is_empty()) {
+            // Auditoria 2026-09-05, vaga 2 (R60): incomparável = recusado à
+            // entrada. Este é o ÚNICO sítio de produção onde se constrói um
+            // `ProductPoint`, logo o único ingresso a defender. A métrica já
+            // põe o par a `f64::INFINITY` (c260497), mas isso só impede o
+            // envenenamento: até aqui o episódio ficava gravado no log
+            // IMUTÁVEL, ocupava um nó do HNSW que nunca casa nada, e ainda
+            // voltava ao cliente como hit-de-enchimento com `dist` não-finito
+            // — que `serde_json` serializa como `null`. O escritor tem de
+            // saber, e este é o último instante em que ainda se pode dizer
+            // "não".
+            //
+            // A referência é a dimensão EM VIGOR no índice, NUNCA a assinatura
+            // da `ProductMetric` (default 32⊗8⊗8): essa é decorativa e
+            // rejeitaria todos os clientes reais. Índice vazio aceita e fixa a
+            // dimensão — não há referência contra a qual decidir. Nada disto
+            // toca no replay nem em `Engine::append`, por isso o histórico
+            // continua a poder arrancar.
+            let novo = (r.hyp.len(), r.sph.len(), r.euc.len());
+            if let Some(vigor) = self.engine.embedding_layout() {
+                if novo != vigor {
+                    return Err(Status::invalid_argument(format!(
+                        "embedding H{}⊗S{}⊗E{} é incomparável com a dimensão em vigor H{}⊗S{}⊗E{}",
+                        novo.0, novo.1, novo.2, vigor.0, vigor.1, vigor.2
+                    )));
+                }
+            }
             let mut hyp = r.hyp;
             heraclitus_manifold::project_to_ball(&mut hyp);
             e.embedding = Some(ProductPoint {
@@ -953,5 +979,130 @@ pub(crate) fn model_bundle_op(
             (true, serde_json::Value::Array(bundles).to_string())
         }
         other => (false, format!("operação desconhecida: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod testes_dimensao_do_embedding {
+    use super::*;
+    use crate::auth::Principal;
+    use heraclitus_core::HeraclitusConfig;
+    use pb::heraclitus_server::Heraclitus;
+
+    fn motor(dir: &std::path::Path) -> Arc<Engine> {
+        let cfg = HeraclitusConfig {
+            data_dir: dir.to_path_buf(),
+            ..HeraclitusConfig::default()
+        };
+        Arc::new(Engine::open(&cfg).unwrap())
+    }
+
+    /// Um Append autenticado como Writer — o principal vive nas extensões do
+    /// pedido porque é lá que o interceptor o põe e é lá que `auth::require` o
+    /// procura.
+    fn pedido(hyp: Vec<f32>, sph: Vec<f32>, euc: Vec<f32>) -> Request<pb::AppendRequest> {
+        let mut req = Request::new(pb::AppendRequest {
+            agent_id: "cliente".into(),
+            kind: "Observation".into(),
+            content: b"episodio".to_vec(),
+            hyp,
+            sph,
+            euc,
+            ..Default::default()
+        });
+        req.extensions_mut().insert(Principal {
+            name: "escritor".into(),
+            roles: Arc::new(vec![AccessRole::Writer]),
+        });
+        req
+    }
+
+    /// Auditoria 2026-09-05, vaga 2 (R60): o caminho de ingestão do gRPC — o
+    /// ÚNICO sítio de produção onde se constrói um `ProductPoint` — aceitava
+    /// qualquer dimensão. O commit c260497 pôs o par incomparável a
+    /// `f64::INFINITY` na métrica, o que fecha o envenenamento (o nó deixa de
+    /// dominar as buscas) mas não fecha a fuga: o episódio fica gravado no log
+    /// IMUTÁVEL, ocupa um nó permanente do HNSW que nunca casa nada, e o
+    /// escritor recebe OK. Este é o último instante em que ainda se pode dizer
+    /// "não".
+    #[tokio::test]
+    async fn append_recusa_embedding_incomparavel_com_a_dimensao_em_vigor() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = Service::new(motor(dir.path()));
+
+        // O primeiro embedding FIXA a dimensão do corpus: H3.
+        svc.append(pedido(vec![0.1, 0.2, 0.3], vec![], vec![]))
+            .await
+            .unwrap();
+        svc.append(pedido(vec![0.4, 0.5, 0.6], vec![], vec![]))
+            .await
+            .unwrap();
+
+        let erro = svc
+            .append(pedido(vec![0.1; 5], vec![], vec![]))
+            .await
+            .unwrap_err();
+        assert_eq!(erro.code(), tonic::Code::InvalidArgument, "{erro}");
+        assert!(
+            erro.message().contains("H5") && erro.message().contains("H3"),
+            "a mensagem tem de nomear as DUAS dimensões: {}",
+            erro.message()
+        );
+
+        // A componente esférica conta tanto como a hiperbólica: com a consulta
+        // a trazer `sph` vazio, `dist_sph_prepared` devolve 0.0 e a métrica NEM
+        // SEQUER vê a incompatibilidade — só a guarda de ingestão a apanha.
+        let erro = svc
+            .append(pedido(vec![0.1, 0.2, 0.3], vec![0.5], vec![]))
+            .await
+            .unwrap_err();
+        assert_eq!(erro.code(), tonic::Code::InvalidArgument, "{erro}");
+
+        // Controlo positivo: a guarda não pode fechar o caminho legítimo.
+        svc.append(pedido(vec![0.7, 0.8, 0.9], vec![], vec![]))
+            .await
+            .unwrap();
+        // Nem o episódio sem embedding nenhum, que não entra no índice.
+        svc.append(pedido(vec![], vec![], vec![])).await.unwrap();
+    }
+
+    /// Auditoria 2026-09-05, vaga 2 (R60): o efeito observável a jusante. Em
+    /// `search_layer` o ramo `results.len() < ef || d < worst` admite o
+    /// candidato infinito enquanto ainda faltam resultados — logo, com menos de
+    /// `ef` nós comparáveis, o nó de dimensão errada ENTRA nos resultados.
+    /// `search` faz `(dist.max(0.0)).sqrt() as f32` -> `f32::INFINITY`,
+    /// `Engine::nearest` propaga-o, e `plan.rs` faz `j["dist"] = json!(dist)`:
+    /// serde_json converte não-finito em `Value::Null`. O cliente recebia o
+    /// episódio incomparável como hit-de-enchimento com `"dist": null`. A
+    /// guarda de ingestão é a única coisa que impede essa linha de existir.
+    #[tokio::test]
+    async fn nenhum_hit_de_nearest_sai_com_dist_nula() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = motor(dir.path());
+        let svc = Service::new(engine.clone());
+
+        svc.append(pedido(vec![0.1, 0.2, 0.3], vec![], vec![]))
+            .await
+            .unwrap();
+        svc.append(pedido(vec![0.4, 0.5, 0.6], vec![], vec![]))
+            .await
+            .unwrap();
+        // Antes da correcção isto era aceite e ficava no índice para sempre.
+        let _ = svc.append(pedido(vec![0.9; 5], vec![], vec![])).await;
+
+        let json = heraclitus_query::execute("NEAREST ([0.1, 0.2, 0.3], 5)", engine.as_ref())
+            .unwrap()
+            .to_string();
+        let linhas: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert!(
+            !linhas.is_empty(),
+            "o corpus comparável tem de continuar a responder: {json}"
+        );
+        for linha in &linhas {
+            assert!(
+                !linha["dist"].is_null(),
+                "um hit saiu com dist não-finita (incomparável): {json}"
+            );
+        }
     }
 }
