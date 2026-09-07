@@ -92,3 +92,39 @@ fn apagar_valor_com_cadeia_overflow_no_cascade_deixa_a_arvore_integra() {
     t.commit().unwrap();
     assert_eq!(t.get(b"zzz-grande").map(|v| v.len()), Some(5000));
 }
+
+/// R41/A45 — ramo gémeo raiz-folha (`push_msg`), que até aqui não tinha um
+/// único teste que morresse ao revertê-lo: o probe do A45 insere 400 chaves de
+/// propósito para a raiz partir, logo exercita SÓ o ramo do
+/// `partial_flush_cascade`. Duas cadeias overflow na MESMA raiz-folha: com a
+/// outra cadeia ainda viva, `calculate_fragmentation_ratio` devolve 0.0 (o
+/// `slot.length` do overflow vivo satura o `saturating_sub`), a compactação NÃO
+/// corre e o slot fantasma vai mesmo para o disco. É o contra-exemplo à nota
+/// "aqui a compactação mascara o defeito antes de alguém o ver".
+#[test]
+fn apagar_uma_de_duas_cadeias_na_raiz_folha_nao_corrompe() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("del_ov_raiz.hbt");
+    let mut t = BEpsilonTree::open(&path, 1000, 128).unwrap();
+
+    t.upsert(b"g1".to_vec(), vec![0xCDu8; 6144]).unwrap();
+    t.upsert(b"g2".to_vec(), vec![0xEFu8; 6144]).unwrap();
+    t.commit().unwrap();
+    assert!(
+        t.verify_tree_integrity().unwrap(),
+        "integra antes de apagar"
+    );
+
+    t.delete_key(b"g1").unwrap();
+    // Limpar a flag SEM limpar o valor em memória faz o serialize
+    // inline-izar de novo os 6144 B e rebentar a página aqui.
+    t.commit()
+        .expect("commit apos apagar valor com cadeia na raiz-folha");
+
+    assert_eq!(t.get(b"g1"), None, "a chave foi mesmo apagada");
+    assert_eq!(t.get(b"g2").map(|v| v.len()), Some(6144), "vizinha intacta");
+    assert!(
+        t.verify_tree_integrity().unwrap(),
+        "slot fantasma nao pode continuar a dizer que tem cadeia"
+    );
+}

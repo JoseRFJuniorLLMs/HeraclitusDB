@@ -1816,12 +1816,37 @@ impl BEpsilonTree {
                         if (root.slots[i].flags & FLAG_OVERFLOW) != 0 {
                             // Auditoria 2026-09-05 (A45): o slot deixou MESMO
                             // de ter cadeia — além do ponteiro há que apagar o
-                            // bit e o valor em memória. FLAG_OVERFLOW com
-                            // `overflow_page == 0` é a combinação que
-                            // `verify_tree_integrity` classifica como
-                            // corrupção; e limpar só o bit faz o `serialize`
-                            // voltar a inline-izar o valor grande e estourar a
-                            // página. As três linhas são indissociáveis.
+                            // bit e o valor em memória.
+                            //
+                            // Vaga 2 (R41): as três linhas NÃO são todas da
+                            // mesma classe, e dizê-lo importa — a nota antiga
+                            // ("corrige-se por simetria; a compactação remove o
+                            // slot fantasma antes de alguém o ver") convidava a
+                            // apagar este ramo por o julgar redundante, e é
+                            // FALSA: `calculate_fragmentation_ratio` soma o
+                            // `slot.length` dos slots VIVOS, e um overflow vivo
+                            // contribui com o comprimento da CADEIA, o que
+                            // satura o `saturating_sub` a 0 e devolve ratio 0.0
+                            // — a compactação não corre e o slot fantasma vai
+                            // mesmo para o disco (contra-exemplo em
+                            // `apagar_uma_de_duas_cadeias_na_raiz_folha_nao_corrompe`).
+                            //   - `flags &= !FLAG_OVERFLOW` e `vals[i].clear()`
+                            //     são LOAD-BEARING: sem o primeiro fica
+                            //     FLAG_OVERFLOW com `overflow_page == 0`, que
+                            //     `verify_tree_integrity` classifica como
+                            //     corrupção; sem o segundo o `serialize` volta
+                            //     a inline-izar o valor grande e estoura a
+                            //     página.
+                            //   - `length = 0` é higiene defensiva: nenhum
+                            //     leitor actual lê o `length` de um slot GHOST
+                            //     (o `serialize` escreve `ov_len = 0` com a
+                            //     flag desligada, o `from_bytes` recalcula
+                            //     `length = v_len`, a fragmentação salta os
+                            //     GHOST e um re-upsert reescreve o Slot todo).
+                            //     Fica para o slot não mentir em memória; quem
+                            //     a prova é o `mod slots_fantasma_tests`, em
+                            //     caixa-branca — o único nível a que este
+                            //     invariante é observável.
                             self.recycle_overflow_chain(root.slots[i].overflow_page)?;
                             root.slots[i].overflow_page = 0;
                             root.slots[i].length = 0;
@@ -2078,11 +2103,13 @@ impl BEpsilonTree {
                             Msg::Delete(_) => {
                                 if let Ok(i) = child.keys.binary_search(&k) {
                                     if (child.slots[i].flags & FLAG_OVERFLOW) != 0 {
-                                        // A45: ver o ramo gémeo raiz-folha. Aqui
-                                        // o defeito não era mascarado por
-                                        // compactação nenhuma — o slot fantasma
-                                        // ia para o disco a afirmar que tinha
-                                        // cadeia, com o ponteiro a zero.
+                                        // A45: ver o ramo gémeo raiz-folha —
+                                        // mesmas três linhas, mesma separação
+                                        // entre as duas load-bearing e o
+                                        // `length = 0` de higiene (R41). Aqui o
+                                        // slot fantasma ia para o disco a
+                                        // afirmar que tinha cadeia, com o
+                                        // ponteiro a zero.
                                         self.recycle_overflow_chain(child.slots[i].overflow_page)?;
                                         child.slots[i].overflow_page = 0;
                                         child.slots[i].length = 0;
@@ -3235,6 +3262,109 @@ mod superbloco_tests {
         assert_eq!(
             t.superblock.read().unwrap().free_list_len as usize,
             MAX_SB_FREE_LIST
+        );
+    }
+}
+
+#[cfg(test)]
+mod slots_fantasma_tests {
+    //! Auditoria recursiva 2026-09-05, vaga 2 (R41): o `slots[i].length = 0` do
+    //! delete de uma chave com cadeia overflow NÃO é observável por
+    //! caixa-preta (nenhum leitor lê o `length` de um slot GHOST). A regra da
+    //! casa — uma correcção sem um teste que morra ao revertê-la não está
+    //! provada — cumpre-se aqui, ao nível a que o invariante existe: o Slot em
+    //! memória depois do delete. Precisa de `acquire_node_guard` e dos campos
+    //! do `Slot`, por isso vive dentro da crate.
+    use super::*;
+
+    /// Ramo raiz-folha (`push_msg`). Duas cadeias na MESMA raiz-folha para que
+    /// a compactação não corra (o `slot.length` da cadeia viva satura o
+    /// `saturating_sub` e o ratio dá 0.0) — é o cenário em que o slot fantasma
+    /// sobrevive e vai para o disco.
+    #[test]
+    fn raiz_folha_apaga_cadeia_e_limpa_o_slot_inteiro() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ghost_raiz.hbt");
+        let mut t = BEpsilonTree::open(&path, 1000, 128).unwrap();
+
+        t.upsert(b"g1".to_vec(), vec![0xCDu8; 6144]).unwrap();
+        t.upsert(b"g2".to_vec(), vec![0xEFu8; 6144]).unwrap();
+        t.commit().unwrap();
+        t.delete_key(b"g1").unwrap();
+        t.commit().unwrap();
+
+        let root_id = t.superblock.read().unwrap().root_id;
+        let guard = t.acquire_node_guard(root_id).unwrap();
+        let root = guard.node.read().unwrap();
+        assert!(root.is_leaf(), "o cenario exige uma raiz-folha");
+        assert_slot_fantasma_limpo(&root, b"g1", "raiz-folha");
+    }
+
+    /// Ramo gémeo do `partial_flush_cascade`: a mesma asserção uma folha
+    /// abaixo, depois de a raiz partir.
+    #[test]
+    fn cascade_apaga_cadeia_e_limpa_o_slot_inteiro() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ghost_cascade.hbt");
+        let mut t = BEpsilonTree::open(&path, 1000, 128).unwrap();
+
+        for i in 0..400u32 {
+            t.upsert(format!("chave-{i:06}").into_bytes(), b"v".to_vec())
+                .unwrap();
+        }
+        t.commit().unwrap();
+        t.upsert(b"zzz-grande".to_vec(), vec![0xABu8; 6144])
+            .unwrap();
+        t.commit().unwrap();
+        t.delete_key(b"zzz-grande").unwrap();
+        t.commit().unwrap();
+
+        let chave = b"zzz-grande".to_vec();
+        let mut id = t.superblock.read().unwrap().root_id;
+        let mut desceu = 0usize;
+        loop {
+            let guard = t.acquire_node_guard(id).unwrap();
+            let node = guard.node.read().unwrap();
+            if node.is_leaf() {
+                assert!(desceu > 0, "a raiz nao partiu — o cascade nao correu");
+                assert_slot_fantasma_limpo(&node, b"zzz-grande", "cascade");
+                break;
+            }
+            let idx = node
+                .keys
+                .partition_point(|p| p.as_slice() <= chave.as_slice());
+            id = node.children[idx];
+            desceu += 1;
+        }
+    }
+
+    fn assert_slot_fantasma_limpo(node: &DiskNode, chave: &[u8], onde: &str) {
+        let i = node
+            .keys
+            .binary_search(&chave.to_vec())
+            .unwrap_or_else(|_| panic!("{onde}: o slot fantasma foi compactado — cenario vacuo"));
+        let slot = &node.slots[i];
+        assert_ne!(
+            slot.flags & FLAG_GHOST,
+            0,
+            "{onde}: o slot tem de ser GHOST"
+        );
+        assert_eq!(
+            slot.flags & FLAG_OVERFLOW,
+            0,
+            "{onde}: FLAG_OVERFLOW com ponteiro a zero e o que o verificador chama corrupcao"
+        );
+        assert_eq!(
+            slot.overflow_page, 0,
+            "{onde}: ponteiro de cadeia por limpar"
+        );
+        assert_eq!(
+            slot.length, 0,
+            "{onde}: o slot fantasma continua a anunciar o comprimento da cadeia que ja nao tem"
+        );
+        assert!(
+            node.vals[i].is_empty(),
+            "{onde}: valor grande ainda em memoria — o serialize volta a inline-iza-lo"
         );
     }
 }
