@@ -1877,7 +1877,7 @@ impl SentinelRuntime {
                     break 'fora;
                 }
             }
-            cursor = ultimo.saturating_add(1);
+            cursor = cursor_apos_lote(cursor, ultimo)?;
         }
         Ok(rows)
     }
@@ -1919,7 +1919,7 @@ impl SentinelRuntime {
                     revisions.insert(incident.incident_id.clone(), incident);
                 }
             }
-            cursor = ultimo.saturating_add(1);
+            cursor = cursor_apos_lote(cursor, ultimo)?;
         }
         Ok(revisions.into_values().collect())
     }
@@ -2035,7 +2035,7 @@ impl SentinelRuntime {
                     }
                 }
             }
-            cursor = ultimo.saturating_add(1);
+            cursor = cursor_apos_lote(cursor, ultimo)?;
         }
 
         // Os lotes são contíguos e `scan_capped` devolve por LSN crescente, logo
@@ -2065,7 +2065,7 @@ impl SentinelRuntime {
                     let _ = engine.observe(lsn, input.entity, input.features, suspicious)?;
                 }
             }
-            cursor = ultimo.saturating_add(1);
+            cursor = cursor_apos_lote(cursor, ultimo)?;
         }
         Ok(Some(engine.snapshot()))
     }
@@ -2324,6 +2324,32 @@ fn talvez_publicar_snapshot(inner: &RuntimeInner, processados: u64) {
     drop(guarda);
 }
 
+/// Avanço do cursor de uma varredura janelada, com PROGRESSO ESTRITO.
+///
+/// Auditoria recursiva 2026-09-05, vaga 2, R111. O `+1` não é cosmético:
+/// `scan_capped` é INCLUSIVO em `from`, portanto com `janela == 1` o lote traz
+/// `ultimo == cursor` e um avanço para `ultimo` seria um ponto fixo — o `while`
+/// giraria para sempre a reler o mesmo registo. É a mesma armadilha que
+/// `Log::scan_capped` já documenta do outro lado da fronteira ("PROGRESSO
+/// ESTRITO (obrigatório)", `heraclitus-log/src/lib.rs:1699`), e o chamador era
+/// o único dos dois lados sem a defesa.
+///
+/// Estes caminhos são disparáveis por um `GET` de leitura: a forma degenerada
+/// não é um teste lento, é uma thread de pedido presa a queimar CPU e I/O — e
+/// uma thread presa é pior do que um erro. Devolver `Err` torna a regressão
+/// diagnosticável (com mensagem, em microssegundos) em vez de a deixar
+/// pendurada até ao timeout do CI, indistinguível de "CI lento".
+///
+/// Custo: uma comparação por LOTE, não por registo.
+fn cursor_apos_lote(atual: Lsn, ultimo: Lsn) -> Result<Lsn, SentinelError> {
+    let proximo = ultimo.saturating_add(1);
+    if proximo <= atual {
+        return Err(SentinelError::Worker(format!(
+            "varredura janelada sem progresso: cursor={atual}, último LSN do lote={ultimo}"
+        )));
+    }
+    Ok(proximo)
+}
 /// SPEC-0072 §10/§11 — percorre `[de, ate)` em lotes, sem nunca materializar
 /// a base inteira.
 ///
@@ -2353,7 +2379,7 @@ fn por_lotes(
         for (lsn, episodio) in linhas {
             visitar(lsn, episodio)?;
         }
-        cursor = ultimo.saturating_add(1);
+        cursor = cursor_apos_lote(cursor, ultimo)?;
     }
     Ok(())
 }
@@ -4983,6 +5009,33 @@ detection:
             .profiles
             .is_empty());
         runtime.shutdown();
+    }
+
+    /// Auditoria recursiva 2026-09-05, vaga 2, R111 — a varredura janelada tem
+    /// de EXIGIR progresso, não confiar nele.
+    ///
+    /// `scan_capped` é inclusivo em `from`: com janela 1 o lote traz
+    /// `ultimo == cursor`. Sem o `+1` o cursor é um ponto fixo e o laço gira
+    /// para sempre — uma regressão que o CI só apanhava por timeout, sem
+    /// mensagem e sem distinguir "avanço partido" de "CI lento". Aqui morre
+    /// com uma mensagem, em microssegundos.
+    #[test]
+    fn o_cursor_de_uma_varredura_janelada_exige_progresso_estrito() {
+        // O caso da janela 1: o último LSN do lote É o cursor.
+        assert_eq!(cursor_apos_lote(0, 0).unwrap(), 1);
+        assert_eq!(cursor_apos_lote(41, 41).unwrap(), 42);
+        assert_eq!(cursor_apos_lote(7, 7).unwrap(), 8);
+        // Um lote que avança de verdade continua a avançar para além do lote.
+        assert_eq!(cursor_apos_lote(7, 19).unwrap(), 20);
+        // Um lote que não avança (ou que anda para trás) é erro, não um laço.
+        let erro = cursor_apos_lote(7, 6).unwrap_err();
+        assert!(
+            erro.to_string().contains("sem progresso"),
+            "a falha tem de se explicar: {erro}"
+        );
+        assert!(cursor_apos_lote(7, 5).is_err());
+        // O topo do domínio satura e também não pode girar.
+        assert!(cursor_apos_lote(Lsn::MAX, Lsn::MAX).is_err());
     }
 
     /// Auditoria 2026-09-05, A41 — janelar a leitura não pode mudar o modelo
