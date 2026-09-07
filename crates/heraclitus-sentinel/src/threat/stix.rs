@@ -717,15 +717,32 @@ fn parse_rfc3339_millis(value: &str) -> Option<u64> {
         digits.parse::<i64>().ok()? * scale
     };
     let days = days_from_civil(year, month, day);
-    // Aritmética verificada como cinto e suspensórios: com os domínios acima
-    // nada disto pode transbordar, mas a entrada vem de um feed de terceiros e
-    // `overflow-checks = true` transforma qualquer folga futura num pânico —
-    // que atravessa o `Err` de `ThreatPlane::load` e derruba o arranque.
-    // `None` é o que o chamador (`and_then`, em `convert`) já sabe tratar.
+    // Auditoria 2026-09-05, vaga 2 (R99): toda a aritmética daqui para baixo é
+    // verificada, INCLUINDO a soma de hora/minuto/segundo — que até aqui era
+    // i64 nua, avaliada antes do `checked_add` que se dizia protegê-la. A
+    // guarda de domínio acima é a primeira linha de defesa; esta é a segunda e
+    // não depende dela. Importa porque a entrada vem de um feed de terceiros e
+    // `overflow-checks = true` transforma qualquer folga futura na guarda num
+    // pânico — que atravessa o `Err` de `ThreatPlane::load` e derruba o
+    // arranque. `None` é o que o chamador (`and_then`, em `convert`) já sabe
+    // tratar.
     let total = days
         .checked_mul(86_400)?
-        .checked_add(hour * 3_600 + minute * 60 + second)?;
+        .checked_add(seconds_of_day(hour, minute, second)?)?;
     u64::try_from(total.checked_mul(1_000)?.checked_add(millis)?).ok()
+}
+
+/// Segundos desde a meia-noite, com aritmética verificada de ponta a ponta.
+///
+/// Auditoria 2026-09-05, vaga 2 (R99): esta soma vivia NUA dentro do
+/// `checked_add` de `parse_rfc3339_millis` — só a guarda de domínio a impedia
+/// de transbordar. Isolada aqui, deixa de depender de uma invariante à
+/// distância: se a guarda alguma vez for relaxada, isto devolve `None` em vez
+/// de panicar com `overflow-checks = true`.
+fn seconds_of_day(hour: i64, minute: i64, second: i64) -> Option<i64> {
+    hour.checked_mul(3_600)?
+        .checked_add(minute.checked_mul(60)?)?
+        .checked_add(second)
 }
 
 /// Howard Hinnant's `days_from_civil`: civil date to days since 1970-01-01.
@@ -1105,6 +1122,22 @@ mod tests {
         // As fronteiras legitimas do perfil RFC 3339 do STIX continuam a passar.
         assert!(parse_rfc3339_millis("9999-12-31T23:59:60Z").is_some());
         assert_eq!(parse_rfc3339_millis("1970-01-01T00:00:00Z"), Some(0));
+    }
+
+    #[test]
+    fn segundos_do_dia_recusam_valores_absurdos_em_vez_de_panicar() {
+        // Auditoria 2026-09-05, vaga 2 (R99): defesa em profundidade — se a
+        // guarda de domínio de `parse_rfc3339_millis` alguma vez for relaxada,
+        // esta soma tem de devolver `None`, não panicar com
+        // `overflow-checks = true`.
+        assert_eq!(seconds_of_day(i64::MAX, 0, 0), None);
+        assert_eq!(seconds_of_day(0, i64::MAX, 0), None);
+        assert_eq!(seconds_of_day(i64::MAX / 3_600, i64::MAX, 0), None);
+        assert_eq!(seconds_of_day(-9_000_000_000_000_000, 0, 0), None);
+        assert_eq!(seconds_of_day(i64::MIN, 0, i64::MIN), None);
+        // Domínio legítimo intacto (incluindo o segundo bissexto 60).
+        assert_eq!(seconds_of_day(23, 59, 60), Some(86_400));
+        assert_eq!(seconds_of_day(0, 0, 0), Some(0));
     }
 
     #[test]
