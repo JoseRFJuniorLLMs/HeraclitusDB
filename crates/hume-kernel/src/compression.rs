@@ -136,12 +136,31 @@ pub mod bitpack {
 
     /// Desempacota `count` valores de `bits` bits cada.
     pub fn unpack(packed: &[u64], bits: u32, count: usize) -> Vec<u64> {
+        let mut out = Vec::with_capacity(count);
+        unpack_into(&mut out, packed, bits, count);
+        out
+    }
+
+    /// Igual ao [`unpack`], mas ACRESCENTA a um buffer já existente em vez de
+    /// devolver um `Vec` novo.
+    ///
+    /// Auditoria 2026-09-05, vaga 2 (R88): o `column::decode` desempacotava
+    /// para um `Vec` temporário e só depois construía a coluna final, portanto
+    /// a coluna inteira ficava viva DUAS vezes ao mesmo tempo — 2x o tecto que
+    /// o `MAX_VALORES` promete. Com isto o chamador reserva `n` uma única vez e
+    /// desempacota lá para dentro.
+    ///
+    /// # Panics
+    /// Se `bits` estiver fora de `1..=64`, ou se `packed` não tiver palavras
+    /// que cheguem para `count` valores (validar ANTES, na fronteira dos bytes
+    /// não confiáveis — ver [`super::column::decode`]).
+    pub fn unpack_into(out: &mut Vec<u64>, packed: &[u64], bits: u32, count: usize) {
         assert!((1..=64).contains(&bits), "bits fora de 1..=64");
         if bits == 64 {
-            return packed[..count].to_vec();
+            out.extend_from_slice(&packed[..count]);
+            return;
         }
         let mask = (1u64 << bits) - 1;
-        let mut out = Vec::with_capacity(count);
         let mut bit_pos = 0usize;
         for _ in 0..count {
             let word = bit_pos / 64;
@@ -153,7 +172,6 @@ pub mod bitpack {
             out.push(v & mask);
             bit_pos += bits as usize;
         }
-        out
     }
 }
 
@@ -366,13 +384,17 @@ pub mod column {
                 let base = take_u64(blob, &mut at)?;
                 let bits = *blob.get(at)? as u32;
                 at += 1;
-                // `bitpack::unpack` indexa `packed[word]` diretamente e entra em
-                // pânico se as palavras não chegarem. Como `bits` e `n` vêm do
-                // disco, a validação tem de acontecer AQUI — na fronteira onde
-                // os bytes não confiáveis entram — e não lá dentro.
+                // `bitpack::unpack_into` indexa `packed[word]` diretamente e
+                // entra em pânico se as palavras não chegarem. Como `bits` e
+                // `n` vêm do disco, a validação tem de acontecer AQUI — na
+                // fronteira onde os bytes não confiáveis entram — e não lá
+                // dentro.
                 if !(1..=64).contains(&bits) {
                     return None;
                 }
+                // No delta, `n` conta a base + as diferenças, logo há `n-1`
+                // valores empacotados. O `checked_sub` é também quem recusa
+                // `n = 0` neste ramo (um blob delta sem base nenhuma é lixo).
                 let valores = if codec == Codec::DeltaBitpack {
                     n.checked_sub(1)?
                 } else {
@@ -387,19 +409,41 @@ pub mod column {
                 for _ in 0..restantes {
                     words.push(take_u64(blob, &mut at)?);
                 }
+                // UMA só materialização da coluna. Auditoria 2026-09-05, vaga 2
+                // (R88): desempacotar para um `Vec` e só depois construir a
+                // coluna punha dois buffers de `n` valores vivos ao mesmo tempo
+                // — medido a 2.02x (delta) e 2.55x (FOR) o tamanho da coluna,
+                // ou seja o DOBRO do que o `MAX_VALORES` promete (~4 GiB no
+                // tecto). Onde há limite duro de memória isso é um abort do
+                // alocador, irrecuperável, no arranque do índice de atributos
+                // (`CompressedSnapshot::expand`) — exatamente o caminho onde
+                // estava desenhada a degradação para rebuild por replay. O
+                // tecto continua a ser o `MAX_VALORES`: o que muda é honrá-lo.
+                //
+                // `delta::decode`/`frame_of_reference::decode` continuam a ser
+                // as primitivas públicas (com testes próprios); só saíram do
+                // caminho quente. As suas semânticas são replicadas aqui à
+                // letra: o delta ENVOLVE, o FOR RECUSA em transbordo.
+                let mut out: Vec<u64> = Vec::with_capacity(n);
                 if codec == Codec::DeltaBitpack {
-                    if n == 0 {
-                        return Some(Vec::new());
+                    // O prefix-sum corre SOBRE o próprio buffer.
+                    out.push(base);
+                    bitpack::unpack_into(&mut out, &words, bits, n - 1);
+                    let mut acc = base as i64;
+                    for v in out[1..].iter_mut() {
+                        // Envolvente, como o `delta::decode`: ver lá o porquê.
+                        acc = acc.wrapping_add(*v as i64);
+                        *v = acc as u64;
                     }
-                    let vals = bitpack::unpack(&words, bits, n - 1);
-                    let mut deltas: Vec<i64> = Vec::with_capacity(n);
-                    deltas.push(base as i64);
-                    deltas.extend(vals.into_iter().map(|v| v as i64));
-                    Some(delta::decode(&deltas))
                 } else {
-                    let offsets = bitpack::unpack(&words, bits, n);
-                    Some(frame_of_reference::decode(base, &offsets)?)
+                    bitpack::unpack_into(&mut out, &words, bits, n);
+                    for v in out.iter_mut() {
+                        // Verificada, como o `frame_of_reference::decode`:
+                        // transbordo é corrupção, e recusa-se a coluna.
+                        *v = base.checked_add(*v)?;
+                    }
                 }
+                Some(out)
             }
         }
     }
@@ -629,6 +673,31 @@ mod column_tests {
         let data = vec![u64::MAX - 3, u64::MAX - 1, u64::MAX, u64::MAX - 2];
         let blob = column::encode(&data);
         assert_eq!(column::codec_of(&blob), Some(Codec::ForBitpack));
+        assert_eq!(column::decode(&blob).unwrap(), data);
+    }
+
+    /// A soma acumulada do ramo delta ENVOLVE, e isso nao e um detalhe: uma
+    /// coluna perfeitamente legitima -- ids crescentes de 1 em 1 -- atravessa
+    /// `i64::MAX` a meio, e o acumulador do prefix-sum e `i64`. Com a soma
+    /// verificada (`overflow-checks = true` no perfil release) isso seria um
+    /// panico no arranque do indice a partir de dados BONS, nao corrompidos.
+    ///
+    /// Auditoria 2026-09-05, vaga 2, R88: a invariante ja existia (era o
+    /// `wrapping_add` do `delta::decode`), mas nenhum teste a exercitava PELO
+    /// `column::decode` -- so pela primitiva. Ao trazer o prefix-sum para
+    /// dentro do `decode`, trocar `wrapping_add` por `+` passava a suite
+    /// inteira. Este teste fecha esse buraco: e a prova de que a semantica foi
+    /// replicada a letra, e nao apenas de que o codigo compila.
+    #[test]
+    fn delta_bitpack_atravessa_a_fronteira_do_i64_sem_panicar() {
+        // 1000 valores centrados em 2^63: metade cabe num i64 positivo, a outra
+        // metade nao. As diferencas continuam todas a 1 (a subtracao envolvente
+        // do `delta::encode` trata da travessia), logo o codec escolhido e
+        // mesmo o delta+bitpack com bits = 1.
+        let base = i64::MAX as u64 - 500;
+        let data: Vec<u64> = (0..1000u64).map(|i| base + i).collect();
+        let blob = column::encode(&data);
+        assert_eq!(column::codec_of(&blob), Some(Codec::DeltaBitpack));
         assert_eq!(column::decode(&blob).unwrap(), data);
     }
 }
