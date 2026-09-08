@@ -14,6 +14,9 @@ Release candidate for evaluation on Linux x86_64. **Not a stable release or prod
 
 ## Compatibility and limitations
 
+- Installation: extract the archive and run `python3 install.py --prefix /absolute/new/instance`. You must define and confirm an admin credential; no default or empty credential is installed. Use 32–128 random printable characters from a password manager. Only its BLAKE3 digest is persisted using the existing RBAC token verifier (this is **not** a slow password KDF; do not use a human/reused password). gRPC uses Bearer; REST supports Basic with username `admin`. Both bind to loopback. Start with the generated `start.py`, which removes inherited `HERACLITUS_*` overrides.
+- The installer creates a new instance and refuses overwrite; it does not start services or migrate an existing database. Python 3.9+ is needed for installation. Keep REST behind an authenticated TLS proxy if remote access is required; this RC does not add native REST TLS or authenticated Raft transport.
+
 - Queries exceeding supported intermediate-result limits return an explicit error, not a partial result. Arbitrary global top-k optimization is not implemented.
 - `BTree::get_snapshot` does not implement historical MVCC; finite historical generations are unsupported.
 - Existing Sigma rules with `logsource` must not be broadened by simply deleting the restriction. A source mapping implementation is still required.

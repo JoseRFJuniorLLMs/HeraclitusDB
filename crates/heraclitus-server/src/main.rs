@@ -22,6 +22,20 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Installer-only utility: secret travels over stdin, never argv or logs.
+    if std::env::args().nth(1).as_deref() == Some("--credential-hash-stdin") {
+        use std::io::Read;
+        let mut secret = Vec::new();
+        std::io::stdin().take(129).read_to_end(&mut secret)?;
+        if !(32..=128).contains(&secret.len()) || !secret.iter().all(|b| (32..=126).contains(b)) {
+            secret.fill(0);
+            return Err("admin credential must contain 32..128 printable ASCII characters".into());
+        }
+        let digest = blake3::hash(&secret).to_hex();
+        secret.fill(0);
+        println!("{digest}");
+        return Ok(());
+    }
     // Enable ANSI virtual-terminal + UTF-8 on the Windows console up front, so
     // both the boot sequence and the runtime tracing logs render with colour
     // instead of raw `←[2m…` escapes in the classic conhost.

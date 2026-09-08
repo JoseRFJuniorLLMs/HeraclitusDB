@@ -53,6 +53,8 @@ jobs:
           set -euo pipefail
           export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
           export CARGO_TARGET_DIR="$RUNNER_TEMP/build-a"
+          # Identical flags for both builds, including both physical roots.
+          export RUSTFLAGS="--remap-path-prefix=$RUNNER_TEMP/build-a=/build --remap-path-prefix=$RUNNER_TEMP/build-b=/build --remap-path-prefix=$GITHUB_WORKSPACE=/src --remap-path-prefix=$HOME/.cargo=/cargo"
           cargo build --release --locked -p heraclitus-server -p heraclitus-qualifier
           mkdir -p "$RUNNER_TEMP/first"
           cp "$CARGO_TARGET_DIR/release/heraclitus-server" "$RUNNER_TEMP/first/"
@@ -81,6 +83,7 @@ jobs:
           cp windows/heraclitus-service.ps1 windows/heraclitus-production.ps1 windows/heraclitus-backup.ps1 "$dist/windows/"
           cp SECURITY.md "$dist/"
           cp LICENSE "$dist/"
+          cp packaging/install.py "$dist/"
           cp "docs/md/RELEASE_NOTES_${version}.md" "$dist/RELEASE_NOTES.md"
           cp docs/security/vulnerability-response.md "$dist/docs/security/"
           cp -R docs/qualification/. "$dist/docs/qualification/"
@@ -119,6 +122,7 @@ jobs:
           tar -xzf "$ARCHIVE" -C "$RUNNER_TEMP/package-check"
           package="$RUNNER_TEMP/package-check/$(basename "$ARCHIVE" .tar.gz)"
           (cd "$package" && sha256sum --check SHA256SUMS)
+          INSTALL_TEST_BINARY="$package/bin/heraclitus-server" python3 packaging/test_install.py
           "$package/bin/heraclitus-qualifier" crash-loop \
             --server-binary "$package/bin/heraclitus-server" \
             --root "$RUNNER_TEMP/rc-crash-run" \
