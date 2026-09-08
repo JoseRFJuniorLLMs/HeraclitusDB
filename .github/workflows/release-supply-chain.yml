@@ -22,6 +22,9 @@ env:
 
 jobs:
   build-sbom-sign:
+    # RC assets are qualified via workflow_dispatch BEFORE publication and
+    # attached unchanged by the release operator. Do not rebuild/overwrite them.
+    if: github.event_name != 'release' || !github.event.release.prerelease
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -32,6 +35,17 @@ jobs:
         with:
           toolchain: 1.96.0
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+
+      - name: Require manifest and requested release versions to agree
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.release_version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG:-$INPUT_VERSION}"
+          actual="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "heraclitus-server") | .version')"
+          test "${version#v}" = "$actual"
 
       - name: Build candidate twice and require reproducibility
         shell: bash
@@ -66,6 +80,8 @@ jobs:
           cp "$RUNNER_TEMP/first/heraclitus-qualifier" "$dist/bin/"
           cp windows/heraclitus-service.ps1 windows/heraclitus-production.ps1 windows/heraclitus-backup.ps1 "$dist/windows/"
           cp SECURITY.md "$dist/"
+          cp LICENSE "$dist/"
+          cp "docs/md/RELEASE_NOTES_${version}.md" "$dist/RELEASE_NOTES.md"
           cp docs/security/vulnerability-response.md "$dist/docs/security/"
           cp -R docs/qualification/. "$dist/docs/qualification/"
           # SPEC-0049 §117/§119 — the eleven operational runbooks travel with
@@ -92,6 +108,28 @@ jobs:
           echo "dist=$dist" >> "$GITHUB_OUTPUT"
           echo "archive=$RUNNER_TEMP/$(basename "$dist").tar.gz" >> "$GITHUB_OUTPUT"
 
+      - name: Qualify the extracted Linux package by killing and restarting it
+        timeout-minutes: 30
+        shell: bash
+        env:
+          ARCHIVE: ${{ steps.payload.outputs.archive }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/package-check" "$RUNNER_TEMP/rc-evidence"
+          tar -xzf "$ARCHIVE" -C "$RUNNER_TEMP/package-check"
+          package="$RUNNER_TEMP/package-check/$(basename "$ARCHIVE" .tar.gz)"
+          (cd "$package" && sha256sum --check SHA256SUMS)
+          "$package/bin/heraclitus-qualifier" crash-loop \
+            --server-binary "$package/bin/heraclitus-server" \
+            --root "$RUNNER_TEMP/rc-crash-run" \
+            --cycles 40 --concurrency 8 --durability always --seed 428931 \
+            --report "$RUNNER_TEMP/rc-evidence/crash-report.json"
+          jq -e '.status == "passed" and .cycles_completed == 40 and
+            .total_acknowledged > 0 and .total_missing_after_restart == 0 and
+            all(.cycles[]; .restart_ok and .integrity_ok and
+              .verification_scope == "full" and .verified_acknowledgements == .acknowledged)' \
+            "$RUNNER_TEMP/rc-evidence/crash-report.json"
+
       - name: Sigstore build provenance for exact release subjects
         id: attest
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
@@ -100,6 +138,7 @@ jobs:
             ${{ steps.payload.outputs.archive }}
             ${{ steps.payload.outputs.archive }}.sha256
             ${{ steps.payload.outputs.dist }}/sbom/bom.cdx.json
+            ${{ runner.temp }}/rc-evidence/crash-report.json
 
       - name: Preserve attestation bundle with release payload
         shell: bash
@@ -119,6 +158,18 @@ jobs:
             ${{ steps.payload.outputs.archive }}.sigstore.json
             ${{ steps.payload.outputs.dist }}/sbom/bom.cdx.json
             ${{ steps.payload.outputs.dist }}/build-manifest.json
+            ${{ runner.temp }}/rc-evidence/crash-report.json
+            ${{ runner.temp }}/rc-evidence/crash-report.json.sha256
+
+      - name: Preserve qualification diagnostics even on failure
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: rc-qualification-failure
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/rc-evidence/
+            ${{ runner.temp }}/rc-crash-run/logs/
 
       - name: Attach assets to published GitHub release
         if: github.event_name == 'release'

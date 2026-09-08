@@ -21,11 +21,6 @@ use tokio::task::JoinSet;
 use crate::evidence::{sha256_file, write_bytes_new, write_json_new};
 use crate::server::{wait_ready, DurabilityMode, ServerSpec, Supervised};
 
-/// Above this many acknowledgements per cycle the harness re-reads an evenly
-/// spread sample instead of every event. The report always says which happened,
-/// because "checked 256 of 40000" and "checked all" are different claims.
-const FULL_VERIFICATION_CEILING: usize = 4_096;
-
 #[derive(Debug, Clone)]
 pub struct CrashConfig {
     pub server_binary: PathBuf,
@@ -54,7 +49,6 @@ pub enum CrashStatus {
 #[serde(rename_all = "snake_case")]
 enum VerificationScope {
     Full,
-    Sampled,
 }
 
 #[derive(Debug, Serialize)]
@@ -221,37 +215,35 @@ async fn verify_acknowledgements(
     client: &mut Client,
     acknowledged: &[Acknowledgement],
 ) -> (VerificationScope, usize, usize) {
-    let (scope, sample): (VerificationScope, Vec<&Acknowledgement>) =
-        if acknowledged.len() <= FULL_VERIFICATION_CEILING {
-            (VerificationScope::Full, acknowledged.iter().collect())
-        } else {
-            let stride = acknowledged.len() / FULL_VERIFICATION_CEILING;
-            (
-                VerificationScope::Sampled,
-                acknowledged
-                    .iter()
-                    .step_by(stride.max(1))
-                    .take(FULL_VERIFICATION_CEILING)
-                    .collect(),
-            )
-        };
     let mut missing = 0_usize;
-    for entry in &sample {
+    for entry in acknowledged {
+        // The acknowledged LSN bounds the read to one record. Querying only
+        // by id rescanned the entire growing database for every ACK, making
+        // the nightly campaign quadratic and liable to exhaust its timeout.
+        // Check BOTH fields in the response, not a substring anywhere in JSON.
         let readable = match client
             .query(&format!(
-                "MATCH (n) WHERE n.id = \"{}\" RETURN n LIMIT 1",
-                entry.event_id
+                "MATCH (n) WHERE n.lsn = {} RETURN n LIMIT 1",
+                entry.lsn
             ))
             .await
         {
-            Ok(value) => value.to_string().contains(&entry.event_id),
+            Ok(value) => acknowledgement_matches(&value, entry),
             Err(_) => false,
         };
         if !readable {
             missing += 1;
         }
     }
-    (scope, sample.len(), missing)
+    (VerificationScope::Full, acknowledged.len(), missing)
+}
+
+fn acknowledgement_matches(value: &serde_json::Value, entry: &Acknowledgement) -> bool {
+    value.as_array().is_some_and(|rows| {
+        rows.len() == 1
+            && rows[0]["lsn"].as_u64() == Some(entry.lsn)
+            && rows[0]["id"].as_str() == Some(entry.event_id.as_str())
+    })
 }
 
 async fn run_cycle(
@@ -468,6 +460,9 @@ async fn run_async(config: &CrashConfig) -> Result<CrashSummary> {
     if cycles.is_empty() {
         failures.push("no crash cycle completed".to_owned());
     }
+    if total_acknowledged == 0 {
+        failures.push("no append was acknowledged; durability was not exercised".to_owned());
+    }
 
     let cycles_completed = cycles.len() as u32;
     let status = if !failures.is_empty() {
@@ -575,6 +570,26 @@ pub fn run(config: CrashConfig) -> Result<CrashSummary> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acknowledgement_requires_exact_lsn_and_id_not_a_json_substring() {
+        let entry = Acknowledgement {
+            lsn: 42,
+            event_id: "expected".into(),
+        };
+        assert!(acknowledgement_matches(
+            &serde_json::json!([{"lsn":42,"id":"expected"}]),
+            &entry
+        ));
+        for wrong in [
+            serde_json::json!([]),
+            serde_json::json!([{"lsn":41,"id":"expected"}]),
+            serde_json::json!([{"lsn":42,"id":"wrong","content":"expected"}]),
+            serde_json::json!({"error":"expected"}),
+        ] {
+            assert!(!acknowledgement_matches(&wrong, &entry));
+        }
+    }
 
     #[test]
     fn kill_instants_are_reproducible_and_inside_the_window() {

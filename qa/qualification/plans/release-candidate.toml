@@ -1,11 +1,11 @@
 schema_version = 1
-suite_version = "1.0.5"
-release_version = "1.0.5-rc"
+suite_version = "1.0.6-rc.1"
+release_version = "1.0.6-rc.1"
 level = "release_candidate"
 target = "reference-lab"
 build_profile = "release"
-binary = "target/release/heraclitus-server.exe"
-known_limitations = []
+binary = "target/release/heraclitus-server"
+known_limitations = ["Linux x86_64 RC; not a production qualification", "Partial source audit; no power-loss certification"]
 
 [metadata]
 purpose = "Release-candidate qualification template"

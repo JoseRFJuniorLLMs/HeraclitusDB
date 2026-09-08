@@ -50,6 +50,7 @@ const SENTINEL_DERIVED_KINDS: &[&str] = &[
     "SecurityIncidentTransition",
     "SecurityHypothesis",
     "SecurityActionProposal",
+    "SecurityActionAttempt",
     "SecurityActionResult",
     "SecurityApproval",
     "SecurityPolicyDecision",
@@ -3496,6 +3497,35 @@ mod tests {
             ..Default::default()
         };
         Engine::open(&cfg).unwrap()
+    }
+
+    #[test]
+    fn action_attempt_is_reserved_and_internal_sink_preserves_claim_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let engine = engine_in(temp.path());
+        let mut claim = Episode::new(
+            "sentinel",
+            EventKind::Custom("SecurityActionAttempt".into()),
+            b"{}".to_vec(),
+        );
+        claim
+            .attrs
+            .insert("sentinel.generated".into(), "true".into());
+        assert!(engine.append(claim.clone()).is_err());
+        let owner = claim.id;
+        let lsn = engine
+            .append_sentinel_derived(claim.clone(), "attempt:test-owner")
+            .unwrap();
+        assert_eq!(engine.log.read(lsn).unwrap().unwrap().1.id, owner);
+        claim.id = Episode::new("retry", EventKind::Observation, vec![]).id;
+        assert_ne!(claim.id, owner);
+        assert_eq!(
+            engine
+                .append_sentinel_derived(claim, "attempt:test-owner")
+                .unwrap(),
+            lsn
+        );
+        assert_eq!(engine.log.read(lsn).unwrap().unwrap().1.id, owner);
     }
 
     #[test]

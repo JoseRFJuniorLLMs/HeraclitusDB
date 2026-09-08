@@ -68,12 +68,24 @@ fn survives_repeated_mid_append_kills() {
 
     // Build the example binary once.
     let alvo = test_target_dir();
-    let status = Command::new(env!("CARGO"))
-        .args(["build", "--example", "crash_writer", "-p", "heraclitus-log"])
+    let mut build = Command::new(env!("CARGO"));
+    build
+        .args([
+            "build",
+            "--locked",
+            "--example",
+            "crash_writer",
+            "-p",
+            "heraclitus-log",
+        ])
         .arg("--target-dir")
-        .arg(&alvo)
-        .status()
-        .expect("cargo build crash_writer");
+        .arg(&alvo);
+    let exe = std::env::current_exe().unwrap();
+    let profile = exe.parent().unwrap().parent().unwrap().file_name().unwrap();
+    if profile != "debug" {
+        build.arg("--profile").arg(profile);
+    }
+    let status = build.status().expect("cargo build crash_writer");
     assert!(status.success());
 
     // Auditoria 2026-09-05, vaga 2 (R65): o caminho que construímos e o
