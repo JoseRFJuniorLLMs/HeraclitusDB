@@ -1321,28 +1321,69 @@ mod tests {
         )
         .unwrap();
         assert_eq!(hyp["alive"], serde_json::json!(true));
+    }
 
-        // E o inverso: remover a aresta que EXISTE tem de calar a regra.
-        let dir2 = tempfile::tempdir().unwrap();
-        let log2 = Arc::new(Log::open(dir2.path(), 1 << 20, FsyncPolicy::Always).unwrap());
-        log2.append(edge("p1", "p2", "fraud_partner", "0.9"))
+    #[test]
+    fn simulate_remove_then_decide_cala_a_regra() {
+        // Auditoria 2026-09-05, vaga 2 (R66): o inverso do teste acima (remover
+        // a aresta que EXISTE) vivia no fim dele, onde nunca chegava a ser
+        // exercitado se o fix de A33 regredisse: a metade ADD panica primeiro e
+        // o ramo REMOVE (overlay de remocao em `materialize_virtual` + DECIDE)
+        // ficava sem prova nenhuma. Isolado, o ramo morre por si.
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        let edge = |from: &str, to: &str, etype: &str, conf: &str| {
+            let mut e = Episode::new("ag", EventKind::Observation, vec![]);
+            e.attrs.insert("edge_from".into(), from.into());
+            e.attrs.insert("edge_to".into(), to.into());
+            e.attrs.insert("edge_type".into(), etype.into());
+            e.attrs.insert("confidence".into(), conf.into());
+            e
+        };
+        // A aresta `fraud_partner` EXISTE, com confianca 0.9 acima do
+        // `fraud_belief_threshold` de 0.7: a realidade dispara a regra.
+        log.append(edge("p1", "p2", "fraud_partner", "0.9"))
             .unwrap();
-        let be2 = LogBackend::new(log2);
-        let real = execute("DECIDE ()", &be2).unwrap();
+        let be = LogBackend::new(log);
+
+        let ids = |v: &serde_json::Value| -> Vec<String> {
+            v["fired"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a["action_id"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        let real = execute("DECIDE ()", &be).unwrap();
         assert!(
             ids(&real).contains(&"flag_fraud:p1->p2".to_string()),
             "a aresta real dispara: {:?}",
             ids(&real)
         );
+
         let removed = execute(
             "SIMULATE REMOVE EDGE (\"p1\", \"p2\", \"fraud_partner\") THEN DECIDE ()",
-            &be2,
+            &be,
         )
         .unwrap();
         assert!(
             !ids(&removed).contains(&"flag_fraud:p1->p2".to_string()),
             "remover a aresta no contrafactual cala a regra: {:?}",
             ids(&removed)
+        );
+        // A assercao de cima, SOZINHA, e VACUA — passa com e sem o fix de A33.
+        // O `DECIDE ()` real acima gravou um evento Action no log
+        // (`append(Some("action"))` no `decide` por omissao) e o
+        // `SIMULATE ... THEN DECIDE` le o conjunto de idempotencia do log REAL
+        // (o `VirtualBackend` delega `scan_range` e so `graph()` da o overlay).
+        // Logo, com o bug, a regra volta a ser decidida mas cai em `skipped` e
+        // NUNCA em `fired`, que e o unico campo que `ids()` observa. E em
+        // `skipped` que a regressao aparece: com o fix e []; sem ele e
+        // ["flag_fraud:p1->p2"].
+        assert!(
+            removed["skipped"].as_array().unwrap().is_empty(),
+            "a regra calada nem sequer chega a ser considerada (nada em skipped): {removed}"
         );
     }
 
