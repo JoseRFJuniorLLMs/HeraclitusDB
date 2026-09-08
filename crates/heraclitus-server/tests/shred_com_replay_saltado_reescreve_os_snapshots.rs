@@ -39,16 +39,53 @@ fn config(dir: &std::path::Path) -> HeraclitusConfig {
     }
 }
 
-/// A asserção é sobre os BYTES do snapshot das views, não sobre o que o índice
-/// responde em RAM: o que o crypto-shred promete é que o plaintext derivado
-/// deixa de existir em DISCO. O snapshot do índice de texto é um `bincode` sem
+/// Lê os bytes do snapshot canónico das views EXIGINDO que ele exista.
+///
+/// Auditoria 2026-09-05, vaga 2 (R124): a versão anterior fazia
+/// `read(...).unwrap_or_default()`, e por isso um `views/text.ckpt` AUSENTE
+/// era indistinguível de "snapshot sem plaintext". As duas asserções
+/// NEGATIVAS deste teste (a do pós-shred e a do arranque seguinte) ficavam
+/// verdes por VACUIDADE no dia em que o caminho de escrita pós-shred
+/// divergisse do pré-shred e deixasse de produzir o ficheiro — verdes sem
+/// observar nada sobre aquilo que o teste existe para provar. Um ficheiro
+/// ausente NUNCA prova que o plaintext saiu do disco. `TextIndex::checkpoint`
+/// chama `ckpt::save` incondicionalmente (mesmo com estado vazio), portanto o
+/// snapshot existe em TODOS os pontos de observação: exigi-lo aqui não é uma
+/// exigência a mais, é o invariante que dá sentido às asserções.
+fn bytes_do_snapshot(dir: &std::path::Path) -> Vec<u8> {
+    let p = dir.join("views").join("text.ckpt");
+    std::fs::read(&p)
+        .unwrap_or_else(|e| panic!("{} tinha de existir neste ponto: {e}", p.display()))
+}
+
+/// A asserção é sobre os BYTES em disco, não sobre o que o índice responde em
+/// RAM: o que o crypto-shred promete é que o plaintext derivado deixa de
+/// existir em DISCO. O snapshot do índice de texto é um `bincode` sem
 /// compressão de `HashMap<String, ...>` — os termos aparecem literais lá
 /// dentro, e é esse o dado que não pode sobreviver à destruição da chave.
-fn plaintext_no_snapshot(dir: &std::path::Path) -> bool {
-    let bytes = std::fs::read(dir.join("views").join("text.ckpt")).unwrap_or_default();
-    bytes
-        .windows(SEGREDO.len())
-        .any(|janela| janela == SEGREDO.as_bytes())
+///
+/// Auditoria 2026-09-05, vaga 2 (R124): a varredura é a TODOS os ficheiros
+/// regulares de `views/`, e não só ao `text.ckpt` de hoje, para que o
+/// plaintext não possa escapar para um ficheiro irmão (um `.tmp` órfão, uma
+/// rotação de backup, um formato segmentado futuro) e continuar a dar o teste
+/// por verde.
+fn plaintext_nas_views(dir: &std::path::Path) -> bool {
+    // Impõe primeiro a existência do snapshot canónico: sem isto a varredura
+    // de um directório vazio responderia "sem plaintext" com toda a calma.
+    let _ = bytes_do_snapshot(dir);
+    std::fs::read_dir(dir.join("views"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .any(|e| {
+            // `unwrap_or_default` é legítimo AQUI: varredura best-effort de
+            // ficheiros que podem desaparecer sob concorrência, e o invariante
+            // de existência já foi imposto acima.
+            let bytes = std::fs::read(e.path()).unwrap_or_default();
+            bytes
+                .windows(SEGREDO.len())
+                .any(|janela| janela == SEGREDO.as_bytes())
+        })
 }
 
 #[test]
@@ -70,7 +107,7 @@ fn shred_com_replay_saltado_reescreve_os_snapshots_das_views() {
         engine.checkpoint_views().unwrap();
     }
     assert!(
-        plaintext_no_snapshot(dir.path()),
+        plaintext_nas_views(dir.path()),
         "montagem: o snapshot das views tinha de conter o plaintext antes do shred"
     );
 
@@ -94,7 +131,7 @@ fn shred_com_replay_saltado_reescreve_os_snapshots_das_views() {
         );
     }
     assert!(
-        !plaintext_no_snapshot(dir.path()),
+        !plaintext_nas_views(dir.path()),
         "o crypto-shred não reescreveu o snapshot das views: o plaintext derivado \
          da titular continua em disco depois de a chave ter sido destruída"
     );
@@ -106,7 +143,7 @@ fn shred_com_replay_saltado_reescreve_os_snapshots_das_views() {
         let _engine = Engine::open(&cfg).unwrap();
     }
     assert!(
-        !plaintext_no_snapshot(dir.path()),
+        !plaintext_nas_views(dir.path()),
         "o plaintext RESSUSCITOU no arranque seguinte: o snapshot PRÉ-shred foi \
          restaurado depois de a chave ter sido destruída"
     );
