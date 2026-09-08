@@ -617,7 +617,25 @@ fn build_match(pair: Pair<Rule>) -> Result<MatchStmt, HeraclitusError> {
                 let mut asc = true;
                 for o in p.into_inner() {
                     match o.as_rule() {
-                        Rule::prop => key = Some(OrderKey::Field(split_prop(o.as_str())?.1)),
+                        Rule::prop => {
+                            let (var, field) = split_prop(o.as_str())?;
+                            let resolved = if let Some(edge) = &m.edge {
+                                if var == edge.rel_var {
+                                    field
+                                } else if field == "id" && var == m.var {
+                                    "from".into()
+                                } else if field == "id" && var == edge.to_var {
+                                    "to".into()
+                                } else {
+                                    return Err(perr(format!("unsupported ORDER BY {var}.{field} in relationship pattern")));
+                                }
+                            } else if var == m.var {
+                                field
+                            } else {
+                                return Err(perr(format!("unknown ORDER BY variable {var}")));
+                            };
+                            key = Some(OrderKey::Field(resolved));
+                        }
                         Rule::ident => key = Some(OrderKey::Field(o.as_str().to_string())),
                         Rule::dist_fn => {
                             let (kind, vector) = build_dist_fn(o)?;

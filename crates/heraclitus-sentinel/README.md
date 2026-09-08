@@ -107,7 +107,22 @@ HERACLITUS_SENTINEL_L3_ENABLED=true
 
 The Sigma frontend accepts scalar/list selections and deterministic boolean
 conditions (`and`, `or`, `not`, `1 of`, `all of`) and rejects unsupported
-modifiers or aggregations at compile time. L3 is disabled by default; when
+modifiers or aggregations at compile time. A non-empty `logsource` is also
+rejected: the normalized schema does not yet provide a lossless Sigma source
+mapping. Do not remove source restrictions just to make a rule compile; provide
+an explicitly scoped, supported rule instead. L1 classifies every matching
+occurrence; alert grouping must not remove suspicious-event evidence. Nested
+temporal operators retain the sum of their dependent windows.
+
+Action execution persists and flushes a unique attempt before calling the
+executor. A completed result is reused, including after restart. An attempt
+without a result is ambiguous and is **not automatically retried**; an operator
+must reconcile the destination's outcome. External executors should also use
+the deterministic action ID as a persistent destination idempotency key.
+Distributed hosts must provide a sink that globally deduplicates derivation
+keys; the local runtime cache alone is not a distributed lock.
+
+L3 is disabled by default; when
 enabled, its derived writes use a host `DerivedEventSink` (the server routes it
 through `Engine`) and client appends cannot claim reserved Sentinel
 kinds/namespaces. The server exposes `/sentinel/status`, bounded AS-OF incident,

@@ -880,7 +880,7 @@ fn flip_cmp(c: Cmp) -> Cmp {
 fn is_builtin_field(f: &str) -> bool {
     matches!(
         f,
-        "lsn" | "id" | "agent_id" | "session_id" | "kind" | "tipo" | "content"
+        "lsn" | "id" | "agent_id" | "session_id" | "kind" | "tipo" | "content" | "ts_hlc"
     )
 }
 
@@ -1085,7 +1085,13 @@ fn lsn_window(conditions: &[(BoolOp, Condition)], bound: Option<Lsn>) -> (Lsn, L
         } else {
             continue;
         };
-        let n = if n < 0.0 { 0u64 } else { n as u64 };
+        // Only push down exactly represented non-negative integer bounds.
+        // Fractional, negative and large f64 values must be evaluated by the
+        // normal comparator, not truncated/clamped into a narrower window.
+        if !n.is_finite() || n < 0.0 || n.fract() != 0.0 || n >= (1u64 << 53) as f64 {
+            continue;
+        }
+        let n = n as u64;
         match cmp {
             Cmp::Ge => lo = lo.max(n),
             Cmp::Gt => lo = lo.max(n.saturating_add(1)),
@@ -1202,7 +1208,8 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
             returns,
             limit,
         } => {
-            let bound = resolve_as_of(as_of, be)?;
+            let head = be.head()?;
+            let bound = Some(resolve_as_of(as_of, be)?.unwrap_or(head).min(head));
             // ÍNDICE SECUNDÁRIO: se o WHERE (tudo AND) fixa `n.<campo> = "v"` num
             // campo não-builtin, resolve pelo índice de atributos (global,
             // O(postings)) em vez de varrer a janela capada. O pós-filtro
@@ -1257,10 +1264,7 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
             // varrimento de hoje — sem regressao — em vez de tomar `Some(vazio)`
             // como resposta final, que e a classe do bug critico ja corrigido.
             let fonte = match (fonte, label.as_deref()) {
-                (None, Some(rotulo)) => be
-                    .attr_lookup_lsns("_kind", rotulo, bound)?
-                    .filter(|lsns| !lsns.is_empty())
-                    .map(Fonte::Lsns),
+                (None, Some(rotulo)) => be.kind_lookup_lsns(rotulo, bound)?.map(Fonte::Lsns),
                 (outra, _) => outra,
             };
             let aceita = |l: Lsn, e: &Episode| -> bool {
@@ -1289,28 +1293,61 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                         lsns.reverse();
                     }
                     let mut out = Vec::new();
-                    for l in lsns.into_iter().take(QUERY_SCAN_CAP) {
+                    for l in lsns {
                         if tecto.is_some_and(|k| out.len() >= k) {
                             break;
                         }
                         if let Some((l, e)) = be.read_lsn(l)? {
                             if aceita(l, &e) {
+                                if out.len() == QUERY_SCAN_CAP {
+                                    return Err(HeraclitusError::Query("query materialization limit exceeded; no partial result returned".into()));
+                                }
                                 out.push((l, e));
                             }
                         }
                     }
                     out
                 }
-                Some(Fonte::Linhas(linhas)) => {
-                    linhas.into_iter().filter(|(l, e)| aceita(*l, e)).collect()
-                }
+                Some(Fonte::Linhas(linhas)) => crate::backend::complete_query_rows(
+                    linhas.into_iter().filter(|(l, e)| aceita(*l, e)).collect(),
+                )?,
                 None => {
-                    // Push any `n.lsn` bounds down to a pruned, capped scan window.
-                    let (lo, hi) = lsn_window(conditions, bound);
-                    be.scan_range(lo, hi)?
-                        .into_iter()
-                        .filter(|(l, e)| aceita(*l, e))
-                        .collect()
+                    // Page by LSN ranges, not by returned row count (shredded
+                    // records leave holes). Every range has at most 4096 LSNs.
+                    let (mut lo, mut hi) = lsn_window(conditions, bound);
+                    let mut out = Vec::new();
+                    'pages: while lo < hi {
+                        if tecto.is_some_and(|k| out.len() >= k) {
+                            break;
+                        }
+                        let (start, end) = if inverter {
+                            (hi.saturating_sub(4096).max(lo), hi)
+                        } else {
+                            (lo, lo.saturating_add(4096).min(hi))
+                        };
+                        let mut page = be.scan_range(start, end)?;
+                        page.sort_by_key(|(lsn, _)| *lsn);
+                        if inverter {
+                            page.reverse();
+                        }
+                        for (lsn, episode) in page {
+                            if aceita(lsn, &episode) {
+                                if out.len() == QUERY_SCAN_CAP {
+                                    return Err(HeraclitusError::Query("query materialization limit exceeded; no partial result returned".into()));
+                                }
+                                out.push((lsn, episode));
+                                if tecto.is_some_and(|k| out.len() >= k) {
+                                    break 'pages;
+                                }
+                            }
+                        }
+                        if inverter {
+                            hi = start;
+                        } else {
+                            lo = end;
+                        }
+                    }
+                    out
                 }
             };
             if let Some((key, asc)) = order_by {
@@ -1716,6 +1753,17 @@ mod testes_rotulo_indice {
     }
 
     impl QueryBackend for Divergente {
+        fn kind_lookup_lsns(
+            &self,
+            label: &str,
+            as_of: Option<Lsn>,
+        ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
+            if label == "Despesas" {
+                self.attr_lookup_lsns("_kind", label, as_of)
+            } else {
+                Ok(None)
+            }
+        }
         fn head(&self) -> Result<Lsn, HeraclitusError> {
             Ok(10)
         }
@@ -1859,17 +1907,21 @@ mod testes_rotulo_indice {
     /// Um posting com 1 000 LSNs e `LIMIT 5` custa 5 leituras — não 1 000.
     struct Contador {
         leituras: std::cell::Cell<usize>,
+        total: u64,
+        index: bool,
     }
 
     impl QueryBackend for Contador {
         fn head(&self) -> Result<Lsn, HeraclitusError> {
-            Ok(1000)
+            Ok(self.total)
         }
         fn scan(&self, _as_of: Option<Lsn>) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
             unimplemented!("o planner tem de ir pelo indice, nao pelo varrimento")
         }
-        fn scan_range(&self, _from: Lsn, _to: Lsn) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
-            unimplemented!("o planner tem de ir pelo indice, nao pelo varrimento")
+        fn scan_range(&self, from: Lsn, to: Lsn) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
+            (from..to.min(self.total))
+                .map(|lsn| self.read_lsn(lsn).map(Option::unwrap))
+                .collect()
         }
         fn attr_lookup(
             &self,
@@ -1885,12 +1937,24 @@ mod testes_rotulo_indice {
             value: &str,
             _as_of: Option<Lsn>,
         ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
-            Ok((field == "cor" && value == "azul").then(|| (0..1000).collect()))
+            Ok(
+                (self.index && field == "cor" && value == "azul")
+                    .then(|| (0..self.total).collect()),
+            )
         }
         fn read_lsn(&self, lsn: Lsn) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
             self.leituras.set(self.leituras.get() + 1);
             let mut e = Episode::new("a", EventKind::Observation, vec![]);
             e.attrs.insert("cor".into(), "azul".into());
+            e.attrs.insert(
+                "late".into(),
+                if lsn >= QUERY_SCAN_CAP as u64 {
+                    "yes"
+                } else {
+                    "no"
+                }
+                .into(),
+            );
             Ok(Some((lsn, e)))
         }
         fn graph(&self) -> Result<TemporalGraph, HeraclitusError> {
@@ -1995,6 +2059,8 @@ mod testes_rotulo_indice {
     fn limit_e_empurrado_para_a_hidratacao_do_indice() {
         let be = Contador {
             leituras: std::cell::Cell::new(0),
+            total: 1000,
+            index: true,
         };
         let lsns = |q: &str| -> Vec<u64> {
             crate::execute(q, &be)
@@ -2035,6 +2101,51 @@ mod testes_rotulo_indice {
         let v = lsns("MATCH (n) WHERE n.cor = \"azul\" RETURN n ORDER BY n.agent_id ASC LIMIT 2");
         assert_eq!(v.len(), 2);
         assert_eq!(be.leituras.get(), 1000);
+    }
+
+    #[test]
+    fn audit_selective_limit_after_old_candidate_cap() {
+        for index in [false, true] {
+            let be = Contador {
+                leituras: std::cell::Cell::new(0),
+                total: QUERY_SCAN_CAP as u64 + 2,
+                index,
+            };
+            let rows = crate::execute(
+                "MATCH (n) WHERE n.cor = \"azul\" AND n.late = \"yes\" RETURN n LIMIT 2",
+                &be,
+            )
+            .unwrap();
+            let rows = rows.as_array().unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0]["lsn"], QUERY_SCAN_CAP as u64);
+            assert_eq!(rows[1]["lsn"], QUERY_SCAN_CAP as u64 + 1);
+        }
+    }
+
+    #[test]
+    fn audit_descending_scan_reads_the_global_tail() {
+        let be = Contador {
+            leituras: std::cell::Cell::new(0),
+            total: QUERY_SCAN_CAP as u64 + 2,
+            index: false,
+        };
+        let rows = crate::execute("MATCH (n) RETURN n ORDER BY n.lsn DESC LIMIT 1", &be).unwrap();
+        assert_eq!(rows[0]["lsn"], be.total - 1);
+        assert!(be.leituras.get() <= 4096);
+    }
+
+    #[test]
+    fn audit_fractional_and_negative_lsn_bounds_are_conservative() {
+        let be = Contador {
+            leituras: std::cell::Cell::new(0),
+            total: 3,
+            index: false,
+        };
+        let rows = crate::execute("MATCH (n) WHERE n.lsn < 1.5 RETURN n", &be).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 2);
+        let rows = crate::execute("MATCH (n) WHERE n.lsn > -1 RETURN n", &be).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 3);
     }
 
     fn conteudos(v: &serde_json::Value) -> Vec<String> {

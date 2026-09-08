@@ -84,9 +84,9 @@ impl DetectionExpr {
                 predicate,
                 window_ms,
                 ..
-            } => (*window_ms).max(predicate.max_window_ms()),
+            } => window_ms.saturating_add(predicate.max_window_ms()),
             Self::Sequence { steps, within_ms } => {
-                (*within_ms).max(steps.iter().map(Self::max_window_ms).max().unwrap_or(0))
+                within_ms.saturating_add(steps.iter().map(Self::max_window_ms).max().unwrap_or(0))
             }
             Self::DistinctCount { window_ms, .. } => *window_ms,
         }
@@ -876,51 +876,61 @@ impl RuleEngine {
                 continue;
             }
             let (evaluation, _) = evaluate_expression(&rule.expression, &eligible);
-            let Some(index) = evaluation.matched.iter().position(|matched| *matched) else {
-                continue;
-            };
-            let indices = evaluation.evidence(index, &eligible).evidence;
-            let mut evidence: Vec<EvidenceRef> = indices
-                .into_iter()
-                .filter_map(|index| eligible.get(index))
-                .map(|(lsn, event)| EvidenceRef {
-                    lsn: *lsn,
-                    event_id: event.raw_event_id,
-                })
-                .collect();
-            evidence.sort_by(|a, b| a.lsn.cmp(&b.lsn).then_with(|| a.event_id.cmp(&b.event_id)));
-            evidence.dedup_by(|a, b| a.lsn == b.lsn && a.event_id == b.event_id);
-            if evidence.is_empty() {
-                continue;
+            // Classify every occurrence. Alert grouping must not erase later
+            // matches (or their suspicious-event evidence) while the first
+            // occurrence remains in the history.
+            for (index, matched) in evaluation.matched.iter().enumerate() {
+                if !matched {
+                    continue;
+                }
+                let indices = evaluation.evidence(index, &eligible).evidence;
+                let mut evidence: Vec<EvidenceRef> = indices
+                    .into_iter()
+                    .filter_map(|index| eligible.get(index))
+                    .map(|(lsn, event)| EvidenceRef {
+                        lsn: *lsn,
+                        event_id: event.raw_event_id,
+                    })
+                    .collect();
+                evidence
+                    .sort_by(|a, b| a.lsn.cmp(&b.lsn).then_with(|| a.event_id.cmp(&b.event_id)));
+                evidence.dedup_by(|a, b| a.lsn == b.lsn && a.event_id == b.event_id);
+                if evidence.is_empty() {
+                    continue;
+                }
+                let subject = evidence.iter().find_map(|ref_| {
+                    eligible
+                        .iter()
+                        .find(|(lsn, event)| {
+                            *lsn == ref_.lsn && event.raw_event_id == ref_.event_id
+                        })
+                        .and_then(|(_, event)| subject_of(event))
+                });
+                let window_start = evidence.first().map(|item| item.lsn).unwrap_or_default();
+                let created_at_lsn = evidence.last().map(|item| item.lsn).unwrap_or(window_start);
+                let signal_id = SecuritySignal::deterministic_id(
+                    &rule.detector,
+                    subject.as_ref(),
+                    &evidence,
+                    window_start,
+                );
+                let mut labels = rule.labels.clone();
+                labels.insert("rule.id".into(), rule.detector.id.clone());
+                labels.insert("rule.version".into(), rule.detector.version.clone());
+                signals.push(SecuritySignal {
+                    signal_id,
+                    detector: rule.detector.clone(),
+                    severity: rule.severity,
+                    score: 1.0,
+                    subject,
+                    evidence,
+                    created_at_lsn,
+                    labels,
+                });
             }
-            let subject = evidence.iter().find_map(|ref_| {
-                eligible
-                    .iter()
-                    .find(|(lsn, event)| *lsn == ref_.lsn && event.raw_event_id == ref_.event_id)
-                    .and_then(|(_, event)| subject_of(event))
-            });
-            let window_start = evidence.first().map(|item| item.lsn).unwrap_or_default();
-            let created_at_lsn = evidence.last().map(|item| item.lsn).unwrap_or(window_start);
-            let signal_id = SecuritySignal::deterministic_id(
-                &rule.detector,
-                subject.as_ref(),
-                &evidence,
-                window_start,
-            );
-            let mut labels = rule.labels.clone();
-            labels.insert("rule.id".into(), rule.detector.id.clone());
-            labels.insert("rule.version".into(), rule.detector.version.clone());
-            signals.push(SecuritySignal {
-                signal_id,
-                detector: rule.detector.clone(),
-                severity: rule.severity,
-                score: 1.0,
-                subject,
-                evidence,
-                created_at_lsn,
-                labels,
-            });
         }
+        let mut seen = std::collections::HashSet::new();
+        signals.retain(|signal| seen.insert(signal.signal_id.clone()));
         signals
     }
 }
@@ -947,6 +957,49 @@ mod tests {
         value.outcome = outcome;
         value.observed_at = lsn * 1_000;
         (lsn, value)
+    }
+
+    #[test]
+    fn nested_temporal_retention_preserves_trigger_evidence() {
+        let inner = DetectionExpr::Count {
+            predicate: Box::new(DetectionExpr::Eq(
+                Field::Outcome,
+                Value::String("failure".into()),
+            )),
+            window_ms: 10,
+            threshold: 2,
+        };
+        let expression = DetectionExpr::And(vec![
+            DetectionExpr::Eq(Field::Activity, Value::String("trigger".into())),
+            DetectionExpr::Count {
+                predicate: Box::new(inner),
+                window_ms: 10,
+                threshold: 1,
+            },
+        ]);
+        let engine = RuleEngine::new([DetectionRule::new("nested", "1", expression, 5)]).unwrap();
+        let mut rows = vec![
+            event(0, Outcome::Failure),
+            event(1, Outcome::Failure),
+            event(2, Outcome::Success),
+        ];
+        for (row, time) in rows.iter_mut().zip([0, 8, 15]) {
+            row.1.observed_at = time;
+        }
+        rows[2].1.activity = "trigger".into();
+        let full = engine.evaluate(&rows);
+        assert_eq!(full.len(), 1);
+        let old_pruning: Vec<_> = rows
+            .iter()
+            .filter(|(_, e)| e.observed_at >= 5)
+            .cloned()
+            .collect();
+        assert!(
+            engine.evaluate(&old_pruning).is_empty(),
+            "old max(W1,W2) loses the nested dependency"
+        );
+        rows.retain(|(_, e)| e.observed_at >= 15u64.saturating_sub(engine.required_window_ms()));
+        assert_eq!(engine.evaluate(&rows), full);
     }
 
     #[test]
@@ -1111,7 +1164,7 @@ mod horizonte_tests {
     }
 
     #[test]
-    fn o_horizonte_e_a_maior_janela_em_qualquer_profundidade() {
+    fn o_horizonte_compoe_dependencias_temporais() {
         let count = DetectionExpr::Count {
             predicate: Box::new(pontual()),
             window_ms: 10_000,
@@ -1129,7 +1182,7 @@ mod horizonte_tests {
         assert_eq!(count.max_window_ms(), 10_000);
         assert_eq!(
             seq.max_window_ms(),
-            10_000,
+            15_000,
             "uma janela aninhada num passo conta"
         );
         let aninhado = DetectionExpr::Or(vec![
@@ -1144,5 +1197,25 @@ mod horizonte_tests {
         ])
         .unwrap();
         assert_eq!(engine.required_window_ms(), 60_000);
+    }
+
+    #[test]
+    fn nested_windows_add_and_saturate() {
+        let inner = DetectionExpr::Count {
+            predicate: Box::new(pontual()),
+            window_ms: 10,
+            threshold: 1,
+        };
+        let outer = DetectionExpr::Count {
+            predicate: Box::new(inner.clone()),
+            window_ms: 20,
+            threshold: 1,
+        };
+        assert_eq!(outer.max_window_ms(), 30);
+        let saturated = DetectionExpr::Sequence {
+            steps: vec![inner],
+            within_ms: u64::MAX,
+        };
+        assert_eq!(saturated.max_window_ms(), u64::MAX);
     }
 }

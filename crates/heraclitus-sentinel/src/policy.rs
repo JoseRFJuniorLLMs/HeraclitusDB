@@ -805,6 +805,10 @@ impl PolicyEngine for DeterministicPolicyEngine {
     }
 }
 
+/// The runtime persists an attempt before dispatch and reuses completed results.
+/// An interrupted/failed attempt requires reconciliation; it is not evidence
+/// that the external side effect did not happen. Executors should additionally
+/// use the deterministic action ID as the destination's idempotency key.
 pub trait SecurityActionExecutor: Send + Sync {
     fn execute<'a>(
         &'a self,

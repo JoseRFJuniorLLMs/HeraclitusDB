@@ -302,7 +302,9 @@ pub struct AccessCredential {
 pub enum FsyncPolicy {
     /// fsync on every append. Slowest, strongest.
     Always,
-    /// Group commit: fsync at most once per `interval_ms`.
+    /// Group commit: schedule fsync every `interval_ms` while writes are dirty,
+    /// including idle tails. ACK provides visibility, not per-append durability;
+    /// use Always or an explicit flush when a durable ACK is required.
     GroupCommit { interval_ms: u64 },
 }
 

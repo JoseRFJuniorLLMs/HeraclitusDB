@@ -717,6 +717,11 @@ mod tests {
                 .map(|r| r["b.id"].as_str().unwrap().to_string())
                 .collect()
         };
+        assert_eq!(
+            ids("MATCH (a)-[r]->(b) RETURN b.id ORDER BY b.id ASC"),
+            vec!["Beto", "Maria", "Zeta"]
+        );
+        assert!(execute("MATCH (a)-[r]->(b) RETURN b.id ORDER BY unknown.id", &be).is_err());
         // DESC + LIMIT 2: as DUAS de maior belief — não as duas primeiras do mapa.
         assert_eq!(
             ids("MATCH (a)-[r:socio_de]->(b) RETURN b.id, r.belief ORDER BY r.belief DESC LIMIT 2"),

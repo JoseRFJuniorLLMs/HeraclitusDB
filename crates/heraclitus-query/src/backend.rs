@@ -115,6 +115,17 @@ pub struct Trace {
 
 pub const QUERY_SCAN_CAP: usize = 250_000;
 
+/// Materialization is bounded, but a prefix is never a complete answer.
+/// Callers reading from a capped source must request CAP + 1 (a sentinel).
+pub fn complete_query_rows<T>(rows: Vec<T>) -> Result<Vec<T>, HeraclitusError> {
+    if rows.len() > QUERY_SCAN_CAP {
+        return Err(HeraclitusError::Query(format!(
+            "query materialization exceeds {QUERY_SCAN_CAP} rows; narrow the range or use LIMIT (no partial result returned)"
+        )));
+    }
+    Ok(rows)
+}
+
 // =========================================================================
 // M29: ENTRADAS UNIFICADAS DE HEAP COM ORDENAÇÃO MÁXIMA/MÍNIMA EXPLICITA
 // =========================================================================
@@ -536,6 +547,15 @@ pub trait QueryBackend {
         Ok(self
             .attr_lookup(field, value, as_of)?
             .map(|hits| hits.into_iter().map(|(l, _)| l).collect()))
+    }
+    /// Complete case-insensitive label lookup. Exact `_kind` postings are not
+    /// sufficient when multiple stored labels differ only in ASCII case.
+    fn kind_lookup_lsns(
+        &self,
+        _label: &str,
+        _as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
+        Ok(None)
     }
     /// O mesmo para o range numérico (ver `attr_range_lookup`).
     fn attr_range_lookup_lsns(
@@ -1160,13 +1180,33 @@ impl LogBackend {
 }
 
 impl QueryBackend for LogBackend {
+    fn kind_lookup_lsns(
+        &self,
+        label: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
+        let bundle = self.sync_bundle()?;
+        let bound = self.resolve_as_of_bound(as_of)?;
+        let Some(kinds) = bundle.attr_index.attributes.get("_kind") else {
+            return Ok(None);
+        };
+        let mut lsns: Vec<_> = kinds
+            .iter()
+            .filter(|(kind, _)| kind.eq_ignore_ascii_case(label))
+            .flat_map(|(_, lsns)| lsns.iter().copied())
+            .filter(|lsn| *lsn < bound)
+            .collect();
+        lsns.sort_unstable();
+        lsns.dedup();
+        Ok(Some(lsns))
+    }
     fn scan(&self, as_of: Option<Lsn>) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
         let bound = self.resolve_as_of_bound(as_of)?;
-        self.log.scan_capped(0, bound, QUERY_SCAN_CAP)
+        complete_query_rows(self.log.scan_capped(0, bound, QUERY_SCAN_CAP + 1)?)
     }
 
     fn scan_range(&self, from: Lsn, to: Lsn) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
-        self.log.scan_capped(from, to, QUERY_SCAN_CAP)
+        complete_query_rows(self.log.scan_capped(from, to, QUERY_SCAN_CAP + 1)?)
     }
 
     fn head(&self) -> Result<Lsn, HeraclitusError> {
@@ -1299,8 +1339,11 @@ impl QueryBackend for LogBackend {
         let t0 = std::time::Instant::now();
         if let Some((mut hits, stats)) =
             self.log
-                .scan_builtin_eq_capped(field, value, 0, bound, QUERY_SCAN_CAP)?
+                .scan_builtin_eq_capped(field, value, 0, bound, QUERY_SCAN_CAP + 1)?
         {
+            if hits.len() > QUERY_SCAN_CAP {
+                return Ok(None);
+            }
             self.observe_access_path("skip", t0.elapsed().as_nanos() as f64);
             *self.last_pruned_scan.lock().unwrap() = Some(stats);
             hits.retain(|(l, _)| *l < bound);
@@ -1342,7 +1385,7 @@ impl QueryBackend for LogBackend {
         // the exact field, so correctness never depends on this hint.
         hits.retain(|(l, _)| *l < bound);
         if hits.len() > QUERY_SCAN_CAP {
-            hits.truncate(QUERY_SCAN_CAP);
+            return Ok(None); // let the planner scan bounded pages instead
         }
         Ok(Some(PrunedScanResult {
             rows: hits,
@@ -1357,6 +1400,9 @@ impl QueryBackend for LogBackend {
         k: usize,
         as_of: Option<Lsn>,
     ) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError> {
+        if k == 0 {
+            return Ok(Vec::new());
+        }
         let b = self.sync_bundle()?;
         let bound = self.resolve_as_of_bound(as_of)?;
         let tokens: Vec<String> = text
@@ -2201,6 +2247,13 @@ impl<'a> VirtualBackend<'a> {
 }
 
 impl QueryBackend for VirtualBackend<'_> {
+    fn kind_lookup_lsns(
+        &self,
+        label: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
+        self.base.kind_lookup_lsns(label, as_of)
+    }
     // --- delegadas: um contrafactual de aresta não as afeta ---
     fn scan(&self, as_of: Option<Lsn>) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
         self.base.scan(as_of)

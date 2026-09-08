@@ -83,7 +83,9 @@ pub struct V6Log {
     root: PathBuf,
     segments_dir: PathBuf,
     manifest_store: ManifestStore,
-    state: Mutex<V6State>,
+    state: Arc<Mutex<V6State>>,
+    sync_stop: Option<std::sync::mpsc::Sender<()>>,
+    sync_worker: Option<std::thread::JoinHandle<()>>,
     /// Serializa workers de packing sem tomar o mutex do writer. O trabalho
     /// pesado (leitura+Zstd+fsync) nunca bloqueia append; só o publish curto do
     /// HRKM volta a tomar `state`.
@@ -209,6 +211,8 @@ struct V6State {
     active: Option<ActiveSegment>,
     next_lsn: Lsn,
     last_sync: Instant,
+    dirty: bool,
+    sync_error: Option<String>,
 }
 
 struct ActiveSegment {
@@ -508,16 +512,56 @@ impl V6Log {
         };
 
         let (tail_tx, _) = broadcast::channel(4096);
+        let state = Arc::new(Mutex::new(V6State {
+            manifest,
+            active: Some(active),
+            next_lsn,
+            last_sync: Instant::now(),
+            dirty: false,
+            sync_error: None,
+        }));
+        let (sync_stop, sync_worker) = match &fsync {
+            FsyncPolicy::Always => (None, None),
+            FsyncPolicy::GroupCommit { interval_ms } => {
+                let (stop, wake) = std::sync::mpsc::channel();
+                let weak = Arc::downgrade(&state);
+                let period = Duration::from_millis(*interval_ms);
+                let worker = std::thread::Builder::new().name("hrkl-v6-fsync".into()).spawn(move || {
+                    let mut wait = period.clamp(Duration::from_millis(1), Duration::from_secs(60));
+                    loop {
+                        let stopping = match wake.recv_timeout(wait) {
+                            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+                        };
+                        let Some(state) = weak.upgrade() else { break; };
+                        let Ok(mut state) = state.lock() else { break; };
+                        if state.sync_error.is_some() { break; }
+                        if state.dirty && (stopping || state.last_sync.elapsed() >= period) {
+                            let result = state.active.as_mut().ok_or_else(|| std::io::Error::other("V6 active segment unavailable"))
+                                .and_then(|active| active.writer.sync().map_err(std::io::Error::other));
+                            if let Err(error) = result {
+                                tracing::error!(%error, "V6 background fsync failed; writes disabled");
+                                state.sync_error = Some(error.to_string());
+                                break;
+                            }
+                            state.last_sync = Instant::now();
+                            state.dirty = false;
+                        }
+                        if stopping { break; }
+                        wait = if state.dirty { period.saturating_sub(state.last_sync.elapsed()) } else { period }
+                            .clamp(Duration::from_millis(1), Duration::from_secs(60));
+                    }
+                })?;
+                (Some(stop), Some(worker))
+            }
+        };
         Ok(Self {
             root,
             segments_dir,
             manifest_store,
-            state: Mutex::new(V6State {
-                manifest,
-                active: Some(active),
-                next_lsn,
-                last_sync: Instant::now(),
-            }),
+            state,
+            sync_stop,
+            sync_worker,
             packing_lock: Mutex::new(()),
             sidecar_lock: Mutex::new(()),
             blocos_por_geracao: Mutex::new(std::collections::HashMap::new()),
@@ -574,6 +618,7 @@ impl V6Log {
             .ok_or_else(|| HeraclitusError::StorageEngine("V6Log sem segmento ativo".into()))?;
         active.writer.sync()?;
         state.last_sync = Instant::now();
+        state.dirty = false;
         Ok(())
     }
 
@@ -2320,6 +2365,7 @@ impl V6Log {
         if sync_now {
             state.last_sync = Instant::now();
         }
+        state.dirty = !sync_now;
         state.next_lsn = state.next_lsn.saturating_add(1);
         self.metrics
             .append_bytes
@@ -2424,9 +2470,27 @@ impl V6Log {
     }
 
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, V6State>, HeraclitusError> {
-        self.state
+        let state = self
+            .state
             .lock()
-            .map_err(|_| HeraclitusError::StorageEngine("mutex do V6Log envenenado".into()))
+            .map_err(|_| HeraclitusError::StorageEngine("mutex do V6Log envenenado".into()))?;
+        if let Some(error) = &state.sync_error {
+            return Err(HeraclitusError::StorageEngine(format!(
+                "V6 background fsync failed: {error}"
+            )));
+        }
+        Ok(state)
+    }
+}
+
+impl Drop for V6Log {
+    fn drop(&mut self) {
+        if let Some(stop) = self.sync_stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(worker) = self.sync_worker.take() {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -3048,6 +3112,37 @@ fn packed_location(id: SegmentId, generation: u32) -> String {
 mod tests {
     use super::*;
     use heraclitus_core::EventKind;
+
+    #[test]
+    fn group_commit_flushes_an_idle_tail_without_another_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = V6Log::open(
+            dir.path(),
+            1 << 20,
+            FsyncPolicy::GroupCommit { interval_ms: 20 },
+        )
+        .unwrap();
+        {
+            let mut state = log.lock_state().unwrap();
+            log.append_inner_locked(&mut state, event(1), None).unwrap();
+            // Model the pending tail even on a slow host where append itself
+            // crossed the interval and performed a foreground sync.
+            state.dirty = true;
+            state.last_sync = Instant::now();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while log.lock_state().unwrap().dirty && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !log.lock_state().unwrap().dirty,
+            "idle tail was never synchronized"
+        );
+        assert_eq!(log.head(), 1);
+        drop(log);
+        let reopened = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
+        assert!(reopened.read(0).unwrap().is_some());
+    }
 
     fn event(i: u64) -> Episode {
         Episode::new(

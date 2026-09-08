@@ -1488,6 +1488,69 @@ impl SentinelRuntime {
             &authorized.policy_version,
         )
         .map_err(|error| SentinelError::Policy(PolicyError::Invalid(error.to_string())))?;
+        let result_lsn = self
+            .inner
+            .l4_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&format!("result:{expected}"))
+            .copied();
+        if let Some(lsn) = result_lsn {
+            let (_, episode) = self.inner.log.read(lsn)?.ok_or_else(|| {
+                SentinelError::Policy(PolicyError::Invalid(
+                    "persisted action result is unavailable".into(),
+                ))
+            })?;
+            let payload: serde_json::Value = serde_json::from_slice(&episode.content)?;
+            let result: ActionResult =
+                serde_json::from_value(payload.get("result").cloned().unwrap_or_default())?;
+            if result.action_id != expected {
+                return Err(SentinelError::Policy(PolicyError::Invalid(
+                    "persisted action result ID mismatch".into(),
+                )));
+            }
+            self.inner.log.flush()?;
+            return Ok((result, lsn));
+        }
+        // Reserve durably BEFORE calling an executor. An incomplete attempt is
+        // ambiguous (the external effect may already have happened), so never
+        // retry it automatically, even after restart or future cancellation.
+        let mut attempt = Episode::new(
+            "sentinel",
+            EventKind::Custom("SecurityActionAttempt".into()),
+            serde_json::to_vec(&authorized)?,
+        );
+        attempt
+            .attrs
+            .insert("sentinel.generated".into(), "true".into());
+        attempt
+            .attrs
+            .insert("sentinel.action_id".into(), expected.clone());
+        attempt.attrs.insert(
+            "sentinel.incident_id".into(),
+            authorized.incident_id.clone(),
+        );
+        let claim_id = attempt.id;
+        let (attempt_lsn, fresh) =
+            self.append_l4_once_with_status(format!("attempt:{expected}"), attempt)?;
+        if !fresh {
+            return Err(SentinelError::Policy(PolicyError::Invalid(
+                "action already attempted; reconcile the external outcome before issuing a new action".into())));
+        }
+        self.inner.log.flush()?;
+        // A replicated sink can return another leader's existing attempt
+        // before our local l4_ids cache catches up. Verify unique ownership.
+        if self
+            .inner
+            .log
+            .read(attempt_lsn)?
+            .is_none_or(|(_, episode)| episode.id != claim_id)
+        {
+            return Err(SentinelError::Policy(PolicyError::Invalid(
+                "action attempt belongs to another execution; reconcile its outcome".into(),
+            )));
+        }
+        self.require_authority()?;
         let result = match executor.execute(&authorized).await {
             Ok(result) => result,
             Err(error) => {
@@ -1505,6 +1568,7 @@ impl SentinelRuntime {
         }
         let episode = result.into_episode(&authorized)?;
         let lsn = self.append_l4_once(format!("result:{expected}"), episode)?;
+        self.inner.log.flush()?;
         self.inner
             .metrics
             .actions_executed_total
@@ -1613,7 +1677,14 @@ impl SentinelRuntime {
                 .and_then(serde_json::Value::as_str)
                 == Some(authorized.authorization_id.as_str())
             {
-                return Ok(());
+                let constraints = payload
+                    .get("decision")
+                    .and_then(|d| d.get("Approve"))
+                    .and_then(|d| d.get("constraints"));
+                if constraints == Some(&serde_json::to_value(&authorized.constraints)?) {
+                    return Ok(());
+                }
+                continue;
             }
             if let Some(approval_id) = payload
                 .get("decision")
@@ -1625,7 +1696,13 @@ impl SentinelRuntime {
                     continue;
                 }
                 let approved = aprovacoes_concedidas.contains(approval_id);
-                if approved {
+                let expected_constraints = ExecutionConstraints {
+                    scope: "approved-human".into(),
+                    max_ttl_secs: None,
+                    requires_approval: false,
+                    allow_retries: false,
+                };
+                if approved && authorized.constraints == expected_constraints {
                     return Ok(());
                 }
             }
@@ -2577,11 +2654,12 @@ fn chave_de_sighting(indicator_id: &str, match_kind: &str, event_id: EventId) ->
     format!("t:{indicator_id}:{match_kind}:{event_id}")
 }
 
-const L4_KINDS: [&str; 9] = [
+const L4_KINDS: [&str; 10] = [
     "SecurityInvestigation",
     "SecurityActionProposal",
     "SecurityPolicyDecision",
     "SecurityActionResult",
+    "SecurityActionAttempt",
     "SecurityAiInvocation",
     "SecurityApproval",
     "SecurityModelUpdate",
@@ -2595,6 +2673,7 @@ fn l4_prefixo_e_atributo(kind: &str) -> (&'static str, &'static str) {
         "SecurityActionProposal" => ("proposal", "sentinel.action_proposal_id"),
         "SecurityPolicyDecision" => ("decision", "sentinel.policy_decision_id"),
         "SecurityActionResult" => ("result", "sentinel.action_id"),
+        "SecurityActionAttempt" => ("attempt", "sentinel.action_id"),
         "SecurityAiInvocation" => ("invocation", "sentinel.invocation_id"),
         "SecurityApproval" => ("approval", "sentinel.approval_id"),
         "SecurityModelUpdate" => ("model-update", "sentinel.model_update_id"),
@@ -4646,10 +4725,10 @@ detection:
 
         assert_eq!(estado.events_normalized_total, BRUTOS);
         assert_eq!(estado.detection_lag_lsn, 0, "o pipeline não chegou ao fim");
-        // Equivalência observável: o resultado não pode mudar. A regra reporta
-        // a PRIMEIRA correspondência, e o `signal_id` determinista deduplica-a.
+        // Every distinct matching event must remain classified, even while
+        // the first occurrence stays in the cached history.
         assert_eq!(
-            estado.signals_emitted_total, 1,
+            estado.signals_emitted_total, BRUTOS,
             "memoizar não pode mudar os sinais emitidos"
         );
         assert_eq!(
@@ -4666,6 +4745,7 @@ detection:
             servido_pela_cache, fresco,
             "o acerto de cache tem de devolver o MESMO conjunto de suspeitos"
         );
+        assert_eq!(fresco.len(), BRUTOS as usize);
         assert_eq!(
             depois_da_leitura, estado.l1_evaluations_total,
             "e tem de devolvê-lo sem voltar a varrer a janela"
@@ -5124,7 +5204,8 @@ detection:
                 "auditd",
                 EventKind::Observation,
                 format!(
-                    r#"{{"source":"auditd","EventID":4625,"user":"u{}","host":"h{}"}}"#,
+                    r#"{{"source":"auditd","EventID":{},"user":"u{}","host":"h{}"}}"#,
+                    if i % 2 == 0 { 4625 } else { 4624 },
                     i % 3,
                     i % 2
                 )
@@ -6115,17 +6196,10 @@ mod poda_l1_tests {
         );
     }
 
-    /// O `RuleEngine::evaluate` reporta a PRIMEIRA correspondencia de cada
-    /// regra, e o `signal_ids` suprime o que ja foi emitido. Enquanto o
-    /// historico crescia sem tecto, essa primeira correspondencia ficava la
-    /// para sempre: a rajada #1 era emitida uma vez e a rajada #2,
-    /// genuinamente distinta e 48 segundos depois, NUNCA chegava a ser
-    /// emitida. Nao era um throttle — era fome permanente.
-    ///
-    /// A poda ao horizonte derivado do ruleset e o que fecha esse buraco: a
-    /// rajada #1 cai fora da janela, a #2 passa a ser a primeira, e sai.
+    /// Detection must find both bursts without relying on pruning to dislodge
+    /// the first match. Pruning only bounds historical retention.
     #[test]
-    fn sem_poda_a_segunda_rajada_nunca_e_emitida_e_com_poda_e() {
+    fn ambas_as_rajadas_sao_detectadas_antes_da_poda() {
         let rule = DetectionRule::new(
             "failed-logins",
             "1.0.0",
@@ -6148,11 +6222,10 @@ mod poda_l1_tests {
 
         let mut historico: Vec<_> = rajada_1.iter().chain(rajada_2.iter()).cloned().collect();
         let sem_poda = engine.evaluate(&historico);
-        assert_eq!(sem_poda.len(), 1);
-        assert_ne!(
-            sem_poda[0].signal_id, so_a_segunda[0].signal_id,
-            "com historico ilimitado so a rajada #1 e reportada; a #2 fica presa atras dela"
-        );
+        assert_eq!(sem_poda.len(), 2);
+        assert!(sem_poda
+            .iter()
+            .any(|s| s.signal_id == so_a_segunda[0].signal_id));
 
         podar_historico_l1(&mut historico, engine.required_window_ms(), 0, u64::MAX);
         assert_eq!(

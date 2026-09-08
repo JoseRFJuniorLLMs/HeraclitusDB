@@ -2401,8 +2401,8 @@ impl Engine {
             if let Some(hit) = self.log.read(l)? {
                 out.push(hit);
             }
-            if out.len() >= heraclitus_query::backend::QUERY_SCAN_CAP {
-                break;
+            if out.len() > heraclitus_query::backend::QUERY_SCAN_CAP {
+                return heraclitus_query::backend::complete_query_rows(out);
             }
         }
         Ok(out)
@@ -2863,14 +2863,42 @@ impl Engine {
 /// The engine IS the real `QueryBackend` for the GQL layer: HNSW for
 /// NEAREST, two-stage for RECALL, graph index for PROVENANCE.
 impl QueryBackend for Engine {
+    fn kind_lookup_lsns(
+        &self,
+        label: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
+        if !heraclitus_index_attr::valor_indexavel(label) {
+            return Ok(None);
+        }
+        let idx = self.attr.read().unwrap();
+        if !idx.conhece_campo("_kind") {
+            return Ok(None);
+        }
+        let bound = as_of.unwrap_or_else(|| self.log.head());
+        let mut lsns = Vec::new();
+        for (kind, _) in idx.field_values("_kind") {
+            if kind.eq_ignore_ascii_case(label) {
+                lsns.extend(
+                    idx.lookup("_kind", &kind)
+                        .iter()
+                        .copied()
+                        .filter(|lsn| *lsn < bound),
+                );
+            }
+        }
+        lsns.sort_unstable();
+        lsns.dedup();
+        Ok(Some(lsns))
+    }
     fn scan(&self, as_of: Option<Lsn>) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
         // R9: capado como o LogBackend de referência — um scan sem teto
         // materializava o log inteiro num Vec (OOM em logs grandes).
-        self.log.scan_capped(
+        heraclitus_query::backend::complete_query_rows(self.log.scan_capped(
             0,
             as_of.unwrap_or(u64::MAX),
-            heraclitus_query::backend::QUERY_SCAN_CAP,
-        )
+            heraclitus_query::backend::QUERY_SCAN_CAP + 1,
+        )?)
     }
 
     /// Snapshot do grafo temporal materializado (a view incremental, sem replay).
@@ -2881,8 +2909,11 @@ impl QueryBackend for Engine {
     fn scan_range(&self, from: Lsn, to: Lsn) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
         // Windowed + capped: segment pruning makes a time slice cheap, and the
         // QUERY_SCAN_CAP keeps a broad scan from exhausting memory (§query guard).
-        self.log
-            .scan_capped(from, to, heraclitus_query::backend::QUERY_SCAN_CAP)
+        heraclitus_query::backend::complete_query_rows(self.log.scan_capped(
+            from,
+            to,
+            heraclitus_query::backend::QUERY_SCAN_CAP + 1,
+        )?)
     }
 
     fn scan_builtin_eq(
@@ -2898,15 +2929,18 @@ impl QueryBackend for Engine {
                 value,
                 0,
                 bound,
-                heraclitus_query::backend::QUERY_SCAN_CAP,
+                heraclitus_query::backend::QUERY_SCAN_CAP + 1,
             )
             .map(|result| {
-                result.map(|(mut rows, stats)| {
+                result.and_then(|(mut rows, stats)| {
+                    if rows.len() > heraclitus_query::backend::QUERY_SCAN_CAP {
+                        return None;
+                    }
                     rows.retain(|(lsn, _)| *lsn < bound);
-                    PrunedScanResult {
+                    Some(PrunedScanResult {
                         rows,
                         stats: Some(stats),
-                    }
+                    })
                 })
             })
     }

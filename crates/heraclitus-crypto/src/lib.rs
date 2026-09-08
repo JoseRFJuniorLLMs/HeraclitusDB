@@ -234,6 +234,15 @@ impl KeyStore {
                 }
             }
         };
+        // A competing reader may observe all 32 bytes before the creator's
+        // fsync. Make the key AND directory durable before publishing it to
+        // the cache; this also covers another KeyStore instance's creator.
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)?
+            .sync_all()?;
+        sync_dir(&self.dir)?;
         self.cache.insert(agent_id.to_string(), key);
         Ok(key)
     }
@@ -247,6 +256,14 @@ impl KeyStore {
             return Some(*k);
         }
         let k = Self::read_key(&self.key_path(agent_id))?;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(self.key_path(agent_id))
+            .ok()?
+            .sync_all()
+            .ok()?;
+        sync_dir(&self.dir).ok()?;
         self.cache.insert(agent_id.to_string(), k);
         Some(k)
     }

@@ -5,7 +5,8 @@
 //! Tabela de Páginas Sujas (Dirty Page Table) dedicada O(1), Filtros de Bloom por amostragem
 //! criptográfica independente por página, Sharding de Cache (Lock Striping) contra concorrência,
 //! Compressão por Prefixo defensiva, CoW estrito para a FreeList e Garbage Collection
-//! automatizado de versões obsoletas do MVCC. Totalmente livre de comportamento indefinido e unsafe.
+//! automatizado de páginas obsoletas. Gerações históricas NÃO são retidas:
+//! `get_snapshot` só aceita `u64::MAX` (head); usar o log para consultas AS OF.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -2431,19 +2432,30 @@ impl BEpsilonTree {
         Ok(out)
     }
 
-    /// Leitura com corte de visibilidade por `snapshot_generation`.
+    /// Read the current head (`snapshot_generation == u64::MAX`).
     ///
-    /// HONESTIDADE SEMÂNTICA (revisão 2026-07-16): o "lsn" comparado aqui é o
-    /// que `upsert`/`delete_key` carimbam nas mensagens — a **GENERATION do
-    /// superbloco**, não um LSN do log do Heraclitus. Serve para snapshots
-    /// relativos a commits desta árvore; NÃO passar LSNs do log (usar
-    /// `get`, que lê o head, para o caso comum).
+    /// Historical generations are unsupported: leaf values and recycled roots
+    /// do not retain history. Reject them rather than returning current values
+    /// as if they belonged to an old snapshot. This is not the log's AS OF API.
     pub fn get_snapshot(&self, key: &[u8], snapshot_generation: u64) -> io::Result<Option<Val>> {
+        if snapshot_generation != u64::MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "historical B-tree generations are not retained; use the log AS OF API",
+            ));
+        }
         let root_id = self.superblock.read().unwrap().root_id;
         let mut curr_id = root_id;
         self.metrics
             .active_snapshots
             .fetch_add(1, Ordering::Acquire);
+        struct SnapshotRead<'a>(&'a AtomicUsize);
+        impl Drop for SnapshotRead<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Release);
+            }
+        }
+        let _snapshot_read = SnapshotRead(&self.metrics.active_snapshots);
         let res = loop {
             let node_guard = self.acquire_node_guard(curr_id)?;
             let node = node_guard.node.read().unwrap();
@@ -2495,9 +2507,6 @@ impl BEpsilonTree {
             let child_idx = node.keys.partition_point(|p| p.as_slice() <= key);
             curr_id = node.children[child_idx];
         };
-        self.metrics
-            .active_snapshots
-            .fetch_sub(1, Ordering::Release);
         res
     }
 

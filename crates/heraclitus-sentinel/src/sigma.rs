@@ -393,6 +393,17 @@ fn unquote(value: &str, line: usize) -> Result<String, RuleCompileError> {
 
 fn compile_document(root: &YamlNode) -> Result<DetectionRule, RuleCompileError> {
     let map = as_map(root, "root")?;
+    // The normalized event schema has no lossless mapping for Sigma's product,
+    // service and category namespace. Ignoring logsource broadens a rule into
+    // unrelated event streams. Reject until an explicit mapping is configured.
+    if let Some(source) = map.get("logsource") {
+        if !as_map(source, "logsource")?.is_empty() {
+            return Err(RuleCompileError::UnsupportedFeature(
+                "logsource requires an explicit normalized-source mapping; it cannot be ignored"
+                    .into(),
+            ));
+        }
+    }
     let id = scalar_required(map, "id")?;
     let version = map
         .get("version")
@@ -845,9 +856,6 @@ mod tests {
 id: 4d8a7d30-2b9a-4d0b-8f20-000000000001
 status: experimental
 level: high
-logsource:
-  product: linux
-  service: sshd
 detection:
   selection:
     EventID: 4625
@@ -864,6 +872,17 @@ detection:
         assert_eq!(rule.severity, 8);
         assert_eq!(rule.labels["sigma.title"], "Failed SSH logins");
         assert!(matches!(rule.expression, DetectionExpr::And(_)));
+    }
+
+    #[test]
+    fn logsource_is_never_silently_ignored() {
+        for key in ["product", "service", "category"] {
+            let scoped = format!("{RULE}\nlogsource:\n  {key}: linux\n");
+            assert!(matches!(
+                compile_sigma(&scoped),
+                Err(RuleCompileError::UnsupportedFeature(_))
+            ));
+        }
     }
 
     #[test]

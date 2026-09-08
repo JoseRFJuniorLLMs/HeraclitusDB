@@ -612,7 +612,40 @@ impl StoragePayload {
     }
 }
 
+#[cfg(test)]
+mod audit_group_commit {
+    use super::*;
+
+    #[test]
+    fn idle_tail_reaches_a_physical_barrier_without_more_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log::open(
+            dir.path(),
+            1 << 20,
+            FsyncPolicy::GroupCommit { interval_ms: 100 },
+        )
+        .unwrap();
+        log.append(Episode::new(
+            "timer-test",
+            EventKind::Observation,
+            b"last append".to_vec(),
+        ))
+        .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while log.synced_batches.load(Ordering::Acquire) == 0 && Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            log.synced_batches.load(Ordering::Acquire) > 0,
+            "no fsync for idle tail"
+        );
+        assert_eq!(log.head(), 1);
+    }
+}
+
 pub struct Log {
+    #[cfg(test)]
+    synced_batches: Arc<AtomicU64>,
     dir: PathBuf,
     hlc: Arc<Hlc>,
     committed_lsn: Arc<AtomicU64>,
@@ -980,6 +1013,10 @@ impl Log {
         let worker_hlc = hlc.clone();
         let worker_poisoned = poisoned.clone();
         let worker_fsync_policy = fsync;
+        #[cfg(test)]
+        let synced_batches = Arc::new(AtomicU64::new(0));
+        #[cfg(test)]
+        let worker_synced_batches = synced_batches.clone();
 
         std::thread::spawn(move || {
             let _drop_guard = WorkerDropGuard {
@@ -996,6 +1033,7 @@ impl Log {
 
                 let mut scratch_buffer = Vec::with_capacity(262144);
                 let mut crypto_scratch = Vec::with_capacity(262144);
+                let mut dirty_since_sync = false;
 
                 loop {
                     batch.clear();
@@ -1007,9 +1045,41 @@ impl Log {
                     // um roll a meio do lote.
                     let mut pending_index_start = 0usize;
 
-                    let first_cmd = match cmd_rx.recv() {
+                    let received = if let FsyncPolicy::GroupCommit { interval_ms } = &fsync_policy {
+                        if dirty_since_sync {
+                            cmd_rx.recv_timeout(
+                                std::time::Duration::from_millis(*interval_ms)
+                                    .saturating_sub(active.last_sync.elapsed()),
+                            )
+                        } else {
+                            cmd_rx
+                                .recv()
+                                .map_err(|_| crossbeam_channel::RecvTimeoutError::Disconnected)
+                        }
+                    } else {
+                        cmd_rx
+                            .recv()
+                            .map_err(|_| crossbeam_channel::RecvTimeoutError::Disconnected)
+                    };
+                    let first_cmd = match received {
                         Ok(cmd) => cmd,
-                        Err(_) => break,
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                            if active.io.sync().is_err() {
+                                worker_poisoned.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                            active.last_sync = Instant::now();
+                            #[cfg(test)]
+                            worker_synced_batches.fetch_add(1, Ordering::Release);
+                            dirty_since_sync = false;
+                            continue;
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                            if dirty_since_sync && active.io.sync().is_err() {
+                                worker_poisoned.store(true, Ordering::SeqCst);
+                            }
+                            break;
+                        }
                     };
 
                     batch.push(first_cmd);
@@ -1270,6 +1340,7 @@ impl Log {
                     }
 
                     // PIPELINE — FASE 3: FS DATA HARDWARE BARRIER
+                    dirty_since_sync |= !stashed_updates.is_empty();
                     if sync_required {
                         if active.io.sync().is_err() {
                             rollback_active_file(&mut active.io, initial_bytes_written);
@@ -1280,6 +1351,9 @@ impl Log {
                             break;
                         }
                         active.last_sync = Instant::now();
+                        #[cfg(test)]
+                        worker_synced_batches.fetch_add(1, Ordering::Release);
+                        dirty_since_sync = false;
                     }
 
                     // PIPELINE — FASE 4: COW ATOMIZADO NO SEGMENTO ATIVO (Splat-Free Completo)
@@ -1352,6 +1426,8 @@ impl Log {
 
         Ok(Self {
             dir,
+            #[cfg(test)]
+            synced_batches,
             hlc,
             committed_lsn,
             poisoned,
