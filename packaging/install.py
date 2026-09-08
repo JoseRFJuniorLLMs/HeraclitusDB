@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import sys
 
@@ -44,7 +45,7 @@ def install(prefix, binary, secret):
     shutil.copyfile(binary, target)
     target.chmod(0o700)
     config = (
-        f'data_dir = {json.dumps(str(prefix / "data"))}\n'
+        f'data_dir = {json.dumps(str(prefix / "data"), ensure_ascii=False)}\n'
         'grpc_addr = "127.0.0.1:7474"\nrest_addr = "127.0.0.1:7475"\n'
         'encryption_at_rest = true\nfsync = { mode = "always" }\n'
         '[[access_credentials]]\nprincipal = "admin"\nroles = ["admin"]\n'
@@ -88,7 +89,7 @@ def main():
     except (ValueError, OSError, subprocess.SubprocessError) as error:
         parser.error(str(error))
     print(f"Instalação criada em {config.parent}. Utilizador: admin. Nenhum serviço foi iniciado.")
-    print(f"Arranque: python3 {config.parent / 'start.py'}")
+    print(f"Arranque: python3 {shlex.quote(str(config.parent / 'start.py'))}")
     print("REST: Basic admin + senha/token; gRPC: Bearer com a mesma credencial. Apenas loopback.")
 
 

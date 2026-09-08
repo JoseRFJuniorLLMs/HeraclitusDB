@@ -106,7 +106,7 @@ jobs:
           )
           tar --sort=name --mtime="@$source_date_epoch" --owner=0 --group=0 --numeric-owner \
             -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/$(basename "$dist").tar.gz" "$(basename "$dist")"
-          sha256sum "$RUNNER_TEMP/$(basename "$dist").tar.gz" > "$RUNNER_TEMP/$(basename "$dist").tar.gz.sha256"
+          (cd "$RUNNER_TEMP" && sha256sum "$(basename "$dist").tar.gz") > "$RUNNER_TEMP/$(basename "$dist").tar.gz.sha256"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "dist=$dist" >> "$GITHUB_OUTPUT"
           echo "archive=$RUNNER_TEMP/$(basename "$dist").tar.gz" >> "$GITHUB_OUTPUT"
