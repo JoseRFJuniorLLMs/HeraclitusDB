@@ -9,10 +9,14 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 fn crash_writer_bin() -> std::path::PathBuf {
-    // target/debug/examples/crash_writer(.exe)
+    // <target>/<perfil>/examples/crash_writer(.exe)
     let mut p = std::env::current_exe().unwrap();
+    // Auditoria 2026-09-05, vaga 2 (R65): as etiquetas destes `pop()` estavam
+    // trocadas — o primeiro remove o NOME do binário de teste, não `deps/`.
+    // O resultado desta função já era o correcto, mas foram estes comentários
+    // enganadores que induziram o erro em `test_target_dir()` abaixo.
+    p.pop(); // nome do binário de teste
     p.pop(); // deps/
-    p.pop(); // debug/
     p.push("examples");
     p.push(format!("crash_writer{}", std::env::consts::EXE_SUFFIX));
     p
@@ -21,11 +25,38 @@ fn crash_writer_bin() -> std::path::PathBuf {
 /// O binário do exemplo precisa ser construído no mesmo target dir do binário
 /// de teste. Assumir o target global do Cargo quebra runners que isolam o
 /// build (e pode fazer o teste matar um binário de outra build).
+///
+/// Auditoria 2026-09-05, vaga 2 (R65): faltava aqui o terceiro `pop()`. Com
+/// dois, esta função devolvia `<target>/<perfil>` em vez de `<target>`, e o
+/// `--target-dir` aninhava a build em `<target>/debug/debug/examples/`
+/// enquanto `crash_writer_bin()` continuava a resolver
+/// `<target>/debug/examples/` — dois caminhos que nunca coincidem. Os irmãos
+/// `hrkl_v6_crash.rs` e `hrkl_v6_packer_crash.rs` já faziam os três pops.
 fn test_target_dir() -> std::path::PathBuf {
     let mut p = std::env::current_exe().expect("caminho do binário de teste");
+    p.pop(); // nome do binário de teste
     p.pop(); // deps/
     p.pop(); // debug/ | release/
     p
+}
+
+/// Onde o `cargo build --target-dir <alvo>` acaba de escrever o example.
+///
+/// O nome do perfil (`debug` | `release`) é lido do caminho do próprio binário
+/// de teste, sem repetir a aritmética de `pop()`s de `test_target_dir()`: é
+/// essa independência que permite à asserção do gate detectar uma divergência
+/// entre as duas funções em vez de a herdar.
+fn crash_writer_esperado(alvo: &std::path::Path) -> std::path::PathBuf {
+    let exe = std::env::current_exe().expect("caminho do binário de teste");
+    let perfil = exe
+        .parent() // deps/
+        .and_then(|p| p.parent()) // debug/ | release/
+        .and_then(|p| p.file_name())
+        .expect("perfil de build no caminho do binário de teste")
+        .to_owned();
+    alvo.join(perfil)
+        .join("examples")
+        .join(format!("crash_writer{}", std::env::consts::EXE_SUFFIX))
 }
 
 #[test]
@@ -36,19 +67,45 @@ fn survives_repeated_mid_append_kills() {
         .unwrap_or(25);
 
     // Build the example binary once.
+    let alvo = test_target_dir();
     let status = Command::new(env!("CARGO"))
         .args(["build", "--example", "crash_writer", "-p", "heraclitus-log"])
         .arg("--target-dir")
-        .arg(test_target_dir())
+        .arg(&alvo)
         .status()
         .expect("cargo build crash_writer");
     assert!(status.success());
+
+    // Auditoria 2026-09-05, vaga 2 (R65): o caminho que construímos e o
+    // caminho que executamos têm de ser o MESMO. Sem esta asserção o defeito
+    // só se manifestava numa das invocações: em `cargo test --test
+    // crash_injection` (que não constrói examples) morria com `spawn
+    // crash_writer: NotFound`, mas num `cargo test` completo passava por
+    // acidente — a invocação externa deixava um `crash_writer` no sítio que o
+    // spawn resolve, possivelmente de uma build ANTERIOR, que é exactamente o
+    // contrário do que este gate promete verificar. Comparar os dois caminhos
+    // faz qualquer divergência falhar em todas as invocações.
+    let bin = crash_writer_bin();
+    let esperado = crash_writer_esperado(&alvo);
+    assert_eq!(
+        bin,
+        esperado,
+        "o gate executaria {} mas o build com --target-dir {} escreveu em {}",
+        bin.display(),
+        alvo.display(),
+        esperado.display()
+    );
+    assert!(
+        bin.exists(),
+        "crash_writer nao foi construido em {}",
+        bin.display()
+    );
 
     let dir = tempfile::tempdir().unwrap();
     let mut last_count = 0u64;
 
     for i in 0..iters {
-        let mut child = Command::new(crash_writer_bin())
+        let mut child = Command::new(&bin)
             .arg(dir.path())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
