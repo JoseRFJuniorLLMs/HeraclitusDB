@@ -1,7 +1,7 @@
 # SPEC-0074 — Heraclitus Agent Black Box: Tamper-Evident Agent Evidence Plane
 
 **Status:** IMPLEMENTADA em v2.0.0 — `crates/heraclitus-agent`, `crates/heraclitus-agent-gateway`, `heraclitus agent *`
-**Adiamento declarado:** OTLP/gRPC fica para a 0074.1 (permitido por §30); o adiamento está documentado em `docs/agent/otel.md`.  
+**OTLP/gRPC:** implementado (`opentelemetry.proto.collector.trace.v1.TraceService`); não houve adiamento para a 0074.1.  
 **Status original:** PROPOSED — PRODUCT PIVOT / P0  
 **Prioridade:** P0 — antes de novas funcionalidades de SOC  
 **Baseline auditado:** `JoseRFJuniorLLMs/HeraclitusDB @ 74f921f1ad25cf27c399522c5c0d27c8ec084009`  

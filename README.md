@@ -93,6 +93,7 @@ cargo run --release -p heraclitus-cli -- agent demo ./data
 |---|---|
 | 8080 | Consola + API de evidência |
 | 4318 | OTLP/HTTP |
+| 4317 | OTLP/gRPC (opcional) |
 | 8787 | proxy MCP (opcional) |
 
 ---

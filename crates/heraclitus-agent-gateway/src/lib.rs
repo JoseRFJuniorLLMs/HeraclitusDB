@@ -7,6 +7,7 @@
 //! |---|---|---|
 //! | Consola + API | 8080 | 0076 §14 |
 //! | OTLP/HTTP | 4318 | 0074 §12 |
+//! | OTLP/gRPC | 4317 | 0074 §12 |
 //! | Proxy MCP | 8787 | 0075 §5 |
 //!
 //! # O quickstart que isto tem de tornar verdadeiro
@@ -25,6 +26,7 @@ pub mod api;
 pub mod auth;
 pub mod console;
 pub mod gateway;
+pub mod grpc;
 pub mod ingest;
 pub mod runtime;
 pub mod upstream;
@@ -93,6 +95,32 @@ pub async fn spawn(
                 .await;
         }));
         tracing::info!(%addr, "OTLP/HTTP a receber traces");
+    }
+
+    if runtime.config.enabled && !runtime.config.otlp.grpc_addr.is_empty() {
+        let addr: std::net::SocketAddr = runtime.config.otlp.grpc_addr.parse().map_err(|e| {
+            HeraclitusError::Config(format!(
+                "OTLP/gRPC em {}: {e}",
+                runtime.config.otlp.grpc_addr
+            ))
+        })?;
+        // Ligar ANTES de `spawn` para que um endereço ocupado seja um erro de
+        // arranque e não um listener que nunca existiu enquanto o operador
+        // julgava que sim.
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| HeraclitusError::Config(format!("OTLP/gRPC em {addr}: {e}")))?;
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        let service = grpc::TraceServiceServer::new(grpc::AgentTraceService::new(runtime.clone()))
+            .max_decoding_message_size(runtime.config.limits.max_body_bytes.max(1024));
+        let sd = shutdown.clone();
+        handles.push(tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming_shutdown(incoming, wait_for(sd))
+                .await;
+        }));
+        tracing::info!(%addr, "OTLP/gRPC a receber traces");
     }
 
     if runtime.config.enabled && runtime.config.console.enabled {

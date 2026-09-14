@@ -21,7 +21,10 @@ Implementa as SPEC-0074, SPEC-0075 e SPEC-0076.
 - **`crates/heraclitus-agent`** — o modelo canónico `AgentEvidenceV1` com 17
   tipos de evento, codec manual com separação de domínio, e um hash lógico que
   não depende do `serde`, do layout do Rust nem da arquitectura da CPU.
-- **Ingestão OpenTelemetry** em `POST /v1/traces` (`:4318`), protobuf e JSON,
+- **Ingestão OpenTelemetry** em `POST /v1/traces` (`:4318`, protobuf e JSON) e
+  em gRPC (`:4317`, `TraceService/Export`). Os dois transportes descem à mesma
+  normalização: o mesmo lote pelos dois produz evidência idêntica e o segundo é
+  deduplicado.
   com as GenAI Semantic Conventions mapeadas para campos tipados. Um span sem
   marca GenAI é ignorado — o tracing HTTP normal da aplicação não entra no
   histórico de evidência, e o produto não se ingere a si próprio.
@@ -104,12 +107,9 @@ Implementa as SPEC-0074, SPEC-0075 e SPEC-0076.
 
 ## Compatibilidade e limitações
 
-- **OTLP/gRPC não está incluído.** Esta versão serve OTLP/HTTP (protobuf e
-  JSON). A SPEC-0074 §30 permite o adiamento desde que documentado; está em
-  `docs/agent/otel.md`. Efeito prático para a maioria das instalações: nenhum —
-  `OTEL_EXPORTER_OTLP_ENDPOINT=http://host:4318` usa `http/protobuf` por
-  omissão. Quem tiver o exporter fixado em gRPC define
-  `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf`.
+- **OTLP/gRPC está desligado por omissão**, não em falta. O exporter OTel
+  apontado a `http://host:4318` usa `http/protobuf`; quem tiver o exporter
+  fixado em gRPC preenche `[agent_black_box.otlp] grpc_addr`.
 - **O plano de agentes está ligado na compilação e desligado na configuração.**
   `HERACLITUS_AGENT_ENABLED=0` é o default da imagem: um servidor não abre
   listeners que ninguém pediu.

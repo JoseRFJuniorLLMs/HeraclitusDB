@@ -58,9 +58,12 @@ impl Default for AgentBlackBoxConfig {
 #[serde(default)]
 pub struct OtlpConfig {
     pub http_addr: String,
-    /// SPEC-0074 §30 permite adiar o OTLP/gRPC para a 0074.1 desde que o
-    /// adiamento esteja documentado. Está: `docs/agent/otel.md`. Quando este
-    /// campo estiver preenchido e o suporte existir, o servidor escuta aqui.
+    /// OTLP/gRPC (`opentelemetry.proto.collector.trace.v1.TraceService`).
+    ///
+    /// Vazio por omissão, e isso não é uma lacuna: o exporter OpenTelemetry
+    /// apontado a `http://host:4318` usa `http/protobuf`, que o `http_addr`
+    /// já serve. Este endereço existe para quem tem o exporter fixado em gRPC
+    /// — e os dois transportes descem à MESMA normalização.
     pub grpc_addr: String,
 }
 

@@ -211,17 +211,15 @@ pub fn run(
     });
 
     checks.push(if config.otlp.grpc_addr.is_empty() {
-        // §30 permite adiar o gRPC desde que o adiamento esteja documentado.
+        // Não é falha: o default do exporter OTel para
+        // `OTEL_EXPORTER_OTLP_ENDPOINT=http://host:4318` é `http/protobuf`.
+        // Quem tiver o exporter fixado em gRPC precisa deste endereço.
         Check::skipped(
             "OTLP/gRPC",
-            "não configurado (adiado para 0074.1; ver docs/agent/otel.md)",
+            "não configurado (o HTTP cobre o default do exporter OTel)",
         )
     } else {
-        Check::warn(
-            "OTLP/gRPC",
-            format!("`{}` está configurado", config.otlp.grpc_addr),
-            "esta versão serve OTLP/HTTP; aponte o exporter a `otlp.http_addr` (ver docs/agent/otel.md)",
-        )
+        Check::ok("OTLP/gRPC", format!("gRPC em {}", config.otlp.grpc_addr))
     });
 
     checks.push(if config.console.enabled {

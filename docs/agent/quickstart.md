@@ -36,6 +36,7 @@ docker compose up -d
 |---|---|
 | 8080 | Consola + API de evidência |
 | 4318 | OTLP/HTTP |
+| 4317 | OTLP/gRPC (opcional, desligado por omissão) |
 | 8787 | proxy MCP (opcional, desligado por omissão) |
 
 Confirme:

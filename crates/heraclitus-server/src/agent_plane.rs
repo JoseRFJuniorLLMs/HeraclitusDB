@@ -90,6 +90,9 @@ impl AgentPlane {
         if let Ok(v) = std::env::var("HERACLITUS_AGENT_OTLP_HTTP_ADDR") {
             self.black_box.otlp.http_addr = v;
         }
+        if let Ok(v) = std::env::var("HERACLITUS_AGENT_OTLP_GRPC_ADDR") {
+            self.black_box.otlp.grpc_addr = v;
+        }
         if let Ok(v) = std::env::var("HERACLITUS_AGENT_CONSOLE_ADDR") {
             self.black_box.console.addr = v;
         }
@@ -229,6 +232,7 @@ capture_mode = "metadata_only"
 
 [agent_black_box.otlp]
 http_addr = "0.0.0.0:4318"
+grpc_addr = "0.0.0.0:4317"
 
 [agent_gateway]
 enabled = true
@@ -240,6 +244,7 @@ upstream_url = "http://mcp:9000"
         let plane = AgentPlane::load(Some(&p)).unwrap();
         assert!(plane.black_box.enabled);
         assert_eq!(plane.black_box.otlp.http_addr, "0.0.0.0:4318");
+        assert_eq!(plane.black_box.otlp.grpc_addr, "0.0.0.0:4317");
         assert_eq!(plane.gateway.mode, GatewayMode::Shadow);
         assert_eq!(plane.gateway.upstream_url, "http://mcp:9000");
     }

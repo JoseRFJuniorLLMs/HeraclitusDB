@@ -3069,6 +3069,7 @@ dependencies = [
  "heraclitus-agent",
  "heraclitus-core",
  "heraclitus-log",
+ "http",
  "http-body-util",
  "hyper",
  "hyper-rustls",
@@ -3081,6 +3082,9 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
  "tracing",
  "ulid",
 ]

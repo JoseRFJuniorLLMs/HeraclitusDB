@@ -133,24 +133,42 @@ lote aparecem em `partialSuccess.rejectedSpans`, que é o que o protocolo OTLP
 define para "aceitei uma parte" — e o que faz o exporter parar de retransmitir o
 lote inteiro.
 
-## OTLP/gRPC — adiado para 0074.1
+## OTLP/gRPC
 
-Esta versão serve **OTLP/HTTP** (protobuf e JSON). O transporte gRPC está
-adiado, e a SPEC-0074 §30 permite-o explicitamente desde que o adiamento esteja
-documentado. Está aqui.
+Serve `opentelemetry.proto.collector.trace.v1.TraceService/Export`:
 
-Consequência prática: **nenhuma**, para a esmagadora maioria das instalações. O
-default do exporter OpenTelemetry quando se define
-`OTEL_EXPORTER_OTLP_ENDPOINT=http://host:4318` é `http/protobuf`, que é
-exactamente o que serve. Quem tiver o exporter fixado em gRPC muda uma variável:
-
-```bash
-export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+```toml
+[agent_black_box.otlp]
+http_addr = "0.0.0.0:4318"
+grpc_addr = "0.0.0.0:4317"
 ```
 
-O `heraclitus agent doctor` avisa se `otlp.grpc_addr` estiver configurado, para
-que ninguém fique à espera de um listener que não existe.
+```bash
+export OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+```
+
+Vazio por omissão, e isso não é uma lacuna: o exporter OpenTelemetry apontado a
+`http://host:4318` usa `http/protobuf`, que o `http_addr` já serve. O gRPC
+existe para quem tem o exporter fixado nesse transporte.
+
+### Um transporte, uma normalização
+
+Os dois caminhos descem ao **mesmo** normalizador, ao mesmo portão de
+privacidade e à mesma deduplicação. Consequências práticas:
+
+- o mesmo lote enviado por gRPC e por HTTP produz evidência idêntica byte a
+  byte;
+- o segundo é **deduplicado** — apontar metade da frota a cada transporte não
+  duplica a história;
+- o tecto de `max_body_bytes` aplica-se aos dois (no gRPC como
+  `max_decoding_message_size`, em vez do default de 4 MiB do tonic).
+
+As três afirmações têm teste: `cargo test -p heraclitus-agent-gateway --test otlp_grpc`.
+
+Um método que não servimos (por exemplo `MetricsService/Export`) responde
+`Unimplemented`, que é o que o protocolo manda — e não um erro de transporte
+que o exporter interpretaria como falha de rede.
 
 ## Métricas e logs
 

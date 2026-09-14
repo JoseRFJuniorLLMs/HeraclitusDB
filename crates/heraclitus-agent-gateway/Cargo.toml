@@ -14,6 +14,13 @@ heraclitus-agent = { workspace = true }
 heraclitus-core = { workspace = true }
 heraclitus-log = { workspace = true }
 axum = { workspace = true }
+# OTLP/gRPC (SPEC-0074 §12). O `tonic` já é o transporte gRPC do servidor; o
+# `tonic-prost` dá o codec sobre as mensagens prost que o caminho HTTP já usa —
+# uma só definição das mensagens, dois transportes.
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+http = "1"
+tokio-stream = { workspace = true, features = ["net"] }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -38,3 +45,4 @@ tempfile = { workspace = true }
 # Só para o teste que prova que o caminho protobuf e o caminho JSON produzem a
 # mesma evidência: o teste precisa de CODIFICAR um lote.
 prost = { workspace = true }
+http = "1"

@@ -28,6 +28,9 @@ services:
       # descubra por acidente que estava a guardar prompts.
       HERACLITUS_AGENT_CAPTURE_MODE: "metadata_only"
       HERACLITUS_AGENT_OTLP_HTTP_ADDR: "0.0.0.0:4318"
+      # gRPC fica desligado por omissão: o exporter OTel apontado à :4318 usa
+      # `http/protobuf`. Ligue-o se tiver o exporter fixado em gRPC.
+      # HERACLITUS_AGENT_OTLP_GRPC_ADDR: "0.0.0.0:4317"
       HERACLITUS_AGENT_CONSOLE_ADDR: "0.0.0.0:8080"
 
       # ── O motor ─────────────────────────────────────────────────────────
@@ -46,6 +49,7 @@ services:
     ports:
       - "8080:8080"   # Consola + API de evidência
       - "4318:4318"   # OTLP/HTTP
+      # - "4317:4317" # OTLP/gRPC, quando ligado acima
       # - "8787:8787" # proxy MCP, quando o gateway estiver ligado
     volumes:
       - heraclitus-data:/var/lib/heraclitus
