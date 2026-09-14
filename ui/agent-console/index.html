@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Heraclitus Agent Black Box</title>
+<link rel="stylesheet" href="/console.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>◼</text></svg>">
+</head>
+<body>
+<div id="dev-banner" class="banner banner-dev" hidden>
+  <strong>DEVELOPMENT PROFILE</strong>
+  &mdash; no authentication is configured. Anyone who can reach this port has full access.
+  Configure OIDC before using this outside a laptop.
+</div>
+<div id="integrity-banner" class="banner banner-broken" hidden></div>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="mark">◼</span>
+    <span class="name">Heraclitus <strong>Agent Black Box</strong></span>
+  </div>
+  <nav id="nav">
+    <a href="#/runs" data-route="runs">Runs</a>
+    <a href="#/approvals" data-route="approvals" class="hidden-when-no-gateway">Approvals <span id="pending-badge" class="badge" hidden>0</span></a>
+    <a href="#/policies" data-route="policies" class="hidden-when-no-gateway">Policies</a>
+    <a href="#/settings" data-route="settings">Settings</a>
+  </nav>
+  <div class="status">
+    <span id="integrity-chip" class="chip chip-unknown">&mdash;</span>
+  </div>
+</header>
+
+<main id="view"><p class="muted">Loading&hellip;</p></main>
+
+<footer>
+  <span id="footer-engine" class="muted"></span>
+  <span class="muted"> &middot; evidence is append-only and verifiable offline &middot; </span>
+  <a href="#/settings">privacy settings</a>
+</footer>
+
+<script src="/console.js"></script>
+</body>
+</html>

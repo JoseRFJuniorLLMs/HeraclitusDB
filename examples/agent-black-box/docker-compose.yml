@@ -1,0 +1,64 @@
+# Heraclitus Agent Black Box — quickstart (SPEC-0076 §20)
+#
+#   docker compose up -d
+#   python sample-python-agent/sample.py
+#   open http://localhost:8080
+#
+# Gate de produto: menos de cinco minutos até ao primeiro run visível, para
+# alguém que já tem Docker instalado.
+#
+# Um serviço, um volume. Não há base de dados à parte, não há broker, não há
+# coletor de telemetria intermédio: o Heraclitus É o coletor.
+
+services:
+  heraclitus:
+    # Para usar uma imagem publicada em vez de construir:
+    #   image: ghcr.io/joserfjuniorllms/heraclitus:2.0.0
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: heraclitus-agent-black-box:local
+    container_name: heraclitus-agent-black-box
+    restart: unless-stopped
+    environment:
+      # ── O produto ───────────────────────────────────────────────────────
+      HERACLITUS_AGENT_ENABLED: "1"
+      HERACLITUS_AGENT_TENANT: "default"
+      # METADATA_ONLY é o default e fica explícito aqui para que ninguém
+      # descubra por acidente que estava a guardar prompts.
+      HERACLITUS_AGENT_CAPTURE_MODE: "metadata_only"
+      HERACLITUS_AGENT_OTLP_HTTP_ADDR: "0.0.0.0:4318"
+      HERACLITUS_AGENT_CONSOLE_ADDR: "0.0.0.0:8080"
+
+      # ── O motor ─────────────────────────────────────────────────────────
+      HERACLITUS_DATA_DIR: "/var/lib/heraclitus"
+      HERACLITUS_GRPC_ADDR: "127.0.0.1:7474"
+      HERACLITUS_REST_ADDR: "127.0.0.1:7475"
+      # Segmentos pequenos: selam depressa, e é a selagem que torna a
+      # evidência PROVÁVEL. Num quickstart, esperar meia hora pela primeira
+      # prova de Merkle seria o mesmo que não ter prova nenhuma.
+      HERACLITUS_SEGMENT_MAX_BYTES: "262144"
+
+      # ── Policy Gateway (SPEC-0075) ──────────────────────────────────────
+      # Desligado neste quickstart: a primeira coisa a fazer é VER o que o
+      # agente faz. Controlar vem a seguir — ver o README.
+      HERACLITUS_AGENT_GATEWAY_ENABLED: "0"
+    ports:
+      - "8080:8080"   # Consola + API de evidência
+      - "4318:4318"   # OTLP/HTTP
+      # - "8787:8787" # proxy MCP, quando o gateway estiver ligado
+    volumes:
+      - heraclitus-data:/var/lib/heraclitus
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/v1/agent/status"]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 6
+    # O log append-only é a verdade: um SIGKILL a meio de um append tem de
+    # encontrar o processo pronto para o suportar, mas dar-lhe tempo para
+    # fechar é melhor do que confiar na recuperação.
+    stop_grace_period: 30s
+
+volumes:
+  heraclitus-data:

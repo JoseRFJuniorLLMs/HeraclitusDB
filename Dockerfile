@@ -4,8 +4,16 @@
 # tinha Docker. Trate a primeira construção como parte da revisão, não como uma
 # formalidade. O modo de falha é ruidoso (a build pára), não silencioso.
 #
-#   docker build -t heraclitus:1.0.5 .
-#   docker run --rm -p 7474:7474 -p 7475:7475 -v heraclitus-data:/var/lib/heraclitus heraclitus:1.0.5
+#   docker build -t heraclitus:2.0.0 .
+#   docker run --rm -p 7474:7474 -p 7475:7475 -v heraclitus-data:/var/lib/heraclitus heraclitus:2.0.0
+#
+# Agent Black Box (SPEC-0074/0075/0076), o produto por omissão:
+#
+#   docker run --rm -e HERACLITUS_AGENT_ENABLED=1 \
+#     -p 8080:8080 -p 4318:4318 \
+#     -v heraclitus-data:/var/lib/heraclitus heraclitus:2.0.0
+#
+#   Consola em http://localhost:8080, OTLP em http://localhost:4318
 #
 # Features: a imagem constrói o conjunto POR OMISSÃO de propósito. `analytics`,
 # `tier*` e `gpu` puxam dependências pesadas (DataFusion, arrow/parquet, wgpu) e
@@ -75,9 +83,24 @@ VOLUME ["/var/lib/heraclitus"]
 ENV HERACLITUS_DATA_DIR=/var/lib/heraclitus \
     HERACLITUS_LOG_DIR=/var/log/heraclitus \
     HERACLITUS_GRPC_ADDR=0.0.0.0:7474 \
-    HERACLITUS_REST_ADDR=0.0.0.0:7475
+    HERACLITUS_REST_ADDR=0.0.0.0:7475 \
+    HERACLITUS_AGENT_ENABLED=0 \
+    HERACLITUS_AGENT_CAPTURE_MODE=metadata_only \
+    HERACLITUS_AGENT_OTLP_HTTP_ADDR=0.0.0.0:4318 \
+    HERACLITUS_AGENT_CONSOLE_ADDR=0.0.0.0:8080
 
-EXPOSE 7474 7475
+# SPEC-0076 §14 — as portas do produto de agentes:
+#   8080  Consola + API de evidência
+#   4318  OTLP/HTTP
+#   8787  proxy MCP (opcional)
+# As históricas (7474 gRPC, 7475 REST de administração) continuam onde estavam;
+# simplesmente não lideram o quickstart.
+#
+# `HERACLITUS_AGENT_ENABLED=0` por omissão é deliberado: uma imagem que abre
+# dois listeners novos sem ninguém os pedir é uma superfície de rede que o
+# operador não escolheu. O `docker compose` de `examples/agent-black-box`
+# liga-o explicitamente.
+EXPOSE 7474 7475 8080 4318 8787
 
 # `/healthz` e não `/stats`: o `/stats` percorre o manifesto e toma os locks dos
 # índices, e uma sonda de saúde nunca deve depender de trabalho pesado. (Ver o

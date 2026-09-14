@@ -22,6 +22,11 @@ heraclitus-compliance = { workspace = true }
 heraclitus-crypto = { workspace = true }
 heraclitus-log = { workspace = true }
 heraclitus-sentinel = { workspace = true }
+# SPEC-0074/0075/0076 — o plano de evidência de agentes. Opcional na
+# compilação, ligado por omissão: é o produto default (0076 §17), mas
+# `--no-default-features` continua a dar o servidor sem ele.
+heraclitus-agent = { workspace = true, optional = true }
+heraclitus-agent-gateway = { workspace = true, optional = true }
 heraclitus-platform = { workspace = true }
 heraclitus-case = { workspace = true }
 heraclitus-content = { workspace = true }
@@ -52,8 +57,13 @@ serde_json = { workspace = true }
 blake3 = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+toml = { workspace = true }
 
 [features]
+# O Agent Black Box faz parte do produto default (SPEC-0076 §17). A feature
+# existe para quem embebe o motor sem ele, não para o esconder.
+default = ["agent"]
+agent = ["dep:heraclitus-agent", "dep:heraclitus-agent-gateway"]
 # Real wgpu dispatch for exact RECALL (M20.3.1): forwards down the chain
 # server -> index-vector -> heraclitus-gpu. Validated on hardware by the
 # self-checks `gpu_matches_cpu_on_hardware` / `product_gpu_matches_cpu_on_hardware`

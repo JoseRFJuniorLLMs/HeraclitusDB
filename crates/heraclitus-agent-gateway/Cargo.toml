@@ -1,0 +1,40 @@
+[package]
+name = "heraclitus-agent-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SPEC-0074/0075/0076 — superfícies de rede do Agent Black Box: ingestão OTLP, proxy MCP com policy, API de evidência e a Consola"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+heraclitus-agent = { workspace = true }
+heraclitus-core = { workspace = true }
+heraclitus-log = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }
+# Cliente HTTP para o upstream do proxy MCP. `hyper`/`hyper-util`/`http-body-util`
+# já vêm com o axum e o tonic; `hyper-rustls` com `native-tokio` acrescenta só o
+# conector TLS e as âncoras do sistema. Não entra nenhum runtime HTTP novo.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "ring"] }
+# O fornecedor criptográfico é declarado À MÃO em `upstream::tls_config` — ver
+# o comentário lá. `ring` é o mesmo que o tonic já traz (`tls-ring`), portanto
+# não entra uma segunda implementação de TLS na imagem.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# Só para o teste que prova que o caminho protobuf e o caminho JSON produzem a
+# mesma evidência: o teste precisa de CODIFICAR um lote.
+prost = { workspace = true }

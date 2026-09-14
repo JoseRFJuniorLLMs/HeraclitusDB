@@ -1,4 +1,5 @@
-//! heraclitus-cli — admin & inspection (§3.14) + the M7 QPS×recall harness.
+pub mod agent;
+pub mod top;
 
 use heraclitus_core::{EventId, FsyncPolicy, HeraclitusConfig, ProductPoint};
 use heraclitus_crypto::KeyStore;

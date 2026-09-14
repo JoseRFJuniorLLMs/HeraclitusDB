@@ -1,0 +1,36 @@
+[package]
+name = "heraclitus-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SPEC-0074/0075 — Agent Black Box: canonical agent evidence, redaction, evidence bundles, offline verification and the deterministic agent policy engine"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+heraclitus-core = { workspace = true }
+heraclitus-log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+ulid = { workspace = true }
+crc32fast = { workspace = true }
+toml = { workspace = true }
+# OTLP/HTTP chega em protobuf por omissão (é o que o exporter OTel manda para
+# :4318). O `prost` já está na árvore por causa do gRPC; as mensagens OTLP que
+# precisamos são escritas à mão em `otlp/proto.rs` para não puxar geração de
+# código nem os .proto do OpenTelemetry para o build.
+prost = { workspace = true }
+# JWT/OIDC (SPEC-0075 §8): ES256 via p256, RS256 via rsa, HS256 via hmac+sha2.
+# Os três já são dependências da árvore (p256/rsa pelo heraclitus-compliance).
+sha2 = { workspace = true }
+hmac = "0.12"
+p256 = { workspace = true }
+rsa = "0.9"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = { workspace = true }
