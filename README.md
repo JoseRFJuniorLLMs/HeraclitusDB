@@ -1,24 +1,264 @@
 <p align="center">
-  <img src="img/logo.jpg" alt="HeraclitusDB Logo" width="300" />
-</p>
-<p align="center">
-  <img src="img/logo2.jpg" alt="HeraclitusDB Banner" width="600" />
+  <img src="img/logo.jpg" alt="Heraclitus Logo" width="300" />
 </p>
 
-<p align="center"><b>O único banco de dados do mundo imune a fraudes retroativas.</b></p>
-<p align="center"><i>Auditoria governamental, inteligência contra fraudes e agentes de IA operando com 100% de transparência e zero amnésia estrutural.</i></p>
+<h1 align="center">Heraclitus Agent Black Box</h1>
+
+<p align="center"><b>Saiba exactamente o que o seu agente de IA fez.<br>
+Prove quem autorizou. Detecte qualquer alteração posterior no histórico.</b></p>
 
 <p align="center">
   <a href="#️-licença-e-modelo-comercial"><img src="https://img.shields.io/badge/license-BSL%201.1-blue" alt="BSL 1.1"></a>
-  <img src="https://img.shields.io/badge/version-v1.0.5-brightgreen" alt="v1.0.5">
+  <img src="https://img.shields.io/badge/version-v2.0.0-brightgreen" alt="v2.0.0">
   <img src="https://img.shields.io/badge/core-Rust%20stable%202021-orange" alt="Rust stable">
-  <img src="https://img.shields.io/badge/storage-HRKL%20v6%20Canonical-purple" alt="HRKL v6">
-  <img src="https://img.shields.io/badge/security-Sentinel%20L0--L6%20%E2%9C%85-blueviolet" alt="Sentinel L0-L6">
-  <img src="https://img.shields.io/badge/compliance-RFC%203161%20%2B%20ICP--Brasil-blue" alt="RFC 3161 ICP-Brasil">
-  <img src="https://img.shields.io/badge/fast%20boot-28ms-brightgreen" alt="Fast boot 28ms">
-  <img src="https://img.shields.io/badge/scale-20M%20eventos%20validados-success" alt="20M eventos">
-  <img src="https://img.shields.io/badge/recall%4010-0.996-brightgreen" alt="recall@10=0.996">
+  <img src="https://img.shields.io/badge/OpenTelemetry-GenAI%20semconv-blueviolet" alt="OTel GenAI">
+  <img src="https://img.shields.io/badge/MCP-2026--07--28-purple" alt="MCP 2026-07-28">
+  <img src="https://img.shields.io/badge/evidence-tamper--evident-success" alt="tamper-evident">
 </p>
+
+---
+
+## O problema
+
+Um agente de IA escolhe ferramentas, encadeia ferramentas, age em nome de uma
+pessoa, usa credenciais delegadas e altera estado externo. A observabilidade
+tradicional responde a *"o que aconteceu?"*. Uma auditoria precisa de mais:
+
+```text
+quem iniciou?                  qual política estava vigente?
+qual agente executou?          houve aprovação humana?
+em nome de quem?               qual foi o efeito externo?
+qual ferramenta foi chamada?   o histórico foi alterado depois?
+quais argumentos efectivos?    consigo verificar isso offline?
+```
+
+O Heraclitus regista cada execução relevante num histórico append-only
+verificável, liga as tool calls às suas evidências e exporta um pacote que pode
+ser conferido offline — **sem trocar a base de dados ou o framework da
+aplicação**.
+
+---
+
+## Como se parece
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│ Heraclitus Agent Black Box                   ● VERIFIED     │
+├─────────────────────────────────────────────────────────────┤
+│ Runs                                                        │
+│                                                             │
+│ 08:41  procurement-agent   7 tools   1 approval   success   │
+│ 08:37  support-agent       2 tools   0 approval   success   │
+│ 08:31  coding-agent        9 tools   2 denied     failed    │
+└─────────────────────────────────────────────────────────────┘
+
+Run 01J...                          Integrity: VERIFIED
+──────────────────────────────────────────────────────────────
+08:41:02  Run started
+08:41:03  Model invocation: claude-opus-5
+08:41:04  Tool requested: lookup_vendor
+08:41:04  Policy: ALLOW
+08:41:04  Tool result: lookup_vendor
+08:41:07  Tool requested: send_payment
+08:41:07  Policy: REQUIRE_APPROVAL          finance-large
+08:41:19  Approved by finance-cfo
+08:41:20  Tool executing: send_payment
+08:41:21  External effect: payment-84723
+08:41:22  Agent output
+```
+
+---
+
+## Quickstart — cinco minutos
+
+```bash
+git clone https://github.com/JoseRFJuniorLLMs/HeraclitusDB
+cd HeraclitusDB/examples/agent-black-box
+docker compose up -d
+
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+python sample-python-agent/sample.py
+```
+
+Abra <http://localhost:8080>.
+
+Se a sua aplicação já exporta OpenTelemetry, a variável de ambiente é a
+integração inteira. Sem Docker:
+
+```bash
+cargo run --release -p heraclitus-cli -- agent demo ./data
+```
+
+| porta | superfície |
+|---|---|
+| 8080 | Consola + API de evidência |
+| 4318 | OTLP/HTTP |
+| 8787 | proxy MCP (opcional) |
+
+---
+
+## O que é capturado
+
+Um span sem marca GenAI **não** vira evidência de agente — o tracing HTTP normal
+da aplicação não entra no histórico.
+
+| kind | quando |
+|---|---|
+| `RunStarted` / `RunFinished` | o run do agente |
+| `ModelInvocationStarted` / `Finished` | uma chamada ao modelo |
+| `ToolRequested` | o agente pediu a ferramenta |
+| `PolicyEvaluated` | a policy decidiu |
+| `ToolAuthorized` / `ToolDenied` | o gateway autorizou ou recusou |
+| `HumanApprovalRequested` / `Granted` / `Denied` | a decisão humana |
+| `ToolInvocationStarted` / `Finished` | a execução e o resultado |
+| `ExternalEffectObserved` | `payment_id`, `commit_sha`, `ticket_id`… |
+| `ErrorObserved` | falha de transporte ou de protocolo |
+| `AgentOutputProduced`, `ArtifactReferenced` | saída e artefactos |
+
+Cada uma traz identidade do agente, identidade humana, delegação, hashes de
+conteúdo, referência de policy e referência de aprovação. A retransmissão de um
+lote OpenTelemetry **não duplica** a história.
+
+---
+
+## Verificar — e falhar honestamente
+
+```bash
+heraclitus agent export /var/lib/heraclitus --to evidence.zip --run run-abc123
+heraclitus agent verify evidence.zip
+```
+
+```text
+Bundle:           01J...
+Records:          1847
+LSN range:        9981..11827
+File digests:     VALID
+Merkle proofs:    VALID
+Logical roots:    VALID
+Missing records:  0
+Broken parents:   0
+Policy links:     17 VALID (of 17)
+Approvals:        2 VALID (of 2)
+
+VERDICT: VERIFIED
+```
+
+Mude um byte:
+
+```bash
+printf 'X' | dd of=evidence.zip bs=1 seek=900 conv=notrunc
+heraclitus agent verify evidence.zip
+```
+
+```text
+VERDICT: DIGEST_MISMATCH
+```
+
+…e o código de saída passa a 3. O verificador não precisa de rede, de base de
+dados nem do servidor. Sem o binário, os digests continuam conferíveis com
+`unzip` e `sha256sum -c`.
+
+Os quatro estados de integridade são honestos: `VERIFIED`, `PARTIAL`,
+`UNVERIFIED`, `BROKEN`. **"Não verificado" nunca vira "válido".**
+
+---
+
+## Autorizar, não só observar
+
+Ponha o Heraclitus à frente dos seus servidores MCP:
+
+```yaml
+version: "agent-policy-v1"
+defaults:
+  decision: deny
+rules:
+  - id: finance-large
+    match:
+      server: finance
+      tool: send_payment
+      conditions:
+        - field: amount
+          op: gt
+          value: 50000
+    decision: require_approval
+    approval:
+      roles: ["cfo"]
+      ttl_seconds: 180
+```
+
+```text
+observe  ->  shadow  ->  enforce
+```
+
+Comece por `shadow`: a policy é avaliada e registada, e a Consola mostra
+`would deny` — sem bloquear nada. Antes de activar, veja o que teria acontecido:
+
+```bash
+heraclitus agent policy simulate nova.yaml --data-dir /var/lib/heraclitus
+```
+
+```text
+historical tool calls: 18442
+ALLOW:               17912
+DENY:                  183
+REQUIRE_APPROVAL:      347
+changed vs active:      81
+```
+
+**A aprovação está ligada ao conteúdo exacto.** Aprovar
+`send_payment(amount=5000)` e executar `send_payment(amount=5001)` falha com
+`APPROVAL_BINDING_MISMATCH`. A aprovação é de uso único e expira.
+
+---
+
+## Privacidade
+
+Por omissão, `METADATA_ONLY`:
+
+| o quê | estado |
+|---|---|
+| corpos de prompt | **OFF** |
+| corpos de completion | **OFF** |
+| argumentos de ferramenta | metadados + hash canónico |
+| resultados de ferramenta | metadados + hash canónico |
+| `Authorization`, `Cookie`, chaves de API | **nunca persistidos, em modo nenhum** |
+
+A última linha não tem excepção: `FULL_EXPLICIT` autoriza guardar o corpo de uma
+tool call; **não** autoriza guardar o bearer token que a acompanhava.
+
+O produto não promete detectar todo o segredo possível. Por isso o default é não
+guardar o corpo: os detectores de forma conhecida são a segunda linha, não a
+primeira.
+
+---
+
+## Documentação do produto
+
+| ficheiro | assunto |
+|---|---|
+| [`docs/agent/quickstart.md`](docs/agent/quickstart.md) | do zero ao pacote verificado |
+| [`docs/agent/otel.md`](docs/agent/otel.md) | o que é capturado do OpenTelemetry |
+| [`docs/agent/mcp.md`](docs/agent/mcp.md) | captura e gateway MCP |
+| [`docs/agent/privacy.md`](docs/agent/privacy.md) | modos de captura e redacção |
+| [`docs/agent/evidence.md`](docs/agent/evidence.md) | o Evidence Bundle e a verificação |
+| [`docs/agent/policy.md`](docs/agent/policy.md) | a linguagem de policy |
+
+Especificações: [SPEC-0074](docs/md/SPEC-new/SPEC-0074-Agent-Black-Box.md),
+[SPEC-0075](docs/md/SPEC-new/SPEC-0075-Agent-Policy-Gateway.md),
+[SPEC-0076](docs/md/SPEC-new/SPEC-0076-Agent-Evidence-Console.md).
+
+---
+
+## O motor por baixo
+
+O Agent Black Box é a superfície. O motor é o **HeraclitusDB** — um banco de
+dados append-only com raízes de Merkle canónicas, viagem no tempo determinística
+e multi-indexação. Não é preciso entendê-lo para usar o produto; o resto deste
+documento descreve-o, para quem quiser.
+
+A camada **Sentinel** (SOC) continua no repositório e continua a funcionar. Não
+aparece no quickstart, não é a página inicial e não é necessária para o Agent
+Black Box.
 
 ---
 
@@ -96,7 +336,7 @@ Consultas realizam fusão RRF (*Reciprocal Rank Fusion*) combinando HNSW vetoria
 
 ## 🗂️ Arquitetura do Workspace Rust
 
-O ecossistema HeraclitusDB é estruturado em **28 crates principais** organizados por camadas estritas de responsabilidade:
+O ecossistema HeraclitusDB é estruturado em **30 crates principais** organizados por camadas estritas de responsabilidade:
 
 ```
 heraclitus-core          ← Tipos fundamentais: Episode, Fact, ProductPoint, HLC, LSN, EBR, VM ISA
@@ -121,6 +361,8 @@ heraclitus-query         ← Parser pest (GQL/Cypher), query planner lock-free A
 heraclitus-txn           ← Transações e isolamento MVCC: Snapshot por LSN, compare_and_append CAS
 heraclitus-raft          ← Replicação distribuída de log com OpenRaft 0.9 e tolerância a partições
 heraclitus-proto         ← Interfaces Protobuf e gRPC (Tonic / Prost)
+heraclitus-agent         ← Agent Black Box: evidência canónica, redacção, policy, bundle e verificação offline
+heraclitus-agent-gateway ← Superfícies do produto: ingestão OTLP (:4318), proxy MCP (:8787), API e Consola (:8080)
 heraclitus-server        ← Servidor gRPC (:7474), REST (:7475), boot narrado e métricas operacionais
 heraclitus-client        ← Cliente nativo em Rust para gRPC
 heraclitus-cli           ← CLI executável: inspect, verify, verify-receipts, anchor, prove, query, bench

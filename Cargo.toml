@@ -27,6 +27,8 @@ members = [
     "sim/heraclitus-sim",
     "tools/heraclitus-ingestor",
     "tools/heraclitus-qualifier",
+    "crates/heraclitus-agent",
+    "crates/heraclitus-agent-gateway",
     "crates/heraclitus-sentinel",
     "crates/heraclitus-case",
     "crates/heraclitus-content",
@@ -50,7 +52,7 @@ members = [
 exclude = ["sdk/python-embedded", "fuzz"]
 
 [workspace.package]
-version = "1.0.6-rc.1"
+version = "2.0.0"
 edition = "2021"
 license = "BUSL-1.1"
 repository = "https://github.com/JoseRFJuniorLLMs/HeraclitusDB"
@@ -81,6 +83,8 @@ heraclitus-client = { path = "crates/heraclitus-client" }
 heraclitus-analytics = { path = "crates/heraclitus-analytics" }
 heraclitus-raft = { path = "crates/heraclitus-raft" }
 heraclitus-server = { path = "crates/heraclitus-server" }
+heraclitus-agent = { path = "crates/heraclitus-agent" }
+heraclitus-agent-gateway = { path = "crates/heraclitus-agent-gateway" }
 heraclitus-sentinel = { path = "crates/heraclitus-sentinel" }
 heraclitus-platform = { path = "crates/heraclitus-platform" }
 heraclitus-case = { path = "crates/heraclitus-case" }
@@ -144,6 +148,9 @@ p256 = { version = "0.13", features = ["ecdsa"] }
 anyhow = "1.0.103"
 csv = "1"
 encoding_rs = "0.8"
+ratatui = "0.29"
+crossterm = "0.28"
+sysinfo = "0.31"
 
 [profile.release]
 lto = "thin"

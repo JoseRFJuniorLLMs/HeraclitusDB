@@ -43,6 +43,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
     let config_path = std::env::args().nth(1).map(std::path::PathBuf::from);
     let config = HeraclitusConfig::load(config_path.as_deref())?;
-    heraclitus_server::serve(config, heraclitus_platform::wait_for_shutdown_signal()).await?;
-    Ok(())
+    // SPEC-0074 §22 — `[agent_black_box]` e `[agent_gateway]` vivem no mesmo
+    // ficheiro, mas são lidos com os tipos do `heraclitus-agent` (ver o
+    // cabeçalho de `agent_plane` para a razão de não estarem no core).
+    #[cfg(feature = "agent")]
+    {
+        let plane = heraclitus_server::agent_plane::AgentPlane::load(config_path.as_deref())?;
+        heraclitus_server::serve_with_agent_plane(
+            config,
+            plane,
+            heraclitus_platform::wait_for_shutdown_signal(),
+        )
+        .await?;
+        return Ok(());
+    }
+    #[cfg(not(feature = "agent"))]
+    {
+        heraclitus_server::serve(config, heraclitus_platform::wait_for_shutdown_signal()).await?;
+        Ok(())
+    }
 }

@@ -1,6 +1,8 @@
 //! heraclitus-server — gRPC (tonic) + minimal REST (axum), §3.14.
 //! The server composes; the storage knows nothing about HTTP or LLMs.
 
+#[cfg(feature = "agent")]
+pub mod agent_plane; // SPEC-0074/0075/0076: o plano de evidência de agentes
 mod auth;
 pub mod boot;
 #[cfg(feature = "replication")]
@@ -34,12 +36,45 @@ pub async fn serve(
     serve_with(config, shutdown, Boot::auto()).await
 }
 
+/// Como [`serve`], mas com o plano de evidência de agentes já lido do mesmo
+/// ficheiro de configuração (SPEC-0074 §22).
+///
+/// O binário do servidor usa esta entrada porque é ele que conhece o caminho do
+/// TOML; quem embebe o motor e não quer o plano de agentes continua a usar
+/// [`serve`], que o lê só do ambiente (e portanto, por omissão, desligado).
+#[cfg(feature = "agent")]
+#[allow(clippy::result_large_err)]
+pub async fn serve_with_agent_plane(
+    config: HeraclitusConfig,
+    plane: agent_plane::AgentPlane,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), HeraclitusError> {
+    serve_inner(config, Some(plane), shutdown, Boot::auto()).await
+}
+
 /// Like [`serve`], but with an explicit boot narrator. `serve` uses
 /// [`Boot::auto`] (a pretty console boot on a TTY, plain `tracing` otherwise);
 /// pass [`Boot::silent`] to suppress the startup narration entirely.
 #[allow(clippy::result_large_err)]
 pub async fn serve_with(
     config: HeraclitusConfig,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    boot: Boot,
+) -> Result<(), HeraclitusError> {
+    #[cfg(feature = "agent")]
+    {
+        serve_inner(config, None, shutdown, boot).await
+    }
+    #[cfg(not(feature = "agent"))]
+    {
+        serve_inner(config, shutdown, boot).await
+    }
+}
+
+#[allow(clippy::result_large_err)]
+async fn serve_inner(
+    config: HeraclitusConfig,
+    #[cfg(feature = "agent")] agent: Option<agent_plane::AgentPlane>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     boot: Boot,
 ) -> Result<(), HeraclitusError> {
@@ -67,6 +102,50 @@ pub async fn serve_with(
     );
 
     let engine = Arc::new(Engine::open_with_boot(&config, &boot)?);
+
+    // SPEC-0074/0075/0076 — o plano de evidência de agentes.
+    //
+    // Sobe DEPOIS do motor (precisa do log) e ANTES do gRPC: se o operador
+    // configurou o gateway em `enforce`, um servidor que aceitasse tráfego
+    // antes de o proxy estar de pé seria uma janela em que nada é imposto.
+    #[cfg(feature = "agent")]
+    let (agent_stop, agent_services) = {
+        let plane = match agent {
+            Some(p) => p,
+            None => agent_plane::AgentPlane::load(None)?,
+        };
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        if plane.enabled() {
+            plane.validate(&config)?;
+            let runtime = agent_plane::build_runtime(engine.clone(), &plane, &config.data_dir)?;
+            let services = heraclitus_agent_gateway::spawn(runtime, rx).await?;
+            boot.ok_line(
+                "Agent Black Box",
+                &format!(
+                    "captura {} · OTLP {} · consola {} · gateway {}",
+                    plane.black_box.capture_mode,
+                    if plane.black_box.otlp.http_addr.is_empty() {
+                        "off".to_string()
+                    } else {
+                        plane.black_box.otlp.http_addr.clone()
+                    },
+                    if plane.black_box.console.enabled {
+                        plane.black_box.console.addr.clone()
+                    } else {
+                        "off".to_string()
+                    },
+                    if plane.gateway.enabled {
+                        plane.gateway.mode.label()
+                    } else {
+                        "off"
+                    }
+                ),
+            );
+            (tx, Some(services))
+        } else {
+            (tx, None)
+        }
+    };
 
     // SPEC-015/021 — replicação por consenso Raft (opt-in). Quando configurada,
     // o nó junta-se/forma o cluster e as escritas passam a ir pelo líder.
@@ -1078,6 +1157,24 @@ pub async fn serve_with(
         .serve_with_shutdown(grpc_addr, shutdown)
         .await
         .map_err(|e| HeraclitusError::Config(format!("grpc serve: {e}")))?;
+    #[cfg(feature = "agent")]
+    {
+        // Sinalizar a paragem ANTES de abortar: as superfícies do agente têm
+        // shutdown gracioso, e abortá-las cortaria um append de evidência a
+        // meio. O `abort` a seguir é só a rede para quem não desligou.
+        let _ = agent_stop.send(true);
+        if let Some(services) = &agent_services {
+            for h in &services.handles {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while !h.is_finished() {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                })
+                .await;
+            }
+            services.abort_all();
+        }
+    }
     rest_task.abort();
     if let Some(t) = compliance_task {
         t.abort();

@@ -204,6 +204,121 @@ enum Cmd {
         #[arg(long)]
         policy_oid: Option<String>,
     },
+    /// SPEC-0074/0075/0076 — Heraclitus Agent Black Box: evidência de agentes,
+    /// pacotes periciais e verificação offline.
+    ///
+    /// `heraclitus agent verify` é o comando que uma perícia corre sobre um
+    /// Evidence Bundle: sem rede, sem base de dados, sem servidor.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCmd,
+    },
+    /// Monitor HeraclitusDB in real-time (inserts/sec, memory, disk, services) with RedHat/Fedora style badges.
+    Top {
+        /// REST API endpoint URL.
+        #[arg(long, default_value = "http://127.0.0.1:7475")]
+        url: String,
+        /// Username for Basic Auth.
+        #[arg(long, default_value = "admin")]
+        user: String,
+        /// Password for Basic Auth.
+        #[arg(long, default_value = "debian23")]
+        pass: String,
+        /// Refresh interval in seconds.
+        #[arg(long, default_value_t = 1.0)]
+        interval: f64,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentCmd {
+    /// Verifica um Evidence Bundle offline (SPEC-0074 §18).
+    ///
+    /// Códigos de saída: 0 VERIFIED, 2 INVALID_BUNDLE, 3 DIGEST_MISMATCH,
+    /// 4 PROOF_FAILURE, 5 UNSUPPORTED_VERSION, 6 INCOMPLETE_SELECTION,
+    /// 7 ATTESTATION_FAILURE.
+    Verify {
+        /// O ficheiro `.zip` do bundle.
+        bundle: PathBuf,
+        /// Saída para automação.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mostra o conteúdo de um bundle sem o verificar.
+    Inspect { bundle: PathBuf },
+    /// Exporta um Evidence Bundle a partir de um directório de dados.
+    ///
+    /// ATENÇÃO: abre o log directamente. Não aponte para o directório de um
+    /// servidor A CORRER — o HRKL não tem trinco entre processos, e dois
+    /// escritores no mesmo directório partem-no. Com o servidor de pé, use
+    /// `POST /api/v1/agent/evidence/export`, que exporta pelo processo que já
+    /// tem o log aberto.
+    Export {
+        /// Directório de dados (ou o directório do log).
+        data_dir: PathBuf,
+        /// Ficheiro `.zip` de destino.
+        #[arg(long)]
+        to: PathBuf,
+        /// Exportar só este run.
+        #[arg(long)]
+        run: Option<String>,
+        /// Janela de tempo, em nanos Unix.
+        #[arg(long)]
+        from: Option<u64>,
+        #[arg(long = "until")]
+        until: Option<u64>,
+        #[arg(long, default_value = "default")]
+        tenant: String,
+    },
+    /// Cria um run de demonstração completo, sem chave de API nem rede.
+    ///
+    /// ESCREVE no directório indicado. Não aponte para o directório de um
+    /// servidor A CORRER: o HRKL não tem trinco entre processos. Para ver o
+    /// demo com o servidor de pé, use antes o agente de exemplo
+    /// (`examples/agent-black-box/sample-python-agent/sample.py`), que fala
+    /// OTLP em vez de abrir o log.
+    Demo {
+        #[arg(default_value = "./data")]
+        data_dir: PathBuf,
+        /// URL da Consola, só para imprimir a ligação.
+        #[arg(long, default_value = "http://localhost:8080")]
+        console: String,
+    },
+    /// Diagnóstico orientado a acção (SPEC-0076 §23).
+    Doctor {
+        #[arg(default_value = "./data")]
+        data_dir: PathBuf,
+        /// Ficheiro TOML com `[agent_black_box]` e `[agent_gateway]`.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Valida e simula documentos de policy (SPEC-0075 §22–§23).
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum PolicyCmd {
+    /// Lê e valida um documento `agent-policy-v1`, sem activar nada.
+    Validate { file: PathBuf },
+    /// Reavalia o histórico já registado com uma policy candidata.
+    Simulate {
+        file: PathBuf,
+        #[arg(long, default_value = "./data")]
+        data_dir: PathBuf,
+        /// A policy activa contra a qual comparar. Sem ela, compara contra o
+        /// default do produto (negar tudo).
+        #[arg(long)]
+        active: Option<PathBuf>,
+        #[arg(long)]
+        from: Option<u64>,
+        #[arg(long = "until")]
+        until: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -218,6 +333,42 @@ enum ManifestCmd {
     Show { dir: PathBuf },
 }
 
+/// Encaminha `heraclitus agent ...` e devolve `(saída, código de saída)`.
+fn run_agent(command: AgentCmd) -> Result<(String, i32), String> {
+    use heraclitus_cli::agent;
+    Ok(match command {
+        AgentCmd::Verify { bundle, json } => agent::verify(&bundle, json),
+        AgentCmd::Inspect { bundle } => (agent::inspect(&bundle)?, 0),
+        AgentCmd::Export {
+            data_dir,
+            to,
+            run,
+            from,
+            until,
+            tenant,
+        } => (agent::export(&data_dir, &to, run, from, until, &tenant)?, 0),
+        AgentCmd::Demo { data_dir, console } => (agent::run_demo(&data_dir, &console)?, 0),
+        AgentCmd::Doctor {
+            data_dir,
+            config,
+            json,
+        } => agent::doctor(&data_dir, config.as_deref(), json)?,
+        AgentCmd::Policy { command } => match command {
+            PolicyCmd::Validate { file } => (agent::policy_validate(&file)?, 0),
+            PolicyCmd::Simulate {
+                file,
+                data_dir,
+                active,
+                from,
+                until,
+            } => (
+                agent::policy_simulate(&file, &data_dir, active.as_deref(), from, until)?,
+                0,
+            ),
+        },
+    })
+}
+
 fn receipts_dir_for(dir: &std::path::Path, receipts: Option<PathBuf>) -> PathBuf {
     receipts.unwrap_or_else(|| {
         dir.parent()
@@ -228,6 +379,22 @@ fn receipts_dir_for(dir: &std::path::Path, receipts: Option<PathBuf>) -> PathBuf
 
 fn main() {
     let cli = Cli::parse();
+    // `heraclitus agent` precisa de mais códigos de saída do que 0/1 — os de
+    // §18 são contrato para scripts periciais — e por isso sai antes do mapa
+    // geral, que colapsa tudo em 1.
+    let cmd = match cli.cmd {
+        Cmd::Agent { command } => {
+            let (saida, codigo) = run_agent(command).unwrap_or_else(|e| (e, 1));
+            if codigo == 0 {
+                println!("{saida}");
+            } else {
+                eprintln!("{saida}");
+            }
+            std::process::exit(codigo);
+        }
+        outro => outro,
+    };
+    let cli = Cli { cmd };
     // Uma falha de integridade (verify/verify-receipts) ou qualquer erro TEM de
     // devolver código de saída 1 — scripts forenses gateiam com `&&`/`||`.
     let result: Result<String, String> = match cli.cmd {
@@ -331,6 +498,14 @@ fn main() {
                 policy_oid.as_deref(),
             )
         }
+        Cmd::Top {
+            url,
+            user,
+            pass,
+            interval,
+        } => heraclitus_cli::top::run_top(&url, &user, &pass, interval),
+        // Tratado acima, com códigos de saída próprios (§18).
+        Cmd::Agent { .. } => unreachable!("`agent` sai antes deste mapa"),
     };
     match result {
         Ok(out) => println!("{out}"),

@@ -14,6 +14,7 @@ path = "src/main.rs"
 path = "src/lib.rs"
 
 [dependencies]
+heraclitus-agent = { workspace = true }
 heraclitus-core = { workspace = true }
 heraclitus-compliance = { workspace = true }
 heraclitus-crypto = { workspace = true }
@@ -29,6 +30,10 @@ blake3 = { workspace = true }
 rand = { workspace = true }
 serde_json = { workspace = true }
 ulid = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+sysinfo = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
