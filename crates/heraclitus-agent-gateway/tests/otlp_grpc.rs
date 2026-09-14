@@ -121,10 +121,12 @@ async fn arrancar() -> Fixture {
         otlp: OtlpConfig {
             http_addr: String::new(),
             grpc_addr: String::new(),
+            ..Default::default()
         },
         console: ConsoleConfig {
             enabled: false,
             addr: String::new(),
+            ..Default::default()
         },
         ..Default::default()
     };

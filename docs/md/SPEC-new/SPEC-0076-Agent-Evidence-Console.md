@@ -1,5 +1,16 @@
 # SPEC-0076 — Heraclitus Agent Evidence Console, Packaging & Productization
 
+> **GLOBAL HOME / PRODUCT PIVOT SUPERSEDED BY SPEC-0077.**
+>
+> A Agent Evidence Console continua suportada, **sob `/agent`**. Deixou de
+> ser a consola por omissão do HeraclitusDB: a raiz (`/`) é a Platform
+> Console. Caducaram as disposições "Agent Console = home global",
+> "Agent Black Box = nome do produto", "AI Agent Evidence & Control =
+> produto default", e o README/quickstart principais centrados em agentes.
+>
+> Os quatro estados honestos de integridade, o RBAC com `approver` e
+> `policy_admin` separados (§28) e o empacotamento mantêm-se válidos.
+
 **Status:** IMPLEMENTADA em v2.0.0 — Consola embutida em `ui/agent-console`, quickstart em `examples/agent-black-box`, README pivotado
 **Por medir:** o teste de onboarding humano de §45 (três pessoas, ambiente limpo) e os gates de adopção de §42 são medições de campo, não de código.  
 **Status original:** PROPOSED — PRODUCT PIVOT / P0  

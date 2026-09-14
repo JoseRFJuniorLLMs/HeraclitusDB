@@ -53,11 +53,52 @@ pub fn router(runtime: Arc<AgentRuntime>) -> Router {
         .with_state(runtime)
 }
 
+/// O portao da ingestao, quando `otlp.require_auth` esta ligado.
+///
+/// Vem desligado de proposito. A porta OTLP costuma estar numa rede fechada e
+/// os exporters do OpenTelemetry nao levam credencial por omissao; liga-la sem
+/// aviso partiria toda a instrumentacao ja instalada e o operador veria spans a
+/// desaparecer sem erro visivel do lado dele.
+///
+/// Mas fechar a Consola e deixar a ingestao aberta protege a LEITURA e nao a
+/// ESCRITA: quem alcancar a porta continua a poder injectar evidencia no log
+/// append-only, que por definicao ninguem apaga depois. Por isso o interruptor
+/// existe, e por isso a Consola diz em que estado esta.
+#[allow(clippy::result_large_err)]
+fn ingest_gate(runtime: &Arc<AgentRuntime>, headers: &HeaderMap) -> Result<(), Response> {
+    let Some(credencial) = runtime.otlp_credential() else {
+        return Ok(());
+    };
+    let cabecalho = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    if credencial.matches(cabecalho) {
+        return Ok(());
+    }
+    runtime.counters.lock().unwrap().rejected += 1;
+    Err((
+        StatusCode::UNAUTHORIZED,
+        [(
+            axum::http::header::WWW_AUTHENTICATE,
+            crate::auth::BASIC_REALM,
+        )],
+        Json(serde_json::json!({
+            "error": "INGEST_UNAUTHORIZED",
+            "detail": "esta porta OTLP exige `Authorization: Basic <utilizador:senha>`",
+            "operator_action": "configure OTEL_EXPORTER_OTLP_HEADERS no exporter, ou desligue require_auth em [agent_black_box.otlp]",
+        })),
+    )
+        .into_response())
+}
+
 async fn traces(
     State(runtime): State<Arc<AgentRuntime>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    if let Err(r) = ingest_gate(&runtime, &headers) {
+        return r;
+    }
     let content_type = headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())

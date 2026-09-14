@@ -28,6 +28,7 @@ pub mod console;
 pub mod gateway;
 pub mod grpc;
 pub mod ingest;
+pub mod platform;
 pub mod runtime;
 pub mod upstream;
 
@@ -123,7 +124,7 @@ pub async fn spawn(
         tracing::info!(%addr, "OTLP/gRPC a receber traces");
     }
 
-    if runtime.config.enabled && runtime.config.console.enabled {
+    if runtime.config.console.enabled {
         let app = api::router(runtime.clone());
         let addr = runtime.config.console.addr.clone();
         let listener = tokio::net::TcpListener::bind(&addr)
@@ -135,7 +136,7 @@ pub async fn spawn(
                 .with_graceful_shutdown(wait_for(sd))
                 .await;
         }));
-        tracing::info!(%addr, "Consola do Agent Black Box");
+        tracing::info!(%addr, "Consola do HeraclitusDB (Platform Console em /, Agent Evidence em /agent)");
     }
 
     if runtime.gateway.enabled {

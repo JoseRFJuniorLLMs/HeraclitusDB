@@ -13,8 +13,11 @@
 //! framework, o sítio certo para o discutir é o momento em que §4 deixar de
 //! chegar — não antes.
 
-use axum::http::{header, StatusCode};
+use crate::runtime::AgentRuntime;
+use axum::extract::State;
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use std::sync::Arc;
 
 const INDEX_HTML: &str = include_str!("../../../ui/agent-console/index.html");
 const CONSOLE_CSS: &str = include_str!("../../../ui/agent-console/console.css");
@@ -39,7 +42,67 @@ fn security_headers() -> [(header::HeaderName, &'static str); 4] {
     ]
 }
 
-pub async fn index() -> Response {
+/// O portao do shell da Consola.
+///
+/// Porque e que o gate esta AQUI e nao so na API: se o HTML carregasse sem
+/// credencial e so o `fetch` levasse 401, o browser nao abriria a caixa de
+/// utilizador/senha de forma fiavel — o utilizador veria uma consola vazia sem
+/// perceber porque. Pedindo no proprio documento, o browser pergunta primeiro e
+/// passa a mandar o `Authorization` em todos os pedidos da mesma origem.
+///
+/// Nao ha aqui nenhuma decisao de papeis: quem sabe a senha ve o shell. O que
+/// o shell mostra continua a ser decidido pela API, pedido a pedido.
+#[allow(clippy::result_large_err)]
+pub(crate) fn gate(runtime: &Arc<AgentRuntime>, headers: &HeaderMap) -> Result<(), Response> {
+    let Some(credencial) = runtime.console_credential() else {
+        return Ok(());
+    };
+    let cabecalho = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    if credencial.matches(cabecalho) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, crate::auth::BASIC_REALM)],
+        security_headers(),
+        "esta consola exige utilizador e senha",
+    )
+        .into_response())
+}
+
+/// O que `/agent` responde quando o módulo está desligado.
+///
+/// SPEC-0077 §18/§38 — não é um 404 mudo. Um 404 mudo faz o operador pensar
+/// que a rota não existe nesta versão, e mandá-lo procurar no changelog uma
+/// funcionalidade que ele tem instalada e apenas não ligou. Dizer qual é o
+/// interruptor custa duas linhas e poupa-lhe a tarde.
+const MODULO_DESLIGADO: &str = concat!(
+    "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">",
+    "<title>Agent Evidence — disabled</title>",
+    "<link rel=\"stylesheet\" href=\"/platform.css\"></head><body>",
+    "<main><h1>Agent Evidence &amp; Control</h1>",
+    "<p class=\"muted\">This module is not enabled on this server.</p>",
+    "<div class=\"notice\">Enable it with <span class=\"mono\">[agent_black_box] enabled = true</span>",
+    " in heraclitus.toml, or <span class=\"mono\">HERACLITUS_AGENT_ENABLED=1</span>, then restart.</div>",
+    "<p class=\"gap-md\"><a href=\"/\">&larr; HeraclitusDB</a></p>",
+    "</main></body></html>",
+);
+
+pub async fn index(State(runtime): State<Arc<AgentRuntime>>, headers: HeaderMap) -> Response {
+    if let Err(r) = gate(&runtime, &headers) {
+        return r;
+    }
+    if !runtime.config.enabled {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            security_headers(),
+            MODULO_DESLIGADO,
+        )
+            .into_response();
+    }
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -49,7 +112,10 @@ pub async fn index() -> Response {
         .into_response()
 }
 
-pub async fn css() -> Response {
+pub async fn css(State(runtime): State<Arc<AgentRuntime>>, headers: HeaderMap) -> Response {
+    if let Err(r) = gate(&runtime, &headers) {
+        return r;
+    }
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
@@ -59,7 +125,10 @@ pub async fn css() -> Response {
         .into_response()
 }
 
-pub async fn js() -> Response {
+pub async fn js(State(runtime): State<Arc<AgentRuntime>>, headers: HeaderMap) -> Response {
+    if let Err(r) = gate(&runtime, &headers) {
+        return r;
+    }
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
@@ -75,7 +144,15 @@ mod tests {
 
     #[test]
     fn os_assets_estao_mesmo_embutidos() {
-        assert!(INDEX_HTML.contains("Agent Black Box"));
+        assert!(INDEX_HTML.contains("Agent Evidence"));
+        // SPEC-0077 §19/§44 — a Consola do módulo diz a que produto pertence.
+        // Sem isto, um screenshot desta tela volta a ser indistinguível de
+        // "o produto chama-se Agent Black Box".
+        assert!(INDEX_HTML.contains("HeraclitusDB"));
+        assert!(
+            INDEX_HTML.contains("href=\"/\""),
+            "falta o caminho de volta a /"
+        );
         assert!(CONSOLE_CSS.contains("--verified"));
         assert!(CONSOLE_JS.contains("/api/v1/agent/status"));
     }

@@ -1,5 +1,15 @@
 # SPEC-0074 — Heraclitus Agent Black Box: Tamper-Evident Agent Evidence Plane
 
+> **PRODUCT POSITIONING SUPERSEDED BY SPEC-0077.**
+>
+> A implementação técnica continua activa como o módulo **Agent Evidence**
+> do HeraclitusDB. O que caducou é tudo o que esta SPEC diz ou implica sobre
+> *product pivot*, *first product*, "produto exposto = Agent Black Box" e
+> "não apresentar Heraclitus como database/platform".
+>
+> `AgentEvidenceV1`, a ingestão OTLP, a captura MCP, o Evidence Bundle e o
+> verificador offline mantêm-se válidos e em uso.
+
 **Status:** IMPLEMENTADA em v2.0.0 — `crates/heraclitus-agent`, `crates/heraclitus-agent-gateway`, `heraclitus agent *`
 **OTLP/gRPC:** implementado (`opentelemetry.proto.collector.trace.v1.TraceService`); não houve adiamento para a 0074.1.  
 **Status original:** PROPOSED — PRODUCT PIVOT / P0  

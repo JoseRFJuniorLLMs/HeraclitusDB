@@ -140,10 +140,12 @@ async fn arrancar_com(max_body_bytes: usize) -> Quickstart {
         otlp: OtlpConfig {
             http_addr: String::new(),
             grpc_addr: String::new(),
+            ..Default::default()
         },
         console: ConsoleConfig {
             enabled: false,
             addr: String::new(),
+            ..Default::default()
         },
         ..Default::default()
     };

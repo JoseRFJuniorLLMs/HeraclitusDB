@@ -13,18 +13,168 @@
 //! aprovação e depois aprovar-se a si própria — e o registo mostraria duas
 //! acções perfeitamente legítimas.
 //!
-//! # DEV_LOCAL é explícito, não implícito
+//! # Três modos, e cada um diz o que é
 //!
-//! No perfil de desenvolvimento não há autenticação e o principal tem todos os
-//! papéis. Isso é aceitável **porque o produto o diz em voz alta**: a Consola
-//! mostra um banner, `/api/v1/agent/status` devolve `auth: "dev_local"`, e a
-//! [`heraclitus_agent::config::AgentGatewayConfig::validate`] recusa arrancar
-//! em produção sem OIDC.
+//! | modo | o que prova | papéis |
+//! |---|---|---|
+//! | `dev_local` | nada | todos |
+//! | `basic` | que quem chama conhece UMA senha partilhada | todos, sob um só sujeito |
+//! | `oidc` | quem é a pessoa, validado pelo emissor dela | os que o token declara |
+//!
+//! O `basic` fecha a porta mas **não** resolve a §28: uma senha partilhada não
+//! distingue pessoas, portanto `approver` e `policy_admin` colapsam num único
+//! principal e uma aprovação fica registada em nome da credencial, não de quem
+//! carregou no botão.
+//!
+//! Isso é aceitável para um portátil ou uma rede interna — e é **dito em voz
+//! alta** em três sítios, porque o perigo não é o modo fraco, é alguém supor
+//! que tem o modo forte: o banner da Consola, o campo `auth` de
+//! `/api/v1/agent/status`, e o `approver_issuer` de cada evidência de
+//! aprovação, que fica `basic-shared` para uma auditoria futura ver que aquela
+//! assinatura não identifica ninguém.
+//!
+//! Em produção, a [`heraclitus_agent::config::AgentGatewayConfig::validate`]
+//! continua a exigir OIDC: `basic` não é promovido a identidade por ser
+//! conveniente.
 
 use crate::runtime::AgentRuntime;
 use axum::http::{HeaderMap, StatusCode};
 use serde::Serialize;
 use std::sync::Arc;
+
+/// O emissor registado nas evidências quando a credencial é partilhada.
+///
+/// Fica na evidência de propósito: uma aprovação assinada por `admin` via senha
+/// partilhada e uma assinada por `jose@example` via OIDC não valem o mesmo, e
+/// quem auditar o bundle daqui a um ano tem de conseguir ver a diferença sem
+/// perguntar a ninguém.
+pub const SHARED_ISSUER: &str = "basic-shared";
+
+/// Comparação em tempo constante.
+///
+/// O tempo não depende do prefixo coincidente, o que fecha o canal lateral de
+/// temporização do `==` de strings. O comprimento continua observável —
+/// inevitável e inócuo, porque o segredo não é o comprimento. É a mesma função
+/// que o REST de administração usa (`heraclitus-server/src/rest.rs`, R17);
+/// está duplicada aqui para não obrigar este crate a depender do servidor.
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Base64 padrão (RFC 4648, com padding), só para montar o valor esperado do
+/// cabeçalho. Nunca se descodifica o input do cliente: compara-se o cabeçalho
+/// inteiro contra o esperado, o que evita ter um descodificador a mastigar
+/// bytes de quem quer que bata à porta.
+pub(crate) fn b64(input: &[u8]) -> String {
+    const AB: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(AB[(n >> 18) as usize & 63] as char);
+        out.push(AB[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            AB[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            AB[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// A credencial partilhada, já na forma em que é comparada.
+///
+/// Guarda o cabeçalho **esperado** e não a senha: o segredo em claro não fica a
+/// passear pela struct, e o `Debug` não o pode imprimir por acidente.
+#[derive(Clone)]
+pub struct SharedCredential {
+    expected_header: Arc<String>,
+    username: Arc<String>,
+}
+
+impl std::fmt::Debug for SharedCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Nunca imprimir o cabeçalho: um `{:?}` num log de erro entregaria a
+        // senha em base64, que é o mesmo que a entregar.
+        f.debug_struct("SharedCredential")
+            .field("username", &self.username)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
+}
+
+impl SharedCredential {
+    /// Constrói a partir de `utilizador:senha`. `None` se a forma for ambígua.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let (utilizador, senha) = raw.split_once(':')?;
+        if utilizador.is_empty() || senha.is_empty() {
+            return None;
+        }
+        Some(Self {
+            expected_header: Arc::new(format!("Basic {}", b64(raw.as_bytes()))),
+            username: Arc::new(utilizador.to_string()),
+        })
+    }
+
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    /// Confere o cabeçalho `Authorization` inteiro, em tempo constante.
+    pub fn matches(&self, header: Option<&str>) -> bool {
+        header.is_some_and(|v| ct_eq(v.as_bytes(), self.expected_header.as_bytes()))
+    }
+}
+
+/// Uma recusa de autenticação, com o que a resposta HTTP precisa.
+#[derive(Debug, Clone)]
+pub struct AuthRejection {
+    pub status: StatusCode,
+    pub code: &'static str,
+    pub detail: String,
+    /// `true` quando a resposta deve levar `WWW-Authenticate: Basic`, para o
+    /// browser mostrar a caixa de login nativa em vez de uma página de erro.
+    pub challenge: bool,
+}
+
+impl AuthRejection {
+    pub fn unauthorized(detail: impl Into<String>, challenge: bool) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            code: "IDENTITY_VALIDATION_FAILED",
+            detail: detail.into(),
+            challenge,
+        }
+    }
+
+    pub fn forbidden(detail: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "FORBIDDEN",
+            detail: detail.into(),
+            challenge: false,
+        }
+    }
+}
+
+/// O `realm` do desafio. Aparece na caixa de login do browser.
+pub const BASIC_REALM: &str = "Basic realm=\"Heraclitus Agent Black Box\", charset=\"UTF-8\"";
 
 /// Os papéis de §29.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -105,6 +255,34 @@ impl Operation {
     }
 }
 
+/// Como é que este principal foi estabelecido.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthMode {
+    /// Ninguém provou nada.
+    DevLocal,
+    /// Alguém provou conhecer uma senha partilhada. Não identifica a pessoa.
+    Basic,
+    /// Um emissor validou quem é a pessoa.
+    Oidc,
+}
+
+impl AuthMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DevLocal => "dev_local",
+            Self::Basic => "basic",
+            Self::Oidc => "oidc",
+        }
+    }
+
+    /// Se este modo distingue PESSOAS. É o que decide se a separação de papéis
+    /// de §28 é real ou nominal — e o que a Consola tem de mostrar.
+    pub fn identifies_people(self) -> bool {
+        self == Self::Oidc
+    }
+}
+
 /// Quem está a chamar.
 #[derive(Debug, Clone, Serialize)]
 pub struct Principal {
@@ -113,6 +291,7 @@ pub struct Principal {
     pub roles: Vec<Role>,
     /// `true` quando o perfil é de desenvolvimento e ninguém provou nada.
     pub dev_local: bool,
+    pub mode: AuthMode,
 }
 
 impl Principal {
@@ -120,69 +299,102 @@ impl Principal {
         op.allowed_roles().iter().any(|r| self.roles.contains(r))
     }
 
-    pub fn require(&self, op: Operation) -> Result<(), (StatusCode, String)> {
+    pub fn require(&self, op: Operation) -> Result<(), AuthRejection> {
         if self.can(op) {
             return Ok(());
         }
-        Err((
-            StatusCode::FORBIDDEN,
-            format!(
-                "o papel necessário para {} é um de [{}]; `{}` tem [{}]",
-                op.label(),
-                op.allowed_roles()
-                    .iter()
-                    .map(|r| r.label())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                self.subject,
-                self.roles
-                    .iter()
-                    .map(|r| r.label())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        ))
+        Err(AuthRejection::forbidden(format!(
+            "o papel necessário para {} é um de [{}]; `{}` tem [{}]",
+            op.label(),
+            op.allowed_roles()
+                .iter()
+                .map(|r| r.label())
+                .collect::<Vec<_>>()
+                .join(", "),
+            self.subject,
+            self.roles
+                .iter()
+                .map(|r| r.label())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )))
+    }
+
+    /// Todos os papéis. É o que `dev_local` e `basic` recebem: nenhum dos dois
+    /// distingue pessoas, portanto dar-lhes um subconjunto seria teatro — a
+    /// mesma credencial trocaria de papel mudando um campo.
+    fn all_roles() -> Vec<Role> {
+        vec![
+            Role::Viewer,
+            Role::Auditor,
+            Role::Approver,
+            Role::PolicyAdmin,
+            Role::SystemAdmin,
+        ]
     }
 }
 
 /// Extrai o principal dos cabeçalhos.
 ///
-/// Com validador OIDC configurado, exige um bearer válido. Sem validador, o
-/// perfil é de desenvolvimento e o principal é anónimo com todos os papéis — o
-/// que só é seguro porque a configuração de produção recusa este caminho.
+/// A ordem é deliberada e vai do mais forte para o mais fraco:
+///
+/// 1. **OIDC**, se houver validador — a única via que identifica pessoas.
+/// 2. **Basic**, se houver credencial partilhada — fecha a porta, não diz quem
+///    entrou. Uma falha aqui devolve `WWW-Authenticate`, para o browser pedir
+///    utilizador e senha em vez de mostrar uma página de erro.
+/// 3. **Aberto**, se não houver nem uma nem outra.
+///
+/// O OIDC vem primeiro para que configurar os dois não degrade em silêncio para
+/// o mais fraco.
 pub fn principal_from(
     runtime: &Arc<AgentRuntime>,
     headers: &HeaderMap,
     now_unix_seconds: u64,
-) -> Result<Principal, (StatusCode, String)> {
+) -> Result<Principal, AuthRejection> {
+    let cabecalho = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
     let Some(validator) = runtime.validator() else {
+        // ── 2. credencial partilhada ────────────────────────────────────────
+        if let Some(credencial) = runtime.console_credential() {
+            if !credencial.matches(cabecalho) {
+                return Err(AuthRejection::unauthorized(
+                    "esta consola exige utilizador e senha",
+                    true,
+                ));
+            }
+            return Ok(Principal {
+                subject: credencial.username().to_string(),
+                // NÃO é o emissor de uma identidade: é a marca de que aquilo
+                // que se provou foi o conhecimento de uma senha. Fica assim na
+                // evidência de cada aprovação.
+                issuer: SHARED_ISSUER.to_string(),
+                roles: Principal::all_roles(),
+                dev_local: false,
+                mode: AuthMode::Basic,
+            });
+        }
+        // ── 3. aberto ───────────────────────────────────────────────────────
         return Ok(Principal {
             subject: "dev-local".to_string(),
             issuer: "dev-local".to_string(),
-            roles: vec![
-                Role::Viewer,
-                Role::Auditor,
-                Role::Approver,
-                Role::PolicyAdmin,
-                Role::SystemAdmin,
-            ],
+            roles: Principal::all_roles(),
             dev_local: true,
+            mode: AuthMode::DevLocal,
         });
     };
-    let token = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or((
-            StatusCode::UNAUTHORIZED,
-            "é necessário `Authorization: Bearer <token>`".to_string(),
-        ))?;
-    let identity = validator.validate(token, now_unix_seconds).map_err(|e| {
-        (
-            StatusCode::UNAUTHORIZED,
-            format!("IDENTITY_VALIDATION_FAILED: {e}"),
-        )
-    })?;
+    // ── 1. OIDC ─────────────────────────────────────────────────────────────
+    let token =
+        cabecalho
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .ok_or(AuthRejection::unauthorized(
+                "é necessário `Authorization: Bearer <token>`",
+                false,
+            ))?;
+    let identity = validator
+        .validate(token, now_unix_seconds)
+        .map_err(|e| AuthRejection::unauthorized(format!("{e}"), false))?;
     let mut roles: Vec<Role> = identity
         .roles
         .iter()
@@ -200,6 +412,7 @@ pub fn principal_from(
         issuer: identity.issuer,
         roles,
         dev_local: false,
+        mode: AuthMode::Oidc,
     })
 }
 
@@ -213,6 +426,7 @@ mod tests {
             issuer: "i".into(),
             roles: roles.to_vec(),
             dev_local: false,
+            mode: AuthMode::Oidc,
         }
     }
 
@@ -273,9 +487,13 @@ mod tests {
         let e = com(&[Role::Viewer])
             .require(Operation::ApproveAction)
             .unwrap_err();
-        assert_eq!(e.0, StatusCode::FORBIDDEN);
-        assert!(e.1.contains("approver"), "{}", e.1);
-        assert!(e.1.contains("viewer"), "{}", e.1);
+        assert_eq!(e.status, StatusCode::FORBIDDEN);
+        assert!(
+            !e.challenge,
+            "um 403 por papel não deve pedir credencial nova"
+        );
+        assert!(e.detail.contains("approver"), "{}", e.detail);
+        assert!(e.detail.contains("viewer"), "{}", e.detail);
     }
 
     #[test]

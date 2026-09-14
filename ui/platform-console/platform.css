@@ -1,0 +1,168 @@
+/* HeraclitusDB — Platform Console (SPEC-0077)
+ *
+ * Mesma linguagem visual da Agent Console: os mesmos tokens, a mesma densidade,
+ * a mesma regra de cor para integridade. Não é a mesma folha porque §32 não
+ * exige que as duas superfícies sejam iguais — exige que sejam legíveis e
+ * honestas. O que ELAS TÊM de partilhar é a semântica da cor: VERIFIED é o
+ * único verde, aqui como lá.
+ *
+ * §32 proíbe explicitamente: mapa-múndi, gauges decorativos, 3D, glassmorphism,
+ * trinta cards sem função e animações sem significado. Não há nenhum aqui. */
+
+:root {
+  color-scheme: light dark;
+  --bg: #fbfaf8;
+  --panel: #ffffff;
+  --ink: #16150f;
+  --muted: #6a675c;
+  --line: #e2ded4;
+  --accent: #2f4858;
+  --verified: #2f6b3d;
+  --unverified: #8a7320;
+  --broken: #9b2c2c;
+  --partial: #6b4e9b;
+  --enabled: #2f6b3d;
+  --disabled: #6a675c;
+  --radius: 6px;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16150f;
+    --panel: #1e1d16;
+    --ink: #efece2;
+    --muted: #9a968a;
+    --line: #322f26;
+    --accent: #8fb0c4;
+    --verified: #7cc08c;
+    --unverified: #d7b65a;
+    --broken: #e07a7a;
+    --partial: #b39ddb;
+    --enabled: #7cc08c;
+    --disabled: #9a968a;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.banner { padding: 10px 20px; font-size: 13px; border-bottom: 1px solid var(--line); }
+.banner-dev { background: #fff4d6; color: #6b5300; }
+@media (prefers-color-scheme: dark) {
+  .banner-dev { background: #3a3113; color: #f0d98a; }
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  flex-wrap: wrap;
+}
+.brand { display: flex; align-items: baseline; gap: 8px; font-size: 15px; }
+.brand .mark { color: var(--accent); font-size: 18px; }
+.brand .name strong { font-weight: 650; }
+.brand .tagline { color: var(--muted); font-size: 12px; }
+
+nav { display: flex; gap: 4px; flex: 1; flex-wrap: wrap; }
+nav a { padding: 6px 12px; border-radius: var(--radius); color: var(--muted); font-size: 14px; }
+nav a.active { background: var(--bg); color: var(--ink); font-weight: 600; }
+
+.chip {
+  padding: 3px 10px;
+  border-radius: 12px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .02em;
+  border: 1px solid currentColor;
+}
+.chip-VERIFIED, .chip-ENABLED { color: var(--verified); }
+.chip-UNVERIFIED, .chip-DEGRADED { color: var(--unverified); }
+.chip-BROKEN { color: var(--broken); }
+.chip-PARTIAL { color: var(--partial); }
+/* NOTCONFIGURED, NOTBUILT, DISABLED e UNAVAILABLE partilham o cinzento de
+ * propósito: nenhum deles é uma afirmação sobre saúde. */
+.chip-unknown, .chip-UNAVAILABLE, .chip-NOTCONFIGURED, .chip-NOTBUILT, .chip-DISABLED {
+  color: var(--muted);
+}
+
+main { padding: 24px 20px 48px; max-width: 1100px; margin: 0 auto; }
+
+h1 { font-size: 20px; margin: 0 0 4px; font-weight: 650; }
+h2 { font-size: 15px; margin: 28px 0 10px; font-weight: 650; }
+.muted { color: var(--muted); font-size: 13px; }
+.mono { font-family: var(--mono); font-size: 12px; word-break: break-all; }
+
+.cards { display: flex; gap: 12px; flex-wrap: wrap; margin: 16px 0 8px; }
+.card {
+  flex: 1 1 150px;
+  padding: 12px 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.card .k { font-size: 12px; color: var(--muted); }
+.card .v { font-size: 22px; font-weight: 600; margin-top: 2px; }
+/* §8/§33 — `N/A` nunca deve ter o peso visual de um número real. Um `N/A` em
+ * corpo 22 bold lê-se, de relance, como um valor; e a diferença entre "não sei"
+ * e "sei que é isto" é exactamente o que esta superfície não pode borrar. */
+.card .v.na { font-size: 15px; font-weight: 500; color: var(--muted); }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); font-size: 14px; }
+th { font-size: 12px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+tr:last-child td { border-bottom: none; }
+tbody tr:hover { background: var(--bg); }
+.table-wrap { overflow-x: auto; }
+td.num, th.num { text-align: right; font-family: var(--mono); font-size: 12px; }
+
+.modules { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; margin-top: 12px; }
+.module {
+  padding: 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.module .name { font-weight: 600; }
+.module .summary { font-size: 13px; color: var(--muted); flex: 1; }
+.module .detail { font-size: 12px; color: var(--muted); }
+
+.kv { margin: 8px 0 0; display: grid; grid-template-columns: max-content 1fr; gap: 2px 14px; font-size: 12px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; font-family: var(--mono); word-break: break-all; }
+
+.notice { padding: 10px 12px; border-radius: var(--radius); border: 1px solid var(--line); background: var(--panel); margin: 12px 0; font-size: 13px; }
+.notice-error { border-color: var(--broken); color: var(--broken); }
+
+.gap-md { margin-top: 10px; }
+.button-row { margin: 10px 0; display: flex; gap: 8px; flex-wrap: wrap; }
+
+footer { padding: 20px; border-top: 1px solid var(--line); font-size: 12px; text-align: center; }
+
+@media (max-width: 640px) {
+  .topbar { gap: 10px; }
+  .brand .tagline { display: none; }
+  main { padding: 16px 12px 40px; }
+  .card { flex-basis: 44%; }
+}

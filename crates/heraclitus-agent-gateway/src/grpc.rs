@@ -66,6 +66,21 @@ impl TraceService for AgentTraceService {
         &self,
         request: tonic::Request<ExportTraceServiceRequest>,
     ) -> Result<tonic::Response<ExportTraceServiceResponse>, tonic::Status> {
+        // A mesma credencial que fecha a porta HTTP tem de fechar esta. Duas
+        // portas para o MESMO log com regras diferentes seria uma delas a
+        // anular a outra em silencio: bastava trocar 4318 por 4317.
+        if let Some(credencial) = self.runtime.otlp_credential() {
+            let cabecalho = request
+                .metadata()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok());
+            if !credencial.matches(cabecalho) {
+                self.runtime.counters.lock().unwrap().rejected += 1;
+                return Err(tonic::Status::unauthenticated(
+                    "esta porta OTLP exige `authorization: Basic <utilizador:senha>`",
+                ));
+            }
+        }
         let traces = request.into_inner();
         {
             let mut c = self.runtime.counters.lock().unwrap();

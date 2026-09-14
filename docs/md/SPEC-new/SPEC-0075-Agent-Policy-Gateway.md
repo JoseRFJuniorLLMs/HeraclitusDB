@@ -1,5 +1,11 @@
 # SPEC-0075 — Heraclitus Agent Policy Gateway: Runtime Authorization, Delegation & Human Approval
 
+> **Product-wide positioning superseded by SPEC-0077.**
+>
+> Esta especificação define o módulo **opcional** Agent Policy Gateway.
+> ALLOW/DENY/REQUIRE_APPROVAL, delegação, authorization binding e o proxy
+> MCP continuam válidos — nenhum deles define a identidade do HeraclitusDB.
+
 **Status:** IMPLEMENTADA em v2.0.0 — `heraclitus-agent::policy/action/identity`, proxy MCP em `heraclitus-agent-gateway::gateway`
 **Fora do MVP, como §36 permite:** OPA/Rego, Cedar, plugins WASM, sandbox universal, SSH/SQL proxy, EDR.  
 **Status original:** PROPOSED — PRODUCT PIVOT / P0  

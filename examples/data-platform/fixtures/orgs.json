@@ -1,0 +1,4 @@
+[
+  { "id": "ORG-1", "name": "Municipal Health Authority", "kind": "public_body", "jurisdiction": "BR-SP" },
+  { "id": "ORG-2", "name": "Federal Transport Agency", "kind": "public_body", "jurisdiction": "BR-DF" }
+]

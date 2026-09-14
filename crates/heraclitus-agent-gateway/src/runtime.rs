@@ -106,6 +106,14 @@ pub struct AgentRuntime {
     pub counters: Mutex<IngestCounters>,
     pub gateway_counters: GatewayCounters,
     validator: Option<OidcValidator>,
+    /// Credencial partilhada da Consola, quando configurada. Guarda o cabeçalho
+    /// esperado, não a senha — ver `auth::SharedCredential`.
+    console_credential: Option<crate::auth::SharedCredential>,
+    /// Quem responde pelo estado da PLATAFORMA (SPEC-0077 §37).
+    ///
+    /// `None` num gateway autónomo: aí a Platform Console diz `N/A` em vez de
+    /// inventar um número. Ver `platform::PlatformSource`.
+    platform: Option<Arc<dyn crate::platform::PlatformSource>>,
     normalizer: OtlpNormalizer,
     started_at_unix_seconds: u64,
     /// Onde os Evidence Bundles exportados ficam. Fora do directório de dados
@@ -135,6 +143,8 @@ impl AgentRuntime {
             counters: Mutex::new(IngestCounters::default()),
             gateway_counters: GatewayCounters::default(),
             validator: None,
+            console_credential: None,
+            platform: None,
             started_at_unix_seconds: now_unix_seconds(),
             bundles_dir: std::path::PathBuf::from("bundles"),
         }
@@ -187,6 +197,63 @@ impl AgentRuntime {
 
     pub fn validator(&self) -> Option<&OidcValidator> {
         self.validator.as_ref()
+    }
+
+    /// Lê a credencial partilhada da configuração.
+    ///
+    /// Uma credencial mal formada (sem `:`, ou com utilizador ou senha vazios)
+    /// é um ERRO de arranque, não um aviso. O modo de falha contrário — aceitar
+    /// e não proteger — deixaria o operador a olhar para uma consola aberta
+    /// convencido de que a tinha fechado.
+    pub fn load_console_credential(&mut self) -> Result<(), HeraclitusError> {
+        let raw = self.config.console.basic_auth.trim().to_string();
+        if raw.is_empty() {
+            self.console_credential = None;
+            return Ok(());
+        }
+        let credencial = crate::auth::SharedCredential::parse(&raw).ok_or_else(|| {
+            HeraclitusError::Config(
+                "[agent_black_box.console] basic_auth tem de ser `utilizador:senha`,                  com os dois campos preenchidos"
+                    .to_string(),
+            )
+        })?;
+        self.console_credential = Some(credencial);
+        Ok(())
+    }
+
+    /// Liga a fonte de estado da plataforma. Chamado pelo `heraclitus-server`,
+    /// que é quem tem o motor.
+    pub fn with_platform(mut self, fonte: Arc<dyn crate::platform::PlatformSource>) -> Self {
+        self.platform = Some(fonte);
+        self
+    }
+
+    pub fn platform(&self) -> Option<&Arc<dyn crate::platform::PlatformSource>> {
+        self.platform.as_ref()
+    }
+
+    pub fn console_credential(&self) -> Option<&crate::auth::SharedCredential> {
+        self.console_credential.as_ref()
+    }
+
+    /// Como a Consola se apresenta. `oidc` ganha sempre ao `basic`.
+    pub fn auth_mode(&self) -> crate::auth::AuthMode {
+        if self.validator.is_some() {
+            crate::auth::AuthMode::Oidc
+        } else if self.console_credential.is_some() {
+            crate::auth::AuthMode::Basic
+        } else {
+            crate::auth::AuthMode::DevLocal
+        }
+    }
+
+    /// Se a ingestão OTLP exige a mesma credencial.
+    pub fn otlp_credential(&self) -> Option<&crate::auth::SharedCredential> {
+        if self.config.otlp.require_auth {
+            self.console_credential.as_ref()
+        } else {
+            None
+        }
     }
 
     pub fn normalizer(&self) -> &OtlpNormalizer {

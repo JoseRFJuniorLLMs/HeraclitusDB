@@ -65,6 +65,20 @@ pub struct OtlpConfig {
     /// já serve. Este endereço existe para quem tem o exporter fixado em gRPC
     /// — e os dois transportes descem à MESMA normalização.
     pub grpc_addr: String,
+    /// Exigir a credencial da Consola também na ingestão OTLP.
+    ///
+    /// Desligado por omissão porque ligá-lo obriga o exporter OpenTelemetry a
+    /// mandar `Authorization: Basic ...` (`OTEL_EXPORTER_OTLP_HEADERS`), e um
+    /// default que parte a instrumentação de quem actualiza seria um default
+    /// errado.
+    ///
+    /// Mas a lacuna é real e vale dizê-la: com a Consola fechada e a ingestão
+    /// aberta, quem chegar à porta não **lê** a evidência mas **escreve-a**. O
+    /// log é append-only e verificável — um registo injectado fica lá e o
+    /// bundle até fecha, porque a prova diz que o registo não foi alterado, não
+    /// que era verdade. O `heraclitus agent doctor` avisa quando esta
+    /// combinação aparece fora de loopback.
+    pub require_auth: bool,
 }
 
 impl Default for OtlpConfig {
@@ -72,6 +86,7 @@ impl Default for OtlpConfig {
         Self {
             http_addr: "0.0.0.0:4318".to_string(),
             grpc_addr: String::new(),
+            require_auth: false,
         }
     }
 }
@@ -136,6 +151,26 @@ pub struct EvidenceConfig {
 pub struct ConsoleConfig {
     pub enabled: bool,
     pub addr: String,
+    /// Credencial partilhada da Consola, na forma `utilizador:senha`. Vazio =
+    /// sem autenticação (perfil de desenvolvimento).
+    ///
+    /// # O que uma credencial partilhada é, e o que não é
+    ///
+    /// **É** um portão de acesso: separa "alguém que provou conhecer a
+    /// credencial" de "ninguém provou nada". Para um portátil ou uma rede
+    /// interna, é a diferença entre a consola estar aberta e não estar.
+    ///
+    /// **Não é** identidade. Uma senha partilhada não distingue pessoas, e isso
+    /// tem uma consequência que a SPEC-0076 §28 leva a sério: com ela, o
+    /// `approver` e o `policy_admin` colapsam num só principal, e uma aprovação
+    /// humana fica registada como tendo sido dada por `admin`, não por quem
+    /// carregou no botão.
+    ///
+    /// O produto diz isto em voz alta — no banner da Consola, em
+    /// `/api/v1/agent/status` e no `approver_issuer` de cada evidência de
+    /// aprovação — em vez de deixar alguém supor que tem RBAC a sério. Para
+    /// identidade por pessoa, é `[agent_gateway.identity] mode = "oidc"`.
+    pub basic_auth: String,
 }
 
 impl Default for ConsoleConfig {
@@ -143,7 +178,27 @@ impl Default for ConsoleConfig {
         Self {
             enabled: true,
             addr: "0.0.0.0:8080".to_string(),
+            basic_auth: String::new(),
         }
+    }
+}
+
+impl ConsoleConfig {
+    /// A credencial, partida em utilizador e senha, se estiver configurada.
+    ///
+    /// Recusa formas ambíguas em vez de as aceitar a meio: sem `:`, utilizador
+    /// vazio ou senha vazia dariam uma credencial que parece configurada e não
+    /// protege nada.
+    pub fn basic_parts(&self) -> Option<(&str, &str)> {
+        let (utilizador, senha) = self.basic_auth.split_once(':')?;
+        if utilizador.is_empty() || senha.is_empty() {
+            return None;
+        }
+        Some((utilizador, senha))
+    }
+
+    pub fn has_basic_auth(&self) -> bool {
+        self.basic_parts().is_some()
     }
 }
 

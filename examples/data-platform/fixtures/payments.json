@@ -1,0 +1,6 @@
+[
+  { "id": "PAY-1", "contract": "CTR-9001", "amount_cents": 240000000, "date": "2024-04-15" },
+  { "id": "PAY-2", "contract": "CTR-9001", "amount_cents": 240000000, "date": "2024-09-15" },
+  { "id": "PAY-3", "contract": "CTR-9002", "amount_cents": 125000000, "date": "2024-08-30" },
+  { "id": "PAY-4", "contract": "CTR-9003", "amount_cents":  30500000, "date": "2025-02-18" }
+]

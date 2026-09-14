@@ -116,10 +116,12 @@ async fn harness(mode: GatewayMode) -> Harness {
         otlp: OtlpConfig {
             http_addr: String::new(),
             grpc_addr: String::new(),
+            ..Default::default()
         },
         console: ConsoleConfig {
             enabled: false,
             addr: String::new(),
+            ..Default::default()
         },
         ..Default::default()
     };
@@ -520,8 +522,10 @@ async fn a_consola_serve_se_a_si_propria_com_csp() {
         hyper_util::client::legacy::connect::HttpConnector,
         Full<hyper::body::Bytes>,
     > = Client::builder(TokioExecutor::new()).build_http();
+    // SPEC-0077 §30 — a Agent Console mudou-se para `/agent`; a raiz é a
+    // Platform Console. A CSP tem de continuar a ser a mesma nas duas.
     let req = hyper::Request::builder()
-        .uri(format!("{}/", h.api_url))
+        .uri(format!("{}/agent", h.api_url))
         .body(Full::new(hyper::body::Bytes::new()))
         .unwrap();
     let resp = client.request(req).await.unwrap();
@@ -535,7 +539,9 @@ async fn a_consola_serve_se_a_si_propria_com_csp() {
         .to_string();
     assert!(csp.contains("default-src 'none'"), "{csp}");
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    assert!(String::from_utf8_lossy(&bytes).contains("Agent Black Box"));
+    let html = String::from_utf8_lossy(&bytes);
+    assert!(html.contains("Agent Evidence"), "{html}");
+    assert!(html.contains("HeraclitusDB"), "{html}");
 }
 
 #[tokio::test]
