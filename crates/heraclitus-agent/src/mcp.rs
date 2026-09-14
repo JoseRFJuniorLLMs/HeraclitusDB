@@ -111,6 +111,72 @@ pub const EXTERNAL_EFFECT_FIELDS: &[&str] = &[
     "orderId",
 ];
 
+/// O payload JSON-RPC de um corpo MCP, seja ele JSON puro ou enquadrado em SSE.
+///
+/// # Porque é que isto é preciso
+///
+/// O MCP Streamable HTTP permite ao servidor responder em `text/event-stream`,
+/// e na prática **todos** os servidores MCP HTTP públicos que testámos o fazem
+/// (Context7, DeepWiki, Cloudflare docs, GitMCP). O corpo não é JSON: é
+///
+/// ```text
+/// event: message
+/// data: {"jsonrpc":"2.0","id":1,"result":{...}}
+/// ```
+///
+/// Antes disto, o `serde_json::from_slice` falhava e o erro era engolido por um
+/// `if let Ok`. A consequência não era cosmética: `is_error` ficava `false`, e
+/// uma tool call que o upstream tinha RECUSADO era gravada no log append-only
+/// com `protocol_status: "ok"`. Um black box que regista um fracasso como
+/// sucesso é pior do que não ter black box — alguém lê o relatório e conclui o
+/// contrário do que aconteceu.
+///
+/// # O que isto NÃO resolve
+///
+/// O gateway continua a bufferizar a resposta inteira antes de a devolver. Para
+/// um upstream que fecha o stream depois de responder (o caso de todos os que
+/// medimos) isso funciona; para um que mantenha o stream aberto, o pedido
+/// espera pelo timeout. Streaming verdadeiro é outro trabalho, e está por fazer.
+fn payload_jsonrpc(body: &[u8]) -> Option<Value> {
+    // O caminho normal primeiro: a esmagadora maioria dos corpos de PEDIDO, e
+    // as respostas de servidores que não usam SSE.
+    if let Ok(v) = serde_json::from_slice::<Value>(body) {
+        return Some(v);
+    }
+    let texto = std::str::from_utf8(body).ok()?;
+
+    // SSE: várias linhas `data:` dentro do mesmo evento concatenam-se com "\n"
+    // (RFC do EventSource). Um corpo pode trazer mais do que um evento; fica o
+    // primeiro que seja uma resposta JSON-RPC, porque é esse que corresponde ao
+    // pedido que fizemos.
+    let mut acumulado = String::new();
+    let evento_terminado = |acc: &mut String| -> Option<Value> {
+        if acc.is_empty() {
+            return None;
+        }
+        let v = serde_json::from_str::<Value>(acc.trim()).ok();
+        acc.clear();
+        v.filter(|v| v.get("result").is_some() || v.get("error").is_some())
+    };
+    for linha in texto.lines() {
+        let linha = linha.strip_suffix('\r').unwrap_or(linha);
+        if linha.is_empty() {
+            if let Some(v) = evento_terminado(&mut acumulado) {
+                return Some(v);
+            }
+            continue;
+        }
+        if let Some(dados) = linha.strip_prefix("data:") {
+            if !acumulado.is_empty() {
+                acumulado.push('\n');
+            }
+            acumulado.push_str(dados.strip_prefix(' ').unwrap_or(dados));
+        }
+        // `event:`, `id:`, `retry:` e comentários (`:`) não interessam aqui.
+    }
+    evento_terminado(&mut acumulado)
+}
+
 /// Extrai o que se consegue de uma troca, sem falhar por campos em falta.
 pub fn extract_facts(ex: &McpExchange) -> McpCallFacts {
     let mut facts = McpCallFacts {
@@ -122,7 +188,7 @@ pub fn extract_facts(ex: &McpExchange) -> McpCallFacts {
     };
 
     if let Some(body) = &ex.request_body {
-        if let Ok(v) = serde_json::from_slice::<Value>(body) {
+        if let Some(v) = payload_jsonrpc(body) {
             if facts.method.is_none() {
                 facts.method = v.get("method").and_then(Value::as_str).map(str::to_string);
             }
@@ -150,7 +216,7 @@ pub fn extract_facts(ex: &McpExchange) -> McpCallFacts {
     }
 
     if let Some(body) = &ex.response_body {
-        if let Ok(v) = serde_json::from_slice::<Value>(body) {
+        if let Some(v) = payload_jsonrpc(body) {
             if v.get("error").is_some() {
                 facts.is_error = true;
                 facts.error_message = v
@@ -466,5 +532,76 @@ mod tests {
             f.external_effect_id, None,
             "o tecto de profundidade parou a busca"
         );
+    }
+
+    // ── SSE ─────────────────────────────────────────────────────────────
+    //
+    // Os enquadramentos abaixo foram MEDIDOS contra servidores reais em
+    // 2026-09-14 (Context7 v4.1.1, DeepWiki, Cloudflare docs, GitMCP). Todos
+    // respondem em `text/event-stream`; nenhum responde JSON puro.
+
+    #[test]
+    fn um_erro_do_upstream_em_sse_nao_passa_por_sucesso() {
+        // O defeito que isto trava: `serde_json::from_slice` falha num corpo
+        // SSE, o `if let Ok` engole o erro, e uma tool call RECUSADA pelo
+        // upstream fica gravada com `protocol_status: "ok"` num log que não se
+        // apaga. Alguém lê o relatório e conclui o contrário do que aconteceu.
+        let corpo = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":12,\"error\":{\"code\":-32602,\"message\":\"Tool nao-existe not found\"}}\n\n";
+        let mut ex = exchange();
+        ex.response_body = Some(corpo.to_vec());
+        let f = extract_facts(&ex);
+        assert!(f.is_error, "um erro em SSE passou por sucesso");
+        assert_eq!(f.error_message.as_deref(), Some("Tool nao-existe not found"));
+    }
+
+    #[test]
+    fn um_is_error_do_resultado_em_sse_tambem_conta() {
+        // O MCP tem DOIS modos de falha: o erro JSON-RPC (protocolo) e o
+        // `result.isError` (a ferramenta correu e falhou). O segundo vem com
+        // HTTP 200 e com `result` presente — é o mais fácil de deixar passar.
+        let corpo = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"falhou\"}],\"isError\":true}}\n\n";
+        let mut ex = exchange();
+        ex.response_body = Some(corpo.to_vec());
+        assert!(extract_facts(&ex).is_error);
+    }
+
+    #[test]
+    fn json_puro_continua_a_funcionar() {
+        // A correcção não pode partir o caminho que já funcionava.
+        let corpo = br#"{"jsonrpc":"2.0","id":1,"error":{"code":-1,"message":"nao"}}"#;
+        let mut ex = exchange();
+        ex.response_body = Some(corpo.to_vec());
+        let f = extract_facts(&ex);
+        assert!(f.is_error);
+        assert_eq!(f.error_message.as_deref(), Some("nao"));
+    }
+
+    #[test]
+    fn sse_com_crlf_e_com_varios_eventos() {
+        // Enquadramento com CRLF, precedido de um comentário de keep-alive e de
+        // um evento que NÃO é uma resposta JSON-RPC. Fica o primeiro que o é.
+        let corpo = b": keep-alive\r\n\r\nevent: ping\r\ndata: {\"nada\":1}\r\n\r\nevent: message\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{\"isError\":true}}\r\n\r\n";
+        let mut ex = exchange();
+        ex.response_body = Some(corpo.to_vec());
+        assert!(extract_facts(&ex).is_error, "o evento certo foi ignorado");
+    }
+
+    #[test]
+    fn um_corpo_que_nao_e_nem_json_nem_sse_nao_inventa_nada() {
+        // Uma página de erro de um proxy, por exemplo. O importante é NÃO
+        // afirmar sucesso: sem payload legível, não há facto nenhum a extrair.
+        let mut ex = exchange();
+        ex.response_body = Some(b"<html><body>502 Bad Gateway</body></html>".to_vec());
+        let f = extract_facts(&ex);
+        assert!(!f.is_error, "inventou um erro que nao leu");
+        assert_eq!(f.external_effect_id, None);
+    }
+
+    #[test]
+    fn o_efeito_externo_tambem_se_le_de_sse() {
+        let corpo = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"order_id\":\"ORD-42\"}}\n\n";
+        let mut ex = exchange();
+        ex.response_body = Some(corpo.to_vec());
+        assert_eq!(extract_facts(&ex).external_effect_id.as_deref(), Some("ORD-42"));
     }
 }

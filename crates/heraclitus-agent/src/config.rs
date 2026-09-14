@@ -406,9 +406,16 @@ impl AgentGatewayConfig {
         if !self.enabled {
             return Ok(());
         }
-        if self.mode != GatewayMode::Observe && self.upstream_url.is_empty() {
+        // Também em `observe`. A excepção que aqui existia era uma falha
+        // silenciosa no MODO que se recomenda usar primeiro: o gateway
+        // arrancava, o `listen_addr` aceitava ligações, o healthcheck passava —
+        // e todos os pedidos davam 502. Um proxy sem para onde encaminhar não é
+        // um proxy em modo de observação; é um proxy partido.
+        if self.upstream_url.is_empty() {
             return Err(ConfigError::Invalid(
-                "o gateway em shadow/enforce precisa de `upstream_url`".into(),
+                "o gateway precisa de `upstream_url` em qualquer modo: sem ele o \
+                 proxy aceita ligações e responde 502 a tudo"
+                    .into(),
             ));
         }
         if production {

@@ -180,10 +180,14 @@ async fn proxy(
         &facts,
         &agent_id,
     );
+    // O hash canónico é dos argumentos CRUS, e tem de o ser: é ele que liga
+    // uma aprovação a UMA execução exacta (§34 da 0075) e é ele que a
+    // deduplicação compara. Redigir o que se MOSTRA não pode mudar aquilo a
+    // que a autorização se vincula.
     requested.content.canonical_content_hash = Some(digest.clone());
-    for (k, v) in &args {
-        requested.content.fields.insert(k.clone(), v.clone());
-    }
+    let redigidos = argumentos_para_persistir(runtime, &args);
+    requested.content.fields = redigidos.content.fields;
+    requested.privacy = redigidos.privacy;
     requested.content.policy = provenance.clone();
     let requested_id = append(runtime, requested);
 
@@ -503,6 +507,35 @@ async fn proxy(
             )
         }
     }
+}
+
+/// Os argumentos de uma tool call, prontos a PERSISTIR.
+///
+/// # Porque é que isto é uma função e não três linhas inline
+///
+/// Porque durante um tempo foram três linhas inline — e estavam erradas. Os
+/// argumentos crus eram inseridos directamente em `content.fields`, enquanto o
+/// preview da tela de aprovação (efémero, que um humano olha uma vez e fecha)
+/// ia redigido. O permanente ficava em claro e o efémero protegido, ao
+/// contrário. Num `tools/call` com `{"api_key": "sk-live-..."}` isso escrevia o
+/// segredo num log append-only, de onde não sai.
+///
+/// A invariante da SPEC-0074 §11 é que uma credencial nunca é persistida em
+/// modo NENHUM — nem em `full_explicit`. Um caminho de escrita que não passe
+/// por [`heraclitus_agent::privacy::apply`] não a pode cumprir, porque é lá que
+/// vivem tanto a lista de campos negados como os detectores de segredo por
+/// forma. Ter isto com nome torna visível qual é esse caminho.
+fn argumentos_para_persistir(
+    runtime: &Arc<AgentRuntime>,
+    args: &BTreeMap<String, String>,
+) -> heraclitus_agent::privacy::RedactionOutcome {
+    heraclitus_agent::privacy::apply(
+        &runtime.config.redaction_profile(),
+        &heraclitus_agent::privacy::RawContent {
+            fields: args.clone(),
+            ..Default::default()
+        },
+    )
 }
 
 /// Os campos que aparecem na tela de aprovação (§34 da 0075).
