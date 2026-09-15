@@ -95,7 +95,9 @@ class MassiveLab:
             a=f'mixed-{i%48:02d}'
             if i%3==0: return 'deny',self.call(a,f'mix-{i}','exec',{'command':'echo SAFE'})[0]
             if i%3==1: return 'allow',self.call(a,f'mix-{i}','lookup_vendor',{'vendor':f'v-{i}'})[0]
-            return 'approval',self.call(a,f'mix-{i}','send_payment',{'amount':1000+i,'account':'synthetic'})[0]
+            # Must cross the policy threshold (>5000); the former 1000+i case
+            # accidentally exercised DEFAULT_DENY instead of REQUIRE_APPROVAL.
+            return 'approval',self.call(a,f'mix-{i}','send_payment',{'amount':6000+i,'account':'synthetic'})[0]
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as ex: out=list(ex.map(one,range(total)))
         groups={k:[s for kk,s in out if kk==k] for k in ('deny','allow','approval')}; after=self.lab.hits(); allow_n=len(groups['allow'])
         delta=(after-before) if before is not None and after is not None else None
@@ -104,7 +106,7 @@ class MassiveLab:
                        detail=f'{total} interleaved decisions',started=t)
 
     def approval_race(self):
-        agent='race-owner'; rid=self.lab.attack_id('race'); req=self.lab.tool(rid,'send_payment',{'amount':4242,'account':'synthetic-race'})
+        agent='race-owner'; rid=self.lab.attack_id('race'); req=self.lab.tool(rid,'send_payment',{'amount':74242,'account':'synthetic-race'})
         s,b,_=self.lab.request(self.cfg['mcp_gateway'],'/mcp','POST',req,self.headers(agent))
         try: approval=b['error']['data']['heraclitus']['approval_id']
         except Exception: approval=None
@@ -177,13 +179,22 @@ class MassiveLab:
                        detail='; '.join(f'{m}={dict(c)}' for m,c in by.items()),started=t)
 
     def final_health(self):
-        s,b,ms=self.lab.request(self.cfg['agent_api'],'/api/v1/agent/status',headers=self.lab.auth_agent()); gc={}; ev='UNKNOWN'
+        s,b,ms=self.lab.request(self.cfg['agent_api'],'/api/v1/agent/status',headers=self.lab.auth_agent())
+        gc={}; ev='UNKNOWN'; mode='UNKNOWN'
         if isinstance(b,dict):
-            gc=b.get('gateway_counters') or (b.get('gateway',{}).get('counters') if isinstance(b.get('gateway'),dict) else {}) or {}
-            ev=(b.get('evidence_log') or {}).get('health') if isinstance(b.get('evidence_log'),dict) else b.get('evidence_log_health','UNKNOWN')
-        evidence_errors=gc.get('evidence_errors') if isinstance(gc,dict) else None; ok=s==200 and evidence_errors in {0,None}
-        self.lab.report(Result(self.lab.attack_id('final-health'),'post-campaign-health','agent:/status','HTTP 200 and evidence_errors=0',
-            f'HTTP {s}; evidence_errors={evidence_errors}; evidence={ev}',ok,s,None,False,None,detail=json.dumps(gc,sort_keys=True)[:500],duration_ms=ms))
+            raw_gateway=b.get('gateway')
+            gc=raw_gateway if isinstance(raw_gateway,dict) else {}
+            raw_ev=b.get('evidence_log')
+            ev=(raw_ev.get('health') if isinstance(raw_ev,dict) else raw_ev) or 'UNKNOWN'
+            mode=b.get('mcp_gateway','UNKNOWN')
+        evidence_errors=gc.get('evidence_errors') if isinstance(gc,dict) else None
+        policy_errors=gc.get('policy_errors') if isinstance(gc,dict) else None
+        upstream_errors=gc.get('upstream_errors') if isinstance(gc,dict) else None
+        ok=(s==200 and mode=='ENFORCE' and ev=='HEALTHY' and evidence_errors==0 and policy_errors==0 and upstream_errors==0)
+        self.lab.report(Result(self.lab.attack_id('final-health'),'post-campaign-health','agent:/status',
+            'HTTP 200, ENFORCE, evidence HEALTHY and all error counters exactly zero',
+            f'HTTP {s}; mode={mode}; evidence={ev}; evidence_errors={evidence_errors}; policy_errors={policy_errors}; upstream_errors={upstream_errors}',
+            ok,s,None,False,None,detail=json.dumps(gc,sort_keys=True)[:500],duration_ms=ms))
 
     def run(self):
         print(f'MASSIVE Agent-Atack-Heraclitus campaign={self.lab.campaign} LOOPBACK-ONLY workers={self.workers} scale={self.scale}')
