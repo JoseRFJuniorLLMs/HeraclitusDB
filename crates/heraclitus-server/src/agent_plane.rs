@@ -130,15 +130,35 @@ impl AgentPlane {
     /// Os gates de §23 da 0074 e §29 da 0075, contra o perfil do host.
     pub fn validate(&self, host: &HeraclitusConfig) -> Result<(), HeraclitusError> {
         let tls = host.tls_cert_path.is_some() && host.tls_key_path.is_some();
-        let auth = host.rest_basic_auth.is_some()
-            || host.auth_token.is_some()
-            || !host.access_credentials.is_empty();
+
+        // AUTH TRUTH: cada superfície conta apenas a credencial que ela
+        // realmente consome. `rest_basic_auth` nunca protege a Console/OTLP.
+        let agent_console_auth = self.black_box.console.has_basic_auth()
+            || (self.gateway.identity.mode == "oidc"
+                && !self.gateway.identity.issuer.is_empty()
+                && !self.gateway.identity.audience.is_empty()
+                && !self.gateway.identity.jwks_path.is_empty());
         self.black_box
-            .validate(host.production_mode, tls, auth)
+            .validate(host.production_mode, tls, agent_console_auth)
             .map_err(|e| HeraclitusError::Config(e.to_string()))?;
         self.gateway
             .validate(host.production_mode, tls)
             .map_err(|e| HeraclitusError::Config(e.to_string()))?;
+
+        // SPEC-0084: loopback is not a trust boundary when the threat is a
+        // compromised LOCAL agent. `enforce` would be a false promise if that
+        // process could simply skip MCP and talk anonymously to Core gRPC/REST.
+        if self.gateway.enabled && self.gateway.mode == GatewayMode::Enforce {
+            let grpc_auth = host.auth_token.is_some() || !host.access_credentials.is_empty();
+            let rest_auth = host.rest_basic_auth.is_some() || !host.access_credentials.is_empty();
+            if !grpc_auth || !rest_auth {
+                return Err(HeraclitusError::Config(format!(
+                    "agent_gateway mode=enforce exige autenticação nas DUAS superfícies Core:                      gRPC={} REST={}. Loopback não é fronteira de confiança contra agente local                      comprometido (SPEC-0084)",
+                    if grpc_auth { "protected" } else { "OPEN" },
+                    if rest_auth { "protected" } else { "OPEN" }
+                )));
+            }
+        }
         Ok(())
     }
 }
@@ -297,6 +317,78 @@ upstream_url = "http://mcp:9000"
         let r = plane.apply_env();
         unsafe { std::env::remove_var("HERACLITUS_AGENT_CAPTURE_MODE") };
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn enforce_recusa_core_grpc_anonimo_mesmo_em_loopback() {
+        let host = HeraclitusConfig {
+            rest_basic_auth: Some("admin:0123456789abcdef".into()),
+            ..Default::default()
+        };
+        let plane = AgentPlane {
+            gateway: AgentGatewayConfig {
+                enabled: true,
+                mode: GatewayMode::Enforce,
+                upstream_url: "http://127.0.0.1:9000".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = plane.validate(&host).unwrap_err().to_string();
+        assert!(err.contains("gRPC=OPEN"), "{err}");
+    }
+
+    #[test]
+    fn enforce_recusa_core_rest_anonimo_mesmo_em_loopback() {
+        let host = HeraclitusConfig {
+            auth_token: Some("0123456789abcdef0123456789abcdef".into()),
+            ..Default::default()
+        };
+        let plane = AgentPlane {
+            gateway: AgentGatewayConfig {
+                enabled: true,
+                mode: GatewayMode::Enforce,
+                upstream_url: "http://127.0.0.1:9000".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let err = plane.validate(&host).unwrap_err().to_string();
+        assert!(err.contains("REST=OPEN"), "{err}");
+    }
+
+    #[test]
+    fn enforce_aceita_core_autenticado_nas_duas_superficies() {
+        let host = HeraclitusConfig {
+            auth_token: Some("0123456789abcdef0123456789abcdef".into()),
+            rest_basic_auth: Some("admin:0123456789abcdef".into()),
+            ..Default::default()
+        };
+        let plane = AgentPlane {
+            gateway: AgentGatewayConfig {
+                enabled: true,
+                mode: GatewayMode::Enforce,
+                upstream_url: "http://127.0.0.1:9000".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(plane.validate(&host).is_ok());
+    }
+
+    #[test]
+    fn shadow_preserva_perfil_dev_loopback_sem_auth() {
+        let host = HeraclitusConfig::default();
+        let plane = AgentPlane {
+            gateway: AgentGatewayConfig {
+                enabled: true,
+                mode: GatewayMode::Shadow,
+                upstream_url: "http://127.0.0.1:9000".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(plane.validate(&host).is_ok());
     }
 
     #[test]
