@@ -8,5 +8,8 @@
   "upstream_hits": "http://127.0.0.1:19000/hits",
   "campaign": "sandbox-demo",
   "concurrency": 64,
+  "massive_agents": 128,
+  "approval_race_workers": 24,
+  "replay_storm": 256,
   "oversized_bytes": 5242880
 }
