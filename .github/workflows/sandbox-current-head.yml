@@ -6,6 +6,12 @@ on:
       - gpt56/agent-security-observability
     paths:
       - .github/workflows/sandbox-current-head.yml
+      - crates/heraclitus-agent/**
+      - crates/heraclitus-agent-gateway/**
+      - crates/heraclitus-server/**
+      - labs/Agent-Atack-Heraclitus/**
+      - Cargo.toml
+      - Cargo.lock
 
 permissions:
   contents: read
