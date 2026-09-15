@@ -1,6 +1,6 @@
 # SPEC-0080 — MCP Non-Tool Governance
 
-**Status:** PROPOSED / implementation in the same qualification branch  
+**Status:** IMPLEMENTED / focused qualification green  
 **Scope:** Heraclitus Agent Policy Gateway  
 **Origin:** sandbox multi-agent red-team, 2026-09-15
 

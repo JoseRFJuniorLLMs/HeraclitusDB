@@ -806,3 +806,76 @@ async fn redteam_lab_fica_no_hrkl_e_aparece_na_api() {
     assert!(!dump.contains("rm -rf"));
     assert!(!dump.to_lowercase().contains("bearer "));
 }
+
+#[tokio::test]
+async fn spec_0080_data_bearing_non_tool_falha_fechado_em_enforce() {
+    let h = harness(GatewayMode::Enforce).await;
+    for (id, method) in [
+        ("r1", "resources/read"),
+        ("p1", "prompts/get"),
+        ("c1", "completion/complete"),
+        ("u1", "vendor/private/read"),
+    ] {
+        let before = h.hits();
+        let (status, body) = post_json(
+            &format!("{}/mcp", h.gateway_url),
+            serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":{}}),
+            &[("x-heraclitus-agent", "compromised-agent")],
+        )
+        .await;
+        assert_eq!(status, 403, "method={method} body={body}");
+        assert_eq!(h.hits(), before, "{method} reached upstream");
+    }
+    let rows = h.runtime.scan().unwrap();
+    assert!(
+        rows.iter()
+            .filter(|r| r.evidence.kind == AgentEvidenceKindV1::ErrorObserved)
+            .count()
+            >= 4
+    );
+    assert_eq!(h.runtime.gateway_counters.snapshot()["evidence_errors"], 0);
+}
+
+#[tokio::test]
+async fn spec_0080_control_methods_continuam_a_passar() {
+    let h = harness(GatewayMode::Enforce).await;
+    for (id, method) in [
+        ("ping", "ping"),
+        ("tl", "tools/list"),
+        ("rl", "resources/list"),
+        ("pl", "prompts/list"),
+    ] {
+        let before = h.hits();
+        let (status, body) = post_json(
+            &format!("{}/mcp", h.gateway_url),
+            serde_json::json!({"jsonrpc":"2.0","id":id,"method":method}),
+            &[],
+        )
+        .await;
+        assert_eq!(status, 200, "method={method} body={body}");
+        assert_eq!(h.hits(), before + 1, "{method} did not reach upstream");
+    }
+}
+
+#[tokio::test]
+async fn spec_0080_shadow_registra_would_deny_mas_nao_bloqueia() {
+    let h = harness(GatewayMode::Shadow).await;
+    let before = h.hits();
+    let (status, _) = post_json(
+        &format!("{}/mcp", h.gateway_url),
+        serde_json::json!({"jsonrpc":"2.0","id":"shadow-read","method":"resources/read","params":{}}),
+        &[("x-heraclitus-agent", "shadow-agent")],
+    ).await;
+    assert_eq!(status, 200);
+    assert_eq!(h.hits(), before + 1);
+    let rows = h.runtime.scan().unwrap();
+    assert!(rows.iter().any(|r| {
+        r.evidence.kind == AgentEvidenceKindV1::ErrorObserved
+            && r.evidence
+                .content
+                .extensions
+                .get("gateway_decision")
+                .map(String::as_str)
+                == Some("would_deny")
+    }));
+}

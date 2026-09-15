@@ -76,6 +76,19 @@ fn mcp_method_is_canonical(method: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'-' | b'.'))
 }
 
+fn mcp_non_tool_control_allowed(method: &str) -> bool {
+    matches!(
+        method,
+        "initialize"
+            | "ping"
+            | "tools/list"
+            | "resources/list"
+            | "resources/templates/list"
+            | "prompts/list"
+            | "logging/setLevel"
+    ) || method.starts_with("notifications/")
+}
+
 async fn proxy(
     State(state): State<Arc<GatewayState>>,
     method: Method,
@@ -212,6 +225,86 @@ async fn proxy(
                 "MCP_METHOD_INVALID",
                 "confusable tools/call method spelling refused before upstream",
             );
+        }
+
+        if mcp_non_tool_control_allowed(method_name) {
+            return forward_or_error(&state, &method, &uri, &upstream_header_map, body).await;
+        }
+
+        // SPEC-0080: data-bearing and unknown non-tool MCP methods do not
+        // inherit an accidental allow merely because they are not tools/call.
+        let mode = runtime.mode();
+        if mode != GatewayMode::Observe {
+            let agent_id = exchange
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| "unknown-agent".to_string());
+            let mut denied = base_evidence(
+                runtime,
+                AgentEvidenceKindV1::ErrorObserved,
+                now_unix_nanos(),
+                &exchange,
+                &facts,
+                &agent_id,
+            );
+            let known_data_method = matches!(
+                method_name,
+                "resources/read"
+                    | "resources/subscribe"
+                    | "resources/unsubscribe"
+                    | "prompts/get"
+                    | "completion/complete"
+            );
+            let reason = if known_data_method {
+                "MCP_NON_TOOL_DENIED"
+            } else {
+                "MCP_UNKNOWN_METHOD_DENIED"
+            };
+            denied
+                .content
+                .extensions
+                .insert("mcp_method".into(), method_name.to_string());
+            denied.content.extensions.insert(
+                "gateway_decision".into(),
+                if mode == GatewayMode::Enforce {
+                    "deny"
+                } else {
+                    "would_deny"
+                }
+                .into(),
+            );
+            denied.outcome = Some(EvidenceOutcomeV1 {
+                transport_status: Some(if mode == GatewayMode::Enforce {
+                    403
+                } else {
+                    200
+                }),
+                protocol_status: Some(reason.into()),
+                error_code: Some(reason.into()),
+                error_message: Some("non-tool MCP method requires explicit governance".into()),
+                ..Default::default()
+            });
+            let gravacao = append(runtime, denied);
+            if let Gravacao::Falhou(motivo) = &gravacao {
+                if mode == GatewayMode::Enforce {
+                    let _ = runtime.flush();
+                    return mcp_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &facts.tool_call_id,
+                        "EVIDENCE_NOT_RECORDED",
+                        motivo,
+                    );
+                }
+            }
+            let _ = runtime.flush();
+            if mode == GatewayMode::Enforce {
+                return mcp_error(
+                    StatusCode::FORBIDDEN,
+                    &facts.tool_call_id,
+                    reason,
+                    "non-tool MCP data/unknown method denied by SPEC-0080",
+                );
+            }
         }
 
         return forward_or_error(&state, &method, &uri, &upstream_header_map, body).await;
