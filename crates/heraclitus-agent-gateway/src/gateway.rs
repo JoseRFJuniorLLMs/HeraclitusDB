@@ -135,6 +135,16 @@ async fn proxy(
         .map(|p| p.subject.clone())
         .or_else(|| header_map.get("x-heraclitus-user").cloned());
 
+    // A policy boundary may never turn a parser failure into passthrough. A
+    // non-empty MCP request with invalid/ambiguous JSON is rejected before the
+    // upstream sees a byte. This closes duplicate-key differential parsing and
+    // excessive-depth bypasses found by the multi-agent red team.
+    if !body.is_empty() {
+        if let Err(detail) = mcp::validate_request_json(&body) {
+            return mcp_error(StatusCode::BAD_REQUEST, &None, "MCP_JSON_INVALID", &detail);
+        }
+    }
+
     // Gateway credentials authenticate to the gateway, not to its upstream.
     let mut upstream_header_map = header_map.clone();
     // Authorization authenticates the caller to this gateway. There is no
