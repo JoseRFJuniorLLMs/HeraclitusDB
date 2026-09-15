@@ -18,18 +18,6 @@ jobs:
           from pathlib import Path
           p=Path('labs/Agent-Atack-Heraclitus/runner_massive.py')
           s=p.read_text()
-          old="""    def credential_separation(self):
-                  aid = self.attack_id('credential-separation')
-                  core_on_agent = self.core_auth(True)
-                  s1, _, _ = self.request(self.cfg['agent_api'], '/api/v1/agent/status', headers=core_on_agent)
-                  agent_on_core = self.auth_agent()
-                  s2, _, ms = self.request(self.cfg['core_rest'], '/stats', headers=agent_on_core)
-                  ok = s1 in {401, 403} and s2 in {401, 403}
-                  self.report(Result(aid, 'credential-plane-separation', 'core↔agent', 'cross-plane credentials rejected',
-                                     f'agent={s1} core={s2}', ok, s2, blocked=ok,
-                                     detail='Core Basic must not authenticate Agent; Agent token must not authenticate Core', duration_ms=ms))
-          """.replace('        ','')
-          # Preserve exact indentation while replacing the function block by markers.
           a=s.index('    def credential_separation(self):')
           b=s.index('\n    def multi_agent_same_rpc_id',a)
           new="""    def credential_separation(self):
@@ -53,9 +41,8 @@ jobs:
           s=s[:a]+new+s[b:]
           bad="detail=f'approval={approval[:18]}… statuses={{{s:statuses.count(s) for s in set(statuses)}}}'))"
           good='detail=f"approval={approval[:18]}… statuses={ {code: statuses.count(code) for code in set(statuses)} }"))'
-          if bad not in s:
-              raise SystemExit('approval status formatting pattern not found')
-          s=s.replace(bad,good)
+          if bad in s:
+              s=s.replace(bad,good)
           p.write_text(s)
           PY
           python3 -m py_compile labs/Agent-Atack-Heraclitus/runner_massive.py
@@ -68,3 +55,4 @@ jobs:
           git add labs/Agent-Atack-Heraclitus/runner_massive.py
           git commit -m 'fix(redteam): distinguish dev-local auth and report approval races'
           git push origin HEAD:gpt56/agent-security-observability
+# rerun after parser differential commit
