@@ -99,14 +99,10 @@ rep(
     "        let v = strict_json(acc.trim().as_bytes()).ok();",
 )
 
-# Tests before the existing test module's final area.
-marker = "#[cfg(test)]\nmod tests {"
-rep(mcp, marker, marker)
-# inject right after mod tests opening/imports by looking for first use super
 rep(
     mcp,
     "mod tests {\n    use super::*;",
-    '''mod tests {
+    r'''mod tests {
     use super::*;
 
     #[test]
@@ -129,7 +125,7 @@ rep(
 
     #[test]
     fn strict_json_rejeita_profundidade_excessiva() {
-        let mut raw = String::from("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"exec\",\"arguments\":{\"x\":");
+        let mut raw = String::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"exec","arguments":{"x":"#);
         raw.push_str(&"[".repeat(256));
         raw.push('0');
         raw.push_str(&"]".repeat(256));
