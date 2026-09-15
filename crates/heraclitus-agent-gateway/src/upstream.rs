@@ -42,6 +42,15 @@ const HOP_BY_HOP: &[&str] = &[
     "content-length",
 ];
 
+/// Prefixo dos cabeçalhos de correlação do Heraclitus.
+///
+/// São nossos e param aqui. Reencaminhá-los dizia a um terceiro na Internet o
+/// nome do utilizador humano (`X-Heraclitus-User: jose`), o identificador do run
+/// e o ambiente — topologia interna publicada a troco de nada, porque o upstream
+/// não sabe o que fazer com eles. Não é um segredo; é informação que ninguém
+/// pediu para divulgar.
+const PREFIXO_CORRELACAO: &str = "x-heraclitus-";
+
 #[derive(Debug, thiserror::Error)]
 pub enum UpstreamError {
     #[error("URL de upstream inválido: {0}")]
@@ -179,6 +188,11 @@ impl UpstreamClient {
             if HOP_BY_HOP.iter().any(|h| k.eq_ignore_ascii_case(h)) {
                 continue;
             }
+            // Os nossos cabeçalhos de correlação param no gateway. Só saem daqui
+            // no sentido do upstream, e o upstream não tem nada a ver com eles.
+            if k.to_ascii_lowercase().starts_with(PREFIXO_CORRELACAO) {
+                continue;
+            }
             let (Ok(name), Ok(value)) = (
                 HeaderName::from_bytes(k.as_bytes()),
                 HeaderValue::from_str(v),
@@ -235,6 +249,31 @@ mod tests {
         assert!(UpstreamClient::new("mcp.interno:9000", 5, 1024).is_err());
         assert!(UpstreamClient::new("ftp://x/", 5, 1024).is_err());
         assert!(UpstreamClient::new("file:///etc/passwd", 5, 1024).is_err());
+    }
+
+    #[test]
+    fn os_cabecalhos_de_correlacao_nao_saem_para_o_upstream() {
+        // O que isto impede: um `tools/call` para um servidor MCP público na
+        // Internet levar consigo `X-Heraclitus-User: jose`. O upstream não pede
+        // essa informação, não a usa, e passa a tê-la.
+        for h in [
+            "X-Heraclitus-User",
+            "x-heraclitus-agent",
+            "X-HERACLITUS-RUN",
+            "X-Heraclitus-Environment",
+        ] {
+            assert!(
+                h.to_ascii_lowercase().starts_with(PREFIXO_CORRELACAO),
+                "`{h}` escapava ao filtro de correlação"
+            );
+        }
+        // E o filtro não pode ser tão largo que apanhe cabeçalhos de terceiros.
+        for h in ["X-Request-Id", "Authorization", "Accept", "x-heraclitus"] {
+            assert!(
+                !h.to_ascii_lowercase().starts_with(PREFIXO_CORRELACAO),
+                "`{h}` estava a ser removido sem ser nosso"
+            );
+        }
     }
 
     #[test]

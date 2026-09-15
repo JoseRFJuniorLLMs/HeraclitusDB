@@ -18,6 +18,7 @@
 
 use crate::auth::{principal_from, Operation, Principal};
 use crate::console;
+use crate::platform;
 use crate::runtime::{now_unix_nanos, now_unix_seconds, AgentRuntime};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -35,12 +36,25 @@ use std::sync::Arc;
 
 pub fn router(runtime: Arc<AgentRuntime>) -> Router {
     Router::new()
-        // ── Consola (0076 §15: assets embutidos, sem Node em produção) ──────
-        .route("/", get(console::index))
-        .route("/runs/:id", get(console::index))
-        .route("/approvals", get(console::index))
-        .route("/policies", get(console::index))
-        .route("/settings", get(console::index))
+        // ── Platform Console (SPEC-0077 §30) ────────────────────────────────
+        //
+        // `/` é do HeraclitusDB. Estava a ser da Agent Console, e era esse o
+        // erro que a 0077 corrige: quem abria o porto da consola via um monitor
+        // de agentes de IA onde devia ver um banco de dados temporal
+        // verificável com um módulo de agentes.
+        .route("/", get(platform::index))
+        .route("/platform.css", get(platform::css))
+        .route("/platform.js", get(platform::js))
+        .route("/api/v1/platform/summary", get(platform::summary))
+        // ── Agent Console (0076 §15: assets embutidos, sem Node em produção) ─
+        //
+        // Sob `/agent`, não na raiz. O roteamento interno é por hash
+        // (`#/runs`), portanto uma só rota serve a aplicação inteira; o
+        // wildcard existe para que um link antigo `/agent/qualquer-coisa`
+        // continue a abrir a consola em vez de dar 404.
+        .route("/agent", get(console::index))
+        .route("/agent/", get(console::index))
+        .route("/agent/*resto", get(console::index))
         .route("/console.css", get(console::css))
         .route("/console.js", get(console::js))
         // SPEC-0074 §21 / SPEC-0075 §30 — as métricas do plano de agentes.
@@ -84,17 +98,32 @@ fn problem(status: StatusCode, code: &str, detail: impl Into<String>, action: &s
         .into_response()
 }
 
-fn forbidden((status, detail): (StatusCode, String)) -> Response {
-    problem(
-        status,
-        if status == StatusCode::UNAUTHORIZED {
-            "IDENTITY_VALIDATION_FAILED"
+/// Converte uma recusa de autenticação numa resposta HTTP.
+///
+/// O `WWW-Authenticate` não é decorativo: é ele que faz o browser abrir a caixa
+/// de utilizador/senha. Sem ele, quem abre a Consola numa consola protegida vê
+/// um JSON de erro e não tem por onde autenticar-se.
+fn forbidden(rejeicao: crate::auth::AuthRejection) -> Response {
+    let corpo = Json(serde_json::json!({
+        "error": rejeicao.code,
+        "detail": rejeicao.detail,
+        "operator_action": if rejeicao.challenge {
+            "introduza o utilizador e a senha da consola"
+        } else if rejeicao.status == StatusCode::UNAUTHORIZED {
+            "apresente uma credencial válida"
         } else {
-            "FORBIDDEN"
+            "peça a um administrador o papel necessário, ou use uma credencial com esse papel"
         },
-        detail,
-        "peça a um administrador o papel necessário, ou use uma credencial com esse papel",
-    )
+    }));
+    if rejeicao.challenge {
+        return (
+            rejeicao.status,
+            [(header::WWW_AUTHENTICATE, crate::auth::BASIC_REALM)],
+            corpo,
+        )
+            .into_response();
+    }
+    (rejeicao.status, corpo).into_response()
 }
 
 // O `Err` destes dois helpers é uma `Response` já pronta (128 bytes), e o
@@ -153,7 +182,11 @@ async fn status(State(runtime): State<Arc<AgentRuntime>>, headers: HeaderMap) ->
     Json(serde_json::json!({
         "product": "Heraclitus Agent Black Box",
         "engine": format!("HeraclitusDB {}", env!("CARGO_PKG_VERSION")),
-        "auth": if principal.dev_local { "dev_local" } else { "oidc" },
+        "auth": runtime.auth_mode().label(),
+        // §28: com uma credencial partilhada os papéis não distinguem pessoas.
+        // A Consola tem de o mostrar; esconder seria deixar alguém supor que
+        // tem RBAC a sério.
+        "auth_identifies_people": runtime.auth_mode().identifies_people(),
         "principal": principal,
         "evidence_log": if integrity.broken > 0 { "DEGRADED" } else { "HEALTHY" },
         "otlp_ingest": if runtime.config.enabled { "HEALTHY" } else { "DISABLED" },

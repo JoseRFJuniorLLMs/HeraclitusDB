@@ -96,6 +96,14 @@ impl AgentPlane {
         if let Ok(v) = std::env::var("HERACLITUS_AGENT_CONSOLE_ADDR") {
             self.black_box.console.addr = v;
         }
+        // A credencial partilhada. Deliberadamente NAO ha default: uma senha
+        // por omissao seria uma porta aberta com aparencia de fechada.
+        if let Ok(v) = std::env::var("HERACLITUS_AGENT_CONSOLE_BASIC_AUTH") {
+            self.black_box.console.basic_auth = v;
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_AGENT_OTLP_REQUIRE_AUTH") {
+            self.black_box.otlp.require_auth = truthy(&v);
+        }
         if let Ok(v) = std::env::var("HERACLITUS_AGENT_GATEWAY_ENABLED") {
             self.gateway.enabled = truthy(&v);
         }
@@ -189,17 +197,40 @@ impl EvidenceLog for EngineEvidenceStore {
     }
 }
 
-/// Constrói o runtime do plano de agentes a partir do motor e da configuração.
+/// Constrói o runtime que serve o porto da consola.
+///
+/// # Porque é que isto corre mesmo com o módulo de agentes DESLIGADO
+///
+/// SPEC-0077 §21/§48: a Platform Console é a superfície do HeraclitusDB, e o
+/// HeraclitusDB não depende do módulo de agentes para existir. Com o módulo
+/// desligado este runtime serve `/` e mais nada — nenhum listener OTLP, nenhum
+/// proxy MCP, nenhuma rota de agente com conteúdo.
+///
+/// O que fica ATRÁS do interruptor é o trabalho caro: `warm()` percorre o log
+/// inteiro (0..head) para reconstruir o índice de deduplicação. Correr isso no
+/// arranque de quem nunca ligou agentes seria fazer toda a gente pagar por uma
+/// funcionalidade que não pediu — num log de gigabytes, minutos de arranque.
 pub fn build_runtime(
     engine: Arc<crate::engine::Engine>,
     plane: &AgentPlane,
-    data_dir: &Path,
+    config: &HeraclitusConfig,
 ) -> Result<Arc<AgentRuntime>, HeraclitusError> {
+    let ligado = plane.enabled();
+    let fonte = Arc::new(crate::platform_source::EnginePlatformSource::new(
+        engine.clone(),
+        config,
+        ligado,
+    ));
     let store = Arc::new(EngineEvidenceStore::new(engine));
     let mut runtime = AgentRuntime::new(plane.black_box.clone(), plane.gateway.clone(), store)
-        .with_bundles_dir(data_dir.join("agent-bundles"));
+        .with_bundles_dir(config.data_dir.join("agent-bundles"));
     runtime.load_validator()?;
-    let runtime = Arc::new(runtime);
+    runtime.load_console_credential()?;
+    let runtime = Arc::new(runtime.with_platform(fonte));
+    if !ligado {
+        tracing::info!("módulo de agentes desligado; a servir só a Platform Console");
+        return Ok(runtime);
+    }
     runtime.load_policy()?;
     // Reconstruir o índice de deduplicação a partir do log: sem isto, um
     // reinício seguido da retransmissão de um lote OTLP duplicaria a história

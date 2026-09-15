@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HeraclitusDB</title>
+<link rel="stylesheet" href="/platform.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>◧</text></svg>">
+</head>
+<body>
+<div id="auth-banner" class="banner banner-dev" hidden></div>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="mark">◧</span>
+    <span class="name"><strong>HeraclitusDB</strong></span>
+    <span class="tagline">Temporal, Verifiable Data &amp; Intelligence Platform</span>
+  </div>
+  <nav id="nav">
+    <a href="#/overview" data-route="overview">Overview</a>
+    <a href="#/data" data-route="data">Data</a>
+    <a href="#/integrity" data-route="integrity">Integrity</a>
+    <a href="#/modules" data-route="modules">Modules</a>
+  </nav>
+  <div class="status">
+    <span id="integrity-chip" class="chip chip-unknown">&mdash;</span>
+  </div>
+</header>
+
+<main id="view"><p class="muted">Loading&hellip;</p></main>
+
+<footer>
+  <span id="footer-engine" class="muted"></span>
+  <span class="muted"> &middot; append-only, temporal, verifiable</span>
+</footer>
+
+<script src="/platform.js"></script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+[
+  { "id": "CTR-9001", "org": "ORG-1", "supplier": "SUP-100", "amount_cents": 480000000, "signed": "2024-03-11", "object": "hospital supplies" },
+  { "id": "CTR-9002", "org": "ORG-2", "supplier": "SUP-200", "amount_cents": 125000000, "signed": "2024-07-02", "object": "fleet maintenance" },
+  { "id": "CTR-9003", "org": "ORG-1", "supplier": "SUP-300", "amount_cents":  61000000, "signed": "2025-01-20", "object": "cleaning services" }
+]

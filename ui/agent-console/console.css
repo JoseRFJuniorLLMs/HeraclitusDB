@@ -80,6 +80,11 @@ a:hover { text-decoration: underline; }
 .brand { display: flex; align-items: center; gap: 8px; font-size: 15px; }
 .brand .mark { color: var(--accent); font-size: 18px; }
 .brand .name strong { font-weight: 650; }
+/* SPEC-0077 §19 — a Agent Console é um módulo, e a marca diz de quem é. O link
+ * para `/` não é decorativo: é a única coisa na página que revela que existe
+ * um produto por cima deste ecrã. */
+.brand .up { color: var(--muted); }
+.brand .sep { color: var(--line); }
 
 nav { display: flex; gap: 4px; flex: 1; flex-wrap: wrap; }
 nav a {

@@ -1,0 +1,5 @@
+[
+  { "id": "SUP-100", "name": "Northwind Medical Ltda", "tax_id": "11.111.111/0001-11", "owner": "PER-1" },
+  { "id": "SUP-200", "name": "Bramante Logistica SA",  "tax_id": "22.222.222/0001-22", "owner": "PER-2" },
+  { "id": "SUP-300", "name": "Cedro Servicos ME",      "tax_id": "33.333.333/0001-33", "owner": "PER-1" }
+]

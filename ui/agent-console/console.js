@@ -81,10 +81,43 @@ function decisionPill(decision, enforced) {
 
 // ── estado global ───────────────────────────────────────────────────────────
 
+// §28 — o que a autenticacao em vigor consegue e nao consegue provar.
+//
+// Sao tres estados, nao dois. O do meio e o que engana: uma senha partilhada
+// fecha a porta, mas toda a gente que entra e "admin". Os papeis `approver` e
+// `policy_admin`, que a 0076 separa de proposito, deixam de separar pessoa
+// nenhuma — quem aprova e quem escreve a politica sao o mesmo sujeito no log.
+// Dizer isto em voz alta e mais util do que um cadeado verde que mente.
+function authBanner() {
+  const el = document.getElementById('auth-banner');
+  el.textContent = '';
+  const forte = document.createElement('strong');
+  let resto;
+  if (STATUS.auth === 'dev_local') {
+    el.className = 'banner banner-dev';
+    forte.textContent = 'DEVELOPMENT PROFILE';
+    resto = ' \u2014 no authentication is configured. Anyone who can reach this ' +
+      'port has full access. Configure OIDC before using this outside a laptop.';
+  } else if (STATUS.auth_identifies_people === false) {
+    el.className = 'banner banner-dev';
+    forte.textContent = 'SHARED PASSWORD';
+    resto = ' \u2014 access is gated, but every session is the same subject (' +
+      STATUS.principal.subject + '). Approvals and policy changes cannot be ' +
+      'attributed to a person, so the approver / policy_admin separation is not ' +
+      'in force. Configure OIDC before relying on this evidence for attribution.';
+  } else {
+    el.hidden = true;
+    return;
+  }
+  el.appendChild(forte);
+  el.appendChild(document.createTextNode(resto));
+  el.hidden = false;
+}
+
 async function loadStatus() {
   STATUS = await api('/api/v1/agent/status');
   document.getElementById('footer-engine').textContent = STATUS.engine;
-  document.getElementById('dev-banner').hidden = STATUS.auth !== 'dev_local';
+  authBanner();
 
   const state = STATUS.summary.integrity;
   const c = document.getElementById('integrity-chip');

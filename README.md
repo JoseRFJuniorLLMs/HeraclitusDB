@@ -2,264 +2,125 @@
   <img src="img/logo.jpg" alt="Heraclitus Logo" width="300" />
 </p>
 
-<h1 align="center">Heraclitus Agent Black Box</h1>
+<h1 align="center">HeraclitusDB</h1>
 
-<p align="center"><b>Saiba exactamente o que o seu agente de IA fez.<br>
-Prove quem autorizou. Detecte qualquer alteração posterior no histórico.</b></p>
+<p align="center"><b>Temporal, Verifiable Data &amp; Intelligence Platform</b></p>
+
+<p align="center">
+Uma plataforma de dados append-only e multi-modelo para consultas temporais,
+recuperação por grafo/vector/texto, proveniência auditável e história
+criptograficamente verificável.
+</p>
 
 <p align="center">
   <a href="#️-licença-e-modelo-comercial"><img src="https://img.shields.io/badge/license-BSL%201.1-blue" alt="BSL 1.1"></a>
   <img src="https://img.shields.io/badge/version-v2.0.0-brightgreen" alt="v2.0.0">
   <img src="https://img.shields.io/badge/core-Rust%20stable%202021-orange" alt="Rust stable">
-  <img src="https://img.shields.io/badge/OpenTelemetry-GenAI%20semconv-blueviolet" alt="OTel GenAI">
-  <img src="https://img.shields.io/badge/MCP-2026--07--28-purple" alt="MCP 2026-07-28">
-  <img src="https://img.shields.io/badge/evidence-tamper--evident-success" alt="tamper-evident">
+  <img src="https://img.shields.io/badge/history-append--only-informational" alt="append-only">
+  <img src="https://img.shields.io/badge/integrity-Merkle%20%2B%20RFC3161-success" alt="tamper-evident">
 </p>
 
 ---
 
-## O problema
+## Porquê
 
-Um agente de IA escolhe ferramentas, encadeia ferramentas, age em nome de uma
-pessoa, usa credenciais delegadas e altera estado externo. A observabilidade
-tradicional responde a *"o que aconteceu?"*. Uma auditoria precisa de mais:
+Em bases de dados tradicionais, `UPDATE` e `DELETE` destroem a história física.
+Em ambientes regulados — auditoria pública, investigação de fraude, compliance,
+memória de agentes — isso produz duas falhas que ninguém consegue detectar
+depois: **adulteração retroativa invisível** e **amnésia estrutural**.
+
+No HeraclitusDB a verdade primária é o log de eventos. Nada é sobrescrito;
+corrige-se acrescentando. Qualquer estado passado é consultável `AS OF`, e
+qualquer alteração física no disco é detectada por provas de Merkle canónicas.
 
 ```text
-quem iniciou?                  qual política estava vigente?
-qual agente executou?          houve aprovação humana?
-em nome de quem?               qual foi o efeito externo?
-qual ferramenta foi chamada?   o histórico foi alterado depois?
-quais argumentos efectivos?    consigo verificar isso offline?
+                              HERACLITUSDB
+                                   │
+        ┌──────────────────┬───────┴───────┬──────────────────┐
+        ▼                  ▼               ▼                  ▼
+  DATA PLATFORM      INTELLIGENCE      ANALYTICS          SENTINEL
+                                                               │
+                                                     AGENT EVIDENCE
+                                                       & CONTROL
 ```
 
-O Heraclitus regista cada execução relevante num histórico append-only
-verificável, liga as tool calls às suas evidências e exporta um pacote que pode
-ser conferido offline — **sem trocar a base de dados ou o framework da
-aplicação**.
+Todos os módulos assentam no mesmo motor: HRKL, temporalidade, índices, query,
+proveniência, Merkle, compliance, armazenamento.
 
 ---
 
-## Como se parece
+## Quickstart — a plataforma
 
-```text
-┌─────────────────────────────────────────────────────────────┐
-│ Heraclitus Agent Black Box                   ● VERIFIED     │
-├─────────────────────────────────────────────────────────────┤
-│ Runs                                                        │
-│                                                             │
-│ 08:41  procurement-agent   7 tools   1 approval   success   │
-│ 08:37  support-agent       2 tools   0 approval   success   │
-│ 08:31  coding-agent        9 tools   2 denied     failed    │
-└─────────────────────────────────────────────────────────────┘
-
-Run 01J...                          Integrity: VERIFIED
-──────────────────────────────────────────────────────────────
-08:41:02  Run started
-08:41:03  Model invocation: claude-opus-5
-08:41:04  Tool requested: lookup_vendor
-08:41:04  Policy: ALLOW
-08:41:04  Tool result: lookup_vendor
-08:41:07  Tool requested: send_payment
-08:41:07  Policy: REQUIRE_APPROVAL          finance-large
-08:41:19  Approved by finance-cfo
-08:41:20  Tool executing: send_payment
-08:41:21  External effect: payment-84723
-08:41:22  Agent output
-```
-
----
-
-## Quickstart — cinco minutos
+Sem agentes de IA, sem LLM, sem rede, sem chave de API.
 
 ```bash
 git clone https://github.com/JoseRFJuniorLLMs/HeraclitusDB
-cd HeraclitusDB/examples/agent-black-box
-docker compose up -d
+cd HeraclitusDB
+cargo build --release
 
-export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
-python sample-python-agent/sample.py
+# 1. arrancar
+./target/release/heraclitus-server config.toml.example
+
+# 2. carregar o dataset de exemplo (fixtures no repositório, sem rede)
+pip install ./sdk/python
+python examples/data-platform/tour.py --addr 127.0.0.1:7474
 ```
 
-Abra <http://localhost:8080>.
+O `tour.py` faz os cinco passos numa corrida: ingere, consulta, atravessa o
+grafo, lê o passado com `AS OF LSN` e verifica a integridade.
 
-Se a sua aplicação já exporta OpenTelemetry, a variável de ambiente é a
-integração inteira. Sem Docker:
+Depois, a partir de qualquer shell — sem depender de o servidor ser honesto:
 
 ```bash
-cargo run --release -p heraclitus-cli -- agent demo ./data
+./target/release/heraclitus log-inspect ./data     # head, segmentos, raízes
+./target/release/heraclitus verify    ./data       # Merkle + CRC de tudo
+./target/release/heraclitus manifest show ./data   # o HRKM interno
 ```
 
 | porta | superfície |
 |---|---|
-| 8080 | Consola + API de evidência |
-| 4318 | OTLP/HTTP |
-| 4317 | OTLP/gRPC (opcional) |
-| 8787 | proxy MCP (opcional) |
+| 8080 | **Platform Console** (`/`) e Agent Evidence Console (`/agent`) |
+| 7474 | gRPC |
+| 7475 | REST |
+
+Ver [`examples/data-platform/`](examples/data-platform/) e
+[`docs/getting-started/quickstart.md`](docs/getting-started/quickstart.md).
 
 ---
 
-## O que é capturado
+## Casos de uso
 
-Um span sem marca GenAI **não** vira evidência de agente — o tracing HTTP normal
-da aplicação não entra no histórico.
-
-| kind | quando |
+| caso | o que o Heraclitus dá |
 |---|---|
-| `RunStarted` / `RunFinished` | o run do agente |
-| `ModelInvocationStarted` / `Finished` | uma chamada ao modelo |
-| `ToolRequested` | o agente pediu a ferramenta |
-| `PolicyEvaluated` | a policy decidiu |
-| `ToolAuthorized` / `ToolDenied` | o gateway autorizou ou recusou |
-| `HumanApprovalRequested` / `Granted` / `Denied` | a decisão humana |
-| `ToolInvocationStarted` / `Finished` | a execução e o resultado |
-| `ExternalEffectObserved` | `payment_id`, `commit_sha`, `ticket_id`… |
-| `ErrorObserved` | falha de transporte ou de protocolo |
-| `AgentOutputProduced`, `ArtifactReferenced` | saída e artefactos |
+| **Inteligência sobre dados públicos** | contratos, compras, pagamentos, fornecedores, sanções — correlacionados no tempo, com proveniência de cada facto |
+| **Fraude e compliance** | grafo de entidades, resolução probabilística, hipóteses com log-odds, contrafactuais |
+| **Auditoria e proveniência** | de um registo até à sua origem: fonte → ingestão → evento → LSN → prova de Merkle |
+| **Analytics temporal** | `AS OF LSN` / `AS OF TIMESTAMP` sobre SQL (DataFusion/Arrow) |
+| **Recuperação para IA** | texto (BM25) + vector (HNSW) + grafo + atributos, fundidos por RRF |
+| **Cibersegurança / SOC** | Sentinel L0–L6: Sigma, baseline, correlação causal, resposta reversível |
+| **Evidência de agentes de IA** | OTLP GenAI, proxy MCP, policy, aprovação humana, Evidence Bundle verificável offline |
 
-Cada uma traz identidade do agente, identidade humana, delegação, hashes de
-conteúdo, referência de policy e referência de aprovação. A retransmissão de um
-lote OpenTelemetry **não duplica** a história.
+Nenhum destes é a identidade exclusiva do produto.
 
 ---
 
-## Verificar — e falhar honestamente
+## Módulos
 
-```bash
-heraclitus agent export /var/lib/heraclitus --to evidence.zip --run run-abc123
-heraclitus agent verify evidence.zip
-```
+Cada um é opcional. O núcleo funciona sem todos eles, e a
+[Platform Console](#quickstart--a-plataforma) mostra o estado **real** de cada
+um — `ENABLED`, `DISABLED`, `DEGRADED`, `NOT CONFIGURED` ou `NOT BUILT`.
 
-```text
-Bundle:           01J...
-Records:          1847
-LSN range:        9981..11827
-File digests:     VALID
-Merkle proofs:    VALID
-Logical roots:    VALID
-Missing records:  0
-Broken parents:   0
-Policy links:     17 VALID (of 17)
-Approvals:        2 VALID (of 2)
-
-VERDICT: VERIFIED
-```
-
-Mude um byte:
-
-```bash
-printf 'X' | dd of=evidence.zip bs=1 seek=900 conv=notrunc
-heraclitus agent verify evidence.zip
-```
-
-```text
-VERDICT: DIGEST_MISMATCH
-```
-
-…e o código de saída passa a 3. O verificador não precisa de rede, de base de
-dados nem do servidor. Sem o binário, os digests continuam conferíveis com
-`unzip` e `sha256sum -c`.
-
-Os quatro estados de integridade são honestos: `VERIFIED`, `PARTIAL`,
-`UNVERIFIED`, `BROKEN`. **"Não verificado" nunca vira "válido".**
+| módulo | o que faz | como se liga |
+|---|---|---|
+| **Agent Evidence & Control** | captura e controla actividade de agentes de IA | `[agent_black_box] enabled = true` |
+| **Sentinel** | analítica de segurança e resposta a incidentes | `[sentinel] enabled = true` |
+| **Analytics** | SQL sobre o log via DataFusion/Arrow | `--features analytics` |
+| **Compliance** | carimbo RFC 3161 e ancoragem de evidência | `compliance_enabled` + TSA |
+| **Cold tier** | segmentos selados para object storage | `--features tier` |
+| **Replication** | consenso Raft entre nós | `--features replication` |
+| **GPU** | dispatch wgpu para recall exacto | `--features gpu` |
 
 ---
-
-## Autorizar, não só observar
-
-Ponha o Heraclitus à frente dos seus servidores MCP:
-
-```yaml
-version: "agent-policy-v1"
-defaults:
-  decision: deny
-rules:
-  - id: finance-large
-    match:
-      server: finance
-      tool: send_payment
-      conditions:
-        - field: amount
-          op: gt
-          value: 50000
-    decision: require_approval
-    approval:
-      roles: ["cfo"]
-      ttl_seconds: 180
-```
-
-```text
-observe  ->  shadow  ->  enforce
-```
-
-Comece por `shadow`: a policy é avaliada e registada, e a Consola mostra
-`would deny` — sem bloquear nada. Antes de activar, veja o que teria acontecido:
-
-```bash
-heraclitus agent policy simulate nova.yaml --data-dir /var/lib/heraclitus
-```
-
-```text
-historical tool calls: 18442
-ALLOW:               17912
-DENY:                  183
-REQUIRE_APPROVAL:      347
-changed vs active:      81
-```
-
-**A aprovação está ligada ao conteúdo exacto.** Aprovar
-`send_payment(amount=5000)` e executar `send_payment(amount=5001)` falha com
-`APPROVAL_BINDING_MISMATCH`. A aprovação é de uso único e expira.
-
----
-
-## Privacidade
-
-Por omissão, `METADATA_ONLY`:
-
-| o quê | estado |
-|---|---|
-| corpos de prompt | **OFF** |
-| corpos de completion | **OFF** |
-| argumentos de ferramenta | metadados + hash canónico |
-| resultados de ferramenta | metadados + hash canónico |
-| `Authorization`, `Cookie`, chaves de API | **nunca persistidos, em modo nenhum** |
-
-A última linha não tem excepção: `FULL_EXPLICIT` autoriza guardar o corpo de uma
-tool call; **não** autoriza guardar o bearer token que a acompanhava.
-
-O produto não promete detectar todo o segredo possível. Por isso o default é não
-guardar o corpo: os detectores de forma conhecida são a segunda linha, não a
-primeira.
-
----
-
-## Documentação do produto
-
-| ficheiro | assunto |
-|---|---|
-| [`docs/agent/quickstart.md`](docs/agent/quickstart.md) | do zero ao pacote verificado |
-| [`docs/agent/otel.md`](docs/agent/otel.md) | o que é capturado do OpenTelemetry |
-| [`docs/agent/mcp.md`](docs/agent/mcp.md) | captura e gateway MCP |
-| [`docs/agent/privacy.md`](docs/agent/privacy.md) | modos de captura e redacção |
-| [`docs/agent/evidence.md`](docs/agent/evidence.md) | o Evidence Bundle e a verificação |
-| [`docs/agent/policy.md`](docs/agent/policy.md) | a linguagem de policy |
-
-Especificações: [SPEC-0074](docs/md/SPEC-new/SPEC-0074-Agent-Black-Box.md),
-[SPEC-0075](docs/md/SPEC-new/SPEC-0075-Agent-Policy-Gateway.md),
-[SPEC-0076](docs/md/SPEC-new/SPEC-0076-Agent-Evidence-Console.md).
-
----
-
-## O motor por baixo
-
-O Agent Black Box é a superfície. O motor é o **HeraclitusDB** — um banco de
-dados append-only com raízes de Merkle canónicas, viagem no tempo determinística
-e multi-indexação. Não é preciso entendê-lo para usar o produto; o resto deste
-documento descreve-o, para quem quiser.
-
-A camada **Sentinel** (SOC) continua no repositório e continua a funcionar. Não
-aparece no quickstart, não é a página inicial e não é necessária para o Agent
-Black Box.
 
 ---
 
@@ -627,7 +488,7 @@ cargo run -p heraclitus-qualifier -- run --profile gov-production --out qa-evide
 cargo run -p heraclitus-qualifier -- verify --evidence qa-evidence/gov-20260901 --binary target/release/heraclitus-server.exe
 
 # Diagnóstico estrito de configuração (rejeita chaves incorretas que poderiam desativar TLS)
-cargo run -p heraclitus-qualifier -- doctor --config heraclitus.toml
+cargo run -p heraclitus-qualifier -- doctor heraclitus.toml
 
 # Gerar SBOM CycloneDX determinístico da cadeia de suprimentos
 cargo run -p heraclitus-qualifier -- sbom --out bom.cdx.json
@@ -659,6 +520,262 @@ Toda a engenharia do HeraclitusDB é regida por especificações normativas estr
 
 ---
 
+## Agent Evidence & Control
+
+> O módulo de evidência de agentes de IA (SPEC-0074/0075/0076). Opcional,
+> desligado por omissão, e servido em `/agent` — não na raiz.
+
+<details>
+<summary><b>Abrir a documentação do módulo</b></summary>
+
+### O problema
+
+Um agente de IA escolhe ferramentas, encadeia ferramentas, age em nome de uma
+pessoa, usa credenciais delegadas e altera estado externo. A observabilidade
+tradicional responde a *"o que aconteceu?"*. Uma auditoria precisa de mais:
+
+```text
+quem iniciou?                  qual política estava vigente?
+qual agente executou?          houve aprovação humana?
+em nome de quem?               qual foi o efeito externo?
+qual ferramenta foi chamada?   o histórico foi alterado depois?
+quais argumentos efectivos?    consigo verificar isso offline?
+```
+
+O Heraclitus regista cada execução relevante num histórico append-only
+verificável, liga as tool calls às suas evidências e exporta um pacote que pode
+ser conferido offline — **sem trocar a base de dados ou o framework da
+aplicação**.
+
+---
+
+### Como se parece
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│ HeraclitusDB / Agent Evidence                ● VERIFIED     │
+├─────────────────────────────────────────────────────────────┤
+│ Runs                                                        │
+│                                                             │
+│ 08:41  procurement-agent   7 tools   1 approval   success   │
+│ 08:37  support-agent       2 tools   0 approval   success   │
+│ 08:31  coding-agent        9 tools   2 denied     failed    │
+└─────────────────────────────────────────────────────────────┘
+
+Run 01J...                          Integrity: VERIFIED
+──────────────────────────────────────────────────────────────
+08:41:02  Run started
+08:41:03  Model invocation: claude-opus-5
+08:41:04  Tool requested: lookup_vendor
+08:41:04  Policy: ALLOW
+08:41:04  Tool result: lookup_vendor
+08:41:07  Tool requested: send_payment
+08:41:07  Policy: REQUIRE_APPROVAL          finance-large
+08:41:19  Approved by finance-cfo
+08:41:20  Tool executing: send_payment
+08:41:21  External effect: payment-84723
+08:41:22  Agent output
+```
+
+---
+
+### Quickstart — cinco minutos
+
+```bash
+git clone https://github.com/JoseRFJuniorLLMs/HeraclitusDB
+cd HeraclitusDB/examples/agent-black-box
+docker compose up -d
+
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+python sample-python-agent/sample.py
+```
+
+Abra <http://localhost:8080/agent>. A raiz (`/`) é a Platform Console.
+
+Se a sua aplicação já exporta OpenTelemetry, a variável de ambiente é a
+integração inteira. Sem Docker:
+
+```bash
+cargo run --release -p heraclitus-cli -- agent demo ./data
+```
+
+| porta | superfície |
+|---|---|
+| 8080 | Consola + API de evidência |
+| 4318 | OTLP/HTTP |
+| 4317 | OTLP/gRPC (opcional) |
+| 8787 | proxy MCP (opcional) |
+
+---
+
+### O que é capturado
+
+Um span sem marca GenAI **não** vira evidência de agente — o tracing HTTP normal
+da aplicação não entra no histórico.
+
+| kind | quando |
+|---|---|
+| `RunStarted` / `RunFinished` | o run do agente |
+| `ModelInvocationStarted` / `Finished` | uma chamada ao modelo |
+| `ToolRequested` | o agente pediu a ferramenta |
+| `PolicyEvaluated` | a policy decidiu |
+| `ToolAuthorized` / `ToolDenied` | o gateway autorizou ou recusou |
+| `HumanApprovalRequested` / `Granted` / `Denied` | a decisão humana |
+| `ToolInvocationStarted` / `Finished` | a execução e o resultado |
+| `ExternalEffectObserved` | `payment_id`, `commit_sha`, `ticket_id`… |
+| `ErrorObserved` | falha de transporte ou de protocolo |
+| `AgentOutputProduced`, `ArtifactReferenced` | saída e artefactos |
+
+Cada uma traz identidade do agente, identidade humana, delegação, hashes de
+conteúdo, referência de policy e referência de aprovação. A retransmissão de um
+lote OpenTelemetry **não duplica** a história.
+
+---
+
+### Verificar — e falhar honestamente
+
+```bash
+heraclitus agent export /var/lib/heraclitus --to evidence.zip --run run-abc123
+heraclitus agent verify evidence.zip
+```
+
+```text
+Bundle:           01J...
+Records:          1847
+LSN range:        9981..11827
+File digests:     VALID
+Merkle proofs:    VALID
+Logical roots:    VALID
+Missing records:  0
+Broken parents:   0
+Policy links:     17 VALID (of 17)
+Approvals:        2 VALID (of 2)
+
+VERDICT: VERIFIED
+```
+
+Mude um byte:
+
+```bash
+printf 'X' | dd of=evidence.zip bs=1 seek=900 conv=notrunc
+heraclitus agent verify evidence.zip
+```
+
+```text
+VERDICT: DIGEST_MISMATCH
+```
+
+…e o código de saída passa a 3. O verificador não precisa de rede, de base de
+dados nem do servidor. Sem o binário, os digests continuam conferíveis com
+`unzip` e `sha256sum -c`.
+
+Os quatro estados de integridade são honestos: `VERIFIED`, `PARTIAL`,
+`UNVERIFIED`, `BROKEN`. **"Não verificado" nunca vira "válido".**
+
+---
+
+### Autorizar, não só observar
+
+Ponha o Heraclitus à frente dos seus servidores MCP:
+
+```yaml
+version: "agent-policy-v1"
+defaults:
+  decision: deny
+rules:
+  - id: finance-large
+    match:
+      server: finance
+      tool: send_payment
+      conditions:
+        - field: amount
+          op: gt
+          value: 50000
+    decision: require_approval
+    approval:
+      roles: ["cfo"]
+      ttl_seconds: 180
+```
+
+```text
+observe  ->  shadow  ->  enforce
+```
+
+Comece por `shadow`: a policy é avaliada e registada, e a Consola mostra
+`would deny` — sem bloquear nada. Antes de activar, veja o que teria acontecido:
+
+```bash
+heraclitus agent policy simulate nova.yaml --data-dir /var/lib/heraclitus
+```
+
+```text
+historical tool calls: 18442
+ALLOW:               17912
+DENY:                  183
+REQUIRE_APPROVAL:      347
+changed vs active:      81
+```
+
+**A aprovação está ligada ao conteúdo exacto.** Aprovar
+`send_payment(amount=5000)` e executar `send_payment(amount=5001)` falha com
+`APPROVAL_BINDING_MISMATCH`. A aprovação é de uso único e expira.
+
+---
+
+### Privacidade
+
+Por omissão, `METADATA_ONLY`:
+
+| o quê | estado |
+|---|---|
+| corpos de prompt | **OFF** |
+| corpos de completion | **OFF** |
+| argumentos de ferramenta | metadados + hash canónico |
+| resultados de ferramenta | metadados + hash canónico |
+| `Authorization`, `Cookie`, chaves de API | **nunca persistidos, em modo nenhum** |
+
+A última linha não tem excepção: `FULL_EXPLICIT` autoriza guardar o corpo de uma
+tool call; **não** autoriza guardar o bearer token que a acompanhava.
+
+O produto não promete detectar todo o segredo possível. Por isso o default é não
+guardar o corpo: os detectores de forma conhecida são a segunda linha, não a
+primeira.
+
+---
+
+### Documentação do produto
+
+| ficheiro | assunto |
+|---|---|
+| [`docs/agent/quickstart.md`](docs/agent/quickstart.md) | do zero ao pacote verificado |
+| [`docs/agent/otel.md`](docs/agent/otel.md) | o que é capturado do OpenTelemetry |
+| [`docs/agent/mcp.md`](docs/agent/mcp.md) | captura e gateway MCP |
+| [`docs/agent/privacy.md`](docs/agent/privacy.md) | modos de captura e redacção |
+| [`docs/agent/evidence.md`](docs/agent/evidence.md) | o Evidence Bundle e a verificação |
+| [`docs/agent/policy.md`](docs/agent/policy.md) | a linguagem de policy |
+
+Especificações: [SPEC-0074](docs/md/SPEC-new/SPEC-0074-Agent-Black-Box.md),
+[SPEC-0075](docs/md/SPEC-new/SPEC-0075-Agent-Policy-Gateway.md),
+[SPEC-0076](docs/md/SPEC-new/SPEC-0076-Agent-Evidence-Console.md).
+
+---
+
+### O que este módulo NÃO é
+
+Não é o produto. É uma aplicação especializada do mesmo motor temporal e
+verificável que serve todo o resto deste repositório — a mesma que faz um
+contrato público ser consultável `AS OF` e provável por Merkle faz uma tool call
+sê-lo também.
+
+A SPEC-0077 fixou isto depois de o ter deixado escorregar: durante a v2.0.0, a
+Agent Console ocupou `/` e o README começava por ela, e um produto que se
+apresenta como monitor de agentes de IA é um produto diferente daquele que este
+repositório contém. Fica registado porque uma SPEC é registo de decisão técnica,
+e apagar o erro tornaria o passado numa variável mutável.
+</details>
+
+---
+
 ## ⚖️ Licença e Modelo Comercial
 
 O **núcleo** do HeraclitusDB é distribuído sob a **Business Source License 1.1 (BSL 1.1)**:
@@ -679,3 +796,4 @@ Consulte o arquivo [LICENSE](LICENSE) para termos completos.
 <p align="center">
   <i>"Panta rhei — nenhum homem pisa no mesmo rio duas vezes. E nenhum fraudador reescreve um rio que já fluiu."</i>
 </p>
+

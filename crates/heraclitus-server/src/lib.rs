@@ -2,7 +2,7 @@
 //! The server composes; the storage knows nothing about HTTP or LLMs.
 
 #[cfg(feature = "agent")]
-pub mod agent_plane; // SPEC-0074/0075/0076: o plano de evidência de agentes
+pub mod agent_plane;
 mod auth;
 pub mod boot;
 #[cfg(feature = "replication")]
@@ -12,6 +12,8 @@ pub mod engine;
 #[cfg(feature = "analytics")]
 pub mod flight_grpc; // SPEC-016: protocolo Arrow Flight real (gRPC, tonic 0.14)
 pub mod grpc;
+#[cfg(feature = "agent")]
+pub mod platform_source; // SPEC-0074/0075/0076: o plano de evidência de agentes
 pub mod rest;
 pub mod telemetry_probe;
 
@@ -115,35 +117,59 @@ async fn serve_inner(
             None => agent_plane::AgentPlane::load(None)?,
         };
         let (tx, rx) = tokio::sync::watch::channel(false);
-        if plane.enabled() {
-            plane.validate(&config)?;
-            let runtime = agent_plane::build_runtime(engine.clone(), &plane, &config.data_dir)?;
+        // SPEC-0077 §21/§48 — a Platform Console sobe INDEPENDENTEMENTE do
+        // módulo de agentes. Antes, todo este bloco estava atrás de
+        // `plane.enabled()`, e a consequência era que o único sítio onde o
+        // HeraclitusDB tinha uma cara era dentro do módulo de agentes: quem
+        // não os usava não tinha superfície nenhuma, e quem os usava via o
+        // produto inteiro apresentado como um monitor de agentes.
+        //
+        // Só os listeners do MÓDULO continuam atrás do interruptor — o
+        // `spawn` gateia OTLP/HTTP, OTLP/gRPC e o proxy MCP um a um.
+        {
+            if plane.enabled() {
+                plane.validate(&config)?;
+            }
+            let runtime = agent_plane::build_runtime(engine.clone(), &plane, &config)?;
             let services = heraclitus_agent_gateway::spawn(runtime, rx).await?;
-            boot.ok_line(
-                "Agent Black Box",
-                &format!(
-                    "captura {} · OTLP {} · consola {} · gateway {}",
-                    plane.black_box.capture_mode,
-                    if plane.black_box.otlp.http_addr.is_empty() {
-                        "off".to_string()
-                    } else {
-                        plane.black_box.otlp.http_addr.clone()
-                    },
-                    if plane.black_box.console.enabled {
-                        plane.black_box.console.addr.clone()
-                    } else {
-                        "off".to_string()
-                    },
-                    if plane.gateway.enabled {
-                        plane.gateway.mode.label()
-                    } else {
-                        "off"
-                    }
-                ),
-            );
+            // Duas linhas de arranque, porque são dois factos diferentes: onde
+            // vive a superfície do produto, e se o módulo opcional está de pé.
+            // Fundi-las era o que fazia o operador ler "Agent Black Box" como o
+            // nome daquilo que tinha acabado de arrancar.
+            if plane.black_box.console.enabled {
+                boot.ok_line(
+                    "Consola",
+                    &format!(
+                        "HeraclitusDB em http://{}/{}",
+                        plane.black_box.console.addr,
+                        if plane.enabled() {
+                            " · módulo de agentes em /agent"
+                        } else {
+                            ""
+                        }
+                    ),
+                );
+            }
+            if plane.enabled() {
+                boot.ok_line(
+                    "Módulo Agent Evidence",
+                    &format!(
+                        "captura {} · OTLP {} · gateway {}",
+                        plane.black_box.capture_mode,
+                        if plane.black_box.otlp.http_addr.is_empty() {
+                            "off".to_string()
+                        } else {
+                            plane.black_box.otlp.http_addr.clone()
+                        },
+                        if plane.gateway.enabled {
+                            plane.gateway.mode.label()
+                        } else {
+                            "off"
+                        }
+                    ),
+                );
+            }
             (tx, Some(services))
-        } else {
-            (tx, None)
         }
     };
 
