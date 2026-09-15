@@ -93,9 +93,9 @@ class MassiveLab:
         total=384*self.scale; before=self.lab.hits(); t=time.perf_counter()
         def one(i):
             a=f'mixed-{i%48:02d}'
-            if i%3==0: return 'deny',self.call(a,f'mix-{i%11}','exec',{'command':'echo SAFE'})[0]
-            if i%3==1: return 'allow',self.call(a,f'mix-{i%11}','lookup_vendor',{'vendor':f'v-{i}'})[0]
-            return 'approval',self.call(a,f'mix-{i%11}','send_payment',{'amount':1000+i,'account':'synthetic'})[0]
+            if i%3==0: return 'deny',self.call(a,f'mix-{i}','exec',{'command':'echo SAFE'})[0]
+            if i%3==1: return 'allow',self.call(a,f'mix-{i}','lookup_vendor',{'vendor':f'v-{i}'})[0]
+            return 'approval',self.call(a,f'mix-{i}','send_payment',{'amount':1000+i,'account':'synthetic'})[0]
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as ex: out=list(ex.map(one,range(total)))
         groups={k:[s for kk,s in out if kk==k] for k in ('deny','allow','approval')}; after=self.lab.hits(); allow_n=len(groups['allow'])
         delta=(after-before) if before is not None and after is not None else None
@@ -148,11 +148,22 @@ class MassiveLab:
 
     def otlp_oversized_fanout(self):
         n=12*self.scale; size=int(self.cfg.get('oversized_bytes',5*1024*1024)); payload=b'{"resourceSpans":[],"pad":"'+b'x'*size+b'"}'; t=time.perf_counter()
-        def one(_): return self.lab.request(self.cfg['otlp'],'/v1/traces','POST',payload,{'Content-Type':'application/json'},timeout=20,read_body=False)[0]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(12,self.workers)) as ex: statuses=list(ex.map(one,range(n)))
-        health,_,_=self.lab.request(self.cfg['agent_api'],'/api/v1/agent/status',headers=self.lab.auth_agent()); ok=all(s==413 for s in statuses) and health==200
-        self.aggregate('otlp-oversized-fanout','otlp:/v1/traces',f'{n}x 413 and service alive',ok,statuses,None,None,blocked=True,
-                       detail=f'{size} bytes/request health={health}',started=t)
+        def one(_):
+            status,body,_=self.lab.request(self.cfg['otlp'],'/v1/traces','POST',payload,{'Content-Type':'application/json'},timeout=20,read_body=False)
+            exc=(body or {}).get('exception') if isinstance(body,dict) else None
+            return status,exc
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(12,self.workers)) as ex: outcomes=list(ex.map(one,range(n)))
+        statuses=[s for s,_ in outcomes]
+        # An HTTP server is allowed to reject an oversized body before the client
+        # finishes uploading it. In that case Python may see BrokenPipe/connection
+        # reset instead of receiving the 413 body. Treat only those explicit early-
+        # close outcomes as a successful rejection; timeouts/other exceptions fail.
+        early_close={'BrokenPipeError','ConnectionResetError','RemoteDisconnected'}
+        rejected=all(s==413 or (s is None and exc in early_close) for s,exc in outcomes)
+        health,_,_=self.lab.request(self.cfg['agent_api'],'/api/v1/agent/status',headers=self.lab.auth_agent()); ok=rejected and health==200
+        exceptions=Counter(exc for s,exc in outcomes if s is None)
+        self.aggregate('otlp-oversized-fanout','otlp:/v1/traces',f'{n} oversized rejected and service alive',ok,statuses,None,None,blocked=True,
+                       detail=f'{size} bytes/request health={health} early_close={dict(exceptions)}',started=t)
 
     def protocol_surface_swirl(self):
         methods=['resources/read','prompts/get','tools/list','ping']; n=160*self.scale; before=self.lab.hits(); t=time.perf_counter()
