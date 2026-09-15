@@ -35,6 +35,9 @@ class Lab:
         if u.scheme not in {'http','https'} or u.hostname not in LOOPBACK:
             raise SystemExit(f'RECUSADO: {label} deve apontar para loopback, veio {url!r}')
     def auth_agent(self):
+        user=os.getenv('HERACLITUS_AGENT_USERNAME','').strip(); pw=os.getenv('HERACLITUS_AGENT_PASSWORD','')
+        if user and pw:
+            raw=base64.b64encode(f'{user}:{pw}'.encode()).decode(); return {'Authorization':f'Basic {raw}'}
         t=os.getenv('HERACLITUS_AGENT_TOKEN','').strip(); return {'Authorization':f'Bearer {t}'} if t else {}
     def core_auth(self,valid=True):
         if not valid: user,pw='invalid-user','invalid-password'

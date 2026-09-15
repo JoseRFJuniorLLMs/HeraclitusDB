@@ -145,6 +145,9 @@ pub struct AgentActionRequestV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionAuthorizationV1 {
     pub authorization_id: String,
+    /// Stable logical request identity. Same id means retry; a new id means a new operation.
+    #[serde(default)]
+    pub request_id: String,
 
     pub policy_id: String,
     pub policy_version: String,
@@ -179,6 +182,7 @@ impl ActionAuthorizationV1 {
         w.str(&self.policy_version);
         w.str(&self.policy_hash);
         w.str(&self.rule_id);
+        w.str(&self.request_id);
         w.str(&self.agent_subject);
         w.opt_str(self.human_subject.as_deref());
         w.str(&self.resource_id);
@@ -206,6 +210,9 @@ pub fn argument_digest(args: &BTreeMap<String, String>) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalRequestV1 {
     pub approval_id: String,
+    /// Logical request identity kept explicitly for mutation/replay discrimination.
+    #[serde(default)]
+    pub request_id: String,
     pub authorization_subject_hash: String,
     pub requested_roles: Vec<String>,
     pub reason: String,
@@ -422,15 +429,19 @@ impl ApprovalStore {
             .find(|(_, r)| r.request.authorization_subject_hash == presented)
             .map(|(k, v)| (k.clone(), v))
         else {
-            // Não há aprovação para ESTE assunto. Pode haver uma para outro —
-            // e é exactamente esse o caso que tem de falhar: procurar por
-            // `approval_id` em vez de por assunto deixaria passar o cenário de
-            // §32 (aprovar 5000, executar 5001).
-            let approved_elsewhere = map
-                .values()
-                .find(|r| r.state == ApprovalState::Granted)
-                .map(|r| r.request.clone());
-            return match approved_elsewhere {
+            // Binding mismatch belongs to the same logical request only. A grant
+            // for an unrelated request must never poison a new operation.
+            let same_request = if authorization.request_id.is_empty() {
+                None
+            } else {
+                map.values()
+                    .find(|r| {
+                        !r.request.request_id.is_empty()
+                            && r.request.request_id == authorization.request_id
+                    })
+                    .map(|r| r.request.clone())
+            };
+            return match same_request {
                 Some(r) => ApprovalVerdict::BindingMismatch {
                     approval_id: r.approval_id,
                     approved_subject_hash: r.authorization_subject_hash,
@@ -514,6 +525,7 @@ mod tests {
         args.insert("account".to_string(), "A".to_string());
         ActionAuthorizationV1 {
             authorization_id: "AZ-1".into(),
+            request_id: "request-1".into(),
             policy_id: "agent-policy".into(),
             policy_version: "v17".into(),
             policy_hash: "hash".into(),
@@ -541,6 +553,65 @@ mod tests {
     }
 
     #[test]
+    fn request_id_novo_define_operacao_logica_nova() {
+        let a = authz("5000");
+        let mut nova = a.clone();
+        nova.request_id = "request-2".into();
+        nova.authorization_id = "AZ-2".into();
+        nova.nonce = "n2".into();
+        assert_ne!(a.subject_hash(), nova.subject_hash());
+    }
+
+    #[test]
+    fn operacao_identica_nova_pode_pedir_nova_aprovacao_apos_consumo() {
+        let store = ApprovalStore::new();
+        let primeira = authz("5000");
+        store.request(request_for(&primeira, 400), 100);
+        grant(&store, &primeira, 150);
+        assert!(store.consume(&primeira, 200).allows_execution());
+        let mut nova = primeira.clone();
+        nova.request_id = "request-2".into();
+        nova.authorization_id = "AZ-2".into();
+        nova.nonce = "n2".into();
+        assert!(matches!(
+            store.consume(&nova, 210),
+            ApprovalVerdict::NotFound
+        ));
+        let mut pedido = request_for(&nova, 500);
+        pedido.approval_id = "A-772".into();
+        assert_eq!(store.request(pedido, 210).approval_id, "A-772");
+        assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn granted_de_outro_request_nao_envenena_operacao_nova() {
+        let store = ApprovalStore::new();
+        let primeira = authz("5000");
+        store.request(request_for(&primeira, 400), 100);
+        grant(&store, &primeira, 150);
+        let mut outra = authz("5001");
+        outra.request_id = "request-2".into();
+        assert!(matches!(
+            store.consume(&outra, 160),
+            ApprovalVerdict::NotFound
+        ));
+    }
+
+    #[test]
+    fn mesmo_request_id_mutado_continua_binding_mismatch() {
+        let store = ApprovalStore::new();
+        let aprovado = authz("5000");
+        store.request(request_for(&aprovado, 400), 100);
+        grant(&store, &aprovado, 150);
+        let mut mutado = authz("5001");
+        mutado.request_id = aprovado.request_id.clone();
+        assert!(matches!(
+            store.consume(&mutado, 160),
+            ApprovalVerdict::BindingMismatch { .. }
+        ));
+    }
+
+    #[test]
     fn uma_aprovacao_exata_sobrevive_a_mudanca_de_segundo_sem_estender_o_ttl() {
         let store = ApprovalStore::new();
         let original = authz("5000");
@@ -559,6 +630,7 @@ mod tests {
     fn request_for(a: &ActionAuthorizationV1, expires: u64) -> ApprovalRequestV1 {
         ApprovalRequestV1 {
             approval_id: "A-771".into(),
+            request_id: a.request_id.clone(),
             authorization_subject_hash: a.subject_hash(),
             requested_roles: vec!["cfo".into()],
             reason: "pagamento acima de 50.000".into(),

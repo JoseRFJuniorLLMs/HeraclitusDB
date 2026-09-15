@@ -326,8 +326,22 @@ async fn proxy(
             } => {
                 GatewayCounters::bump(&runtime.gateway_counters.require_approval);
                 let now = now_unix_seconds();
+                let Some(logical_request_id) = facts
+                    .tool_call_id
+                    .as_deref()
+                    .filter(|id| !id.trim().is_empty())
+                    .map(str::to_string)
+                else {
+                    return mcp_error(
+                        StatusCode::BAD_REQUEST,
+                        &facts.tool_call_id,
+                        "MCP_REQUEST_ID_REQUIRED_FOR_APPROVAL",
+                        "approval-required tool calls need a stable JSON-RPC id",
+                    );
+                };
                 let authorization = ActionAuthorizationV1 {
                     authorization_id: ulid::Ulid::new().to_string(),
+                    request_id: logical_request_id.clone(),
                     policy_id: a.policy_id.clone(),
                     policy_version: a.policy_version.clone(),
                     policy_hash: a.policy_hash.clone(),
@@ -373,6 +387,7 @@ async fn proxy(
                         // segue — é isso que "would require approval" significa.
                         let pedido = ApprovalRequestV1 {
                             approval_id: ulid::Ulid::new().to_string(),
+                            request_id: logical_request_id.clone(),
                             authorization_subject_hash: subject_hash.clone(),
                             requested_roles: roles.clone(),
                             reason: format!(

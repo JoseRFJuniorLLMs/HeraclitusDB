@@ -161,8 +161,8 @@ class MassiveLab(Lab):
         aid=self.attack_id('redteam-limit')
         s,b,ms=self.request(self.cfg['agent_api'],'/api/v1/agent/red-team/events?limit=999999999',headers=self.auth_agent())
         returned=None
-        if isinstance(b,dict): returned=b.get('returned')
-        ok=(s in {400,413,422}) or (s==200 and isinstance(returned,int) and returned<=5000)
+        if isinstance(b,dict) and isinstance(b.get('summary'),dict): returned=b['summary'].get('returned')
+        ok=(s in {400,413,422}) or (s==200 and isinstance(returned,int) and returned<=1000)
         self.report(Result(aid,'redteam-query-limit','agent:red-team/events','huge limit rejected or capped',
                            f'HTTP {s} returned={returned}',ok,s,blocked=(s!=200),detail='bounded query protects memory/response amplification',duration_ms=ms))
 

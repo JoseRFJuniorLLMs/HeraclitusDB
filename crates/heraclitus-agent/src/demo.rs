@@ -151,6 +151,7 @@ pub fn build_demo_run(base_unix_nanos: u64, run_id: &str) -> DemoRun {
     let digest = argument_digest(&args);
     let authorization = ActionAuthorizationV1 {
         authorization_id: "AZ-DEMO-1".into(),
+        request_id: "call-pay-1".into(),
         policy_id: engine.document().id.clone(),
         policy_version: engine.revision().to_string(),
         policy_hash: engine.hash().to_string(),
