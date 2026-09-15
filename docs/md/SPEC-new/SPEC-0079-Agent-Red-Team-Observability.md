@@ -51,6 +51,14 @@ recorded policy DENY and approval replay activity; the synthetic upstream hit
 counter independently confirmed zero forwarding for the explicit DENY, mixed
 batch bypass check, argument-mutation denial and 64-request DENY flood.
 
+The live campaign also exposed a native observability flaw around approval
+retries: multiple HTTP attempts could legitimately reuse the same MCP
+`tool_call_id`, causing the gateway evidence dedupe key to collide. Commit
+`441935b2db857c74c2ec0f2bc6afc466e8bb5862` hardened that path so every gateway
+HTTP attempt receives distinct durable evidence identity while OTLP keeps its
+trace/span retry semantics. In `ENFORCE`, an unexpected evidence conflict is now
+fail-closed rather than merely logged.
+
 The SPEC-0078 final qualification pass also completed successfully after
 removing the vulnerable `lru 0.12.5` dependency path through the CLI, running
 focused Agent/Gateway regressions, Clippy and the RustSec gate with only the
