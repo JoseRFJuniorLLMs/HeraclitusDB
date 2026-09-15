@@ -551,7 +551,10 @@ mod tests {
         ex.response_body = Some(corpo.to_vec());
         let f = extract_facts(&ex);
         assert!(f.is_error, "um erro em SSE passou por sucesso");
-        assert_eq!(f.error_message.as_deref(), Some("Tool nao-existe not found"));
+        assert_eq!(
+            f.error_message.as_deref(),
+            Some("Tool nao-existe not found")
+        );
     }
 
     #[test]
@@ -602,6 +605,9 @@ mod tests {
         let corpo = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"order_id\":\"ORD-42\"}}\n\n";
         let mut ex = exchange();
         ex.response_body = Some(corpo.to_vec());
-        assert_eq!(extract_facts(&ex).external_effect_id.as_deref(), Some("ORD-42"));
+        assert_eq!(
+            extract_facts(&ex).external_effect_id.as_deref(),
+            Some("ORD-42")
+        );
     }
 }

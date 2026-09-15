@@ -34,7 +34,9 @@
 //! `BYPASS PROTECTION: CONFIGURED / UNKNOWN` em vez de o produto afirmar
 //! enforcement que não pode garantir.
 
-use crate::runtime::{now_unix_nanos, now_unix_seconds, AgentRuntime, GatewayCounters};
+use crate::runtime::{
+    now_unix_nanos, now_unix_seconds, AgentRuntime, AppendOutcome, GatewayCounters,
+};
 use crate::upstream::{UpstreamClient, UpstreamError};
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, State};
@@ -189,7 +191,29 @@ async fn proxy(
     requested.content.fields = redigidos.content.fields;
     requested.privacy = redigidos.privacy;
     requested.content.policy = provenance.clone();
-    let requested_id = append(runtime, requested);
+    let gravacao = append(runtime, requested);
+    // Fail-closed em `enforce`: o produto promete que nada acontece sem ficar
+    // registado, e executar uma acção cujo registo falhou desmente exactamente
+    // essa promessa. `observe` e `shadow` prometem o contrário — nunca bloquear
+    // — por isso aí a falha é ruidosa (log + contador + /status) mas não trava
+    // a chamada. Silenciosa é que não pode ser em modo nenhum.
+    if let Gravacao::Falhou(motivo) = &gravacao {
+        if mode == GatewayMode::Enforce {
+            let _ = runtime.flush();
+            return mcp_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &facts.tool_call_id,
+                "EVIDENCE_NOT_RECORDED",
+                motivo,
+            );
+        }
+        tracing::warn!(
+            modo = mode.label(),
+            motivo = %motivo,
+            "a chamada segue sem evidência gravada: em enforce seria recusada"
+        );
+    }
+    let requested_id = gravacao.id();
 
     if let Some(prov) = &provenance {
         let mut evaluated = base_evidence(
@@ -202,7 +226,7 @@ async fn proxy(
         );
         evaluated.content.policy = Some(prov.clone());
         evaluated.parents = requested_id.iter().cloned().collect();
-        append(runtime, evaluated);
+        let _ = append(runtime, evaluated);
     }
 
     // ── decidir ─────────────────────────────────────────────────────────────
@@ -224,7 +248,7 @@ async fn proxy(
                     );
                     denied.content.policy = provenance.clone();
                     denied.parents = requested_id.iter().cloned().collect();
-                    append(runtime, denied);
+                    let _ = append(runtime, denied);
                     let _ = runtime.flush();
                     return mcp_error(
                         StatusCode::FORBIDDEN,
@@ -281,7 +305,7 @@ async fn proxy(
                             approver_issuer: None,
                             decided_at_unix_nanos: None,
                         });
-                        append(runtime, autorizada);
+                        let _ = append(runtime, autorizada);
                     }
                     ApprovalVerdict::NotFound if enforced || mode == GatewayMode::Shadow => {
                         // Primeiro encontro com esta acção: abrir o pedido de
@@ -327,7 +351,7 @@ async fn proxy(
                             decided_at_unix_nanos: None,
                         });
                         pedida.parents = requested_id.iter().cloned().collect();
-                        append(runtime, pedida);
+                        let _ = append(runtime, pedida);
                         let _ = runtime.flush();
 
                         if enforced {
@@ -353,7 +377,7 @@ async fn proxy(
                                 &agent_id,
                             );
                             denied.content.policy = provenance.clone();
-                            append(runtime, denied);
+                            let _ = append(runtime, denied);
                             let _ = runtime.flush();
                             return mcp_error(
                                 StatusCode::FORBIDDEN,
@@ -396,7 +420,7 @@ async fn proxy(
         &agent_id,
     );
     started_ev.parents = requested_id.iter().cloned().collect();
-    let started_id = append(runtime, started_ev);
+    let started_id = append(runtime, started_ev).id();
 
     let t0 = now_unix_nanos();
     let resultado = forward(&state, &method, &uri, &header_map, body).await;
@@ -445,7 +469,7 @@ async fn proxy(
                 error_code: None,
             });
             finished.parents = started_id.iter().cloned().collect();
-            let finished_id = append(runtime, finished);
+            let finished_id = append(runtime, finished).id();
 
             if let Some(effect) = &factos_resposta.external_effect_id {
                 let mut ev = base_evidence(
@@ -458,7 +482,7 @@ async fn proxy(
                 );
                 ev.subject.external_effect_id = Some(effect.clone());
                 ev.parents = finished_id.into_iter().collect();
-                append(runtime, ev);
+                let _ = append(runtime, ev);
             }
             let _ = runtime.flush();
 
@@ -497,7 +521,7 @@ async fn proxy(
                 ..Default::default()
             });
             erro.parents = started_id.into_iter().collect();
-            append(runtime, erro);
+            let _ = append(runtime, erro);
             let _ = runtime.flush();
             mcp_error(
                 StatusCode::BAD_GATEWAY,
@@ -596,17 +620,73 @@ fn base_evidence(
     e
 }
 
-fn append(runtime: &Arc<AgentRuntime>, e: AgentEvidenceV1) -> Option<String> {
+/// O que aconteceu à tentativa de gravar uma evidência.
+///
+/// Existe porque `Option<String>` não chegava: `None` tanto significava
+/// "duplicado, não havia nada a gravar" como "falhou a gravar", e quem chamava
+/// não conseguia distinguir os dois. Um deles é normal; o outro é a perda de um
+/// registo num sistema cuja única razão de existir é não perder registos.
+enum Gravacao {
+    /// Gravada, ou duplicada (que é uma não-gravação legítima).
+    Ok(Option<String>),
+    /// NÃO gravada. O `String` é o motivo, para chegar ao cliente.
+    Falhou(String),
+}
+
+impl Gravacao {
+    fn id(&self) -> Option<String> {
+        match self {
+            Gravacao::Ok(id) => id.clone(),
+            Gravacao::Falhou(_) => None,
+        }
+    }
+}
+
+/// Grava uma evidência, sem nunca o fazer em silêncio quando falha.
+///
+/// # Porque é que isto conta
+///
+/// A causa mais provável de falha aqui é um `Conflict` de deduplicação: a chave
+/// já existe com conteúdo diferente. A chave não inclui o `agent_id`, portanto
+/// dois agentes distintos que usem o mesmo `server_id` e reciclem o mesmo `id`
+/// JSON-RPC — coisa que os clientes MCP fazem, é um contador por sessão —
+/// produzem a MESMA chave. O `Conflict` é a recusa correcta (SPEC-0074 §14: não
+/// se reescreve evidência já registada).
+///
+/// O que estava errado não era a recusa: era o que vinha a seguir. O erro ia
+/// para um contador partilhado com os erros de policy, a evidência desaparecia,
+/// e a chamada seguia para o upstream na mesma. Ou seja, o agente executava uma
+/// acção que o sistema não registou — exactamente o modo de falha que um black
+/// box não pode ter, e invisível: a Consola mostrava um agente e não o outro,
+/// sem nada a dizer porquê.
+fn append(runtime: &Arc<AgentRuntime>, e: AgentEvidenceV1) -> Gravacao {
     let id = e.evidence_id.clone();
-    match runtime.append(&e) {
-        Ok(_) => Some(id),
-        Err(err) => {
-            // Falhar a gravar evidência não pode derrubar o proxy em silêncio,
-            // mas também não pode passar despercebido: o operador vê-o no log
-            // e no contador de erros.
-            tracing::error!(erro = %err, "evidência de agente não foi gravada");
-            GatewayCounters::bump(&runtime.gateway_counters.policy_errors);
-            None
+    match runtime.append_outcome(&e) {
+        AppendOutcome::Gravada(_) | AppendOutcome::Duplicada => Gravacao::Ok(Some(id)),
+        // Conflito NÃO bloqueia, e a razão é concreta: o retry depois de uma
+        // aprovação humana usa, por contrato, o mesmo `tool_call_id` — é essa a
+        // razão de existir do authorization binding — e o `ToolRequested` que
+        // se grava então leva a proveniência da aprovação, que o primeiro não
+        // tinha. Mesma chave, conteúdo diferente: conflito legítimo.
+        //
+        // Recusar a GRAVAÇÃO continua certo (não se reescreve evidência
+        // registada). Recusar a CHAMADA partiria o fluxo da SPEC-0075 §16.
+        // O que muda em relação a antes é que isto deixou de ser invisível.
+        AppendOutcome::Conflito { existing_hash } => {
+            tracing::warn!(
+                chave = %e.dedupe_key,
+                gravado = %existing_hash,
+                "evidência recusada por conflito de deduplicação"
+            );
+            GatewayCounters::bump(&runtime.gateway_counters.evidence_errors);
+            Gravacao::Ok(None)
+        }
+        // O log não aceitou a escrita. Aqui não há leitura benigna: a acção não
+        // ficou registada.
+        AppendOutcome::Falhou(err) => {
+            tracing::error!(erro = %err, "evidência de agente NÃO foi gravada");
+            GatewayCounters::bump(&runtime.gateway_counters.evidence_errors);
+            Gravacao::Falhou(err.to_string())
         }
     }
 }

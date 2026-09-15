@@ -57,7 +57,11 @@ async fn upstream(hits: Hits) -> String {
         let hits = hits.clone();
         async move {
             hits.fetch_add(1, Ordering::SeqCst);
-            let id = corpo.0.get("id").cloned().unwrap_or(serde_json::Value::Null);
+            let id = corpo
+                .0
+                .get("id")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             Json(serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -259,11 +263,19 @@ async fn a_redaccao_nao_muda_aquilo_a_que_a_aprovacao_se_vincula() {
     // ou nada executa, ou (muito pior) o binding deixa de distinguir argumentos
     // que deviam ser distintos, porque ambos redigem para `[REDACTED]`.
     let f = arrancar("metadata_only").await;
-    tool_call(&f, serde_json::json!({ "api_key": "sk-live-AAA", "x": "1" })).await;
+    tool_call(
+        &f,
+        serde_json::json!({ "api_key": "sk-live-AAA", "x": "1" }),
+    )
+    .await;
     let primeiro = evidencia_em_texto(&f);
 
     let g = arrancar("metadata_only").await;
-    tool_call(&g, serde_json::json!({ "api_key": "sk-live-BBB", "x": "1" })).await;
+    tool_call(
+        &g,
+        serde_json::json!({ "api_key": "sk-live-BBB", "x": "1" }),
+    )
+    .await;
     let segundo = evidencia_em_texto(&g);
 
     let hash = |s: &str| -> String {

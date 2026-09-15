@@ -1,0 +1,91 @@
+# black-box-in-action.md §12 — política de teste para o Agent Policy Gateway.
+#
+# Os nomes das tools NÃO são inventados: vieram do `tools/list` do Context7
+# medido em 2026-09-14. O §12 avisa explicitamente para não fazer hardcode de
+# `query-docs` sem conferir — a conferência foi feita, e o que faltava era o par
+# obrigatório `resolve-library-id`, que o Context7 exige chamar primeiro.
+#
+#     resolve-library-id   required: [query, libraryName]
+#     query-docs           required: [libraryId, query]
+#
+# Ambas anotadas pelo próprio upstream como readOnlyHint=true,
+# destructiveHint=false, idempotentHint=true. É por isso que servem para o
+# laboratório: nenhuma delas muda estado em lado nenhum.
+
+version: "agent-policy-v1"
+id: "black-box-in-action"
+revision: "v1"
+
+# Fail-closed (SPEC-0075 §2.2). O motor RECUSA carregar uma política com
+# `decision: allow` no default — e faz bem: um default permissivo transforma
+# cada tool nova do upstream numa acção autorizada sem ninguém decidir nada.
+defaults:
+  decision: deny
+
+rules:
+  # ── o caminho normal ──────────────────────────────────────────────────────
+  - id: resolver-biblioteca
+    match:
+      server: context7
+      tool: resolve-library-id
+    decision: allow
+
+  - id: consultar-documentacao
+    match:
+      server: context7
+      tool: query-docs
+    decision: allow
+
+  # ── as tools do stub local ────────────────────────────────────────────────
+  #
+  # `scripts/test-agent-black-box-mcp.sh` corre contra
+  # `scripts/mcp-upstream-stub.py`, que é o único upstream capaz de responder à
+  # pergunta "foste chamado?" — e sem essa resposta não há como PROVAR que um
+  # `deny` em enforce não tocou no upstream.
+  #
+  # Não trazem `server:` de propósito: o stub não envia `X-Heraclitus-Server`,
+  # portanto o `server_id` acaba por ser o host do upstream.
+  - id: stub-lookup
+    match:
+      tool: lookup_vendor
+    decision: allow
+
+  - id: stub-echo
+    match:
+      tool: echo
+    decision: allow
+
+  # ── o caso que a demonstração precisa de ter ──────────────────────────────
+  #
+  # Uma regra de DENY explícita, sobre uma tool que o upstream nem tem. Serve
+  # para provar o §13 "caso negado" sem depender de o Context7 ter alguma coisa
+  # destrutiva — ele não tem, e é bom que não tenha.
+  #
+  # Em `enforce`, esta chamada nunca chega ao upstream: o gateway grava
+  # ToolDenied e devolve 403 antes de abrir a ligação.
+  - id: proibido-por-exemplo
+    match:
+      tool: apagar_tudo
+    decision: deny
+    reason_code: TOOL_PROIBIDA
+
+  # ── aprovação humana ──────────────────────────────────────────────────────
+  #
+  # Ver a ressalva no README deste exemplo: o binding da aprovação inclui
+  # `issued_at`/`expires_at`, que o gateway regenera a cada pedido, portanto o
+  # retry só é aceite se cair no mesmo segundo UNIX. Está aqui para a superfície
+  # ficar exercitada, não porque o fluxo esteja pronto para uma demonstração.
+  - id: exige-aprovacao
+    match:
+      tool: query-docs
+      fields:
+        libraryId: "/segredo/interno"
+    decision: require_approval
+    reason_code: BIBLIOTECA_RESTRITA
+    # Sem `roles` o motor recusa carregar a política, e faz bem: um
+    # `require_approval` que qualquer pessoa pode satisfazer não é uma aprovação,
+    # é um clique. `approver` é o papel que a SPEC-0076 §28 separa de propósito
+    # de `policy_admin` — quem aprova não deve ser quem escreve a regra.
+    approval:
+      roles: ["approver"]
+      ttl_seconds: 300

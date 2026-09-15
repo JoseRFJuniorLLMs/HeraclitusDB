@@ -73,6 +73,8 @@ pub struct GatewayCounters {
     pub approval_expired: AtomicU64,
     pub approval_replay_rejected: AtomicU64,
     pub policy_errors: AtomicU64,
+    /// Evidência que NÃO foi gravada. Ver `gateway::append`.
+    pub evidence_errors: AtomicU64,
     pub upstream_errors: AtomicU64,
 }
 
@@ -83,6 +85,7 @@ impl GatewayCounters {
     pub fn snapshot(&self) -> serde_json::Value {
         serde_json::json!({
             "requests": self.requests.load(Ordering::Relaxed),
+            "evidence_errors": self.evidence_errors.load(Ordering::Relaxed),
             "allow": self.allow.load(Ordering::Relaxed),
             "deny": self.deny.load(Ordering::Relaxed),
             "require_approval": self.require_approval.load(Ordering::Relaxed),
@@ -121,6 +124,32 @@ pub struct AgentRuntime {
     /// misturá-lo com os segmentos do HRKL convida a que alguém apague o
     /// errado.
     bundles_dir: std::path::PathBuf,
+}
+
+/// O que aconteceu a uma tentativa de gravar evidência.
+///
+/// Existe para separar duas coisas que o `Result` juntava e que têm
+/// consequências opostas:
+///
+/// - [`Conflito`](AppendOutcome::Conflito) — a chave já existe com conteúdo
+///   diferente. Parece adulteração, mas o caminho de aprovação humana produz um
+///   legitimamente: o retry DEPOIS de aprovar usa, por contrato, o mesmo
+///   `tool_call_id` (é essa a razão de existir do authorization binding), e o
+///   `ToolRequested` que se grava então tem a proveniência da aprovação, que o
+///   primeiro não tinha. Recusar a gravação está certo — reescrever evidência
+///   registada não se faz — mas recusar a CHAMADA partia o fluxo que a
+///   SPEC-0075 §16 define.
+/// - [`Falhou`](AppendOutcome::Falhou) — o log não aceitou a escrita. Aqui não
+///   há leitura benigna: a acção não ficou registada.
+#[derive(Debug)]
+pub enum AppendOutcome {
+    Gravada(Lsn),
+    /// Já lá estava, com o mesmo conteúdo. Retransmissão normal.
+    Duplicada,
+    Conflito {
+        existing_hash: String,
+    },
+    Falhou(HeraclitusError),
 }
 
 impl AgentRuntime {
@@ -300,6 +329,36 @@ impl AgentRuntime {
 
     pub fn policy(&self) -> ActivePolicy {
         self.policy.read().unwrap().clone()
+    }
+
+    /// Como [`AgentRuntime::append`], mas dizendo QUAL das três coisas
+    /// aconteceu em vez de colapsar duas delas num erro.
+    pub fn append_outcome(&self, e: &AgentEvidenceV1) -> AppendOutcome {
+        let verdict = {
+            let mut idx = self.dedupe.lock().unwrap();
+            idx.admit(e)
+        };
+        match verdict {
+            DedupeVerdict::Duplicate => {
+                self.counters.lock().unwrap().duplicates += 1;
+                AppendOutcome::Duplicada
+            }
+            DedupeVerdict::Conflict { existing_hash } => {
+                self.counters.lock().unwrap().conflicts += 1;
+                AppendOutcome::Conflito { existing_hash }
+            }
+            DedupeVerdict::Novel => match self.log.append_evidence(e) {
+                Ok(lsn) => {
+                    let mut c = self.counters.lock().unwrap();
+                    c.events += 1;
+                    if e.privacy.redaction_applied {
+                        c.redactions += 1;
+                    }
+                    AppendOutcome::Gravada(lsn)
+                }
+                Err(err) => AppendOutcome::Falhou(err),
+            },
+        }
     }
 
     /// Persiste uma evidência, passando pela deduplicação.
