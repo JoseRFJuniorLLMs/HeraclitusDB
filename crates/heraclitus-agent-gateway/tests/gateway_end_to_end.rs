@@ -50,6 +50,14 @@ rules:
       roles: ["cfo"]
       ttl_seconds: 300
 
+  - id: pagamento-expira
+    match:
+      tool: send_payment_short
+    decision: require_approval
+    approval:
+      roles: ["cfo"]
+      ttl_seconds: 1
+
   - id: shell
     match:
       tool: exec
@@ -442,6 +450,45 @@ async fn aprovar_5000_e_executar_5001_e_recusado() {
         reason == "APPROVAL_PENDING" || reason == "APPROVAL_BINDING_MISMATCH",
         "a acção mutada tem de abrir uma aprovação NOVA ou falhar o binding; veio `{reason}`"
     );
+}
+
+#[tokio::test]
+async fn aprovacao_expirada_nunca_toca_o_upstream() {
+    let h = harness(GatewayMode::Enforce).await;
+    let pedido = tool_call(
+        "c-exp",
+        "send_payment_short",
+        serde_json::json!({ "amount": 75000, "account": "v1" }),
+    );
+    let (status, body) = post_json(
+        &format!("{}/mcp", h.gateway_url),
+        pedido.clone(),
+        AGENT_HEADERS,
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+    let approval_id = body["error"]["data"]["heraclitus"]["approval_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (status, body) = post_json(
+        &format!("{}/api/v1/agent/approvals/{approval_id}/approve", h.api_url),
+        serde_json::json!({}),
+        &[],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let antes = h.hits();
+    let (status, body) = post_json(&format!("{}/mcp", h.gateway_url), pedido, AGENT_HEADERS).await;
+    assert_eq!(h.hits(), antes, "aprovacao expirada chegou ao upstream");
+    assert!(status == 403 || status == 202, "status {status}: {body}");
+    let reason = body["error"]["data"]["heraclitus"]["reason_code"]
+        .as_str()
+        .unwrap_or_default();
+    assert_eq!(reason, "APPROVAL_EXPIRED", "{body}");
 }
 
 #[tokio::test]
