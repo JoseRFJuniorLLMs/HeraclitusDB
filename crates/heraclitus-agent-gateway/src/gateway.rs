@@ -68,6 +68,14 @@ pub fn router(state: Arc<GatewayState>) -> Router {
     Router::new().fallback(proxy).with_state(state)
 }
 
+fn mcp_method_is_canonical(method: &str) -> bool {
+    !method.is_empty()
+        && method.len() <= 128
+        && method
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'-' | b'.'))
+}
+
 async fn proxy(
     State(state): State<Arc<GatewayState>>,
     method: Method,
@@ -172,6 +180,14 @@ async fn proxy(
     let facts = mcp::extract_facts(&exchange);
 
     let method_name = facts.method.as_deref().unwrap_or_default();
+    if !mcp_method_is_canonical(method_name) {
+        return mcp_error(
+            StatusCode::BAD_REQUEST,
+            &facts.tool_call_id,
+            "MCP_METHOD_INVALID",
+            "MCP method must use the canonical ASCII alphabet [A-Za-z0-9._/-] and be <= 128 bytes",
+        );
+    }
     let e_tool_call = method_name == "tools/call";
 
     // Near-miss spellings of `tools/call` are never forwarded. A permissive
@@ -884,4 +900,47 @@ fn approval_pending(id: &Option<String>, pedido: &ApprovalRequestV1) -> Response
         }
     });
     (StatusCode::ACCEPTED, axum::Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod method_canonical_tests {
+    use super::mcp_method_is_canonical;
+
+    #[test]
+    fn standard_mcp_methods_use_canonical_alphabet() {
+        for method in [
+            "initialize",
+            "ping",
+            "tools/list",
+            "tools/call",
+            "resources/read",
+            "prompts/get",
+        ] {
+            assert!(mcp_method_is_canonical(method), "{method}");
+        }
+    }
+
+    #[test]
+    fn ambiguous_or_encoded_methods_are_rejected() {
+        for method in [
+            "tools／call",
+            "tools﹨call",
+            "tools＼call",
+            "tools%252Fcall",
+            "tools%252fcall",
+            "tools/call\u{200b}",
+            "tools/\u{200b}call",
+            "tools/call\0",
+            "tools\\call",
+            "tools call",
+            "tools\tcall",
+        ] {
+            assert!(
+                !mcp_method_is_canonical(method),
+                "unexpectedly canonical: {method:?}"
+            );
+        }
+        assert!(!mcp_method_is_canonical(""));
+        assert!(!mcp_method_is_canonical(&"a".repeat(129)));
+    }
 }
