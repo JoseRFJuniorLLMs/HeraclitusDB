@@ -1,0 +1,44 @@
+name: Sandbox red-team SPEC-0078
+
+on:
+  push:
+    branches:
+      - gpt56/sandbox-redteam-spec0078
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
+
+      - name: Build hardened server
+        run: cargo build --release --locked -p heraclitus-server
+
+      - name: Package exact source snapshot and binary
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          git archive --format=tar.gz --prefix=HeraclitusDB/ -o dist/heraclitus-source.tgz HEAD
+          cp target/release/heraclitus-server dist/
+          sha256sum dist/* > dist/SHA256SUMS
+          git rev-parse HEAD > dist/COMMIT
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: heraclitus-spec0078-sandbox-bundle
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
