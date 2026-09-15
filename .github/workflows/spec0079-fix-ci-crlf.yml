@@ -19,7 +19,7 @@ jobs:
           ref: gpt56/agent-security-observability
           fetch-depth: 0
       - name: Make RSA test-boundary gate CRLF-safe without weakening it
-        shell: python
+        shell: python {0}
         run: |
           from pathlib import Path
           p = Path('.github/workflows/ci.yml')
@@ -29,8 +29,8 @@ jobs:
             exit 1
           fi
 """
-          new = """          # lib.rs is intentionally CRLF-compatible on Windows. Normalize line endings
-          # before checking the cfg(test) boundary; the security assertion stays exact.
+          new = """          # lib.rs is CRLF-compatible on Windows. Normalize line endings before
+          # checking the cfg(test) boundary; the security assertion stays exact.
           if ! tr -d '\\r' < crates/heraclitus-compliance/src/lib.rs | grep -A1 '^#\\[cfg(test)\\]$' | grep -q 'mod test_pki;'; then
             echo \"test_pki deixou de estar atras de #[cfg(test)]: chave privada RSA pode entrar em producao\"
             exit 1
