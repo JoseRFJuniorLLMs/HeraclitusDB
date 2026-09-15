@@ -42,12 +42,13 @@ jobs:
               p.write_text(t.replace('ratatui = "0.29"', 'ratatui = "0.30.2"', 1))
           PY
           cargo update -p ratatui --precise 0.30.2
-          if cargo tree -i lru >/tmp/lru-tree.txt 2>&1; then
+          if cargo tree -i lru@0.12.5 >/tmp/lru-tree.txt 2>&1; then
             cat /tmp/lru-tree.txt
-            echo 'lru remains in dependency graph' >&2
+            echo 'vulnerable lru 0.12.5 remains in dependency graph' >&2
             exit 1
           else
             cat /tmp/lru-tree.txt || true
+            echo 'vulnerable lru 0.12.5 removed; newer lru versions are allowed'
           fi
 
       - name: Format
