@@ -1,0 +1,87 @@
+name: SPEC-0079 gateway evidence finalization
+
+on:
+  push:
+    branches:
+      - gpt56/agent-security-observability
+    paths:
+      - .github/workflows/spec-0079-gateway-evidence-final.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix-and-qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: gpt56/agent-security-observability
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
+
+      - name: Apply live red-team evidence fix
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p=Path('crates/heraclitus-agent/src/dedupe.rs')
+          t=p.read_text()
+          old='''    w.opt_str(e.subject.tool_call_id.as_deref());\n    hex32(&domain_hash(DOMAIN_DEDUPE, w.as_slice()))\n'''
+          new='''    w.opt_str(e.subject.tool_call_id.as_deref());\n    // Gateway HTTP requests are attempts, not exporter retransmissions. The same\n    // JSON-RPC id is intentionally reused across pending -> approved -> replay\n    // in the approval protocol. Each attempt must therefore remain distinct\n    // evidence. OTLP keeps trace/span based dedupe unchanged.\n    if e.source.source_kind == "gateway" {\n        w.str(&e.evidence_id);\n    }\n    hex32(&domain_hash(DOMAIN_DEDUPE, w.as_slice()))\n'''
+          if old not in t: raise SystemExit('dedupe insertion point not found')
+          t=t.replace(old,new,1)
+          marker='''    #[test]\n    fn warm_from_reconstroi_o_estado() {'''
+          test='''    #[test]\n    fn tentativas_gateway_com_mesmo_rpc_id_sao_evidencias_distintas() {\n        let mut a = AgentEvidenceV1::new("t", AgentEvidenceKindV1::ToolRequested, 1);\n        a.source.source_kind = "gateway".into();\n        a.source.source_instance = Some("mcp".into());\n        a.subject.tool_call_id = Some("rpc-7".into());\n        a.evidence_id = "attempt-a".into();\n        let mut b = a.clone();\n        b.evidence_id = "attempt-b".into();\n        assert_ne!(dedupe_key(&a), dedupe_key(&b));\n\n        // OTLP continua a deduplicar pela identidade do span, não pelo envelope.\n        a.source.source_kind = "otlp_http".into();\n        b.source.source_kind = "otlp_http".into();\n        a.trace_id = Some("trace".into());\n        b.trace_id = Some("trace".into());\n        a.span_id = Some("span".into());\n        b.span_id = Some("span".into());\n        assert_eq!(dedupe_key(&a), dedupe_key(&b));\n    }\n\n'''
+          if marker not in t: raise SystemExit('dedupe test marker not found')
+          t=t.replace(marker,test+marker,1)
+          p.write_text(t)
+
+          p=Path('crates/heraclitus-agent-gateway/src/gateway.rs')
+          t=p.read_text()
+          old='''        // Conflito NÃO bloqueia, e a razão é concreta: o retry depois de uma\n        // aprovação humana usa, por contrato, o mesmo `tool_call_id` — é essa a\n        // razão de existir do authorization binding — e o `ToolRequested` que\n        // se grava então leva a proveniência da aprovação, que o primeiro não\n        // tinha. Mesma chave, conteúdo diferente: conflito legítimo.\n        //\n        // Recusar a GRAVAÇÃO continua certo (não se reescreve evidência\n        // registada). Recusar a CHAMADA partiria o fluxo da SPEC-0075 §16.\n        // O que muda em relação a antes é que isto deixou de ser invisível.\n        AppendOutcome::Conflito { existing_hash } => {\n            tracing::warn!(\n                chave = %e.dedupe_key,\n                gravado = %existing_hash,\n                "evidência recusada por conflito de deduplicação"\n            );\n            GatewayCounters::bump(&runtime.gateway_counters.evidence_errors);\n            Gravacao::Ok(None)\n        }\n'''
+          new='''        // SPEC-0079 live red-team: gateway attempts now carry distinct\n        // dedupe identities. A conflict here is no longer an expected approval\n        // retry; it is an evidence-integrity failure and ENFORCE must fail closed.\n        AppendOutcome::Conflito { existing_hash } => {\n            let motivo = format!(\n                "conflito de deduplicação no gateway: chave {} já gravada como {}",\n                e.dedupe_key, existing_hash\n            );\n            tracing::error!(motivo = %motivo, "evidência de agente NÃO foi gravada");\n            GatewayCounters::bump(&runtime.gateway_counters.evidence_errors);\n            Gravacao::Falhou(motivo)\n        }\n'''
+          if old not in t: raise SystemExit('gateway conflict branch not found')
+          t=t.replace(old,new,1)
+          p.write_text(t)
+
+          p=Path('crates/heraclitus-agent-gateway/src/runtime.rs')
+          t=p.read_text()
+          old='''/// - [`Conflito`](AppendOutcome::Conflito) — a chave já existe com conteúdo\n///   diferente. Parece adulteração, mas o caminho de aprovação humana produz um\n///   legitimamente: o retry DEPOIS de aprovar usa, por contrato, o mesmo\n///   `tool_call_id` (é essa a razão de existir do authorization binding), e o\n///   `ToolRequested` que se grava então tem a proveniência da aprovação, que o\n///   primeiro não tinha. Recusar a gravação está certo — reescrever evidência\n///   registada não se faz — mas recusar a CHAMADA partia o fluxo que a\n///   SPEC-0075 §16 define.\n'''
+          new='''/// - [`Conflito`](AppendOutcome::Conflito) — a chave já existe com conteúdo\n///   diferente. Para OTLP isto continua a significar colisão/rewrite da mesma\n///   identidade lógica. Para o gateway, cada tentativa HTTP recebe identidade\n///   de evidência distinta, portanto um conflito também é falha de integridade\n///   e o modo `enforce` recusa a acção.\n'''
+          if old not in t: raise SystemExit('runtime conflict documentation not found')
+          p.write_text(t.replace(old,new,1))
+
+          p=Path('crates/heraclitus-agent-gateway/tests/gateway_end_to_end.rs')
+          t=p.read_text()
+          needle='''    assert!(status == 403 || status == 202, "status {status}: {body}");\n}\n\n#[tokio::test]\nasync fn aprovar_5000_e_executar_5001_e_recusado()'''
+          repl='''    assert!(status == 403 || status == 202, "status {status}: {body}");\n    assert_eq!(\n        h.runtime.gateway_counters.snapshot()["evidence_errors"],\n        0,\n        "approval retry/replay não pode criar buracos no evidence log"\n    );\n}\n\n#[tokio::test]\nasync fn aprovar_5000_e_executar_5001_e_recusado()'''
+          if needle not in t: raise SystemExit('gateway E2E assertion marker not found')
+          p.write_text(t.replace(needle,repl,1))
+          PY
+
+      - name: Qualify focused security path
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo fmt --all
+          cargo test -p heraclitus-agent dedupe::tests
+          cargo test -p heraclitus-agent-gateway --test gateway_end_to_end
+          cargo clippy -p heraclitus-agent -p heraclitus-agent-gateway --all-targets -- -D warnings
+
+      - name: Commit and remove one-shot workflow
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -f .github/workflows/spec-0079-gateway-evidence-final.yml
+          git config user.name 'GPT-5.6 Sol'
+          git config user.email 'actions@users.noreply.github.com'
+          git add -A
+          git commit -m 'fix(spec-0079): make every gateway attempt durable evidence'
+          git push origin HEAD:gpt56/agent-security-observability
