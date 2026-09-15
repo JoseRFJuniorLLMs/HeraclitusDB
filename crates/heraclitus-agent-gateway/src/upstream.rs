@@ -27,8 +27,6 @@ use hyper_util::rt::TokioExecutor;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-/// Cabeçalhos que NUNCA são reencaminhados ao upstream nem devolvidos ao
-/// cliente. `hop-by-hop` do RFC 9110 mais os que pertencem ao transporte.
 const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
@@ -42,13 +40,6 @@ const HOP_BY_HOP: &[&str] = &[
     "content-length",
 ];
 
-/// Prefixo dos cabeçalhos de correlação do Heraclitus.
-///
-/// São nossos e param aqui. Reencaminhá-los dizia a um terceiro na Internet o
-/// nome do utilizador humano (`X-Heraclitus-User: jose`), o identificador do run
-/// e o ambiente — topologia interna publicada a troco de nada, porque o upstream
-/// não sabe o que fazer com eles. Não é um segredo; é informação que ninguém
-/// pediu para divulgar.
 const PREFIXO_CORRELACAO: &str = "x-heraclitus-";
 
 #[derive(Debug, thiserror::Error)]
@@ -63,13 +54,13 @@ pub enum UpstreamError {
     Timeout,
 }
 
+#[derive(Debug)]
 pub struct UpstreamResponse {
     pub status: u16,
     pub headers: BTreeMap<String, String>,
     pub body: Bytes,
 }
 
-/// A configuração TLS do cliente, com o fornecedor criptográfico **explícito**.
 fn tls_config() -> Result<rustls::ClientConfig, UpstreamError> {
     let mut roots = rustls::RootCertStore::empty();
     let carregadas = rustls_native_certs::load_native_certs();
@@ -92,7 +83,6 @@ fn tls_config() -> Result<rustls::ClientConfig, UpstreamError> {
     .map(|b| b.with_root_certificates(roots).with_no_client_auth())
 }
 
-/// Cliente para um upstream fixo.
 pub struct UpstreamClient {
     base: Uri,
     client: Client<
@@ -135,7 +125,6 @@ impl UpstreamClient {
         &self.base
     }
 
-    /// Reencaminha um pedido. Sem redireccionamentos, sem retries.
     pub async fn forward(
         &self,
         method: &str,
@@ -198,11 +187,9 @@ impl UpstreamClient {
             }
         }
 
-        // SECURITY BOUNDARY: never `collect()` first and check length later.
-        // A malicious or compromised MCP upstream controls this stream; reading
-        // an unbounded response into memory before enforcing the configured cap
-        // turns `max_response_bytes` into a post-mortem metric and enables a
-        // trivial memory-exhaustion attack against the gateway.
+        // Never collect an attacker-controlled response before applying the cap.
+        // The former collect-then-check sequence allowed a compromised MCP
+        // upstream to force an allocation far above max_response_bytes.
         let mut response_body = resposta.into_body();
         let mut collected = Vec::with_capacity(self.max_response_bytes.min(64 * 1024));
         while let Some(frame) = response_body.frame().await {
@@ -279,9 +266,6 @@ mod tests {
     async fn resposta_upstream_e_limitada_durante_a_leitura() {
         use axum::routing::post;
 
-        // Several chunks are preferable to one giant Content-Length response:
-        // this proves the cap applies while consuming the stream, not after an
-        // unbounded `collect()` has already allocated the whole body.
         let payload = Arc::new(vec![b'X'; 256 * 1024]);
         let app = axum::Router::new().fallback(post({
             let payload = payload.clone();
