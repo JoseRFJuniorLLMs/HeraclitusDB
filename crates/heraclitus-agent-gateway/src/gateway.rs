@@ -151,6 +151,10 @@ async fn proxy(
     // configured upstream credential source yet, so forwarding a caller token
     // would be credential leakage in both OIDC and dev_local modes.
     upstream_header_map.remove("authorization");
+    // Classification hints are never forwarded. The body is the single
+    // security/protocol authority, preventing header-vs-body parser differential.
+    upstream_header_map.remove("mcp-method");
+    upstream_header_map.remove("mcp-name");
 
     let mut exchange = McpExchange {
         tenant_id: runtime.config.tenant_id.clone(),
@@ -336,7 +340,7 @@ async fn proxy(
             } => {
                 GatewayCounters::bump(&runtime.gateway_counters.require_approval);
                 let now = now_unix_seconds();
-                let Some(logical_request_id) = facts
+                let Some(raw_request_id) = facts
                     .tool_call_id
                     .as_deref()
                     .filter(|id| !id.trim().is_empty())
@@ -349,6 +353,15 @@ async fn proxy(
                         "approval-required tool calls need a stable JSON-RPC id",
                     );
                 };
+                // JSON-RPC ids are scoped to a client/session, not globally.
+                // Namespace them by trusted agent identity and run correlation so
+                // 256 agents may all use id=1 without poisoning one another.
+                let logical_request_id = format!(
+                    "{}:{}:{}",
+                    agent_id,
+                    exchange.run_id.as_deref().unwrap_or(""),
+                    raw_request_id
+                );
                 let authorization = ActionAuthorizationV1 {
                     authorization_id: ulid::Ulid::new().to_string(),
                     request_id: logical_request_id.clone(),

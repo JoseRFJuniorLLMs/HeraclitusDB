@@ -292,8 +292,11 @@ pub fn extract_facts(ex: &McpExchange) -> McpCallFacts {
 
     if let Some(body) = &ex.request_body {
         if let Some(v) = payload_jsonrpc(body) {
-            if facts.method.is_none() {
-                facts.method = v.get("method").and_then(Value::as_str).map(str::to_string);
+            // The JSON-RPC body is authoritative. Caller-controlled helper
+            // headers are capture hints only and may never override the message
+            // that the upstream will actually parse.
+            if let Some(method) = v.get("method").and_then(Value::as_str) {
+                facts.method = Some(method.to_string());
             }
             facts.tool_call_id = v
                 .get("id")
@@ -303,11 +306,8 @@ pub fn extract_facts(ex: &McpExchange) -> McpCallFacts {
                 })
                 .filter(|s| !s.is_empty() && s != "null");
             if let Some(params) = v.get("params") {
-                if facts.tool_name.is_none() {
-                    facts.tool_name = params
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
+                if let Some(name) = params.get("name").and_then(Value::as_str) {
+                    facts.tool_name = Some(name.to_string());
                 }
                 if let Some(args) = params.get("arguments").and_then(Value::as_object) {
                     for (k, val) in args {
@@ -507,6 +507,19 @@ mod tests {
         assert!(validate_request_json(raw)
             .unwrap_err()
             .contains("duplicada"));
+    }
+
+    #[test]
+    fn corpo_json_rpc_prevalece_sobre_headers_de_classificacao() {
+        let mut ex = McpExchange::default();
+        ex.request_headers
+            .insert(HEADER_METHOD.into(), "resources/read".into());
+        ex.request_headers
+            .insert(HEADER_NAME.into(), "lookup_vendor".into());
+        ex.request_body = Some(br#"{"jsonrpc":"2.0","id":"x","method":"tools/call","params":{"name":"exec","arguments":{}}}"#.to_vec());
+        let facts = extract_facts(&ex);
+        assert_eq!(facts.method.as_deref(), Some("tools/call"));
+        assert_eq!(facts.tool_name.as_deref(), Some("exec"));
     }
 
     #[test]
