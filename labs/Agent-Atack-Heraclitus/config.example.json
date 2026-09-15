@@ -7,6 +7,7 @@
   "mcp_gateway": "http://127.0.0.1:18787",
   "upstream_hits": "http://127.0.0.1:19000/hits",
   "campaign": "sandbox-demo",
+  "profile": "massive-v2",
   "concurrency": 64,
   "massive_agents": 128,
   "approval_race_workers": 24,
