@@ -70,34 +70,10 @@ pub struct UpstreamResponse {
 }
 
 /// A configuração TLS do cliente, com o fornecedor criptográfico **explícito**.
-///
-/// # Porque não `with_native_roots()` e pronto
-///
-/// Porque o `rustls` escolhe o fornecedor por um default de processo, e quando
-/// mais do que um está compilado na árvore (`ring` e `aws-lc-rs` chegam por
-/// caminhos diferentes conforme as features unificadas do workspace) ele
-/// recusa-se a adivinhar e entra em pânico:
-///
-/// ```text
-/// Could not automatically determine the process-level CryptoProvider
-/// from Rustls crate features.
-/// ```
-///
-/// Isso apareceu num teste; podia ter aparecido no primeiro pedido TLS de uma
-/// instalação. A alternativa óbvia — `install_default()` — resolve, mas é uma
-/// biblioteca a impor uma escolha global ao processo inteiro, exactamente o que
-/// a SPEC-0073 §20 proíbe para o allocator e pela mesma razão: quem embebe o
-/// motor deve poder escolher.
-///
-/// Portanto o fornecedor é declarado aqui, no sítio que o usa: `ring`, que é o
-/// mesmo que o `tonic` já traz (`tls-ring`). Uma só implementação de TLS na
-/// imagem, escolhida por nós e não por acaso de features.
 fn tls_config() -> Result<rustls::ClientConfig, UpstreamError> {
     let mut roots = rustls::RootCertStore::empty();
     let carregadas = rustls_native_certs::load_native_certs();
     for cert in carregadas.certs {
-        // Uma âncora malformada no armazém do sistema não deve derrubar o
-        // gateway; o que derruba é não sobrar nenhuma.
         let _ = roots.add(cert);
     }
     if roots.is_empty() {
@@ -151,7 +127,7 @@ impl UpstreamClient {
             base,
             client,
             timeout: Duration::from_secs(timeout_secs.max(1)),
-            max_response_bytes,
+            max_response_bytes: max_response_bytes.max(1),
         })
     }
 
@@ -188,8 +164,6 @@ impl UpstreamClient {
             if HOP_BY_HOP.iter().any(|h| k.eq_ignore_ascii_case(h)) {
                 continue;
             }
-            // Os nossos cabeçalhos de correlação param no gateway. Só saem daqui
-            // no sentido do upstream, e o upstream não tem nada a ver com eles.
             if k.to_ascii_lowercase().starts_with(PREFIXO_CORRELACAO) {
                 continue;
             }
@@ -223,19 +197,32 @@ impl UpstreamClient {
                 out_headers.insert(k.as_str().to_string(), s.to_string());
             }
         }
-        let collected = resposta
-            .into_body()
-            .collect()
-            .await
-            .map_err(|e| UpstreamError::Transport(e.to_string()))?
-            .to_bytes();
-        if collected.len() > self.max_response_bytes {
-            return Err(UpstreamError::TooLarge(self.max_response_bytes));
+
+        // SECURITY BOUNDARY: never `collect()` first and check length later.
+        // A malicious or compromised MCP upstream controls this stream; reading
+        // an unbounded response into memory before enforcing the configured cap
+        // turns `max_response_bytes` into a post-mortem metric and enables a
+        // trivial memory-exhaustion attack against the gateway.
+        let mut response_body = resposta.into_body();
+        let mut collected = Vec::with_capacity(self.max_response_bytes.min(64 * 1024));
+        while let Some(frame) = response_body.frame().await {
+            let frame = frame.map_err(|e| UpstreamError::Transport(e.to_string()))?;
+            if let Some(data) = frame.data_ref() {
+                let next_len = collected
+                    .len()
+                    .checked_add(data.len())
+                    .ok_or(UpstreamError::TooLarge(self.max_response_bytes))?;
+                if next_len > self.max_response_bytes {
+                    return Err(UpstreamError::TooLarge(self.max_response_bytes));
+                }
+                collected.extend_from_slice(data);
+            }
         }
+
         Ok(UpstreamResponse {
             status,
             headers: out_headers,
-            body: collected,
+            body: Bytes::from(collected),
         })
     }
 }
@@ -243,6 +230,7 @@ impl UpstreamClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn url_sem_esquema_e_recusado() {
@@ -253,9 +241,6 @@ mod tests {
 
     #[test]
     fn os_cabecalhos_de_correlacao_nao_saem_para_o_upstream() {
-        // O que isto impede: um `tools/call` para um servidor MCP público na
-        // Internet levar consigo `X-Heraclitus-User: jose`. O upstream não pede
-        // essa informação, não a usa, e passa a tê-la.
         for h in [
             "X-Heraclitus-User",
             "x-heraclitus-agent",
@@ -267,7 +252,6 @@ mod tests {
                 "`{h}` escapava ao filtro de correlação"
             );
         }
-        // E o filtro não pode ser tão largo que apanhe cabeçalhos de terceiros.
         for h in ["X-Request-Id", "Authorization", "Accept", "x-heraclitus"] {
             assert!(
                 !h.to_ascii_lowercase().starts_with(PREFIXO_CORRELACAO),
@@ -289,5 +273,34 @@ mod tests {
                 "{h} devia ser hop-by-hop"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn resposta_upstream_e_limitada_durante_a_leitura() {
+        use axum::routing::post;
+
+        // Several chunks are preferable to one giant Content-Length response:
+        // this proves the cap applies while consuming the stream, not after an
+        // unbounded `collect()` has already allocated the whole body.
+        let payload = Arc::new(vec![b'X'; 256 * 1024]);
+        let app = axum::Router::new().fallback(post({
+            let payload = payload.clone();
+            move || {
+                let payload = payload.clone();
+                async move { payload.as_ref().clone() }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = UpstreamClient::new(&format!("http://{addr}"), 5, 1024).unwrap();
+        let err = client
+            .forward("POST", "/mcp", &BTreeMap::new(), Bytes::from_static(b"{}"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, UpstreamError::TooLarge(1024)));
     }
 }
