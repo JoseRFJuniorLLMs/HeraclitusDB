@@ -70,6 +70,12 @@ pub fn router(runtime: Arc<AgentRuntime>) -> Router {
         .route("/api/v1/agent/evidence/:id", get(evidence_detail))
         .route("/api/v1/agent/evidence/:id/proof", get(evidence_proof))
         .route("/api/v1/agent/evidence/export", post(export))
+        // SPEC-0079 — laboratório defensivo: telemetria estruturada de probes.
+        // POST é SystemAdmin; GET segue a permissão de leitura dos runs.
+        .route(
+            "/api/v1/agent/red-team/events",
+            get(red_team_events).post(red_team_record),
+        )
         .route("/api/v1/agent/bundles/:name", get(download_bundle))
         // ── Policy (0075 §21) ───────────────────────────────────────────────
         .route("/api/v1/agent/policies", get(policies))
@@ -146,6 +152,255 @@ fn rows_or_error(runtime: &Arc<AgentRuntime>) -> Result<Vec<StoredEvidence>, Res
             "verifique o estado do armazenamento com `heraclitus agent doctor`",
         )
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct RedTeamInput {
+    attack_id: String,
+    #[serde(default)]
+    campaign_id: Option<String>,
+    vector: String,
+    target: String,
+    phase: String,
+    result: String,
+    #[serde(default)]
+    expected: Option<String>,
+    #[serde(default)]
+    reason_code: Option<String>,
+    #[serde(default)]
+    blocked: Option<bool>,
+    #[serde(default)]
+    upstream_delta: Option<i64>,
+    #[serde(default)]
+    transport_status: Option<i64>,
+    #[serde(default)]
+    sequence: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct RedTeamQuery {
+    campaign: Option<String>,
+    limit: Option<usize>,
+}
+
+fn invalid_probe_atom(label: &str, value: &str, max: usize) -> Option<Response> {
+    if value.is_empty() || value.len() > max || value.chars().any(|c| c.is_control()) {
+        return Some(problem(
+            StatusCode::BAD_REQUEST,
+            "REDTEAM_EVENT_INVALID",
+            format!("{label} vazio, grande demais ou com caracteres de controlo"),
+            "envie apenas metadados curtos; payloads ofensivos e segredos não pertencem ao evidence log",
+        ));
+    }
+    None
+}
+
+async fn red_team_record(
+    State(runtime): State<Arc<AgentRuntime>>,
+    headers: HeaderMap,
+    Json(input): Json<RedTeamInput>,
+) -> Response {
+    let principal = match who(&runtime, &headers) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    // A telemetria do laboratório é uma escrita administrativa. O Dashboard é
+    // somente leitura; o runner autorizado escreve directamente na Agent API.
+    if let Err(e) = principal.require(Operation::ChangeCapture) {
+        return forbidden(e);
+    }
+    for (label, value, max) in [
+        ("attack_id", input.attack_id.as_str(), 128usize),
+        ("vector", input.vector.as_str(), 128usize),
+        ("target", input.target.as_str(), 256usize),
+        ("phase", input.phase.as_str(), 48usize),
+        ("result", input.result.as_str(), 64usize),
+    ] {
+        if let Some(r) = invalid_probe_atom(label, value, max) {
+            return r;
+        }
+    }
+    let campaign = input.campaign_id.as_deref().unwrap_or("manual");
+    if let Some(r) = invalid_probe_atom("campaign_id", campaign, 128) {
+        return r;
+    }
+
+    let now = now_unix_nanos();
+    let mut ev = heraclitus_agent::evidence::AgentEvidenceV1::new(
+        runtime.config.tenant_id.clone(),
+        heraclitus_agent::evidence::AgentEvidenceKindV1::ErrorObserved,
+        now,
+    );
+    ev.run_id = Some(format!("redteam:{campaign}"));
+    ev.agent = heraclitus_agent::evidence::AgentIdentityV1 {
+        agent_id: "agent-atack-heraclitus".into(),
+        agent_name: Some("Agent-Atack-Heraclitus".into()),
+        framework: Some("heraclitus-redteam-lab".into()),
+        ..Default::default()
+    };
+    ev.subject.protocol = Some("redteam_lab".into());
+    ev.subject.server_id = Some(input.target.clone());
+    ev.subject.tool_name = Some(input.vector.clone());
+    ev.subject.tool_call_id = Some(input.attack_id.clone());
+    ev.source = heraclitus_agent::evidence::EvidenceSourceV1 {
+        source_kind: "redteam_lab".into(),
+        source_instance: Some(principal.subject.clone()),
+        source_sequence: input.sequence,
+        received_at_unix_nanos: Some(now),
+    };
+    ev.privacy.capture_mode = heraclitus_agent::evidence::CaptureModeV1::MetadataOnly;
+    ev.privacy.redaction_applied = true;
+    ev.content
+        .fields
+        .insert("attack_id".into(), input.attack_id.clone());
+    ev.content
+        .fields
+        .insert("campaign_id".into(), campaign.to_string());
+    ev.content
+        .fields
+        .insert("vector".into(), input.vector.clone());
+    ev.content
+        .fields
+        .insert("target".into(), input.target.clone());
+    ev.content
+        .fields
+        .insert("phase".into(), input.phase.clone());
+    ev.content
+        .fields
+        .insert("result".into(), input.result.clone());
+    if let Some(v) = &input.expected {
+        if v.len() <= 128 {
+            ev.content.fields.insert("expected".into(), v.clone());
+        }
+    }
+    if let Some(v) = &input.reason_code {
+        if v.len() <= 128 {
+            ev.content.fields.insert("reason_code".into(), v.clone());
+        }
+    }
+    if let Some(v) = input.blocked {
+        ev.content.fields.insert("blocked".into(), v.to_string());
+    }
+    if let Some(v) = input.upstream_delta {
+        ev.content
+            .fields
+            .insert("upstream_delta".into(), v.to_string());
+    }
+    ev.outcome = Some(heraclitus_agent::evidence::EvidenceOutcomeV1 {
+        transport_status: input.transport_status,
+        protocol_status: Some(input.result.clone()),
+        error_code: input.reason_code.clone(),
+        ..Default::default()
+    });
+    ev.dedupe_key = format!(
+        "redteam:{}:{}:{}:{}",
+        campaign,
+        input.attack_id,
+        input.phase,
+        input.sequence.unwrap_or(0)
+    );
+
+    match runtime.append(&ev) {
+        Ok(lsn) => Json(serde_json::json!({
+            "accepted": true,
+            "duplicate": lsn.is_none(),
+            "evidence_id": ev.evidence_id,
+            "lsn": lsn,
+            "capture": "METADATA_ONLY",
+        }))
+        .into_response(),
+        Err(e) => problem(
+            StatusCode::CONFLICT,
+            "REDTEAM_EVIDENCE_REJECTED",
+            e.to_string(),
+            "use outro attack_id/phase/sequence; evidência existente nunca é reescrita",
+        ),
+    }
+}
+
+async fn red_team_events(
+    State(runtime): State<Arc<AgentRuntime>>,
+    headers: HeaderMap,
+    Query(q): Query<RedTeamQuery>,
+) -> Response {
+    let principal = match who(&runtime, &headers) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    if let Err(e) = principal.require(Operation::ViewRuns) {
+        return forbidden(e);
+    }
+    let rows = match rows_or_error(&runtime) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    let limit = q.limit.unwrap_or(200).clamp(1, 1000);
+    let mut events = Vec::new();
+    let mut blocked = 0u64;
+    let mut reached_upstream = 0u64;
+    for row in rows.iter().rev() {
+        let e = &row.evidence;
+        if e.source.source_kind != "redteam_lab" {
+            continue;
+        }
+        let campaign = e
+            .content
+            .fields
+            .get("campaign_id")
+            .map(String::as_str)
+            .unwrap_or("");
+        if q.campaign
+            .as_deref()
+            .is_some_and(|wanted| wanted != campaign)
+        {
+            continue;
+        }
+        let is_blocked = e.content.fields.get("blocked").is_some_and(|v| v == "true");
+        if is_blocked {
+            blocked += 1;
+        }
+        let delta = e
+            .content
+            .fields
+            .get("upstream_delta")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        if delta > 0 {
+            reached_upstream += 1;
+        }
+        events.push(serde_json::json!({
+            "lsn": row.lsn,
+            "record_hash": row.record_hash(),
+            "evidence_id": e.evidence_id,
+            "observed_at_unix_nanos": e.observed_at_unix_nanos,
+            "run_id": e.run_id,
+            "attack_id": e.content.fields.get("attack_id"),
+            "campaign_id": e.content.fields.get("campaign_id"),
+            "vector": e.content.fields.get("vector"),
+            "target": e.content.fields.get("target"),
+            "phase": e.content.fields.get("phase"),
+            "result": e.content.fields.get("result"),
+            "expected": e.content.fields.get("expected"),
+            "reason_code": e.content.fields.get("reason_code"),
+            "blocked": is_blocked,
+            "upstream_delta": delta,
+            "transport_status": e.outcome.as_ref().and_then(|o| o.transport_status),
+            "capture_mode": e.privacy.capture_mode.label(),
+        }));
+        if events.len() >= limit {
+            break;
+        }
+    }
+    let returned = events.len();
+    Json(serde_json::json!({
+        "events": events,
+        "summary": {
+            "returned": returned,
+            "blocked": blocked,
+            "reached_upstream": reached_upstream,
+        },
+        "truth": "red-team metadata is lab-reporter evidence; native gateway decisions remain independent evidence",
+    })).into_response()
 }
 
 #[derive(Debug, Deserialize, Default)]

@@ -714,3 +714,43 @@ async fn flood_concorrente_de_deny_nunca_toca_o_upstream() {
         "evidence log ficou ilegível"
     );
 }
+
+#[tokio::test]
+async fn redteam_lab_fica_no_hrkl_e_aparece_na_api() {
+    let h = harness(GatewayMode::Enforce).await;
+    let (status, body) = post_json(
+        &format!("{}/api/v1/agent/red-team/events", h.api_url),
+        serde_json::json!({
+            "attack_id": "rt-001",
+            "campaign_id": "sandbox-demo",
+            "vector": "mcp-policy-deny",
+            "target": "mcp://sandbox/exec",
+            "phase": "result",
+            "result": "blocked",
+            "expected": "blocked",
+            "reason_code": "SHELL_DENIED",
+            "blocked": true,
+            "upstream_delta": 0,
+            "transport_status": 403,
+            "sequence": 1
+        }),
+        &[],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["lsn"].as_u64().is_some(), "{body}");
+
+    let (status, body) = get_json(&format!(
+        "{}/api/v1/agent/red-team/events?campaign=sandbox-demo&limit=10",
+        h.api_url
+    ))
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["events"][0]["attack_id"], "rt-001");
+    assert_eq!(body["events"][0]["blocked"], true);
+    assert_eq!(body["events"][0]["upstream_delta"], 0);
+    assert_eq!(body["events"][0]["capture_mode"], "METADATA_ONLY");
+    let dump = body.to_string();
+    assert!(!dump.contains("rm -rf"));
+    assert!(!dump.to_lowercase().contains("bearer "));
+}
