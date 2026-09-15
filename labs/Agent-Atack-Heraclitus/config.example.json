@@ -1,0 +1,12 @@
+{
+  "core_rest": "http://127.0.0.1:17475",
+  "core_grpc_host": "127.0.0.1",
+  "core_grpc_port": 17474,
+  "agent_api": "http://127.0.0.1:18080",
+  "otlp": "http://127.0.0.1:14318",
+  "mcp_gateway": "http://127.0.0.1:18787",
+  "upstream_hits": "http://127.0.0.1:19000/hits",
+  "campaign": "sandbox-demo",
+  "concurrency": 64,
+  "oversized_bytes": 5242880
+}
