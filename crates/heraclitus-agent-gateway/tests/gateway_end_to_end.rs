@@ -404,6 +404,11 @@ async fn aprovado_executa_uma_vez_e_so_uma() {
     let (status, body) = post_json(&format!("{}/mcp", h.gateway_url), pedido, AGENT_HEADERS).await;
     assert_eq!(h.hits(), antes + 1, "executou duas vezes");
     assert!(status == 403 || status == 202, "status {status}: {body}");
+    assert_eq!(
+        h.runtime.gateway_counters.snapshot()["evidence_errors"],
+        0,
+        "approval retry/replay não pode criar buracos no evidence log"
+    );
 }
 
 #[tokio::test]

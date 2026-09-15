@@ -132,13 +132,10 @@ pub struct AgentRuntime {
 /// consequências opostas:
 ///
 /// - [`Conflito`](AppendOutcome::Conflito) — a chave já existe com conteúdo
-///   diferente. Parece adulteração, mas o caminho de aprovação humana produz um
-///   legitimamente: o retry DEPOIS de aprovar usa, por contrato, o mesmo
-///   `tool_call_id` (é essa a razão de existir do authorization binding), e o
-///   `ToolRequested` que se grava então tem a proveniência da aprovação, que o
-///   primeiro não tinha. Recusar a gravação está certo — reescrever evidência
-///   registada não se faz — mas recusar a CHAMADA partia o fluxo que a
-///   SPEC-0075 §16 define.
+///   diferente. Para OTLP isto continua a significar colisão/rewrite da mesma
+///   identidade lógica. Para o gateway, cada tentativa HTTP recebe identidade
+///   de evidência distinta, portanto um conflito também é falha de integridade
+///   e o modo `enforce` recusa a acção.
 /// - [`Falhou`](AppendOutcome::Falhou) — o log não aceitou a escrita. Aqui não
 ///   há leitura benigna: a acção não ficou registada.
 #[derive(Debug)]

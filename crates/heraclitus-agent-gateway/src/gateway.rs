@@ -663,23 +663,17 @@ fn append(runtime: &Arc<AgentRuntime>, e: AgentEvidenceV1) -> Gravacao {
     let id = e.evidence_id.clone();
     match runtime.append_outcome(&e) {
         AppendOutcome::Gravada(_) | AppendOutcome::Duplicada => Gravacao::Ok(Some(id)),
-        // Conflito NÃO bloqueia, e a razão é concreta: o retry depois de uma
-        // aprovação humana usa, por contrato, o mesmo `tool_call_id` — é essa a
-        // razão de existir do authorization binding — e o `ToolRequested` que
-        // se grava então leva a proveniência da aprovação, que o primeiro não
-        // tinha. Mesma chave, conteúdo diferente: conflito legítimo.
-        //
-        // Recusar a GRAVAÇÃO continua certo (não se reescreve evidência
-        // registada). Recusar a CHAMADA partiria o fluxo da SPEC-0075 §16.
-        // O que muda em relação a antes é que isto deixou de ser invisível.
+        // SPEC-0079 live red-team: gateway attempts now carry distinct
+        // dedupe identities. A conflict here is no longer an expected approval
+        // retry; it is an evidence-integrity failure and ENFORCE must fail closed.
         AppendOutcome::Conflito { existing_hash } => {
-            tracing::warn!(
-                chave = %e.dedupe_key,
-                gravado = %existing_hash,
-                "evidência recusada por conflito de deduplicação"
+            let motivo = format!(
+                "conflito de deduplicação no gateway: chave {} já gravada como {}",
+                e.dedupe_key, existing_hash
             );
+            tracing::error!(motivo = %motivo, "evidência de agente NÃO foi gravada");
             GatewayCounters::bump(&runtime.gateway_counters.evidence_errors);
-            Gravacao::Ok(None)
+            Gravacao::Falhou(motivo)
         }
         // O log não aceitou a escrita. Aqui não há leitura benigna: a acção não
         // ficou registada.
