@@ -24,6 +24,13 @@ class MassiveLab(Lab):
 
     def credential_separation(self):
         aid = self.attack_id('credential-separation')
+        snapshot = self.status_snapshot()
+        if snapshot.get('auth') == 'dev_local':
+            self.report(Result(aid, 'credential-plane-separation', 'core↔agent',
+                               'N/A: dev_local deliberately has no Agent credential boundary',
+                               'N/A dev_local', True, blocked=False,
+                               detail='Use basic/OIDC profile to qualify cross-plane credential separation'))
+            return
         core_on_agent = self.core_auth(True)
         s1, _, _ = self.request(self.cfg['agent_api'], '/api/v1/agent/status', headers=core_on_agent)
         agent_on_core = self.auth_agent()
@@ -31,7 +38,7 @@ class MassiveLab(Lab):
         ok = s1 in {401, 403} and s2 in {401, 403}
         self.report(Result(aid, 'credential-plane-separation', 'core↔agent', 'cross-plane credentials rejected',
                            f'agent={s1} core={s2}', ok, s2, blocked=ok,
-                           detail='Core Basic must not authenticate Agent; Agent token must not authenticate Core', duration_ms=ms))
+                           detail='Core and Agent credentials are intentionally distinct', duration_ms=ms))
 
     def multi_agent_same_rpc_id(self):
         agents = int(self.cfg.get('massive_agents', 128))
@@ -144,7 +151,7 @@ class MassiveLab(Lab):
         ok=sa==200 and wins==1 and delta in {1,None}
         self.report(Result(aid,'approval-concurrent-consume','mcp:send_payment','exactly one execution from one approval',
                            f'wins={wins}/{n}',ok,200 if wins else None,blocked=not ok,upstream_delta=delta,
-                           detail=f'approval={approval[:18]}… statuses={{{s:statuses.count(s) for s in set(statuses)}}}'))
+                           detail=f"approval={approval[:18]}… statuses={ {code: statuses.count(code) for code in set(statuses)} }"))
 
     def replay_storm(self):
         n=int(self.cfg.get('replay_storm',256)); aid=self.attack_id('replay-storm')
