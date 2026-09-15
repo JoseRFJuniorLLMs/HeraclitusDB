@@ -88,16 +88,58 @@ async fn proxy(
         })
         .collect();
 
-    let server_id = header_map
-        .get("x-heraclitus-server")
-        .cloned()
-        .unwrap_or_else(|| {
-            state
-                .upstream
-                .as_ref()
-                .and_then(|u| u.base().host().map(str::to_string))
-                .unwrap_or_else(|| "upstream".to_string())
-        });
+    // Trust boundary: policy resource identity is derived from the configured
+    // upstream. A caller-controlled X-Heraclitus-Server is correlation metadata
+    // only and can never select another server's policy rules.
+    let server_id = state
+        .upstream
+        .as_ref()
+        .and_then(|u| u.base().host().map(str::to_string))
+        .unwrap_or_else(|| "upstream".to_string());
+
+    // Bound untrusted correlation metadata before copying it into durable evidence.
+    for nome in [
+        "x-heraclitus-agent",
+        "x-heraclitus-run",
+        "x-heraclitus-user",
+        "x-heraclitus-environment",
+        "x-heraclitus-trace",
+        "x-heraclitus-server",
+    ] {
+        if header_map.get(nome).is_some_and(|v| v.len() > 512) {
+            return mcp_error(
+                StatusCode::BAD_REQUEST,
+                &None,
+                "CORRELATION_HEADER_TOO_LARGE",
+                &format!("{nome} excede 512 bytes"),
+            );
+        }
+    }
+
+    // In OIDC mode the identity used by policy and evidence comes from the
+    // validated token, never from spoofable X-Heraclitus-* headers.
+    let principal = if runtime.gateway.identity.mode == "oidc" {
+        match crate::auth::principal_from(runtime, &headers, now_unix_seconds()) {
+            Ok(p) => Some(p),
+            Err(e) => return mcp_error(e.status, &None, e.code, &e.detail),
+        }
+    } else {
+        None
+    };
+    let trusted_agent = principal
+        .as_ref()
+        .map(|p| p.subject.clone())
+        .or_else(|| header_map.get("x-heraclitus-agent").cloned());
+    let trusted_human = principal
+        .as_ref()
+        .map(|p| p.subject.clone())
+        .or_else(|| header_map.get("x-heraclitus-user").cloned());
+
+    // Gateway credentials authenticate to the gateway, not to its upstream.
+    let mut upstream_header_map = header_map.clone();
+    if principal.is_some() {
+        upstream_header_map.remove("authorization");
+    }
 
     let mut exchange = McpExchange {
         tenant_id: runtime.config.tenant_id.clone(),
@@ -108,8 +150,8 @@ async fn proxy(
         observed_at_unix_nanos: started,
         trace_id: header_map.get("x-heraclitus-trace").cloned(),
         run_id: header_map.get("x-heraclitus-run").cloned(),
-        agent_id: header_map.get("x-heraclitus-agent").cloned(),
-        human_subject: header_map.get("x-heraclitus-user").cloned(),
+        agent_id: trusted_agent,
+        human_subject: trusted_human,
         ..Default::default()
     };
     let facts = mcp::extract_facts(&exchange);
@@ -124,7 +166,7 @@ async fn proxy(
     // `ping`) passa sem policy e sem evidência. Registá-lo encheria a timeline
     // de ruído de protocolo e escondia as acções que interessam.
     if !e_tool_call {
-        return forward_or_error(&state, &method, &uri, &header_map, body).await;
+        return forward_or_error(&state, &method, &uri, &upstream_header_map, body).await;
     }
 
     let agent_id = exchange
@@ -423,7 +465,7 @@ async fn proxy(
     let started_id = append(runtime, started_ev).id();
 
     let t0 = now_unix_nanos();
-    let resultado = forward(&state, &method, &uri, &header_map, body).await;
+    let resultado = forward(&state, &method, &uri, &upstream_header_map, body).await;
     let duracao = now_unix_nanos().saturating_sub(t0);
 
     match resultado {
