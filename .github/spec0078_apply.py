@@ -285,7 +285,8 @@ semantic = r'''
         || token.is_some()
         || credentials > 0;
     if let Some(raw) = config.get("agent_black_box") {
-        match raw.clone().try_into::<AgentBlackBoxConfig>() {
+        let parsed: Result<AgentBlackBoxConfig, _> = raw.clone().try_into();
+        match parsed {
             Ok(agent) => {
                 if let Err(error) =
                     agent.validate(production, tls_configured, core_auth_configured)
@@ -307,7 +308,8 @@ semantic = r'''
         }
     }
     if let Some(raw) = config.get("agent_gateway") {
-        match raw.clone().try_into::<AgentGatewayConfig>() {
+        let parsed: Result<AgentGatewayConfig, _> = raw.clone().try_into();
+        match parsed {
             Ok(gateway) => {
                 if let Err(error) = gateway.validate(production, tls_configured) {
                     findings.push(finding(
