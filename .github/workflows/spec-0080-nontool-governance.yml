@@ -1,0 +1,211 @@
+name: SPEC-0080 non-tool MCP governance
+on:
+  push:
+    branches: [gpt56/agent-security-observability]
+    paths: ['.github/workflows/spec-0080-nontool-governance.yml']
+permissions:
+  contents: write
+jobs:
+  implement:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: gpt56/agent-security-observability
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
+      - name: Implement fail-closed non-tool governance
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('crates/heraclitus-agent-gateway/src/gateway.rs')
+          s=p.read_text()
+          marker='''fn mcp_method_is_canonical(method: &str) -> bool {
+              !method.is_empty()
+                  && method.len() <= 128
+                  && method
+                      .bytes()
+                      .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'-' | b'.'))
+          }
+          '''
+          if marker not in s:
+              raise SystemExit('canonical method marker not found')
+          extra=marker+'''\nfn mcp_non_tool_control_allowed(method: &str) -> bool {
+              matches!(
+                  method,
+                  "initialize"
+                      | "ping"
+                      | "tools/list"
+                      | "resources/list"
+                      | "resources/templates/list"
+                      | "prompts/list"
+                      | "logging/setLevel"
+              ) || method.starts_with("notifications/")
+          }
+          '''
+          s=s.replace(marker,extra,1)
+          old='''        return forward_or_error(&state, &method, &uri, &upstream_header_map, body).await;
+              }
+          
+              let agent_id = exchange
+          '''
+          new='''        if mcp_non_tool_control_allowed(method_name) {
+                  return forward_or_error(&state, &method, &uri, &upstream_header_map, body).await;
+              }
+          
+              // SPEC-0080: data-bearing and unknown non-tool MCP methods do not
+              // inherit an accidental allow merely because they are not tools/call.
+              let mode = runtime.mode();
+              if mode != GatewayMode::Observe {
+                  let agent_id = exchange
+                      .agent_id
+                      .clone()
+                      .unwrap_or_else(|| "unknown-agent".to_string());
+                  let mut denied = base_evidence(
+                      runtime,
+                      AgentEvidenceKindV1::ErrorObserved,
+                      now_unix_nanos(),
+                      &exchange,
+                      &facts,
+                      &agent_id,
+                  );
+                  let known_data_method = matches!(
+                      method_name,
+                      "resources/read"
+                          | "resources/subscribe"
+                          | "resources/unsubscribe"
+                          | "prompts/get"
+                          | "completion/complete"
+                  );
+                  let reason = if known_data_method {
+                      "MCP_NON_TOOL_DENIED"
+                  } else {
+                      "MCP_UNKNOWN_METHOD_DENIED"
+                  };
+                  denied.content.extensions.insert("mcp_method".into(), method_name.to_string());
+                  denied.content.extensions.insert(
+                      "gateway_decision".into(),
+                      if mode == GatewayMode::Enforce { "deny" } else { "would_deny" }.into(),
+                  );
+                  denied.outcome = Some(EvidenceOutcomeV1 {
+                      transport_status: Some(if mode == GatewayMode::Enforce { 403 } else { 200 }),
+                      protocol_status: Some(reason.into()),
+                      error_code: Some(reason.into()),
+                      error_message: Some("non-tool MCP method requires explicit governance".into()),
+                      ..Default::default()
+                  });
+                  let gravacao = append(runtime, denied);
+                  if let Gravacao::Falhou(motivo) = &gravacao {
+                      if mode == GatewayMode::Enforce {
+                          let _ = runtime.flush();
+                          return mcp_error(
+                              StatusCode::INTERNAL_SERVER_ERROR,
+                              &facts.tool_call_id,
+                              "EVIDENCE_NOT_RECORDED",
+                              motivo,
+                          );
+                      }
+                  }
+                  let _ = runtime.flush();
+                  if mode == GatewayMode::Enforce {
+                      return mcp_error(
+                          StatusCode::FORBIDDEN,
+                          &facts.tool_call_id,
+                          reason,
+                          "non-tool MCP data/unknown method denied by SPEC-0080",
+                      );
+                  }
+              }
+          
+              return forward_or_error(&state, &method, &uri, &upstream_header_map, body).await;
+              }
+          
+              let agent_id = exchange
+          '''
+          if old not in s:
+              raise SystemExit('non-tool passthrough marker not found')
+          s=s.replace(old,new,1)
+          p.write_text(s)
+          PY
+      - name: Add E2E regression tests
+        run: |
+          cat >> crates/heraclitus-agent-gateway/tests/gateway_end_to_end.rs <<'RS'
+          
+          #[tokio::test]
+          async fn spec_0080_data_bearing_non_tool_falha_fechado_em_enforce() {
+              let h = harness(GatewayMode::Enforce).await;
+              for (id, method) in [
+                  ("r1", "resources/read"),
+                  ("p1", "prompts/get"),
+                  ("c1", "completion/complete"),
+                  ("u1", "vendor/private/read"),
+              ] {
+                  let antes = h.hits();
+                  let (status, body) = post_json(
+                      &format!("{}/mcp", h.gateway_url),
+                      serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":{}}),
+                      &[("x-heraclitus-agent", "compromised-agent")],
+                  ).await;
+                  assert_eq!(status, 403, "method={method} body={body}");
+                  assert_eq!(h.hits(), antes, "{method} reached upstream");
+              }
+              let rows = h.runtime.scan().unwrap();
+              assert!(rows.iter().filter(|r| r.evidence.kind == AgentEvidenceKindV1::ErrorObserved).count() >= 4);
+              assert_eq!(h.runtime.gateway_counters.snapshot()["evidence_errors"], 0);
+          }
+          
+          #[tokio::test]
+          async fn spec_0080_control_methods_continuam_a_passar() {
+              let h = harness(GatewayMode::Enforce).await;
+              for (id, method) in [("ping", "ping"), ("tl", "tools/list"), ("rl", "resources/list"), ("pl", "prompts/list")] {
+                  let antes = h.hits();
+                  let (status, body) = post_json(
+                      &format!("{}/mcp", h.gateway_url),
+                      serde_json::json!({"jsonrpc":"2.0","id":id,"method":method}),
+                      &[],
+                  ).await;
+                  assert_eq!(status, 200, "method={method} body={body}");
+                  assert_eq!(h.hits(), antes + 1, "{method} did not reach upstream");
+              }
+          }
+          
+          #[tokio::test]
+          async fn spec_0080_shadow_registra_would_deny_mas_nao_bloqueia() {
+              let h = harness(GatewayMode::Shadow).await;
+              let antes = h.hits();
+              let (status, _) = post_json(
+                  &format!("{}/mcp", h.gateway_url),
+                  serde_json::json!({"jsonrpc":"2.0","id":"shadow-read","method":"resources/read","params":{}}),
+                  &[("x-heraclitus-agent", "shadow-agent")],
+              ).await;
+              assert_eq!(status, 200);
+              assert_eq!(h.hits(), antes + 1);
+              let rows = h.runtime.scan().unwrap();
+              assert!(rows.iter().any(|r| {
+                  r.evidence.kind == AgentEvidenceKindV1::ErrorObserved
+                      && r.evidence.content.extensions.get("gateway_decision").map(String::as_str) == Some("would_deny")
+              }));
+          }
+          RS
+      - name: Focused qualification
+        run: |
+          cargo fmt --all -- --check || cargo fmt --all
+          cargo test -p heraclitus-agent-gateway --test gateway_end_to_end
+          cargo test -p heraclitus-agent-gateway
+          cargo clippy -p heraclitus-agent-gateway --all-targets -- -D warnings
+      - name: Mark SPEC implemented and commit
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('docs/md/SPEC-new/SPEC-0080-MCP-Non-Tool-Governance.md')
+          s=p.read_text().replace('**Status:** PROPOSED / implementation in the same qualification branch', '**Status:** IMPLEMENTED / focused qualification green')
+          p.write_text(s)
+          PY
+          git config user.name 'GPT-5.6 Sol'
+          git config user.email 'actions@users.noreply.github.com'
+          git rm .github/workflows/spec-0080-nontool-governance.yml
+          git add crates/heraclitus-agent-gateway/src/gateway.rs crates/heraclitus-agent-gateway/tests/gateway_end_to_end.rs docs/md/SPEC-new/SPEC-0080-MCP-Non-Tool-Governance.md
+          git commit -m 'feat(spec-0080): fail closed on non-tool MCP data surfaces'
+          git push origin HEAD:gpt56/agent-security-observability
