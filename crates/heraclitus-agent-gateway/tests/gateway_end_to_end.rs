@@ -377,7 +377,11 @@ async fn aprovado_executa_uma_vez_e_so_uma() {
     .await;
     assert_eq!(status, 200);
 
-    // 3. A mesma acção exacta passa — uma vez.
+    // SPEC-0078: o bug da v2.0.0 só aparecia quando o retry cruzava o segundo
+    // UNIX porque issued_at/expires_at eram indevidamente parte do binding.
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+    // 3. A mesma acção exacta passa — uma vez, mesmo noutro segundo.
     let antes = h.hits();
     let (status, _) = post_json(
         &format!("{}/mcp", h.gateway_url),
@@ -670,5 +674,43 @@ async fn exportar_pela_api_devolve_um_bundle_descarregavel() {
         heraclitus_agent::verifier::VerifyExit::Verified,
         "sem prova de inclusão o verdicto não pode ser VERIFIED: {}",
         report.to_human()
+    );
+}
+
+#[tokio::test]
+async fn flood_concorrente_de_deny_nunca_toca_o_upstream() {
+    let h = harness(GatewayMode::Enforce).await;
+    let antes = h.hits();
+    let mut tarefas = tokio::task::JoinSet::new();
+    for i in 0..64usize {
+        let url = format!("{}/mcp", h.gateway_url);
+        tarefas.spawn(async move {
+            post_json(
+                &url,
+                tool_call(
+                    &format!("deny-flood-{i}"),
+                    "exec",
+                    serde_json::json!({ "command": "rm -rf /", "attempt": i }),
+                ),
+                AGENT_HEADERS,
+            )
+            .await
+            .0
+        });
+    }
+    let mut negadas = 0usize;
+    while let Some(resultado) = tarefas.join_next().await {
+        assert_eq!(resultado.unwrap(), 403);
+        negadas += 1;
+    }
+    assert_eq!(negadas, 64);
+    assert_eq!(
+        h.hits(),
+        antes,
+        "DENY concorrente vazou chamada ao upstream"
+    );
+    assert!(
+        !h.runtime.scan().unwrap().is_empty(),
+        "evidence log ficou ilegível"
     );
 }

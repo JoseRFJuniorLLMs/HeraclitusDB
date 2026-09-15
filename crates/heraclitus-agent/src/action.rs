@@ -9,8 +9,10 @@
 //! Isto não é uma verificação que se faz "com cuidado" no sítio certo: é um
 //! **hash do assunto** calculado antes de pedir a aprovação e reconferido antes
 //! de executar. Se qualquer coisa que importa mudar — ferramenta, servidor,
-//! argumentos, agente, humano, policy, validade — o hash muda e a autorização
-//! deixa de valer. Não há caminho no código que execute sem o reconferir.
+//! argumentos, agente, humano ou policy — o hash muda e a autorização
+//! deixa de valer. A validade temporal é verificada separadamente pelo lifecycle
+//! da aprovação e pela autorização apresentada; não faz parte da identidade do
+//! assunto. Não há caminho no código que execute sem ambas as verificações.
 //!
 //! # Single-use e expiração
 //!
@@ -165,10 +167,12 @@ pub struct ActionAuthorizationV1 {
 impl ActionAuthorizationV1 {
     /// O hash do **assunto** da autorização.
     ///
-    /// Exactamente os campos de §14: se mudar a ferramenta, o servidor, os
-    /// argumentos, o agente, o humano, a policy ou a validade, a autorização
-    /// deixa de valer. O `authorization_id` e o `nonce` NÃO entram — o assunto
-    /// é o que se aprova, não o papel em que veio escrito.
+    /// Binding estável da SPEC-0078 §3: ferramenta/servidor, argumentos,
+    /// agente, humano e policy identificam o assunto aprovado. `issued_at`,
+    /// `expires_at`, `authorization_id` e `nonce` NÃO entram: são lifecycle e
+    /// envelope efémero. Expiração continua obrigatória em `ApprovalStore` e
+    /// `is_valid_at`, mas um retry um segundo depois não muda o que o humano
+    /// aprovou.
     pub fn subject_hash(&self) -> String {
         let mut w = CanonicalWriter::new();
         w.str(&self.policy_id);
@@ -180,8 +184,6 @@ impl ActionAuthorizationV1 {
         w.str(&self.resource_id);
         w.str(&self.action);
         w.str(&self.argument_digest);
-        w.u64v(self.issued_at);
-        w.u64v(self.expires_at);
         hex32(&domain_hash(DOMAIN_AUTHZ_SUBJECT, w.as_slice()))
     }
 
@@ -525,6 +527,33 @@ mod tests {
             expires_at: 400,
             nonce: "n1".into(),
         }
+    }
+
+    #[test]
+    fn o_binding_do_assunto_nao_depende_do_relogio_ou_envelope() {
+        let a = authz("5000");
+        let mut retry = a.clone();
+        retry.authorization_id = "AZ-2".into();
+        retry.nonce = "n2".into();
+        retry.issued_at = 250;
+        retry.expires_at = 900;
+        assert_eq!(a.subject_hash(), retry.subject_hash());
+    }
+
+    #[test]
+    fn uma_aprovacao_exata_sobrevive_a_mudanca_de_segundo_sem_estender_o_ttl() {
+        let store = ApprovalStore::new();
+        let original = authz("5000");
+        store.request(request_for(&original, 400), 100);
+        grant(&store, &original, 150);
+
+        let mut retry = original.clone();
+        retry.authorization_id = "AZ-retry".into();
+        retry.nonce = "retry-nonce".into();
+        retry.issued_at = 250;
+        retry.expires_at = 550;
+        assert_eq!(original.subject_hash(), retry.subject_hash());
+        assert!(store.consume(&retry, 250).allows_execution());
     }
 
     fn request_for(a: &ActionAuthorizationV1, expires: u64) -> ApprovalRequestV1 {

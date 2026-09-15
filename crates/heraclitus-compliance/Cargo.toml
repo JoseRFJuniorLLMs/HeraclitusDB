@@ -43,7 +43,7 @@ pkcs1 = "0.7"
 # consegue escolher um provider por omissao — o `ClientConfig::builder()`
 # ENTRA EM PANICO em vez de devolver erro. O provider e escolhido
 # explicitamente no `tls_config`; esta feature so garante que ele existe.
-rustls = { version = "0.23", features = ["ring"] }
+rustls = { version = "0.23.45", features = ["ring"] }
 rustls-pki-types = "1"
 
 [dev-dependencies]
