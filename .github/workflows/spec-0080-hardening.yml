@@ -43,23 +43,33 @@ jobs:
                       .and_then(|u| u.base().host().map(str::to_string))
                       .unwrap_or_else(|| "upstream".to_string())
               });
-
-          let mut exchange = McpExchange {
+          '''.replace('              ', '        ').replace('                  ', '            ')
+          # The replacement above only normalizes the literal's presentation in YAML.
+          # Use the exact source spelling if normalization differs.
+          exact = '''    let server_id = header_map
+              .get("x-heraclitus-server")
+              .cloned()
+              .unwrap_or_else(|| {
+                  state
+                      .upstream
+                      .as_ref()
+                      .and_then(|u| u.base().host().map(str::to_string))
+                      .unwrap_or_else(|| "upstream".to_string())
+              });
           '''
-          new = '''    // Trust boundary: the caller never chooses the resource identity that
-              // policy evaluates.  `X-Heraclitus-Server` is correlation metadata only;
-              // accepting it here would let an agent pretend that the fixed upstream is a
-              // different server and potentially match another server's allow rule.
+          # Robustly find from semantic boundaries instead of depending on indentation.
+          start = s.index('    let server_id = header_map\n')
+          end = s.index('\n\n    let mut exchange = McpExchange {', start)
+          new = '''    // Trust boundary: policy resource identity is derived from the configured
+              // upstream. A caller-controlled X-Heraclitus-Server is correlation metadata
+              // only and can never select another server's policy rules.
               let server_id = state
                   .upstream
                   .as_ref()
                   .and_then(|u| u.base().host().map(str::to_string))
                   .unwrap_or_else(|| "upstream".to_string());
 
-              // Correlation headers are useful, but they are untrusted input.  Bound them
-              // before copying any value into durable evidence.  This is deliberately much
-              // smaller than Hyper's transport limit: a 16 KiB agent id has no legitimate
-              // forensic value and only turns the evidence log into an amplification target.
+              // Bound untrusted correlation metadata before copying it into durable evidence.
               for nome in [
                   "x-heraclitus-agent",
                   "x-heraclitus-run",
@@ -78,9 +88,8 @@ jobs:
                   }
               }
 
-              // In OIDC mode the identity used by policy comes from the validated token,
-              // never from spoofable X-Heraclitus-* headers.  dev_local intentionally keeps
-              // the old header-based correlation semantics for a loopback laboratory.
+              // In OIDC mode the identity used by policy and evidence comes from the
+              // validated token, never from spoofable X-Heraclitus-* headers.
               let principal = if runtime.gateway.identity.mode == "oidc" {
                   match crate::auth::principal_from(runtime, &headers, now_unix_seconds()) {
                       Ok(p) => Some(p),
@@ -98,49 +107,37 @@ jobs:
                   .map(|p| p.subject.clone())
                   .or_else(|| header_map.get("x-heraclitus-user").cloned());
 
-              // A Bearer token authenticates the caller *to the gateway*.  It is not an
-              // upstream credential and must never be forwarded to the MCP server.  A future
-              // upstream-auth feature needs its own explicit credential source.
+              // Gateway credentials authenticate to the gateway, not to its upstream.
               let mut upstream_header_map = header_map.clone();
               if principal.is_some() {
                   upstream_header_map.remove("authorization");
               }
+          '''
+          # De-indent the YAML-friendly source body to Rust's actual indentation.
+          lines = new.splitlines()
+          normalized=[]
+          for line in lines:
+              if line.startswith('              '): line = '    ' + line[14:]
+              elif line.startswith('                  '): line = '        ' + line[18:]
+              elif line.startswith('                      '): line = '            ' + line[22:]
+              normalized.append(line)
+          new='\n'.join(normalized)
+          s = s[:start] + new + s[end:]
 
-              let mut exchange = McpExchange {
-          '''
-          if old not in s:
-              raise SystemExit('server_id anchor not found')
-          s = s.replace(old, new, 1)
+          s = s.replace(
+              '        agent_id: header_map.get("x-heraclitus-agent").cloned(),\n        human_subject: header_map.get("x-heraclitus-user").cloned(),',
+              '        agent_id: trusted_agent,\n        human_subject: trusted_human,', 1)
+          s = s.replace(
+              '        return forward_or_error(&state, &method, &uri, &header_map, body).await;',
+              '        return forward_or_error(&state, &method, &uri, &upstream_header_map, body).await;', 1)
+          s = s.replace(
+              '    let resultado = forward(&state, &method, &uri, &header_map, body).await;',
+              '    let resultado = forward(&state, &method, &uri, &upstream_header_map, body).await;', 1)
 
-          old = '''        agent_id: header_map.get("x-heraclitus-agent").cloned(),
-                  human_subject: header_map.get("x-heraclitus-user").cloned(),
-          '''
-          new = '''        agent_id: trusted_agent,
-                  human_subject: trusted_human,
-          '''
-          if old not in s:
-              raise SystemExit('identity anchor not found')
-          s = s.replace(old, new, 1)
-
-          old = '''        return forward_or_error(&state, &method, &uri, &header_map, body).await;
-          '''
-          new = '''        return forward_or_error(&state, &method, &uri, &upstream_header_map, body).await;
-          '''
-          if old not in s:
-              raise SystemExit('passthrough forward anchor not found')
-          s = s.replace(old, new, 1)
-
-          old = '''    let resultado = forward(&state, &method, &uri, &header_map, body).await;
-          '''
-          new = '''    let resultado = forward(&state, &method, &uri, &upstream_header_map, body).await;
-          '''
-          if old not in s:
-              raise SystemExit('tool forward anchor not found')
-          s = s.replace(old, new, 1)
-
+          for required in ['agent_id: trusted_agent', '&upstream_header_map, body', 'CORRELATION_HEADER_TOO_LARGE', 'principal_from(runtime']:
+              if required not in s: raise SystemExit(f'missing patched token: {required}')
           p.write_text(s)
           PY
-
           cargo fmt --all
 
       - name: Focused tests and lint
