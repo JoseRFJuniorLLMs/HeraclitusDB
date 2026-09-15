@@ -35,14 +35,15 @@ jobs:
         run: |
           set -euxo pipefail
           cargo update -p ratatui --precise 0.30.2
-          if cargo tree -i lru > /tmp/lru-tree.txt 2>&1; then
-            cat /tmp/lru-tree.txt
-            echo 'lru remains in the resolved dependency graph' >&2
+          if cargo tree -i lru@0.12.5 > /tmp/lru-vulnerable-tree.txt 2>&1; then
+            cat /tmp/lru-vulnerable-tree.txt
+            echo 'vulnerable lru 0.12.5 remains in the resolved dependency graph' >&2
             exit 1
           else
-            cat /tmp/lru-tree.txt || true
-            echo 'lru removed from the resolved dependency graph'
+            cat /tmp/lru-vulnerable-tree.txt || true
+            echo 'vulnerable lru 0.12.5 removed from the resolved dependency graph'
           fi
+          cargo tree -i lru@0.18.4 || true
 
       - name: Format and focused security regressions
         shell: bash
