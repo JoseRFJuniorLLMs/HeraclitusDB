@@ -26,6 +26,29 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
       - name: Apply auth-boundary fixes
         run: python3 scripts/spec0084_apply.py
+      - name: Align legacy public-OTLP test with listener-specific auth
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('crates/heraclitus-agent/src/config.rs')
+          s = p.read_text()
+          old = '''        c.otlp.http_addr = "0.0.0.0:4318".into();
+                  assert!(c.validate(true, false, false).is_err());
+                  assert!(c.validate(true, true, true).is_ok());
+                  assert!(c.validate(false, false, false).is_ok(), "dev não é gateado");'''
+          new = '''        c.otlp.http_addr = "0.0.0.0:4318".into();
+                  assert!(c.validate(true, false, false).is_err());
+                  c.console.basic_auth = "collector:a-strong-local-password".into();
+                  c.otlp.require_auth = true;
+                  assert!(c.validate(true, true, true).is_ok());
+                  c.console.basic_auth.clear();
+                  c.otlp.require_auth = false;
+                  assert!(c.validate(false, false, false).is_ok(), "dev não é gateado");'''
+          if old not in s:
+              raise SystemExit('legacy public OTLP test block not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
       - name: Format
         run: cargo fmt --all
       - name: Focused security tests
