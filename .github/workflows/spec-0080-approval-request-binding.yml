@@ -1,0 +1,319 @@
+name: SPEC-0080 approval request binding
+
+on:
+  push:
+    branches:
+      - gpt56/agent-security-observability
+    paths:
+      - .github/workflows/spec-0080-approval-request-binding.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix-and-qualify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: gpt56/agent-security-observability
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
+      - name: Apply per-request approval binding fix
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace(path, old, new, count=1):
+              p=Path(path); text=p.read_text()
+              if old not in text:
+                  raise SystemExit(f'pattern not found in {path}: {old[:120]!r}')
+              text=text.replace(old,new,count)
+              p.write_text(text)
+
+          action='crates/heraclitus-agent/src/action.rs'
+          replace(action,
+          '''pub struct ActionAuthorizationV1 {
+              pub authorization_id: String,
+
+              pub policy_id: String,''',
+          '''pub struct ActionAuthorizationV1 {
+              pub authorization_id: String,
+              /// Identidade lógica do pedido que recebeu a decisão humana. Retries
+              /// transportam o mesmo request id; uma nova operação, ainda que com os
+              /// mesmos argumentos, recebe outro id e precisa de nova aprovação.
+              #[serde(default)]
+              pub request_id: String,
+
+              pub policy_id: String,''')
+
+          replace(action,
+          '''pub struct ApprovalRequestV1 {
+              pub approval_id: String,
+              pub authorization_subject_hash: String,''',
+          '''pub struct ApprovalRequestV1 {
+              pub approval_id: String,
+              /// Request id lógico separado do hash para distinguir mutação/replay
+              /// de uma operação nova e independente com conteúdo idêntico.
+              #[serde(default)]
+              pub request_id: String,
+              pub authorization_subject_hash: String,''')
+
+          replace(action,
+          '''    /// Binding estável da SPEC-0078 §3: ferramenta/servidor, argumentos,
+              /// agente, humano e policy identificam o assunto aprovado. `issued_at`,
+              /// `expires_at`, `authorization_id` e `nonce` NÃO entram: são lifecycle e
+              /// envelope efémero. Expiração continua obrigatória em `ApprovalStore` e
+              /// `is_valid_at`, mas um retry um segundo depois não muda o que o humano
+              /// aprovou.''',
+          '''    /// Binding estável da SPEC-0078 §3 e SPEC-0080: request lógico,
+              /// ferramenta/servidor, argumentos, agente, humano e policy identificam
+              /// o assunto aprovado. `issued_at`, `expires_at`, `authorization_id` e
+              /// `nonce` NÃO entram: são lifecycle e envelope efémero. Um retry do
+              /// mesmo request id sobrevive à mudança de relógio; uma operação nova,
+              /// mesmo com conteúdo idêntico, recebe outro request id e outra aprovação.''')
+
+          replace(action,
+          '''        w.str(&self.rule_id);
+              w.str(&self.agent_subject);''',
+          '''        w.str(&self.rule_id);
+              w.str(&self.request_id);
+              w.str(&self.agent_subject);''')
+
+          old='''        let Some((id, record)) = map
+              .iter_mut()
+              .find(|(_, r)| r.request.authorization_subject_hash == presented)
+              .map(|(k, v)| (k.clone(), v))
+          else {
+              // Não há aprovação para ESTE assunto. Pode haver uma para outro —
+              // e é exactamente esse o caso que tem de falhar: procurar por
+              // `approval_id` em vez de por assunto deixaria passar o cenário de
+              // §32 (aprovar 5000, executar 5001).
+              let approved_elsewhere = map
+                  .values()
+                  .find(|r| r.state == ApprovalState::Granted)
+                  .map(|r| r.request.clone());
+              return match approved_elsewhere {
+                  Some(r) => ApprovalVerdict::BindingMismatch {
+                      approval_id: r.approval_id,
+                      approved_subject_hash: r.authorization_subject_hash,
+                      presented_subject_hash: presented,
+                  },
+                  None => ApprovalVerdict::NotFound,
+              };
+          };'''
+          new='''        let Some((id, record)) = map
+              .iter_mut()
+              .find(|(_, r)| r.request.authorization_subject_hash == presented)
+              .map(|(k, v)| (k.clone(), v))
+          else {
+              // Não há aprovação para ESTE assunto. Só é binding mismatch quando
+              // o MESMO request lógico reaparece com assunto diferente. Uma
+              // aprovação concedida para outro request jamais pode "envenenar" o
+              // plano inteiro e impedir uma nova operação legítima de pedir a sua
+              // própria aprovação.
+              let same_request = (!authorization.request_id.is_empty())
+                  .then(|| {
+                      map.values().find(|r| {
+                          !r.request.request_id.is_empty()
+                              && r.request.request_id == authorization.request_id
+                      })
+                  })
+                  .flatten()
+                  .map(|r| r.request.clone());
+              return match same_request {
+                  Some(r) => ApprovalVerdict::BindingMismatch {
+                      approval_id: r.approval_id,
+                      approved_subject_hash: r.authorization_subject_hash,
+                      presented_subject_hash: presented,
+                  },
+                  None => ApprovalVerdict::NotFound,
+              };
+          };'''
+          replace(action,old,new)
+
+          replace(action,
+          '''        ActionAuthorizationV1 {
+                  authorization_id: "AZ-1".into(),
+                  policy_id: "agent-policy".into(),''',
+          '''        ActionAuthorizationV1 {
+                  authorization_id: "AZ-1".into(),
+                  request_id: "request-1".into(),
+                  policy_id: "agent-policy".into(),''')
+
+          replace(action,
+          '''        ApprovalRequestV1 {
+                  approval_id: "A-771".into(),
+                  authorization_subject_hash: a.subject_hash(),''',
+          '''        ApprovalRequestV1 {
+                  approval_id: "A-771".into(),
+                  request_id: a.request_id.clone(),
+                  authorization_subject_hash: a.subject_hash(),''')
+
+          marker='''    #[test]
+              fn uma_aprovacao_exata_sobrevive_a_mudanca_de_segundo_sem_estender_o_ttl() {'''
+          tests='''    #[test]
+              fn request_id_novo_define_operacao_logica_nova() {
+                  let a = authz("5000");
+                  let mut nova = a.clone();
+                  nova.request_id = "request-2".into();
+                  nova.authorization_id = "AZ-2".into();
+                  nova.nonce = "n2".into();
+                  assert_ne!(a.subject_hash(), nova.subject_hash());
+              }
+
+              #[test]
+              fn operacao_identica_nova_pode_pedir_nova_aprovacao_apos_consumo() {
+                  let store = ApprovalStore::new();
+                  let primeira = authz("5000");
+                  store.request(request_for(&primeira, 400), 100);
+                  grant(&store, &primeira, 150);
+                  assert!(store.consume(&primeira, 200).allows_execution());
+
+                  let mut nova = primeira.clone();
+                  nova.request_id = "request-2".into();
+                  nova.authorization_id = "AZ-2".into();
+                  nova.nonce = "n2".into();
+                  assert!(matches!(store.consume(&nova, 210), ApprovalVerdict::NotFound));
+
+                  let mut pedido = request_for(&nova, 500);
+                  pedido.approval_id = "A-772".into();
+                  let aberto = store.request(pedido, 210);
+                  assert_eq!(aberto.approval_id, "A-772");
+                  assert_eq!(store.len(), 2);
+              }
+
+              #[test]
+              fn aprovacao_concedida_de_outro_request_nao_envenena_novo_request() {
+                  let store = ApprovalStore::new();
+                  let primeira = authz("5000");
+                  store.request(request_for(&primeira, 400), 100);
+                  grant(&store, &primeira, 150);
+
+                  let mut outra = authz("5001");
+                  outra.request_id = "request-2".into();
+                  assert!(matches!(store.consume(&outra, 160), ApprovalVerdict::NotFound));
+              }
+
+              #[test]
+              fn mesmo_request_id_mutado_continua_binding_mismatch() {
+                  let store = ApprovalStore::new();
+                  let aprovado = authz("5000");
+                  store.request(request_for(&aprovado, 400), 100);
+                  grant(&store, &aprovado, 150);
+                  let mut mutado = authz("5001");
+                  mutado.request_id = aprovado.request_id.clone();
+                  assert!(matches!(
+                      store.consume(&mutado, 160),
+                      ApprovalVerdict::BindingMismatch { .. }
+                  ));
+              }
+
+          '''+marker
+          replace(action,marker,tests)
+
+          gateway='crates/heraclitus-agent-gateway/src/gateway.rs'
+          replace(gateway,
+          '''                GatewayCounters::bump(&runtime.gateway_counters.require_approval);
+                      let now = now_unix_seconds();
+                      let authorization = ActionAuthorizationV1 {''',
+          '''                GatewayCounters::bump(&runtime.gateway_counters.require_approval);
+                      let now = now_unix_seconds();
+                      let Some(logical_request_id) = facts
+                          .tool_call_id
+                          .as_deref()
+                          .filter(|id| !id.trim().is_empty())
+                          .map(str::to_string)
+                      else {
+                          return mcp_error(
+                              StatusCode::BAD_REQUEST,
+                              &facts.tool_call_id,
+                              "MCP_REQUEST_ID_REQUIRED_FOR_APPROVAL",
+                              "approval-required tool calls need a stable JSON-RPC id",
+                          );
+                      };
+                      let authorization = ActionAuthorizationV1 {''')
+          replace(gateway,
+          '''                    authorization_id: ulid::Ulid::new().to_string(),
+                          policy_id: a.policy_id.clone(),''',
+          '''                    authorization_id: ulid::Ulid::new().to_string(),
+                          request_id: logical_request_id.clone(),
+                          policy_id: a.policy_id.clone(),''')
+          replace(gateway,
+          '''                        let pedido = ApprovalRequestV1 {
+                              approval_id: ulid::Ulid::new().to_string(),
+                              authorization_subject_hash: subject_hash.clone(),''',
+          '''                        let pedido = ApprovalRequestV1 {
+                              approval_id: ulid::Ulid::new().to_string(),
+                              request_id: logical_request_id.clone(),
+                              authorization_subject_hash: subject_hash.clone(),''')
+
+          demo='crates/heraclitus-agent/src/demo.rs'
+          replace(demo,
+          '''    let authorization = ActionAuthorizationV1 {
+                  authorization_id: "AZ-DEMO-1".into(),
+                  policy_id: engine.document().id.clone(),''',
+          '''    let authorization = ActionAuthorizationV1 {
+                  authorization_id: "AZ-DEMO-1".into(),
+                  request_id: "call-pay-1".into(),
+                  policy_id: engine.document().id.clone(),''')
+
+          runner='labs/Agent-Atack-Heraclitus/runner.py'
+          replace(runner,
+          '''    def auth_agent(self):
+                  t=os.getenv('HERACLITUS_AGENT_TOKEN','').strip(); return {'Authorization':f'Bearer {t}'} if t else {}''',
+          '''    def auth_agent(self):
+                  user=os.getenv('HERACLITUS_AGENT_USERNAME','').strip(); pw=os.getenv('HERACLITUS_AGENT_PASSWORD','')
+                  if user and pw:
+                      raw=base64.b64encode(f'{user}:{pw}'.encode()).decode()
+                      return {'Authorization':f'Basic {raw}'}
+                  t=os.getenv('HERACLITUS_AGENT_TOKEN','').strip()
+                  return {'Authorization':f'Bearer {t}'} if t else {}''')
+
+          massive='labs/Agent-Atack-Heraclitus/runner_massive.py'
+          replace(massive,
+          '''        returned=None
+                  if isinstance(b,dict): returned=b.get('returned')
+                  ok=(s in {400,413,422}) or (s==200 and isinstance(returned,int) and returned<=5000)''',
+          '''        returned=None
+                  if isinstance(b,dict):
+                      summary=b.get('summary')
+                      if isinstance(summary,dict): returned=summary.get('returned')
+                  ok=(s in {400,413,422}) or (s==200 and isinstance(returned,int) and returned<=1000)''')
+
+          spec=Path('docs/md/SPEC-new/SPEC-0080-Per-Request-Approval-Binding.md')
+          spec.write_text('''# SPEC-0080 — Per-Request Approval Binding\n\nStatus: implemented / qualification gate required.\n\n## Problem\n\nA stable approval subject based only on policy, identity, resource and arguments makes retries safe, but it also makes a consumed approval shadow every future independent operation with identical content. Worse, a granted approval for one subject can poison a different new request if the store treats any unrelated grant as a binding mismatch.\n\n## Contract\n\nThe authorization subject includes the stable MCP JSON-RPC request id in addition to policy, agent/human identity, resource, action and argument digest.\n\n- Same request id + same subject: retry of the same logical operation; a consumed approval is replay and is rejected.\n- Same request id + changed subject: binding mismatch; rejected.\n- New request id + same content: new logical operation; no old grant is reused and a new approval may be requested.\n- New request id + different content: independent operation; an unrelated granted approval cannot poison it.\n- Approval-required MCP calls without a stable request id fail closed before upstream.\n\n`issued_at`, `expires_at`, nonce and authorization envelope id remain outside the subject hash so a legitimate retry across a clock tick still binds to the same logical request.\n\n## Red-team regression\n\nQualification must prove replay rejection, mutation rejection, cross-agent theft rejection, exactly-one concurrent consumption, and successful opening of a second approval for a later request with identical arguments.\n''')
+          PY
+      - name: Format
+        run: cargo fmt --all
+      - name: Agent approval unit tests
+        run: cargo test -p heraclitus-agent action::tests -- --nocapture
+      - name: Gateway tests
+        run: cargo test -p heraclitus-agent-gateway
+      - name: Clippy focused crates
+        run: cargo clippy -p heraclitus-agent -p heraclitus-agent-gateway --all-targets -- -D warnings
+      - name: Lab syntax and guard
+        run: |
+          python3 -m py_compile labs/Agent-Atack-Heraclitus/runner.py labs/Agent-Atack-Heraclitus/runner_massive.py
+          python3 -m unittest labs/Agent-Atack-Heraclitus/tests/test_guard.py
+      - name: Commit qualified fix and remove one-shot workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/spec-0080-approval-request-binding.yml
+          git add crates/heraclitus-agent/src/action.rs \
+                  crates/heraclitus-agent/src/demo.rs \
+                  crates/heraclitus-agent-gateway/src/gateway.rs \
+                  labs/Agent-Atack-Heraclitus/runner.py \
+                  labs/Agent-Atack-Heraclitus/runner_massive.py \
+                  docs/md/SPEC-new/SPEC-0080-Per-Request-Approval-Binding.md
+          git config user.name 'GPT-5.6 Sol'
+          git config user.email 'actions@users.noreply.github.com'
+          git commit -m 'fix(spec-0080): bind approvals to logical request identity'
+          git push origin HEAD:gpt56/agent-security-observability
