@@ -26,7 +26,7 @@ jobs:
           cargo test -p heraclitus-agent-gateway
       - name: Build release server
         run: cargo build --release --locked -p heraclitus-server
-      - name: Package exact head
+      - name: Package exact head and source
         shell: bash
         run: |
           set -euo pipefail
@@ -35,6 +35,8 @@ jobs:
           cp -R labs/Agent-Atack-Heraclitus dist/
           git rev-parse HEAD > dist/COMMIT
           sha256sum dist/heraclitus-server > dist/SHA256SUMS
+          git archive --format=tar.gz --prefix=HeraclitusDB/ -o dist/heraclitus-source.tar.gz HEAD
+          sha256sum dist/heraclitus-source.tar.gz >> dist/SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: heraclitus-sandbox-current-head
