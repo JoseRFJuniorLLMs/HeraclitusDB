@@ -1,3 +1,4 @@
+# qualification rerun after deep-json fixture repair
 name: SPEC-0081 strict MCP JSON boundary
 
 on:
