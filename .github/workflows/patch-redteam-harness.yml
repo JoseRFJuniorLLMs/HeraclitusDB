@@ -1,0 +1,56 @@
+name: Patch redteam harness findings
+on:
+  push:
+    branches: [gpt56/agent-security-observability]
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: gpt56/agent-security-observability
+      - name: Patch harness
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('labs/Agent-Atack-Heraclitus/massive_runner.py')
+          s=p.read_text()
+          s=s.replace("f'mix-{i%11}'", "f'mix-{i}'")
+          old="""        def one(_): return self.lab.request(self.cfg['otlp'],'/v1/traces','POST',payload,{'Content-Type':'application/json'},timeout=20,read_body=False)[0]
+          with concurrent.futures.ThreadPoolExecutor(max_workers=min(12,self.workers)) as ex: statuses=list(ex.map(one,range(n)))
+          health,_,_=self.lab.request(self.cfg['agent_api'],'/api/v1/agent/status',headers=self.lab.auth_agent()); ok=all(s==413 for s in statuses) and health==200
+          self.aggregate('otlp-oversized-fanout','otlp:/v1/traces',f'{n}x 413 and service alive',ok,statuses,None,None,blocked=True,
+                         detail=f'{size} bytes/request health={health}',started=t)
+          """
+          new="""        def one(_):
+              status,body,_=self.lab.request(self.cfg['otlp'],'/v1/traces','POST',payload,{'Content-Type':'application/json'},timeout=20,read_body=False)
+              exc=(body or {}).get('exception') if isinstance(body,dict) else None
+              return status,exc
+          with concurrent.futures.ThreadPoolExecutor(max_workers=min(12,self.workers)) as ex: outcomes=list(ex.map(one,range(n)))
+          statuses=[s for s,_ in outcomes]
+          # The server may reject an oversized body before the client finishes
+          # uploading it. Python then observes an early close rather than the
+          # 413 response body. Only explicit early-close errors count as reject;
+          # timeouts and every other exception remain failures.
+          early_close={'BrokenPipeError','ConnectionResetError','RemoteDisconnected'}
+          rejected=all(s==413 or (s is None and exc in early_close) for s,exc in outcomes)
+          health,_,_=self.lab.request(self.cfg['agent_api'],'/api/v1/agent/status',headers=self.lab.auth_agent()); ok=rejected and health==200
+          exceptions=Counter(exc for s,exc in outcomes if s is None)
+          self.aggregate('otlp-oversized-fanout','otlp:/v1/traces',f'{n} oversized rejected and service alive',ok,statuses,None,None,blocked=True,
+                         detail=f'{size} bytes/request health={health} early_close={dict(exceptions)}',started=t)
+          """
+          if old not in s:
+              raise SystemExit('OTLP block not found')
+          p.write_text(s.replace(old,new))
+          PY
+          python3 -m py_compile labs/Agent-Atack-Heraclitus/massive_runner.py
+      - name: Commit patch and remove one-shot workflow
+        run: |
+          rm .github/workflows/patch-redteam-harness.yml
+          git config user.name 'GPT-5.6 Sol'
+          git config user.email 'actions@users.noreply.github.com'
+          git add labs/Agent-Atack-Heraclitus/massive_runner.py .github/workflows/patch-redteam-harness.yml
+          git commit -m 'fix(redteam): isolate mixed request ids and classify OTLP early reject'
+          git push origin HEAD:gpt56/agent-security-observability
