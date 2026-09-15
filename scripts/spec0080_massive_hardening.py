@@ -27,9 +27,7 @@ new = '''    let method_name = facts.method.as_deref().unwrap_or_default();
         let mut normalized = method_name
             .trim()
             .to_ascii_lowercase()
-            .replace('\\\\', "/")
-            .replace('∕', "/")
-            .replace('⁄', "/")
+            .replace(['\\\\', '∕', '⁄'], "/")
             .replace("%2f", "/")
             .replace("%5c", "/");
         while normalized.contains("//") {
