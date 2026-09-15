@@ -137,9 +137,10 @@ async fn proxy(
 
     // Gateway credentials authenticate to the gateway, not to its upstream.
     let mut upstream_header_map = header_map.clone();
-    if principal.is_some() {
-        upstream_header_map.remove("authorization");
-    }
+    // Authorization authenticates the caller to this gateway. There is no
+    // configured upstream credential source yet, so forwarding a caller token
+    // would be credential leakage in both OIDC and dev_local modes.
+    upstream_header_map.remove("authorization");
 
     let mut exchange = McpExchange {
         tenant_id: runtime.config.tenant_id.clone(),
