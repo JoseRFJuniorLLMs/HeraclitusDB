@@ -206,8 +206,10 @@ mod tests {
     #[test]
     fn duplicate_authorization_metadata_is_rejected_in_both_orders() {
         let token = "0123456789abcdef0123456789abcdef"; // gitleaks:allow -- unit-test vector
-        let mut cfg = HeraclitusConfig::default();
-        cfg.auth_token = Some(token.into());
+        let cfg = HeraclitusConfig {
+            auth_token: Some(token.into()),
+            ..Default::default()
+        };
         let auth = Authenticator::from_config(&cfg).unwrap();
 
         for values in [
