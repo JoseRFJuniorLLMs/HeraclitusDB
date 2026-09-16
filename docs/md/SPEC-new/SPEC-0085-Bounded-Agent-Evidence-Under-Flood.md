@@ -55,7 +55,7 @@ For that kind, the generic engine projection path SHALL:
 - **not** retain the full episode in the generic memtable;
 - **not** feed the episode body/metadata into generic materialized views such as text/vector/graph/activation/telemetry views;
 - **not** create general-purpose attribute postings for the Agent evidence envelope;
-- **still advance projection watermarks** so boot replay and checkpoints do not repeatedly scan already-consumed internal evidence.
+- for the general `AttrIndex`, **advance only its watermark** without creating postings; for opaque generic views, do not forge an internal watermark for state they never applied. A skipped evidence-only tail may therefore be rescanned on restart, which is bounded I/O and preserves snapshot truth.
 
 The live append path, boot catch-up path and explicit view rebuild path MUST make the same decision. Otherwise a restart would materialize records that the live path deliberately excluded and state hashes would depend on whether the node had restarted.
 

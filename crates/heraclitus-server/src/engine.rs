@@ -710,7 +710,13 @@ impl Engine {
         if vm_bridge::is_hvm(episode) {
             return;
         }
-        self.memtable.apply(lsn, episode.clone());
+        let agent_evidence = matches!(
+            &episode.kind,
+            EventKind::Custom(kind) if kind == "AgentEvidence"
+        );
+        if !agent_evidence {
+            self.memtable.apply(lsn, episode.clone());
+        }
         self.views.lock().unwrap().apply(lsn, episode);
         self.attr.write().unwrap().apply(lsn, episode);
     }
