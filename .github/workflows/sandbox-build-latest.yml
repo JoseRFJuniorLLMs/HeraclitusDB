@@ -20,7 +20,7 @@ jobs:
           cargo test -p heraclitus-agent-gateway --all-features
       - name: Build release server
         run: cargo build --release -p heraclitus-server
-      - name: Package exact post-SPEC-0081 head
+      - name: Package exact post-SPEC-0082 head
         run: |
           mkdir -p dist/Agent-Atack-Heraclitus
           cp target/release/heraclitus-server dist/
