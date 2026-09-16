@@ -1,0 +1,80 @@
+name: SPEC-0080 MCP parser hardening
+on:
+  push:
+    branches: [gpt56/agent-security-observability]
+permissions:
+  contents: write
+jobs:
+  harden:
+    if: github.actor != 'actions'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: gpt56/agent-security-observability
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
+      - name: Apply parser hardening discovered by live sandbox red-team
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p=Path('crates/heraclitus-agent/src/mcp.rs')
+          s=p.read_text()
+          old='''pub struct McpCallFacts {\n    pub method: Option<String>,\n    pub tool_name: Option<String>,'''
+          new='''pub struct McpCallFacts {\n    pub method: Option<String>,\n    /// `true` quando o cabeçalho MCP e o corpo JSON-RPC discordam sobre o método.\n    /// O gateway recusa a chamada: confiar no cabeçalho permitiria classificar\n    /// `tools/call` no corpo como `ping` e contornar a policy.\n    pub method_header_conflict: bool,\n    pub tool_name: Option<String>,'''
+          assert old in s
+          s=s.replace(old,new,1)
+
+          old='''pub fn extract_facts(ex: &McpExchange) -> McpCallFacts {\n    let mut facts = McpCallFacts {\n        method: header(ex, HEADER_METHOD),\n        tool_name: header(ex, HEADER_NAME),'''
+          new='''pub fn extract_facts(ex: &McpExchange) -> McpCallFacts {\n    let header_method = header(ex, HEADER_METHOD);\n    let mut facts = McpCallFacts {\n        method: header_method.clone(),\n        tool_name: header(ex, HEADER_NAME),'''
+          assert old in s
+          s=s.replace(old,new,1)
+
+          old='''            if facts.method.is_none() {\n                facts.method = v.get("method").and_then(Value::as_str).map(str::to_string);\n            }'''
+          new='''            if let Some(body_method) = v.get("method").and_then(Value::as_str) {\n                if let Some(header_method) = header_method.as_deref() {\n                    facts.method_header_conflict = header_method != body_method;\n                }\n                // O corpo JSON-RPC é a autoridade semântica. O cabeçalho é\n                // apenas uma classificação antecipada e nunca pode rebaixar\n                // `tools/call` para um método inofensivo.\n                facts.method = Some(body_method.to_string());\n            }'''
+          assert old in s
+          s=s.replace(old,new,1)
+
+          # Insert a recursive no-duplicate-key JSON validator immediately before extract_facts.
+          marker='''/// Extrai o que se consegue de uma troca, sem falhar por campos em falta.\npub fn extract_facts'''
+          assert marker in s
+          validator=r'''/// Valida JSON de pedido sem aceitar chaves duplicadas em nenhum objecto.\n///\n/// RFC 8259 permite parsers divergirem quando uma chave aparece duas vezes.\n/// Num gateway de autorização isso é perigoso: policy e upstream podem ver\n/// valores diferentes para `method`, `params`, `name` ou argumentos.\npub fn validate_request_json(body: &[u8]) -> Result<(), String> {\n    use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};\n    use std::collections::HashSet;\n    use std::fmt;\n\n    #[derive(Clone, Copy)]\n    struct UniqueSeed;\n    struct UniqueVisitor;\n\n    impl<'de> DeserializeSeed<'de> for UniqueSeed {\n        type Value = ();\n        fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>\n        where D: serde::Deserializer<'de> {\n            deserializer.deserialize_any(UniqueVisitor)\n        }\n    }\n\n    impl<'de> Visitor<'de> for UniqueVisitor {\n        type Value = ();\n        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {\n            f.write_str("JSON sem chaves duplicadas")\n        }\n        fn visit_map<A>(self, mut map: A) -> Result<(), A::Error>\n        where A: MapAccess<'de> {\n            let mut seen = HashSet::new();\n            while let Some(key) = map.next_key::<String>()? {\n                if !seen.insert(key.clone()) {\n                    return Err(de::Error::custom(format!("chave JSON duplicada: {key}")));\n                }\n                map.next_value_seed(UniqueSeed)?;\n            }\n            Ok(())\n        }\n        fn visit_seq<A>(self, mut seq: A) -> Result<(), A::Error>\n        where A: SeqAccess<'de> {\n            while seq.next_element_seed(UniqueSeed)?.is_some() {}\n            Ok(())\n        }\n        fn visit_bool<E>(self, _: bool) -> Result<(), E> where E: de::Error { Ok(()) }\n        fn visit_i64<E>(self, _: i64) -> Result<(), E> where E: de::Error { Ok(()) }\n        fn visit_u64<E>(self, _: u64) -> Result<(), E> where E: de::Error { Ok(()) }\n        fn visit_f64<E>(self, _: f64) -> Result<(), E> where E: de::Error { Ok(()) }\n        fn visit_str<E>(self, _: &str) -> Result<(), E> where E: de::Error { Ok(()) }\n        fn visit_string<E>(self, _: String) -> Result<(), E> where E: de::Error { Ok(()) }\n        fn visit_none<E>(self) -> Result<(), E> where E: de::Error { Ok(()) }\n        fn visit_unit<E>(self) -> Result<(), E> where E: de::Error { Ok(()) }\n        fn visit_some<D>(self, d: D) -> Result<(), D::Error> where D: serde::Deserializer<'de> { UniqueSeed.deserialize(d) }\n    }\n\n    let mut de = serde_json::Deserializer::from_slice(body);\n    UniqueSeed.deserialize(&mut de).map_err(|e| e.to_string())?;\n    de.end().map_err(|e| e.to_string())\n}\n\n'''.replace('\\n','\n')
+          s=s.replace(marker,validator+marker,1)
+
+          # Add focused unit tests before end of mcp.rs test module by appending a small independent test module.
+          s += r'''\n\n#[cfg(test)]\nmod spec_0080_parser_hardening_tests {\n    use super::*;\n\n    #[test]\n    fn duplicate_keys_are_rejected_recursively() {\n        assert!(validate_request_json(br#"{\"method\":\"tools/call\",\"params\":{\"name\":\"exec\",\"name\":\"lookup_vendor\"}}"#).is_err());\n        assert!(validate_request_json(br#"{\"method\":\"tools/call\",\"params\":{\"arguments\":{\"x\":1,\"x\":2}}}"#).is_err());\n    }\n\n    #[test]\n    fn header_cannot_override_body_method() {\n        let mut ex=McpExchange::default();\n        ex.request_headers.insert(HEADER_METHOD.into(), "ping".into());\n        ex.request_body=Some(br#"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"exec\",\"arguments\":{}}}"#.to_vec());\n        let f=extract_facts(&ex);\n        assert_eq!(f.method.as_deref(),Some("tools/call"));\n        assert!(f.method_header_conflict);\n    }\n}\n'''.replace('\\n','\n')
+          p.write_text(s)
+
+          p=Path('crates/heraclitus-agent-gateway/src/gateway.rs')
+          s=p.read_text()
+          old='''    let facts = mcp::extract_facts(&exchange);\n\n    let method_name = facts.method.as_deref().unwrap_or_default();'''
+          new='''    if let Err(detail) = mcp::validate_request_json(&body) {\n        return mcp_error(\n            StatusCode::BAD_REQUEST,\n            &None,\n            "MCP_JSON_AMBIGUOUS",\n            &detail,\n        );\n    }\n    let facts = mcp::extract_facts(&exchange);\n    if facts.method_header_conflict {\n        return mcp_error(\n            StatusCode::BAD_REQUEST,\n            &facts.tool_call_id,\n            "MCP_METHOD_CONFLICT",\n            "mcp-method header disagrees with JSON-RPC body method",\n        );\n    }\n\n    let method_name = facts.method.as_deref().unwrap_or_default();'''
+          assert old in s
+          s=s.replace(old,new,1)
+          p.write_text(s)
+
+          spec=Path('docs/md/SPEC-new/SPEC-0080-MCP-Parser-Authority-and-Ambiguity-Hardening.md')
+          spec.write_text('''# SPEC-0080 — MCP Parser Authority and Ambiguity Hardening\n\n**Status:** IMPLEMENTED / QUALIFICATION REQUIRED\n\n## Achados reproduzidos em sandbox\n\n1. Um cliente podia enviar `mcp-method: ping` no cabeçalho e `method: tools/call` no corpo. Como a classificação antecipada tinha precedência, o Gateway tratava a chamada como protocolo comum e encaminhava o corpo para o upstream. Em laboratório, `exec` chegou ao stub sintético com HTTP 200.\n2. JSON com chaves duplicadas em `params`/`name` era aceite. Mesmo quando Gateway e stub escolhiam a mesma ocorrência, parsers diferentes podem escolher ocorrências diferentes, criando parser differential na fronteira de autorização.\n\n## Contrato\n\n- O método do corpo JSON-RPC é a autoridade semântica.\n- Se `mcp-method` estiver presente e discordar do corpo, responder 400 `MCP_METHOD_CONFLICT` antes do upstream.\n- Recusar JSON com qualquer chave duplicada, em qualquer profundidade, com 400 `MCP_JSON_AMBIGUOUS`.\n- A validação ocorre antes de distinguir tool call de método não-tool.\n- Nenhuma forma ambígua pode alcançar o upstream.\n\n## Gates\n\n- unit test: header `ping` + body `tools/call` resulta em método canónico `tools/call` e conflito sinalizado;\n- unit test: chaves duplicadas recursivas são recusadas;\n- testes existentes de policy, approval, red-team e gateway continuam verdes;\n- clippy `-D warnings`; rustfmt.\n''')
+          PY
+          cargo fmt --all
+      - name: Qualify hardening
+        shell: bash
+        run: |
+          cargo test -p heraclitus-agent spec_0080_parser_hardening_tests -- --nocapture
+          cargo test -p heraclitus-agent-gateway --all-features
+          cargo clippy -p heraclitus-agent -p heraclitus-agent-gateway --all-targets --all-features -- -D warnings
+      - name: Commit qualified fix and remove one-shot workflow
+        shell: bash
+        run: |
+          git config user.name 'GPT-5.6 Sol'
+          git config user.email 'actions@users.noreply.github.com'
+          rm .github/workflows/spec-0080-mcp-parser-hardening.yml
+          git add -A
+          git commit -m 'fix(spec-0080): close MCP header-body and duplicate-key parser bypass'
+          git push origin HEAD:gpt56/agent-security-observability
