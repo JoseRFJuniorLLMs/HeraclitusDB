@@ -1,6 +1,6 @@
 # SPEC-0085 — Approval Flood Containment and Control-Plane Backpressure
 
-**Status:** PROPOSED  
+**Status:** IMPLEMENTED  
 **Date:** 2026-09-16  
 **Scope:** Agent Policy Gateway / ApprovalStore / Agent Black Box
 

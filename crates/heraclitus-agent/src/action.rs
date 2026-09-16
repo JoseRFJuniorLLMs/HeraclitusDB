@@ -347,6 +347,28 @@ pub struct ApprovalStore {
     consumed_subjects: Mutex<BTreeMap<String, String>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalAdmissionError {
+    GlobalLimit { limit: usize },
+    PerAgentLimit { agent: String, limit: usize },
+}
+
+impl std::fmt::Display for ApprovalAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::GlobalLimit { limit } => {
+                write!(f, "global pending approval limit reached ({limit})")
+            }
+            Self::PerAgentLimit { agent, limit } => {
+                write!(
+                    f,
+                    "pending approval limit reached for agent `{agent}` ({limit})"
+                )
+            }
+        }
+    }
+}
+
 impl ApprovalStore {
     pub fn new() -> Self {
         Self::default()
@@ -356,14 +378,51 @@ impl ApprovalStore {
     /// assunto, devolve-o em vez de criar outro (§26: um retry não cria uma
     /// segunda aprovação).
     pub fn request(&self, req: ApprovalRequestV1, now: u64) -> ApprovalRequestV1 {
+        self.request_bounded(req, now, usize::MAX, usize::MAX)
+            .expect("unbounded approval admission cannot hit a capacity limit")
+    }
+
+    /// SPEC-0085: duplicate detection and capacity admission are one critical
+    /// section, so a concurrent swarm cannot race past either ceiling. Exact
+    /// retries are checked first and therefore consume no extra capacity.
+    pub fn request_bounded(
+        &self,
+        req: ApprovalRequestV1,
+        now: u64,
+        max_pending_global: usize,
+        max_pending_per_agent: usize,
+    ) -> Result<ApprovalRequestV1, ApprovalAdmissionError> {
         let mut map = self.inner.lock().unwrap();
         expire_locked(&mut map, now);
         if let Some(existing) = map.values().find(|r| {
             r.state == ApprovalState::Pending
                 && r.request.authorization_subject_hash == req.authorization_subject_hash
         }) {
-            return existing.request.clone();
+            return Ok(existing.request.clone());
         }
+
+        let pending_global = map
+            .values()
+            .filter(|r| r.state == ApprovalState::Pending)
+            .count();
+        if pending_global >= max_pending_global {
+            return Err(ApprovalAdmissionError::GlobalLimit {
+                limit: max_pending_global,
+            });
+        }
+
+        let agent = req.preview.agent.clone();
+        let pending_agent = map
+            .values()
+            .filter(|r| r.state == ApprovalState::Pending && r.request.preview.agent == agent)
+            .count();
+        if pending_agent >= max_pending_per_agent {
+            return Err(ApprovalAdmissionError::PerAgentLimit {
+                agent,
+                limit: max_pending_per_agent,
+            });
+        }
+
         let out = req.clone();
         map.insert(
             req.approval_id.clone(),
@@ -374,7 +433,7 @@ impl ApprovalStore {
                 authorization: None,
             },
         );
-        out
+        Ok(out)
     }
 
     /// Aplica uma decisão humana. Recusa decidir o que já foi decidido.
@@ -920,5 +979,62 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(r.resource_id(), "mcp://finance/send_payment");
+    }
+}
+
+#[cfg(test)]
+mod spec_0085_capacity_tests {
+    use super::*;
+
+    fn request(agent: &str, id: &str, subject: &str) -> ApprovalRequestV1 {
+        ApprovalRequestV1 {
+            approval_id: id.into(),
+            request_id: id.into(),
+            authorization_subject_hash: subject.into(),
+            requested_roles: vec!["approver".into()],
+            reason: "test".into(),
+            preview: ApprovalPreviewV1 {
+                agent: agent.into(),
+                ..Default::default()
+            },
+            requested_at: 1,
+            expires_at: 999,
+        }
+    }
+
+    #[test]
+    fn per_agent_limit_is_atomic_and_retry_costs_nothing() {
+        let store = ApprovalStore::new();
+        let a = request("agent-a", "a1", "subject-a1");
+        let b = request("agent-a", "a2", "subject-a2");
+        assert!(store.request_bounded(a.clone(), 10, 4, 2).is_ok());
+        assert!(store.request_bounded(b, 10, 4, 2).is_ok());
+        assert!(matches!(
+            store.request_bounded(request("agent-a", "a3", "subject-a3"), 10, 4, 2),
+            Err(ApprovalAdmissionError::PerAgentLimit { limit: 2, .. })
+        ));
+        let retry = store.request_bounded(a, 10, 4, 2).unwrap();
+        assert_eq!(retry.approval_id, "a1");
+        assert_eq!(store.pending(10).len(), 2);
+    }
+
+    #[test]
+    fn global_limit_contains_multi_agent_fanout() {
+        let store = ApprovalStore::new();
+        for i in 0..4 {
+            assert!(store
+                .request_bounded(
+                    request(&format!("agent-{i}"), &format!("id-{i}"), &format!("s-{i}")),
+                    10,
+                    4,
+                    4,
+                )
+                .is_ok());
+        }
+        assert!(matches!(
+            store.request_bounded(request("agent-z", "id-z", "s-z"), 10, 4, 4),
+            Err(ApprovalAdmissionError::GlobalLimit { limit: 4 })
+        ));
+        assert_eq!(store.pending(10).len(), 4);
     }
 }

@@ -317,12 +317,18 @@ impl Default for PolicyConfig {
 #[serde(default)]
 pub struct ApprovalConfig {
     pub default_ttl_seconds: u64,
+    /// SPEC-0085: hard ceiling for live pending approval requests.
+    pub max_pending_global: usize,
+    /// SPEC-0085: one compromised agent cannot consume the shared queue.
+    pub max_pending_per_agent: usize,
 }
 
 impl Default for ApprovalConfig {
     fn default() -> Self {
         Self {
             default_ttl_seconds: 300,
+            max_pending_global: 4096,
+            max_pending_per_agent: 64,
         }
     }
 }
@@ -439,6 +445,21 @@ impl AgentGatewayConfig {
                 "o gateway precisa de `upstream_url` em qualquer modo: sem ele o \
                  proxy aceita ligações e responde 502 a tudo"
                     .into(),
+            ));
+        }
+        if self.approval.max_pending_global == 0 {
+            return Err(ConfigError::Invalid(
+                "agent_gateway.approval.max_pending_global deve ser > 0 (SPEC-0085)".into(),
+            ));
+        }
+        if self.approval.max_pending_per_agent == 0 {
+            return Err(ConfigError::Invalid(
+                "agent_gateway.approval.max_pending_per_agent deve ser > 0 (SPEC-0085)".into(),
+            ));
+        }
+        if self.approval.max_pending_per_agent > self.approval.max_pending_global {
+            return Err(ConfigError::Invalid(
+                "agent_gateway.approval.max_pending_per_agent não pode exceder max_pending_global (SPEC-0085)".into(),
             ));
         }
         if production {

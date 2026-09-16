@@ -72,6 +72,7 @@ pub struct GatewayCounters {
     pub shadow_deny: AtomicU64,
     pub approval_expired: AtomicU64,
     pub approval_replay_rejected: AtomicU64,
+    pub approval_capacity_rejected: AtomicU64,
     pub policy_errors: AtomicU64,
     /// Evidência que NÃO foi gravada. Ver `gateway::append`.
     pub evidence_errors: AtomicU64,
@@ -92,6 +93,7 @@ impl GatewayCounters {
             "shadow_deny": self.shadow_deny.load(Ordering::Relaxed),
             "approval_expired": self.approval_expired.load(Ordering::Relaxed),
             "approval_replay_rejected": self.approval_replay_rejected.load(Ordering::Relaxed),
+            "approval_capacity_rejected": self.approval_capacity_rejected.load(Ordering::Relaxed),
             "policy_errors": self.policy_errors.load(Ordering::Relaxed),
             "upstream_errors": self.upstream_errors.load(Ordering::Relaxed),
         })

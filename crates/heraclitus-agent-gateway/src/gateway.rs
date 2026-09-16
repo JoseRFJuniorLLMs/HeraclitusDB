@@ -570,30 +570,77 @@ async fn proxy(
                             requested_at: now,
                             expires_at: now + *ttl_seconds,
                         };
-                        let pedido = runtime.approvals.request(pedido, now);
-
-                        let mut pedida = base_evidence(
-                            runtime,
-                            AgentEvidenceKindV1::HumanApprovalRequested,
-                            now_unix_nanos(),
-                            &exchange,
-                            &facts,
-                            &agent_id,
+                        let pedido = runtime.approvals.request_bounded(
+                            pedido,
+                            now,
+                            runtime.gateway.approval.max_pending_global,
+                            runtime.gateway.approval.max_pending_per_agent,
                         );
-                        pedida.content.policy = provenance.clone();
-                        pedida.content.approval = Some(ApprovalProvenanceV1 {
-                            approval_id: pedido.approval_id.clone(),
-                            authorization_subject_hash: subject_hash.clone(),
-                            approver_subject: None,
-                            approver_issuer: None,
-                            decided_at_unix_nanos: None,
-                        });
-                        pedida.parents = requested_id.iter().cloned().collect();
-                        let _ = append(runtime, pedida);
-                        let _ = runtime.flush();
 
-                        if enforced {
-                            return approval_pending(&facts.tool_call_id, &pedido);
+                        match pedido {
+                            Ok(pedido) => {
+                                let mut pedida = base_evidence(
+                                    runtime,
+                                    AgentEvidenceKindV1::HumanApprovalRequested,
+                                    now_unix_nanos(),
+                                    &exchange,
+                                    &facts,
+                                    &agent_id,
+                                );
+                                pedida.content.policy = provenance.clone();
+                                pedida.content.approval = Some(ApprovalProvenanceV1 {
+                                    approval_id: pedido.approval_id.clone(),
+                                    authorization_subject_hash: subject_hash.clone(),
+                                    approver_subject: None,
+                                    approver_issuer: None,
+                                    decided_at_unix_nanos: None,
+                                });
+                                pedida.parents = requested_id.iter().cloned().collect();
+                                let _ = append(runtime, pedida);
+                                let _ = runtime.flush();
+
+                                if enforced {
+                                    return approval_pending(&facts.tool_call_id, &pedido);
+                                }
+                            }
+                            Err(limit) => {
+                                GatewayCounters::bump(
+                                    &runtime.gateway_counters.approval_capacity_rejected,
+                                );
+                                let mut denied = base_evidence(
+                                    runtime,
+                                    AgentEvidenceKindV1::ToolDenied,
+                                    now_unix_nanos(),
+                                    &exchange,
+                                    &facts,
+                                    &agent_id,
+                                );
+                                denied.content.policy = provenance.clone();
+                                denied
+                                    .content
+                                    .extensions
+                                    .insert("reason_code".into(), "APPROVAL_QUEUE_FULL".into());
+                                denied
+                                    .content
+                                    .extensions
+                                    .insert("approval_admission".into(), limit.to_string());
+                                denied.parents = requested_id.iter().cloned().collect();
+                                let _ = append(runtime, denied);
+                                let _ = runtime.flush();
+
+                                if enforced {
+                                    return mcp_error(
+                                        StatusCode::TOO_MANY_REQUESTS,
+                                        &facts.tool_call_id,
+                                        "APPROVAL_QUEUE_FULL",
+                                        &limit.to_string(),
+                                    );
+                                }
+                                tracing::warn!(
+                                    motivo = %limit,
+                                    "shadow approval simulation capacity exhausted; action remains non-blocking"
+                                );
+                            }
                         }
                     }
                     outro => {
