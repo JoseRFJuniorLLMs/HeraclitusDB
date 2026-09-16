@@ -16,10 +16,11 @@ jobs:
       - name: Focused security gates
         run: |
           cargo test -p heraclitus-agent mcp:: -- --nocapture
+          cargo test -p heraclitus-agent --lib action::tests -- --nocapture
           cargo test -p heraclitus-agent-gateway --all-features
       - name: Build release server
         run: cargo build --release -p heraclitus-server
-      - name: Package
+      - name: Package exact post-SPEC-0081 head
         run: |
           mkdir -p dist/Agent-Atack-Heraclitus
           cp target/release/heraclitus-server dist/
