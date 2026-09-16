@@ -20,11 +20,11 @@
 
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
-use hyper::header::{HeaderName, HeaderValue};
+use hyper::header::{HeaderMap, HeaderName, HeaderValue, CONNECTION};
 use hyper::{Method, Request, Uri};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 const HOP_BY_HOP: &[&str] = &[
@@ -41,6 +41,44 @@ const HOP_BY_HOP: &[&str] = &[
 ];
 
 const PREFIXO_CORRELACAO: &str = "x-heraclitus-";
+
+/// RFC 9110: `Connection` pode nomear outros campos que são hop-by-hop para
+/// aquela mensagem específica. Uma lista estática não basta: sem esta etapa,
+/// `Connection: X-Private-Hop` removia `Connection` mas deixava
+/// `X-Private-Hop` atravessar a fronteira do proxy.
+fn connection_tokens_from_values<'a>(
+    values: impl Iterator<Item = &'a str>,
+) -> BTreeSet<String> {
+    values
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect()
+}
+
+fn connection_tokens_from_btree(headers: &BTreeMap<String, String>) -> BTreeSet<String> {
+    connection_tokens_from_values(
+        headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("connection"))
+            .map(|(_, value)| value.as_str()),
+    )
+}
+
+fn connection_tokens_from_header_map(headers: &HeaderMap) -> BTreeSet<String> {
+    connection_tokens_from_values(
+        headers
+            .get_all(CONNECTION)
+            .iter()
+            .filter_map(|value| value.to_str().ok()),
+    )
+}
+
+fn is_hop_by_hop(name: &str, connection_tokens: &BTreeSet<String>) -> bool {
+    HOP_BY_HOP.iter().any(|h| name.eq_ignore_ascii_case(h))
+        || connection_tokens.contains(&name.to_ascii_lowercase())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum UpstreamError {
@@ -149,8 +187,9 @@ impl UpstreamClient {
         let method = Method::from_bytes(method.as_bytes())
             .map_err(|e| UpstreamError::BadUrl(format!("método inválido: {e}")))?;
         let mut req = Request::builder().method(method).uri(uri);
+        let connection_tokens = connection_tokens_from_btree(headers);
         for (k, v) in headers {
-            if HOP_BY_HOP.iter().any(|h| k.eq_ignore_ascii_case(h)) {
+            if is_hop_by_hop(k, &connection_tokens) {
                 continue;
             }
             if k.to_ascii_lowercase().starts_with(PREFIXO_CORRELACAO) {
@@ -174,12 +213,10 @@ impl UpstreamClient {
             .map_err(|e| UpstreamError::Transport(e.to_string()))?;
 
         let status = resposta.status().as_u16();
+        let response_connection_tokens = connection_tokens_from_header_map(resposta.headers());
         let mut out_headers = BTreeMap::new();
         for (k, v) in resposta.headers() {
-            if HOP_BY_HOP
-                .iter()
-                .any(|h| k.as_str().eq_ignore_ascii_case(h))
-            {
+            if is_hop_by_hop(k.as_str(), &response_connection_tokens) {
                 continue;
             }
             if let Ok(s) = v.to_str() {
@@ -260,6 +297,24 @@ mod tests {
                 "{h} devia ser hop-by-hop"
             );
         }
+    }
+
+    #[test]
+    fn connection_remove_headers_hop_by_hop_nomeados_dinamicamente() {
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "Connection".into(),
+            "X-Redteam-Hop, keep-alive, X-Another-Hop".into(),
+        );
+        headers.insert("X-Redteam-Hop".into(), "synthetic".into());
+        headers.insert("X-Another-Hop".into(), "synthetic-2".into());
+        headers.insert("X-End-To-End".into(), "preserve".into());
+
+        let tokens = connection_tokens_from_btree(&headers);
+        assert!(is_hop_by_hop("X-Redteam-Hop", &tokens));
+        assert!(is_hop_by_hop("x-another-hop", &tokens));
+        assert!(is_hop_by_hop("Keep-Alive", &tokens));
+        assert!(!is_hop_by_hop("X-End-To-End", &tokens));
     }
 
     #[tokio::test]
