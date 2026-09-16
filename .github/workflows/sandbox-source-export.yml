@@ -15,7 +15,7 @@ jobs:
           tar --exclude=.git --exclude=target -czf /tmp/heraclitus-source.tar.gz .
           sha256sum /tmp/heraclitus-source.tar.gz > /tmp/SHA256SUMS
           git rev-parse HEAD > /tmp/COMMIT
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: heraclitus-source-sandbox
           path: |
