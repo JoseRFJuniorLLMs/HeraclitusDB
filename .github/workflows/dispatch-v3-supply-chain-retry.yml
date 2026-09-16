@@ -11,6 +11,7 @@ permissions:
   contents: read
 
 # One-shot dispatcher. Removed as soon as the official tagged run starts.
+# Trigger commit: retry uses the v-prefixed release_version expected by the tagged workflow.
 jobs:
   dispatch:
     runs-on: ubuntu-24.04
