@@ -93,12 +93,24 @@ impl Authenticator {
 
     #[allow(clippy::result_large_err)]
     pub fn authenticate(&self, mut req: Request<()>) -> Result<Request<()>, Status> {
-        let token = req
-            .metadata()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(str::to_owned);
+        // Authentication metadata is security-sensitive and therefore must be
+        // unambiguous. Different HTTP/2 intermediaries may disagree about how
+        // repeated Authorization fields are combined. Accepting the first one
+        // would make authentication depend on header order, so repeated values
+        // fail closed regardless of which token comes first.
+        let token = {
+            let mut values = req.metadata().get_all("authorization").iter();
+            let first = values.next();
+            if values.next().is_some() {
+                return Err(Status::unauthenticated(
+                    "multiple authorization metadata values are not allowed",
+                ));
+            }
+            first
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(str::to_owned)
+        };
         match self.resolver(token.as_deref()) {
             Some(principal) => {
                 req.extensions_mut().insert(principal);
@@ -182,17 +194,35 @@ mod tests {
 
     #[test]
     fn aprovador_e_sempre_a_identidade_autenticada() {
-        // Ausente: fica a identidade, sem drama.
         assert_eq!(vincular_aprovador(None, "ana"), Ok("ana"));
-        // Coincidente: idem.
         assert_eq!(vincular_aprovador(Some("ana"), "ana"), Ok("ana"));
-        // Divergente: recusado, e a mensagem nomeia os DOIS lados — quem le o
-        // log precisa de saber quem tentou e em nome de quem.
         let erro = vincular_aprovador(Some("a-directora"), "ana").unwrap_err();
         assert!(
             erro.contains("a-directora") && erro.contains("ana"),
             "{erro}"
         );
+    }
+
+    #[test]
+    fn duplicate_authorization_metadata_is_rejected_in_both_orders() {
+        let token = "0123456789abcdef0123456789abcdef"; // gitleaks:allow -- unit-test vector
+        let mut cfg = HeraclitusConfig::default();
+        cfg.auth_token = Some(token.into());
+        let auth = Authenticator::from_config(&cfg).unwrap();
+
+        for values in [
+            [format!("Bearer {token}"), "Bearer wrong".to_string()],
+            ["Bearer wrong".to_string(), format!("Bearer {token}")],
+        ] {
+            let mut req = Request::new(());
+            req.metadata_mut()
+                .append("authorization", values[0].parse().unwrap());
+            req.metadata_mut()
+                .append("authorization", values[1].parse().unwrap());
+            let err = auth.authenticate(req).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert!(err.message().contains("multiple authorization"));
+        }
     }
 
     #[test]
