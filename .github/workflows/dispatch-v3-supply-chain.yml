@@ -10,6 +10,7 @@ permissions:
   actions: write
   contents: read
 
+# One-shot dispatcher: removed after the official v3.0.0 supply-chain run starts.
 jobs:
   dispatch:
     runs-on: ubuntu-24.04
