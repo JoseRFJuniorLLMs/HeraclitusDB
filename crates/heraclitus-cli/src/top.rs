@@ -5,6 +5,7 @@
 
 mod cockpit;
 mod http;
+mod model;
 mod render;
 
 pub use cockpit::run_top;
