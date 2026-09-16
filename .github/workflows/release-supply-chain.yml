@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: Version recorded in the release dossier
+        description: Version recorded in the release dossier (3.0.0 or v3.0.0)
         required: true
         type: string
 
@@ -84,7 +84,9 @@ jobs:
           cp SECURITY.md "$dist/"
           cp LICENSE "$dist/"
           cp packaging/install.py "$dist/"
-          cp "docs/md/RELEASE_NOTES_${version}.md" "$dist/RELEASE_NOTES.md"
+          # Release notes are canonically named with a v-prefix; accept both
+          # `3.0.0` and `v3.0.0` as manual dispatch input.
+          cp "docs/md/RELEASE_NOTES_v${version#v}.md" "$dist/RELEASE_NOTES.md"
           cp docs/security/vulnerability-response.md "$dist/docs/security/"
           cp -R docs/qualification/. "$dist/docs/qualification/"
           # SPEC-0049 §117/§119 — the eleven operational runbooks travel with
