@@ -315,7 +315,9 @@ async fn proxy(
         .clone()
         .unwrap_or_else(|| "unknown-agent".to_string());
     let args = facts.arguments.clone();
-    let digest = argument_digest(&args);
+    // Authorization binding preserva o tipo JSON; policy e preview continuam
+    // a usar a projecção textual compatível com policies existentes.
+    let digest = argument_digest(&facts.binding_arguments);
 
     // ── policy ──────────────────────────────────────────────────────────────
     let mode = runtime.mode();

@@ -86,8 +86,14 @@ pub struct McpCallFacts {
     /// `true` quando a resposta MCP declara erro (`isError` ou `error`).
     pub is_error: bool,
     pub error_message: Option<String>,
-    /// Argumentos tipados extraídos de `params.arguments`, achatados.
+    /// Argumentos para policy/preview, achatados para strings. Mantemos esta
+    /// projecção por compatibilidade com as policies existentes.
     pub arguments: BTreeMap<String, String>,
+    /// Representação canónica TIPADA dos mesmos argumentos, exclusivamente
+    /// para authorization binding. JSON string `"75000"` e JSON number `75000`
+    /// têm de produzir digests diferentes, mesmo que a policy os projecte para
+    /// a mesma string.
+    pub binding_arguments: BTreeMap<String, String>,
     /// Identificadores de efeito externo que a resposta devolveu, por
     /// allowlist (SPEC-0075 §25).
     pub external_effect_id: Option<String>,
@@ -312,6 +318,10 @@ pub fn extract_facts(ex: &McpExchange) -> McpCallFacts {
                 if let Some(args) = params.get("arguments").and_then(Value::as_object) {
                     for (k, val) in args {
                         facts.arguments.insert(k.clone(), flatten(val));
+                        facts.binding_arguments.insert(
+                            k.clone(),
+                            serde_json::to_string(val).unwrap_or_else(|_| "null".to_string()),
+                        );
                     }
                 }
             }
@@ -507,6 +517,25 @@ mod tests {
         assert!(validate_request_json(raw)
             .unwrap_err()
             .contains("duplicada"));
+    }
+
+    #[test]
+    fn binding_preserva_tipo_json_mesmo_quando_policy_achata() {
+        let a = McpExchange {
+            request_body: Some(br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_payment","arguments":{"amount":75000}}}"#.to_vec()),
+            ..Default::default()
+        };
+        let b = McpExchange {
+            request_body: Some(br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_payment","arguments":{"amount":"75000"}}}"#.to_vec()),
+            ..Default::default()
+        };
+        let fa = extract_facts(&a);
+        let fb = extract_facts(&b);
+        assert_eq!(fa.arguments.get("amount"), fb.arguments.get("amount"));
+        assert_ne!(
+            fa.binding_arguments.get("amount"),
+            fb.binding_arguments.get("amount")
+        );
     }
 
     #[test]
