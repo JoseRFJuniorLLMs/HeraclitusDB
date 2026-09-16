@@ -402,6 +402,17 @@ impl AgentRuntime {
         let mut idx = self.dedupe.lock().unwrap();
         idx.warm_from(rows.iter().map(|r| &r.evidence));
         self.approvals.warm(Vec::new());
+        self.approvals.warm_consumed(rows.iter().filter_map(|row| {
+            let e = &row.evidence;
+            if e.kind != heraclitus_agent::evidence::AgentEvidenceKindV1::ToolAuthorized {
+                return None;
+            }
+            let approval = e.content.approval.as_ref()?;
+            Some((
+                approval.authorization_subject_hash.clone(),
+                approval.approval_id.clone(),
+            ))
+        }));
         Ok(rows.len())
     }
 

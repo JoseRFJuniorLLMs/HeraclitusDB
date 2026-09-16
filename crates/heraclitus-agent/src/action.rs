@@ -341,6 +341,10 @@ impl ApprovalVerdict {
 #[derive(Debug, Default)]
 pub struct ApprovalStore {
     inner: Mutex<BTreeMap<String, ApprovalRecord>>,
+    /// Assuntos já consumidos reconstruídos do HRKL. Separado dos records
+    /// vivos porque uma execução antiga não precisa de preview/TTL para ser
+    /// reconhecida como replay, apenas do subject hash e approval id.
+    consumed_subjects: Mutex<BTreeMap<String, String>>,
 }
 
 impl ApprovalStore {
@@ -429,6 +433,15 @@ impl ApprovalStore {
             .find(|(_, r)| r.request.authorization_subject_hash == presented)
             .map(|(k, v)| (k.clone(), v))
         else {
+            if let Some(approval_id) = self
+                .consumed_subjects
+                .lock()
+                .unwrap()
+                .get(&presented)
+                .cloned()
+            {
+                return ApprovalVerdict::AlreadyUsed { approval_id };
+            }
             // Binding mismatch belongs to the same logical request only. A grant
             // for an unrelated request must never poison a new operation.
             let same_request = if authorization.request_id.is_empty() {
@@ -462,6 +475,10 @@ impl ApprovalStore {
                 }
                 record.state = ApprovalState::Consumed;
                 record.authorization = Some(authorization.clone());
+                self.consumed_subjects
+                    .lock()
+                    .unwrap()
+                    .insert(presented, id.clone());
                 ApprovalVerdict::Authorized { approval_id: id }
             }
         }
@@ -486,6 +503,15 @@ impl ApprovalStore {
 
     pub fn all(&self) -> Vec<ApprovalRecord> {
         self.inner.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Reconstrói o ledger mínimo de approvals já consumidos.
+    /// Chamado no arranque a partir de evidências `ToolAuthorized` duráveis.
+    pub fn warm_consumed(&self, records: impl IntoIterator<Item = (String, String)>) {
+        let mut consumed = self.consumed_subjects.lock().unwrap();
+        for (subject_hash, approval_id) in records {
+            consumed.insert(subject_hash, approval_id);
+        }
     }
 
     /// Reconstrói o índice a partir de registos já persistidos.
@@ -560,6 +586,17 @@ mod tests {
         nova.authorization_id = "AZ-2".into();
         nova.nonce = "n2".into();
         assert_ne!(a.subject_hash(), nova.subject_hash());
+    }
+
+    #[test]
+    fn replay_consumido_reconstruido_do_log_continua_bloqueado() {
+        let store = ApprovalStore::new();
+        let a = authz("5000");
+        store.warm_consumed([(a.subject_hash(), "A-durable".to_string())]);
+        assert!(matches!(
+            store.consume(&a, 200),
+            ApprovalVerdict::AlreadyUsed { approval_id } if approval_id == "A-durable"
+        ));
     }
 
     #[test]

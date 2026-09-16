@@ -513,7 +513,18 @@ async fn proxy(
                             approver_issuer: None,
                             decided_at_unix_nanos: None,
                         });
-                        let _ = append(runtime, autorizada);
+                        let authorization_write = append(runtime, autorizada);
+                        if let Gravacao::Falhou(motivo) = authorization_write {
+                            if enforced {
+                                let _ = runtime.flush();
+                                return mcp_error(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    &facts.tool_call_id,
+                                    "AUTHORIZATION_EVIDENCE_NOT_RECORDED",
+                                    &motivo,
+                                );
+                            }
+                        }
                     }
                     ApprovalVerdict::Pending { approval_id } => {
                         // Retry idempotente de uma operação que continua à espera
