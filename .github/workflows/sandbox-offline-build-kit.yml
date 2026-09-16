@@ -1,0 +1,43 @@
+name: Sandbox offline Rust build kit
+
+on:
+  push:
+    branches:
+      - gpt56/agent-security-observability
+
+permissions:
+  contents: read
+
+jobs:
+  kit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact branch state
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+      - name: Install minimal pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup override set 1.96.0
+          rustc --version
+          cargo --version
+      - name: Vendor locked dependencies
+        run: |
+          mkdir -p offline-kit
+          cargo vendor --locked --versioned-dirs offline-kit/vendor > offline-kit/cargo-config.toml
+      - name: Package portable toolchain
+        run: |
+          SYSROOT="$(rustc --print sysroot)"
+          cp -a "$SYSROOT" offline-kit/toolchain
+          git rev-parse HEAD > offline-kit/SOURCE_COMMIT
+          rustc --version > offline-kit/RUSTC_VERSION
+          cargo --version > offline-kit/CARGO_VERSION
+      - name: Upload offline kit
+        uses: actions/upload-artifact@v4
+        with:
+          name: heraclitus-sandbox-offline-kit
+          path: offline-kit
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 1
