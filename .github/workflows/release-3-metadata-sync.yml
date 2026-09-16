@@ -1,0 +1,66 @@
+name: Release 3 metadata sync
+
+on:
+  push:
+    branches:
+      - gpt56/agent-security-observability
+    paths:
+      - .github/workflows/release-3-metadata-sync.yml
+
+permissions:
+  contents: write
+
+jobs:
+  sync-metadata:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: gpt56/agent-security-observability
+          fetch-depth: 0
+
+      - name: Synchronize current-release references
+        shell: python
+        run: |
+          from pathlib import Path
+
+          replacements = {
+              Path('README.md'): [
+                  ('version-v2.0.0-brightgreen', 'version-v3.0.0-brightgreen'),
+                  ('alt="v2.0.0"', 'alt="v3.0.0"'),
+              ],
+              Path('Dockerfile'): [
+                  ('heraclitus:2.0.0', 'heraclitus:3.0.0'),
+              ],
+              Path('examples/agent-black-box/docker-compose.yml'): [
+                  ('heraclitus:2.0.0', 'heraclitus:3.0.0'),
+              ],
+              Path('qa/qualification/plans/release-candidate.toml'): [
+                  ('suite_version = "2.0.0"', 'suite_version = "3.0.0"'),
+                  ('release_version = "2.0.0"', 'release_version = "3.0.0"'),
+              ],
+          }
+
+          for path, pairs in replacements.items():
+              text = path.read_text(encoding='utf-8')
+              original = text
+              for old, new in pairs:
+                  if old not in text:
+                      raise SystemExit(f'expected release marker not found in {path}: {old}')
+                  text = text.replace(old, new, 1)
+              if text != original:
+                  path.write_text(text, encoding='utf-8')
+
+      - name: Commit release metadata
+        shell: bash
+        run: |
+          if git diff --quiet; then
+            echo "Release metadata already synchronized"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md Dockerfile examples/agent-black-box/docker-compose.yml qa/qualification/plans/release-candidate.toml
+          git commit -m "chore(release): synchronize 3.0.0 metadata"
+          git push origin HEAD:gpt56/agent-security-observability
