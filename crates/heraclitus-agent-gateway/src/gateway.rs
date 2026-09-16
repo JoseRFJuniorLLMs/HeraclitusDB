@@ -515,6 +515,24 @@ async fn proxy(
                         });
                         let _ = append(runtime, autorizada);
                     }
+                    ApprovalVerdict::Pending { approval_id } => {
+                        // Retry idempotente de uma operação que continua à espera
+                        // de decisão humana. Não é uma recusa: devolver o MESMO
+                        // 202 permite ao agente aguardar/pollar sem criar outra
+                        // aprovação e sem transformar "pending" em falso 403.
+                        if enforced {
+                            let Some(record) = runtime.approvals.get(&approval_id) else {
+                                return mcp_error(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    &facts.tool_call_id,
+                                    "APPROVAL_STATE_LOST",
+                                    "pending approval disappeared from the live index",
+                                );
+                            };
+                            let _ = runtime.flush();
+                            return approval_pending(&facts.tool_call_id, &record.request);
+                        }
+                    }
                     ApprovalVerdict::NotFound if enforced || mode == GatewayMode::Shadow => {
                         // Primeiro encontro com esta acção: abrir o pedido de
                         // aprovação. Em shadow o pedido é registado mas a acção
