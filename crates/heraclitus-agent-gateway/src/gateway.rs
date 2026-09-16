@@ -68,6 +68,27 @@ pub fn router(state: Arc<GatewayState>) -> Router {
     Router::new().fallback(proxy).with_state(state)
 }
 
+fn mcp_method_is_canonical(method: &str) -> bool {
+    !method.is_empty()
+        && method.len() <= 128
+        && method
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'-' | b'.'))
+}
+
+fn mcp_non_tool_control_allowed(method: &str) -> bool {
+    matches!(
+        method,
+        "initialize"
+            | "ping"
+            | "tools/list"
+            | "resources/list"
+            | "resources/templates/list"
+            | "prompts/list"
+            | "logging/setLevel"
+    ) || method.starts_with("notifications/")
+}
+
 async fn proxy(
     State(state): State<Arc<GatewayState>>,
     method: Method,
@@ -88,16 +109,73 @@ async fn proxy(
         })
         .collect();
 
-    let server_id = header_map
-        .get("x-heraclitus-server")
-        .cloned()
-        .unwrap_or_else(|| {
-            state
-                .upstream
-                .as_ref()
-                .and_then(|u| u.base().host().map(str::to_string))
-                .unwrap_or_else(|| "upstream".to_string())
-        });
+    // Trust boundary: policy resource identity is derived from the configured
+    // upstream. A caller-controlled X-Heraclitus-Server is correlation metadata
+    // only and can never select another server's policy rules.
+    let server_id = state
+        .upstream
+        .as_ref()
+        .and_then(|u| u.base().host().map(str::to_string))
+        .unwrap_or_else(|| "upstream".to_string());
+
+    // Bound untrusted correlation metadata before copying it into durable evidence.
+    for nome in [
+        "x-heraclitus-agent",
+        "x-heraclitus-run",
+        "x-heraclitus-user",
+        "x-heraclitus-environment",
+        "x-heraclitus-trace",
+        "x-heraclitus-server",
+    ] {
+        if header_map.get(nome).is_some_and(|v| v.len() > 512) {
+            return mcp_error(
+                StatusCode::BAD_REQUEST,
+                &None,
+                "CORRELATION_HEADER_TOO_LARGE",
+                &format!("{nome} excede 512 bytes"),
+            );
+        }
+    }
+
+    // In OIDC mode the identity used by policy and evidence comes from the
+    // validated token, never from spoofable X-Heraclitus-* headers.
+    let principal = if runtime.gateway.identity.mode == "oidc" {
+        match crate::auth::principal_from(runtime, &headers, now_unix_seconds()) {
+            Ok(p) => Some(p),
+            Err(e) => return mcp_error(e.status, &None, e.code, &e.detail),
+        }
+    } else {
+        None
+    };
+    let trusted_agent = principal
+        .as_ref()
+        .map(|p| p.subject.clone())
+        .or_else(|| header_map.get("x-heraclitus-agent").cloned());
+    let trusted_human = principal
+        .as_ref()
+        .map(|p| p.subject.clone())
+        .or_else(|| header_map.get("x-heraclitus-user").cloned());
+
+    // A policy boundary may never turn a parser failure into passthrough. A
+    // non-empty MCP request with invalid/ambiguous JSON is rejected before the
+    // upstream sees a byte. This closes duplicate-key differential parsing and
+    // excessive-depth bypasses found by the multi-agent red team.
+    if !body.is_empty() {
+        if let Err(detail) = mcp::validate_request_json(&body) {
+            return mcp_error(StatusCode::BAD_REQUEST, &None, "MCP_JSON_INVALID", &detail);
+        }
+    }
+
+    // Gateway credentials authenticate to the gateway, not to its upstream.
+    let mut upstream_header_map = header_map.clone();
+    // Authorization authenticates the caller to this gateway. There is no
+    // configured upstream credential source yet, so forwarding a caller token
+    // would be credential leakage in both OIDC and dev_local modes.
+    upstream_header_map.remove("authorization");
+    // Classification hints are never forwarded. The body is the single
+    // security/protocol authority, preventing header-vs-body parser differential.
+    upstream_header_map.remove("mcp-method");
+    upstream_header_map.remove("mcp-name");
 
     let mut exchange = McpExchange {
         tenant_id: runtime.config.tenant_id.clone(),
@@ -108,23 +186,128 @@ async fn proxy(
         observed_at_unix_nanos: started,
         trace_id: header_map.get("x-heraclitus-trace").cloned(),
         run_id: header_map.get("x-heraclitus-run").cloned(),
-        agent_id: header_map.get("x-heraclitus-agent").cloned(),
-        human_subject: header_map.get("x-heraclitus-user").cloned(),
+        agent_id: trusted_agent,
+        human_subject: trusted_human,
         ..Default::default()
     };
     let facts = mcp::extract_facts(&exchange);
 
-    let e_tool_call = facts
-        .method
-        .as_deref()
-        .map(|m| m == "tools/call")
-        .unwrap_or(false);
+    let method_name = facts.method.as_deref().unwrap_or_default();
+    if !mcp_method_is_canonical(method_name) {
+        return mcp_error(
+            StatusCode::BAD_REQUEST,
+            &facts.tool_call_id,
+            "MCP_METHOD_INVALID",
+            "MCP method must use the canonical ASCII alphabet [A-Za-z0-9._/-] and be <= 128 bytes",
+        );
+    }
+    let e_tool_call = method_name == "tools/call";
 
-    // Tráfego que não é uma chamada de ferramenta (`initialize`, `tools/list`,
-    // `ping`) passa sem policy e sem evidência. Registá-lo encheria a timeline
-    // de ruído de protocolo e escondia as acções que interessam.
+    // Near-miss spellings of `tools/call` are never forwarded. A permissive
+    // upstream could normalize case, slash variants or percent encoding after
+    // this gateway and thereby turn what looked like protocol traffic here into
+    // a tool execution there. Unknown ordinary MCP methods may still pass
+    // through; confusable tool-call spellings fail closed.
     if !e_tool_call {
-        return forward_or_error(&state, &method, &uri, &header_map, body).await;
+        let mut normalized = method_name
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['\\', '∕', '⁄'], "/")
+            .replace("%2f", "/")
+            .replace("%5c", "/");
+        while normalized.contains("//") {
+            normalized = normalized.replace("//", "/");
+        }
+        if normalized == "tools/call" || normalized.starts_with("tools/call/") {
+            return mcp_error(
+                StatusCode::BAD_REQUEST,
+                &None,
+                "MCP_METHOD_INVALID",
+                "confusable tools/call method spelling refused before upstream",
+            );
+        }
+
+        if mcp_non_tool_control_allowed(method_name) {
+            return forward_or_error(&state, &method, &uri, &upstream_header_map, body).await;
+        }
+
+        // SPEC-0080: data-bearing and unknown non-tool MCP methods do not
+        // inherit an accidental allow merely because they are not tools/call.
+        let mode = runtime.mode();
+        if mode != GatewayMode::Observe {
+            let agent_id = exchange
+                .agent_id
+                .clone()
+                .unwrap_or_else(|| "unknown-agent".to_string());
+            let mut denied = base_evidence(
+                runtime,
+                AgentEvidenceKindV1::ErrorObserved,
+                now_unix_nanos(),
+                &exchange,
+                &facts,
+                &agent_id,
+            );
+            let known_data_method = matches!(
+                method_name,
+                "resources/read"
+                    | "resources/subscribe"
+                    | "resources/unsubscribe"
+                    | "prompts/get"
+                    | "completion/complete"
+            );
+            let reason = if known_data_method {
+                "MCP_NON_TOOL_DENIED"
+            } else {
+                "MCP_UNKNOWN_METHOD_DENIED"
+            };
+            denied
+                .content
+                .extensions
+                .insert("mcp_method".into(), method_name.to_string());
+            denied.content.extensions.insert(
+                "gateway_decision".into(),
+                if mode == GatewayMode::Enforce {
+                    "deny"
+                } else {
+                    "would_deny"
+                }
+                .into(),
+            );
+            denied.outcome = Some(EvidenceOutcomeV1 {
+                transport_status: Some(if mode == GatewayMode::Enforce {
+                    403
+                } else {
+                    200
+                }),
+                protocol_status: Some(reason.into()),
+                error_code: Some(reason.into()),
+                error_message: Some("non-tool MCP method requires explicit governance".into()),
+                ..Default::default()
+            });
+            let gravacao = append(runtime, denied);
+            if let Gravacao::Falhou(motivo) = &gravacao {
+                if mode == GatewayMode::Enforce {
+                    let _ = runtime.flush();
+                    return mcp_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &facts.tool_call_id,
+                        "EVIDENCE_NOT_RECORDED",
+                        motivo,
+                    );
+                }
+            }
+            let _ = runtime.flush();
+            if mode == GatewayMode::Enforce {
+                return mcp_error(
+                    StatusCode::FORBIDDEN,
+                    &facts.tool_call_id,
+                    reason,
+                    "non-tool MCP data/unknown method denied by SPEC-0080",
+                );
+            }
+        }
+
+        return forward_or_error(&state, &method, &uri, &upstream_header_map, body).await;
     }
 
     let agent_id = exchange
@@ -132,7 +315,9 @@ async fn proxy(
         .clone()
         .unwrap_or_else(|| "unknown-agent".to_string());
     let args = facts.arguments.clone();
-    let digest = argument_digest(&args);
+    // Authorization binding preserva o tipo JSON; policy e preview continuam
+    // a usar a projecção textual compatível com policies existentes.
+    let digest = argument_digest(&facts.binding_arguments);
 
     // ── policy ──────────────────────────────────────────────────────────────
     let mode = runtime.mode();
@@ -266,8 +451,31 @@ async fn proxy(
             } => {
                 GatewayCounters::bump(&runtime.gateway_counters.require_approval);
                 let now = now_unix_seconds();
+                let Some(raw_request_id) = facts
+                    .tool_call_id
+                    .as_deref()
+                    .filter(|id| !id.trim().is_empty())
+                    .map(str::to_string)
+                else {
+                    return mcp_error(
+                        StatusCode::BAD_REQUEST,
+                        &facts.tool_call_id,
+                        "MCP_REQUEST_ID_REQUIRED_FOR_APPROVAL",
+                        "approval-required tool calls need a stable JSON-RPC id",
+                    );
+                };
+                // JSON-RPC ids are scoped to a client/session, not globally.
+                // Namespace them by trusted agent identity and run correlation so
+                // 256 agents may all use id=1 without poisoning one another.
+                let logical_request_id = format!(
+                    "{}:{}:{}",
+                    agent_id,
+                    exchange.run_id.as_deref().unwrap_or(""),
+                    raw_request_id
+                );
                 let authorization = ActionAuthorizationV1 {
                     authorization_id: ulid::Ulid::new().to_string(),
+                    request_id: logical_request_id.clone(),
                     policy_id: a.policy_id.clone(),
                     policy_version: a.policy_version.clone(),
                     policy_hash: a.policy_hash.clone(),
@@ -305,7 +513,36 @@ async fn proxy(
                             approver_issuer: None,
                             decided_at_unix_nanos: None,
                         });
-                        let _ = append(runtime, autorizada);
+                        let authorization_write = append(runtime, autorizada);
+                        if let Gravacao::Falhou(motivo) = authorization_write {
+                            if enforced {
+                                let _ = runtime.flush();
+                                return mcp_error(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    &facts.tool_call_id,
+                                    "AUTHORIZATION_EVIDENCE_NOT_RECORDED",
+                                    &motivo,
+                                );
+                            }
+                        }
+                    }
+                    ApprovalVerdict::Pending { approval_id } => {
+                        // Retry idempotente de uma operação que continua à espera
+                        // de decisão humana. Não é uma recusa: devolver o MESMO
+                        // 202 permite ao agente aguardar/pollar sem criar outra
+                        // aprovação e sem transformar "pending" em falso 403.
+                        if enforced {
+                            let Some(record) = runtime.approvals.get(&approval_id) else {
+                                return mcp_error(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    &facts.tool_call_id,
+                                    "APPROVAL_STATE_LOST",
+                                    "pending approval disappeared from the live index",
+                                );
+                            };
+                            let _ = runtime.flush();
+                            return approval_pending(&facts.tool_call_id, &record.request);
+                        }
                     }
                     ApprovalVerdict::NotFound if enforced || mode == GatewayMode::Shadow => {
                         // Primeiro encontro com esta acção: abrir o pedido de
@@ -313,6 +550,7 @@ async fn proxy(
                         // segue — é isso que "would require approval" significa.
                         let pedido = ApprovalRequestV1 {
                             approval_id: ulid::Ulid::new().to_string(),
+                            request_id: logical_request_id.clone(),
                             authorization_subject_hash: subject_hash.clone(),
                             requested_roles: roles.clone(),
                             reason: format!(
@@ -332,30 +570,77 @@ async fn proxy(
                             requested_at: now,
                             expires_at: now + *ttl_seconds,
                         };
-                        let pedido = runtime.approvals.request(pedido, now);
-
-                        let mut pedida = base_evidence(
-                            runtime,
-                            AgentEvidenceKindV1::HumanApprovalRequested,
-                            now_unix_nanos(),
-                            &exchange,
-                            &facts,
-                            &agent_id,
+                        let pedido = runtime.approvals.request_bounded(
+                            pedido,
+                            now,
+                            runtime.gateway.approval.max_pending_global,
+                            runtime.gateway.approval.max_pending_per_agent,
                         );
-                        pedida.content.policy = provenance.clone();
-                        pedida.content.approval = Some(ApprovalProvenanceV1 {
-                            approval_id: pedido.approval_id.clone(),
-                            authorization_subject_hash: subject_hash.clone(),
-                            approver_subject: None,
-                            approver_issuer: None,
-                            decided_at_unix_nanos: None,
-                        });
-                        pedida.parents = requested_id.iter().cloned().collect();
-                        let _ = append(runtime, pedida);
-                        let _ = runtime.flush();
 
-                        if enforced {
-                            return approval_pending(&facts.tool_call_id, &pedido);
+                        match pedido {
+                            Ok(pedido) => {
+                                let mut pedida = base_evidence(
+                                    runtime,
+                                    AgentEvidenceKindV1::HumanApprovalRequested,
+                                    now_unix_nanos(),
+                                    &exchange,
+                                    &facts,
+                                    &agent_id,
+                                );
+                                pedida.content.policy = provenance.clone();
+                                pedida.content.approval = Some(ApprovalProvenanceV1 {
+                                    approval_id: pedido.approval_id.clone(),
+                                    authorization_subject_hash: subject_hash.clone(),
+                                    approver_subject: None,
+                                    approver_issuer: None,
+                                    decided_at_unix_nanos: None,
+                                });
+                                pedida.parents = requested_id.iter().cloned().collect();
+                                let _ = append(runtime, pedida);
+                                let _ = runtime.flush();
+
+                                if enforced {
+                                    return approval_pending(&facts.tool_call_id, &pedido);
+                                }
+                            }
+                            Err(limit) => {
+                                GatewayCounters::bump(
+                                    &runtime.gateway_counters.approval_capacity_rejected,
+                                );
+                                let mut denied = base_evidence(
+                                    runtime,
+                                    AgentEvidenceKindV1::ToolDenied,
+                                    now_unix_nanos(),
+                                    &exchange,
+                                    &facts,
+                                    &agent_id,
+                                );
+                                denied.content.policy = provenance.clone();
+                                denied
+                                    .content
+                                    .extensions
+                                    .insert("reason_code".into(), "APPROVAL_QUEUE_FULL".into());
+                                denied
+                                    .content
+                                    .extensions
+                                    .insert("approval_admission".into(), limit.to_string());
+                                denied.parents = requested_id.iter().cloned().collect();
+                                let _ = append(runtime, denied);
+                                let _ = runtime.flush();
+
+                                if enforced {
+                                    return mcp_error(
+                                        StatusCode::TOO_MANY_REQUESTS,
+                                        &facts.tool_call_id,
+                                        "APPROVAL_QUEUE_FULL",
+                                        &limit.to_string(),
+                                    );
+                                }
+                                tracing::warn!(
+                                    motivo = %limit,
+                                    "shadow approval simulation capacity exhausted; action remains non-blocking"
+                                );
+                            }
                         }
                     }
                     outro => {
@@ -423,7 +708,7 @@ async fn proxy(
     let started_id = append(runtime, started_ev).id();
 
     let t0 = now_unix_nanos();
-    let resultado = forward(&state, &method, &uri, &header_map, body).await;
+    let resultado = forward(&state, &method, &uri, &upstream_header_map, body).await;
     let duracao = now_unix_nanos().saturating_sub(t0);
 
     match resultado {
@@ -663,23 +948,17 @@ fn append(runtime: &Arc<AgentRuntime>, e: AgentEvidenceV1) -> Gravacao {
     let id = e.evidence_id.clone();
     match runtime.append_outcome(&e) {
         AppendOutcome::Gravada(_) | AppendOutcome::Duplicada => Gravacao::Ok(Some(id)),
-        // Conflito NÃO bloqueia, e a razão é concreta: o retry depois de uma
-        // aprovação humana usa, por contrato, o mesmo `tool_call_id` — é essa a
-        // razão de existir do authorization binding — e o `ToolRequested` que
-        // se grava então leva a proveniência da aprovação, que o primeiro não
-        // tinha. Mesma chave, conteúdo diferente: conflito legítimo.
-        //
-        // Recusar a GRAVAÇÃO continua certo (não se reescreve evidência
-        // registada). Recusar a CHAMADA partiria o fluxo da SPEC-0075 §16.
-        // O que muda em relação a antes é que isto deixou de ser invisível.
+        // SPEC-0079 live red-team: gateway attempts now carry distinct
+        // dedupe identities. A conflict here is no longer an expected approval
+        // retry; it is an evidence-integrity failure and ENFORCE must fail closed.
         AppendOutcome::Conflito { existing_hash } => {
-            tracing::warn!(
-                chave = %e.dedupe_key,
-                gravado = %existing_hash,
-                "evidência recusada por conflito de deduplicação"
+            let motivo = format!(
+                "conflito de deduplicação no gateway: chave {} já gravada como {}",
+                e.dedupe_key, existing_hash
             );
+            tracing::error!(motivo = %motivo, "evidência de agente NÃO foi gravada");
             GatewayCounters::bump(&runtime.gateway_counters.evidence_errors);
-            Gravacao::Ok(None)
+            Gravacao::Falhou(motivo)
         }
         // O log não aceitou a escrita. Aqui não há leitura benigna: a acção não
         // ficou registada.
@@ -792,4 +1071,47 @@ fn approval_pending(id: &Option<String>, pedido: &ApprovalRequestV1) -> Response
         }
     });
     (StatusCode::ACCEPTED, axum::Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod method_canonical_tests {
+    use super::mcp_method_is_canonical;
+
+    #[test]
+    fn standard_mcp_methods_use_canonical_alphabet() {
+        for method in [
+            "initialize",
+            "ping",
+            "tools/list",
+            "tools/call",
+            "resources/read",
+            "prompts/get",
+        ] {
+            assert!(mcp_method_is_canonical(method), "{method}");
+        }
+    }
+
+    #[test]
+    fn ambiguous_or_encoded_methods_are_rejected() {
+        for method in [
+            "tools／call",
+            "tools﹨call",
+            "tools＼call",
+            "tools%252Fcall",
+            "tools%252fcall",
+            "tools/call\u{200b}",
+            "tools/\u{200b}call",
+            "tools/call\0",
+            "tools\\call",
+            "tools call",
+            "tools\tcall",
+        ] {
+            assert!(
+                !mcp_method_is_canonical(method),
+                "unexpectedly canonical: {method:?}"
+            );
+        }
+        assert!(!mcp_method_is_canonical(""));
+        assert!(!mcp_method_is_canonical(&"a".repeat(129)));
+    }
 }

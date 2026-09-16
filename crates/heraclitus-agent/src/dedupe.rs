@@ -46,6 +46,13 @@ pub fn dedupe_key(e: &AgentEvidenceV1) -> String {
     // para todas as chamadas do mesmo tipo. O `tool_call_id` é o identificador
     // que o próprio protocolo já oferece para as distinguir.
     w.opt_str(e.subject.tool_call_id.as_deref());
+    // Gateway HTTP requests are attempts, not exporter retransmissions. The same
+    // JSON-RPC id is intentionally reused across pending -> approved -> replay
+    // in the approval protocol. Each attempt must therefore remain distinct
+    // evidence. OTLP keeps trace/span based dedupe unchanged.
+    if e.source.source_kind == "gateway" {
+        w.str(&e.evidence_id);
+    }
     hex32(&domain_hash(DOMAIN_DEDUPE, w.as_slice()))
 }
 
@@ -223,6 +230,27 @@ mod tests {
             idx.admit(&e);
         }
         assert!(idx.len() <= 4, "len={}", idx.len());
+    }
+
+    #[test]
+    fn tentativas_gateway_com_mesmo_rpc_id_sao_evidencias_distintas() {
+        let mut a = AgentEvidenceV1::new("t", AgentEvidenceKindV1::ToolRequested, 1);
+        a.source.source_kind = "gateway".into();
+        a.source.source_instance = Some("mcp".into());
+        a.subject.tool_call_id = Some("rpc-7".into());
+        a.evidence_id = "attempt-a".into();
+        let mut b = a.clone();
+        b.evidence_id = "attempt-b".into();
+        assert_ne!(dedupe_key(&a), dedupe_key(&b));
+
+        // OTLP continua a deduplicar pela identidade do span, não pelo envelope.
+        a.source.source_kind = "otlp_http".into();
+        b.source.source_kind = "otlp_http".into();
+        a.trace_id = Some("trace".into());
+        b.trace_id = Some("trace".into());
+        a.span_id = Some("span".into());
+        b.span_id = Some("span".into());
+        assert_eq!(dedupe_key(&a), dedupe_key(&b));
     }
 
     #[test]

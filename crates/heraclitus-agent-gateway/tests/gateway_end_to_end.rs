@@ -50,6 +50,14 @@ rules:
       roles: ["cfo"]
       ttl_seconds: 300
 
+  - id: pagamento-expira
+    match:
+      tool: send_payment_short
+    decision: require_approval
+    approval:
+      roles: ["cfo"]
+      ttl_seconds: 1
+
   - id: shell
     match:
       tool: exec
@@ -377,7 +385,11 @@ async fn aprovado_executa_uma_vez_e_so_uma() {
     .await;
     assert_eq!(status, 200);
 
-    // 3. A mesma acção exacta passa — uma vez.
+    // SPEC-0078: o bug da v2.0.0 só aparecia quando o retry cruzava o segundo
+    // UNIX porque issued_at/expires_at eram indevidamente parte do binding.
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+    // 3. A mesma acção exacta passa — uma vez, mesmo noutro segundo.
     let antes = h.hits();
     let (status, _) = post_json(
         &format!("{}/mcp", h.gateway_url),
@@ -392,6 +404,11 @@ async fn aprovado_executa_uma_vez_e_so_uma() {
     let (status, body) = post_json(&format!("{}/mcp", h.gateway_url), pedido, AGENT_HEADERS).await;
     assert_eq!(h.hits(), antes + 1, "executou duas vezes");
     assert!(status == 403 || status == 202, "status {status}: {body}");
+    assert_eq!(
+        h.runtime.gateway_counters.snapshot()["evidence_errors"],
+        0,
+        "approval retry/replay não pode criar buracos no evidence log"
+    );
 }
 
 #[tokio::test]
@@ -438,6 +455,45 @@ async fn aprovar_5000_e_executar_5001_e_recusado() {
         reason == "APPROVAL_PENDING" || reason == "APPROVAL_BINDING_MISMATCH",
         "a acção mutada tem de abrir uma aprovação NOVA ou falhar o binding; veio `{reason}`"
     );
+}
+
+#[tokio::test]
+async fn aprovacao_expirada_nunca_toca_o_upstream() {
+    let h = harness(GatewayMode::Enforce).await;
+    let pedido = tool_call(
+        "c-exp",
+        "send_payment_short",
+        serde_json::json!({ "amount": 75000, "account": "v1" }),
+    );
+    let (status, body) = post_json(
+        &format!("{}/mcp", h.gateway_url),
+        pedido.clone(),
+        AGENT_HEADERS,
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+    let approval_id = body["error"]["data"]["heraclitus"]["approval_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (status, body) = post_json(
+        &format!("{}/api/v1/agent/approvals/{approval_id}/approve", h.api_url),
+        serde_json::json!({}),
+        &[],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let antes = h.hits();
+    let (status, body) = post_json(&format!("{}/mcp", h.gateway_url), pedido, AGENT_HEADERS).await;
+    assert_eq!(h.hits(), antes, "aprovacao expirada chegou ao upstream");
+    assert!(status == 403 || status == 202, "status {status}: {body}");
+    let reason = body["error"]["data"]["heraclitus"]["reason_code"]
+        .as_str()
+        .unwrap_or_default();
+    assert_eq!(reason, "APPROVAL_EXPIRED", "{body}");
 }
 
 #[tokio::test]
@@ -671,4 +727,155 @@ async fn exportar_pela_api_devolve_um_bundle_descarregavel() {
         "sem prova de inclusão o verdicto não pode ser VERIFIED: {}",
         report.to_human()
     );
+}
+
+#[tokio::test]
+async fn flood_concorrente_de_deny_nunca_toca_o_upstream() {
+    let h = harness(GatewayMode::Enforce).await;
+    let antes = h.hits();
+    let mut tarefas = tokio::task::JoinSet::new();
+    for i in 0..64usize {
+        let url = format!("{}/mcp", h.gateway_url);
+        tarefas.spawn(async move {
+            post_json(
+                &url,
+                tool_call(
+                    &format!("deny-flood-{i}"),
+                    "exec",
+                    serde_json::json!({ "command": "rm -rf /", "attempt": i }),
+                ),
+                AGENT_HEADERS,
+            )
+            .await
+            .0
+        });
+    }
+    let mut negadas = 0usize;
+    while let Some(resultado) = tarefas.join_next().await {
+        assert_eq!(resultado.unwrap(), 403);
+        negadas += 1;
+    }
+    assert_eq!(negadas, 64);
+    assert_eq!(
+        h.hits(),
+        antes,
+        "DENY concorrente vazou chamada ao upstream"
+    );
+    assert!(
+        !h.runtime.scan().unwrap().is_empty(),
+        "evidence log ficou ilegível"
+    );
+}
+
+#[tokio::test]
+async fn redteam_lab_fica_no_hrkl_e_aparece_na_api() {
+    let h = harness(GatewayMode::Enforce).await;
+    let (status, body) = post_json(
+        &format!("{}/api/v1/agent/red-team/events", h.api_url),
+        serde_json::json!({
+            "attack_id": "rt-001",
+            "campaign_id": "sandbox-demo",
+            "vector": "mcp-policy-deny",
+            "target": "mcp://sandbox/exec",
+            "phase": "result",
+            "result": "blocked",
+            "expected": "blocked",
+            "reason_code": "SHELL_DENIED",
+            "blocked": true,
+            "upstream_delta": 0,
+            "transport_status": 403,
+            "sequence": 1
+        }),
+        &[],
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["lsn"].as_u64().is_some(), "{body}");
+
+    let (status, body) = get_json(&format!(
+        "{}/api/v1/agent/red-team/events?campaign=sandbox-demo&limit=10",
+        h.api_url
+    ))
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["events"][0]["attack_id"], "rt-001");
+    assert_eq!(body["events"][0]["blocked"], true);
+    assert_eq!(body["events"][0]["upstream_delta"], 0);
+    assert_eq!(body["events"][0]["capture_mode"], "METADATA_ONLY");
+    let dump = body.to_string();
+    assert!(!dump.contains("rm -rf"));
+    assert!(!dump.to_lowercase().contains("bearer "));
+}
+
+#[tokio::test]
+async fn spec_0080_data_bearing_non_tool_falha_fechado_em_enforce() {
+    let h = harness(GatewayMode::Enforce).await;
+    for (id, method) in [
+        ("r1", "resources/read"),
+        ("p1", "prompts/get"),
+        ("c1", "completion/complete"),
+        ("u1", "vendor/private/read"),
+    ] {
+        let before = h.hits();
+        let (status, body) = post_json(
+            &format!("{}/mcp", h.gateway_url),
+            serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":{}}),
+            &[("x-heraclitus-agent", "compromised-agent")],
+        )
+        .await;
+        assert_eq!(status, 403, "method={method} body={body}");
+        assert_eq!(h.hits(), before, "{method} reached upstream");
+    }
+    let rows = h.runtime.scan().unwrap();
+    assert!(
+        rows.iter()
+            .filter(|r| r.evidence.kind == AgentEvidenceKindV1::ErrorObserved)
+            .count()
+            >= 4
+    );
+    assert_eq!(h.runtime.gateway_counters.snapshot()["evidence_errors"], 0);
+}
+
+#[tokio::test]
+async fn spec_0080_control_methods_continuam_a_passar() {
+    let h = harness(GatewayMode::Enforce).await;
+    for (id, method) in [
+        ("ping", "ping"),
+        ("tl", "tools/list"),
+        ("rl", "resources/list"),
+        ("pl", "prompts/list"),
+    ] {
+        let before = h.hits();
+        let (status, body) = post_json(
+            &format!("{}/mcp", h.gateway_url),
+            serde_json::json!({"jsonrpc":"2.0","id":id,"method":method}),
+            &[],
+        )
+        .await;
+        assert_eq!(status, 200, "method={method} body={body}");
+        assert_eq!(h.hits(), before + 1, "{method} did not reach upstream");
+    }
+}
+
+#[tokio::test]
+async fn spec_0080_shadow_registra_would_deny_mas_nao_bloqueia() {
+    let h = harness(GatewayMode::Shadow).await;
+    let before = h.hits();
+    let (status, _) = post_json(
+        &format!("{}/mcp", h.gateway_url),
+        serde_json::json!({"jsonrpc":"2.0","id":"shadow-read","method":"resources/read","params":{}}),
+        &[("x-heraclitus-agent", "shadow-agent")],
+    ).await;
+    assert_eq!(status, 200);
+    assert_eq!(h.hits(), before + 1);
+    let rows = h.runtime.scan().unwrap();
+    assert!(rows.iter().any(|r| {
+        r.evidence.kind == AgentEvidenceKindV1::ErrorObserved
+            && r.evidence
+                .content
+                .extensions
+                .get("gateway_decision")
+                .map(String::as_str)
+                == Some("would_deny")
+    }));
 }

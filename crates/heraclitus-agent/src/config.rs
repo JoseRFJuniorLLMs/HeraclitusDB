@@ -317,12 +317,18 @@ impl Default for PolicyConfig {
 #[serde(default)]
 pub struct ApprovalConfig {
     pub default_ttl_seconds: u64,
+    /// SPEC-0085: hard ceiling for live pending approval requests.
+    pub max_pending_global: usize,
+    /// SPEC-0085: one compromised agent cannot consume the shared queue.
+    pub max_pending_per_agent: usize,
 }
 
 impl Default for ApprovalConfig {
     fn default() -> Self {
         Self {
             default_ttl_seconds: 300,
+            max_pending_global: 4096,
+            max_pending_per_agent: 64,
         }
     }
 }
@@ -371,7 +377,30 @@ impl AgentBlackBoxConfig {
                 "max_body_bytes = 0 recusaria todos os lotes".into(),
             ));
         }
+        // `require_auth=true` sem credencial era pior que `false`: parecia um
+        // controlo ligado, mas `otlp_credential()` devolvia None e o ingest
+        // deixava passar tudo. Tornar a configuração impossível fecha essa
+        // diferença entre intenção e execução.
+        if self.otlp.require_auth
+            && (!self.otlp.http_addr.is_empty() || !self.otlp.grpc_addr.is_empty())
+            && !self.console.has_basic_auth()
+        {
+            return Err(ConfigError::Invalid(
+                "agent_black_box.otlp.require_auth=true exige                  agent_black_box.console.basic_auth=user:senha; sem a credencial a ingestão                  não estaria autenticada (SPEC-0084)"
+                    .into(),
+            ));
+        }
         if production {
+            for (nome, addr) in [
+                ("otlp.http_addr", &self.otlp.http_addr),
+                ("otlp.grpc_addr", &self.otlp.grpc_addr),
+            ] {
+                if !addr.is_empty() && !is_loopback(addr) && !self.otlp.require_auth {
+                    return Err(ConfigError::Invalid(format!(
+                        "{nome} = `{addr}` não é loopback em produção e                          agent_black_box.otlp.require_auth=false; a porta de ingestão ficaria                          aberta a injecção de evidência (SPEC-0084)"
+                    )));
+                }
+            }
             if self.capture_mode() == CaptureModeV1::FullExplicit {
                 // Não é proibido — §11 di-lo explicitamente possível — mas tem
                 // de ser uma decisão administrativa, não um default herdado.
@@ -416,6 +445,21 @@ impl AgentGatewayConfig {
                 "o gateway precisa de `upstream_url` em qualquer modo: sem ele o \
                  proxy aceita ligações e responde 502 a tudo"
                     .into(),
+            ));
+        }
+        if self.approval.max_pending_global == 0 {
+            return Err(ConfigError::Invalid(
+                "agent_gateway.approval.max_pending_global deve ser > 0 (SPEC-0085)".into(),
+            ));
+        }
+        if self.approval.max_pending_per_agent == 0 {
+            return Err(ConfigError::Invalid(
+                "agent_gateway.approval.max_pending_per_agent deve ser > 0 (SPEC-0085)".into(),
+            ));
+        }
+        if self.approval.max_pending_per_agent > self.approval.max_pending_global {
+            return Err(ConfigError::Invalid(
+                "agent_gateway.approval.max_pending_per_agent não pode exceder max_pending_global (SPEC-0085)".into(),
             ));
         }
         if production {
@@ -488,6 +532,36 @@ mod tests {
     }
 
     #[test]
+    fn otlp_require_auth_sem_credencial_e_configuracao_invalida() {
+        let mut c = AgentBlackBoxConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        c.otlp.http_addr = "127.0.0.1:4318".into();
+        c.otlp.grpc_addr = String::new();
+        c.otlp.require_auth = true;
+        c.console.basic_auth.clear();
+        assert!(c.validate(false, false, false).is_err());
+        c.console.basic_auth = "collector:a-strong-local-password".into();
+        assert!(c.validate(false, false, true).is_ok());
+    }
+
+    #[test]
+    fn producao_otlp_publico_exige_auth_na_propria_ingestao() {
+        let mut c = AgentBlackBoxConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        c.otlp.http_addr = "0.0.0.0:4318".into();
+        c.otlp.grpc_addr = String::new();
+        c.console.basic_auth = "collector:a-strong-local-password".into();
+        c.otlp.require_auth = false;
+        assert!(c.validate(true, true, true).is_err());
+        c.otlp.require_auth = true;
+        assert!(c.validate(true, true, true).is_ok());
+    }
+
+    #[test]
     fn producao_sem_tls_recusa_bind_publico() {
         let mut c = AgentBlackBoxConfig {
             enabled: true,
@@ -495,7 +569,11 @@ mod tests {
         };
         c.otlp.http_addr = "0.0.0.0:4318".into();
         assert!(c.validate(true, false, false).is_err());
+        c.console.basic_auth = "collector:a-strong-local-password".into();
+        c.otlp.require_auth = true;
         assert!(c.validate(true, true, true).is_ok());
+        c.console.basic_auth.clear();
+        c.otlp.require_auth = false;
         assert!(c.validate(false, false, false).is_ok(), "dev não é gateado");
     }
 

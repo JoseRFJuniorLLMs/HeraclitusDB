@@ -72,6 +72,7 @@ pub struct GatewayCounters {
     pub shadow_deny: AtomicU64,
     pub approval_expired: AtomicU64,
     pub approval_replay_rejected: AtomicU64,
+    pub approval_capacity_rejected: AtomicU64,
     pub policy_errors: AtomicU64,
     /// Evidência que NÃO foi gravada. Ver `gateway::append`.
     pub evidence_errors: AtomicU64,
@@ -92,6 +93,7 @@ impl GatewayCounters {
             "shadow_deny": self.shadow_deny.load(Ordering::Relaxed),
             "approval_expired": self.approval_expired.load(Ordering::Relaxed),
             "approval_replay_rejected": self.approval_replay_rejected.load(Ordering::Relaxed),
+            "approval_capacity_rejected": self.approval_capacity_rejected.load(Ordering::Relaxed),
             "policy_errors": self.policy_errors.load(Ordering::Relaxed),
             "upstream_errors": self.upstream_errors.load(Ordering::Relaxed),
         })
@@ -132,13 +134,10 @@ pub struct AgentRuntime {
 /// consequências opostas:
 ///
 /// - [`Conflito`](AppendOutcome::Conflito) — a chave já existe com conteúdo
-///   diferente. Parece adulteração, mas o caminho de aprovação humana produz um
-///   legitimamente: o retry DEPOIS de aprovar usa, por contrato, o mesmo
-///   `tool_call_id` (é essa a razão de existir do authorization binding), e o
-///   `ToolRequested` que se grava então tem a proveniência da aprovação, que o
-///   primeiro não tinha. Recusar a gravação está certo — reescrever evidência
-///   registada não se faz — mas recusar a CHAMADA partia o fluxo que a
-///   SPEC-0075 §16 define.
+///   diferente. Para OTLP isto continua a significar colisão/rewrite da mesma
+///   identidade lógica. Para o gateway, cada tentativa HTTP recebe identidade
+///   de evidência distinta, portanto um conflito também é falha de integridade
+///   e o modo `enforce` recusa a acção.
 /// - [`Falhou`](AppendOutcome::Falhou) — o log não aceitou a escrita. Aqui não
 ///   há leitura benigna: a acção não ficou registada.
 #[derive(Debug)]
@@ -405,6 +404,17 @@ impl AgentRuntime {
         let mut idx = self.dedupe.lock().unwrap();
         idx.warm_from(rows.iter().map(|r| &r.evidence));
         self.approvals.warm(Vec::new());
+        self.approvals.warm_consumed(rows.iter().filter_map(|row| {
+            let e = &row.evidence;
+            if e.kind != heraclitus_agent::evidence::AgentEvidenceKindV1::ToolAuthorized {
+                return None;
+            }
+            let approval = e.content.approval.as_ref()?;
+            Some((
+                approval.authorization_subject_hash.clone(),
+                approval.approval_id.clone(),
+            ))
+        }));
         Ok(rows.len())
     }
 

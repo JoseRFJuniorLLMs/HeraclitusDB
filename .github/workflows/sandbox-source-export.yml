@@ -1,0 +1,25 @@
+name: Sandbox source export
+on:
+  push:
+    branches: [gpt56/agent-security-observability]
+    paths: [.github/workflows/sandbox-source-export.yml]
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+      - name: Pack source
+        run: |
+          tar --exclude=.git --exclude=target -czf /tmp/heraclitus-source.tar.gz .
+          sha256sum /tmp/heraclitus-source.tar.gz > /tmp/SHA256SUMS
+          git rev-parse HEAD > /tmp/COMMIT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: heraclitus-source-sandbox
+          path: |
+            /tmp/heraclitus-source.tar.gz
+            /tmp/SHA256SUMS
+            /tmp/COMMIT
+          if-no-files-found: error

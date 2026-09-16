@@ -414,3 +414,27 @@ async fn metricas_e_logs_sao_aceites_e_descartados() {
     let runs = get(&format!("{}/api/v1/agent/runs", q.api_url)).await;
     assert!(runs["runs"].as_array().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn otlp_json_malformado_e_rejeitado_sem_derrubar_o_listener() {
+    let q = arrancar().await;
+    let (status, _) = post(
+        &format!("{}/v1/traces", q.otlp_url),
+        b"{nao-e-json".to_vec(),
+        "application/json",
+    )
+    .await;
+    assert_eq!(status, 400);
+
+    let (status, body) = post(
+        &format!("{}/v1/traces", q.otlp_url),
+        LOTE,
+        "application/json",
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "listener nao recuperou depois de input malformado: {body}"
+    );
+    assert!(body["heraclitus"]["accepted"].as_u64().unwrap_or(0) > 0);
+}

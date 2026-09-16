@@ -4,7 +4,7 @@
 # tinha Docker. Trate a primeira construção como parte da revisão, não como uma
 # formalidade. O modo de falha é ruidoso (a build pára), não silencioso.
 #
-#   docker build -t heraclitus:2.0.0 .
+#   docker build -t heraclitus:3.0.0 .
 #   docker run --rm -p 7474:7474 -p 7475:7475 -v heraclitus-data:/var/lib/heraclitus heraclitus:2.0.0
 #
 # Agent Black Box (SPEC-0074/0075/0076), o produto por omissão:

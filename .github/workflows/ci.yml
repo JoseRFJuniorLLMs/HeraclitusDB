@@ -110,7 +110,7 @@ jobs:
           # Estes dois testes transformam essa afirmacao em algo que a maquina
           # confere. Se alguem acrescentar assinatura RSA ao servidor, o gate
           # cai aqui em vez de a excecao envelhecer em silencio.
-          if ! grep -A1 '^#\[cfg(test)\]$' crates/heraclitus-compliance/src/lib.rs | grep -q 'mod test_pki;'; then
+          if ! tr -d '\r' < crates/heraclitus-compliance/src/lib.rs | grep -A1 '^#\[cfg(test)\]$' | grep -q 'mod test_pki;'; then
             echo "test_pki deixou de estar atras de #[cfg(test)]: chave privada RSA pode entrar em producao"
             exit 1
           fi
@@ -225,8 +225,8 @@ jobs:
   # target. Nunca podia passar: era vermelho por aritmética, não por defeito
   # encontrado — e um gate que nunca fica verde deixa de ser lido, que é a
   # única coisa pior do que não ter gate nenhum. O budget longo mudou-se para
-  # o job `fuzz-deep` do qualification-nightly, onde tem tempo a sério; aqui
-  # fica o passe de fumo que cabe no tempo e apanha a regressão óbvia por PR.
+  # o job `fuzz-deep` do qualification-nightly, onde tem tempo a serio; aqui
+  # fica o passe de fumo que cabe no tempo e apanha a regressão obvia por PR.
   fuzz:
     runs-on: ubuntu-latest
     timeout-minutes: 35

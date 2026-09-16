@@ -1,0 +1,31 @@
+name: Sandbox gRPC client package
+
+on:
+  push:
+    branches:
+      - gpt56/agent-security-observability
+    paths:
+      - .github/workflows/sandbox-grpc-sdk.yml
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Package generated Python gRPC client
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/heraclitusdb
+          cp sdk/python/heraclitusdb/heraclitus_pb2.py dist/heraclitusdb/
+          cp sdk/python/heraclitusdb/heraclitus_pb2_grpc.py dist/heraclitusdb/
+          cp sdk/python/heraclitusdb/__init__.py dist/heraclitusdb/ || true
+          git rev-parse HEAD > dist/COMMIT
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: heraclitus-grpc-python-client
+          path: dist/
+          retention-days: 1

@@ -1,0 +1,31 @@
+name: Sandbox source snapshot
+
+on:
+  push:
+    branches:
+      - gpt56/agent-security-observability
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact branch state
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+      - name: Record commit
+        run: git rev-parse HEAD > SANDBOX_SOURCE_COMMIT
+      - name: Upload source tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: heraclitus-source-sandbox
+          path: |
+            .
+            !.git/**
+          include-hidden-files: true
+          if-no-files-found: error
+          compression-level: 3
+          retention-days: 1

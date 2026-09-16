@@ -14,7 +14,7 @@
 //! O planeador de queries usa `lookup` para resolver `WHERE n.<campo> = "v"` sem
 //! varrer a janela (ver heraclitus-query::plan).
 
-use heraclitus_core::{CanonicalKeyCodec, Episode, HeraclitusError, Lsn};
+use heraclitus_core::{CanonicalKeyCodec, Episode, EventKind, HeraclitusError, Lsn};
 use heraclitus_views::View;
 use serde::{Deserialize, Serialize};
 use std::collections::{hash_map::RandomState, BTreeMap, HashMap};
@@ -1124,6 +1124,17 @@ impl View for AttrIndex {
     }
 
     fn apply(&mut self, lsn: Lsn, event: &Episode) {
+        // SPEC-0085: AgentEvidence is already durably indexed by its dedicated
+        // evidence plane. Duplicating its high-cardinality envelope into the
+        // generic AttrIndex lets a denied-action flood allocate RAM without
+        // gaining any application-query capability. Consume the LSN so boot
+        // does not replay it forever, but create no generic postings.
+        if matches!(&event.kind, EventKind::Custom(kind) if kind == "AgentEvidence") {
+            self.inner.watermark = self.inner.watermark.max(lsn);
+            self.inner.applied = true;
+            return;
+        }
+
         // Inserção ORDENADA com dedup por LSN (binary_search): torna o apply
         // idempotente (replay que sobrepõe o watermark re-entrega LSNs já
         // aplicados → skip) E tolerante a entregas fora de ordem (dois appends
@@ -1342,6 +1353,29 @@ mod tests {
         // do campo hoje), por isso conta os dois — e a unica grandeza aqui que
         // olha para alem de `ate`.
         assert_eq!(f.valores_total, 2);
+    }
+
+    #[test]
+    fn agent_evidence_only_advances_watermark_without_generic_postings() {
+        let mut idx = AttrIndex::new();
+        let mut e = Episode::new(
+            "hostile-agent",
+            EventKind::Custom("AgentEvidence".into()),
+            br#"{\"evidence_id\":\"synthetic\"}"#.to_vec(),
+        );
+        e.attrs
+            .insert("agent.evidence_id".into(), "unique-high-cardinality".into());
+        e.attrs.insert("agent.tool".into(), "exec".into());
+        idx.apply(77, &e);
+        assert_eq!(idx.watermark(), 77);
+        assert_eq!(
+            idx.keys(),
+            0,
+            "Agent evidence must stay out of generic AttrIndex"
+        );
+        assert!(idx.lookup("agent.tool", "exec").is_empty());
+        assert!(idx.lookup("_agent", "hostile-agent").is_empty());
+        assert!(idx.lookup("_kind", "AgentEvidence").is_empty());
     }
 
     #[test]

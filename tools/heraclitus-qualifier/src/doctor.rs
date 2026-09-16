@@ -18,6 +18,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use heraclitus_agent::config::{AgentBlackBoxConfig, AgentGatewayConfig};
 use serde::Serialize;
 use toml::Value;
 
@@ -131,7 +132,114 @@ const KNOWN_KEYS: &[&str] = &[
     "v6_lakehouse_interval_secs",
     "v6_lakehouse_path",
     "v6_lakehouse_table",
+    "agent_black_box",
+    "agent_gateway",
 ];
+
+const AGENT_BLACK_BOX_KEYS: &[&str] = &[
+    "enabled",
+    "capture_mode",
+    "tenant_id",
+    "max_body_bytes",
+    "otlp",
+    "mcp",
+    "redaction",
+    "evidence",
+    "console",
+    "limits",
+];
+const AGENT_OTLP_KEYS: &[&str] = &["http_addr", "grpc_addr", "require_auth"];
+const AGENT_MCP_KEYS: &[&str] = &["enabled", "listen_addr", "mode"];
+const AGENT_REDACTION_KEYS: &[&str] = &[
+    "profile",
+    "deny_headers",
+    "deny_fields",
+    "max_field_bytes",
+    "max_fields",
+];
+const AGENT_EVIDENCE_KEYS: &[&str] = &["rfc3161", "max_bundle_records"];
+const AGENT_CONSOLE_KEYS: &[&str] = &["enabled", "addr", "basic_auth"];
+const AGENT_LIMIT_KEYS: &[&str] = &[
+    "max_attributes",
+    "max_attribute_key_bytes",
+    "max_attribute_value_bytes",
+    "max_events_per_batch",
+    "max_body_bytes",
+    "max_queue_depth",
+];
+const AGENT_GATEWAY_KEYS: &[&str] = &[
+    "enabled",
+    "mode",
+    "listen_addr",
+    "upstream_url",
+    "identity",
+    "policy",
+    "approval",
+    "bypass_protection_configured",
+];
+const AGENT_IDENTITY_KEYS: &[&str] = &[
+    "mode",
+    "issuer",
+    "audience",
+    "jwks_path",
+    "roles_claim",
+    "clock_skew_seconds",
+];
+const AGENT_POLICY_KEYS: &[&str] = &["active", "default_decision"];
+const AGENT_APPROVAL_KEYS: &[&str] = &["default_ttl_seconds"];
+
+fn check_table_keys(findings: &mut Vec<Finding>, value: &Value, path: &str, allowed: &[&str]) {
+    let Some(table) = value.as_table() else {
+        findings.push(finding(
+            "configuration",
+            Severity::Blocking,
+            format!("{path} must be a TOML table"),
+            "use the documented table shape; scalar values do not configure this server surface",
+        ));
+        return;
+    };
+    let allowed = allowed.iter().copied().collect::<BTreeSet<_>>();
+    for key in table.keys() {
+        if !allowed.contains(key.as_str()) {
+            findings.push(finding(
+                "configuration",
+                Severity::Blocking,
+                format!("key {path}.{key} is not read by the server and has no effect"),
+                "remove the key or correct its spelling; nested agent configuration is checked recursively",
+            ));
+        }
+    }
+}
+
+fn check_agent_nested_keys(findings: &mut Vec<Finding>, config: &Value) {
+    if let Some(agent) = config.get("agent_black_box") {
+        check_table_keys(findings, agent, "agent_black_box", AGENT_BLACK_BOX_KEYS);
+        for (key, allowed) in [
+            ("otlp", AGENT_OTLP_KEYS),
+            ("mcp", AGENT_MCP_KEYS),
+            ("redaction", AGENT_REDACTION_KEYS),
+            ("evidence", AGENT_EVIDENCE_KEYS),
+            ("console", AGENT_CONSOLE_KEYS),
+            ("limits", AGENT_LIMIT_KEYS),
+        ] {
+            if let Some(value) = agent.get(key) {
+                check_table_keys(findings, value, &format!("agent_black_box.{key}"), allowed);
+            }
+        }
+    }
+    if let Some(gateway) = config.get("agent_gateway") {
+        check_table_keys(findings, gateway, "agent_gateway", AGENT_GATEWAY_KEYS);
+        for (key, allowed) in [
+            ("identity", AGENT_IDENTITY_KEYS),
+            ("policy", AGENT_POLICY_KEYS),
+            ("approval", AGENT_APPROVAL_KEYS),
+        ] {
+            if let Some(value) = gateway.get(key) {
+                check_table_keys(findings, value, &format!("agent_gateway.{key}"), allowed);
+            }
+        }
+    }
+}
 
 fn is_loopback_bind(address: &str) -> Option<bool> {
     let socket: SocketAddr = address.parse().ok()?;
@@ -189,6 +297,7 @@ pub fn diagnose(config: &Value, config_dir: &Path) -> Vec<Finding> {
             }
         }
     }
+    check_agent_nested_keys(&mut findings, config);
 
     // ---- TLS and mTLS -----------------------------------------------------
     let cert = string(config, "tls_cert_path");
@@ -332,6 +441,55 @@ pub fn diagnose(config: &Value, config_dir: &Path) -> Vec<Finding> {
                 "rest_cors_origins contains \"*\"; this REST surface has write routes".to_owned(),
                 "list exact origins, or serve panel and API from one origin",
             ));
+        }
+    }
+
+    // ---- Agent plane contract --------------------------------------------
+    // Unknown nested keys were rejected above before serde gets a chance to
+    // ignore them. Typed parsing here then reuses the server's semantic gates.
+    let core_auth_configured =
+        string(config, "rest_basic_auth").is_some() || token.is_some() || credentials > 0;
+    if let Some(raw) = config.get("agent_black_box") {
+        let parsed: Result<AgentBlackBoxConfig, _> = raw.clone().try_into();
+        match parsed {
+            Ok(agent) => {
+                if let Err(error) = agent.validate(production, tls_configured, core_auth_configured)
+                {
+                    findings.push(finding(
+                        "agent",
+                        Severity::Blocking,
+                        format!("agent_black_box is rejected by the server: {error}"),
+                        "make the Agent Black Box configuration satisfy the same production gates as heraclitus-server",
+                    ));
+                }
+            }
+            Err(error) => findings.push(finding(
+                "agent",
+                Severity::Blocking,
+                format!("agent_black_box cannot be parsed by the server: {error}"),
+                "fix the table types and values before qualification",
+            )),
+        }
+    }
+    if let Some(raw) = config.get("agent_gateway") {
+        let parsed: Result<AgentGatewayConfig, _> = raw.clone().try_into();
+        match parsed {
+            Ok(gateway) => {
+                if let Err(error) = gateway.validate(production, tls_configured) {
+                    findings.push(finding(
+                        "agent",
+                        Severity::Blocking,
+                        format!("agent_gateway is rejected by the server: {error}"),
+                        "make the Agent Policy Gateway configuration satisfy the server validation gates",
+                    ));
+                }
+            }
+            Err(error) => findings.push(finding(
+                "agent",
+                Severity::Blocking,
+                format!("agent_gateway cannot be parsed by the server: {error}"),
+                "fix the table types and values before qualification",
+            )),
         }
     }
 
@@ -756,6 +914,82 @@ mod tests {
         let report = run(&path).unwrap();
         assert!(report.safe_to_start, "{:#?}", report.findings);
         assert_eq!(report.blocking, 0);
+    }
+
+    #[test]
+    fn agent_black_box_e_gateway_sao_configuracao_real_nao_chaves_inertes() {
+        let findings = diagnose_text(
+            r#"
+[agent_black_box]
+enabled = true
+capture_mode = "metadata_only"
+[agent_black_box.otlp]
+http_addr = "127.0.0.1:4318"
+[agent_black_box.console]
+addr = "127.0.0.1:8080"
+
+[agent_gateway]
+enabled = true
+mode = "shadow"
+listen_addr = "127.0.0.1:8787"
+upstream_url = "http://127.0.0.1:9000"
+"#,
+        );
+        assert!(!has(
+            &findings,
+            Severity::Blocking,
+            "key \"agent_black_box\""
+        ));
+        assert!(!has(&findings, Severity::Blocking, "key \"agent_gateway\""));
+        assert!(!has(
+            &findings,
+            Severity::Blocking,
+            "agent_black_box is rejected"
+        ));
+        assert!(!has(
+            &findings,
+            Severity::Blocking,
+            "agent_gateway is rejected"
+        ));
+    }
+
+    #[test]
+    fn typo_dentro_da_configuracao_de_agente_e_blocking() {
+        let findings =
+            diagnose_text("[agent_black_box]\nenabled = true\ncapture_mod = \"metadata_only\"\n");
+        assert!(has(
+            &findings,
+            Severity::Blocking,
+            "agent_black_box.capture_mod"
+        ));
+    }
+
+    #[test]
+    fn gateway_enforce_de_producao_sem_bypass_e_recusado_com_a_mesma_semantica_do_servidor() {
+        let findings = diagnose_text(
+            r#"
+production_mode = true
+tls_cert_path = "missing-cert.pem"
+tls_key_path = "missing-key.pem"
+rest_basic_auth = "operator:secret"
+[agent_gateway]
+enabled = true
+mode = "enforce"
+listen_addr = "127.0.0.1:8787"
+upstream_url = "https://mcp.example"
+bypass_protection_configured = false
+[agent_gateway.identity]
+mode = "oidc"
+issuer = "https://id.example"
+audience = "heraclitus"
+jwks_path = "/tmp/jwks.json"
+"#,
+        );
+        assert!(has(
+            &findings,
+            Severity::Blocking,
+            "bypass_protection_configured"
+        ));
     }
 
     #[test]

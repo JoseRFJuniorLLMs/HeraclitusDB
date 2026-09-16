@@ -22,10 +22,18 @@ use serde_json::Value;
 /// Descodifica um lote OTLP/JSON.
 pub fn decode_traces_json(bytes: &[u8]) -> Result<TracesData, OtlpError> {
     let root: Value = serde_json::from_slice(bytes).map_err(|e| OtlpError::Json(e.to_string()))?;
-    let arr = pick(&root, "resourceSpans", "resource_spans")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    if !root.is_object() {
+        return Err(OtlpError::Json(
+            "OTLP/JSON top-level must be an object".to_string(),
+        ));
+    }
+    let arr = match pick(&root, "resourceSpans", "resource_spans") {
+        None => Vec::new(),
+        Some(v) => v
+            .as_array()
+            .cloned()
+            .ok_or_else(|| OtlpError::Json("resourceSpans must be an array".to_string()))?,
+    };
     Ok(TracesData {
         resource_spans: arr.iter().map(resource_spans).collect(),
     })
@@ -308,6 +316,14 @@ mod tests {
     #[test]
     fn json_invalido_e_erro_e_nao_panico() {
         assert!(decode_traces_json(b"{nao e json").is_err());
+    }
+
+    #[test]
+    fn top_level_otlp_json_tem_de_ser_objeto() {
+        assert!(decode_traces_json(b"[]").is_err());
+        assert!(decode_traces_json(b"null").is_err());
+        assert!(decode_traces_json(br#"{"resourceSpans":{}}"#).is_err());
+        assert!(decode_traces_json(b"{}").is_ok());
     }
 
     #[test]

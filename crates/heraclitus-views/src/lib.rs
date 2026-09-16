@@ -9,7 +9,7 @@
 //! planned optimization; correctness never depends on them, because the
 //! recovery story is *always* "rebuild from LSN 0".
 
-use heraclitus_core::{Episode, HeraclitusError, Lsn};
+use heraclitus_core::{Episode, EventKind, HeraclitusError, Lsn};
 use heraclitus_log::EpisodeLog;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -62,6 +62,13 @@ pub mod ckpt {
 }
 
 /// A materialized view over the log.
+fn is_agent_evidence(event: &Episode) -> bool {
+    matches!(&event.kind, EventKind::Custom(kind) if kind == "AgentEvidence")
+}
+
+/// AgentEvidence is canonical security-plane data. It remains in HRKL and is
+/// projected by the dedicated Agent APIs; generic views intentionally ignore
+/// it so a denied-action flood cannot become graph/text/activation RAM growth.
 pub trait View: Send + Sync {
     fn name(&self) -> &str;
     /// Apply one event. MUST be deterministic in (lsn, event).
@@ -162,7 +169,7 @@ impl ViewRegistry {
 
     /// Apply one live tail event to every view sem alocações no hot path.
     pub fn apply(&mut self, lsn: Lsn, event: &Episode) {
-        if heraclitus_log::vm_bridge::is_hvm(event) {
+        if heraclitus_log::vm_bridge::is_hvm(event) || is_agent_evidence(event) {
             return;
         }
         for (i, v) in self.views.iter_mut().enumerate() {
@@ -312,7 +319,7 @@ impl ViewRegistry {
             }
             let last = batch.last().unwrap().0;
             for (lsn, ep) in &batch {
-                if heraclitus_log::vm_bridge::is_hvm(ep) {
+                if heraclitus_log::vm_bridge::is_hvm(ep) || is_agent_evidence(ep) {
                     continue;
                 }
                 for (i, v) in self.views.iter_mut().enumerate() {
@@ -389,7 +396,7 @@ impl ViewRegistry {
                 break;
             };
             for (lsn, ep) in &batch {
-                if heraclitus_log::vm_bridge::is_hvm(ep) {
+                if heraclitus_log::vm_bridge::is_hvm(ep) || is_agent_evidence(ep) {
                     continue;
                 }
                 for (i, v) in self.views.iter_mut().enumerate() {
