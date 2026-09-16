@@ -1,0 +1,61 @@
+name: SPEC-0085 typed approval binding
+on:
+  push:
+    branches: [gpt56/agent-security-observability]
+    paths: [.github/workflows/spec-0085-typed-approval-binding.yml]
+permissions:
+  contents: write
+jobs:
+  harden:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: gpt56/agent-security-observability
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
+      - name: Patch typed approval binding
+        shell: python
+        run: |
+          from pathlib import Path
+          p=Path('crates/heraclitus-agent/src/mcp.rs')
+          s=p.read_text()
+          old='''    /// Argumentos tipados extraídos de `params.arguments`, achatados.\n    pub arguments: BTreeMap<String, String>,\n    /// Identificadores de efeito externo'''
+          new='''    /// Argumentos para policy/preview, achatados para strings. Mantemos esta\n    /// projecção por compatibilidade com as policies existentes.\n    pub arguments: BTreeMap<String, String>,\n    /// Representação canónica TIPADA dos mesmos argumentos, exclusivamente\n    /// para authorization binding. JSON string `"75000"` e JSON number `75000`\n    /// têm de produzir digests diferentes, mesmo que a policy os projecte para\n    /// a mesma string.\n    pub binding_arguments: BTreeMap<String, String>,\n    /// Identificadores de efeito externo'''
+          assert old in s
+          s=s.replace(old,new,1)
+          old2='''                    for (k, val) in args {\n                        facts.arguments.insert(k.clone(), flatten(val));\n                    }'''
+          new2='''                    for (k, val) in args {\n                        facts.arguments.insert(k.clone(), flatten(val));\n                        facts.binding_arguments.insert(\n                            k.clone(),\n                            serde_json::to_string(val).unwrap_or_else(|_| "null".to_string()),\n                        );\n                    }'''
+          assert old2 in s
+          s=s.replace(old2,new2,1)
+          marker='''    #[test]\n    fn corpo_json_rpc_prevalece_sobre_headers_de_classificacao() {'''
+          test='''    #[test]\n    fn binding_preserva_tipo_json_mesmo_quando_policy_achata() {\n        let mut a = McpExchange::default();\n        a.request_body = Some(br#"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"send_payment\",\"arguments\":{\"amount\":75000}}}"#.to_vec());\n        let mut b = McpExchange::default();\n        b.request_body = Some(br#"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"send_payment\",\"arguments\":{\"amount\":\"75000\"}}}"#.to_vec());\n        let fa = extract_facts(&a);\n        let fb = extract_facts(&b);\n        assert_eq!(fa.arguments.get("amount"), fb.arguments.get("amount"));\n        assert_ne!(fa.binding_arguments.get("amount"), fb.binding_arguments.get("amount"));\n    }\n\n'''+marker
+          assert marker in s
+          s=s.replace(marker,test,1)
+          p.write_text(s)
+
+          g=Path('crates/heraclitus-agent-gateway/src/gateway.rs')
+          s=g.read_text()
+          old='''    let args = facts.arguments.clone();\n    let digest = argument_digest(&args);'''
+          new='''    let args = facts.arguments.clone();\n    // Authorization binding preserva o tipo JSON; policy e preview continuam\n    // a usar a projecção textual compatível com policies existentes.\n    let digest = argument_digest(&facts.binding_arguments);'''
+          assert old in s
+          s=s.replace(old,new,1)
+          g.write_text(s)
+      - name: Format and focused qualification
+        run: |
+          cargo fmt --all
+          cargo test -p heraclitus-agent mcp::tests --all-features
+          cargo test -p heraclitus-agent-gateway --test gateway_end_to_end --all-features
+          cargo test -p heraclitus-agent-gateway --all-features
+          cargo clippy -p heraclitus-agent -p heraclitus-agent-gateway --all-targets --all-features -- -D warnings
+      - name: Commit fix and remove one-shot workflow
+        run: |
+          git config user.name 'GPT-5.6 Sol'
+          git config user.email 'actions@users.noreply.github.com'
+          git add crates/heraclitus-agent/src/mcp.rs crates/heraclitus-agent-gateway/src/gateway.rs
+          git rm .github/workflows/spec-0085-typed-approval-binding.yml
+          git commit -m 'fix(spec-0085): bind approvals to typed JSON arguments'
+          git push origin HEAD:gpt56/agent-security-observability
