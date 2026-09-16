@@ -1,0 +1,27 @@
+name: Retry v3.0.0 supply chain
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/dispatch-v3-supply-chain-retry.yml
+
+permissions:
+  actions: write
+  contents: read
+
+# One-shot dispatcher. Removed as soon as the official tagged run starts.
+jobs:
+  dispatch:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Retry official supply-chain against exact v3.0.0 tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run release-supply-chain.yml \
+            --repo JoseRFJuniorLLMs/HeraclitusDB \
+            --ref v3.0.0 \
+            -f release_version=v3.0.0
