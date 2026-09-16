@@ -1,9 +1,9 @@
 use super::http::{derive_url_with_port, fetch_json, fetch_text, probe_port};
 use super::model::{
     baseline_from, evaluate_alarms, extract_watermarks, parse_agent, parse_compliance, parse_raft,
-    parse_redteam, parse_sentinel, parse_storage, u64_at, ActiveTabCompat, AgentSnapshot,
-    AlarmBaseline, AlarmBook, AlarmInputs, ComplianceSnapshot, IndexSnapshot, RaftSnapshot,
-    RedTeamSnapshot, SentinelSnapshot, StorageSnapshot,
+    parse_redteam, parse_sentinel, parse_storage, u64_at, AgentSnapshot, AlarmBaseline, AlarmBook,
+    AlarmInputs, ComplianceSnapshot, IndexSnapshot, RaftSnapshot, RedTeamSnapshot, SentinelSnapshot,
+    StorageSnapshot,
 };
 use super::render;
 use crossterm::{
