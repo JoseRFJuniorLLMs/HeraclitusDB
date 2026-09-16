@@ -13,7 +13,7 @@
 services:
   heraclitus:
     # Para usar uma imagem publicada em vez de construir:
-    #   image: ghcr.io/joserfjuniorllms/heraclitus:2.0.0
+    #   image: ghcr.io/joserfjuniorllms/heraclitus:3.0.0
     build:
       context: ../..
       dockerfile: Dockerfile

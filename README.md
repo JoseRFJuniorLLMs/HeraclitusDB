@@ -14,7 +14,7 @@ criptograficamente verificável.
 
 <p align="center">
   <a href="#️-licença-e-modelo-comercial"><img src="https://img.shields.io/badge/license-BSL%201.1-blue" alt="BSL 1.1"></a>
-  <img src="https://img.shields.io/badge/version-v2.0.0-brightgreen" alt="v2.0.0">
+  <img src="https://img.shields.io/badge/version-v3.0.0-brightgreen" alt="v3.0.0">
   <img src="https://img.shields.io/badge/core-Rust%20stable%202021-orange" alt="Rust stable">
   <img src="https://img.shields.io/badge/history-append--only-informational" alt="append-only">
   <img src="https://img.shields.io/badge/integrity-Merkle%20%2B%20RFC3161-success" alt="tamper-evident">
