@@ -50,6 +50,7 @@ const SENTINEL_REFRESH: Duration = Duration::from_secs(2);
 const GRPC_PROBE_REFRESH: Duration = Duration::from_secs(5);
 const STATE_REFRESH: Duration = Duration::from_secs(10);
 const COMPLIANCE_REFRESH: Duration = Duration::from_secs(30);
+const REDTEAM_REFRESH: Duration = Duration::from_secs(1);
 
 struct TerminalGuard;
 
@@ -218,6 +219,34 @@ struct RaftSnapshot {
     peers: Option<u64>,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Default, Clone)]
+struct RedTeamEvent {
+    observed_at_unix_nanos: u64,
+    attack_id: String,
+    campaign_id: String,
+    vector: String,
+    target: String,
+    phase: String,
+    result: String,
+    reason_code: String,
+    blocked: bool,
+    upstream_delta: i64,
+    transport_status: Option<u16>,
+    lsn: Option<u64>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct RedTeamSnapshot {
+    available: bool,
+    total_probes: u64,
+    blocked: u64,
+    reached_upstream: u64,
+    active_campaign: String,
+    last_attack_lsn: Option<u64>,
+    events: Vec<RedTeamEvent>,
+}
+
 #[derive(Debug, Clone)]
 struct BackgroundTask {
     id: String,
@@ -280,12 +309,19 @@ struct AppState {
     last_sentinel_poll: Option<Instant>,
     last_compliance_poll: Option<Instant>,
     last_grpc_probe: Option<Instant>,
+    last_redteam_poll: Option<Instant>,
+
+    agent_url: String,
+    redteam: RedTeamSnapshot,
 
     selected_task_index: usize,
 }
 
 impl AppState {
     fn new(target_url: String, auth: String, interval_sec: f64) -> Self {
+        let agent_url = env::var("HERACLITUS_AGENT_URL")
+            .unwrap_or_else(|_| derive_agent_url(&target_url));
+
         Self {
             active_tab: ActiveTab::Overview,
             paused: false,
@@ -321,6 +357,7 @@ impl AppState {
             sentinel: SentinelSnapshot::default(),
             compliance: ComplianceSnapshot::default(),
             raft: RaftSnapshot::default(),
+            redteam: RedTeamSnapshot::default(),
 
             grpc_reachable: None,
             grpc_probe_latency_ms: None,
@@ -329,6 +366,9 @@ impl AppState {
             last_sentinel_poll: None,
             last_compliance_poll: None,
             last_grpc_probe: None,
+            last_redteam_poll: None,
+
+            agent_url,
 
             selected_task_index: 0,
         }
@@ -386,6 +426,11 @@ impl AppState {
             self.poll_compliance();
         }
 
+        if should_poll(self.last_redteam_poll, REDTEAM_REFRESH, now) {
+            self.last_redteam_poll = Some(now);
+            self.poll_redteam();
+        }
+
         let task_count = self.background_tasks().len();
         if task_count == 0 {
             self.selected_task_index = 0;
@@ -399,6 +444,7 @@ impl AppState {
         self.last_sentinel_poll = None;
         self.last_compliance_poll = None;
         self.last_grpc_probe = None;
+        self.last_redteam_poll = None;
         self.update_fast();
     }
 
@@ -490,6 +536,21 @@ impl AppState {
             Err(_) => {
                 self.grpc_reachable = Some(false);
                 self.grpc_probe_latency_ms = None;
+            }
+        }
+    }
+
+    fn poll_redteam(&mut self) {
+        let mut target = self.agent_url.clone();
+        let mut auth = self.auth.clone();
+        match fetch_json_with_fallback(&mut target, &mut auth, "/api/v1/agent/red-team/events?limit=50") {
+            Ok((value, _)) => self.redteam = parse_redteam(&value),
+            Err(_) => {
+                let mut empty_auth = String::new();
+                match fetch_json_with_fallback(&mut target, &mut empty_auth, "/api/v1/agent/red-team/events?limit=50") {
+                    Ok((value, _)) => self.redteam = parse_redteam(&value),
+                    Err(_) => self.redteam.available = false,
+                }
             }
         }
     }
@@ -629,6 +690,36 @@ impl AppState {
                     "DEGRADED" | "CATCHINGUP" | "CATCHING_UP" => Severity::Warning,
                     "CRITICAL" => Severity::Critical,
                     _ => Severity::Neutral,
+                },
+            });
+        }
+
+        if self.redteam.available {
+            let state = if self.redteam.reached_upstream > 0 {
+                "LEAK_DETECTED"
+            } else if self.redteam.blocked > 0 {
+                "DEFENDED"
+            } else {
+                "OBSERVING"
+            };
+            tasks.push(BackgroundTask {
+                id: "REDT".into(),
+                kind: "RED TEAM PROBES".into(),
+                state: state.into(),
+                progress: format!("{}/{} blocked", self.redteam.blocked, self.redteam.total_probes),
+                throughput: "N/D".into(),
+                detail: format!(
+                    "campaign={} leaks={} last_lsn={}",
+                    self.redteam.active_campaign,
+                    self.redteam.reached_upstream,
+                    self.redteam.last_attack_lsn.map(|n| n.to_string()).unwrap_or_else(|| "none".into())
+                ),
+                severity: if self.redteam.reached_upstream > 0 {
+                    Severity::Critical
+                } else if self.redteam.blocked > 0 {
+                    Severity::Good
+                } else {
+                    Severity::Neutral
                 },
             });
         }
@@ -1496,10 +1587,19 @@ fn render_raft(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
 }
 
 fn render_security(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(14), Constraint::Min(8)])
+        .split(area);
+
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
+        .constraints([
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+        ])
+        .split(vertical[0]);
 
     let sentinel = if app.sentinel.available {
         Paragraph::new(vec![
@@ -1539,15 +1639,6 @@ fn render_security(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
                 },
             ),
             kv_line(
-                "Queue overflows",
-                format_number(app.sentinel.queue_overflow_total),
-                if app.sentinel.queue_overflow_total == 0 {
-                    Color::Green
-                } else {
-                    Color::Red
-                },
-            ),
-            kv_line(
                 "Processed",
                 format_number(app.sentinel.events_processed_total),
                 Color::Green,
@@ -1568,44 +1659,12 @@ fn render_security(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
                 Color::Red,
             ),
             kv_line(
-                "Normalization errors",
-                format_number(app.sentinel.normalization_errors_total),
-                if app.sentinel.normalization_errors_total == 0 {
-                    Color::Green
-                } else {
-                    Color::Red
-                },
-            ),
-            kv_line(
-                "Incident capacity drops",
-                format_number(app.sentinel.incident_capacity_drops_total),
-                if app.sentinel.incident_capacity_drops_total == 0 {
-                    Color::Green
-                } else {
-                    Color::Red
-                },
-            ),
-            kv_line(
-                "L0 latency",
-                format!("{} µs", app.sentinel.l0_latency_us),
-                Color::Gray,
-            ),
-            kv_line(
-                "L1/L2/L3",
+                "L0/L1/L2",
                 format!(
-                    "{}/{}/{} ms",
+                    "{}µs / {}ms / {}ms",
+                    app.sentinel.l0_latency_us,
                     app.sentinel.l1_latency_ms,
-                    app.sentinel.l2_latency_ms,
-                    app.sentinel.l3_latency_ms
-                ),
-                Color::Gray,
-            ),
-            kv_line(
-                "Boot",
-                format!(
-                    "{} ({} ms)",
-                    value_or_nd(&app.sentinel.boot_outcome),
-                    app.sentinel.boot_total_ms
+                    app.sentinel.l2_latency_ms
                 ),
                 Color::Gray,
             ),
@@ -1661,15 +1720,6 @@ fn render_security(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
                 },
             ),
             kv_line(
-                "Anchor forks",
-                format_number(app.compliance.deferred_anchor_forks),
-                if app.compliance.deferred_anchor_forks == 0 {
-                    Color::Green
-                } else {
-                    Color::Red
-                },
-            ),
-            kv_line(
                 "Deadlines overdue",
                 format!(
                     "{} / {}",
@@ -1682,16 +1732,6 @@ fn render_security(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
                 },
             ),
             kv_line(
-                "Due 24h/48h/72h",
-                format!(
-                    "{}/{}/{}",
-                    app.compliance.deadline_24h,
-                    app.compliance.deadline_48h,
-                    app.compliance.deadline_72h
-                ),
-                Color::Yellow,
-            ),
-            kv_line(
                 "ANPD pending",
                 format_number(app.compliance.pending_anpd),
                 Color::Yellow,
@@ -1702,18 +1742,12 @@ fn render_security(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
                 Color::Yellow,
             ),
             kv_line(
-                "Retention exceptions",
-                format_number(app.compliance.retention_exceptions),
-                Color::Gray,
-            ),
-            kv_line(
                 "Policy versions",
                 format_number(app.compliance.active_policy_versions),
                 Color::Gray,
             ),
-            Line::from(""),
             Line::from(Span::styled(
-                truncate(&app.compliance.trust_notice, 110),
+                truncate(&app.compliance.trust_notice, 40),
                 Style::default().fg(Color::DarkGray),
             )),
         ])
@@ -1725,6 +1759,199 @@ fn render_security(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
             .style(Style::default().fg(Color::DarkGray))
     };
     frame.render_widget(compliance, columns[1]);
+
+    let redteam_widget = if app.redteam.available {
+        let (status_text, status_color) = if app.redteam.reached_upstream > 0 {
+            ("VULNERABILIDADE DETECTADA", Color::Red)
+        } else if app.redteam.total_probes > 0 && app.redteam.blocked > 0 {
+            ("RESILIENTE / DEFENDED", Color::Green)
+        } else {
+            ("EM OBSERVAÇÃO", Color::Cyan)
+        };
+
+        Paragraph::new(vec![
+            title_line("RED TEAM & ADVERSARIAL"),
+            Line::from(""),
+            kv_line("Status de Defesa", status_text, status_color),
+            kv_line(
+                "Campanha ativa",
+                value_or_nd(&app.redteam.active_campaign),
+                Color::Cyan,
+            ),
+            kv_line(
+                "Probes registrados",
+                format_number(app.redteam.total_probes),
+                Color::Yellow,
+            ),
+            kv_line(
+                "Bloqueados (Defesa)",
+                format_number(app.redteam.blocked),
+                Color::Green,
+            ),
+            kv_line(
+                "Vazaram p/ Upstream",
+                format_number(app.redteam.reached_upstream),
+                if app.redteam.reached_upstream == 0 {
+                    Color::Green
+                } else {
+                    Color::Red
+                },
+            ),
+            kv_line(
+                "Último LSN gravado",
+                app.redteam
+                    .last_attack_lsn
+                    .map(format_number)
+                    .unwrap_or_else(|| "N/D".into()),
+                Color::Cyan,
+            ),
+            kv_line(
+                "Agent Gateway",
+                truncate(&app.agent_url, 26),
+                Color::Gray,
+            ),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Telemetria integrada de probes do laboratório em tempo real.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" RED TEAM RESILIENCE "),
+        )
+        .wrap(Wrap { trim: false })
+    } else {
+        Paragraph::new(vec![
+            title_line("RED TEAM & ADVERSARIAL"),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("Aguardando Agent Gateway em {}", app.agent_url),
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "GET /api/v1/agent/red-team/events",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "Aguardando sondas ou execuções do laboratório...",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" RED TEAM RESILIENCE "),
+        )
+        .wrap(Wrap { trim: false })
+    };
+    frame.render_widget(redteam_widget, columns[2]);
+
+    let attack_header = Row::new([
+        "HORA",
+        "ATTACK ID",
+        "CAMPANHA",
+        "VETOR",
+        "ALVO",
+        "RESULTADO",
+        "BLOQUEADO",
+        "UPSTREAM Δ",
+        "LSN",
+    ])
+    .style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )
+    .bottom_margin(1);
+
+    let attack_rows: Vec<Row> = if app.redteam.events.is_empty() {
+        let msg = if app.redteam.available {
+            "Aguardando execução de testes de invasão pelo runner...".to_string()
+        } else {
+            "Agent Gateway (/api/v1/agent/red-team/events) ainda não consultado ou sem eventos".to_string()
+        };
+        vec![Row::new(vec![
+            "—".to_string(),
+            "—".to_string(),
+            "—".to_string(),
+            msg,
+            "—".to_string(),
+            "—".to_string(),
+            "—".to_string(),
+            "—".to_string(),
+            "—".to_string(),
+        ])
+        .style(Style::default().fg(Color::DarkGray))]
+    } else {
+        app.redteam
+            .events
+            .iter()
+            .take(30)
+            .map(|e| {
+                let time_str = format_unix_nanos_time(e.observed_at_unix_nanos);
+                let (res_color, res_text) = if e.upstream_delta > 0 {
+                    (Color::Red, format!("LEAK ({})", e.result))
+                } else if e.blocked || e.result == "PASS" {
+                    (Color::Green, e.result.clone())
+                } else if e.result == "FAIL" {
+                    (Color::Red, e.result.clone())
+                } else {
+                    (Color::Yellow, e.result.clone())
+                };
+
+                let blocked_str = if e.blocked { "SIM".to_string() } else { "não".to_string() };
+                let upstream_str = if e.upstream_delta > 0 {
+                    format!("+{}", e.upstream_delta)
+                } else {
+                    "0 (clean)".to_string()
+                };
+
+                let lsn_str = e
+                    .lsn
+                    .map(|v| format_number(v))
+                    .unwrap_or_else(|| "N/D".to_string());
+
+                Row::new(vec![
+                    time_str,
+                    truncate(&e.attack_id, 12).to_string(),
+                    truncate(&e.campaign_id, 12).to_string(),
+                    truncate(&e.vector, 28).to_string(),
+                    truncate(&e.target, 24).to_string(),
+                    res_text,
+                    blocked_str,
+                    upstream_str,
+                    lsn_str,
+                ])
+                .style(Style::default().fg(res_color))
+            })
+            .collect()
+    };
+
+    let attacks_table = Table::new(
+        attack_rows,
+        [
+            Constraint::Length(9),  // HORA
+            Constraint::Length(12), // ATTACK ID
+            Constraint::Length(12), // CAMPANHA
+            Constraint::Length(28), // VETOR
+            Constraint::Length(24), // ALVO
+            Constraint::Length(12), // RESULTADO
+            Constraint::Length(10), // BLOQUEADO
+            Constraint::Length(12), // UPSTREAM Δ
+            Constraint::Length(10), // LSN
+        ],
+    )
+    .header(attack_header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" SONDAS DE INVASÃO / ADVERSARIAL ATTACKS (TEMPO REAL) "),
+    );
+
+    frame.render_widget(attacks_table, vertical[1]);
 }
 
 fn render_indexes(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
@@ -2358,6 +2585,82 @@ fn parse_raft(value: &Value) -> RaftSnapshot {
                 .and_then(Value::as_array)
                 .map(|members| members.len() as u64)
         }),
+    }
+}
+
+fn derive_agent_url(target_url: &str) -> String {
+    if let Ok(authority) = http_authority(target_url) {
+        let host = authority_host(&authority);
+        if host.contains(':') && !host.starts_with('[') {
+            format!("http://[{host}]:8080")
+        } else {
+            format!("http://{host}:8080")
+        }
+    } else {
+        "http://127.0.0.1:8080".to_string()
+    }
+}
+
+fn format_unix_nanos_time(nanos: u64) -> String {
+    let secs = nanos / 1_000_000_000;
+    if secs == 0 {
+        return "—".into();
+    }
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    format!("{h:02}:{m:02}:{s:02}")
+}
+
+fn parse_redteam(value: &Value) -> RedTeamSnapshot {
+    let events_arr = value.get("events").and_then(Value::as_array);
+    let summary = value.get("summary");
+
+    let mut events = Vec::new();
+    if let Some(arr) = events_arr {
+        for item in arr {
+            events.push(RedTeamEvent {
+                observed_at_unix_nanos: u64_at(item, "observed_at_unix_nanos").unwrap_or(0),
+                attack_id: string_at(item, "attack_id").unwrap_or_else(|| "—".into()),
+                campaign_id: string_at(item, "campaign_id").unwrap_or_else(|| "manual".into()),
+                vector: string_at(item, "vector").unwrap_or_else(|| "—".into()),
+                target: string_at(item, "target").unwrap_or_else(|| "—".into()),
+                phase: string_at(item, "phase").unwrap_or_else(|| "result".into()),
+                result: string_at(item, "result").unwrap_or_else(|| "—".into()),
+                reason_code: string_at(item, "reason_code").unwrap_or_default(),
+                blocked: item.get("blocked").and_then(Value::as_bool).unwrap_or(false),
+                upstream_delta: item.get("upstream_delta").and_then(Value::as_i64).unwrap_or(0),
+                transport_status: item.get("transport_status").and_then(Value::as_u64).map(|v| v as u16),
+                lsn: item.get("lsn").and_then(Value::as_u64),
+            });
+        }
+    }
+
+    let total_probes = summary
+        .and_then(|s| u64_at(s, "returned"))
+        .unwrap_or(events.len() as u64);
+    let blocked = summary
+        .and_then(|s| u64_at(s, "blocked"))
+        .unwrap_or_else(|| events.iter().filter(|e| e.blocked).count() as u64);
+    let reached_upstream = summary
+        .and_then(|s| u64_at(s, "reached_upstream"))
+        .unwrap_or_else(|| events.iter().filter(|e| e.upstream_delta > 0).count() as u64);
+
+    let active_campaign = events
+        .first()
+        .map(|e| e.campaign_id.clone())
+        .unwrap_or_else(|| "nenhuma".into());
+
+    let last_attack_lsn = events.first().and_then(|e| e.lsn);
+
+    RedTeamSnapshot {
+        available: true,
+        total_probes,
+        blocked,
+        reached_upstream,
+        active_campaign,
+        last_attack_lsn,
+        events,
     }
 }
 
