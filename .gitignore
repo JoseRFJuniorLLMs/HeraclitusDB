@@ -65,3 +65,5 @@ config.carga.toml
 # Binarios de release construidos localmente (o WSL escreve-os aqui). Nunca
 # entram no git: um binario de 16 MB fica na historia para sempre.
 /release/
+.antigravity/
+

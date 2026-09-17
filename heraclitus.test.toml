@@ -1,0 +1,21 @@
+﻿data_dir = "/tmp/heraclitus-test-data"
+grpc_addr = "127.0.0.1:7474"
+rest_addr = "127.0.0.1:7475"
+
+[agent_black_box]
+enabled = true
+capture_mode = "metadata_only"
+
+[agent_black_box.console]
+enabled = true
+addr = "127.0.0.1:8080"
+
+[agent_black_box.otlp]
+http_addr = "127.0.0.1:4318"
+grpc_addr = "127.0.0.1:4317"
+
+[agent_gateway]
+enabled = true
+mode = "shadow"
+listen_addr = "127.0.0.1:9000"
+upstream_url = "http://127.0.0.1:19000"
