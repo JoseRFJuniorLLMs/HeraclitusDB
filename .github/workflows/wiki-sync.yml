@@ -1,0 +1,69 @@
+name: Sync GitHub Wiki
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "docs/wiki/**"
+      - ".github/workflows/wiki-sync.yml"
+  gollum:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: heraclitus-wiki-sync
+  cancel-in-progress: true
+
+jobs:
+  sync-wiki:
+    name: Publish docs/wiki to GitHub Wiki
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Publish Wiki
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WIKI_URL: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.wiki.git
+        run: |
+          set -euo pipefail
+
+          echo "Synchronizing docs/wiki -> ${{ github.repository }} Wiki"
+
+          if ! git clone "$WIKI_URL" /tmp/heraclitus-wiki; then
+            echo "::error::The GitHub Wiki backend has not been initialized yet."
+            echo "::error::Open the repository Wiki tab, create the first page once, and save it."
+            echo "::error::That first save will trigger this workflow again through the gollum event."
+            exit 1
+          fi
+
+          cd /tmp/heraclitus-wiki
+
+          # Mirror the versioned documentation into the native GitHub Wiki.
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -a "$GITHUB_WORKSPACE/docs/wiki/." .
+
+          # GitHub Wiki expects Home.md for the landing page.
+          test -f Home.md
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "Wiki is already synchronized."
+            exit 0
+          fi
+
+          git commit -m "docs(wiki): sync from main@${GITHUB_SHA::12}"
+          git push origin HEAD
+
+          echo "Wiki published successfully."
