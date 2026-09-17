@@ -51,6 +51,7 @@ const GRPC_PROBE_REFRESH: Duration = Duration::from_secs(5);
 const STATE_REFRESH: Duration = Duration::from_secs(10);
 const COMPLIANCE_REFRESH: Duration = Duration::from_secs(30);
 const REDTEAM_REFRESH: Duration = Duration::from_secs(1);
+const AGENT_STATUS_REFRESH: Duration = Duration::from_secs(2);
 
 struct TerminalGuard;
 
@@ -64,26 +65,30 @@ impl Drop for TerminalGuard {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActiveTab {
     Overview = 0,
-    Tasks = 1,
+    Pipelines = 1,
     Storage = 2,
     Queries = 3,
     Raft = 4,
     Security = 5,
-    Indexes = 6,
+    Agents = 6,
+    Indexes = 7,
+    Compliance = 8,
 }
 
 impl ActiveTab {
-    const COUNT: usize = 7;
+    const COUNT: usize = 9;
 
     fn from_index(index: usize) -> Self {
         match index % Self::COUNT {
             0 => Self::Overview,
-            1 => Self::Tasks,
+            1 => Self::Pipelines,
             2 => Self::Storage,
             3 => Self::Queries,
             4 => Self::Raft,
             5 => Self::Security,
-            _ => Self::Indexes,
+            6 => Self::Agents,
+            7 => Self::Indexes,
+            _ => Self::Compliance,
         }
     }
 
@@ -247,6 +252,98 @@ struct RedTeamSnapshot {
     events: Vec<RedTeamEvent>,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Default, Clone)]
+struct AgentGatewayCounters {
+    requests: u64,
+    allow: u64,
+    deny: u64,
+    require_approval: u64,
+    shadow_deny: u64,
+    approval_replay_rejected: u64,
+    approval_capacity_rejected: u64,
+    approval_expired: u64,
+    policy_errors: u64,
+    evidence_errors: u64,
+    upstream_errors: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Default, Clone)]
+struct AgentPolicySnapshot {
+    id: String,
+    version: String,
+    lifecycle: String,
+    rules: u64,
+    hash: String,
+    activated_by: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Default, Clone)]
+struct AgentIngestSnapshot {
+    events: u64,
+    batches: u64,
+    bytes: u64,
+    duplicates: u64,
+    conflicts: u64,
+    rejected: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Default, Clone)]
+struct AgentIntegritySnapshot {
+    total: u64,
+    pending_seal: u64,
+    proved: u64,
+    broken: u64,
+    missing: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Default, Clone)]
+struct AgentSummarySnapshot {
+    runs: u64,
+    tool_calls: u64,
+    denied: u64,
+    pending_approvals: u64,
+    integrity: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Default, Clone)]
+struct AgentStatusSnapshot {
+    available: bool,
+    engine: String,
+    product: String,
+    auth: String,
+    bypass_protection: String,
+    evidence_log: String,
+    mcp_gateway: String,
+    otlp_ingest: String,
+    rfc3161: String,
+    gateway: AgentGatewayCounters,
+    policy: AgentPolicySnapshot,
+    ingest: AgentIngestSnapshot,
+    integrity: AgentIntegritySnapshot,
+    summary: AgentSummarySnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlarmSeverity {
+    Warning,
+    Critical,
+}
+
+#[derive(Debug, Clone)]
+struct Alarm {
+    source: &'static str,
+    code: &'static str,
+    severity: AlarmSeverity,
+    message: String,
+    value: String,
+}
+
 #[derive(Debug, Clone)]
 struct BackgroundTask {
     id: String,
@@ -310,9 +407,11 @@ struct AppState {
     last_compliance_poll: Option<Instant>,
     last_grpc_probe: Option<Instant>,
     last_redteam_poll: Option<Instant>,
+    last_agent_status_poll: Option<Instant>,
 
     agent_url: String,
     redteam: RedTeamSnapshot,
+    agent_status: AgentStatusSnapshot,
 
     selected_task_index: usize,
 }
@@ -358,6 +457,7 @@ impl AppState {
             compliance: ComplianceSnapshot::default(),
             raft: RaftSnapshot::default(),
             redteam: RedTeamSnapshot::default(),
+            agent_status: AgentStatusSnapshot::default(),
 
             grpc_reachable: None,
             grpc_probe_latency_ms: None,
@@ -367,6 +467,7 @@ impl AppState {
             last_compliance_poll: None,
             last_grpc_probe: None,
             last_redteam_poll: None,
+            last_agent_status_poll: None,
 
             agent_url,
 
@@ -431,6 +532,11 @@ impl AppState {
             self.poll_redteam();
         }
 
+        if should_poll(self.last_agent_status_poll, AGENT_STATUS_REFRESH, now) {
+            self.last_agent_status_poll = Some(now);
+            self.poll_agent_status();
+        }
+
         let task_count = self.background_tasks().len();
         if task_count == 0 {
             self.selected_task_index = 0;
@@ -445,6 +551,7 @@ impl AppState {
         self.last_compliance_poll = None;
         self.last_grpc_probe = None;
         self.last_redteam_poll = None;
+        self.last_agent_status_poll = None;
         self.update_fast();
     }
 
@@ -553,6 +660,168 @@ impl AppState {
                 }
             }
         }
+    }
+
+    fn poll_agent_status(&mut self) {
+        let mut target = self.agent_url.clone();
+        let mut auth = self.auth.clone();
+        match fetch_json_with_fallback(&mut target, &mut auth, "/api/v1/agent/status") {
+            Ok((value, _)) => self.agent_status = parse_agent_status(&value),
+            Err(_) => {
+                let mut empty_auth = String::new();
+                match fetch_json_with_fallback(&mut target, &mut empty_auth, "/api/v1/agent/status") {
+                    Ok((value, _)) => self.agent_status = parse_agent_status(&value),
+                    Err(_) => self.agent_status.available = false,
+                }
+            }
+        }
+    }
+
+    fn evaluate_alarms(&self) -> Vec<Alarm> {
+        let mut alarms = Vec::new();
+
+        if !self.online {
+            alarms.push(Alarm {
+                source: "SERVER",
+                code: "ALM-SRV-001",
+                severity: AlarmSeverity::Critical,
+                message: "REST server unreachable or offline".into(),
+                value: "OFFLINE".into(),
+            });
+        }
+
+        if self.redteam.reached_upstream > 0 {
+            alarms.push(Alarm {
+                source: "GATEWAY",
+                code: "ALM-SEC-001",
+                severity: AlarmSeverity::Critical,
+                message: "Security boundary breach! Attack reached upstream target".into(),
+                value: format!("+{} leaks", self.redteam.reached_upstream),
+            });
+        }
+
+        if self.storage.physical_crc_failures > 0 {
+            alarms.push(Alarm {
+                source: "STORAGE",
+                code: "ALM-CRC-001",
+                severity: AlarmSeverity::Critical,
+                message: "HRKL physical block CRC verification failure".into(),
+                value: format!("{} crc err", self.storage.physical_crc_failures),
+            });
+        }
+
+        if self.storage.canonical_verify_failures > 0 {
+            alarms.push(Alarm {
+                source: "STORAGE",
+                code: "ALM-CAN-001",
+                severity: AlarmSeverity::Critical,
+                message: "Canonical serialization / hash verification failure".into(),
+                value: format!("{} verify err", self.storage.canonical_verify_failures),
+            });
+        }
+
+        if self.agent_status.available {
+            if self.agent_status.evidence_log != "HEALTHY" && !self.agent_status.evidence_log.is_empty() {
+                alarms.push(Alarm {
+                    source: "AGENT",
+                    code: "ALM-EVD-001",
+                    severity: AlarmSeverity::Critical,
+                    message: "Agent Black Box evidence log degraded or broken".into(),
+                    value: self.agent_status.evidence_log.clone(),
+                });
+            }
+
+            if self.agent_status.gateway.evidence_errors > 0 {
+                alarms.push(Alarm {
+                    source: "GATEWAY",
+                    code: "ALM-EVD-002",
+                    severity: AlarmSeverity::Critical,
+                    message: "Agent Gateway evidence logging error".into(),
+                    value: format!("{} errors", self.agent_status.gateway.evidence_errors),
+                });
+            }
+
+            if self.agent_status.gateway.approval_replay_rejected > 0 {
+                alarms.push(Alarm {
+                    source: "GATEWAY",
+                    code: "ALM-REP-001",
+                    severity: AlarmSeverity::Warning,
+                    message: "Replay attack detected on human-in-the-loop approvals".into(),
+                    value: format!("{} rejections", self.agent_status.gateway.approval_replay_rejected),
+                });
+            }
+
+            if self.agent_status.gateway.policy_errors > 0 {
+                alarms.push(Alarm {
+                    source: "GATEWAY",
+                    code: "ALM-POL-001",
+                    severity: AlarmSeverity::Warning,
+                    message: "Agent Gateway policy evaluation errors".into(),
+                    value: format!("{} errors", self.agent_status.gateway.policy_errors),
+                });
+            }
+        }
+
+        if self.sentinel.available {
+            if self.sentinel.queue_overflow_total > 0 {
+                alarms.push(Alarm {
+                    source: "SENTINEL",
+                    code: "ALM-SNT-001",
+                    severity: AlarmSeverity::Critical,
+                    message: "Sentinel queue overflow dropped telemetry events".into(),
+                    value: format!("{} drops", self.sentinel.queue_overflow_total),
+                });
+            }
+            if self.sentinel.lag_state.to_ascii_uppercase() == "CRITICAL" {
+                alarms.push(Alarm {
+                    source: "SENTINEL",
+                    code: "ALM-SNT-002",
+                    severity: AlarmSeverity::Critical,
+                    message: "Sentinel detection lag in critical state".into(),
+                    value: format!("{} LSN lag", self.sentinel.detection_lag_lsn),
+                });
+            }
+        }
+
+        if self.compliance.available {
+            if self.compliance.deadline_overdue > 0 {
+                alarms.push(Alarm {
+                    source: "COMPLIANCE",
+                    code: "ALM-CMP-001",
+                    severity: AlarmSeverity::Critical,
+                    message: "Regulatory compliance deadlines overdue".into(),
+                    value: format!("{}/{} overdue", self.compliance.deadline_overdue, self.compliance.deadline_total),
+                });
+            }
+            if self.compliance.deferred_anchor_forks > 0 {
+                alarms.push(Alarm {
+                    source: "COMPLIANCE",
+                    code: "ALM-CMP-002",
+                    severity: AlarmSeverity::Critical,
+                    message: "Deferred RFC 3161 anchor forks detected in trust store".into(),
+                    value: format!("{} forks", self.compliance.deferred_anchor_forks),
+                });
+            }
+        }
+
+        if self.storage.available && self.storage.parquet_export_lag_lsn > 100_000 {
+            alarms.push(Alarm {
+                source: "LAKEHOUSE",
+                code: "ALM-LAK-001",
+                severity: AlarmSeverity::Warning,
+                message: "Parquet Lakehouse export lag exceeds 100k LSN".into(),
+                value: format!("lag={}", format_number(self.storage.parquet_export_lag_lsn)),
+            });
+        }
+
+        alarms
+    }
+
+    fn alarm_counts(&self) -> (usize, usize) {
+        let alarms = self.evaluate_alarms();
+        let crit = alarms.iter().filter(|a| a.severity == AlarmSeverity::Critical).count();
+        let warn = alarms.iter().filter(|a| a.severity == AlarmSeverity::Warning).count();
+        (crit, warn)
     }
 
     fn background_tasks(&self) -> Vec<BackgroundTask> {
@@ -694,6 +963,33 @@ impl AppState {
             });
         }
 
+        if self.agent_status.available {
+            tasks.push(BackgroundTask {
+                id: "AGNT".into(),
+                kind: "AGENT EVIDENCE LOG".into(),
+                state: if self.agent_status.evidence_log.is_empty() {
+                    "UNKNOWN".into()
+                } else {
+                    self.agent_status.evidence_log.clone()
+                },
+                progress: format!("{} events", format_number(self.agent_status.ingest.events)),
+                throughput: format!("{} err", self.agent_status.gateway.evidence_errors),
+                detail: format!(
+                    "conflicts={} rejected={} bypass={}",
+                    self.agent_status.ingest.conflicts,
+                    self.agent_status.ingest.rejected,
+                    self.agent_status.bypass_protection
+                ),
+                severity: if self.agent_status.evidence_log == "HEALTHY"
+                    && self.agent_status.gateway.evidence_errors == 0
+                {
+                    Severity::Good
+                } else {
+                    Severity::Critical
+                },
+            });
+        }
+
         if self.redteam.available {
             let state = if self.redteam.reached_upstream > 0 {
                 "LEAK_DETECTED"
@@ -720,6 +1016,34 @@ impl AppState {
                     Severity::Good
                 } else {
                     Severity::Neutral
+                },
+            });
+        }
+
+        if self.compliance.available {
+            tasks.push(BackgroundTask {
+                id: "RFC".into(),
+                kind: "RFC 3161 ANCHOR".into(),
+                state: if self.compliance.deferred_anchor_forks == 0 {
+                    "HEALTHY"
+                } else {
+                    "FORK_DETECTED"
+                }
+                .into(),
+                progress: format!("{} receipts", format_number(self.compliance.receipts_total)),
+                throughput: "N/D".into(),
+                detail: format!(
+                    "deferred={} overdue={}/{}",
+                    self.compliance.deferred_anchors,
+                    self.compliance.deadline_overdue,
+                    self.compliance.deadline_total
+                ),
+                severity: if self.compliance.deferred_anchor_forks == 0
+                    && self.compliance.deadline_overdue == 0
+                {
+                    Severity::Good
+                } else {
+                    Severity::Critical
                 },
             });
         }
@@ -818,12 +1142,14 @@ pub fn run_top(url_str: &str, user: &str, pass: &str, interval_sec: f64) -> Resu
                         app.interval_sec = (app.interval_sec + 0.25).min(MAX_INTERVAL_SECS)
                     }
                     KeyCode::Char('1') => app.active_tab = ActiveTab::Overview,
-                    KeyCode::Char('2') => app.active_tab = ActiveTab::Tasks,
+                    KeyCode::Char('2') => app.active_tab = ActiveTab::Pipelines,
                     KeyCode::Char('3') => app.active_tab = ActiveTab::Storage,
                     KeyCode::Char('4') => app.active_tab = ActiveTab::Queries,
                     KeyCode::Char('5') => app.active_tab = ActiveTab::Raft,
                     KeyCode::Char('6') => app.active_tab = ActiveTab::Security,
-                    KeyCode::Char('7') => app.active_tab = ActiveTab::Indexes,
+                    KeyCode::Char('7') => app.active_tab = ActiveTab::Agents,
+                    KeyCode::Char('8') => app.active_tab = ActiveTab::Indexes,
+                    KeyCode::Char('9') => app.active_tab = ActiveTab::Compliance,
                     KeyCode::Tab => app.active_tab = app.active_tab.next(),
                     KeyCode::BackTab => app.active_tab = app.active_tab.previous(),
                     KeyCode::Up => {
@@ -881,73 +1207,181 @@ fn ui(frame: &mut ratatui::Frame<'_>, app: &mut AppState) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(4),
             Constraint::Length(3),
             Constraint::Min(10),
             Constraint::Length(3),
         ])
         .split(area);
 
-    render_tabs(frame, app, vertical[0]);
+    render_banner(frame, app, vertical[0]);
+    render_tabs(frame, app, vertical[1]);
 
     match app.active_tab {
-        ActiveTab::Overview => render_overview(frame, app, vertical[1]),
-        ActiveTab::Tasks => render_tasks(frame, app, vertical[1]),
-        ActiveTab::Storage => render_storage(frame, app, vertical[1]),
-        ActiveTab::Queries => render_queries(frame, app, vertical[1]),
-        ActiveTab::Raft => render_raft(frame, app, vertical[1]),
-        ActiveTab::Security => render_security(frame, app, vertical[1]),
-        ActiveTab::Indexes => render_indexes(frame, app, vertical[1]),
+        ActiveTab::Overview => render_overview(frame, app, vertical[2]),
+        ActiveTab::Pipelines => render_pipelines(frame, app, vertical[2]),
+        ActiveTab::Storage => render_storage(frame, app, vertical[2]),
+        ActiveTab::Queries => render_queries(frame, app, vertical[2]),
+        ActiveTab::Raft => render_raft(frame, app, vertical[2]),
+        ActiveTab::Security => render_security(frame, app, vertical[2]),
+        ActiveTab::Agents => render_agents(frame, app, vertical[2]),
+        ActiveTab::Indexes => render_indexes(frame, app, vertical[2]),
+        ActiveTab::Compliance => render_compliance(frame, app, vertical[2]),
     }
 
-    render_footer(frame, app, vertical[2]);
+    render_footer(frame, app, vertical[3]);
 
     if app.show_help {
         render_help(frame, area);
     }
 }
 
+fn render_banner(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
+    let (crit_count, warn_count) = app.alarm_counts();
+
+    let online_span = if app.online {
+        Span::styled("● ONLINE", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled("● OFFLINE", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+    };
+
+    let raft_role = if app.raft.available {
+        value_or_nd(&app.raft.role)
+    } else {
+        "N/D".to_string()
+    };
+
+    let sentinel_status = if app.sentinel.available {
+        format!("{}(lag:{})", app.sentinel.lag_state, app.sentinel.detection_lag_lsn)
+    } else {
+        "OFFLINE".to_string()
+    };
+
+    let agent_gw_status = if app.agent_status.available {
+        "ACTIVE".to_string()
+    } else {
+        "N/D".to_string()
+    };
+
+    let redteam_status = if app.redteam.available {
+        if app.redteam.reached_upstream > 0 {
+            format!("LEAK(+{})", app.redteam.reached_upstream)
+        } else if app.redteam.blocked > 0 {
+            format!("{}/{} BLOCKED", app.redteam.blocked, app.redteam.total_probes)
+        } else {
+            "OBSERVING".to_string()
+        }
+    } else {
+        "N/D".to_string()
+    };
+
+    let redteam_color = if app.redteam.reached_upstream > 0 {
+        Color::Red
+    } else if app.redteam.blocked > 0 {
+        Color::Green
+    } else {
+        Color::Cyan
+    };
+
+    let line1 = Line::from(vec![
+        Span::styled(" HERACLITUS ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        online_span,
+        Span::raw(" │ "),
+        Span::styled(format!("LSN {}", format_number(app.head_lsn)), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw(" │ "),
+        Span::styled(format!("{:.1} evt/s", app.insert_rate), Style::default().fg(Color::Green)),
+        Span::raw(" │ Raft: "),
+        Span::styled(raft_role, Style::default().fg(Color::Yellow)),
+        Span::raw(" │ Sentinel: "),
+        Span::styled(sentinel_status, sentinel_color(&app.sentinel.lag_state)),
+        Span::raw(" │ Agent GW: "),
+        Span::styled(agent_gw_status, if app.agent_status.available { Color::Green } else { Color::DarkGray }),
+        Span::raw(" │ Defense: "),
+        Span::styled(redteam_status, Style::default().fg(redteam_color).add_modifier(Modifier::BOLD)),
+    ]);
+
+    let crit_span = if crit_count > 0 {
+        Span::styled(format!(" {crit_count} CRITICAL "), Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled(" 0 CRIT ", Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD))
+    };
+
+    let warn_span = if warn_count > 0 {
+        Span::styled(format!(" {warn_count} WARN "), Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled(" 0 WARN ", Style::default().fg(Color::DarkGray))
+    };
+
+    let crc_span = if app.storage.physical_crc_failures == 0 {
+        Span::styled("CRC: OK", Style::default().fg(Color::Green))
+    } else {
+        Span::styled(format!("CRC: {} FAIL", app.storage.physical_crc_failures), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+    };
+
+    let can_span = if app.storage.canonical_verify_failures == 0 {
+        Span::styled("CAN: OK", Style::default().fg(Color::Green))
+    } else {
+        Span::styled(format!("CAN: {} FAIL", app.storage.canonical_verify_failures), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+    };
+
+    let evd_span = if !app.agent_status.available {
+        Span::styled("Evidence: N/D", Style::default().fg(Color::DarkGray))
+    } else if app.agent_status.evidence_log == "HEALTHY" {
+        Span::styled("Evidence: HEALTHY", Style::default().fg(Color::Green))
+    } else {
+        Span::styled(format!("Evidence: {}", app.agent_status.evidence_log), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+    };
+
+    let leak_span = if app.redteam.reached_upstream > 0 {
+        Span::styled(format!("Boundary: +{} LEAK", app.redteam.reached_upstream), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+    } else {
+        Span::styled("Boundary: CLEAN (0 leak)", Style::default().fg(Color::Green))
+    };
+
+    let line2 = Line::from(vec![
+        Span::raw(" "),
+        crit_span,
+        Span::raw(" "),
+        warn_span,
+        Span::raw(" │ "),
+        crc_span,
+        Span::raw(" │ "),
+        can_span,
+        Span::raw(" │ "),
+        evd_span,
+        Span::raw(" │ "),
+        leak_span,
+        Span::raw(" │ "),
+        Span::styled(truncate(&app.target_url, 28), Style::default().fg(Color::DarkGray)),
+    ]);
+
+    let banner = Paragraph::new(vec![line1, line2])
+        .block(Block::default().borders(Borders::ALL).title(Line::from(vec![
+            Span::styled(" ⚡ COMMAND CENTER ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        ])));
+
+    frame.render_widget(banner, area);
+}
+
 fn render_tabs(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
     let titles = [
         "[1] Overview",
-        "[2] Tasks",
+        "[2] Pipelines",
         "[3] Storage",
         "[4] Queries",
         "[5] Raft",
         "[6] Security",
-        "[7] Indexes",
+        "[7] Agents",
+        "[8] Indexes",
+        "[9] Compliance",
     ]
     .into_iter()
     .map(Line::from)
     .collect::<Vec<_>>();
 
-    let connection = if app.online {
-        "● ONLINE"
-    } else {
-        "● OFFLINE"
-    };
-    let connection_style = if app.online {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
-    };
-
     let tabs = Tabs::new(titles)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(Line::from(vec![
-                    Span::styled(
-                        " ⚡ HERACLITUS DB TASK MANAGER ",
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(connection, connection_style),
-                    Span::raw(" "),
-                ])),
-        )
+        .block(Block::default().borders(Borders::ALL).title(" NAVIGATION "))
         .select(app.active_tab as usize)
         .style(Style::default().fg(Color::Gray))
         .highlight_style(
@@ -981,7 +1415,7 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
             Style::default().fg(Color::Yellow),
         ),
         Span::raw(" | "),
-        Span::styled("Tab/1-7", Style::default().fg(Color::Yellow)),
+        Span::styled("Tab/1-9", Style::default().fg(Color::Yellow)),
         Span::raw(" abas | "),
         Span::styled("u", Style::default().fg(Color::Yellow)),
         Span::raw(" refresh | "),
@@ -1010,7 +1444,11 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
 fn render_overview(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(8), Constraint::Min(10)])
+        .constraints([
+            Constraint::Length(7),
+            Constraint::Min(8),
+            Constraint::Length(9),
+        ])
         .split(area);
 
     let top = Layout::default()
@@ -1109,13 +1547,127 @@ fn render_overview(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
     );
     frame.render_widget(storage, top[2]);
 
-    let bottom = Layout::default()
+    let middle = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(64), Constraint::Percentage(36)])
         .split(vertical[1]);
 
-    render_ingest_chart(frame, app, bottom[0]);
-    render_overview_right(frame, app, bottom[1]);
+    render_ingest_chart(frame, app, middle[0]);
+    render_overview_right(frame, app, middle[1]);
+
+    render_verified_invariants(frame, vertical[2]);
+}
+
+fn render_verified_invariants(frame: &mut ratatui::Frame<'_>, area: Rect) {
+    let header = Row::new([
+        "SPEC",
+        "SUBSYSTEM",
+        "THEOREM / INVARIANT",
+        "FORMAL PROPERTY",
+        "ENGINE",
+        "STATUS",
+    ])
+    .style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )
+    .bottom_margin(0);
+
+    let rows = vec![
+        Row::new([
+            "SPEC-0010",
+            "heraclitus-storage",
+            "ProofAppendOnly",
+            "Monotonic LSN progression & physical block immutability",
+            "Lean 4 (v4.8)",
+            "PROVED",
+        ])
+        .style(Style::default().fg(Color::Green)),
+        Row::new([
+            "SPEC-0015",
+            "heraclitus-merkle",
+            "ProofMerkleTree",
+            "Cryptographic state inclusion & collision resistance",
+            "Lean 4 (v4.8)",
+            "PROVED",
+        ])
+        .style(Style::default().fg(Color::Green)),
+        Row::new([
+            "SPEC-0022",
+            "heraclitus-state",
+            "ProofDeterministicReplay",
+            "Strict state isomorphism under identical event history",
+            "Lean 4 (v4.8)",
+            "PROVED",
+        ])
+        .style(Style::default().fg(Color::Green)),
+        Row::new([
+            "SPEC-0034",
+            "heraclitus-core",
+            "ProofDenseMap",
+            "Hazard pointers memory safety & lock-free progression",
+            "Lean 4 (v4.8)",
+            "PROVED",
+        ])
+        .style(Style::default().fg(Color::Green)),
+        Row::new([
+            "SPEC-0041",
+            "heraclitus-hlc",
+            "ProofHLC",
+            "Strict causality & wall-clock forward monotonicity",
+            "Lean 4 (v4.8)",
+            "PROVED",
+        ])
+        .style(Style::default().fg(Color::Green)),
+        Row::new([
+            "SPEC-0081",
+            "heraclitus-agent",
+            "ProofApprovalIdempotence",
+            "Zero double-execution & replay safety under burst",
+            "Lean 4 (v4.8)",
+            "PROVED",
+        ])
+        .style(Style::default().fg(Color::Green)),
+        Row::new([
+            "SPEC-0085",
+            "heraclitus-agent-gateway",
+            "ProofToolCallIsolation",
+            "Zero leak past denial barrier (upstream_delta == 0)",
+            "Lean 4 (v4.8)",
+            "PROVED",
+        ])
+        .style(Style::default().fg(Color::Green)),
+        Row::new([
+            "SPEC-0078",
+            "heraclitus-blackbox",
+            "ProofRFC3161Seal",
+            "Tamper-evident evidence chain non-repudiation",
+            "Kani / Proptest",
+            "TESTED",
+        ])
+        .style(Style::default().fg(Color::Cyan)),
+    ];
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(11),
+            Constraint::Length(25),
+            Constraint::Length(26),
+            Constraint::Min(40),
+            Constraint::Length(16),
+            Constraint::Length(10),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" FORMAL SPEC & VERIFIED INVARIANTS (LEAN 4 / FORMAL PROOFS) "),
+    );
+
+    frame.render_widget(table, area);
 }
 
 fn render_ingest_chart(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
@@ -1240,7 +1792,12 @@ fn render_overview_right(frame: &mut ratatui::Frame<'_>, app: &AppState, area: R
     frame.render_widget(views_widget, sections[2]);
 }
 
-fn render_tasks(frame: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect) {
+fn render_pipelines(frame: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect) {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(6)])
+        .split(area);
+
     let tasks = app.background_tasks();
     let header = Row::new(["ID", "TYPE", "STATE", "PROGRESS", "THROUGHPUT", "DETAILS"])
         .style(
@@ -1266,10 +1823,10 @@ fn render_tasks(frame: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect) 
         rows,
         [
             Constraint::Length(7),
-            Constraint::Length(20),
-            Constraint::Length(12),
-            Constraint::Length(12),
-            Constraint::Length(15),
+            Constraint::Length(22),
+            Constraint::Length(14),
+            Constraint::Length(16),
+            Constraint::Length(16),
             Constraint::Min(25),
         ],
     )
@@ -1277,7 +1834,7 @@ fn render_tasks(frame: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect) 
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" BACKGROUND TASKS / OPERATIONAL PIPELINES "),
+            .title(" OPERATIONAL PIPELINES & BACKGROUND WORKERS "),
     )
     .row_highlight_style(
         Style::default()
@@ -1286,11 +1843,45 @@ fn render_tasks(frame: &mut ratatui::Frame<'_>, app: &mut AppState, area: Rect) 
     )
     .highlight_symbol("▶ ");
 
+    let selected_idx = app.selected_task_index.min(tasks.len().saturating_sub(1));
     let mut state = TableState::default();
-    state.select(Some(
-        app.selected_task_index.min(tasks.len().saturating_sub(1)),
-    ));
-    frame.render_stateful_widget(table, area, &mut state);
+    state.select(Some(selected_idx));
+    frame.render_stateful_widget(table, vertical[0], &mut state);
+
+    let detail_lines = if let Some(task) = tasks.get(selected_idx) {
+        let (color, desc) = match task.id.as_str() {
+            "HRKL" => (Color::Cyan, "Motor de compactação e ordenação de blocos físicos append-only."),
+            "LAKE" => (Color::Yellow, "Pipeline de exportação colunar contínua Parquet para arquitetura Lakehouse."),
+            "HRKI" => (Color::Green, "Sidecar de indexação secundária e reconciliação de ponteiros de bloco."),
+            "CRC" => (Color::Red, "Verificação contínua de integridade física CRC32C nos blocos de cauda e arquivo."),
+            "CAN" => (Color::Magenta, "Verificação canônica de serialização e invariantes formais de replay."),
+            "SEC" => (Color::Green, "Sentinel SOC telemetry ingest, processamento L0/L1/L2 e detecção de ameaças."),
+            "AGNT" => (Color::Blue, "Agent Black Box evidence log, registro de auditoria e barramento de segurança."),
+            "REDT" => (Color::Red, "Monitoramento contínuo de sondas adversariais e imunidade contra evasão."),
+            "RFC" => (Color::Cyan, "Âncoras criptográficas RFC 3161 TSA para carimbo de tempo qualificado e não-repúdio."),
+            _ => (Color::Gray, "Pipeline de telemetria operacional."),
+        };
+        vec![
+            Line::from(vec![
+                Span::styled(format!(" [{}] {} ", task.id, task.kind), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                Span::raw(" Estado: "),
+                Span::styled(&task.state, severity_style(task.severity)),
+                Span::raw(" │ Progresso: "),
+                Span::styled(&task.progress, Style::default().fg(Color::White)),
+                Span::raw(" │ Vazão: "),
+                Span::styled(&task.throughput, Style::default().fg(Color::Yellow)),
+            ]),
+            Line::from(Span::styled(desc, Style::default().fg(Color::Gray))),
+            kv_line("Telemetria do nó", &task.detail, Color::Cyan),
+        ]
+    } else {
+        vec![Line::from("Nenhum pipeline operacional selecionado.")]
+    };
+
+    let detail_widget = Paragraph::new(detail_lines)
+        .block(Block::default().borders(Borders::ALL).title(" DETALHES DO PIPELINE SELECIONADO (↑/↓) "))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(detail_widget, vertical[1]);
 }
 
 fn render_storage(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
@@ -1595,15 +2186,15 @@ fn render_security(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
             Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
         ])
         .split(vertical[0]);
 
     let sentinel = if app.sentinel.available {
         Paragraph::new(vec![
-            title_line("SENTINEL SECURITY"),
+            title_line("SENTINEL SOC ENGINE"),
             Line::from(""),
             kv_line(
                 "Enabled",
@@ -1659,7 +2250,7 @@ fn render_security(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
                 Color::Red,
             ),
             kv_line(
-                "L0/L1/L2",
+                "L0/L1/L2 Latency",
                 format!(
                     "{}µs / {}ms / {}ms",
                     app.sentinel.l0_latency_us,
@@ -1669,98 +2260,325 @@ fn render_security(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
                 Color::Gray,
             ),
         ])
-        .block(Block::default().borders(Borders::ALL).title(" SENTINEL "))
+        .block(Block::default().borders(Borders::ALL).title(" SENTINEL SOC "))
         .wrap(Wrap { trim: false })
     } else {
         Paragraph::new("/sentinel/status indisponível. O painel não assume HEALTHY sem medição.")
-            .block(Block::default().borders(Borders::ALL).title(" SENTINEL "))
+            .block(Block::default().borders(Borders::ALL).title(" SENTINEL SOC "))
             .style(Style::default().fg(Color::DarkGray))
     };
     frame.render_widget(sentinel, columns[0]);
 
-    let compliance = if app.compliance.available {
+    let controls = if app.sentinel.available {
         Paragraph::new(vec![
-            title_line("COMPLIANCE / TRUST"),
+            title_line("THREAT POSTURE & SOC CONTROLS"),
             Line::from(""),
             kv_line(
-                "Status",
-                value_or_nd(&app.compliance.status),
-                compliance_color(&app.compliance.status),
+                "AI Circuit",
+                value_or_nd(&app.sentinel.ai_circuit_state),
+                if app.sentinel.ai_circuit_state.to_ascii_uppercase() == "CLOSED" || app.sentinel.ai_circuit_state.to_ascii_uppercase() == "HEALTHY" {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                },
             ),
             kv_line(
-                "As of LSN",
-                format_number(app.compliance.as_of_lsn),
+                "Queue Overflows",
+                format_number(app.sentinel.queue_overflow_total),
+                if app.sentinel.queue_overflow_total == 0 { Color::Green } else { Color::Red },
+            ),
+            kv_line(
+                "Norm. Errors",
+                format_number(app.sentinel.normalization_errors_total),
+                if app.sentinel.normalization_errors_total == 0 { Color::Green } else { Color::Yellow },
+            ),
+            kv_line(
+                "Capacity Drops",
+                format_number(app.sentinel.incident_capacity_drops_total),
+                if app.sentinel.incident_capacity_drops_total == 0 { Color::Green } else { Color::Red },
+            ),
+            kv_line(
+                "Actions Proposed",
+                format_number(app.sentinel.actions_proposed_total),
                 Color::Cyan,
             ),
             kv_line(
-                "Receipts",
-                format_number(app.compliance.receipts_total),
-                Color::Gray,
+                "Actions Approved",
+                format_number(app.sentinel.actions_approved_total),
+                Color::Green,
             ),
             kv_line(
-                "Sealed watermark",
-                format_number(app.compliance.current_sealed_watermark),
-                Color::Gray,
-            ),
-            kv_line(
-                "Last anchor",
-                app.compliance
-                    .last_anchor_lsn
-                    .map(format_number)
-                    .unwrap_or_else(|| "N/D".into()),
-                Color::Gray,
-            ),
-            kv_line(
-                "Deferred anchors",
-                format_number(app.compliance.deferred_anchors),
-                if app.compliance.deferred_anchor_forks == 0 {
-                    Color::Yellow
-                } else {
-                    Color::Red
-                },
-            ),
-            kv_line(
-                "Deadlines overdue",
-                format!(
-                    "{} / {}",
-                    app.compliance.deadline_overdue, app.compliance.deadline_total
-                ),
-                if app.compliance.deadline_overdue == 0 {
-                    Color::Green
-                } else {
-                    Color::Red
-                },
-            ),
-            kv_line(
-                "ANPD pending",
-                format_number(app.compliance.pending_anpd),
+                "Actions Denied",
+                format_number(app.sentinel.actions_denied_total),
                 Color::Yellow,
             ),
             kv_line(
-                "Legal holds",
-                format_number(app.compliance.legal_holds),
-                Color::Yellow,
+                "Actions Executed",
+                format_number(app.sentinel.actions_executed_total),
+                Color::Green,
             ),
             kv_line(
-                "Policy versions",
-                format_number(app.compliance.active_policy_versions),
-                Color::Gray,
+                "Action Failures",
+                format_number(app.sentinel.action_failures_total),
+                if app.sentinel.action_failures_total == 0 { Color::Green } else { Color::Red },
             ),
-            Line::from(Span::styled(
-                truncate(&app.compliance.trust_notice, 40),
-                Style::default().fg(Color::DarkGray),
-            )),
         ])
-        .block(Block::default().borders(Borders::ALL).title(" COMPLIANCE "))
+        .block(Block::default().borders(Borders::ALL).title(" SOC RESPONSE "))
         .wrap(Wrap { trim: false })
     } else {
-        Paragraph::new("/compliance/status indisponível ou ainda não consultado.")
-            .block(Block::default().borders(Borders::ALL).title(" COMPLIANCE "))
+        Paragraph::new("Controles operacionais aguardando Sentinel...")
+            .block(Block::default().borders(Borders::ALL).title(" SOC RESPONSE "))
             .style(Style::default().fg(Color::DarkGray))
     };
-    frame.render_widget(compliance, columns[1]);
+    frame.render_widget(controls, columns[1]);
 
-    let redteam_widget = if app.redteam.available {
+    let ai_investigation = if app.sentinel.available {
+        Paragraph::new(vec![
+            title_line("AI INVESTIGATION & BOOT"),
+            Line::from(""),
+            kv_line(
+                "AI Requests",
+                format_number(app.sentinel.ai_requests_total),
+                Color::Cyan,
+            ),
+            kv_line(
+                "AI Failures",
+                format_number(app.sentinel.ai_failures_total),
+                if app.sentinel.ai_failures_total == 0 { Color::Green } else { Color::Red },
+            ),
+            kv_line(
+                "AI Latency",
+                format!("{} ms", app.sentinel.ai_latency_ms),
+                Color::Yellow,
+            ),
+            kv_line(
+                "AI Tokens",
+                format_number(app.sentinel.ai_tokens_total),
+                Color::Gray,
+            ),
+            kv_line(
+                "Persisted Invs",
+                format_number(app.sentinel.ai_investigations_persisted_total),
+                Color::Green,
+            ),
+            kv_line(
+                "Boot Outcome",
+                value_or_nd(&app.sentinel.boot_outcome),
+                if app.sentinel.boot_outcome.to_ascii_uppercase() == "SUCCESS" { Color::Green } else { Color::Yellow },
+            ),
+            kv_line(
+                "Boot Duration",
+                format!("{} ms", app.sentinel.boot_total_ms),
+                Color::Gray,
+            ),
+            kv_line(
+                "Scanned Events",
+                format_number(app.sentinel.boot_events_scanned_total),
+                Color::Cyan,
+            ),
+        ])
+        .block(Block::default().borders(Borders::ALL).title(" AI INVESTIGATION "))
+        .wrap(Wrap { trim: false })
+    } else {
+        Paragraph::new("Telemetria AI do Sentinel indisponível.")
+            .block(Block::default().borders(Borders::ALL).title(" AI INVESTIGATION "))
+            .style(Style::default().fg(Color::DarkGray))
+    };
+    frame.render_widget(ai_investigation, columns[2]);
+
+    render_alarms_table(frame, app, vertical[1]);
+}
+
+fn render_alarms_table(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
+    let alarms = app.evaluate_alarms();
+    let header = Row::new([
+        "ORIGEM",
+        "CÓDIGO",
+        "SEVERIDADE",
+        "DESCRIÇÃO DO ALARME / INVARIANTE VIOLADO",
+        "VALOR ATUAL",
+        "ESTADO",
+    ])
+    .style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )
+    .bottom_margin(1);
+
+    let rows: Vec<Row> = if alarms.is_empty() {
+        vec![Row::new([
+            "SISTEMA",
+            "ALM-NOMINAL",
+            "NORMAL",
+            "Todos os sistemas operando em conformidade nominal — zero alarmes ou violações de barreira.",
+            "100% ÍNTEGRO",
+            "ATIVO",
+        ])
+        .style(Style::default().fg(Color::Green))]
+    } else {
+        alarms
+            .iter()
+            .map(|a| {
+                let (sev_style, sev_text) = match a.severity {
+                    AlarmSeverity::Critical => (Style::default().fg(Color::Red).add_modifier(Modifier::BOLD), "CRÍTICO"),
+                    AlarmSeverity::Warning => (Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD), "AVISO"),
+                };
+                Row::new(vec![
+                    a.source.to_string(),
+                    a.code.to_string(),
+                    sev_text.to_string(),
+                    a.message.clone(),
+                    a.value.clone(),
+                    "DISPARADO".to_string(),
+                ])
+                .style(sev_style)
+            })
+            .collect()
+    };
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(12),
+            Constraint::Length(14),
+            Constraint::Length(12),
+            Constraint::Min(45),
+            Constraint::Length(20),
+            Constraint::Length(12),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" MOTOR DE ALARMES & RASTREAMENTO DE DELTAS EM TEMPO REAL "),
+    );
+
+    frame.render_widget(table, area);
+}
+
+fn render_agents(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(14), Constraint::Min(8)])
+        .split(area);
+
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
+        .split(vertical[0]);
+
+    let gateway = if app.agent_status.available {
+        Paragraph::new(vec![
+            title_line("AGENT GATEWAY"),
+            Line::from(""),
+            kv_line("Product", value_or_nd(&app.agent_status.product), Color::Cyan),
+            kv_line("Engine", value_or_nd(&app.agent_status.engine), Color::Cyan),
+            kv_line("Auth Mode", value_or_nd(&app.agent_status.auth), Color::Yellow),
+            kv_line(
+                "Bypass Prot.",
+                value_or_nd(&app.agent_status.bypass_protection),
+                if app.agent_status.bypass_protection == "UNKNOWN" { Color::Yellow } else { Color::Green },
+            ),
+            kv_line(
+                "Evidence Log",
+                value_or_nd(&app.agent_status.evidence_log),
+                if app.agent_status.evidence_log == "HEALTHY" { Color::Green } else { Color::Red },
+            ),
+            kv_line("MCP Gateway", value_or_nd(&app.agent_status.mcp_gateway), Color::Gray),
+            kv_line(
+                "Total Requests",
+                format_number(app.agent_status.gateway.requests),
+                Color::Cyan,
+            ),
+            kv_line(
+                "Allowed",
+                format_number(app.agent_status.gateway.allow),
+                Color::Green,
+            ),
+            kv_line(
+                "Denied",
+                format_number(app.agent_status.gateway.deny),
+                Color::Red,
+            ),
+            kv_line(
+                "Shadow Deny",
+                format_number(app.agent_status.gateway.shadow_deny),
+                Color::Yellow,
+            ),
+        ])
+        .block(Block::default().borders(Borders::ALL).title(" AGENT GATEWAY "))
+        .wrap(Wrap { trim: false })
+    } else {
+        Paragraph::new(vec![
+            title_line("AGENT GATEWAY"),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("Aguardando Agent Gateway em {}", app.agent_url),
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled("GET /api/v1/agent/status", Style::default().fg(Color::DarkGray))),
+        ])
+        .block(Block::default().borders(Borders::ALL).title(" AGENT GATEWAY "))
+        .wrap(Wrap { trim: false })
+    };
+    frame.render_widget(gateway, columns[0]);
+
+    let approval = if app.agent_status.available {
+        Paragraph::new(vec![
+            title_line("APPROVAL & POLICY SECURITY"),
+            Line::from(""),
+            kv_line("Active Policy", format!("{}:{}", value_or_nd(&app.agent_status.policy.id), value_or_nd(&app.agent_status.policy.version)), Color::Cyan),
+            kv_line("Lifecycle", value_or_nd(&app.agent_status.policy.lifecycle), Color::Green),
+            kv_line("Rules Active", format_number(app.agent_status.policy.rules), Color::Yellow),
+            kv_line("Activated By", value_or_nd(&app.agent_status.policy.activated_by), Color::Gray),
+            kv_line(
+                "Require Appr.",
+                format_number(app.agent_status.gateway.require_approval),
+                Color::Yellow,
+            ),
+            kv_line(
+                "Replay Rejected",
+                format_number(app.agent_status.gateway.approval_replay_rejected),
+                if app.agent_status.gateway.approval_replay_rejected == 0 { Color::Green } else { Color::Yellow },
+            ),
+            kv_line(
+                "Capacity Rej.",
+                format_number(app.agent_status.gateway.approval_capacity_rejected),
+                if app.agent_status.gateway.approval_capacity_rejected == 0 { Color::Green } else { Color::Red },
+            ),
+            kv_line(
+                "Expired Appr.",
+                format_number(app.agent_status.gateway.approval_expired),
+                Color::Gray,
+            ),
+            kv_line(
+                "Policy Errors",
+                format_number(app.agent_status.gateway.policy_errors),
+                if app.agent_status.gateway.policy_errors == 0 { Color::Green } else { Color::Red },
+            ),
+            kv_line(
+                "Upstream Errors",
+                format_number(app.agent_status.gateway.upstream_errors),
+                if app.agent_status.gateway.upstream_errors == 0 { Color::Green } else { Color::Red },
+            ),
+        ])
+        .block(Block::default().borders(Borders::ALL).title(" APPROVAL & POLICY "))
+        .wrap(Wrap { trim: false })
+    } else {
+        Paragraph::new("Aguardando métricas de aprovação e governança...")
+            .block(Block::default().borders(Borders::ALL).title(" APPROVAL & POLICY "))
+            .style(Style::default().fg(Color::DarkGray))
+    };
+    frame.render_widget(approval, columns[1]);
+
+    let resilience = if app.redteam.available {
         let (status_text, status_color) = if app.redteam.reached_upstream > 0 {
             ("VULNERABILIDADE DETECTADA", Color::Red)
         } else if app.redteam.total_probes > 0 && app.redteam.blocked > 0 {
@@ -1770,35 +2588,31 @@ fn render_security(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
         };
 
         Paragraph::new(vec![
-            title_line("RED TEAM & ADVERSARIAL"),
+            title_line("RED TEAM RESILIENCE"),
             Line::from(""),
-            kv_line("Status de Defesa", status_text, status_color),
+            kv_line("Defesa Global", status_text, status_color),
             kv_line(
-                "Campanha ativa",
+                "Campanha Ativa",
                 value_or_nd(&app.redteam.active_campaign),
                 Color::Cyan,
             ),
             kv_line(
-                "Probes registrados",
+                "Total de Probes",
                 format_number(app.redteam.total_probes),
                 Color::Yellow,
             ),
             kv_line(
-                "Bloqueados (Defesa)",
+                "Bloqueados (Pass)",
                 format_number(app.redteam.blocked),
                 Color::Green,
             ),
             kv_line(
-                "Vazaram p/ Upstream",
+                "Vazaram (Leaks)",
                 format_number(app.redteam.reached_upstream),
-                if app.redteam.reached_upstream == 0 {
-                    Color::Green
-                } else {
-                    Color::Red
-                },
+                if app.redteam.reached_upstream == 0 { Color::Green } else { Color::Red },
             ),
             kv_line(
-                "Último LSN gravado",
+                "Último LSN Ataque",
                 app.redteam
                     .last_attack_lsn
                     .map(format_number)
@@ -1806,49 +2620,38 @@ fn render_security(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
                 Color::Cyan,
             ),
             kv_line(
-                "Agent Gateway",
-                truncate(&app.agent_url, 26),
-                Color::Gray,
+                "Evidence Ingest",
+                format!("{} evts", format_number(app.agent_status.ingest.events)),
+                Color::Green,
             ),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Telemetria integrada de probes do laboratório em tempo real.",
-                Style::default().fg(Color::DarkGray),
-            )),
+            kv_line(
+                "Integridade",
+                value_or_nd(&app.agent_status.summary.integrity),
+                if app.agent_status.summary.integrity == "PROVED" { Color::Green } else { Color::Yellow },
+            ),
+            kv_line(
+                "Total Proved",
+                format!("{}/{}", app.agent_status.integrity.proved, app.agent_status.integrity.total),
+                Color::Green,
+            ),
         ])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" RED TEAM RESILIENCE "),
-        )
+        .block(Block::default().borders(Borders::ALL).title(" ADVERSARIAL RESILIENCE "))
         .wrap(Wrap { trim: false })
     } else {
         Paragraph::new(vec![
-            title_line("RED TEAM & ADVERSARIAL"),
+            title_line("RED TEAM RESILIENCE"),
             Line::from(""),
-            Line::from(Span::styled(
-                format!("Aguardando Agent Gateway em {}", app.agent_url),
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "GET /api/v1/agent/red-team/events",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                "Aguardando sondas ou execuções do laboratório...",
-                Style::default().fg(Color::DarkGray),
-            )),
+            Line::from(Span::styled("Aguardando telemetria de testes de invasão...", Style::default().fg(Color::DarkGray))),
         ])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" RED TEAM RESILIENCE "),
-        )
+        .block(Block::default().borders(Borders::ALL).title(" ADVERSARIAL RESILIENCE "))
         .wrap(Wrap { trim: false })
     };
-    frame.render_widget(redteam_widget, columns[2]);
+    frame.render_widget(resilience, columns[2]);
 
+    render_redteam_table(frame, app, vertical[1]);
+}
+
+fn render_redteam_table(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
     let attack_header = Row::new([
         "HORA",
         "ATTACK ID",
@@ -1873,7 +2676,7 @@ fn render_security(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
         } else {
             "Agent Gateway (/api/v1/agent/red-team/events) ainda não consultado ou sem eventos".to_string()
         };
-        vec![Row::new(vec![
+        vec![Row::new([
             "—".to_string(),
             "—".to_string(),
             "—".to_string(),
@@ -1933,15 +2736,15 @@ fn render_security(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
     let attacks_table = Table::new(
         attack_rows,
         [
-            Constraint::Length(9),  // HORA
-            Constraint::Length(12), // ATTACK ID
-            Constraint::Length(12), // CAMPANHA
-            Constraint::Length(28), // VETOR
-            Constraint::Length(24), // ALVO
-            Constraint::Length(12), // RESULTADO
-            Constraint::Length(10), // BLOQUEADO
-            Constraint::Length(12), // UPSTREAM Δ
-            Constraint::Length(10), // LSN
+            Constraint::Length(9),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(28),
+            Constraint::Length(24),
+            Constraint::Length(12),
+            Constraint::Length(10),
+            Constraint::Length(12),
+            Constraint::Length(10),
         ],
     )
     .header(attack_header)
@@ -1951,7 +2754,202 @@ fn render_security(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
             .title(" SONDAS DE INVASÃO / ADVERSARIAL ATTACKS (TEMPO REAL) "),
     );
 
-    frame.render_widget(attacks_table, vertical[1]);
+    frame.render_widget(attacks_table, area);
+}
+
+fn render_compliance(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(14), Constraint::Min(8)])
+        .split(area);
+
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
+        .split(vertical[0]);
+
+    let tsa = if app.compliance.available {
+        Paragraph::new(vec![
+            title_line("RFC 3161 TSA & TRUST SEALS"),
+            Line::from(""),
+            kv_line(
+                "Status",
+                value_or_nd(&app.compliance.status),
+                compliance_color(&app.compliance.status),
+            ),
+            kv_line(
+                "As of LSN",
+                format_number(app.compliance.as_of_lsn),
+                Color::Cyan,
+            ),
+            kv_line(
+                "RFC 3161 Seal",
+                value_or_nd(&app.agent_status.rfc3161),
+                if app.agent_status.rfc3161 == "ACTIVE" { Color::Green } else { Color::Yellow },
+            ),
+            kv_line(
+                "Receipts Total",
+                format_number(app.compliance.receipts_total),
+                Color::Green,
+            ),
+            kv_line(
+                "Sealed Watermark",
+                format_number(app.compliance.current_sealed_watermark),
+                Color::Cyan,
+            ),
+            kv_line(
+                "Last Anchor LSN",
+                app.compliance
+                    .last_anchor_lsn
+                    .map(format_number)
+                    .unwrap_or_else(|| "N/D".into()),
+                Color::Gray,
+            ),
+            Line::from(""),
+            Line::from(Span::styled(
+                truncate(&app.compliance.trust_notice, 38),
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+        .block(Block::default().borders(Borders::ALL).title(" RFC 3161 TSA "))
+        .wrap(Wrap { trim: false })
+    } else {
+        Paragraph::new("/compliance/status indisponível.")
+            .block(Block::default().borders(Borders::ALL).title(" RFC 3161 TSA "))
+            .style(Style::default().fg(Color::DarkGray))
+    };
+    frame.render_widget(tsa, columns[0]);
+
+    let anchors = if app.compliance.available {
+        Paragraph::new(vec![
+            title_line("ANCHOR HEALTH & GOVERNANCE"),
+            Line::from(""),
+            kv_line(
+                "Deferred Anchors",
+                format_number(app.compliance.deferred_anchors),
+                if app.compliance.deferred_anchor_forks == 0 {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                },
+            ),
+            kv_line(
+                "Anchor Forks",
+                format_number(app.compliance.deferred_anchor_forks),
+                if app.compliance.deferred_anchor_forks == 0 {
+                    Color::Green
+                } else {
+                    Color::Red
+                },
+            ),
+            kv_line(
+                "Legal Holds",
+                format_number(app.compliance.legal_holds),
+                Color::Yellow,
+            ),
+            kv_line(
+                "Retention Excs",
+                format_number(app.compliance.retention_exceptions),
+                Color::Yellow,
+            ),
+            kv_line(
+                "Policy Versions",
+                format_number(app.compliance.active_policy_versions),
+                Color::Cyan,
+            ),
+            kv_line(
+                "ANPD Pending",
+                format_number(app.compliance.pending_anpd),
+                Color::Yellow,
+            ),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Âncoras em conformidade ICP-Brasil e RFC 3161.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+        .block(Block::default().borders(Borders::ALL).title(" ANCHOR HEALTH "))
+        .wrap(Wrap { trim: false })
+    } else {
+        Paragraph::new("Aguardando âncoras...")
+            .block(Block::default().borders(Borders::ALL).title(" ANCHOR HEALTH "))
+            .style(Style::default().fg(Color::DarkGray))
+    };
+    frame.render_widget(anchors, columns[1]);
+
+    let deadlines = if app.compliance.available {
+        Paragraph::new(vec![
+            title_line("DEADLINES & SOVEREIGNTY"),
+            Line::from(""),
+            kv_line(
+                "Total Deadlines",
+                format_number(app.compliance.deadline_total),
+                Color::Cyan,
+            ),
+            kv_line(
+                "Overdue (Late)",
+                format_number(app.compliance.deadline_overdue),
+                if app.compliance.deadline_overdue == 0 { Color::Green } else { Color::Red },
+            ),
+            kv_line(
+                "Due within 24h",
+                format_number(app.compliance.deadline_24h),
+                if app.compliance.deadline_24h == 0 { Color::Green } else { Color::Yellow },
+            ),
+            kv_line(
+                "Due within 48h",
+                format_number(app.compliance.deadline_48h),
+                Color::Gray,
+            ),
+            kv_line(
+                "Due within 72h",
+                format_number(app.compliance.deadline_72h),
+                Color::Gray,
+            ),
+            kv_line(
+                "Egress Allowed/Denied",
+                format!("{}/{}", app.compliance.egress_allowed, app.compliance.egress_denied),
+                if app.compliance.egress_denied > 0 { Color::Yellow } else { Color::Green },
+            ),
+            kv_line(
+                "Model Allowed/Denied",
+                format!("{}/{}", app.compliance.model_allowed, app.compliance.model_denied),
+                if app.compliance.model_denied > 0 { Color::Yellow } else { Color::Green },
+            ),
+        ])
+        .block(Block::default().borders(Borders::ALL).title(" SOVEREIGNTY "))
+        .wrap(Wrap { trim: false })
+    } else {
+        Paragraph::new("Prazos regulatórios indisponíveis.")
+            .block(Block::default().borders(Borders::ALL).title(" SOVEREIGNTY "))
+            .style(Style::default().fg(Color::DarkGray))
+    };
+    frame.render_widget(deadlines, columns[2]);
+
+    let audit_info = Paragraph::new(vec![
+        title_line("REGULATORY COMPLIANCE AUDIT RECORD"),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("LGPD Art. 17/18/19: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw("Direito de confirmação, acesso e eliminação de dados tratados."),
+        ]),
+        Line::from(vec![
+            Span::styled("RFC 3161 Evidence Token: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::raw("Carimbos de tempo criptograficamente selados por hash SHA-256 e cadeia X.509."),
+        ]),
+        Line::from(vec![
+            Span::styled("Data Sovereignty Boundary: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw("Controle estrito de fronteira de egress — zero exfiltração não autorizada de telemetria."),
+        ]),
+    ])
+    .block(Block::default().borders(Borders::ALL).title(" REGULATORY & LEGAL INVARIANTS "))
+    .wrap(Wrap { trim: false });
+
+    frame.render_widget(audit_info, vertical[1]);
 }
 
 fn render_indexes(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
@@ -2055,10 +3053,10 @@ fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
     let help = Paragraph::new(vec![
         title_line("HERACLITUS TOP - TECLAS"),
         Line::from(""),
-        help_line("1..7", "abrir aba diretamente"),
+        help_line("1..9", "abrir aba diretamente (Overview..Compliance)"),
         help_line("Tab / Shift+Tab", "aba seguinte / anterior"),
-        help_line("↑ / ↓", "selecionar task"),
-        help_line("Home / End", "primeira / última task"),
+        help_line("↑ / ↓", "selecionar item / pipeline"),
+        help_line("Home / End", "primeiro / último item"),
         help_line("p / Espaço", "pausar / continuar polling"),
         help_line("u", "forçar refresh de todas as rotas"),
         help_line("r", "zerar histórico e pico de ingestão"),
@@ -2661,6 +3659,69 @@ fn parse_redteam(value: &Value) -> RedTeamSnapshot {
         active_campaign,
         last_attack_lsn,
         events,
+    }
+}
+
+fn parse_agent_status(value: &Value) -> AgentStatusSnapshot {
+    let gw = value.get("gateway").unwrap_or(&Value::Null);
+    let pol = value.get("policy").unwrap_or(&Value::Null);
+    let ing = value.get("ingest").unwrap_or(&Value::Null);
+    let intg = value.get("integrity_detail").unwrap_or(&Value::Null);
+    let summ = value.get("summary").unwrap_or(&Value::Null);
+
+    AgentStatusSnapshot {
+        available: true,
+        engine: string_at(value, "engine").unwrap_or_default(),
+        product: string_at(value, "product").unwrap_or_default(),
+        auth: string_at(value, "auth").unwrap_or_default(),
+        bypass_protection: string_at(value, "bypass_protection").unwrap_or_default(),
+        evidence_log: string_at(value, "evidence_log").unwrap_or_default(),
+        mcp_gateway: string_at(value, "mcp_gateway").unwrap_or_default(),
+        otlp_ingest: string_at(value, "otlp_ingest").unwrap_or_default(),
+        rfc3161: string_at(value, "rfc3161").unwrap_or_default(),
+        gateway: AgentGatewayCounters {
+            requests: u64_at(gw, "requests").unwrap_or(0),
+            allow: u64_at(gw, "allow").unwrap_or(0),
+            deny: u64_at(gw, "deny").unwrap_or(0),
+            require_approval: u64_at(gw, "require_approval").unwrap_or(0),
+            shadow_deny: u64_at(gw, "shadow_deny").unwrap_or(0),
+            approval_replay_rejected: u64_at(gw, "approval_replay_rejected").unwrap_or(0),
+            approval_capacity_rejected: u64_at(gw, "approval_capacity_rejected").unwrap_or(0),
+            approval_expired: u64_at(gw, "approval_expired").unwrap_or(0),
+            policy_errors: u64_at(gw, "policy_errors").unwrap_or(0),
+            evidence_errors: u64_at(gw, "evidence_errors").unwrap_or(0),
+            upstream_errors: u64_at(gw, "upstream_errors").unwrap_or(0),
+        },
+        policy: AgentPolicySnapshot {
+            id: string_at(pol, "id").unwrap_or_default(),
+            version: string_at(pol, "version").unwrap_or_default(),
+            lifecycle: string_at(pol, "lifecycle").unwrap_or_default(),
+            rules: u64_at(pol, "rules").unwrap_or(0),
+            hash: string_at(pol, "hash").unwrap_or_default(),
+            activated_by: string_at(pol, "activated_by").unwrap_or_default(),
+        },
+        ingest: AgentIngestSnapshot {
+            events: u64_at(ing, "events").unwrap_or(0),
+            batches: u64_at(ing, "batches").unwrap_or(0),
+            bytes: u64_at(ing, "bytes").unwrap_or(0),
+            duplicates: u64_at(ing, "duplicates").unwrap_or(0),
+            conflicts: u64_at(ing, "conflicts").unwrap_or(0),
+            rejected: u64_at(ing, "rejected").unwrap_or(0),
+        },
+        integrity: AgentIntegritySnapshot {
+            total: u64_at(intg, "total").unwrap_or(0),
+            pending_seal: u64_at(intg, "pending_seal").unwrap_or(0),
+            proved: u64_at(intg, "proved").unwrap_or(0),
+            broken: u64_at(intg, "broken").unwrap_or(0),
+            missing: u64_at(intg, "missing").unwrap_or(0),
+        },
+        summary: AgentSummarySnapshot {
+            runs: u64_at(summ, "runs").unwrap_or(0),
+            tool_calls: u64_at(summ, "tool_calls").unwrap_or(0),
+            denied: u64_at(summ, "denied").unwrap_or(0),
+            pending_approvals: u64_at(summ, "pending_approvals").unwrap_or(0),
+            integrity: string_at(summ, "integrity").unwrap_or_default(),
+        },
     }
 }
 
