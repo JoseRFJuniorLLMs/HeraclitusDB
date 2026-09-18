@@ -19,6 +19,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+pub mod provider;
+pub use provider::*;
+
 /// Magic prefix marking a sealed (encrypted) content blob.
 pub const ENC_MAGIC: &[u8; 8] = b"HRKLENC1";
 const NONCE_LEN: usize = 12;

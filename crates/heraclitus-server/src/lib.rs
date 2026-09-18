@@ -16,6 +16,7 @@ pub mod grpc;
 pub mod platform_source; // SPEC-0074/0075/0076: o plano de evidência de agentes
 pub mod rest;
 pub mod telemetry_probe;
+pub mod trusted_admin;
 
 pub use embedded::Embedded;
 pub use engine::Engine;

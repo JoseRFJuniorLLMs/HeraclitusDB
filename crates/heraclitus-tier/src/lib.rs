@@ -24,6 +24,7 @@
 pub mod compaction;
 pub mod demotion;
 pub mod generation;
+pub mod immutable;
 pub mod lakehouse;
 pub mod object_source;
 pub mod receipts_v2;
@@ -31,6 +32,7 @@ pub mod receipts_v2;
 pub use compaction::{ColdCollectReport, ColdRepackOutcome};
 pub use demotion::{ColdTierV6, ColdVerifyReport};
 pub use generation::GenerationKey;
+pub use immutable::*;
 pub use lakehouse::worker::{ExportOutcome, LakehouseWorker};
 pub use object_source::{ColdReadStats, ColdSegmentReader, SparseSource};
 pub use receipts_v2::{AnyDemotionReceipt, DemotionReceiptV2};

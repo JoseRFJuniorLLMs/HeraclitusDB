@@ -38,6 +38,7 @@ pub mod deferred;
 pub mod icp;
 pub mod model_bundle;
 pub mod privacy;
+pub mod profiles;
 pub mod receipt;
 pub mod regulatory;
 pub mod rfc3161;

@@ -3371,6 +3371,7 @@ dependencies = [
 name = "heraclitus-crypto"
 version = "3.0.1"
 dependencies = [
+ "blake3",
  "chacha20poly1305",
  "dashmap",
  "rand 0.8.7",
@@ -3386,6 +3387,21 @@ dependencies = [
  "heraclitus-manifold",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "heraclitus-forensic"
+version = "3.0.1"
+dependencies = [
+ "blake3",
+ "heraclitus-core",
+ "heraclitus-crypto",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3649,6 +3665,7 @@ dependencies = [
  "heraclitus-core",
  "heraclitus-crypto",
  "heraclitus-distill",
+ "heraclitus-forensic",
  "heraclitus-index-attr",
  "heraclitus-index-graph",
  "heraclitus-index-text",
@@ -3668,6 +3685,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.20",
  "tikv-jemallocator",
  "tokio",
  "tokio-stream",

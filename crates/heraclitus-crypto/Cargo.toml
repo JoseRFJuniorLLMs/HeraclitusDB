@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+blake3 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 dashmap = { workspace = true }
 rand = { workspace = true }

@@ -1,0 +1,15 @@
+[package]
+name = "heraclitus-forensic"
+version = "3.0.1"
+edition = "2021"
+
+[dependencies]
+heraclitus-core = { path = "../heraclitus-core" }
+heraclitus-crypto = { path = "../heraclitus-crypto" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+sha2 = "0.10"
+thiserror = { workspace = true }
+tempfile = { workspace = true }
+hex = "0.4.3"
