@@ -24,7 +24,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Compile runner
-        run: python -m py_compile labs/Deep-RedTeam-Heraclitus/runner.py
+        run: |
+          python -m py_compile labs/Deep-RedTeam-Heraclitus/runner.py
+          python -m py_compile labs/Agent-Atack-Heraclitus/runner.py
       - name: Validate JSON configuration
         run: |
           python -m json.tool labs/Deep-RedTeam-Heraclitus/config.example.json > /dev/null
