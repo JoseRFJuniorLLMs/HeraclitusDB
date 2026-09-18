@@ -110,7 +110,7 @@ attestation = "qa/qualification/attestations/q2_failure.json"
 
 [[trials]]
 id = "q3_attack"
-description = "Q3 protocol, authn, authz, parser and adversarial attack campaign"
+description = "Q3 protocol, authn, authz, parser, tenant, privileged-fault, HRKL rollback and hostile-peer attack campaign; attach Deep-RedTeam-Heraclitus evidence where applicable"
 mode = "external_attestation"
 assurance = "qualification_lab"
 attestation = "qa/qualification/attestations/q3_attack.json"
@@ -124,7 +124,7 @@ attestation = "qa/qualification/attestations/q4_upgrade.json"
 
 [[trials]]
 id = "q5_node_loss"
-description = "Q5 Raft host loss, partition, latency and replacement matrix"
+description = "Q5 Raft host loss, partition, latency, replacement, stale-snapshot and hostile-peer trust-boundary matrix"
 mode = "external_attestation"
 assurance = "qualification_lab"
 attestation = "qa/qualification/attestations/q5_node_loss.json"
