@@ -179,6 +179,9 @@ pub struct Engine {
     /// gera um evento `AuditQuery` no próprio log — quem consultou o quê é,
     /// ele próprio, evidência imutável. Liga por config (audit_queries).
     audit_queries: bool,
+    /// Auditoria de operações administrativas (shredding, config, replicação).
+    /// Controlada por flag independente `audit_admin` (auditoria C3).
+    audit_admin: bool,
     /// SPEC-015/021 — quando a replicação está ativa, as escritas passam por
     /// aqui (o líder do raft) em vez de irem direto ao log. Vazio = nó autónomo
     /// (o caminho normal). Preenchido uma vez por `set_replication`.
@@ -659,6 +662,7 @@ impl Engine {
             log_only,
             attr_nao_materializado: std::sync::atomic::AtomicBool::new(skip_replay),
             audit_queries: config.audit_queries,
+            audit_admin: config.audit_admin,
             replication: std::sync::OnceLock::new(),
             hvm_lock: Mutex::new(()),
             index_gate: std::sync::RwLock::new(()),
@@ -744,9 +748,10 @@ impl Engine {
         let _ = self.append(e);
     }
 
-    /// Registra toda tentativa de operação administrativa, inclusive falhas.
+    /// Registra toda tentativa de operação administrativa, inclusive falhas (auditoria C3/B2).
+    /// Controlada pela flag `audit_admin`. Avisa via log caso o append falhe.
     pub fn audit_admin(&self, operation: &str, ok: bool, principal: &str) {
-        if !self.audit_queries {
+        if !self.audit_admin {
             return;
         }
         let mut e = Episode::new(
@@ -759,7 +764,31 @@ impl Engine {
         e.attrs.insert("operation".into(), operation.into());
         e.attrs
             .insert("ok".into(), if ok { "true".into() } else { "false".into() });
-        let _ = self.append(e);
+        if let Err(err) = self.append(e) {
+            eprintln!(
+                "AVISO DE SEGURANÇA: Falha ao persistir evento de auditoria administrativa \
+                 (op: {operation}, principal: {principal}): {err:?}"
+            );
+        }
+    }
+
+    /// Registra operação administrativa com garantia transacional síncrona (fail-closed).
+    /// Se a gravação no log de auditoria falhar, a operação inteira deve falhar.
+    pub fn audit_admin_strict(&self, operation: &str, ok: bool, principal: &str) -> Result<Lsn, HeraclitusError> {
+        if !self.audit_admin {
+            return Ok(0);
+        }
+        let mut e = Episode::new(
+            "heraclitus-audit",
+            EventKind::Custom("AuditAdmin".into()),
+            operation.as_bytes().to_vec(),
+        );
+        e.attrs.insert("audit".into(), "admin".into());
+        e.attrs.insert("principal".into(), principal.into());
+        e.attrs.insert("operation".into(), operation.into());
+        e.attrs
+            .insert("ok".into(), if ok { "true".into() } else { "false".into() });
+        self.append(e)
     }
 
     /// Grava o checkpoint do índice de atributos (o servidor pode chamar

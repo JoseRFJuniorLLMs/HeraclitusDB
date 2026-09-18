@@ -638,7 +638,7 @@ mod tests {
         for (i, e) in eps.iter().enumerate() {
             let payload =
                 crate::encode_storage_payload_for_version(version, e.id.0.to_bytes(), e).unwrap();
-            let rec = format::encode_record(version, i as u64, 500 + i as u64, &payload);
+            let rec = format::encode_record(version, i as u64, 500 + i as u64, &payload).unwrap();
             folhas.push(format::record_leaf(version, &rec));
             f.write_all(&rec).unwrap();
         }

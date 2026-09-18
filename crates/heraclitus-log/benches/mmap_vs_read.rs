@@ -51,7 +51,7 @@ fn segmento_selado(dir: &Path, n: u64, tamanho: usize) -> PathBuf {
     )
     .unwrap();
     for lsn in 0..n {
-        let rec = encode_record(format::FORMAT_VERSION, lsn, lsn, &payload);
+        let rec = encode_record(format::FORMAT_VERSION, lsn, lsn, &payload).unwrap();
         f.write_all(&rec).unwrap();
     }
     f.write_all(
@@ -115,7 +115,8 @@ fn varrer_mmap(path: &Path) -> (u64, u64) {
 /// custo do `open` é a diferença entre medir o mmap e medir o `mmap()`.
 fn varrer_mapeado(seg: &MappedSegment) -> (u64, u64) {
     let (mut registos, mut bytes) = (0u64, 0u64);
-    for (_lsn, _hlc, payload) in seg.records() {
+    for rec in seg.records() {
+        let (_lsn, _hlc, payload) = rec.unwrap();
         registos += 1;
         // TOCAR nos bytes, não só no comprimento: senão as páginas do payload
         // nunca são faltadas e o mmap parece rápido por não fazer o trabalho

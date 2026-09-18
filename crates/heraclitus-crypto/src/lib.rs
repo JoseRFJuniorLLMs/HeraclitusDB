@@ -27,6 +27,15 @@ const NONCE_LEN: usize = 12;
 pub const SHREDDED: &[u8] = b"[shredded]";
 
 /// True if `blob` looks like a sealed content blob.
+///
+/// # Limitação conhecida
+///
+/// Detecção por prefixo mágico: um payload em claro que comece literalmente
+/// com `HRKLENC1` (8 bytes) seguido de >= 12 bytes adicionais será
+/// incorrectamente classificado como cifrado, causando erro de decifra
+/// (falha explícita, não corrupção silenciosa). Na prática a probabilidade
+/// é negligenciável para conteúdo textual/bincode, mas o desenho ideal
+/// usaria metadado de envelope em vez de heurística de conteúdo.
 pub fn is_encrypted(blob: &[u8]) -> bool {
     blob.len() >= ENC_MAGIC.len() + NONCE_LEN && blob[..ENC_MAGIC.len()] == ENC_MAGIC[..]
 }
@@ -93,23 +102,29 @@ pub struct KeyStore {
 /// ficheiros herdam a ACL do perfil do utilizador e não há API std para endurecer
 /// mais sem uma dependência de ACLs — no-op documentado, best-effort no Unix.
 #[cfg(unix)]
-fn restrict_dir_perms(dir: &Path) {
+fn restrict_dir_perms(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
 }
 #[cfg(not(unix))]
-fn restrict_dir_perms(_dir: &Path) {}
+fn restrict_dir_perms(_dir: &Path) -> io::Result<()> {
+    // Windows: ACLs do perfil do utilizador; endurecimento documentado como
+    // responsabilidade do runbook de deployment.
+    Ok(())
+}
 
 /// Restringe um ficheiro de chave a owner-only (0600) no Unix. Aplica-se ao tmp
 /// ANTES do rename atómico, para o ficheiro final nunca existir com permissões
 /// largas (a chave em claro nunca fica world-readable, nem por um instante).
 #[cfg(unix)]
-fn restrict_file_perms(path: &Path) {
+fn restrict_file_perms(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 #[cfg(not(unix))]
-fn restrict_file_perms(_path: &Path) {}
+fn restrict_file_perms(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
 
 /// Torna durável a *entrada de directório*, não só o conteúdo do ficheiro.
 ///
@@ -138,7 +153,7 @@ impl KeyStore {
     pub fn open(dir: impl Into<PathBuf>) -> io::Result<Arc<Self>> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
-        restrict_dir_perms(&dir);
+        restrict_dir_perms(&dir)?;
         Ok(Arc::new(Self {
             dir,
             cache: DashMap::new(),
@@ -199,7 +214,7 @@ impl KeyStore {
                 {
                     Ok(mut f) => {
                         // Vencedor: 0600 ANTES de escrever os bytes da chave.
-                        restrict_file_perms(&path);
+                        restrict_file_perms(&path)?;
                         let mut k = [0u8; 32];
                         rand::thread_rng().fill_bytes(&mut k);
                         f.write_all(&k)?;

@@ -101,6 +101,7 @@ impl MappedSegment {
         RecordIter {
             buf: &self.mmap[HEADER_LEN.min(self.mmap.len())..],
             version: self.version,
+            finished: false,
         }
     }
 }
@@ -109,20 +110,38 @@ impl MappedSegment {
 pub struct RecordIter<'a> {
     buf: &'a [u8],
     version: u16,
+    finished: bool,
 }
 
 impl<'a> Iterator for RecordIter<'a> {
-    /// `(lsn, hlc, payload)` — `payload` borrows the mmap.
-    type Item = (Lsn, u64, &'a [u8]);
+    /// `Result<(lsn, hlc, payload), HeraclitusError>` — `payload` borrows the mmap.
+    /// Auditoria B6: distingue fim limpo (EOF / Footer) de corrupção ou escrita incompleta.
+    type Item = Result<(Lsn, u64, &'a [u8]), HeraclitusError>;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.finished || self.buf.is_empty() {
+            return None;
+        }
         match format::decode_record(self.version, self.buf) {
             Decoded::Record(lsn, hlc, payload, consumed) => {
                 self.buf = &self.buf[consumed..];
-                Some((lsn, hlc, payload))
+                Some(Ok((lsn, hlc, payload)))
             }
-            // Footer (sealed boundary) or Torn → end of the record stream.
-            _ => None,
+            Decoded::Footer(_) => {
+                // Fim legítimo do segmento selado
+                self.finished = true;
+                self.buf = &[];
+                None
+            }
+            Decoded::Torn => {
+                // Buffer não-vazio que falhou no decode é corrupção/escrita rasgada
+                self.finished = true;
+                self.buf = &[];
+                Some(Err(HeraclitusError::Corruption {
+                    context: "mmap segment record scan".into(),
+                    detail: "registo corrompido, CRC inválido ou escrita incompleta".into(),
+                }))
+            }
         }
     }
 }
@@ -151,7 +170,7 @@ mod tests {
             };
             f.write_all(&hdr.encode()).unwrap();
             for (i, p) in payloads.iter().enumerate() {
-                let rec = encode_record(format::FORMAT_VERSION, 100 + i as u64, 500 + i as u64, p);
+                let rec = encode_record(format::FORMAT_VERSION, 100 + i as u64, 500 + i as u64, p).unwrap();
                 hashes.push(format::record_leaf(format::FORMAT_VERSION, &rec));
                 f.write_all(&rec).unwrap();
             }
@@ -169,8 +188,13 @@ mod tests {
         let seg = MappedSegment::open(&path).unwrap();
         assert_eq!(seg.version, format::FORMAT_VERSION);
 
-        let got: Vec<(Lsn, u64, Vec<u8>)> =
-            seg.records().map(|(l, h, p)| (l, h, p.to_vec())).collect();
+        let got: Vec<(Lsn, u64, Vec<u8>)> = seg
+            .records()
+            .map(|r| {
+                let (l, h, p) = r.expect("registo integro");
+                (l, h, p.to_vec())
+            })
+            .collect();
         assert_eq!(
             got.len(),
             3,
@@ -184,8 +208,7 @@ mod tests {
         assert!(seg.as_bytes().len() > HEADER_LEN + format::FOOTER_LEN);
     }
 
-    /// A tampered byte in a mapped record halts the zero-copy stream at that
-    /// record (CRC mismatch → Torn → iterator ends) instead of yielding it.
+    /// A tampered byte in a mapped record yields Corruption error instead of silently stopping.
     #[test]
     fn tampered_record_halts_iteration() {
         let dir = tempfile::tempdir().unwrap();
@@ -198,8 +221,8 @@ mod tests {
                 created_hlc: 1,
             };
             f.write_all(&hdr.encode()).unwrap();
-            let rec0 = encode_record(format::FORMAT_VERSION, 0, 0, b"good");
-            let mut rec1 = encode_record(format::FORMAT_VERSION, 1, 0, b"tampered");
+            let rec0 = encode_record(format::FORMAT_VERSION, 0, 0, b"good").unwrap();
+            let mut rec1 = encode_record(format::FORMAT_VERSION, 1, 0, b"tampered").unwrap();
             let n = rec1.len();
             rec1[n - 1] ^= 0x01; // flip a payload byte; CRC no longer matches
             f.write_all(&rec0).unwrap();
@@ -207,7 +230,9 @@ mod tests {
             f.sync_all().unwrap();
         }
         let seg = MappedSegment::open(&path).unwrap();
-        let got: Vec<Lsn> = seg.records().map(|(l, _, _)| l).collect();
-        assert_eq!(got, vec![0], "iteration halts at the first tampered record");
+        let got: Vec<Result<Lsn, _>> = seg.records().map(|r| r.map(|(l, _, _)| l)).collect();
+        assert_eq!(got.len(), 2, "deve retornar o primeiro OK e o segundo Err(Corruption)");
+        assert_eq!(got[0].as_ref().unwrap(), &0);
+        assert!(matches!(got[1], Err(HeraclitusError::Corruption { .. })));
     }
 }

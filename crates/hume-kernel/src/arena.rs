@@ -64,7 +64,7 @@ impl ScratchAllocator {
     /// `SPEC-0039 §6`; aqui a política é deixar o chamador decidir).
     ///
     /// # Panics
-    /// Se `align` não for potência de dois.
+    /// Se `align` não for potência de dois ou exceder [`crate::CACHE_LINE`].
     // `&self -> &mut [u8]` é o contrato deliberado da bump arena (cf. `bumpalo`):
     // cada região devolvida é disjunta, o borrow atado a `&self` impede `reset`.
     #[allow(clippy::mut_from_ref)]
@@ -72,6 +72,13 @@ impl ScratchAllocator {
         assert!(
             align.is_power_of_two(),
             "alinhamento tem de ser potência de dois"
+        );
+        assert!(
+            align <= crate::CACHE_LINE,
+            "alinhamento {align} excede CACHE_LINE ({}); o buffer base só garante \
+             alinhamento a {} bytes",
+            crate::CACHE_LINE,
+            crate::CACHE_LINE
         );
         let cur = self.offset.get();
         let start = (cur + align - 1) & !(align - 1);
@@ -170,5 +177,11 @@ mod tests {
     #[should_panic(expected = "potência de dois")]
     fn rejects_non_pow2_align() {
         ScratchAllocator::new(64).alloc_bytes(8, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "excede CACHE_LINE")]
+    fn rejects_align_greater_than_cache_line() {
+        ScratchAllocator::new(256).alloc_bytes(8, 128);
     }
 }

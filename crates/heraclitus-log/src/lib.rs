@@ -1214,12 +1214,18 @@ impl Log {
                                     continue;
                                 }
 
-                                let record = format::encode_record(
+                                let record = match format::encode_record(
                                     format::FORMAT_VERSION,
                                     tentative_lsn,
                                     episode.ts_hlc,
                                     &scratch_buffer,
-                                );
+                                ) {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        let _ = resp_tx.send(Err(e));
+                                        continue;
+                                    }
+                                };
 
                                 if active.bytes_written + record.len() as u64 > segment_max_bytes {
                                     // CORREÇÃO DE PERDA NO ROLL: publicar no

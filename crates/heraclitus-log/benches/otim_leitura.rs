@@ -266,7 +266,8 @@ fn main() {
     let mut bytes6 = 0usize;
     {
         let seg = MappedSegment::open(&path).expect("mmap");
-        for (_lsn, _hlc, p) in seg.records() {
+        for rec in seg.records() {
+            let (_lsn, _hlc, p) = rec.expect("registo integro");
             bytes6 += p.len();
             n6 += 1;
         }

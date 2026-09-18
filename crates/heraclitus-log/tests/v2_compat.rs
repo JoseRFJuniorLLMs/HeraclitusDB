@@ -26,7 +26,7 @@ fn write_v2_segment(dir: &std::path::Path, episodes: &[Episode]) {
     f.write_all(&hdr.encode()).unwrap();
     for (i, e) in episodes.iter().enumerate() {
         let payload = bincode::serde::encode_to_vec(e, BINCODE_CFG).unwrap();
-        let rec = format::encode_record(2, i as u64, e.ts_hlc, &payload);
+        let rec = format::encode_record(2, i as u64, e.ts_hlc, &payload).unwrap();
         f.write_all(&rec).unwrap();
     }
     f.sync_all().unwrap();
@@ -123,7 +123,7 @@ fn v3_segment_remains_readable_under_v4() {
             parents: e.parents.clone(),
         };
         let payload = bincode::serde::encode_to_vec(&sp, BINCODE_CFG).unwrap();
-        let rec = format::encode_record(3, i as u64, e.ts_hlc, &payload);
+        let rec = format::encode_record(3, i as u64, e.ts_hlc, &payload).unwrap();
         f.write_all(&rec).unwrap();
     }
     f.sync_all().unwrap();

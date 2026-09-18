@@ -530,6 +530,10 @@ pub struct HeraclitusConfig {
     /// (immudb-style access meta-audit: who queried what is itself evidence).
     /// Default `false` — it grows the log by one event per query.
     pub audit_queries: bool,
+    /// Append an `AuditAdmin` event to the log for every administrative operation
+    /// (shredding, config changes, replication control).
+    /// Default `true` — auditoria administrativa separada de consultas (auditoria C3).
+    pub audit_admin: bool,
     /// Encrypt episode `content` at rest with a per-`agent_id` key (§3.10),
     /// enabling crypto-shredding. `false` = plaintext at rest (default).
     /// Keys live under `<data_dir>/keys`.
@@ -739,6 +743,7 @@ impl Default for HeraclitusConfig {
             rest_allow_erasure: false,
             checkpoint_interval_secs: 300,
             audit_queries: false,
+            audit_admin: true,
             encryption_at_rest: false,
             compliance_enabled: false,
             compliance_interval_secs: 300,
@@ -922,6 +927,10 @@ impl HeraclitusConfig {
         }
         if let Ok(v) = std::env::var("HERACLITUS_AUDIT_QUERIES") {
             self.audit_queries =
+                matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes");
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_AUDIT_ADMIN") {
+            self.audit_admin =
                 matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes");
         }
         if let Ok(v) = std::env::var("HERACLITUS_ENCRYPTION") {
@@ -1372,9 +1381,9 @@ impl HeraclitusConfig {
             if !matches!(self.fsync, FsyncPolicy::Always) {
                 return Err(invalid("produção exige fsync = always".into()));
             }
-            if !self.encryption_at_rest || !self.audit_queries {
+            if !self.encryption_at_rest || !self.audit_queries || !self.audit_admin {
                 return Err(invalid(
-                    "produção exige encryption_at_rest=true e audit_queries=true".into(),
+                    "produção exige encryption_at_rest=true, audit_queries=true e audit_admin=true".into(),
                 ));
             }
             if self.access_credentials.is_empty() || self.auth_token.is_some() {
@@ -1727,6 +1736,7 @@ max_graph_hops = 6
         cfg.fsync = FsyncPolicy::Always;
         cfg.encryption_at_rest = true;
         cfg.audit_queries = true;
+        cfg.audit_admin = true;
         cfg.rest_basic_auth = Some("admin:strong-local-secret".into());
         cfg.compliance_enabled = true;
         cfg.compliance_tsa_mode = "http".into();

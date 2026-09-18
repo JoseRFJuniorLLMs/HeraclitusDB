@@ -52,6 +52,12 @@ pub const HEADER_LEN: usize = 4 + 2 + 8 + 8;
 pub const RECORD_HEADER_LEN: usize = 4 + 4 + 8 + 8;
 pub const FOOTER_LEN: usize = 4 + 8 + 8 + 8 + 32;
 
+/// Tamanho máximo de um payload de registo individual. O decoder rejeita acima
+/// deste limiar (`Decoded::Torn`), por isso o encoder tem de aplicar a mesma
+/// restrição — caso contrário grava-se um registo que nunca mais se lê. O valor
+/// coincide com o `len > 512 MiB` em [`decode_record`]. Auditoria B5/C1.
+pub const MAX_RECORD_PAYLOAD: usize = 512 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SegmentHeader {
     pub version: u16,
@@ -141,16 +147,40 @@ impl SegmentFooter {
 /// the given format `version`. v1 protects only the payload; v2+ protects the
 /// full authenticated region (`len + lsn + hlc + payload`) so a flip in any
 /// header field is caught on decode.
-pub fn encode_record(version: u16, lsn: Lsn, hlc: u64, payload: &[u8]) -> Vec<u8> {
+///
+/// Devolve `Err` se o payload exceder [`MAX_RECORD_PAYLOAD`] (512 MiB) ou
+/// `u32::MAX` — auditoria B5/C1.
+pub fn encode_record(
+    version: u16,
+    lsn: Lsn,
+    hlc: u64,
+    payload: &[u8],
+) -> Result<Vec<u8>, HeraclitusError> {
+    if payload.len() > MAX_RECORD_PAYLOAD {
+        return Err(HeraclitusError::StorageEngine(format!(
+            "payload de {} bytes excede o máximo permitido ({MAX_RECORD_PAYLOAD} bytes)",
+            payload.len()
+        )));
+    }
+    // Guarda contra truncação silenciosa de usize → u32 (auditoria C1).
+    // Em plataformas de 64 bits com payloads > 4 GiB, o cast `as u32` perdia
+    // os bits altos — o registo gravado continha um `len` errado e o decoder
+    // reconstruía dados truncados.
+    let len_u32: u32 = payload.len().try_into().map_err(|_| {
+        HeraclitusError::StorageEngine(format!(
+            "payload de {} bytes não cabe em u32",
+            payload.len()
+        ))
+    })?;
     let mut buf = Vec::with_capacity(RECORD_HEADER_LEN + payload.len());
-    buf.extend_from_slice(&(payload.len() as u32).to_le_bytes()); // [0..4]   len
-    buf.extend_from_slice(&[0u8; 4]); //                             [4..8]   crc (filled below)
-    buf.extend_from_slice(&lsn.to_le_bytes()); //                    [8..16]  lsn
-    buf.extend_from_slice(&hlc.to_le_bytes()); //                    [16..24] hlc
-    buf.extend_from_slice(payload); //                               [24..]   payload
+    buf.extend_from_slice(&len_u32.to_le_bytes());           // [0..4]   len
+    buf.extend_from_slice(&[0u8; 4]); //                       [4..8]   crc (filled below)
+    buf.extend_from_slice(&lsn.to_le_bytes()); //              [8..16]  lsn
+    buf.extend_from_slice(&hlc.to_le_bytes()); //              [16..24] hlc
+    buf.extend_from_slice(payload); //                         [24..]   payload
     let crc = authenticated_crc(version, &buf);
     buf[4..8].copy_from_slice(&crc.to_le_bytes());
-    buf
+    Ok(buf)
 }
 
 /// CRC over a record's authenticated region. The 4-byte CRC field at `[4..8]`

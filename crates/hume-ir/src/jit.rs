@@ -22,6 +22,10 @@ pub struct JitFilter {
     // módulo tem de sobreviver enquanto a função existir.
     func: CompiledFn,
     _module: JITModule,
+    /// Schema exigido: número de colunas e tipo de cada coluna referenciada.
+    n_columns: usize,
+    /// (índice_coluna, tipo_esperado) para cada Op::Column na IR.
+    column_schema: Vec<(usize, Ty)>,
 }
 
 impl JitFilter {
@@ -30,6 +34,13 @@ impl JitFilter {
         let types_of = verify(f).map_err(|e| format!("IR inválida: {e:?}"))?;
         if types_of[f.ret as usize] != Ty::Bool {
             return Err("a função do filtro tem de devolver Bool".into());
+        }
+
+        let mut column_schema = Vec::new();
+        for inst in &f.insts {
+            if let Op::Column(idx, ty) = &inst.op {
+                column_schema.push((*idx, *ty));
+            }
         }
 
         let mut flags = settings::builder();
@@ -110,6 +121,8 @@ impl JitFilter {
         Ok(Self {
             func,
             _module: module,
+            n_columns: f.n_columns,
+            column_schema,
         })
     }
 
@@ -119,6 +132,36 @@ impl JitFilter {
     /// `cols` tem de cobrir todas as colunas referenciadas pela IR, cada uma com
     /// pelo menos `n` elementos.
     pub fn run(&self, cols: &[ColumnData], n: usize) -> Vec<u32> {
+        assert!(
+            cols.len() >= self.n_columns,
+            "JitFilter::run: esperava >= {} colunas, recebeu {}",
+            self.n_columns,
+            cols.len()
+        );
+        for &(idx, expected_ty) in &self.column_schema {
+            assert!(
+                idx < cols.len(),
+                "JitFilter::run: coluna {idx} fora do intervalo (total: {})",
+                cols.len()
+            );
+            let actual_ty = match &cols[idx] {
+                ColumnData::I64(_) => Ty::I64,
+                ColumnData::F64(_) => Ty::F64,
+            };
+            assert_eq!(
+                actual_ty, expected_ty,
+                "JitFilter::run: coluna {idx} tem tipo {actual_ty:?}, esperava {expected_ty:?}"
+            );
+            let col_len = match &cols[idx] {
+                ColumnData::I64(s) => s.len(),
+                ColumnData::F64(s) => s.len(),
+            };
+            assert!(
+                col_len >= n,
+                "JitFilter::run: coluna {idx} tem {col_len} elementos, precisa de >= {n}"
+            );
+        }
+
         let ptrs: Vec<*const u8> = cols
             .iter()
             .map(|c| match c {

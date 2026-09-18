@@ -78,7 +78,7 @@ fn escrever_segmento(dir: &Path, version: u16, eps: &[Episode]) -> Vec<[u8; 32]>
         let payload =
             heraclitus_log::encode_storage_payload_for_version(version, e.id.0.to_bytes(), e)
                 .unwrap();
-        let rec = format::encode_record(version, i as u64, e.ts_hlc, &payload);
+        let rec = format::encode_record(version, i as u64, e.ts_hlc, &payload).unwrap();
         folhas.push(format::record_leaf(version, &rec));
         f.write_all(&rec).unwrap();
     }
@@ -169,7 +169,7 @@ fn folha_e_crc_do_v1_cobrem_so_o_payload_e_do_v2_mais_a_regiao_autenticada() {
         heraclitus_log::encode_storage_payload_for_version(1, e.id.0.to_bytes(), e).unwrap();
 
     for (v, deve_detectar) in [(1u16, false), (2, true), (3, true), (4, true), (5, true)] {
-        let bom = format::encode_record(v, 7, e.ts_hlc, &payload);
+        let bom = format::encode_record(v, 7, e.ts_hlc, &payload).unwrap();
         assert!(
             matches!(format::decode_record(v, &bom), Decoded::Record(7, _, _, _)),
             "v{v}: o registo íntegro tinha de decodificar"
@@ -204,8 +204,8 @@ fn v5_e_v4_diferem_no_crc_e_nao_no_payload() {
     let p5 = heraclitus_log::encode_storage_payload_for_version(5, e.id.0.to_bytes(), e).unwrap();
     assert_eq!(p4, p5, "v4 e v5 partilham o layout do payload");
 
-    let r4 = format::encode_record(4, 0, e.ts_hlc, &p4);
-    let r5 = format::encode_record(5, 0, e.ts_hlc, &p5);
+    let r4 = format::encode_record(4, 0, e.ts_hlc, &p4).unwrap();
+    let r5 = format::encode_record(5, 0, e.ts_hlc, &p5).unwrap();
     assert_ne!(&r4[4..8], &r5[4..8], "o campo CRC tem de diferir");
     assert_eq!(&r4[8..], &r5[8..], "tudo o resto é idêntico");
 

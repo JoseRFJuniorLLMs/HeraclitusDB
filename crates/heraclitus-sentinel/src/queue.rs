@@ -48,6 +48,14 @@ impl SecurityQueue {
         })
     }
 
+    /// # Deprecated
+    ///
+    /// Não usar em código novo. Consumir o `Receiver` directamente contorna o
+    /// decremento de `depth` — o `QueueSnapshot::depth` fica inflado para
+    /// sempre. Usar [`SecurityQueue::recv_timeout`] em vez disso.
+    #[deprecated(
+        note = "contorna o decremento de depth; usar recv_timeout()"
+    )]
     pub fn receiver(&self) -> Receiver<Lsn> {
         self.rx.clone()
     }
