@@ -242,6 +242,8 @@ pub struct Engine {
     /// Estado regulatório dobrado uma vez e estendido pela cauda desde então.
     /// Vive aqui porque o `RegulatoryPolicyEngine` nasce e morre em cada RPC.
     pub regulatory_cache: Arc<heraclitus_compliance::RegulatoryStateCache>,
+    /// Protocolo de administração confiável em duas fases (SPEC-0089).
+    pub trusted_admin: Arc<crate::trusted_admin::TrustedAdminProtocol>,
 }
 
 /// Contrato de encaminhamento de escritas pelo consenso. Implementado pelo
@@ -669,6 +671,7 @@ impl Engine {
             idempotency_locks: (0..IDEMPOTENCY_SHARDS).map(|_| Mutex::new(())).collect(),
             case_locks: (0..IDEMPOTENCY_SHARDS).map(|_| Mutex::new(())).collect(),
             regulatory_cache: Arc::new(heraclitus_compliance::RegulatoryStateCache::default()),
+            trusted_admin: Arc::new(crate::trusted_admin::TrustedAdminProtocol::new()),
             cold_range_reads: std::sync::atomic::AtomicU64::new(0),
             cold_bytes_downloaded: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "tier")]
@@ -789,6 +792,11 @@ impl Engine {
         e.attrs
             .insert("ok".into(), if ok { "true".into() } else { "false".into() });
         self.append(e)
+    }
+
+    /// Retorna o protocolo de administração confiável (SPEC-0089).
+    pub fn trusted_admin(&self) -> &Arc<crate::trusted_admin::TrustedAdminProtocol> {
+        &self.trusted_admin
     }
 
     /// Grava o checkpoint do índice de atributos (o servidor pode chamar

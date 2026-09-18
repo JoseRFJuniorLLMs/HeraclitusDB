@@ -133,6 +133,10 @@ impl JitFilter {
     /// pelo menos `n` elementos.
     pub fn run(&self, cols: &[ColumnData], n: usize) -> Vec<u32> {
         assert!(
+            n <= u32::MAX as usize,
+            "JitFilter::run: número de linhas n ({n}) excede u32::MAX"
+        );
+        assert!(
             cols.len() >= self.n_columns,
             "JitFilter::run: esperava >= {} colunas, recebeu {}",
             self.n_columns,
