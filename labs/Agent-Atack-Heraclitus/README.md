@@ -14,8 +14,11 @@ O runner encerra antes de qualquer teste se um endpoint não for `localhost`, `1
 - `exec` bloqueado em ENFORCE e prova por `upstream_delta`.
 - ferramenta benigna autorizada.
 - JSON-RPC batch misto para procurar bypass.
+- confusão semântica header/body e confusão de método MCP.
+- tentativa de reverse-proxy por caminho arbitrário fora de /mcp.
 - `resources/read` e `prompts/get` para observar cobertura de evidência.
 - fluxo de aprovação, consumo único, replay e mutação de argumentos.
+- corrida concorrente sobre a mesma aprovação: exatamente uma execução pode vencer.
 - flood concorrente de DENY.
 - reload de policy inválida.
 - path traversal no download de bundles sem ler o corpo.
@@ -50,3 +53,7 @@ A saída imprime PASS/FAIL, HTTP status, se foi bloqueado, delta real de chamada
 ## Evidência, sem truques
 
 `redteam_lab` é o depoimento do runner selado no HRKL. Ele deve ser correlacionado com evidência nativa do HeraclitusDB como `PolicyEvaluated`, `ToolDenied`, approvals e `ExternalEffectObserved`. O Dashboard R10 mostra essa diferença explicitamente.
+
+## Complemento de superfícies profundas
+
+Tenant isolation, fault injection administrativo, query resource isolation, rollback/substitution HRKL e hostile Raft peers vivem em ../Deep-RedTeam-Heraclitus/. Os dois laboratórios compõem a campanha Q3; nenhum deles substitui o outro.
