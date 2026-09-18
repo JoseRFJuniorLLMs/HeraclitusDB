@@ -201,9 +201,60 @@ class Lab:
         hs,hb,_=self.request(self.cfg['agent_api'],'/api/v1/agent/status',headers=self.auth_agent()); ok=hs==200
         self.report(Result(aid,'oversized-identity-header','mcp:headers','service remains alive',f'HTTP {s}, health {hs}',ok,s,self.reason(b),blocked=(s in {400,413,431}),detail='16KiB identity header',duration_ms=ms))
 
+    def semantic_confusion(self):
+        aid=self.attack_id('semantic-confusion')
+        before=self.hits()
+        req=self.tool(aid,'exec',{'command':'echo HERACLITUS_SEMANTIC_MISMATCH'})
+        h=self.mcp_headers(); h['mcp-name']='lookup_vendor'
+        s,b,ms=self.request(self.cfg['mcp_gateway'],'/mcp','POST',req,h)
+        after=self.hits(); delta=(after-before) if before is not None and after is not None else None
+        ok=s in {400,403,422} and (delta in {0,None})
+        self.report(Result(aid,'mcp-semantic-confusion','mcp:header-vs-body','reject mismatch and upstreamΔ=0',f'HTTP {s}',ok,s,self.reason(b),blocked=ok,upstream_delta=delta,detail='header benign, body denied tool',duration_ms=ms))
+
+    def method_confusion(self):
+        aid=self.attack_id('method-confusion')
+        before=self.hits()
+        req=self.tool(aid,'exec',{'command':'echo HERACLITUS_METHOD_MISMATCH'})
+        h=self.mcp_headers(); h['mcp-method']='tools/list'
+        s,b,ms=self.request(self.cfg['mcp_gateway'],'/mcp','POST',req,h)
+        after=self.hits(); delta=(after-before) if before is not None and after is not None else None
+        ok=s in {400,403,422} and (delta in {0,None})
+        self.report(Result(aid,'mcp-method-confusion','mcp:method-header-vs-body','reject mismatch and upstreamΔ=0',f'HTTP {s}',ok,s,self.reason(b),blocked=ok,upstream_delta=delta,detail='header says tools/list, body says tools/call',duration_ms=ms))
+
+    def arbitrary_path_bypass(self):
+        aid=self.attack_id('path-bypass')
+        before=self.hits()
+        req=self.tool(aid,'exec',{'command':'echo HERACLITUS_PATH_BYPASS'})
+        s,b,ms=self.request(self.cfg['mcp_gateway'],'/admin/delete','POST',req,self.mcp_headers())
+        after=self.hits(); delta=(after-before) if before is not None and after is not None else None
+        ok=s in {404,405} and (delta in {0,None})
+        self.report(Result(aid,'gateway-arbitrary-path','mcp:/admin/delete','local 404/405 and upstreamΔ=0',f'HTTP {s}',ok,s,self.reason(b),blocked=ok,upstream_delta=delta,duration_ms=ms))
+
+    def approval_race(self):
+        aid=self.attack_id('approval-race')
+        req=self.tool(aid,'send_payment',{'amount':75000,'account':'synthetic-race'})
+        s,b,_=self.request(self.cfg['mcp_gateway'],'/mcp','POST',req,self.mcp_headers())
+        try: approval=b['error']['data']['heraclitus']['approval_id']
+        except Exception: approval=None
+        if s!=202 or not approval:
+            self.report(Result(aid,'approval-concurrent-single-use','mcp:send_payment','202 approval pending','not available',False,s,self.reason(b),blocked=True)); return
+        as_,ab,_=self.request(self.cfg['agent_api'],f'/api/v1/agent/approvals/{approval}/approve','POST',{},self.auth_agent())
+        if as_!=200:
+            self.report(Result(aid,'approval-concurrent-single-use','agent:approve','approval accepted',f'HTTP {as_}',False,as_,self.reason(ab),blocked=True)); return
+        workers=max(2,min(int(self.cfg.get('approval_race_workers',24)),64))
+        before=self.hits()
+        def one(i):
+            return self.request(self.cfg['mcp_gateway'],'/mcp','POST',req,self.mcp_headers(f'{aid}-run'),timeout=10)[0]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            statuses=list(ex.map(one,range(workers)))
+        after=self.hits(); delta=(after-before) if before is not None and after is not None else None
+        successes=sum(x==200 for x in statuses)
+        ok=successes==1 and (delta in {1,None})
+        self.report(Result(aid,'approval-concurrent-single-use','mcp:send_payment','exactly one execution under race',f'{successes}/{workers} HTTP 200',ok,200 if successes else None,'APPROVAL_SINGLE_USE',blocked=ok,upstream_delta=delta,detail=f'approval={approval[:18]}… workers={workers}'))
+
     def run(self):
         print(f'Agent-Atack-Heraclitus campaign={self.campaign} LOOPBACK-ONLY')
-        suites=[self.core_auth_tests,self.grpc_reachability,self.otlp_malformed,self.otlp_oversized,self.mcp_deny,self.mcp_allow,self.mcp_batch,self.protocol_passthrough,self.approval_flow,self.approval_mutation,self.concurrent_deny,self.policy_invalid_reload,self.path_traversal,self.hostile_headers]
+        suites=[self.core_auth_tests,self.grpc_reachability,self.otlp_malformed,self.otlp_oversized,self.mcp_deny,self.mcp_allow,self.mcp_batch,self.semantic_confusion,self.method_confusion,self.arbitrary_path_bypass,self.protocol_passthrough,self.approval_flow,self.approval_mutation,self.approval_race,self.concurrent_deny,self.policy_invalid_reload,self.path_traversal,self.hostile_headers]
         for fn in suites:
             try: fn()
             except Exception as e:
