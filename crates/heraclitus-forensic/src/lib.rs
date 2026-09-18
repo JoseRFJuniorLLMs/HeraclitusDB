@@ -208,4 +208,54 @@ mod tests {
         let result = verifier.verify();
         assert!(matches!(result, Err(VerifierError::MerkleRootMismatch { .. })));
     }
+
+    #[test]
+    fn test_path_traversal_rejected() {
+        let dir = tempdir().unwrap();
+        let target_dir = dir.path().join("evidence_pkg");
+        
+        let manifest = create_test_manifest();
+        let obj = EvidenceObject {
+            object_id: "evil-obj".to_string(),
+            relative_path: "../../evil.txt".to_string(),
+            size_bytes: 4,
+            sha256_hex: "dummy".to_string(),
+            blake3_hex: "dummy".to_string(),
+            content_type: "text/plain".to_string(),
+            source_lsn: None,
+        };
+        let mut builder = EvidencePackageBuilder::new(manifest);
+        builder.add_object_data(obj, b"evil".to_vec());
+        let result = builder.build(&target_dir);
+        assert!(matches!(result, Err(PackageError::PathTraversal(_))));
+    }
+
+    #[test]
+    fn test_tampered_custody_digest_fails() {
+        let dir = tempdir().unwrap();
+        let target_dir = dir.path().join("evidence_pkg");
+        
+        let manifest = create_test_manifest();
+        let mut builder = EvidencePackageBuilder::new(manifest);
+        let mut entry = CustodyEntry {
+            step_index: 0,
+            timestamp_secs: 1600000001,
+            action: CustodyAction::Reconhecimento,
+            operator_principal: "perito-1".to_string(),
+            terminal_or_node: "terminal-01".to_string(),
+            previous_entry_hash: "".to_string(),
+            entry_hash: "".to_string(),
+        };
+        entry.entry_hash = entry.compute_hash();
+        builder.add_custody_entry(entry);
+        builder.build(&target_dir).expect("Failed to build package");
+
+        // Altera o arquivo custody.jsonl sem alterar manifest
+        let custody_file = target_dir.join("provenance/custody.jsonl");
+        fs::write(custody_file, b"{\"tampered\": true}\n").unwrap();
+
+        let verifier = EvidenceVerifier::new(&target_dir);
+        let result = verifier.verify();
+        assert!(matches!(result, Err(VerifierError::CustodyDigestMismatch { .. })));
+    }
 }

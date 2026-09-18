@@ -84,6 +84,8 @@ pub struct ProfileEvaluationReport {
     pub partial_count: usize,
     pub unknown_count: usize,
     pub not_assessed_count: usize,
+    pub not_applicable_count: usize,
+    pub external_count: usize,
     pub bindings: Vec<EvidenceBinding>,
 }
 
@@ -173,6 +175,8 @@ pub fn evaluate_profile(
     let mut partial_count = 0;
     let mut unknown_count = 0;
     let mut not_assessed_count = 0;
+    let mut not_applicable_count = 0;
+    let mut external_count = 0;
     
     let mut bindings = Vec::new();
 
@@ -189,7 +193,8 @@ pub fn evaluate_profile(
                 ControlStatus::Partial => partial_count += 1,
                 ControlStatus::Unknown => unknown_count += 1,
                 ControlStatus::NotAssessed => not_assessed_count += 1,
-                _ => {}
+                ControlStatus::NotApplicable => not_applicable_count += 1,
+                ControlStatus::External => external_count += 1,
             }
             bindings.push(evidence.clone());
         } else {
@@ -217,6 +222,8 @@ pub fn evaluate_profile(
         partial_count,
         unknown_count,
         not_assessed_count,
+        not_applicable_count,
+        external_count,
         bindings,
     }
 }
@@ -275,5 +282,42 @@ mod tests {
         assert_eq!(report.pass_count, 0);
         assert_eq!(report.not_assessed_count, 1);
         assert_eq!(report.bindings[0].status, ControlStatus::NotAssessed);
+    }
+
+    #[test]
+    fn test_evaluate_profile_not_applicable_and_external() {
+        let mut profile = ComplianceProfile::lgpd_brazil_profile();
+        profile.controls.push(ControlDefinition {
+            control_id: "LGPD-Physical".to_string(),
+            title: "Segurança Física de Instalações".to_string(),
+            requirement: "Controle de portaria predial".to_string(),
+            responsibility: Responsibility::Operator,
+            evidence_requirements: vec![],
+            automated_checks: vec![],
+        });
+        
+        let ev1 = EvidenceBinding {
+            control_id: "LGPD-Art46".to_string(),
+            status: ControlStatus::NotApplicable,
+            evidence_description: "Não aplicável ao escopo".to_string(),
+            artifact_digest: "".to_string(),
+            test_reference: "".to_string(),
+            assessed_at_secs: 100,
+        };
+        let ev2 = EvidenceBinding {
+            control_id: "LGPD-Physical".to_string(),
+            status: ControlStatus::External,
+            evidence_description: "Atestado de empresa de vigilância".to_string(),
+            artifact_digest: "ext-123".to_string(),
+            test_reference: "attest-01".to_string(),
+            assessed_at_secs: 100,
+        };
+
+        let report = evaluate_profile(&profile, &[ev1, ev2]);
+        assert_eq!(report.controls_evaluated, 2);
+        assert_eq!(report.not_applicable_count, 1);
+        assert_eq!(report.external_count, 1);
+        assert_eq!(report.pass_count, 0);
+        assert_eq!(report.fail_count, 0);
     }
 }

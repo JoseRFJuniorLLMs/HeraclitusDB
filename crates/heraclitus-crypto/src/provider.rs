@@ -86,7 +86,104 @@ pub struct EncryptionEnvelopeV2 {
     pub ciphertext: Vec<u8>,
 }
 
+/// Cabeçalho estrutural do envelope V2 (legível sem a chave de decifra).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvelopeHeader {
+    pub version: u16,
+    pub tenant: TenantId,
+    pub key_id: String,
+    pub key_epoch: u64,
+    pub algorithm: String,
+    pub nonce: [u8; 12],
+    pub aad_digest: [u8; 32],
+    pub ciphertext_offset: usize,
+}
+
 impl EncryptionEnvelopeV2 {
+    /// Inspeciona e valida o cabeçalho do envelope sem necessidade da chave criptográfica.
+    /// Permite descobrir `tenant`, `key_id` e `key_epoch` para requisição ao KMS / KeyProvider.
+    pub fn peek_header(envelope_bytes: &[u8]) -> Option<EnvelopeHeader> {
+        if envelope_bytes.len() < 2 {
+            return None;
+        }
+
+        let mut offset = 0;
+        let version = u16::from_be_bytes(envelope_bytes[offset..offset + 2].try_into().ok()?);
+        offset += 2;
+        if version != 2 {
+            return None;
+        }
+
+        // tenant
+        if envelope_bytes.len() < offset + 2 {
+            return None;
+        }
+        let tenant_len = u16::from_be_bytes(envelope_bytes[offset..offset + 2].try_into().ok()?) as usize;
+        offset += 2;
+        if envelope_bytes.len() < offset + tenant_len {
+            return None;
+        }
+        let tenant_str = std::str::from_utf8(&envelope_bytes[offset..offset + tenant_len]).ok()?;
+        let tenant = TenantId::new(tenant_str.to_string()).ok()?;
+        offset += tenant_len;
+
+        // key_id
+        if envelope_bytes.len() < offset + 2 {
+            return None;
+        }
+        let key_id_len = u16::from_be_bytes(envelope_bytes[offset..offset + 2].try_into().ok()?) as usize;
+        offset += 2;
+        if envelope_bytes.len() < offset + key_id_len {
+            return None;
+        }
+        let key_id = std::str::from_utf8(&envelope_bytes[offset..offset + key_id_len]).ok()?.to_string();
+        offset += key_id_len;
+
+        // key_epoch
+        if envelope_bytes.len() < offset + 8 {
+            return None;
+        }
+        let key_epoch = u64::from_be_bytes(envelope_bytes[offset..offset + 8].try_into().ok()?);
+        offset += 8;
+
+        // algorithm
+        if envelope_bytes.len() < offset + 2 {
+            return None;
+        }
+        let algo_len = u16::from_be_bytes(envelope_bytes[offset..offset + 2].try_into().ok()?) as usize;
+        offset += 2;
+        if envelope_bytes.len() < offset + algo_len {
+            return None;
+        }
+        let algorithm = std::str::from_utf8(&envelope_bytes[offset..offset + algo_len]).ok()?.to_string();
+        offset += algo_len;
+
+        // nonce (12 bytes)
+        if envelope_bytes.len() < offset + 12 {
+            return None;
+        }
+        let nonce: [u8; 12] = envelope_bytes[offset..offset + 12].try_into().ok()?;
+        offset += 12;
+
+        // aad_digest (32 bytes)
+        if envelope_bytes.len() < offset + 32 {
+            return None;
+        }
+        let aad_digest: [u8; 32] = envelope_bytes[offset..offset + 32].try_into().ok()?;
+        offset += 32;
+
+        Some(EnvelopeHeader {
+            version,
+            tenant,
+            key_id,
+            key_epoch,
+            algorithm,
+            nonce,
+            aad_digest,
+            ciphertext_offset: offset,
+        })
+    }
+
     /// Sela dados e cria o envelope binário V2.
     pub fn seal(
         key: &[u8; 32],
@@ -118,12 +215,14 @@ impl EncryptionEnvelopeV2 {
 
         // tenant (tamanho + bytes)
         let tenant_bytes = tenant.as_str().as_bytes();
-        result.extend_from_slice(&(tenant_bytes.len() as u16).to_be_bytes());
+        let tenant_len: u16 = tenant_bytes.len().try_into().expect("tenant id excede u16::MAX");
+        result.extend_from_slice(&tenant_len.to_be_bytes());
         result.extend_from_slice(tenant_bytes);
 
         // key_id
         let key_id_bytes = key_id.as_bytes();
-        result.extend_from_slice(&(key_id_bytes.len() as u16).to_be_bytes());
+        let key_id_len: u16 = key_id_bytes.len().try_into().expect("key_id excede u16::MAX");
+        result.extend_from_slice(&key_id_len.to_be_bytes());
         result.extend_from_slice(key_id_bytes);
 
         // key_epoch
@@ -132,7 +231,8 @@ impl EncryptionEnvelopeV2 {
         // algorithm
         let algo = "ChaCha20-Poly1305";
         let algo_bytes = algo.as_bytes();
-        result.extend_from_slice(&(algo_bytes.len() as u16).to_be_bytes());
+        let algo_len: u16 = algo_bytes.len().try_into().expect("algorithm excede u16::MAX");
+        result.extend_from_slice(&algo_len.to_be_bytes());
         result.extend_from_slice(algo_bytes);
 
         // nonce
@@ -149,85 +249,19 @@ impl EncryptionEnvelopeV2 {
 
     /// Abre o envelope binário V2 e retorna os dados em texto plano.
     pub fn open(key: &[u8; 32], envelope_bytes: &[u8], expected_aad: &[u8]) -> Option<Vec<u8>> {
-        if envelope_bytes.len() < 2 {
-            return None;
-        }
-
-        let mut offset = 0;
-        let version = u16::from_be_bytes(envelope_bytes[offset..offset + 2].try_into().ok()?);
-        offset += 2;
-        if version != 2 {
-            return None;
-        }
-
-        // tenant
-        if envelope_bytes.len() < offset + 2 {
-            return None;
-        }
-        let tenant_len = u16::from_be_bytes(envelope_bytes[offset..offset + 2].try_into().ok()?) as usize;
-        offset += 2;
-        if envelope_bytes.len() < offset + tenant_len {
-            return None;
-        }
-        let _tenant_str = std::str::from_utf8(&envelope_bytes[offset..offset + tenant_len]).ok()?;
-        offset += tenant_len;
-
-        // key_id
-        if envelope_bytes.len() < offset + 2 {
-            return None;
-        }
-        let key_id_len = u16::from_be_bytes(envelope_bytes[offset..offset + 2].try_into().ok()?) as usize;
-        offset += 2;
-        if envelope_bytes.len() < offset + key_id_len {
-            return None;
-        }
-        let _key_id_str = std::str::from_utf8(&envelope_bytes[offset..offset + key_id_len]).ok()?;
-        offset += key_id_len;
-
-        // key_epoch
-        if envelope_bytes.len() < offset + 8 {
-            return None;
-        }
-        let _epoch = u64::from_be_bytes(envelope_bytes[offset..offset + 8].try_into().ok()?);
-        offset += 8;
-
-        // algorithm
-        if envelope_bytes.len() < offset + 2 {
-            return None;
-        }
-        let algo_len = u16::from_be_bytes(envelope_bytes[offset..offset + 2].try_into().ok()?) as usize;
-        offset += 2;
-        if envelope_bytes.len() < offset + algo_len {
-            return None;
-        }
-        let _algo_str = std::str::from_utf8(&envelope_bytes[offset..offset + algo_len]).ok()?;
-        offset += algo_len;
-
-        // nonce (12 bytes)
-        if envelope_bytes.len() < offset + 12 {
-            return None;
-        }
-        let nonce = &envelope_bytes[offset..offset + 12];
-        offset += 12;
-
-        // aad_digest (32 bytes)
-        if envelope_bytes.len() < offset + 32 {
-            return None;
-        }
-        let aad_digest = &envelope_bytes[offset..offset + 32];
-        offset += 32;
+        let header = Self::peek_header(envelope_bytes)?;
 
         // Verificar aad_digest com BLAKE3
         let expected_digest = *blake3::hash(expected_aad).as_bytes();
-        if aad_digest != expected_digest {
+        if header.aad_digest != expected_digest {
             return None;
         }
 
-        let ct = &envelope_bytes[offset..];
+        let ct = &envelope_bytes[header.ciphertext_offset..];
         let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
         cipher
             .decrypt(
-                Nonce::from_slice(nonce),
+                Nonce::from_slice(&header.nonce),
                 Payload {
                     msg: ct,
                     aad: expected_aad,
@@ -242,6 +276,7 @@ pub trait KeyProvider: Send + Sync {
     fn provider_id(&self) -> &str;
     fn capabilities(&self) -> KeyCapabilities;
     fn generate_data_key(&self, tenant: &TenantId) -> Result<(KeyRef, [u8; 32]), String>;
+    fn wrap_data_key(&self, tenant: &TenantId, data_key: &[u8; 32]) -> Result<WrappedDataKey, String>;
     fn unwrap_data_key(&self, key: &WrappedDataKey) -> Result<[u8; 32], String>;
     fn rotate(&self, tenant: &TenantId) -> Result<KeyRef, String>;
     fn destroy(&self, key: &KeyRef) -> Result<DestroyReceipt, String>;
@@ -324,8 +359,64 @@ impl KeyProvider for SoftwareKeyProvider {
         Ok((key_ref, data_key))
     }
 
-    fn unwrap_data_key(&self, _key: &WrappedDataKey) -> Result<[u8; 32], String> {
-        Err("Não implementado para SoftwareKeyProvider na versão base".into())
+    fn wrap_data_key(&self, tenant: &TenantId, data_key: &[u8; 32]) -> Result<WrappedDataKey, String> {
+        let master = self.get_or_create_master_key(tenant);
+        let epoch = self.get_epoch(tenant);
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&master));
+        let mut nonce = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let ct = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: data_key,
+                    aad: tenant.as_str().as_bytes(),
+                },
+            )
+            .map_err(|e| format!("wrap error: {e}"))?;
+        let mut wrapped = Vec::with_capacity(12 + ct.len());
+        wrapped.extend_from_slice(&nonce);
+        wrapped.extend_from_slice(&ct);
+
+        Ok(WrappedDataKey {
+            key_ref: KeyRef {
+                tenant: tenant.clone(),
+                key_id: format!("{}-key-{}", tenant.as_str(), epoch),
+                epoch,
+            },
+            wrapped_ciphertext: wrapped,
+            wrapping_algorithm: "ChaCha20-Poly1305".into(),
+            created_at_secs: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+        })
+    }
+
+    fn unwrap_data_key(&self, key: &WrappedDataKey) -> Result<[u8; 32], String> {
+        let master = {
+            let keys = self.master_keys.lock().unwrap();
+            keys.get(&key.key_ref.tenant).copied().ok_or_else(|| {
+                format!(
+                    "Chave mestre para tenant {} não encontrada (chave destruída ou inexistente)",
+                    key.key_ref.tenant.as_str()
+                )
+            })?
+        };
+        if key.wrapped_ciphertext.len() < 12 {
+            return Err("ciphertext encapsulado inválido (menor que nonce)".into());
+        }
+        let nonce = &key.wrapped_ciphertext[..12];
+        let ct = &key.wrapped_ciphertext[12..];
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&master));
+        let pt = cipher
+            .decrypt(
+                Nonce::from_slice(nonce),
+                Payload {
+                    msg: ct,
+                    aad: key.key_ref.tenant.as_str().as_bytes(),
+                },
+            )
+            .map_err(|e| format!("desencapsulamento falhou: {e}"))?;
+        pt.try_into()
+            .map_err(|_| "tamanho de chave desencapsulada incorreto".into())
     }
 
     fn rotate(&self, tenant: &TenantId) -> Result<KeyRef, String> {
@@ -344,11 +435,26 @@ impl KeyProvider for SoftwareKeyProvider {
     }
 
     fn destroy(&self, key: &KeyRef) -> Result<DestroyReceipt, String> {
+        let mut keys = self.master_keys.lock().unwrap();
+        let existed = keys.remove(&key.tenant).is_some();
+        let destroyed_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(key.tenant.as_str().as_bytes());
+        hasher.update(key.key_id.as_bytes());
+        hasher.update(&key.epoch.to_be_bytes());
+        hasher.update(&destroyed_at.to_be_bytes());
+        hasher.update(if existed { b"destroyed" } else { b"not_found" });
+        let proof_digest = hasher.finalize().to_hex().to_string();
+
         Ok(DestroyReceipt {
             key_ref: key.clone(),
-            destroyed_at_secs: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-            provider_signature: None,
-            proof_digest: "dummy-proof".into(),
+            destroyed_at_secs: destroyed_at,
+            provider_signature: Some(format!("sig-software-{}", proof_digest)),
+            proof_digest,
         })
     }
 
@@ -408,5 +514,35 @@ mod tests {
         let wrong_aad = b"Contexto alterado";
         let opened_wrong = EncryptionEnvelopeV2::open(&key, &envelope_bytes, wrong_aad);
         assert!(opened_wrong.is_none());
+
+        // Inspecionar cabeçalho sem possuir a chave
+        let header = EncryptionEnvelopeV2::peek_header(&envelope_bytes).expect("Falha ao ler header");
+        assert_eq!(header.tenant.as_str(), "tenant-abc");
+        assert_eq!(header.key_id, "key-123");
+        assert_eq!(header.key_epoch, 1);
+    }
+
+    #[test]
+    fn test_wrap_unwrap_and_crypto_shred() {
+        let provider = SoftwareKeyProvider::new();
+        let tenant = TenantId::new("tenant-shred".to_string()).unwrap();
+
+        let (_kref, data_key) = provider.generate_data_key(&tenant).unwrap();
+
+        // Encapsula chave de dados
+        let wrapped = provider.wrap_data_key(&tenant, &data_key).expect("wrap falhou");
+
+        // Desencapsula com sucesso
+        let unwrapped = provider.unwrap_data_key(&wrapped).expect("unwrap falhou");
+        assert_eq!(unwrapped, data_key);
+
+        // Executa crypto-shred da chave mestre do tenant
+        let receipt = provider.destroy(&wrapped.key_ref).expect("destroy falhou");
+        assert!(!receipt.proof_digest.is_empty());
+        assert!(receipt.provider_signature.is_some());
+
+        // Nova tentativa de unwrap deve falhar (chave destruída)
+        let unwrap_after_shred = provider.unwrap_data_key(&wrapped);
+        assert!(unwrap_after_shred.is_err(), "unwrap deveria falhar após crypto-shred");
     }
 }

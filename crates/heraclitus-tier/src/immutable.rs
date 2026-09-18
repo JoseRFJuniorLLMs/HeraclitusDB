@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 
 /// Modos de retenção suportados.
 #[derive(Debug, Clone, PartialEq)]
@@ -92,9 +90,7 @@ impl LocalWormBackend {
     }
     
     fn compute_digest(data: &[u8]) -> String {
-        let mut hasher = DefaultHasher::new();
-        data.hash(&mut hasher);
-        format!("{:016x}", hasher.finish())
+        blake3::hash(data).to_hex().to_string()
     }
 
     /// Recupera os dados binários do objeto armazenado.

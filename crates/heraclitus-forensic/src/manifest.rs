@@ -77,13 +77,27 @@ pub struct CustodyEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CustodyAction {
+    /// 1. Reconhecimento (CPP Art. 158-B, I)
+    Reconhecimento,
+    /// 2. Isolamento (CPP Art. 158-B, II)
+    Isolamento,
+    /// 3. Fixação (CPP Art. 158-B, III)
     Fixacao,
+    /// 4. Coleta (CPP Art. 158-B, IV)
     Coleta,
+    /// 5. Acondicionamento (CPP Art. 158-B, V)
     Acondicionamento,
+    /// 6. Transporte (CPP Art. 158-B, VI)
     Transporte,
+    /// 7. Recebimento (CPP Art. 158-B, VII)
     Recebimento,
+    /// 8. Processamento (CPP Art. 158-B, VIII)
     Processamento,
+    /// 9. Armazenamento / Guarda (CPP Art. 158-B, IX)
+    Armazenamento,
     Guarda,
+    /// 10. Descarte (CPP Art. 158-B, X)
+    Descarte,
 }
 
 impl CustodyEntry {

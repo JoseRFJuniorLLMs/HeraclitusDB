@@ -16,10 +16,30 @@ pub enum VerifierError {
     ObjectChecksumMismatch { path: String, expected: String, actual: String },
     #[error("Broken custody chain at step {step}")]
     BrokenCustodyChain { step: u64 },
+    #[error("Custody digest mismatch: expected {expected}, got {actual}")]
+    CustodyDigestMismatch { expected: String, actual: String },
     #[error("Merkle root mismatch: expected {expected}, got {actual}")]
     MerkleRootMismatch { expected: String, actual: String },
     #[error("Missing file: {0}")]
     MissingFile(String),
+    #[error("Path traversal detected: {0}")]
+    PathTraversal(String),
+}
+
+pub(crate) fn validate_safe_relative_path(path_str: &str) -> bool {
+    let path = Path::new(path_str);
+    if path.is_absolute() {
+        return false;
+    }
+    for comp in path.components() {
+        match comp {
+            std::path::Component::ParentDir | std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 pub struct EvidenceVerifier {
@@ -62,6 +82,10 @@ impl EvidenceVerifier {
 
         // Verify objects
         for obj in &manifest.objects {
+            if !validate_safe_relative_path(&obj.relative_path) {
+                return Err(VerifierError::PathTraversal(obj.relative_path.clone()));
+            }
+
             let obj_path = self.package_dir.join(&obj.relative_path);
             if !obj_path.exists() {
                 return Err(VerifierError::MissingFile(obj.relative_path.clone()));
@@ -91,6 +115,22 @@ impl EvidenceVerifier {
 
         // Verify custody chain
         let custody_path = self.package_dir.join("provenance").join("custody.jsonl");
+        if !manifest.custody_digest.is_empty() {
+            if !custody_path.exists() {
+                return Err(VerifierError::MissingFile("provenance/custody.jsonl".to_string()));
+            }
+            let custody_bytes = fs::read(&custody_path)?;
+            let mut hasher = Sha256::new();
+            hasher.update(&custody_bytes);
+            let actual_custody_digest = hex::encode(hasher.finalize());
+            if actual_custody_digest != manifest.custody_digest {
+                return Err(VerifierError::CustodyDigestMismatch {
+                    expected: manifest.custody_digest.clone(),
+                    actual: actual_custody_digest,
+                });
+            }
+        }
+
         if custody_path.exists() {
             let custody_content = fs::read_to_string(&custody_path)?;
             let mut previous_hash = String::new();
