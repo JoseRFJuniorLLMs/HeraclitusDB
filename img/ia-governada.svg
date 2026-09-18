@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1800" viewBox="0 0 1600 1800">
+  <defs>
+    <filter id="s"><feDropShadow dx="0" dy="12" stdDeviation="14" flood-opacity=".18"/></filter>
+    <marker id="a" markerWidth="12" markerHeight="12" refX="6" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 Z" fill="#4aaaeb"/></marker>
+  </defs>
+  <rect width="1600" height="1800" fill="#f6f9fc"/>
+  <g font-family="Arial, sans-serif" text-anchor="middle">
+    <g filter="url(#s)"><rect x="260" y="55" width="1080" height="160" rx="44" fill="#0a294a"/><text x="800" y="155" font-size="64" font-weight="700" fill="#fff">IA GOVERNADA</text></g>
+    
+      <line x1="800" y1="215" x2="800" y2="265" stroke="#4aaaeb" stroke-width="9" marker-end="url(#a)"/>
+      <g filter="url(#s)">
+        <rect x="360" y="285" width="880" height="140" rx="34" fill="#145380" />
+        <text x="800" y="373" font-size="44" font-weight="700" fill="#fff">AGENTE</text>
+      </g>
+      <line x1="800" y1="425" x2="800" y2="480" stroke="#4aaaeb" stroke-width="9" marker-end="url(#a)"/>
+      <g filter="url(#s)">
+        <rect x="360" y="500" width="880" height="140" rx="34" fill="#2d455b" />
+        <text x="800" y="588" font-size="44" font-weight="700" fill="#fff">SOLICITAÇÃO</text>
+      </g>
+      <line x1="800" y1="640" x2="800" y2="695" stroke="#4aaaeb" stroke-width="9" marker-end="url(#a)"/>
+      <g filter="url(#s)">
+        <rect x="360" y="715" width="880" height="140" rx="34" fill="#0a294a" />
+        <text x="800" y="803" font-size="38" font-weight="700" fill="#fff">DECISÃO DE POLÍTICA</text>
+      </g>
+      <line x1="800" y1="855" x2="800" y2="910" stroke="#4aaaeb" stroke-width="9" marker-end="url(#a)"/>
+      <g filter="url(#s)">
+        <rect x="360" y="930" width="880" height="140" rx="34" fill="#145380" />
+        <text x="800" y="1018" font-size="44" font-weight="700" fill="#fff">APROVAÇÃO</text>
+      </g>
+      <line x1="800" y1="1070" x2="800" y2="1125" stroke="#4aaaeb" stroke-width="9" marker-end="url(#a)"/>
+      <g filter="url(#s)">
+        <rect x="280" y="1145" width="1040" height="140" rx="34" fill="#2d455b" />
+        <text x="800" y="1233" font-size="36" font-weight="700" fill="#fff">EXECUÇÃO DA FERRAMENTA</text>
+      </g>
+      <line x1="800" y1="1285" x2="800" y2="1340" stroke="#4aaaeb" stroke-width="9" marker-end="url(#a)"/>
+      <g filter="url(#s)">
+        <rect x="360" y="1360" width="880" height="140" rx="34" fill="#145380" />
+        <text x="800" y="1448" font-size="44" font-weight="700" fill="#fff">RESULTADO</text>
+      </g>
+      <line x1="800" y1="1500" x2="800" y2="1555" stroke="#4aaaeb" stroke-width="9" marker-end="url(#a)"/>
+      <g filter="url(#s)">
+        <rect x="360" y="1575" width="880" height="150" rx="34" fill="#0a294a" stroke="#64c8ff" stroke-width="5"/>
+        <text x="800" y="1670" font-size="44" font-weight="700" fill="#fff">EVIDÊNCIA</text>
+      </g>
+  </g>
+</svg>

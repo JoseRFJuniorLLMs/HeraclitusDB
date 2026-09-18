@@ -32,27 +32,9 @@ Ele foi projetado como uma **camada de confiança** entre sistemas que produzem 
 
 A ideia é simples:
 
-~~~text
-Sistemas institucionais
-        |
-        v
-     INGEST
-        |
-        v
-    PRESERVE
-        |
-        v
-      PROVE
-        |
-        v
-     CONTROL
-        |
-        v
-      AUDIT
-        |
-        v
-EXPORT VERIFIABLE EVIDENCE
-~~~
+<p align="center">
+  <img src="img/fluxo-institucional.svg" alt="Fluxo institucional do HeraclitusDB: ingestão, preservação, prova, controle, auditoria e exportação de evidência verificável" width="900" />
+</p>
 
 SIAFI, SEI, ERPs, aplicações administrativas, SOCs, sistemas policiais, plataformas de IA e bancos tradicionais podem continuar fazendo aquilo para que foram construídos.
 
@@ -74,27 +56,9 @@ O produto passa a ser organizado em torno de cinco capacidades fundamentais:
 
 Essa orientação muda o papel do banco.
 
-~~~text
-                     HERACLITUSDB
-                          |
-        +-----------------+-----------------+
-        |                 |                 |
-        v                 v                 v
-    DATA PLANE        SECURITY PLANE      TRUST PLANE
-    HRKL / Raft       Sentinel / Agents   Merkle / RFC3161
-    Views / Query     Policy / Approval   Crypto / Compliance
-        |                 |                 |
-        +-----------------+-----------------+
-                          |
-                          v
-                    EVIDENCE PLANE
-                 Provenance / Custody
-                Proofs / Legal Hold
-                          |
-                          v
-                 INTEROPERABILITY
-             SQL / Flight / Lakehouse
-~~~
+<p align="center">
+  <img src="img/arquitetura-planos.svg" alt="Arquitetura do HeraclitusDB em planos de dados, segurança, confiança, evidências e interoperabilidade" width="900" />
+</p>
 
 ---
 
@@ -161,21 +125,9 @@ O objetivo não é confiar em um agente porque ele “parece inteligente”.
 
 O objetivo é poder reconstruir:
 
-~~~text
-agent
-  |
-request
-  |
-policy decision
-  |
-approval
-  |
-tool execution
-  |
-result
-  |
-evidence
-~~~
+<p align="center">
+  <img src="img/ia-governada.svg" alt="Fluxo de IA governada do HeraclitusDB, da solicitação do agente até a evidência auditável" width="760" />
+</p>
 
 ---
 
