@@ -383,6 +383,10 @@ impl TrustedAdminProtocol {
         intent_lsn: Lsn,
         result_lsn: Option<Lsn>,
     ) {
+        let mut active = self.active_operations.write().unwrap();
+        active.remove(idempotency_key);
+        drop(active);
+
         let mut map = self.idempotency_map.lock().unwrap();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -401,13 +405,27 @@ impl TrustedAdminProtocol {
     }
 
     /// Consulta se uma operação já foi processada anteriormente por idempotency_key.
-    pub fn query_idempotency(&self, idempotency_key: &str) -> Option<(AdminState, Lsn, Option<Lsn>)> {
+    pub fn query_idempotency(&self, idempotency_key: &str) -> Option<(AdminState, Lsn, Option<Lsn>, Option<u64>)> {
         let map = self.idempotency_map.lock().unwrap();
-        map.get(idempotency_key).map(|e| (e.state, e.intent_lsn, e.result_lsn))
+        map.get(idempotency_key).map(|e| (e.state, e.intent_lsn, e.result_lsn, e.completed_at_secs))
+    }
+
+    /// Retorna o estado de uma operação ativa ou registrada por idempotency_key.
+    pub fn get_operation_state(&self, idempotency_key: &str) -> Option<AdminState> {
+        let active = self.active_operations.read().unwrap();
+        if let Some(state) = active.get(idempotency_key) {
+            return Some(*state);
+        }
+        let map = self.idempotency_map.lock().unwrap();
+        map.get(idempotency_key).map(|e| e.state)
     }
 
     /// Cria um token de execução após a persistência da intenção (Fase 2).
     pub fn create_execution_token(&self, operation_id: String, intent_lsn: Lsn) -> AdminExecutionToken {
+        let mut active = self.active_operations.write().unwrap();
+        active.insert(operation_id.clone(), AdminState::IntentDurable);
+        drop(active);
+
         AdminExecutionToken {
             operation_id,
             intent_lsn,

@@ -2323,6 +2323,13 @@ impl V6Log {
         let opaque_meta = episode.id.0.to_bytes();
         let payload =
             crate::encode_storage_payload_v6(opaque_meta, &episode, self.keystore.as_deref())?;
+        if payload.len() > crate::format::MAX_RECORD_PAYLOAD {
+            return Err(HeraclitusError::StorageEngine(format!(
+                "payload V6 de {} bytes excede o máximo permitido ({} bytes)",
+                payload.len(),
+                crate::format::MAX_RECORD_PAYLOAD
+            )));
+        }
         if let Some(expected) = expected_lsn {
             if expected != state.next_lsn {
                 return Err(HeraclitusError::CasConflict {

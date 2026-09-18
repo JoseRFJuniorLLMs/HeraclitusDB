@@ -97,6 +97,16 @@ impl LocalWormBackend {
         format!("{:016x}", hasher.finish())
     }
 
+    /// Recupera os dados binários do objeto armazenado.
+    pub fn get_data(&self, object_id: &str) -> Result<Vec<u8>, String> {
+        let store = self.store.read().map_err(|_| "Falha ao adquirir o lock".to_string())?;
+        if let Some(record) = store.get(object_id) {
+            Ok(record.data.clone())
+        } else {
+            Err("Objeto não encontrado".to_string())
+        }
+    }
+
     fn eval_retention(policy: &RetentionPolicy, now_secs: u64) -> RetentionStatus {
         if policy.legal_hold {
             RetentionStatus::IndefiniteLegalHold

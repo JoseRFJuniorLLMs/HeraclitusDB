@@ -174,4 +174,38 @@ mod tests {
         let result = verifier.verify();
         assert!(matches!(result, Err(VerifierError::BrokenCustodyChain { .. })));
     }
+
+    #[test]
+    fn test_merkle_root_mismatch_fails() {
+        let dir = tempdir().unwrap();
+        let target_dir = dir.path().join("evidence_pkg");
+        
+        let mut manifest = create_test_manifest();
+        manifest.merkle.root_blake3 = "bad-merkle-root-blake3".to_string();
+        
+        let data = b"test content";
+        let mut sha256 = Sha256::new();
+        sha256.update(data);
+        let sha256_hex = hex::encode(sha256.finalize());
+        let blake3_hex = blake3::hash(data).to_hex().to_string();
+        
+        let obj = EvidenceObject {
+            object_id: "obj-1".to_string(),
+            relative_path: "evidence/file1.txt".to_string(),
+            size_bytes: data.len() as u64,
+            sha256_hex,
+            blake3_hex,
+            content_type: "text/plain".to_string(),
+            source_lsn: Some(10),
+        };
+        manifest.objects.push(obj.clone());
+        
+        let mut builder = EvidencePackageBuilder::new(manifest);
+        builder.add_object_data(obj, data.to_vec());
+        builder.build(&target_dir).expect("Failed to build package");
+        
+        let verifier = EvidenceVerifier::new(&target_dir);
+        let result = verifier.verify();
+        assert!(matches!(result, Err(VerifierError::MerkleRootMismatch { .. })));
+    }
 }

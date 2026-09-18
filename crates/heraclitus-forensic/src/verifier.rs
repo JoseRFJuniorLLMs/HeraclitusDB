@@ -116,16 +116,18 @@ impl EvidenceVerifier {
         }
 
         // Verify Merkle
-        // Simplistic reproduction of merkle root from objects for the sake of example
-        // In a real implementation this would verify the proof trees
-        let mut hasher = blake3::Hasher::new();
-        for obj in &manifest.objects {
-            hasher.update(obj.blake3_hex.as_bytes());
-        }
-        let computed_root_blake3 = hasher.finalize().to_hex().to_string();
-        if computed_root_blake3 != manifest.merkle.root_blake3 && !manifest.objects.is_empty() {
-            // Only enforce if we actually recomputed and there were objects (or the logic to recompute matches)
-            // For now, let's just make sure it passes tests if set correctly
+        if !manifest.merkle.root_blake3.is_empty() && !manifest.objects.is_empty() {
+            let mut hasher = blake3::Hasher::new();
+            for obj in &manifest.objects {
+                hasher.update(obj.blake3_hex.as_bytes());
+            }
+            let computed_root_blake3 = hasher.finalize().to_hex().to_string();
+            if computed_root_blake3 != manifest.merkle.root_blake3 {
+                return Err(VerifierError::MerkleRootMismatch {
+                    expected: manifest.merkle.root_blake3.clone(),
+                    actual: computed_root_blake3,
+                });
+            }
         }
 
         Ok(manifest)
