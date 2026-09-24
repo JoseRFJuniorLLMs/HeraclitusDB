@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1800" viewBox="0 0 1600 1800">
+  <defs>
+    <filter id="s"><feDropShadow dx="0" dy="12" stdDeviation="14" flood-opacity=".18"/></filter>
+    <marker id="a" markerWidth="12" markerHeight="12" refX="6" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 Z" fill="#4aaaeb"/></marker>
+  </defs>
+  <rect width="1600" height="1800" fill="#f6f9fc"/>
+  <g font-family="Arial, sans-serif" text-anchor="middle">
+    <g filter="url(#s)"><rect x="250" y="70" width="1100" height="175" rx="44" fill="#0a294a"/><text x="800" y="180" font-size="70" font-weight="700" fill="#fff">HERACLITUSDB</text></g>
+    <g stroke="#4aaaeb" stroke-width="9" fill="none">
+      <line x1="800" y1="245" x2="800" y2="320"/>
+      <line x1="390" y1="320" x2="1210" y2="320"/>
+      <line x1="390" y1="320" x2="390" y2="380" marker-end="url(#a)"/>
+      <line x1="800" y1="320" x2="800" y2="380" marker-end="url(#a)"/>
+      <line x1="1210" y1="320" x2="1210" y2="380" marker-end="url(#a)"/>
+    </g>
+    <g filter="url(#s)">
+      <rect x="120" y="390" width="500" height="360" rx="36" fill="#145380"/>
+      <text x="370" y="485" font-size="43" font-weight="700" fill="#fff">PLANO DE DADOS</text>
+      <line x1="180" y1="525" x2="560" y2="525" stroke="#ffffff55" stroke-width="3"/>
+      <text x="370" y="610" font-size="32" fill="#fff">HRKL / Raft</text>
+      <text x="370" y="685" font-size="32" fill="#fff">Visões / Consultas</text>
+    </g>
+    <g filter="url(#s)">
+      <rect x="550" y="390" width="500" height="360" rx="36" fill="#2d455b"/>
+      <text x="800" y="475" font-size="38" font-weight="700" fill="#fff">PLANO DE SEGURANÇA</text>
+      <line x1="610" y1="525" x2="990" y2="525" stroke="#ffffff55" stroke-width="3"/>
+      <text x="800" y="610" font-size="32" fill="#fff">Sentinel / Agentes</text>
+      <text x="800" y="685" font-size="32" fill="#fff">Política / Aprovação</text>
+    </g>
+    <g filter="url(#s)">
+      <rect x="980" y="390" width="500" height="360" rx="36" fill="#0a294a"/>
+      <text x="1230" y="475" font-size="38" font-weight="700" fill="#fff">PLANO DE CONFIANÇA</text>
+      <line x1="1040" y1="525" x2="1420" y2="525" stroke="#ffffff55" stroke-width="3"/>
+      <text x="1230" y="610" font-size="32" fill="#fff">Merkle / RFC 3161</text>
+      <text x="1230" y="685" font-size="30" fill="#fff">Criptografia / Conformidade</text>
+    </g>
+    <g stroke="#4aaaeb" stroke-width="9" fill="none">
+      <line x1="370" y1="750" x2="370" y2="850"/>
+      <line x1="800" y1="750" x2="800" y2="850"/>
+      <line x1="1230" y1="750" x2="1230" y2="850"/>
+      <line x1="370" y1="850" x2="1230" y2="850"/>
+      <line x1="800" y1="850" x2="800" y2="940" marker-end="url(#a)"/>
+    </g>
+    <g filter="url(#s)">
+      <rect x="330" y="960" width="940" height="300" rx="40" fill="#1c3750"/>
+      <text x="800" y="1050" font-size="50" font-weight="700" fill="#fff">PLANO DE EVIDÊNCIAS</text>
+      <line x1="430" y1="1090" x2="1170" y2="1090" stroke="#ffffff55" stroke-width="3"/>
+      <text x="800" y="1160" font-size="31" fill="#fff">Proveniência / Cadeia de custódia</text>
+      <text x="800" y="1220" font-size="31" fill="#fff">Provas / Retenção legal</text>
+    </g>
+    <line x1="800" y1="1260" x2="800" y2="1360" stroke="#4aaaeb" stroke-width="9" marker-end="url(#a)"/>
+    <g filter="url(#s)">
+      <rect x="280" y="1380" width="1040" height="280" rx="46" fill="#0a294a" stroke="#64c8ff" stroke-width="5"/>
+      <text x="800" y="1490" font-size="52" font-weight="700" fill="#fff">INTEROPERABILIDADE</text>
+      <line x1="430" y1="1530" x2="1170" y2="1530" stroke="#ffffff55" stroke-width="3"/>
+      <text x="800" y="1610" font-size="36" fill="#fff">SQL / Flight / Lakehouse</text>
+    </g>
+  </g>
+</svg>

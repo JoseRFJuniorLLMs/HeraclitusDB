@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "campaigns": [
     "sast",
     "dependency_audit",
@@ -10,17 +10,105 @@
     "tenant_isolation",
     "configuration_abuse",
     "resource_exhaustion",
+    "privileged_admin_fault",
+    "hrkl_rollback_substitution",
+    "raft_hostile_peer",
     "red_team"
   ],
+  "deep_redteam": {
+    "runner": "labs/Deep-RedTeam-Heraclitus/runner.py",
+    "report_schema": "heraclitus-deep-redteam/1",
+    "required_campaigns": [
+      {
+        "id": "tenant-isolation",
+        "severity_if_failed": "critical",
+        "attacks": [
+          "TENANT-identity-dominates-caller-input",
+          "TENANT-cross-read-telemetry",
+          "TENANT-cross-read-security-events",
+          "TENANT-cross-read-agent-evidence",
+          "TENANT-cross-query-text-vector-graph",
+          "TENANT-cross-as-of-cold-export"
+        ]
+      },
+      {
+        "id": "privileged-admin-fault",
+        "severity_if_failed": "critical",
+        "attacks": [
+          "ADMIN-crash-before-durable-intent",
+          "ADMIN-crash-after-intent-before-side-effect",
+          "ADMIN-crash-after-side-effect-before-result",
+          "ADMIN-disk-full-on-intent",
+          "ADMIN-quorum-loss-on-intent",
+          "ADMIN-reconcile-unknown-without-reexecute"
+        ]
+      },
+      {
+        "id": "query-resource-isolation",
+        "severity_if_failed": "high",
+        "attacks": [
+          "QUERY-external-table-file-read",
+          "QUERY-dml-through-read-only-surface",
+          "QUERY-valid-expensive-concurrency",
+          "QUERY-tenant-noisy-neighbor",
+          "QUERY-result-cap-timeout-cancellation"
+        ]
+      },
+      {
+        "id": "hrkl-rollback-substitution",
+        "severity_if_failed": "critical",
+        "attacks": [
+          "HRKL-single-bit-corruption",
+          "HRKL-valid-segment-from-other-database",
+          "HRKL-valid-segment-from-other-tenant",
+          "HRKL-manifest-generation-rollback",
+          "HRKL-segment-manifest-mix-and-match",
+          "HRKL-cold-generation-wrong-logical-root"
+        ]
+      },
+      {
+        "id": "raft-hostile-peer",
+        "severity_if_failed": "critical",
+        "attacks": [
+          "RAFT-oversized-frame",
+          "RAFT-malformed-bincode",
+          "RAFT-rogue-peer-boundary",
+          "RAFT-old-snapshot",
+          "RAFT-tampered-snapshot",
+          "RAFT-appendentries-replay",
+          "RAFT-old-leader-after-heal",
+          "RAFT-membership-race"
+        ]
+      }
+    ]
+  },
   "required_disposition": [
     "finding_id",
+    "attack_id",
+    "campaign_id",
     "severity",
     "affected_binary_sha256",
+    "configuration_digest",
+    "request_or_fixture_digest",
     "reproduction_evidence",
+    "expected_invariant",
+    "observed_effect",
     "owner",
     "status",
     "fix_or_risk_acceptance",
     "regression_test_when_technically_possible"
   ],
-  "government_blockers": ["critical_open", "high_open_without_formal_acceptance"]
+  "government_blockers": [
+    "critical_open",
+    "high_open_without_formal_acceptance",
+    "deep_redteam_required_campaign_missing",
+    "deep_redteam_fail_without_disposition"
+  ],
+  "rules": {
+    "skip_is_not_pass": true,
+    "fuzzing_is_not_red_team": true,
+    "local_integrity_is_not_anti_rollback": true,
+    "network_isolation_claim_requires_external_evidence": true,
+    "production_attack_evidence_must_bind_exact_binary": true
+  }
 }

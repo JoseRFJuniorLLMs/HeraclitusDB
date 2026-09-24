@@ -1,0 +1,98 @@
+{
+  "campaign": "deep-redteam-local",
+  "core_rest": "http://127.0.0.1:17475",
+  "agent_api": "http://127.0.0.1:18080",
+  "mcp_gateway": "http://127.0.0.1:18787",
+
+  "tenant": {
+    "enabled": false,
+    "base": "http://127.0.0.1:17475",
+    "tenant_a": "redteam-tenant-a",
+    "tenant_b": "redteam-tenant-b",
+    "auth_a": {
+      "mode": "bearer",
+      "token_env": "HERACLITUS_TENANT_A_TOKEN"
+    },
+    "auth_b": {
+      "mode": "bearer",
+      "token_env": "HERACLITUS_TENANT_B_TOKEN"
+    },
+    "probes": [
+      {
+        "path": "/telemetry/health?tenant_id={tenant}",
+        "method": "GET",
+        "self_allowed_status": [200],
+        "cross_denied_status": [401, 403, 404],
+        "require_denial": true,
+        "tenant_a_marker": "redteam-tenant-a"
+      },
+      {
+        "path": "/security/events?tenant_id={tenant}",
+        "method": "GET",
+        "self_allowed_status": [200],
+        "cross_denied_status": [401, 403, 404],
+        "require_denial": true,
+        "tenant_a_marker": "redteam-tenant-a"
+      }
+    ]
+  },
+
+  "query": {
+    "enabled": true,
+    "auth": {
+      "mode": "basic",
+      "user_env": "HERACLITUS_CORE_USERNAME",
+      "password_env": "HERACLITUS_CORE_PASSWORD"
+    },
+    "mutation_denied_status": [400, 401, 403, 405, 422],
+    "stress_enabled": false,
+    "workers": 4,
+    "rounds": 16,
+    "timeout_seconds": 10,
+    "stress_sql": "SELECT COUNT(*) AS n FROM events"
+  },
+
+  "admin_fault": {
+    "enabled": false,
+    "seed_data_dir": "./lab-data/admin-seed",
+    "cwd": ".",
+    "server_argv": [
+      "target/release/heraclitus-server",
+      "--config",
+      "qa/redteam/heraclitus-redteam.toml"
+    ],
+    "operation_argv": [
+      "target/release/heraclitus",
+      "verify",
+      "{data_dir}/log"
+    ],
+    "verify_argv": [
+      "target/release/heraclitus",
+      "log-inspect",
+      "{data_dir}/log"
+    ],
+    "health_url": "http://127.0.0.1:17475/healthz",
+    "ready_timeout_seconds": 10,
+    "verify_timeout_seconds": 30,
+    "kill_delays_ms": [0, 10, 50, 200]
+  },
+
+  "hrkl": {
+    "enabled": false,
+    "fixture_dir": "./lab-data/hrkl-fixture",
+    "cli_argv": ["target/release/heraclitus"],
+    "timeout_seconds": 30,
+    "expect_local_rollback_rejection": false
+  },
+
+  "raft": {
+    "enabled": false,
+    "require_authenticated_transport": false,
+    "targets": [
+      {
+        "host": "127.0.0.1",
+        "port": 19090
+      }
+    ]
+  }
+}
