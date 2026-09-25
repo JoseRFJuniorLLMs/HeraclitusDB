@@ -55,7 +55,7 @@ exclude = ["sdk/python-embedded", "fuzz"]
 [workspace.package]
 version = "3.0.1"
 edition = "2021"
-license = "BUSL-1.1"
+license = "GPL-2.0-only"
 repository = "https://github.com/JoseRFJuniorLLMs/HeraclitusDB"
 authors = ["José R. F. Junior", "Claude (Anthropic)"]
 
