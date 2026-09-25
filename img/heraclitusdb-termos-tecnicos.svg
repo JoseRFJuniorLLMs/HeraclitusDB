@@ -1,0 +1,150 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1697" viewBox="0 0 1200 1697" role="img" aria-labelledby="title desc">
+<title id="title">HeraclitusDB — termos técnicos mais importantes</title>
+<desc id="desc">Infográfico em português com os principais termos técnicos do HeraclitusDB, organizados em Histórico e Integridade, Prova e Forense, Consulta e Analytics, Segurança e Governança.</desc>
+<defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#031426"/>
+    <stop offset="0.5" stop-color="#061d35"/>
+    <stop offset="1" stop-color="#03111f"/>
+  </linearGradient>
+  <linearGradient id="brand" x1="0" x2="1">
+    <stop offset="0" stop-color="#ffffff"/>
+    <stop offset="0.72" stop-color="#dbeafe"/>
+    <stop offset="0.73" stop-color="#42e7f5"/>
+    <stop offset="1" stop-color="#13bfe7"/>
+  </linearGradient>
+  <radialGradient id="core" cx="50%" cy="42%" r="62%">
+    <stop offset="0" stop-color="#123b69"/>
+    <stop offset="1" stop-color="#06182d"/>
+  </radialGradient>
+  <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+    <path d="M32 0H0V32" fill="none" stroke="#1e5b80" stroke-width="1" opacity=".18"/>
+  </pattern>
+  <filter id="glow" x="-40%" y="-40%" width="180%" height="180%">
+    <feGaussianBlur stdDeviation="8" result="b"/>
+    <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+  </filter>
+  <style>
+    .t{font-family:Inter,Segoe UI,Arial,sans-serif;fill:#f4f8ff}
+    .muted{font-family:Inter,Segoe UI,Arial,sans-serif;fill:#b8cce0}
+    .small{font-size:18px}
+    .desc{font-size:18px;fill:#c9d7e6}
+    .term{font-size:25px;font-weight:750;fill:#f7fbff}
+    .section{font-size:30px;font-weight:800;fill:#fff}
+    .eyebrow{font-size:14px;font-weight:700;letter-spacing:2.6px}
+    .row{fill:#071b2e;fill-opacity:.82;stroke-width:1.3}
+  </style>
+</defs>
+
+<rect width="1200" height="1697" fill="url(#bg)"/>
+<rect width="1200" height="1697" fill="url(#grid)"/>
+
+<!-- ambient lines -->
+<path d="M0 155 C180 100 310 190 470 135 S800 90 1200 155" fill="none" stroke="#0f5077" stroke-width="2" opacity=".28"/>
+<path d="M0 1610 C220 1540 420 1660 635 1578 S960 1540 1200 1605" fill="none" stroke="#0f5077" stroke-width="2" opacity=".35"/>
+
+<!-- Header -->
+<g transform="translate(72 42)">
+  <circle cx="72" cy="62" r="54" fill="#083e76" stroke="#37dff2" stroke-width="2"/>
+  <path d="M28 58c25-34 57-40 91-18 11 7 22 10 34 8-14 32-40 48-68 39-20-7-34-28-57-29z" fill="#19c5ef"/>
+  <path d="M27 78c21-17 44-16 65 2 23 19 43 18 61 3-9 25-33 40-58 38-28-2-54-19-68-43z" fill="#0d64f0" opacity=".95"/>
+  <text x="156" y="75" class="t" font-size="70" font-weight="900" fill="url(#brand)">HeraclitusDB</text>
+  <text x="158" y="116" class="muted" font-size="20" letter-spacing="6">TERMOS TÉCNICOS MAIS IMPORTANTES</text>
+</g>
+
+<!-- Section 1 -->
+<g transform="translate(32 188)">
+  <rect width="555" height="555" rx="24" fill="#062a2b" fill-opacity=".78" stroke="#25e0c3" stroke-width="2"/>
+  <rect width="555" height="96" rx="24" fill="#063c3a" fill-opacity=".7"/>
+  <text x="32" y="45" class="section">1. Histórico e Integridade</text>
+  <text x="32" y="74" class="eyebrow" fill="#59f2d8">REGISTROS CONFIÁVEIS, IMUTÁVEIS E VERIFICÁVEIS</text>
+
+  <g transform="translate(18 108)">
+    <g><rect class="row" width="519" height="67" rx="13" stroke="#1cae9b"/><text x="24" y="29" class="term">HRKL</text><text x="24" y="53" class="desc">log canônico append-only do sistema</text></g>
+    <g transform="translate(0 73)"><rect class="row" width="519" height="67" rx="13" stroke="#1cae9b"/><text x="24" y="29" class="term">LSN</text><text x="24" y="53" class="desc">número sequencial de cada evento</text></g>
+    <g transform="translate(0 146)"><rect class="row" width="519" height="67" rx="13" stroke="#1cae9b"/><text x="24" y="29" class="term">HLC</text><text x="24" y="53" class="desc">relógio híbrido para ordenar fatos</text></g>
+    <g transform="translate(0 219)"><rect class="row" width="519" height="67" rx="13" stroke="#1cae9b"/><text x="24" y="29" class="term">Canonical History</text><text x="24" y="53" class="desc">história oficial preservada</text></g>
+    <g transform="translate(0 292)"><rect class="row" width="519" height="67" rx="13" stroke="#1cae9b"/><text x="24" y="29" class="term">BLAKE3</text><text x="24" y="53" class="desc">hash rápido para integridade</text></g>
+    <g transform="translate(0 365)"><rect class="row" width="519" height="67" rx="13" stroke="#1cae9b"/><text x="24" y="29" class="term">Merkle Root</text><text x="24" y="53" class="desc">prova criptográfica do conjunto</text></g>
+  </g>
+</g>
+
+<!-- Section 2 -->
+<g transform="translate(613 188)">
+  <rect width="555" height="555" rx="24" fill="#18163c" fill-opacity=".78" stroke="#9885ff" stroke-width="2"/>
+  <rect width="555" height="96" rx="24" fill="#252055" fill-opacity=".72"/>
+  <text x="32" y="45" class="section">2. Prova e Forense</text>
+  <text x="32" y="74" class="eyebrow" fill="#baaaff">EVIDÊNCIAS CONFIÁVEIS DO INÍCIO AO FIM</text>
+
+  <g transform="translate(18 108)">
+    <g><rect class="row" width="519" height="67" rx="13" stroke="#7668c7"/><text x="24" y="29" class="term">Evidence Package</text><text x="24" y="53" class="desc">pacote exportável de evidências</text></g>
+    <g transform="translate(0 73)"><rect class="row" width="519" height="67" rx="13" stroke="#7668c7"/><text x="24" y="29" class="term">Chain of Custody</text><text x="24" y="53" class="desc">cadeia de custódia verificável</text></g>
+    <g transform="translate(0 146)"><rect class="row" width="519" height="67" rx="13" stroke="#7668c7"/><text x="24" y="29" class="term">RFC 3161</text><text x="24" y="53" class="desc">carimbo do tempo criptográfico</text></g>
+    <g transform="translate(0 219)"><rect class="row" width="519" height="67" rx="13" stroke="#7668c7"/><text x="24" y="29" class="term">Legal Hold</text><text x="24" y="53" class="desc">preservação obrigatória de registros</text></g>
+    <g transform="translate(0 292)"><rect class="row" width="519" height="67" rx="13" stroke="#7668c7"/><text x="24" y="29" class="term">WORM</text><text x="24" y="53" class="desc">gravar uma vez, ler muitas</text></g>
+    <g transform="translate(0 365)"><rect class="row" width="519" height="67" rx="13" stroke="#7668c7"/><text x="24" y="29" class="term">Offline Verifier</text><text x="24" y="53" class="desc">verificação sem depender do banco original</text></g>
+  </g>
+</g>
+
+<!-- central hub -->
+<g transform="translate(600 770)" filter="url(#glow)">
+  <circle r="134" fill="url(#core)" stroke="#5eeaff" stroke-width="3"/>
+  <circle r="116" fill="none" stroke="#2c8ab6" stroke-width="1" opacity=".8"/>
+  <path d="M0-82 l43 18 v35 c0 39-20 63-43 75-23-12-43-36-43-75v-35z" fill="#0b5c9d" stroke="#62eaff" stroke-width="3"/>
+  <path d="M-14-43h28v30h-28zM-14-4h28M-14 8h20" fill="none" stroke="#d7f6ff" stroke-width="4" stroke-linecap="round"/>
+  <text y="78" class="t" font-size="27" font-weight="800" text-anchor="middle">Preservar o fato</text>
+  <text y="111" class="t" font-size="27" font-weight="800" text-anchor="middle" fill="#4ef0d3">Provar a história</text>
+  <text y="144" class="t" font-size="27" font-weight="800" text-anchor="middle">Controlar a ação</text>
+</g>
+
+<!-- connectors -->
+<g stroke="#4bdff4" stroke-width="3" fill="none" opacity=".8">
+  <path d="M455 743 L505 770"/>
+  <path d="M745 743 L695 770"/>
+  <path d="M455 905 L505 835"/>
+  <path d="M745 905 L695 835"/>
+</g>
+<g fill="#67efff"><circle cx="505" cy="770" r="6"/><circle cx="695" cy="770" r="6"/><circle cx="505" cy="835" r="6"/><circle cx="695" cy="835" r="6"/></g>
+
+<!-- Section 3 -->
+<g transform="translate(32 889)">
+  <rect width="555" height="555" rx="24" fill="#302509" fill-opacity=".72" stroke="#f6c742" stroke-width="2"/>
+  <rect width="555" height="96" rx="24" fill="#4b3608" fill-opacity=".65"/>
+  <text x="32" y="45" class="section">3. Consulta e Analytics</text>
+  <text x="32" y="74" class="eyebrow" fill="#ffd868">DADOS EM CONHECIMENTO, COM DESEMPENHO</text>
+  <g transform="translate(18 108)">
+    <g><rect class="row" width="519" height="67" rx="13" stroke="#b98d23"/><text x="24" y="29" class="term">DataFusion</text><text x="24" y="53" class="desc">motor analítico principal</text></g>
+    <g transform="translate(0 73)"><rect class="row" width="519" height="67" rx="13" stroke="#b98d23"/><text x="24" y="29" class="term">Arrow Flight</text><text x="24" y="53" class="desc">transporte rápido de dados colunares</text></g>
+    <g transform="translate(0 146)"><rect class="row" width="519" height="67" rx="13" stroke="#b98d23"/><text x="24" y="29" class="term">BM25</text><text x="24" y="53" class="desc">busca textual por relevância</text></g>
+    <g transform="translate(0 219)"><rect class="row" width="519" height="67" rx="13" stroke="#b98d23"/><text x="24" y="29" class="term">HNSW</text><text x="24" y="53" class="desc">busca vetorial aproximada</text></g>
+    <g transform="translate(0 292)"><rect class="row" width="519" height="67" rx="13" stroke="#b98d23"/><text x="24" y="29" class="term">Hybrid Retrieval</text><text x="24" y="53" class="desc">combina texto, vetor e grafo</text></g>
+    <g transform="translate(0 365)"><rect class="row" width="519" height="67" rx="13" stroke="#b98d23"/><text x="24" y="29" class="term">Lakehouse</text><text x="24" y="53" class="desc">Parquet, Iceberg e Delta</text></g>
+  </g>
+</g>
+
+<!-- Section 4 -->
+<g transform="translate(613 889)">
+  <rect width="555" height="555" rx="24" fill="#06213d" fill-opacity=".8" stroke="#31c8ff" stroke-width="2"/>
+  <rect width="555" height="96" rx="24" fill="#082e52" fill-opacity=".76"/>
+  <text x="32" y="45" class="section">4. Segurança e Governança</text>
+  <text x="32" y="74" class="eyebrow" fill="#63dbff">CONTROLE, CONFIANÇA E OPERAÇÃO SEGURA</text>
+  <g transform="translate(18 108)">
+    <g><rect class="row" width="519" height="67" rx="13" stroke="#2087b7"/><text x="24" y="29" class="term">Raft</text><text x="24" y="53" class="desc">consenso distribuído do cluster</text></g>
+    <g transform="translate(0 73)"><rect class="row" width="519" height="67" rx="13" stroke="#2087b7"/><text x="24" y="29" class="term">HSM</text><text x="24" y="53" class="desc">cofre físico para chaves</text></g>
+    <g transform="translate(0 146)"><rect class="row" width="519" height="67" rx="13" stroke="#2087b7"/><text x="24" y="29" class="term">PKCS#11</text><text x="24" y="53" class="desc">interface padrão para HSM</text></g>
+    <g transform="translate(0 219)"><rect class="row" width="519" height="67" rx="13" stroke="#2087b7"/><text x="24" y="29" class="term">Durable Intent</text><text x="24" y="53" class="desc">sem intenção durável, sem efeito privilegiado</text></g>
+    <g transform="translate(0 292)"><rect class="row" width="519" height="67" rx="13" stroke="#2087b7"/><text x="24" y="29" class="term">Sentinel</text><text x="24" y="53" class="desc">plano de inteligência e defesa</text></g>
+    <g transform="translate(0 365)"><rect class="row" width="519" height="67" rx="13" stroke="#2087b7"/><text x="24" y="29" class="term">MCP / Agent Policy Gateway</text><text x="24" y="53" class="desc">controle de ações de agentes de IA</text></g>
+  </g>
+</g>
+
+<!-- summary -->
+<g transform="translate(32 1480)">
+  <rect width="1136" height="128" rx="24" fill="#082b4d" fill-opacity=".86" stroke="#4dbdf6" stroke-width="2"/>
+  <text x="38" y="52" class="t" font-size="31" font-weight="850">Em resumo</text>
+  <text x="38" y="90" class="muted" font-size="22">HeraclitusDB une histórico imutável, prova criptográfica, analytics multimodal e governança forte.</text>
+</g>
+
+<text x="38" y="1656" class="eyebrow" fill="#55b7e5">DO EVENTO  •  À EVIDÊNCIA  •  AO CONHECIMENTO  •  À AÇÃO</text>
+<text x="1162" y="1656" class="eyebrow" text-anchor="end" fill="#55b7e5">AUDITÁVEL  •  ESCALÁVEL  •  INTEROPERÁVEL</text>
+</svg>
