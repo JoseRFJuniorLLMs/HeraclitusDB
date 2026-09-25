@@ -623,20 +623,6 @@ Evite divulgar publicamente detalhes exploráveis antes da coordenação da corr
 
 ---
 
-# Licença
-
-O workspace declara licença **BUSL-1.1**.
-
-Consulte [LICENSE](LICENSE) para os termos completos.
-
----
-
-# Autoria e citação
-
-Consulte [CITATION.cff](CITATION.cff).
-
----
-
 <p align="center">
   <strong>HeraclitusDB</strong><br/>
   Preserve o fato. Prove a história. Controle a ação.
@@ -1216,4 +1202,23 @@ Em linguagem comum:
 > o objetivo é conseguir responder não apenas **“qual é o dado agora?”**, mas também **“o que aconteceu, em que ordem, quem participou, que autorização existia, esse histórico foi alterado e outra pessoa consegue verificar a prova sem simplesmente confiar em nós?”**
 
 Esse é o papel central do HeraclitusDB: **preservar o fato, provar a história e controlar a ação**.
+
+---
+
+# Licença
+
+O workspace declara licença **BUSL-1.1**.
+
+Consulte [LICENSE](LICENSE) para os termos completos.
+
+---
+
+# Autoria e contato
+
+**Jose R F Junior**
+
+- **E-mail:** web2ajax@gmail.com
+- **E-mail institucional:** joseribanmar.junior@inss.gov.br
+
+Para citação acadêmica e metadados de autoria, consulte [CITATION.cff](CITATION.cff).
 
