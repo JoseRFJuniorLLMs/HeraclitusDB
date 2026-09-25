@@ -1437,7 +1437,11 @@ Esse é o papel central do HeraclitusDB: **preservar o fato, provar a história 
 
 # Licença
 
-O workspace declara licença **BUSL-1.1**.
+O HeraclitusDB é distribuído sob a **GNU General Public License version 2 only (GPL-2.0-only)**, a mesma licença-base utilizada pelo kernel Linux.
+
+Isso permite usar, estudar, modificar e redistribuir o software, respeitando as obrigações da GPL v2 para distribuição de versões modificadas e binários derivados.
+
+> **Nota:** o HeraclitusDB adota a GPL-2.0-only. A exceção `Linux-syscall-note`, usada pelo kernel Linux para sua interface UAPI/syscalls, não é aplicada ao HeraclitusDB.
 
 Consulte [LICENSE](LICENSE) para os termos completos.
 
