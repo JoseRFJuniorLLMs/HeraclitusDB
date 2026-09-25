@@ -32,7 +32,7 @@ Sim. Separando **o que existe de verdade no produto** do que **ainda falta para 
 | **Formal verification** | Lean para algumas invariantes importantes                                       | **TEM**               |
 | **Supply chain**        | SBOM/proveniência previstos e tooling relacionado                               | **TEM PARCIALMENTE**  |
 | **Runbooks**            | Backup, restore, DR, air-gap, vulnerabilidades, upgrade                         | **TEM**               |
-| **Licença comercial**   | BUSL 1.1 com uso em produção dependente de licença comercial                    | **TEM**               |
+| **Licença do projeto**  | GPL-2.0-only, com código-fonte redistribuível e copyleft nas distribuições derivadas | **TEM**            |
 
 ---
 
