@@ -644,6 +644,16 @@ Consulte [CITATION.cff](CITATION.cff).
 
 ---
 
+## Mapa visual dos principais termos técnicos
+
+<p align="center">
+  <img src="img/heraclitusdb-termos-tecnicos.svg" alt="HeraclitusDB — principais termos técnicos: histórico e integridade, prova e forense, consulta e analytics, segurança e governança" width="1000" />
+</p>
+
+> Visão resumida dos conceitos centrais do HeraclitusDB. As definições detalhadas aparecem no glossário logo abaixo.
+
+---
+
 # Apêndice A — Glossário técnico para leigos
 
 Esta seção explica, em linguagem simples, os principais termos técnicos usados no HeraclitusDB e nas suas especificações.
