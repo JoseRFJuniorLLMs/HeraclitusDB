@@ -8,7 +8,7 @@ version = "1.0.5"
 description = "Cliente Python para o HeraclitusDB — banco de auditoria event-sourced (log imutável, AS OF, Merkle, provenance)."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "BUSL-1.1" }
+license = { text = "GPL-2.0-only" }
 authors = [{ name = "Jose R F Junior", email = "web2ajax@gmail.com" }]
 keywords = ["heraclitusdb", "event-sourcing", "audit", "graph", "provenance", "merkle", "grpc"]
 dependencies = ["grpcio>=1.80", "protobuf>=6.31.1"]
