@@ -135,9 +135,9 @@ O objetivo é poder reconstruir:
 
 Esta seção descreve capacidades presentes no código atual. O arquivo **docs/md/SPEC-new/STATUS.md** continua sendo a autoridade detalhada sobre maturidade e lacunas.
 
-## HRKL: história canônica append-only
+## HRKL (Heraclitus Record-Keeping Log): história canônica append-only
 
-O HRKL é o núcleo persistente do HeraclitusDB.
+O HRKL (Heraclitus Record-Keeping Log) é o núcleo persistente do HeraclitusDB.
 
 A linha atual inclui:
 
@@ -145,7 +145,7 @@ A linha atual inclui:
 - LSN e HLC;
 - CRC-32C em formatos recentes;
 - raízes Merkle com BLAKE3;
-- formato HRKL v6;
+- formato HRKL (Heraclitus Record-Keeping Log) v6;
 - modos RAW e PACKED;
 - manifesto HRKM;
 - índices laterais HRKI;
@@ -443,7 +443,7 @@ O workspace Rust 3.0.1 é dividido em crates especializados.
 
 ~~~text
 heraclitus-core              tipos, runtime e tempo lógico
-heraclitus-log               HRKL, persistência e integridade
+heraclitus-log               HRKL (Heraclitus Record-Keeping Log), persistência e integridade
 heraclitus-crypto            criptografia
 heraclitus-compliance        confiança, recibos, TSA e retenção
 heraclitus-memtable          estado recente
@@ -603,7 +603,7 @@ Documentação de início:
 - [SPEC-0046 — Government Compliance](docs/md/SPEC-new/SPEC-0046.md)
 - [SPEC-0048 — Orchestrator & Forensic Evidence Plane](docs/md/SPEC-new/SPEC-0048.md)
 - [SPEC-0049 — Production & Security Qualification](docs/md/SPEC-new/SPEC-0049.md)
-- [SPEC-0050 — HRKL](docs/md/SPEC-new/SPEC-0050-HRKL.md)
+- [SPEC-0050 — HRKL (Heraclitus Record-Keeping Log)](docs/md/SPEC-new/SPEC-0050-HRKL.md)
 - [SPEC-0086 — Government Trust & Key Management](docs/md/SPEC-new/SPEC-0086-Government-Trust-Key-Management.md)
 - [SPEC-0087 — Forensic Evidence & Chain of Custody](docs/md/SPEC-new/SPEC-0087-Forensic-Evidence-Chain-of-Custody.md)
 - [SPEC-0088 — Government Compliance Profiles](docs/md/SPEC-new/SPEC-0088-Government-Compliance-Profiles.md)
@@ -654,8 +654,8 @@ Uma analogia útil é pensar no HeraclitusDB como uma combinação de **cartóri
 
 | Termo | Significado técnico | Explicação para leigos |
 |---|---|---|
-| **HRKL — Heraclitus Log** | Núcleo persistente canônico do HeraclitusDB, baseado em histórico append-only. | É como um livro de cartório em que novas páginas podem ser acrescentadas, mas as antigas continuam fazendo parte da história. |
-| **HRKL v6** | Formato que separa verdade lógica da representação física. | O documento continua sendo o mesmo mesmo que seja comprimido ou reorganizado. |
+| **HRKL (Heraclitus Record-Keeping Log)** | Núcleo persistente canônico do HeraclitusDB, baseado em histórico append-only. | É como um livro de cartório em que novas páginas podem ser acrescentadas, mas as antigas continuam fazendo parte da história. |
+| **HRKL (Heraclitus Record-Keeping Log) v6** | Formato que separa verdade lógica da representação física. | O documento continua sendo o mesmo mesmo que seja comprimido ou reorganizado. |
 | **Canonical Record** | Representação lógica oficial de um evento. | É a versão oficial daquele fato dentro do sistema. |
 | **Canonical History** | Sequência completa dos registros canônicos. | É o diário completo do que aconteceu, em ordem. |
 | **Append-only** | Novos fatos são acrescentados em vez de sobrescrever silenciosamente os anteriores. | Em vez de apagar “saldo = 100” e escrever “saldo = 80”, registra-se um novo fato informando a mudança. |
@@ -667,8 +667,8 @@ Uma analogia útil é pensar no HeraclitusDB como uma combinação de **cartóri
 | **RAW** | Representação física mais direta de um segmento. | É como guardar os documentos sem compactação avançada. |
 | **PACKED** | Representação física empacotada/comprimida. | É guardar os mesmos documentos dentro de um arquivo compactado. |
 | **ARCHIVED** | Representação destinada a armazenamento frio. | É mandar documentos antigos para o arquivo histórico sem apagar o conteúdo. |
-| **HRKM** | Manifesto do armazenamento HRKL. | É o catálogo que informa quais volumes existem e onde estão. |
-| **HRKI** | Índices laterais do HRKL. | É o índice remissivo de um livro: acelera a busca, mas o livro continua sendo a fonte oficial. |
+| **HRKM** | Manifesto do armazenamento HRKL (Heraclitus Record-Keeping Log). | É o catálogo que informa quais volumes existem e onde estão. |
+| **HRKI** | Índices laterais do HRKL (Heraclitus Record-Keeping Log). | É o índice remissivo de um livro: acelera a busca, mas o livro continua sendo a fonte oficial. |
 | **Sidecar Index** | Índice auxiliar separado do dado canônico. | É uma ficha catalográfica ao lado do arquivo original. |
 | **Physical Generation** | Uma representação física específica da mesma história lógica. | O mesmo filme pode existir em formatos físicos diferentes sem mudar o conteúdo. |
 | **Logical Root** | Hash representando a história lógica canônica. | É a impressão digital do conteúdo, independentemente da embalagem. |
@@ -697,7 +697,7 @@ Não é correto resumir a arquitetura atual dizendo simplesmente que o Heraclitu
 
 **LSM-Tree — Log-Structured Merge Tree** é uma família de arquiteturas em que escritas normalmente passam por estruturas em memória e registros sequenciais antes de serem consolidadas em estruturas organizadas em disco. Conceitos como memtable, WAL e compactação pertencem a esse universo e aparecem em partes das especificações do projeto.
 
-Entretanto, a arquitetura atual do HeraclitusDB trata o **HRKL append-only como a história canônica**. Por isso, “possui conceitos relacionados a arquiteturas log-structured” é uma descrição mais precisa do que transformar LSM na identidade central do banco.
+Entretanto, a arquitetura atual do HeraclitusDB trata o **HRKL (Heraclitus Record-Keeping Log) append-only como a história canônica**. Por isso, “possui conceitos relacionados a arquiteturas log-structured” é uma descrição mais precisa do que transformar LSM na identidade central do banco.
 
 ## A.2 Integridade criptográfica e prova
 
@@ -1187,7 +1187,7 @@ O HeraclitusDB pode, conforme os componentes efetivamente habilitados e qualific
 1. atribuir um **LSN** para posicionar o fato na história;
 2. usar **HLC** para registrar sua ordem temporal;
 3. associar uma **identidade** ao evento;
-4. preservar o **Canonical Record** no **HRKL**;
+4. preservar o **Canonical Record** no **HRKL (Heraclitus Record-Keeping Log)**;
 5. calcular **BLAKE3/Merkle** para permitir verificação de integridade;
 6. obter **RFC 3161** quando houver uma TSA/ACT configurada e validada;
 7. permitir ao **Sentinel** analisar se o comportamento é anormal;
