@@ -468,6 +468,236 @@ hume-kernel / hume-ir        infraestrutura experimental HUME
 
 A lista canônica está em [Cargo.toml](Cargo.toml).
 
+## O que significa cada crate e para que ele serve
+
+Um **crate** é uma unidade de código Rust. Em linguagem simples, o HeraclitusDB não é um programa monolítico: ele é dividido em módulos especializados. Cada crate possui uma responsabilidade clara e pode ser testado, evoluído e auditado com menos acoplamento.
+
+### \`heraclitus-core\` — tipos fundamentais, IDs e tempo lógico
+
+É a base compartilhada pelos demais módulos. Define tipos, identificadores, erros, configuração, contratos internos e estruturas usadas por várias partes do sistema.
+
+**Para que serve:** garantir que todos os componentes falem a mesma linguagem interna. Conceitos como identificadores de evento, LSN, configuração e contratos básicos não precisam ser reinventados em cada crate.
+
+**Exemplo para leigos:** é como o conjunto de formulários e regras comuns usados por todos os departamentos de uma organização. Se cada departamento inventasse seu próprio formato de CPF, data ou número de processo, o sistema inteiro viraria uma pequena obra de ficção administrativa.
+
+### \`heraclitus-log\` — HRKL (Heraclitus Record-Keeping Log), persistência e integridade
+
+É a **fonte canônica da história** do HeraclitusDB. Mantém o HRKL, um log segmentado e append-only no qual novos fatos são acrescentados sem substituir silenciosamente os anteriores.
+
+**Para que serve:** preservar a sequência histórica dos eventos, sustentar replay, recuperação após falhas, integridade de segmentos, LSNs e mecanismos de prova associados ao armazenamento.
+
+**Exemplo para leigos:** funciona como o livro principal de um cartório. Outros índices podem acelerar pesquisas, mas, se houver dúvida sobre o que realmente aconteceu, é ao livro oficial que se retorna.
+
+### \`heraclitus-crypto\` — primitivas criptográficas
+
+Concentra funções e estruturas criptográficas usadas pelo restante do sistema.
+
+**Para que serve:** oferecer operações de hash, assinatura, verificação e proteção criptográfica sem espalhar implementações sensíveis por dezenas de módulos.
+
+**Exemplo para leigos:** é a caixa de ferramentas que contém lacres, selos e mecanismos matemáticos usados para provar que algo não foi alterado.
+
+### \`heraclitus-compliance\` — confiança, RFC 3161, TSA, recibos e retenção
+
+É a camada voltada a evidências de confiança e requisitos de conformidade. Inclui suporte relacionado a carimbo do tempo RFC 3161, validação de TSA, ancoragem de Merkle, recibos, certificados, retenção e Legal Hold.
+
+**Para que serve:** conectar a história técnica do banco a provas verificáveis e políticas institucionais.
+
+**Exemplo para leigos:** não basta dizer “este documento existia ontem”. Essa camada busca produzir e validar recibos que permitam demonstrar tecnicamente essa afirmação.
+
+### \`heraclitus-memtable\` — estado recente em memória
+
+Mantém uma visão rápida, em RAM, da parte mais recente do histórico.
+
+**Para que serve:** permitir acesso de baixa latência aos dados recém-gravados e oferecer semântica de **read-your-own-writes**, isto é, uma escrita confirmada pode ser lida imediatamente sem aguardar materializações posteriores.
+
+**Exemplo para leigos:** o HRKL é o arquivo oficial; a memtable é a pilha de documentos recém-chegados que ainda está sobre a mesa para consulta imediata.
+
+### \`heraclitus-views\` — materializações reconstruíveis
+
+Gerencia **views materializadas**, ou seja, estados derivados do log canônico para facilitar consultas.
+
+**Para que serve:** transformar o histórico de eventos em representações úteis, controlar watermarks e permitir reconstrução determinística por replay.
+
+**Exemplo para leigos:** o HRKL guarda todas as movimentações de uma conta; uma view pode mostrar diretamente o saldo atual. Se a view for perdida, ela pode ser recalculada lendo novamente o histórico.
+
+### \`heraclitus-index-vector\` — índice vetorial HNSW
+
+Implementa busca por similaridade vetorial, incluindo HNSW e filtragem associada.
+
+**Para que serve:** encontrar itens semanticamente ou matematicamente semelhantes a um vetor de consulta.
+
+**Exemplo para leigos:** em vez de procurar somente a palavra exata “automóvel”, o sistema pode encontrar registros semanticamente próximos de “carro”, “veículo” ou representações equivalentes, dependendo dos embeddings usados.
+
+### \`heraclitus-index-graph\` — relações e grafo temporal
+
+Mantém índices derivados de adjacência, propriedades e relações entre entidades.
+
+**Para que serve:** navegar conexões do tipo “quem acessou o quê”, “qual evento levou a outro”, “quais entidades estão relacionadas” e, quando aplicável, observar essas relações no tempo.
+
+**Exemplo para leigos:** é o mapa de conexões. Se A enviou para B, B alterou C e C pertence a D, o grafo permite percorrer esse caminho.
+
+### \`heraclitus-index-text\` — busca textual BM25
+
+Implementa índice invertido e ranking BM25 para recuperação textual.
+
+**Para que serve:** localizar documentos ou eventos relevantes a partir de palavras e expressões, ordenando resultados por relevância.
+
+**Exemplo para leigos:** é semelhante ao mecanismo de busca de uma biblioteca que não apenas encontra a palavra, mas tenta mostrar primeiro os documentos em que ela é mais importante.
+
+### \`heraclitus-index-attr\` — índices de atributos
+
+Cria índices secundários derivados para atributos estruturados e associa valores aos LSNs correspondentes.
+
+**Para que serve:** acelerar buscas como CPF, CNPJ, nome, código de processo, severidade ou qualquer outro campo indexável, sem transformar esses índices na fonte da verdade.
+
+**Exemplo para leigos:** é o fichário que diz em quais páginas do livro principal determinado CPF aparece.
+
+### \`heraclitus-retrieval\` — fusão de mecanismos de recuperação
+
+Combina resultados vindos de diferentes mecanismos de busca. O crate implementa recuperação em dois estágios, incluindo fusão por RRF e reranking plugável.
+
+**Para que serve:** reunir resultados de texto, vetor, atributos e outras fontes em um ranking final mais útil.
+
+**Exemplo para leigos:** vários especialistas entregam listas diferentes de candidatos; essa camada combina as listas e decide quais resultados merecem aparecer primeiro.
+
+### \`heraclitus-query\` — linguagem e planejamento de consultas
+
+É a camada responsável por interpretar consultas, incluindo subconjunto Cypher/GQL, consultas temporais **AS OF**, planejamento baseado em regras e explicação de planos.
+
+**Para que serve:** transformar a pergunta do usuário em operações que os índices, views e demais mecanismos conseguem executar.
+
+**Exemplo para leigos:** o usuário pergunta “quais entidades estavam ligadas a este evento às 14h?”. O query planner traduz essa pergunta para um roteiro executável pelo banco.
+
+### \`heraclitus-analytics\` — SQL e DataFusion
+
+Fornece analytics SQL sobre a história imutável usando Apache DataFusion, em uma superfície de leitura.
+
+**Para que serve:** executar filtros, agregações, joins e análises de grandes volumes sem transformar o mecanismo analítico na fonte canônica do banco.
+
+**Exemplo para leigos:** é a sala de análise. O arquivo oficial permanece preservado, enquanto o DataFusion lê os dados e responde perguntas como “quantos incidentes ocorreram por órgão e por mês?”.
+
+### \`heraclitus-raft\` — consenso e replicação
+
+Implementa replicação do log e, quando a feature correspondente é usada, consenso com **openraft**, incluindo transportes TCP e gRPC.
+
+**Para que serve:** manter múltiplos nós de um cluster de acordo sobre a sequência oficial de gravações e permitir continuidade diante de falhas compatíveis com o modelo de consenso.
+
+**Exemplo para leigos:** três servidores mantêm cópias do mesmo livro. O Raft estabelece quem coordena a escrita e quantos precisam concordar antes de considerar uma página oficialmente registrada.
+
+### \`heraclitus-gpu\` — aceleração heterogênea
+
+Contém caminhos de aceleração para operações em lote, particularmente cálculos de distância e seleção de candidatos usados em recuperação vetorial.
+
+**Para que serve:** aproveitar GPU ou hardware especializado quando o custo de cálculo justificar essa aceleração.
+
+**Exemplo para leigos:** uma CPU tem poucos trabalhadores muito versáteis; uma GPU possui milhares de trabalhadores simples capazes de executar a mesma conta sobre muitos dados ao mesmo tempo.
+
+### \`heraclitus-agent\` — evidência e governança de agentes de IA
+
+Implementa partes do **Agent Black Box** e do motor determinístico de política: evidência canônica de ações de agentes, redaction, evidence bundles, verificação offline e decisões de política.
+
+**Para que serve:** registrar e governar o que agentes de IA tentaram fazer, o que foi permitido, negado ou submetido a aprovação e quais evidências ficaram preservadas.
+
+**Exemplo para leigos:** é a caixa-preta do agente de IA. Se uma IA solicitar uma ação sensível, deve ser possível reconstruir depois o pedido, a política aplicada e a decisão tomada.
+
+### \`heraclitus-agent-gateway\` — fronteira de rede e Policy Gateway
+
+Expõe as superfícies de rede do módulo de agentes, incluindo ingestão OTLP, proxy MCP com política, API de evidência e console.
+
+**Para que serve:** ficar entre o agente e sistemas externos, aplicando controles antes de a chamada alcançar o destino protegido.
+
+**Exemplo para leigos:** é o porteiro. A IA pode pedir para abrir a porta, mas quem decide se a porta realmente será aberta é o gateway conforme identidade, parâmetros, política e aprovações.
+
+### \`heraclitus-sentinel\` — detecção, correlação e investigação de segurança
+
+É o plano derivado de segurança do HeraclitusDB, limitado, reconstruível e baseado no log canônico.
+
+**Para que serve:** receber e normalizar eventos, aplicar regras, detectar comportamento suspeito, correlacionar sinais e apoiar investigação, mantendo a possibilidade de replay.
+
+**Exemplo para leigos:** é a central de segurança. Um login isolado pode parecer normal; dezenas de falhas, mudança de privilégio e download em massa podem formar um incidente quando analisados em conjunto.
+
+### \`heraclitus-case\` — gestão de casos event-sourced
+
+Implementa Case Management sobre o log canônico usando event sourcing.
+
+**Para que serve:** registrar a evolução de investigações e incidentes como uma sequência auditável de eventos, em vez de apenas manter o estado final do caso.
+
+**Exemplo para leigos:** em vez de mostrar apenas “caso encerrado”, preserva quando foi aberto, quem analisou, quais evidências foram adicionadas, quais decisões ocorreram e como chegou ao encerramento.
+
+### \`heraclitus-content\` — conteúdo operacional e playbooks
+
+Implementa o **Content Hub** event-sourced.
+
+**Para que serve:** versionar e preservar conteúdo operacional, como regras, definições e playbooks, mantendo histórico de alterações.
+
+**Exemplo para leigos:** é a biblioteca de procedimentos do SOC. Se um playbook mudar, é possível saber qual versão estava em vigor quando determinada resposta foi executada.
+
+### \`heraclitus-platform\` — integração com o sistema operacional
+
+Fornece abstrações de plataforma e capacidades específicas do ambiente operacional, incluindo primitivas Linux, recursos nativos e integração com cgroups v2 quando aplicável.
+
+**Para que serve:** separar detalhes do sistema operacional do restante da lógica do banco.
+
+**Exemplo para leigos:** o motor do HeraclitusDB não deveria precisar saber em cada módulo como Linux controla CPU, memória ou processos. A camada de plataforma concentra esse conhecimento.
+
+### \`hume-kernel\` — núcleo experimental de execução HUME
+
+Contém primitivas do **HUME — Heraclitus Unified Micro-Execution Engine**.
+
+**Para que serve:** pesquisar caminhos próprios de execução física, vetorização e otimização de operações de baixo nível.
+
+**Exemplo para leigos:** é um laboratório para experimentar um motor próprio capaz de transformar operações abstratas em execução muito eficiente sobre o hardware.
+
+### \`hume-ir\` — representação intermediária do HUME
+
+Define a **IR — Intermediate Representation** do HUME, incluindo conceitos de SSA usados para representar operações antes de chegar ao código de máquina ou a backends especializados.
+
+**Para que serve:** criar uma linguagem interna que possa ser otimizada e posteriormente traduzida para diferentes formas de execução.
+
+**Exemplo para leigos:** é como um idioma intermediário. Uma consulta é traduzida primeiro para HUME-IR e, em tese, depois pode ser convertida para instruções adequadas à CPU, SIMD, JIT ou outros backends.
+
+> **Importante sobre HUME:** estes crates são infraestrutura experimental. O motor analítico vivo do HeraclitusDB continua sendo o **DataFusion**; a existência de \`hume-kernel\` e \`hume-ir\` no workspace não significa que o HUME esteja atualmente substituindo o DataFusion no caminho de produção.
+
+### Como esses módulos se encaixam
+
+Em uma visão simplificada:
+
+~~~text
+                    APLICAÇÕES / SISTEMAS
+                            |
+                            v
+              query / agent-gateway / platform
+                            |
+            +---------------+---------------+
+            |                               |
+            v                               v
+       retrieval                        sentinel
+    /      |      \                        |
+ text   vector   graph                  case/content
+    \      |      /
+       views / memtable
+            |
+            v
+ HRKL (Heraclitus Record-Keeping Log)
+            |
+      crypto / compliance
+            |
+            v
+      TRUST / EVIDENCE
+
+Em cluster:
+HRKL <-> raft <-> outros nós
+
+Para analytics:
+HRKL -> analytics / DataFusion
+
+Pesquisa de execução:
+HUME-IR -> HUME Kernel
+~~~
+
+A regra arquitetural mais importante é que **índices, views, analytics, Sentinel e outros planos derivados não substituem a história canônica**. O HRKL (Heraclitus Record-Keeping Log) permanece como referência persistente a partir da qual estados derivados podem ser reconstruídos quando o contrato daquele componente permitir replay.
+
+
 ---
 
 # Modelo de implantação
