@@ -311,8 +311,6 @@ impl EncryptionEnvelopeV2 {
     }
 }
 
-}
-
 /// Traço para provedores de chaves
 pub trait KeyProvider: Send + Sync {
     fn provider_id(&self) -> &str;
