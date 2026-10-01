@@ -43,11 +43,33 @@ pub struct EvidenceObject {
     pub source_lsn: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct HrklRootCommitment {
+    pub segment_id: u64,
+    pub generation: u64,
+    pub format_version: u16,
+    pub logical_root_hex: String,
+    pub leaf_count: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MerkleEvidence {
+    /// Compromisso legado do CONJUNTO exportado. Não é prova HRKL de origem.
     pub root_blake3: String,
+    /// Compromisso legado do CONJUNTO exportado. Não é prova HRKL de origem.
     pub root_sha256: String,
+    /// Número de objetos exportados no compromisso legado acima.
     pub leaves_count: u64,
+    /// Raízes HRKL reais atestadas pelo manifesto e usadas pelas inclusion
+    /// proofs em `proofs/merkle.json`.
+    #[serde(default)]
+    pub origin_roots: Vec<HrklRootCommitment>,
+    /// SHA-256 dos bytes canónicos de `proofs/merkle.json`.
+    ///
+    /// Liga a prova ao manifesto; uma assinatura/timestamp do manifesto passa
+    /// então a comprometer também o documento de prova, sem circularidade.
+    #[serde(default)]
+    pub proofs_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -105,11 +127,12 @@ impl CustodyEntry {
         use sha2::{Sha256, Digest};
         let action_str = serde_json::to_string(&self.action).unwrap_or_default();
         let entry_str = format!(
-            "{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}",
             self.step_index,
             self.timestamp_secs,
             action_str,
             self.operator_principal,
+            self.terminal_or_node,
             self.previous_entry_hash
         );
         let mut hasher = Sha256::new();

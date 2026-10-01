@@ -28,6 +28,8 @@ mod tests {
                 root_blake3: String::new(),
                 root_sha256: String::new(),
                 leaves_count: 0,
+                origin_roots: vec![],
+                proofs_sha256: String::new(),
             },
             custody_digest: "digest".to_string(),
             export_identity: "exporter".to_string(),
@@ -128,7 +130,7 @@ mod tests {
         builder.build(&target_dir).expect("Failed to build package");
         
         // Tamper with the object
-        fs::write(target_dir.join("evidence/file1.txt"), b"tampered content").unwrap();
+        fs::write(target_dir.join("evidence/file1.txt"), b"best content").unwrap();
         
         let verifier = EvidenceVerifier::new(&target_dir);
         let result = verifier.verify();

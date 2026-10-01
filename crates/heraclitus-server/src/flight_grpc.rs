@@ -11,6 +11,7 @@
 //! IPC do analytics; a variante gRPC é acréscimo natural).
 
 use arrow_flight::encode::FlightDataEncoderBuilder;
+use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
@@ -18,17 +19,20 @@ use arrow_flight::{
 };
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
+use heraclitus_analytics::datafusion::arrow::record_batch::RecordBatch;
 use heraclitus_analytics::vectorized::{episodes_to_batches_sized, BATCH_ROWS};
+use heraclitus_core::Episode;
 use heraclitus_log::EpisodeLog;
 use std::sync::Arc;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
-pub struct HeraclitusFlight {
+struct HeraclitusFlight {
     log: Arc<dyn EpisodeLog>,
 }
 
 impl HeraclitusFlight {
-    pub fn new<L: EpisodeLog + 'static>(log: Arc<L>) -> Self {
+    fn new<L: EpisodeLog + 'static>(log: Arc<L>) -> Self {
         Self { log }
     }
 
@@ -48,6 +52,45 @@ impl HeraclitusFlight {
     }
 }
 
+fn episode_resident_bytes(episode: &Episode) -> usize {
+    let kind_bytes = match &episode.kind {
+        heraclitus_core::EventKind::Custom(value) => value.len(),
+        _ => 24,
+    };
+    let embedding_bytes = episode
+        .embedding
+        .as_ref()
+        .map(|point| {
+            point
+                .hyp
+                .len()
+                .saturating_add(point.sph.len())
+                .saturating_add(point.euc.len())
+                .saturating_mul(std::mem::size_of::<f32>())
+        })
+        .unwrap_or(0);
+    let attrs_bytes = episode
+        .attrs
+        .iter()
+        .map(|(key, value)| key.len().saturating_add(value.len()))
+        .sum::<usize>();
+    let parents_bytes = episode
+        .parents
+        .len()
+        .saturating_mul(std::mem::size_of::<heraclitus_core::EventId>());
+
+    episode
+        .content
+        .len()
+        .saturating_add(episode.agent_id.len())
+        .saturating_add(episode.session_id.len())
+        .saturating_add(kind_bytes)
+        .saturating_add(embedding_bytes)
+        .saturating_add(attrs_bytes)
+        .saturating_add(parents_bytes)
+        .saturating_add(96)
+}
+
 type S<T> = BoxStream<'static, Result<T, Status>>;
 
 #[tonic::async_trait]
@@ -63,21 +106,101 @@ impl FlightService for HeraclitusFlight {
     async fn do_get(&self, req: Request<Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
         let as_of = Self::parse_ticket(req.get_ref())?;
         let log = self.log.clone();
-        // Materialização fora do executor async (o scan lê disco).
-        let batches = tokio::task::spawn_blocking(move || {
-            let to = as_of.unwrap_or(u64::MAX).min(log.head());
-            let events = log.scan(0, to).map_err(|e| e.to_string())?;
-            // Streaming Flight: lotes fixos de BATCH_ROWS (contrato do fio).
-            episodes_to_batches_sized(&events, BATCH_ROWS).map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| Status::internal(format!("join: {e}")))?
-        .map_err(Status::internal)?;
 
-        // O encoder OFICIAL do protocolo: RecordBatches → FlightData frames.
+        // Backpressure e admission control globais. O permit vive dentro do
+        // produtor e só é libertado quando o stream termina ou o cliente cai.
+        const FLIGHT_BUFFERED_BATCHES: usize = 4;
+        const FLIGHT_MAX_CONCURRENT: usize = 4;
+        const FLIGHT_PAGE_BYTES: usize = 8 * 1024 * 1024;
+        static FLIGHT_GATE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+            std::sync::OnceLock::new();
+        let permit = FLIGHT_GATE
+            .get_or_init(|| {
+                std::sync::Arc::new(tokio::sync::Semaphore::new(FLIGHT_MAX_CONCURRENT))
+            })
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("admission control Flight encerrado"))?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch, FlightError>>(
+            FLIGHT_BUFFERED_BATCHES,
+        );
+
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let to = as_of.unwrap_or(u64::MAX).min(log.head());
+            let mut cur = 0u64;
+
+            while cur < to {
+                // Página limitada por LINHAS e por BYTES residentes. Point
+                // reads evitam que um scan já tenha alocado milhares de
+                // episódios antes de conseguirmos aplicar o budget.
+                let mut events = Vec::with_capacity(BATCH_ROWS);
+                let mut page_bytes = 0usize;
+
+                while cur < to && events.len() < BATCH_ROWS {
+                    let read = match log.read(cur) {
+                        Ok(read) => read,
+                        Err(error) => {
+                            let _ = tx.blocking_send(Err(FlightError::protocol(format!(
+                                "leitura do log falhou no LSN {cur}: {error}"
+                            ))));
+                            return;
+                        }
+                    };
+                    cur = cur.saturating_add(1);
+
+                    let Some((lsn, episode)) = read else {
+                        continue;
+                    };
+                    let row_bytes = episode_resident_bytes(&episode);
+                    if row_bytes > FLIGHT_PAGE_BYTES {
+                        let _ = tx.blocking_send(Err(FlightError::protocol(format!(
+                            "evento LSN {lsn} excede budget Flight de {FLIGHT_PAGE_BYTES} bytes"
+                        ))));
+                        return;
+                    }
+                    if !events.is_empty()
+                        && page_bytes.saturating_add(row_bytes) > FLIGHT_PAGE_BYTES
+                    {
+                        // Reprocessar este LSN na página seguinte.
+                        cur = lsn;
+                        break;
+                    }
+
+                    page_bytes = page_bytes.saturating_add(row_bytes);
+                    events.push((lsn, episode));
+                }
+
+                if events.is_empty() {
+                    continue;
+                }
+
+                let batches = match episodes_to_batches_sized(&events, BATCH_ROWS) {
+                    Ok(batches) => batches,
+                    Err(error) => {
+                        let _ = tx.blocking_send(Err(FlightError::protocol(format!(
+                            "conversão Arrow falhou: {error}"
+                        ))));
+                        return;
+                    }
+                };
+
+                for batch in batches {
+                    // Receiver fechado = cancelamento cooperativo imediato no
+                    // próximo envio, sem continuar a percorrer o log.
+                    if tx.blocking_send(Ok(batch)).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+
         let stream = FlightDataEncoderBuilder::new()
-            .build(futures::stream::iter(batches.into_iter().map(Ok)))
-            .map_err(|e| Status::internal(e.to_string()))
+            .with_schema(heraclitus_analytics::vectorized::batch_schema())
+            .build(ReceiverStream::new(rx))
+            .map_err(Status::from)
             .boxed();
         Ok(Response::new(stream))
     }
@@ -158,6 +281,14 @@ pub async fn serve_flight<L: EpisodeLog + 'static>(
         .await
         .map_err(|e| format!("flight bind {addr}: {e}"))?;
     let local = listener.local_addr().map_err(|e| e.to_string())?;
+    // A API pública também impõe a mesma fronteira do boot principal. Assim um
+    // integrador não consegue expor Flight sem autenticação em 0.0.0.0 apenas
+    // por chamar `serve_flight` diretamente.
+    if !local.ip().is_loopback() {
+        return Err(format!(
+            "Flight sem autenticação só pode escutar em loopback; endereço resolvido: {local}"
+        ));
+    }
     let svc = FlightServiceServer::new(HeraclitusFlight::new(log));
     let handle = tokio::spawn(async move {
         let incoming = tonic::transport::server::TcpIncoming::from(listener);

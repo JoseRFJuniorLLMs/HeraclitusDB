@@ -60,3 +60,22 @@ async fn flight_client_does_doget_over_real_grpc() {
     // Ticket desconhecido → erro gRPC limpo, não crash.
     assert!(client.do_get(Ticket::new("hack")).await.is_err());
 }
+
+
+#[tokio::test]
+async fn public_flight_helper_refuses_non_loopback_bind() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+
+    let result = serve_flight(log, "0.0.0.0:0").await;
+    match result {
+        Err(error) => assert!(
+            error.contains("loopback"),
+            "erro deve explicar a fronteira de segurança: {error}"
+        ),
+        Ok((addr, handle)) => {
+            handle.abort();
+            panic!("Flight sem autenticação não podia escutar em {addr}");
+        }
+    }
+}

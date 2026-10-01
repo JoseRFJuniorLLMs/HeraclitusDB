@@ -24,6 +24,7 @@
 
 use heraclitus_core::{Episode, EventKind, FsyncPolicy, HeraclitusConfig};
 use heraclitus_server::engine::Engine;
+use heraclitus_server::trusted_admin::AdminContext;
 
 /// O prefixo é o que o keystore por agente usa para derivar a chave da titular.
 const TITULAR: &str = "titular:hmac-sha256:carlos";
@@ -117,8 +118,15 @@ fn shred_com_replay_saltado_reescreve_os_snapshots_das_views() {
         std::env::set_var("HERACLITUS_SKIP_VIEW_REPLAY", "1");
         let engine = Engine::open(&cfg).unwrap();
         std::env::remove_var("HERACLITUS_SKIP_VIEW_REPLAY");
+        let ctx = AdminContext::new(
+            "integration-test-admin",
+            "test",
+            vec!["admin".into()],
+        );
         assert!(
-            engine.shred(TITULAR).unwrap(),
+            engine
+                .shred_as(&ctx, TITULAR, "test-shred-replay-skipped")
+                .unwrap(),
             "montagem: o shred tinha de destruir a chave da titular"
         );
         assert!(

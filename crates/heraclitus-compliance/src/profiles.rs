@@ -264,7 +264,7 @@ mod tests {
             test_reference: "test1".to_string(),
             assessed_at_secs: 100,
         };
-        let report = evaluate_profile(&profile, &[ev.clone()]);
+        let report = evaluate_profile(&profile, std::slice::from_ref(&ev));
         
         assert_eq!(report.controls_evaluated, 1);
         assert_eq!(report.pass_count, 1);

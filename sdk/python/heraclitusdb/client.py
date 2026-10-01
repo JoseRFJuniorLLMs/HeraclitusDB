@@ -201,20 +201,32 @@ class Client:
         ).lsn
 
     # ── admin / integridade ──────────────────────────────────────────────
-    def admin(self, op, arg=""):
+    def admin(self, op, arg="", *, idempotency_key=None):
+        metadata = list(self._md)
+        if idempotency_key is not None:
+            key = str(idempotency_key).strip()
+            if not key or len(key) > 128:
+                raise ValueError("idempotency_key deve conter entre 1 e 128 caracteres")
+            metadata.append(("x-heraclitus-idempotency-key", key))
         try:
             resp = self._stub.Admin(
-                pb.AdminRequest(op=op, arg=arg), metadata=self._md, timeout=self.timeout
+                pb.AdminRequest(op=op, arg=arg), metadata=metadata, timeout=self.timeout
             )
             return {"ok": resp.ok, "message": resp.message}
         except grpc.RpcError as e:
             raise HeraclitusError(f"Admin falhou: {e.details()}") from e
 
-    def shred(self, agent_id):
+    def shred(self, agent_id, *, idempotency_key):
         """Crypto-shredding (§3.10): destrói a chave do agente -> o conteúdo
         cifrado desse agente fica permanentemente ilegível. O log não é mutado.
-        Requer encryption_at_rest ativo no servidor."""
-        return self.admin(f"shred:{agent_id}")
+
+        idempotency_key é obrigatório e deve ser reutilizado em retries da
+        mesma operação.
+        """
+        return self.admin(
+            f"shred:{agent_id}",
+            idempotency_key=idempotency_key,
+        )
 
     def verify(self):
         """Verificação criptográfica de integridade (Árvore de Merkle). {ok, message}."""

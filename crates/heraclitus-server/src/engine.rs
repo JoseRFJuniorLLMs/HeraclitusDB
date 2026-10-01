@@ -129,6 +129,35 @@ fn is_compliance_reserved(episode: &Episode) -> bool {
         )
 }
 
+
+const TRUSTED_ADMIN_KINDS: &[&str] = &["TrustedAdminIntent", "TrustedAdminResult"];
+
+fn is_internal_trusted_admin_episode(episode: &Episode) -> bool {
+    episode.agent_id == "heraclitus-trusted-admin"
+        && episode.attrs.get("audit").is_some_and(|value| value == "trusted-admin")
+        && episode.attrs.get("protocol").is_some_and(|value| value == "SPEC-0089")
+        && matches!(
+            &episode.kind,
+            EventKind::Custom(kind) if TRUSTED_ADMIN_KINDS.contains(&kind.as_str())
+        )
+}
+
+fn is_trusted_admin_reserved(episode: &Episode) -> bool {
+    episode.agent_id == "heraclitus-trusted-admin"
+        || episode
+            .attrs
+            .get("protocol")
+            .is_some_and(|value| value == "SPEC-0089")
+        || episode
+            .attrs
+            .get("audit")
+            .is_some_and(|value| value == "trusted-admin")
+        || matches!(
+            &episode.kind,
+            EventKind::Custom(kind) if TRUSTED_ADMIN_KINDS.contains(&kind.as_str())
+        )
+}
+
 pub struct Engine {
     /// Backend append-only selecionado explicitamente na configuração.
     /// `legacy` continua sendo o default; `v6` nunca é inferido nem migrado.
@@ -683,6 +712,7 @@ impl Engine {
             engine.attr.read().unwrap().save(&engine.attr_dir)?;
             std::fs::remove_file(&privacy_rebuild_marker)?;
         }
+        engine.recover_trusted_admin_state()?;
         Ok(engine)
     }
 
@@ -797,6 +827,150 @@ impl Engine {
     /// Retorna o protocolo de administração confiável (SPEC-0089).
     pub fn trusted_admin(&self) -> &Arc<crate::trusted_admin::TrustedAdminProtocol> {
         &self.trusted_admin
+    }
+
+    fn append_trusted_admin_record<T: serde::Serialize>(
+        &self,
+        kind: &str,
+        value: &T,
+    ) -> Result<Lsn, crate::trusted_admin::AdminError> {
+        let content = serde_json::to_vec(value).map_err(|error| {
+            crate::trusted_admin::AdminError::PreconditionFailed(format!(
+                "serialização do registro administrativo falhou: {error}"
+            ))
+        })?;
+        let mut episode = Episode::new(
+            "heraclitus-trusted-admin",
+            EventKind::Custom(kind.to_string()),
+            content,
+        );
+        episode.attrs.insert("audit".into(), "trusted-admin".into());
+        episode.attrs.insert("protocol".into(), "SPEC-0089".into());
+
+        // O namespace é reservado a este caminho interno. A validação impede
+        // que uma alteração futura transforme o recovery em consumidor de
+        // eventos forjáveis por Writer.
+        if !is_internal_trusted_admin_episode(&episode) {
+            return Err(crate::trusted_admin::AdminError::PreconditionFailed(
+                "registro TrustedAdmin interno inválido".into(),
+            ));
+        }
+
+        // `append_internal` aguarda consenso quando a replicação está ativa.
+        // A barreira física cobre também GroupCommit local: o token só nasce
+        // depois deste flush.
+        let lsn = self
+            .append_internal(episode)
+            .map_err(crate::trusted_admin::AdminError::Storage)?;
+        self.log
+            .flush()
+            .map_err(crate::trusted_admin::AdminError::Storage)?;
+        Ok(lsn)
+    }
+
+    /// Executa operação privilegiada pelo único caminho autorizado.
+    ///
+    /// A intenção entra no log antes de a closure receber o token. O resultado
+    /// entra depois; falha nessa segunda persistência deixa o protocolo UNKNOWN
+    /// e recuperável no próximo boot.
+    pub fn execute_trusted_admin<T, F>(
+        &self,
+        ctx: &crate::trusted_admin::AdminContext,
+        op: &crate::trusted_admin::AdminOperation,
+        effect: F,
+    ) -> Result<crate::trusted_admin::AdminOutcome<T>, crate::trusted_admin::AdminError>
+    where
+        F: FnOnce(
+            &crate::trusted_admin::AdminExecutionToken,
+        ) -> Result<
+            (T, String, std::collections::BTreeMap<String, String>),
+            crate::trusted_admin::AdminError,
+        >,
+    {
+        self.trusted_admin.execute_admin(
+            ctx,
+            op,
+            |intent| self.append_trusted_admin_record("TrustedAdminIntent", intent),
+            effect,
+            |result| self.append_trusted_admin_record("TrustedAdminResult", result),
+        )
+    }
+
+    /// Reconcilia uma operação administrativa UNKNOWN por inspeção do estado
+    /// real, persistindo a conclusão no mesmo log durável.
+    pub fn reconcile_trusted_admin<F>(
+        &self,
+        idempotency_key: &str,
+        inspect: F,
+    ) -> Result<crate::trusted_admin::AdminResult, crate::trusted_admin::AdminError>
+    where
+        F: FnOnce(
+            &crate::trusted_admin::AdminIntent,
+        ) -> Result<
+            (
+                crate::trusted_admin::AdminState,
+                String,
+                std::collections::BTreeMap<String, String>,
+            ),
+            crate::trusted_admin::AdminError,
+        >,
+    {
+        self.trusted_admin.reconcile_admin(
+            idempotency_key,
+            inspect,
+            |result| self.append_trusted_admin_record("TrustedAdminResult", result),
+        )
+    }
+
+    fn recover_trusted_admin_state(&self) -> Result<(), HeraclitusError> {
+        let head = self.log.head();
+        let mut cur = 0u64;
+        while cur <= head {
+            let batch = self
+                .log
+                .scan_capped(cur, head.saturating_add(1), 100_000)?;
+            let Some(&(last, _)) = batch.last() else {
+                break;
+            };
+            for (lsn, episode) in &batch {
+                if !is_internal_trusted_admin_episode(episode) {
+                    continue;
+                }
+                let EventKind::Custom(kind) = &episode.kind else {
+                    continue;
+                };
+                match kind.as_str() {
+                    "TrustedAdminIntent" => {
+                        let intent = serde_json::from_slice::<crate::trusted_admin::AdminIntent>(
+                            &episode.content,
+                        )
+                        .map_err(|error| {
+                            HeraclitusError::Config(format!(
+                                "TrustedAdminIntent inválido no LSN {lsn}: {error}"
+                            ))
+                        })?;
+                        self.trusted_admin.recover_intent(*lsn, &intent);
+                    }
+                    "TrustedAdminResult" => {
+                        let result = serde_json::from_slice::<crate::trusted_admin::AdminResult>(
+                            &episode.content,
+                        )
+                        .map_err(|error| {
+                            HeraclitusError::Config(format!(
+                                "TrustedAdminResult inválido no LSN {lsn}: {error}"
+                            ))
+                        })?;
+                        self.trusted_admin.recover_result(*lsn, &result);
+                    }
+                    _ => {}
+                }
+            }
+            cur = last.saturating_add(1);
+            if last == u64::MAX {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Grava o checkpoint do índice de atributos (o servidor pode chamar
@@ -2035,10 +2209,62 @@ impl Engine {
         serde_json::json!({ "titular": agent_id, "acessos": achados })
     }
 
+    /// Atalho exclusivo dos testes unitários antigos.
+    ///
+    /// Não existe em builds normais: consumidores produtivos precisam fornecer
+    /// um contexto administrativo ao caminho durável `shred_as`.
+    #[cfg(test)]
+    fn shred(&self, agent_id: &str) -> Result<bool, HeraclitusError> {
+        let ctx = crate::trusted_admin::AdminContext::new(
+            "unit-test-admin",
+            "test",
+            vec!["admin".into()],
+        );
+        let idem = ctx.request_id.clone();
+        self.shred_as(&ctx, agent_id, &idem)
+            .map_err(|error| HeraclitusError::Config(error.to_string()))
+    }
+
+    pub fn shred_as(
+        &self,
+        ctx: &crate::trusted_admin::AdminContext,
+        agent_id: &str,
+        idempotency_key: &str,
+    ) -> Result<bool, crate::trusted_admin::AdminError> {
+        let mut op = crate::trusted_admin::AdminOperation::new(
+            format!("crypto-shred:{idempotency_key}"),
+            idempotency_key.to_string(),
+            crate::trusted_admin::AdminOperationKind::CryptoShred {
+                agent_id: agent_id.to_string(),
+            },
+            "irreversible crypto-shred",
+        );
+        op.parameters_digest = blake3::hash(agent_id.as_bytes()).to_hex().to_string();
+
+        let outcome = self.execute_trusted_admin(ctx, &op, |token| {
+            let destroyed = self
+                .shred_effect(token, agent_id)
+                .map_err(crate::trusted_admin::AdminError::Storage)?;
+            let mut receipts = std::collections::BTreeMap::new();
+            receipts.insert("key_destroyed".into(), destroyed.to_string());
+            let post = blake3::hash(
+                format!("crypto-shred:{agent_id}:{destroyed}").as_bytes(),
+            )
+            .to_hex()
+            .to_string();
+            Ok((destroyed, post, receipts))
+        })?;
+        Ok(outcome.value)
+    }
+
     /// Crypto-shred (§3.10): destroy an agent's encryption key so all of its
     /// sealed content becomes permanently unreadable. The log is never mutated.
     /// Errors if encryption at rest is disabled.
-    pub fn shred(&self, agent_id: &str) -> Result<bool, HeraclitusError> {
+    fn shred_effect(
+        &self,
+        _token: &crate::trusted_admin::AdminExecutionToken,
+        agent_id: &str,
+    ) -> Result<bool, HeraclitusError> {
         let ks = self.keystore.as_ref().ok_or_else(|| {
             HeraclitusError::Config("encryption at rest is disabled; nothing to shred".into())
         })?;
@@ -2233,6 +2459,12 @@ impl Engine {
                 "tipos, agente e atributos compliance.* são reservados ao motor regulatório".into(),
             ));
         }
+        if is_trusted_admin_reserved(&episode) {
+            return Err(HeraclitusError::Query(
+                "eventos TrustedAdmin/SPEC-0089 são reservados ao executor administrativo interno"
+                    .into(),
+            ));
+        }
         if episode.attrs.contains_key(IDEMPOTENCY_KEY_ATTR)
             || episode.attrs.contains_key(IDEMPOTENCY_HASH_ATTR)
         {
@@ -2264,6 +2496,12 @@ impl Engine {
         if is_compliance_reserved(&episode) {
             return Err(HeraclitusError::Query(
                 "tipos, agente e atributos compliance.* são reservados ao motor regulatório".into(),
+            ));
+        }
+        if is_trusted_admin_reserved(&episode) {
+            return Err(HeraclitusError::Query(
+                "eventos TrustedAdmin/SPEC-0089 são reservados ao executor administrativo interno"
+                    .into(),
             ));
         }
         if key.is_empty() {
@@ -3418,10 +3656,29 @@ impl heraclitus_compliance::ComplianceSink for Engine {
 }
 
 #[cfg(test)]
+fn legal_hold_for_test(
+    engine: &Arc<Engine>,
+    op: &str,
+    arg: &str,
+) -> (bool, String) {
+    if op == "legal-holds" {
+        return crate::grpc::legal_hold_list(engine);
+    }
+    let ctx = crate::trusted_admin::AdminContext::new(
+        "unit-test-admin",
+        "test",
+        vec!["admin".into()],
+    );
+    let key = format!("test:{op}:{}", blake3::hash(arg.as_bytes()).to_hex());
+    crate::grpc::trusted_legal_hold_op(engine, &ctx, op, arg, &key)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use heraclitus_core::FsyncPolicy;
     use heraclitus_query::backend::{replay_graph, LogBackend};
+
 
     /// Auditoria 2026-09-05 (`grpc.rs:521`, CONFIRMADO): as escritas do RPC
     /// admin de compliance iam directas ao log, sem `index_applied`. Um
@@ -3438,14 +3695,17 @@ mod tests {
             ..Default::default()
         };
         let engine = Arc::new(Engine::open(&cfg).unwrap());
-        let (ok, msg) = crate::grpc::legal_hold_op(
+        let (ok, msg) = legal_hold_for_test(
             &engine,
             "legal-hold-place",
             r#"{"hold_id":"h1","lsn_start":0,"lsn_end":10,
                 "authority":"tribunal","reason":"prova"}"#,
         );
         assert!(ok, "{msg}");
-        assert_eq!(engine.head(), 1, "o hold está no log");
+        assert!(
+            engine.head() >= 3,
+            "AdminIntent + LegalHold + AdminResult têm de estar no log"
+        );
 
         // O caminho do índice de atributos (`n.kind` → `_kind`), SEM reiniciar.
         let v = heraclitus_query::execute(
@@ -4823,7 +5083,7 @@ mod tests {
             .unwrap();
 
         // Hold com fim aberto ate um LSN muito a frente: cobre o que vier.
-        let (ok, msg) = crate::grpc::legal_hold_op(
+        let (ok, msg) = legal_hold_for_test(
             &engine,
             "legal-hold-place",
             r#"{"hold_id":"h","lsn_start":0,"lsn_end":1000000,
@@ -5373,7 +5633,7 @@ mod legal_hold_entrypoint_tests {
             .unwrap();
         assert!(engine.shred(sonda).unwrap());
 
-        let (ok, msg) = crate::grpc::legal_hold_op(
+        let (ok, msg) = legal_hold_for_test(
             &engine,
             "legal-hold-place",
             &format!(
@@ -5384,7 +5644,7 @@ mod legal_hold_entrypoint_tests {
         assert!(ok, "{msg}");
 
         // A listagem diz a verdade sobre o que esta retido.
-        let (ok, listagem) = crate::grpc::legal_hold_op(&engine, "legal-holds", "");
+        let (ok, listagem) = legal_hold_for_test(&engine, "legal-holds", "");
         assert!(ok, "{listagem}");
         let holds: serde_json::Value = serde_json::from_str(&listagem).unwrap();
         assert_eq!(holds.as_array().unwrap().len(), 1);
@@ -5411,14 +5671,14 @@ mod legal_hold_entrypoint_tests {
         }
 
         // Levantar exige autoridade e razao, e e auditado no log.
-        let (ok, msg) = crate::grpc::legal_hold_op(
+        let (ok, msg) = legal_hold_for_test(
             &engine,
             "legal-hold-release",
             r#"{"hold_id":"hold-1","authority":"tribunal","reason":"caso encerrado"}"#,
         );
         assert!(ok, "{msg}");
 
-        let (_, listagem) = crate::grpc::legal_hold_op(&engine, "legal-holds", "");
+        let (_, listagem) = legal_hold_for_test(&engine, "legal-holds", "");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&listagem)
                 .unwrap()
@@ -5448,7 +5708,7 @@ mod legal_hold_entrypoint_tests {
             r#"{"lsn_start":0,"lsn_end":0,"authority":"a","reason":"r"}"#,
             "isto nao e json",
         ] {
-            let (ok, _) = crate::grpc::legal_hold_op(&engine, "legal-hold-place", corpo);
+            let (ok, _) = legal_hold_for_test(&engine, "legal-hold-place", corpo);
             assert!(!ok, "aceitou um pedido incompleto: {corpo}");
         }
     }
@@ -5468,7 +5728,7 @@ mod legal_hold_entrypoint_tests {
         engine
             .append(Episode::new("a", EventKind::Observation, b"antes".to_vec()))
             .unwrap();
-        let (ok, _) = crate::grpc::legal_hold_op(
+        let (ok, _) = legal_hold_for_test(
             &engine,
             "legal-hold-place",
             r#"{"hold_id":"h","authority":"a","reason":"r"}"#,
@@ -5482,7 +5742,7 @@ mod legal_hold_entrypoint_tests {
             ))
             .unwrap();
 
-        let (_, listagem) = crate::grpc::legal_hold_op(&engine, "legal-holds", "");
+        let (_, listagem) = legal_hold_for_test(&engine, "legal-holds", "");
         let holds: serde_json::Value = serde_json::from_str(&listagem).unwrap();
         assert!(
             holds[0]["lsn_end"].as_u64().unwrap() < depois,

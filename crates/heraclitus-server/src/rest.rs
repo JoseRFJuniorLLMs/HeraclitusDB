@@ -1285,30 +1285,19 @@ async fn titular_eliminar(
             })),
         );
     }
-    let alvo = id.clone();
-    let r = tokio::task::spawn_blocking(move || engine.shred(&alvo)).await;
-    match r {
-        Ok(Ok(destruida)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "ok": true,
-                "chave_destruida": destruida,
-                "nota": if destruida {
-                    "Chave destruida. O log NAO foi alterado: a cadeia Merkle continua a verificar."
-                } else {
-                    "Nao havia chave para este titular (ja eliminado, ou nunca escreveu)."
-                },
-            })),
-        ),
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("join: {e}") })),
-        ),
-    }
+    // SPEC-0089: Basic auth não fornece identidade/papel suficiente para uma
+    // operação irreversível. Mesmo com o antigo interruptor habilitado, a
+    // superfície REST não executa mais o efeito; o caminho mutável é o Admin
+    // RPC autenticado, que persiste Durable Intent antes do crypto-shred.
+    let _ = engine; // mantém a assinatura do handler estável
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "ok": false,
+            "error": "crypto-shred pelo REST desativado: use o Admin RPC confiável",
+            "alternativa": format!("Admin RPC com op = \"shred:{id}\""),
+        })),
+    )
 }
 
 /// `GET /flight/events[?as_of=N]` → corpo `application/vnd.apache.arrow.stream`.
@@ -1374,6 +1363,12 @@ async fn sql(State(engine): State<Arc<Engine>>, Json(body): Json<serde_json::Val
 const SQL_MAX_ROWS: usize = 2_000_000;
 #[cfg(feature = "analytics")]
 const SQL_MAX_BYTES: usize = 256 * 1024 * 1024;
+#[cfg(feature = "analytics")]
+const SQL_MAX_RESULT_ROWS: usize = 10_000;
+#[cfg(feature = "analytics")]
+const SQL_MAX_RESULT_BYTES: usize = 32 * 1024 * 1024;
+#[cfg(feature = "analytics")]
+const SQL_MAX_CONCURRENT: usize = 4;
 
 /// Núcleo testável de `POST /sql`: materializa o log em `spawn_blocking` (nunca
 /// no executor async) e corre o SQL no DataFusion. Erro de SQL do utilizador =
@@ -1384,21 +1379,42 @@ async fn run_sql(
     query: String,
     as_of: Option<u64>,
 ) -> Result<Vec<serde_json::Value>, (StatusCode, String)> {
+    // Admission control GLOBAL da superfície SQL. Sem isto, quatro limites
+    // "por consulta" multiplicavam-se por N pedidos concorrentes até o host
+    // descobrir, de forma pedagógica e cara, que RAM também é finita.
+    static SQL_GATE: std::sync::OnceLock<tokio::sync::Semaphore> =
+        std::sync::OnceLock::new();
+    let permit = SQL_GATE
+        .get_or_init(|| tokio::sync::Semaphore::new(SQL_MAX_CONCURRENT))
+        .acquire()
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "admission control SQL encerrado".to_string(),
+            )
+        })?;
+
+    const SQL_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + SQL_TOTAL_TIMEOUT;
     let log = engine.log.clone();
     let analytics = tokio::task::spawn_blocking(move || {
-        heraclitus_analytics::LogAnalytics::from_log_capped(
+        heraclitus_analytics::LogAnalytics::from_log_capped_until(
             &log,
             as_of,
             SQL_MAX_ROWS,
             SQL_MAX_BYTES,
+            deadline,
         )
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")))?
     .map_err(|e| match e {
-        // Orçamento excedido é erro do PEDIDO (demasiado largo), não do servidor.
         heraclitus_analytics::AnalyticsError::Budget { .. } => {
             (StatusCode::PAYLOAD_TOO_LARGE, e.to_string())
+        }
+        heraclitus_analytics::AnalyticsError::Timeout { .. } => {
+            (StatusCode::REQUEST_TIMEOUT, e.to_string())
         }
         other => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1406,25 +1422,36 @@ async fn run_sql(
         ),
     })?;
 
-    // Aqui o timeout é eficaz: `analytics.sql` é um futuro async, que ao ser
-    // largado é mesmo cancelado (ao contrário do `spawn_blocking` acima).
-    let rows = tokio::time::timeout(std::time::Duration::from_secs(30), analytics.sql(&query))
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::REQUEST_TIMEOUT,
-                "timeout executando SQL".to_string(),
-            )
-        })?
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("sql: {e}")))?;
-
-    if rows.len() > 10_000 {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
         return Err((
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "Conjunto de resultados muito grande (> 10.000 linhas). Utilize LIMIT.".to_string(),
+            StatusCode::REQUEST_TIMEOUT,
+            "timeout total da consulta expirou durante a materialização".to_string(),
         ));
     }
 
+    let rows = tokio::time::timeout(
+        remaining,
+        analytics.sql_capped(&query, SQL_MAX_RESULT_ROWS, SQL_MAX_RESULT_BYTES),
+    )
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::REQUEST_TIMEOUT,
+            "timeout total executando SQL".to_string(),
+        )
+    })?
+    .map_err(|e| match e {
+        heraclitus_analytics::AnalyticsError::Budget { .. } => {
+            (StatusCode::PAYLOAD_TOO_LARGE, e.to_string())
+        }
+        heraclitus_analytics::AnalyticsError::Timeout { .. } => {
+            (StatusCode::REQUEST_TIMEOUT, e.to_string())
+        }
+        other => (StatusCode::BAD_REQUEST, format!("sql: {other}")),
+    })?;
+
+    drop(permit);
     Ok(rows)
 }
 
