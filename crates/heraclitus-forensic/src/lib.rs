@@ -28,6 +28,7 @@ mod tests {
                 root_blake3: String::new(),
                 root_sha256: String::new(),
                 leaves_count: 0,
+                proofs_sha256: String::new(),
             },
             custody_digest: "digest".to_string(),
             export_identity: "exporter".to_string(),
