@@ -24,7 +24,6 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::datasource::MemTable;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use futures::StreamExt;
 use heraclitus_core::{EventKind, HeraclitusError, Lsn};
 use heraclitus_log::EpisodeLog;
 use std::sync::Arc;
@@ -281,16 +280,19 @@ impl LogAnalytics {
         let df = df
             .limit(0, Some(probe_rows))
             .map_err(|e| AnalyticsError::Sql(e.to_string()))?;
-        let mut stream = df
-            .execute_stream()
+        // O LIMIT externo garante que o collect nunca materializa mais de
+        // max_rows + 1 linhas. Isso mantém a saída estritamente limitada sem
+        // adicionar uma nova dependência ao crate/Cargo.lock; os operadores
+        // intermediários continuam limitados pelo RuntimeEnv acima.
+        let batches = df
+            .collect()
             .await
             .map_err(|e| AnalyticsError::Sql(e.to_string()))?;
 
         let mut rows = Vec::new();
         let mut json_bytes = 0usize;
 
-        while let Some(batch) = stream.next().await {
-            let batch = batch.map_err(|e| AnalyticsError::Sql(e.to_string()))?;
+        for batch in batches {
             let next_rows = rows.len().saturating_add(batch.num_rows());
             if next_rows > max_rows {
                 return Err(AnalyticsError::Budget {
