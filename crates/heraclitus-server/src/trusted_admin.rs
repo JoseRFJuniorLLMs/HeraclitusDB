@@ -438,12 +438,10 @@ impl TrustedAdminProtocol {
                     new_digest: intent_digest.to_string(),
                 });
             }
-            if !matches!(entry.state, AdminState::Failed) {
-                return Err(AdminError::AlreadyProcessed(format!(
-                    "{} ({:?})",
-                    op.idempotency_key, entry.state
-                )));
-            }
+            return Err(AdminError::AlreadyProcessed(format!(
+                "{} ({:?})",
+                op.idempotency_key, entry.state
+            )));
         }
 
         map.insert(
@@ -1262,6 +1260,55 @@ mod tests {
         }
         assert_eq!(succeeded, 1);
         assert_eq!(effects.load(Ordering::SeqCst), 1);
+    }
+
+
+    #[test]
+    fn reconciled_failed_operation_cannot_reexecute_with_same_key() {
+        let protocol = TrustedAdminProtocol::new();
+        let intent = AdminIntent {
+            operation_id: "op-failed".into(),
+            idempotency_key: "idem-failed".into(),
+            intent_digest: "digest".into(),
+            principal: "alice".into(),
+            tenant: "tenant".into(),
+            kind: AdminOperationKind::Custom {
+                name: "x".into(),
+                details: "y".into(),
+            },
+            target_digest: "target".into(),
+            parameters_digest: "params".into(),
+            reason: "reason".into(),
+            approval_policy: None,
+            requested_at_secs: 1,
+            approver_count: 0,
+        };
+        protocol.recover_intent(10, &intent);
+        protocol
+            .reconcile_admin(
+                "idem-failed",
+                |_| Ok((AdminState::Failed, "post".into(), BTreeMap::new())),
+                |_| Ok(11),
+            )
+            .unwrap();
+
+        let ctx = AdminContext::new("alice", "tenant", vec!["admin".into()]);
+        let mut op = AdminOperation::new(
+            "op-failed",
+            "idem-failed",
+            AdminOperationKind::Custom {
+                name: "x".into(),
+                details: "y".into(),
+            },
+            "reason",
+        );
+        op.target_digest = "target".into();
+        op.parameters_digest = "params".into();
+
+        // A intenção reconstruída deste teste usa digest sintético; o ponto
+        // aqui é que uma chave terminal nunca pode voltar ao executor.
+        let reservation = protocol.reserve(&op, "digest");
+        assert!(matches!(reservation, Err(AdminError::AlreadyProcessed(_))));
     }
 
 }
