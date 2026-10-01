@@ -683,6 +683,7 @@ impl Engine {
             engine.attr.read().unwrap().save(&engine.attr_dir)?;
             std::fs::remove_file(&privacy_rebuild_marker)?;
         }
+        engine.recover_trusted_admin_state()?;
         Ok(engine)
     }
 
@@ -797,6 +798,103 @@ impl Engine {
     /// Retorna o protocolo de administração confiável (SPEC-0089).
     pub fn trusted_admin(&self) -> &Arc<crate::trusted_admin::TrustedAdminProtocol> {
         &self.trusted_admin
+    }
+
+    fn append_trusted_admin_record<T: serde::Serialize>(
+        &self,
+        kind: &str,
+        value: &T,
+    ) -> Result<Lsn, crate::trusted_admin::AdminError> {
+        let content = serde_json::to_vec(value).map_err(|error| {
+            crate::trusted_admin::AdminError::PreconditionFailed(format!(
+                "serialização do registro administrativo falhou: {error}"
+            ))
+        })?;
+        let mut episode = Episode::new(
+            "heraclitus-trusted-admin",
+            EventKind::Custom(kind.to_string()),
+            content,
+        );
+        episode.attrs.insert("audit".into(), "trusted-admin".into());
+        episode.attrs.insert("protocol".into(), "SPEC-0089".into());
+        self.append(episode)
+            .map_err(crate::trusted_admin::AdminError::Storage)
+    }
+
+    /// Executa operação privilegiada pelo único caminho autorizado.
+    ///
+    /// A intenção entra no log antes de a closure receber o token. O resultado
+    /// entra depois; falha nessa segunda persistência deixa o protocolo UNKNOWN
+    /// e recuperável no próximo boot.
+    pub fn execute_trusted_admin<T, F>(
+        &self,
+        ctx: &crate::trusted_admin::AdminContext,
+        op: &crate::trusted_admin::AdminOperation,
+        effect: F,
+    ) -> Result<crate::trusted_admin::AdminOutcome<T>, crate::trusted_admin::AdminError>
+    where
+        F: FnOnce(
+            &crate::trusted_admin::AdminExecutionToken,
+        ) -> Result<
+            (T, String, std::collections::BTreeMap<String, String>),
+            crate::trusted_admin::AdminError,
+        >,
+    {
+        self.trusted_admin.execute_admin(
+            ctx,
+            op,
+            |intent| self.append_trusted_admin_record("TrustedAdminIntent", intent),
+            effect,
+            |result| self.append_trusted_admin_record("TrustedAdminResult", result),
+        )
+    }
+
+    fn recover_trusted_admin_state(&self) -> Result<(), HeraclitusError> {
+        let head = self.log.head();
+        let mut cur = 0u64;
+        while cur <= head {
+            let batch = self
+                .log
+                .scan_capped(cur, head.saturating_add(1), 100_000)?;
+            let Some(&(last, _)) = batch.last() else {
+                break;
+            };
+            for (lsn, episode) in &batch {
+                let EventKind::Custom(kind) = &episode.kind else {
+                    continue;
+                };
+                match kind.as_str() {
+                    "TrustedAdminIntent" => {
+                        let intent = serde_json::from_slice::<crate::trusted_admin::AdminIntent>(
+                            &episode.content,
+                        )
+                        .map_err(|error| {
+                            HeraclitusError::Config(format!(
+                                "TrustedAdminIntent inválido no LSN {lsn}: {error}"
+                            ))
+                        })?;
+                        self.trusted_admin.recover_intent(*lsn, &intent);
+                    }
+                    "TrustedAdminResult" => {
+                        let result = serde_json::from_slice::<crate::trusted_admin::AdminResult>(
+                            &episode.content,
+                        )
+                        .map_err(|error| {
+                            HeraclitusError::Config(format!(
+                                "TrustedAdminResult inválido no LSN {lsn}: {error}"
+                            ))
+                        })?;
+                        self.trusted_admin.recover_result(*lsn, &result);
+                    }
+                    _ => {}
+                }
+            }
+            cur = last.saturating_add(1);
+            if last == u64::MAX {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Grava o checkpoint do índice de atributos (o servidor pode chamar
@@ -2035,10 +2133,61 @@ impl Engine {
         serde_json::json!({ "titular": agent_id, "acessos": achados })
     }
 
+    /// Crypto-shred público compatível para uso embedded.
+    ///
+    /// Mesmo chamadas locais passam pelo protocolo durável. Superfícies remotas
+    /// devem usar `shred_as` para preservar a identidade autenticada.
+    pub fn shred(&self, agent_id: &str) -> Result<bool, HeraclitusError> {
+        let ctx = crate::trusted_admin::AdminContext::new(
+            "embedded-admin",
+            "default",
+            vec!["admin".into()],
+        );
+        let idem = ctx.request_id.clone();
+        self.shred_as(&ctx, agent_id, &idem)
+            .map_err(|error| HeraclitusError::Config(error.to_string()))
+    }
+
+    pub fn shred_as(
+        &self,
+        ctx: &crate::trusted_admin::AdminContext,
+        agent_id: &str,
+        idempotency_key: &str,
+    ) -> Result<bool, crate::trusted_admin::AdminError> {
+        let mut op = crate::trusted_admin::AdminOperation::new(
+            format!("crypto-shred:{idempotency_key}"),
+            idempotency_key.to_string(),
+            crate::trusted_admin::AdminOperationKind::CryptoShred {
+                agent_id: agent_id.to_string(),
+            },
+            "irreversible crypto-shred",
+        );
+        op.parameters_digest = blake3::hash(agent_id.as_bytes()).to_hex().to_string();
+
+        let outcome = self.execute_trusted_admin(ctx, &op, |token| {
+            let destroyed = self
+                .shred_effect(token, agent_id)
+                .map_err(crate::trusted_admin::AdminError::Storage)?;
+            let mut receipts = std::collections::BTreeMap::new();
+            receipts.insert("key_destroyed".into(), destroyed.to_string());
+            let post = blake3::hash(
+                format!("crypto-shred:{agent_id}:{destroyed}").as_bytes(),
+            )
+            .to_hex()
+            .to_string();
+            Ok((destroyed, post, receipts))
+        })?;
+        Ok(outcome.value)
+    }
+
     /// Crypto-shred (§3.10): destroy an agent's encryption key so all of its
     /// sealed content becomes permanently unreadable. The log is never mutated.
     /// Errors if encryption at rest is disabled.
-    pub fn shred(&self, agent_id: &str) -> Result<bool, HeraclitusError> {
+    fn shred_effect(
+        &self,
+        _token: &crate::trusted_admin::AdminExecutionToken,
+        agent_id: &str,
+    ) -> Result<bool, HeraclitusError> {
         let ks = self.keystore.as_ref().ok_or_else(|| {
             HeraclitusError::Config("encryption at rest is disabled; nothing to shred".into())
         })?;
