@@ -676,7 +676,28 @@ impl EvidenceVerifier {
                 .iter()
                 .map(|object| (object.object_id.as_str(), object))
                 .collect();
+            let declared_roots: std::collections::HashSet<_> = manifest
+                .merkle
+                .origin_roots
+                .iter()
+                .map(|root| {
+                    (
+                        root.segment_id,
+                        root.generation,
+                        root.format_version,
+                        root.logical_root_hex.as_str(),
+                        root.leaf_count,
+                    )
+                })
+                .collect();
+            if declared_roots.is_empty() {
+                return Err(VerifierError::InvalidMerkleProof(
+                    "provas HRKL presentes sem origin_roots comprometidas no manifesto".into(),
+                ));
+            }
+
             let mut proven_objects = std::collections::HashSet::new();
+            let mut observed_roots = std::collections::HashSet::new();
             for proof in &document.proofs {
                 let object = objects_by_id.get(proof.object_id.as_str()).ok_or_else(|| {
                     VerifierError::InvalidMerkleProof(format!(
@@ -696,6 +717,20 @@ impl EvidenceVerifier {
                         proof.object_id
                     )));
                 }
+                let root_key = (
+                    proof.segment_id,
+                    proof.generation,
+                    proof.format_version,
+                    proof.logical_root_hex.as_str(),
+                    proof.leaf_count,
+                );
+                if !declared_roots.contains(&root_key) {
+                    return Err(VerifierError::InvalidMerkleProof(format!(
+                        "objeto {} fecha contra raiz não comprometida no manifesto",
+                        proof.object_id
+                    )));
+                }
+                observed_roots.insert(root_key);
                 verify_hrkl_object_proof(proof)?;
             }
 
@@ -710,6 +745,15 @@ impl EvidenceVerifier {
                     "documento de provas não cobre exatamente os objetos com source_lsn".into(),
                 ));
             }
+            if observed_roots != declared_roots {
+                return Err(VerifierError::InvalidMerkleProof(
+                    "origin_roots do manifesto e raízes efetivamente provadas divergem".into(),
+                ));
+            }
+        } else if !manifest.merkle.origin_roots.is_empty() {
+            return Err(VerifierError::InvalidMerkleProof(
+                "manifesto declara origin_roots sem documento de provas".into(),
+            ));
         }
 
         if !manifest.objects.is_empty() {
@@ -881,6 +925,7 @@ mod verifier_regressions {
                 root_blake3: String::new(),
                 root_sha256: String::new(),
                 leaves_count: 0,
+                origin_roots: vec![],
                 proofs_sha256: String::new(),
             },
             custody_digest: String::new(),
