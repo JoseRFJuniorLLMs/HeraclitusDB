@@ -1395,13 +1395,16 @@ async fn run_sql(
             )
         })?;
 
+    const SQL_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + SQL_TOTAL_TIMEOUT;
     let log = engine.log.clone();
     let analytics = tokio::task::spawn_blocking(move || {
-        heraclitus_analytics::LogAnalytics::from_log_capped(
+        heraclitus_analytics::LogAnalytics::from_log_capped_until(
             &log,
             as_of,
             SQL_MAX_ROWS,
             SQL_MAX_BYTES,
+            deadline,
         )
     })
     .await
@@ -1410,30 +1413,40 @@ async fn run_sql(
         heraclitus_analytics::AnalyticsError::Budget { .. } => {
             (StatusCode::PAYLOAD_TOO_LARGE, e.to_string())
         }
+        heraclitus_analytics::AnalyticsError::Timeout { .. } => {
+            (StatusCode::REQUEST_TIMEOUT, e.to_string())
+        }
         other => (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("analytics: {other}"),
         ),
     })?;
 
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err((
+            StatusCode::REQUEST_TIMEOUT,
+            "timeout total da consulta expirou durante a materialização".to_string(),
+        ));
+    }
+
     let rows = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        analytics.sql_capped(
-            &query,
-            SQL_MAX_RESULT_ROWS,
-            SQL_MAX_RESULT_BYTES,
-        ),
+        remaining,
+        analytics.sql_capped(&query, SQL_MAX_RESULT_ROWS, SQL_MAX_RESULT_BYTES),
     )
     .await
     .map_err(|_| {
         (
             StatusCode::REQUEST_TIMEOUT,
-            "timeout executando SQL".to_string(),
+            "timeout total executando SQL".to_string(),
         )
     })?
     .map_err(|e| match e {
         heraclitus_analytics::AnalyticsError::Budget { .. } => {
             (StatusCode::PAYLOAD_TOO_LARGE, e.to_string())
+        }
+        heraclitus_analytics::AnalyticsError::Timeout { .. } => {
+            (StatusCode::REQUEST_TIMEOUT, e.to_string())
         }
         other => (StatusCode::BAD_REQUEST, format!("sql: {other}")),
     })?;
