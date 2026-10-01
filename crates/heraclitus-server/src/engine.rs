@@ -3608,6 +3608,23 @@ mod tests {
     use heraclitus_core::FsyncPolicy;
     use heraclitus_query::backend::{replay_graph, LogBackend};
 
+
+    fn legal_hold_for_test(
+        engine: &Arc<Engine>,
+        op: &str,
+        arg: &str,
+    ) -> (bool, String) {
+        if op == "legal-holds" {
+            return crate::grpc::legal_hold_list(engine);
+        }
+        let ctx = crate::trusted_admin::AdminContext::new(
+            "unit-test-admin",
+            "test",
+            vec!["admin".into()],
+        );
+        crate::grpc::trusted_legal_hold_op(engine, &ctx, op, arg)
+    }
+
     /// Auditoria 2026-09-05 (`grpc.rs:521`, CONFIRMADO): as escritas do RPC
     /// admin de compliance iam directas ao log, sem `index_applied`. Um
     /// `LegalHold` acabado de colocar não existia para o índice `_kind` até ao
@@ -3623,7 +3640,7 @@ mod tests {
             ..Default::default()
         };
         let engine = Arc::new(Engine::open(&cfg).unwrap());
-        let (ok, msg) = crate::grpc::legal_hold_op(
+        let (ok, msg) = legal_hold_for_test(
             &engine,
             "legal-hold-place",
             r#"{"hold_id":"h1","lsn_start":0,"lsn_end":10,
@@ -5008,7 +5025,7 @@ mod tests {
             .unwrap();
 
         // Hold com fim aberto ate um LSN muito a frente: cobre o que vier.
-        let (ok, msg) = crate::grpc::legal_hold_op(
+        let (ok, msg) = legal_hold_for_test(
             &engine,
             "legal-hold-place",
             r#"{"hold_id":"h","lsn_start":0,"lsn_end":1000000,
@@ -5558,7 +5575,7 @@ mod legal_hold_entrypoint_tests {
             .unwrap();
         assert!(engine.shred(sonda).unwrap());
 
-        let (ok, msg) = crate::grpc::legal_hold_op(
+        let (ok, msg) = legal_hold_for_test(
             &engine,
             "legal-hold-place",
             &format!(
@@ -5569,7 +5586,7 @@ mod legal_hold_entrypoint_tests {
         assert!(ok, "{msg}");
 
         // A listagem diz a verdade sobre o que esta retido.
-        let (ok, listagem) = crate::grpc::legal_hold_op(&engine, "legal-holds", "");
+        let (ok, listagem) = legal_hold_for_test(&engine, "legal-holds", "");
         assert!(ok, "{listagem}");
         let holds: serde_json::Value = serde_json::from_str(&listagem).unwrap();
         assert_eq!(holds.as_array().unwrap().len(), 1);
@@ -5596,14 +5613,14 @@ mod legal_hold_entrypoint_tests {
         }
 
         // Levantar exige autoridade e razao, e e auditado no log.
-        let (ok, msg) = crate::grpc::legal_hold_op(
+        let (ok, msg) = legal_hold_for_test(
             &engine,
             "legal-hold-release",
             r#"{"hold_id":"hold-1","authority":"tribunal","reason":"caso encerrado"}"#,
         );
         assert!(ok, "{msg}");
 
-        let (_, listagem) = crate::grpc::legal_hold_op(&engine, "legal-holds", "");
+        let (_, listagem) = legal_hold_for_test(&engine, "legal-holds", "");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&listagem)
                 .unwrap()
@@ -5633,7 +5650,7 @@ mod legal_hold_entrypoint_tests {
             r#"{"lsn_start":0,"lsn_end":0,"authority":"a","reason":"r"}"#,
             "isto nao e json",
         ] {
-            let (ok, _) = crate::grpc::legal_hold_op(&engine, "legal-hold-place", corpo);
+            let (ok, _) = legal_hold_for_test(&engine, "legal-hold-place", corpo);
             assert!(!ok, "aceitou um pedido incompleto: {corpo}");
         }
     }
@@ -5653,7 +5670,7 @@ mod legal_hold_entrypoint_tests {
         engine
             .append(Episode::new("a", EventKind::Observation, b"antes".to_vec()))
             .unwrap();
-        let (ok, _) = crate::grpc::legal_hold_op(
+        let (ok, _) = legal_hold_for_test(
             &engine,
             "legal-hold-place",
             r#"{"hold_id":"h","authority":"a","reason":"r"}"#,
@@ -5667,7 +5684,7 @@ mod legal_hold_entrypoint_tests {
             ))
             .unwrap();
 
-        let (_, listagem) = crate::grpc::legal_hold_op(&engine, "legal-holds", "");
+        let (_, listagem) = legal_hold_for_test(&engine, "legal-holds", "");
         let holds: serde_json::Value = serde_json::from_str(&listagem).unwrap();
         assert!(
             holds[0]["lsn_end"].as_u64().unwrap() < depois,
