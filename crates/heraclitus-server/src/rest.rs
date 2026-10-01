@@ -1285,30 +1285,19 @@ async fn titular_eliminar(
             })),
         );
     }
-    let alvo = id.clone();
-    let r = tokio::task::spawn_blocking(move || engine.shred(&alvo)).await;
-    match r {
-        Ok(Ok(destruida)) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "ok": true,
-                "chave_destruida": destruida,
-                "nota": if destruida {
-                    "Chave destruida. O log NAO foi alterado: a cadeia Merkle continua a verificar."
-                } else {
-                    "Nao havia chave para este titular (ja eliminado, ou nunca escreveu)."
-                },
-            })),
-        ),
-        Ok(Err(e)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
-        ),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "ok": false, "error": format!("join: {e}") })),
-        ),
-    }
+    // SPEC-0089: Basic auth não fornece identidade/papel suficiente para uma
+    // operação irreversível. Mesmo com o antigo interruptor habilitado, a
+    // superfície REST não executa mais o efeito; o caminho mutável é o Admin
+    // RPC autenticado, que persiste Durable Intent antes do crypto-shred.
+    let _ = engine; // mantém a assinatura do handler estável
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({
+            "ok": false,
+            "error": "crypto-shred pelo REST desativado: use o Admin RPC confiável",
+            "alternativa": format!("Admin RPC com op = \"shred:{id}\""),
+        })),
+    )
 }
 
 /// `GET /flight/events[?as_of=N]` → corpo `application/vnd.apache.arrow.stream`.
