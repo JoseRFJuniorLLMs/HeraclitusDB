@@ -33,6 +33,8 @@ pub enum AnalyticsError {
     Log(HeraclitusError),
     Arrow(String),
     Sql(String),
+    /// O deadline cooperativo expirou durante uma fase da consulta.
+    Timeout { phase: &'static str },
     /// A materialização excedeu o orçamento de linhas/bytes desta chamada.
     Budget {
         limit: String,
@@ -47,6 +49,7 @@ impl std::fmt::Display for AnalyticsError {
             AnalyticsError::Log(e) => write!(f, "log: {e}"),
             AnalyticsError::Arrow(e) => write!(f, "arrow: {e}"),
             AnalyticsError::Sql(e) => write!(f, "sql: {e}"),
+            AnalyticsError::Timeout { phase } => write!(f, "timeout durante {phase}"),
             AnalyticsError::Budget { limit, rows, bytes } => write!(
                 f,
                 "orçamento de materialização excedido ({limit}): {rows} linhas, \
@@ -120,13 +123,37 @@ impl LogAnalytics {
     /// cortam a materialização a meio e devolvem [`AnalyticsError::Budget`],
     /// para o pedido falhar depressa e barato em vez de matar o processo.
     ///
-    /// O corte é verificado POR JANELA (não só no fim): o custo máximo excedido
-    /// é de uma janela de `scan_capped`, não do log todo.
+    /// O corte é verificado POR LINHA antes de acumular as colunas. A leitura
+    /// usa um Episode de cada vez, portanto não existe uma janela grande
+    /// materializada antes do gate em bytes.
     pub fn from_log_capped<L: EpisodeLog + ?Sized>(
         log: &L,
         as_of: Option<Lsn>,
         max_rows: usize,
         max_bytes: usize,
+    ) -> Result<Self, AnalyticsError> {
+        Self::from_log_capped_inner(log, as_of, max_rows, max_bytes, None)
+    }
+
+    /// Igual a `from_log_capped`, mas com deadline cooperativo que inclui a
+    /// construção da tabela Arrow. Usado pela superfície HTTP para que o
+    /// timeout não comece só depois de a parte cara já ter acontecido.
+    pub fn from_log_capped_until<L: EpisodeLog + ?Sized>(
+        log: &L,
+        as_of: Option<Lsn>,
+        max_rows: usize,
+        max_bytes: usize,
+        deadline: std::time::Instant,
+    ) -> Result<Self, AnalyticsError> {
+        Self::from_log_capped_inner(log, as_of, max_rows, max_bytes, Some(deadline))
+    }
+
+    fn from_log_capped_inner<L: EpisodeLog + ?Sized>(
+        log: &L,
+        as_of: Option<Lsn>,
+        max_rows: usize,
+        max_bytes: usize,
+        deadline: Option<std::time::Instant>,
     ) -> Result<Self, AnalyticsError> {
         let head = log.head();
         let to = as_of.unwrap_or(head).min(head);
@@ -145,56 +172,67 @@ impl LogAnalytics {
 
         let mut cur = 0u64;
         while cur < to {
-            let batch = log.scan_capped(cur, to, 50_000)?;
-            let Some(&(last, _)) = batch.last() else {
-                break;
-            };
-            for (lsn, e) in &batch {
-                let content = String::from_utf8_lossy(&e.content).into_owned();
-                let attrs = serde_json::to_string(&e.attrs).unwrap_or_else(|_| "{}".into());
-                let kind = kind_label(&e.kind);
-                let row_bytes = content
-                    .len()
-                    .saturating_add(attrs.len())
-                    .saturating_add(e.agent_id.len())
-                    .saturating_add(e.session_id.len())
-                    .saturating_add(kind.len())
-                    .saturating_add(40) // cinco u64
-                    .saturating_add(26); // ULID em texto
-                let next_rows = lsns.len().saturating_add(1);
-                let next_bytes = approx_bytes.saturating_add(row_bytes);
-
-                // Gate POR LINHA, antes de qualquer clone/push. A janela de
-                // scan já não pode ultrapassar o orçamento em até 50k linhas.
-                if next_rows > max_rows {
-                    return Err(AnalyticsError::Budget {
-                        limit: format!("max_rows={max_rows}"),
-                        rows: next_rows,
-                        bytes: next_bytes,
-                    });
-                }
-                if next_bytes > max_bytes {
-                    return Err(AnalyticsError::Budget {
-                        limit: format!("max_bytes={max_bytes}"),
-                        rows: next_rows,
-                        bytes: next_bytes,
-                    });
-                }
-                approx_bytes = next_bytes;
-
-                lsns.push(*lsn);
-                ids.push(e.id.to_string());
-                agents.push(e.agent_id.clone());
-                sessions.push(e.session_id.clone());
-                ts.push(e.ts_hlc);
-                kinds.push(kind);
-                contents.push(content);
-                attrs_json.push(attrs);
-                valid_from.push(e.valid_from.unwrap_or(0));
-                valid_to.push(e.valid_to.unwrap_or(0));
+            if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+                return Err(AnalyticsError::Timeout {
+                    phase: "materialização analítica",
+                });
             }
 
-            cur = last + 1;
+            let Some((lsn, e)) = log.read(cur)? else {
+                cur = cur.saturating_add(1);
+                continue;
+            };
+            cur = lsn.saturating_add(1);
+
+            // Só um Episode está residente antes do gate. Isso elimina a
+            // antiga janela de dezenas de milhares de clones antes de o
+            // orçamento em bytes poder reagir.
+            let content = String::from_utf8_lossy(&e.content).into_owned();
+            let attrs = serde_json::to_string(&e.attrs).unwrap_or_else(|_| "{}".into());
+            let kind = kind_label(&e.kind);
+            let row_bytes = content
+                .len()
+                .saturating_add(attrs.len())
+                .saturating_add(e.agent_id.len())
+                .saturating_add(e.session_id.len())
+                .saturating_add(kind.len())
+                .saturating_add(40) // cinco u64
+                .saturating_add(26); // ULID em texto
+            let next_rows = lsns.len().saturating_add(1);
+            let next_bytes = approx_bytes.saturating_add(row_bytes);
+
+            if next_rows > max_rows {
+                return Err(AnalyticsError::Budget {
+                    limit: format!("max_rows={max_rows}"),
+                    rows: next_rows,
+                    bytes: next_bytes,
+                });
+            }
+            if next_bytes > max_bytes {
+                return Err(AnalyticsError::Budget {
+                    limit: format!("max_bytes={max_bytes}"),
+                    rows: next_rows,
+                    bytes: next_bytes,
+                });
+            }
+            approx_bytes = next_bytes;
+
+            lsns.push(lsn);
+            ids.push(e.id.to_string());
+            agents.push(e.agent_id);
+            sessions.push(e.session_id);
+            ts.push(e.ts_hlc);
+            kinds.push(kind);
+            contents.push(content);
+            attrs_json.push(attrs);
+            valid_from.push(e.valid_from.unwrap_or(0));
+            valid_to.push(e.valid_to.unwrap_or(0));
+        }
+
+        if deadline.is_some_and(|limit| std::time::Instant::now() >= limit) {
+            return Err(AnalyticsError::Timeout {
+                phase: "construção Arrow",
+            });
         }
 
         let schema = Arc::new(Schema::new(vec![
@@ -255,11 +293,11 @@ impl LogAnalytics {
         .await
     }
 
-    /// Executa SQL sem materializar todos os RecordBatches de saída.
+    /// Executa SQL com materialização de saída estritamente limitada.
     ///
-    /// Um LIMIT externo de `max_rows + 1` permite detectar excesso sem
-    /// devolver um resultado truncado. O stream é consumido batch a batch; ao
-    /// atingir qualquer orçamento ele é descartado, cancelando a execução.
+    /// Um LIMIT externo de `max_rows + 1` impede que `collect` materialize
+    /// um resultado arbitrariamente grande; operadores intermediários ficam
+    /// sob o memory pool do RuntimeEnv e a serialização JSON tem budget próprio.
     pub async fn sql_capped(
         &self,
         query: &str,
