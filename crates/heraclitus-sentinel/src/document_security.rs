@@ -609,13 +609,15 @@ fn preview(text: &str) -> String {
     s
 }
 
-fn join_text<'a, I>(items: I) -> String
+fn join_text<I, S>(items: I) -> String
 where
-    I: Iterator<Item = &'a String>,
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
 {
     items
+        .into_iter()
+        .map(|s| s.as_ref().to_owned())
         .filter(|s| !s.trim().is_empty())
-        .map(String::as_str)
         .collect::<Vec<_>>()
         .join("\n")
 }
