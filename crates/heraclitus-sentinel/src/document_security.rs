@@ -397,7 +397,6 @@ impl<C: SemanticInjectionClassifier> DocumentFirewall<C> {
                     "ignore previous instructions",
                     "ignore todas as instru",
                     "system override",
-                    "prompt injection",
                     "negar todos os comandos",
                     "desconsidere as regras",
                 ],
