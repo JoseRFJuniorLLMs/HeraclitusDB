@@ -214,6 +214,39 @@ impl Client {
         Ok((r.ok, r.message))
     }
 
+    /// Executa uma operação administrativa com chave estável de idempotência.
+    ///
+    /// Operações destrutivas do servidor (crypto-shred e mutações de Legal
+    /// Hold) exigem esta chave no metadata para que retries não executem o
+    /// efeito novamente.
+    pub async fn admin_idempotent(
+        &mut self,
+        op: &str,
+        arg: &str,
+        idempotency_key: &str,
+    ) -> Result<(bool, String), tonic::Status> {
+        let key = idempotency_key.trim();
+        if key.is_empty() || key.len() > 128 {
+            return Err(tonic::Status::invalid_argument(
+                "idempotency_key deve conter entre 1 e 128 caracteres",
+            ));
+        }
+        let value: MetadataValue<Ascii> = key.parse().map_err(|_| {
+            tonic::Status::invalid_argument(
+                "idempotency_key contém caracteres inválidos para metadata gRPC",
+            )
+        })?;
+        let mut request = self.req(pb::AdminRequest {
+            op: op.into(),
+            arg: arg.into(),
+        });
+        request
+            .metadata_mut()
+            .insert("x-heraclitus-idempotency-key", value);
+        let r = self.inner.admin(request).await?.into_inner();
+        Ok((r.ok, r.message))
+    }
+
     /// Subscribe to the tail from `from_lsn`; returns the raw stream.
     ///
     /// SEM teto por chamada, de propósito: é um stream de vida longa e o log
