@@ -208,7 +208,7 @@ fn verify_hrkl_object_proof(proof: &HrklObjectProof) -> Result<(), VerifierError
     let mut width = proof.leaf_count;
     let mut expected_sides = Vec::new();
     while width > 1 {
-        let sibling = if index % 2 == 0 {
+        let sibling = if index.is_multiple_of(2) {
             index.checked_add(1).filter(|s| *s < width)
         } else {
             Some(index - 1)
