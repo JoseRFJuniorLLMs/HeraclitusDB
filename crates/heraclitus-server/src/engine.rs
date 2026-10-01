@@ -129,6 +129,35 @@ fn is_compliance_reserved(episode: &Episode) -> bool {
         )
 }
 
+
+const TRUSTED_ADMIN_KINDS: &[&str] = &["TrustedAdminIntent", "TrustedAdminResult"];
+
+fn is_internal_trusted_admin_episode(episode: &Episode) -> bool {
+    episode.agent_id == "heraclitus-trusted-admin"
+        && episode.attrs.get("audit").is_some_and(|value| value == "trusted-admin")
+        && episode.attrs.get("protocol").is_some_and(|value| value == "SPEC-0089")
+        && matches!(
+            &episode.kind,
+            EventKind::Custom(kind) if TRUSTED_ADMIN_KINDS.contains(&kind.as_str())
+        )
+}
+
+fn is_trusted_admin_reserved(episode: &Episode) -> bool {
+    episode.agent_id == "heraclitus-trusted-admin"
+        || episode
+            .attrs
+            .get("protocol")
+            .is_some_and(|value| value == "SPEC-0089")
+        || episode
+            .attrs
+            .get("audit")
+            .is_some_and(|value| value == "trusted-admin")
+        || matches!(
+            &episode.kind,
+            EventKind::Custom(kind) if TRUSTED_ADMIN_KINDS.contains(&kind.as_str())
+        )
+}
+
 pub struct Engine {
     /// Backend append-only selecionado explicitamente na configuração.
     /// `legacy` continua sendo o default; `v6` nunca é inferido nem migrado.
@@ -818,11 +847,20 @@ impl Engine {
         episode.attrs.insert("audit".into(), "trusted-admin".into());
         episode.attrs.insert("protocol".into(), "SPEC-0089".into());
 
-        // `append` já aguarda commit por quórum quando a replicação está
-        // ativa. A barreira explícita abaixo cobre o backend local inclusive em
-        // GroupCommit: o token administrativo só é emitido DEPOIS de flush().
+        // O namespace é reservado a este caminho interno. A validação impede
+        // que uma alteração futura transforme o recovery em consumidor de
+        // eventos forjáveis por Writer.
+        if !is_internal_trusted_admin_episode(&episode) {
+            return Err(crate::trusted_admin::AdminError::PreconditionFailed(
+                "registro TrustedAdmin interno inválido".into(),
+            ));
+        }
+
+        // `append_internal` aguarda consenso quando a replicação está ativa.
+        // A barreira física cobre também GroupCommit local: o token só nasce
+        // depois deste flush.
         let lsn = self
-            .append(episode)
+            .append_internal(episode)
             .map_err(crate::trusted_admin::AdminError::Storage)?;
         self.log
             .flush()
@@ -895,6 +933,9 @@ impl Engine {
                 break;
             };
             for (lsn, episode) in &batch {
+                if !is_internal_trusted_admin_episode(episode) {
+                    continue;
+                }
                 let EventKind::Custom(kind) = &episode.kind else {
                     continue;
                 };
@@ -2418,6 +2459,12 @@ impl Engine {
                 "tipos, agente e atributos compliance.* são reservados ao motor regulatório".into(),
             ));
         }
+        if is_trusted_admin_reserved(&episode) {
+            return Err(HeraclitusError::Query(
+                "eventos TrustedAdmin/SPEC-0089 são reservados ao executor administrativo interno"
+                    .into(),
+            ));
+        }
         if episode.attrs.contains_key(IDEMPOTENCY_KEY_ATTR)
             || episode.attrs.contains_key(IDEMPOTENCY_HASH_ATTR)
         {
@@ -2449,6 +2496,12 @@ impl Engine {
         if is_compliance_reserved(&episode) {
             return Err(HeraclitusError::Query(
                 "tipos, agente e atributos compliance.* são reservados ao motor regulatório".into(),
+            ));
+        }
+        if is_trusted_admin_reserved(&episode) {
+            return Err(HeraclitusError::Query(
+                "eventos TrustedAdmin/SPEC-0089 são reservados ao executor administrativo interno"
+                    .into(),
             ));
         }
         if key.is_empty() {
