@@ -11,6 +11,7 @@
 //! IPC do analytics; a variante gRPC é acréscimo natural).
 
 use arrow_flight::encode::FlightDataEncoderBuilder;
+use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
@@ -18,9 +19,11 @@ use arrow_flight::{
 };
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
+use heraclitus_analytics::datafusion::arrow::record_batch::RecordBatch;
 use heraclitus_analytics::vectorized::{episodes_to_batches_sized, BATCH_ROWS};
 use heraclitus_log::EpisodeLog;
 use std::sync::Arc;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 pub struct HeraclitusFlight {
@@ -63,21 +66,64 @@ impl FlightService for HeraclitusFlight {
     async fn do_get(&self, req: Request<Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
         let as_of = Self::parse_ticket(req.get_ref())?;
         let log = self.log.clone();
-        // Materialização fora do executor async (o scan lê disco).
-        let batches = tokio::task::spawn_blocking(move || {
-            let to = as_of.unwrap_or(u64::MAX).min(log.head());
-            let events = log.scan(0, to).map_err(|e| e.to_string())?;
-            // Streaming Flight: lotes fixos de BATCH_ROWS (contrato do fio).
-            episodes_to_batches_sized(&events, BATCH_ROWS).map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| Status::internal(format!("join: {e}")))?
-        .map_err(Status::internal)?;
 
-        // O encoder OFICIAL do protocolo: RecordBatches → FlightData frames.
+        // Canal pequeno = backpressure real. O produtor bloqueante só mantém
+        // uma página de log + poucos RecordBatches em voo, em vez de varrer e
+        // materializar o log inteiro antes do primeiro byte.
+        const FLIGHT_BUFFERED_BATCHES: usize = 4;
+        const FLIGHT_SCAN_ROWS: usize = BATCH_ROWS * 4;
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<Result<RecordBatch, FlightError>>(
+                FLIGHT_BUFFERED_BATCHES,
+            );
+
+        tokio::task::spawn_blocking(move || {
+            let to = as_of.unwrap_or(u64::MAX).min(log.head());
+            let mut cur = 0u64;
+
+            while cur < to {
+                let events = match log.scan_capped(cur, to, FLIGHT_SCAN_ROWS) {
+                    Ok(events) => events,
+                    Err(error) => {
+                        let _ = tx.blocking_send(Err(FlightError::protocol(format!(
+                            "scan do log falhou: {error}"
+                        ))));
+                        return;
+                    }
+                };
+                let Some(&(last, _)) = events.last() else {
+                    return;
+                };
+
+                let batches = match episodes_to_batches_sized(&events, BATCH_ROWS) {
+                    Ok(batches) => batches,
+                    Err(error) => {
+                        let _ = tx.blocking_send(Err(FlightError::protocol(format!(
+                            "conversão Arrow falhou: {error}"
+                        ))));
+                        return;
+                    }
+                };
+
+                for batch in batches {
+                    // Se o cliente cancelar, o receiver cai e este produtor
+                    // termina imediatamente na próxima tentativa de envio.
+                    if tx.blocking_send(Ok(batch)).is_err() {
+                        return;
+                    }
+                }
+
+                cur = last.saturating_add(1);
+                if last == u64::MAX {
+                    return;
+                }
+            }
+        });
+
         let stream = FlightDataEncoderBuilder::new()
-            .build(futures::stream::iter(batches.into_iter().map(Ok)))
-            .map_err(|e| Status::internal(e.to_string()))
+            .with_schema(heraclitus_analytics::vectorized::batch_schema())
+            .build(ReceiverStream::new(rx))
+            .map_err(Status::from)
             .boxed();
         Ok(Response::new(stream))
     }
@@ -158,6 +204,14 @@ pub async fn serve_flight<L: EpisodeLog + 'static>(
         .await
         .map_err(|e| format!("flight bind {addr}: {e}"))?;
     let local = listener.local_addr().map_err(|e| e.to_string())?;
+    // A API pública também impõe a mesma fronteira do boot principal. Assim um
+    // integrador não consegue expor Flight sem autenticação em 0.0.0.0 apenas
+    // por chamar `serve_flight` diretamente.
+    if !local.ip().is_loopback() {
+        return Err(format!(
+            "Flight sem autenticação só pode escutar em loopback; endereço resolvido: {local}"
+        ));
+    }
     let svc = FlightServiceServer::new(HeraclitusFlight::new(log));
     let handle = tokio::spawn(async move {
         let incoming = tonic::transport::server::TcpIncoming::from(listener);
