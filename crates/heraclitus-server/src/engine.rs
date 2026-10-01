@@ -3647,7 +3647,10 @@ mod tests {
                 "authority":"tribunal","reason":"prova"}"#,
         );
         assert!(ok, "{msg}");
-        assert_eq!(engine.head(), 1, "o hold está no log");
+        assert!(
+            engine.head() >= 3,
+            "AdminIntent + LegalHold + AdminResult têm de estar no log"
+        );
 
         // O caminho do índice de atributos (`n.kind` → `_kind`), SEM reiniciar.
         let v = heraclitus_query::execute(
