@@ -2142,14 +2142,15 @@ impl Engine {
         serde_json::json!({ "titular": agent_id, "acessos": achados })
     }
 
-    /// Crypto-shred público compatível para uso embedded.
+    /// Atalho exclusivo dos testes unitários antigos.
     ///
-    /// Mesmo chamadas locais passam pelo protocolo durável. Superfícies remotas
-    /// devem usar `shred_as` para preservar a identidade autenticada.
-    pub fn shred(&self, agent_id: &str) -> Result<bool, HeraclitusError> {
+    /// Não existe em builds normais: consumidores produtivos precisam fornecer
+    /// um contexto administrativo ao caminho durável `shred_as`.
+    #[cfg(test)]
+    fn shred(&self, agent_id: &str) -> Result<bool, HeraclitusError> {
         let ctx = crate::trusted_admin::AdminContext::new(
-            "embedded-admin",
-            "default",
+            "unit-test-admin",
+            "test",
             vec!["admin".into()],
         );
         let idem = ctx.request_id.clone();
