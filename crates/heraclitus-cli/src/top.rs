@@ -772,7 +772,7 @@ impl AppState {
                     value: format!("{} drops", self.sentinel.queue_overflow_total),
                 });
             }
-            if self.sentinel.lag_state.to_ascii_uppercase() == "CRITICAL" {
+            if self.sentinel.lag_state.eq_ignore_ascii_case("CRITICAL") {
                 alarms.push(Alarm {
                     source: "SENTINEL",
                     code: "ALM-SNT-002",
@@ -2276,7 +2276,7 @@ fn render_security(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
             kv_line(
                 "AI Circuit",
                 value_or_nd(&app.sentinel.ai_circuit_state),
-                if app.sentinel.ai_circuit_state.to_ascii_uppercase() == "CLOSED" || app.sentinel.ai_circuit_state.to_ascii_uppercase() == "HEALTHY" {
+                if app.sentinel.ai_circuit_state.eq_ignore_ascii_case("CLOSED") || app.sentinel.ai_circuit_state.eq_ignore_ascii_case("HEALTHY") {
                     Color::Green
                 } else {
                     Color::Yellow
@@ -2364,7 +2364,7 @@ fn render_security(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
             kv_line(
                 "Boot Outcome",
                 value_or_nd(&app.sentinel.boot_outcome),
-                if app.sentinel.boot_outcome.to_ascii_uppercase() == "SUCCESS" { Color::Green } else { Color::Yellow },
+                if app.sentinel.boot_outcome.eq_ignore_ascii_case("SUCCESS") { Color::Green } else { Color::Yellow },
             ),
             kv_line(
                 "Boot Duration",
@@ -2714,7 +2714,7 @@ fn render_redteam_table(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Re
 
                 let lsn_str = e
                     .lsn
-                    .map(|v| format_number(v))
+                    .map(format_number)
                     .unwrap_or_else(|| "N/D".to_string());
 
                 Row::new(vec![
