@@ -907,4 +907,115 @@ mod tests {
             Some(AdminState::Unknown)
         );
     }
+
+    #[test]
+    fn intent_persistence_failure_never_runs_side_effect_and_releases_reservation() {
+        let protocol = TrustedAdminProtocol::new();
+        let ctx = AdminContext::new("alice", "tenant", vec!["admin".into()]);
+        let op = AdminOperation::new(
+            "op-intent-fail",
+            "idem-intent-fail",
+            AdminOperationKind::Custom {
+                name: "test".into(),
+                details: "intent fail".into(),
+            },
+            "test",
+        );
+        let effect_ran = std::sync::atomic::AtomicBool::new(false);
+
+        let result = protocol.execute_admin(
+            &ctx,
+            &op,
+            |_| Err(AdminError::IntentPersistenceFailed("disk offline".into())),
+            |_| {
+                effect_ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(((), String::new(), BTreeMap::new()))
+            },
+            |_| Ok(2),
+        );
+
+        assert!(matches!(result, Err(AdminError::IntentPersistenceFailed(_))));
+        assert!(!effect_ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(protocol.get_operation_state("idem-intent-fail"), None);
+    }
+
+    #[test]
+    fn result_persistence_failure_marks_operation_unknown_and_blocks_replay() {
+        let protocol = TrustedAdminProtocol::new();
+        let ctx = AdminContext::new("alice", "tenant", vec!["admin".into()]);
+        let op = AdminOperation::new(
+            "op-result-fail",
+            "idem-result-fail",
+            AdminOperationKind::Custom {
+                name: "test".into(),
+                details: "result fail".into(),
+            },
+            "test",
+        );
+
+        let result = protocol.execute_admin(
+            &ctx,
+            &op,
+            |_| Ok(41),
+            |_| Ok((7u64, "post".into(), BTreeMap::new())),
+            |_| Err(AdminError::ResultPersistenceFailed("disk offline".into())),
+        );
+        assert!(matches!(result, Err(AdminError::UnknownState(_))));
+        assert_eq!(
+            protocol.get_operation_state("idem-result-fail"),
+            Some(AdminState::Unknown)
+        );
+
+        let replay = protocol.execute_admin(
+            &ctx,
+            &op,
+            |_| Ok(42),
+            |_| Ok((8u64, "post-2".into(), BTreeMap::new())),
+            |_| Ok(43),
+        );
+        assert!(matches!(replay, Err(AdminError::AlreadyProcessed(_))));
+    }
+
+    #[test]
+    fn idempotency_key_cannot_be_reused_for_different_intent() {
+        let protocol = TrustedAdminProtocol::new();
+        let ctx = AdminContext::new("alice", "tenant", vec!["admin".into()]);
+        let mut first = AdminOperation::new(
+            "op-a",
+            "same-key",
+            AdminOperationKind::Custom {
+                name: "test".into(),
+                details: "a".into(),
+            },
+            "test",
+        );
+        first.parameters_digest = "params-a".into();
+
+        protocol
+            .execute_admin(
+                &ctx,
+                &first,
+                |_| Ok(1),
+                |_| Ok(((), "post".into(), BTreeMap::new())),
+                |_| Ok(2),
+            )
+            .unwrap();
+
+        let mut second = AdminOperation::new(
+            "op-b",
+            "same-key",
+            AdminOperationKind::Custom {
+                name: "test".into(),
+                details: "b".into(),
+            },
+            "test",
+        );
+        second.parameters_digest = "params-b".into();
+
+        assert!(matches!(
+            protocol.validate(&ctx, &second),
+            Err(AdminError::IdempotencyConflict { .. })
+        ));
+    }
+
 }
