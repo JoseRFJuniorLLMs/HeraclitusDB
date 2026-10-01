@@ -70,10 +70,12 @@ pub struct DestroyReceipt {
     pub proof_digest: String,
 }
 
-/// Envelope de encriptação versão 2 (SPEC-0086 §6).
+/// API histórica do envelope estruturado (SPEC-0086 §6).
 ///
-/// Carrega metadados estruturais explícitos de tenant, chave e epoch,
-/// sem depender de heurística de magic prefix.
+/// O formato autenticado atual é **versão 3**. A versão 2 anterior deixava o
+/// cabeçalho fora do AAD e, portanto, não pode ser reinterpretada como segura.
+/// `open` só aceita v3; compatibilidade v2 exige a função explicitamente
+/// nomeada `open_legacy_v2_untrusted_metadata`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptionEnvelopeV2 {
     pub version: u16,
@@ -100,6 +102,10 @@ pub struct EnvelopeHeader {
 }
 
 impl EncryptionEnvelopeV2 {
+    const LEGACY_VERSION: u16 = 2;
+    const AUTHENTICATED_VERSION: u16 = 3;
+    const ALGORITHM: &'static str = "ChaCha20-Poly1305";
+
     /// Inspeciona e valida o cabeçalho do envelope sem necessidade da chave criptográfica.
     /// Permite descobrir `tenant`, `key_id` e `key_epoch` para requisição ao KMS / KeyProvider.
     pub fn peek_header(envelope_bytes: &[u8]) -> Option<EnvelopeHeader> {
@@ -110,7 +116,7 @@ impl EncryptionEnvelopeV2 {
         let mut offset = 0;
         let version = u16::from_be_bytes(envelope_bytes[offset..offset + 2].try_into().ok()?);
         offset += 2;
-        if version != 2 {
+        if !matches!(version, Self::LEGACY_VERSION | Self::AUTHENTICATED_VERSION) {
             return None;
         }
 
@@ -187,6 +193,7 @@ impl EncryptionEnvelopeV2 {
     /// Constrói o AAD canônico interno. O cabeçalho faz parte do compromisso
     /// criptográfico; alterar tenant/key/epoch/algoritmo/nonce invalida a tag.
     fn authenticated_aad(
+        version: u16,
         tenant: &TenantId,
         key_id: &str,
         epoch: u64,
@@ -203,7 +210,8 @@ impl EncryptionEnvelopeV2 {
         let mut out = Vec::with_capacity(
             32 + tenant.as_str().len() + key_id.len() + algorithm.len() + caller_aad.len(),
         );
-        out.extend_from_slice(b"HeraclitusDB/EnvelopeV2/HeaderAAD/v1");
+        out.extend_from_slice(b"HeraclitusDB/Envelope/HeaderAAD/v1");
+        out.extend_from_slice(&version.to_be_bytes());
         push_len_bytes(&mut out, tenant.as_str().as_bytes());
         push_len_bytes(&mut out, key_id.as_bytes());
         out.extend_from_slice(&epoch.to_be_bytes());
@@ -213,7 +221,7 @@ impl EncryptionEnvelopeV2 {
         out
     }
 
-    /// Sela dados e cria o envelope binário V2.
+    /// Sela dados no formato autenticado atual (v3).
     pub fn seal(
         key: &[u8; 32],
         plaintext: &[u8],
@@ -222,18 +230,17 @@ impl EncryptionEnvelopeV2 {
         key_id: String,
         epoch: u64,
     ) -> Vec<u8> {
-        const ALGORITHM: &str = "ChaCha20-Poly1305";
-
         let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
         let mut nonce = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce);
 
         let aad_digest = *blake3::hash(aad).as_bytes();
         let bound_aad = Self::authenticated_aad(
+            Self::AUTHENTICATED_VERSION,
             &tenant,
             &key_id,
             epoch,
-            ALGORITHM,
+            Self::ALGORITHM,
             &nonce,
             aad,
         );
@@ -249,7 +256,7 @@ impl EncryptionEnvelopeV2 {
             .expect("chacha20poly1305 encrypt nunca falha para chave/nonce validos");
 
         let mut result = Vec::new();
-        result.extend_from_slice(&2u16.to_be_bytes());
+        result.extend_from_slice(&Self::AUTHENTICATED_VERSION.to_be_bytes());
 
         let tenant_bytes = tenant.as_str().as_bytes();
         let tenant_len: u16 = tenant_bytes.len().try_into().expect("tenant id excede u16::MAX");
@@ -263,7 +270,7 @@ impl EncryptionEnvelopeV2 {
 
         result.extend_from_slice(&epoch.to_be_bytes());
 
-        let algo_bytes = ALGORITHM.as_bytes();
+        let algo_bytes = Self::ALGORITHM.as_bytes();
         let algo_len: u16 = algo_bytes.len().try_into().expect("algorithm excede u16::MAX");
         result.extend_from_slice(&algo_len.to_be_bytes());
         result.extend_from_slice(algo_bytes);
@@ -274,12 +281,13 @@ impl EncryptionEnvelopeV2 {
         result
     }
 
-    /// Abre o envelope binário V2 e retorna os dados em texto plano.
+    /// Abre apenas o formato autenticado atual (v3).
+    ///
+    /// Um envelope v2 nunca é promovido silenciosamente a "seguro": callers que
+    /// precisam de migração devem optar explicitamente pela API legacy abaixo.
     pub fn open(key: &[u8; 32], envelope_bytes: &[u8], expected_aad: &[u8]) -> Option<Vec<u8>> {
-        const ALGORITHM: &str = "ChaCha20-Poly1305";
-
         let header = Self::peek_header(envelope_bytes)?;
-        if header.algorithm != ALGORITHM {
+        if header.version != Self::AUTHENTICATED_VERSION || header.algorithm != Self::ALGORITHM {
             return None;
         }
 
@@ -289,6 +297,7 @@ impl EncryptionEnvelopeV2 {
         }
 
         let bound_aad = Self::authenticated_aad(
+            header.version,
             &header.tenant,
             &header.key_id,
             header.key_epoch,
@@ -305,6 +314,39 @@ impl EncryptionEnvelopeV2 {
                 Payload {
                     msg: ct,
                     aad: &bound_aad,
+                },
+            )
+            .ok()
+    }
+
+    /// Compatibilidade explícita com envelopes v2 históricos.
+    ///
+    /// **Atenção:** v2 autentica apenas o AAD fornecido pelo chamador. Tenant,
+    /// key_id, epoch e algorithm do cabeçalho NÃO ficam criptograficamente
+    /// vinculados. Use somente para migração/leitura de legado e re-selar como
+    /// v3 antes de tratar os metadados como confiáveis.
+    pub fn open_legacy_v2_untrusted_metadata(
+        key: &[u8; 32],
+        envelope_bytes: &[u8],
+        expected_aad: &[u8],
+    ) -> Option<Vec<u8>> {
+        let header = Self::peek_header(envelope_bytes)?;
+        if header.version != Self::LEGACY_VERSION || header.algorithm != Self::ALGORITHM {
+            return None;
+        }
+        let expected_digest = *blake3::hash(expected_aad).as_bytes();
+        if header.aad_digest != expected_digest {
+            return None;
+        }
+
+        let ct = &envelope_bytes[header.ciphertext_offset..];
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+        cipher
+            .decrypt(
+                Nonce::from_slice(&header.nonce),
+                Payload {
+                    msg: ct,
+                    aad: expected_aad,
                 },
             )
             .ok()
@@ -608,6 +650,7 @@ mod tests {
 
         // Inspecionar cabeçalho sem possuir a chave
         let header = EncryptionEnvelopeV2::peek_header(&envelope_bytes).expect("Falha ao ler header");
+        assert_eq!(header.version, EncryptionEnvelopeV2::AUTHENTICATED_VERSION);
         assert_eq!(header.tenant.as_str(), "tenant-abc");
         assert_eq!(header.key_id, "key-123");
         assert_eq!(header.key_epoch, 1);
@@ -698,6 +741,25 @@ mod tests {
         let epoch_pos = key_pos + header.key_id.len();
         tampered_epoch[epoch_pos + 7] ^= 0x01;
         assert!(EncryptionEnvelopeV2::open(&key, &tampered_epoch, aad).is_none());
+    }
+
+
+    #[test]
+    fn secure_open_rejects_legacy_version_instead_of_reinterpreting_it() {
+        let tenant = TenantId::new("tenant-version".to_string()).unwrap();
+        let mut key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut key);
+        let mut envelope = EncryptionEnvelopeV2::seal(
+            &key,
+            b"payload",
+            b"aad",
+            tenant,
+            "key-1".into(),
+            1,
+        );
+
+        envelope[..2].copy_from_slice(&EncryptionEnvelopeV2::LEGACY_VERSION.to_be_bytes());
+        assert!(EncryptionEnvelopeV2::open(&key, &envelope, b"aad").is_none());
     }
 
 }
