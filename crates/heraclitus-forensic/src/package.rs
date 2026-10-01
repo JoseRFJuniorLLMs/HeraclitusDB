@@ -82,14 +82,25 @@ impl EvidencePackageBuilder {
             self.manifest.custody_digest = String::new();
         }
 
-        // Se raiz Merkle não foi informada mas há objetos, calcula automaticamente
-        if self.manifest.merkle.root_blake3.is_empty() && !self.objects_data.is_empty() {
-            let mut hasher = blake3::Hasher::new();
+        // Compromisso determinístico do conjunto exportado. Enquanto a prova HRKL
+        // completa não estiver ligada, estas raízes são do conjunto do pacote e
+        // NÃO devem ser apresentadas como proof path do log de origem.
+        if !self.objects_data.is_empty() {
+            let mut blake3_hasher = blake3::Hasher::new();
+            let mut sha256_hasher = Sha256::new();
             for (obj, _) in &self.objects_data {
-                hasher.update(obj.blake3_hex.as_bytes());
+                blake3_hasher.update(obj.blake3_hex.as_bytes());
+                sha256_hasher.update(obj.sha256_hex.as_bytes());
             }
-            self.manifest.merkle.root_blake3 = hasher.finalize().to_hex().to_string();
+            self.manifest.merkle.root_blake3 =
+                blake3_hasher.finalize().to_hex().to_string();
+            self.manifest.merkle.root_sha256 =
+                hex::encode(sha256_hasher.finalize());
             self.manifest.merkle.leaves_count = self.objects_data.len() as u64;
+        } else {
+            self.manifest.merkle.root_blake3.clear();
+            self.manifest.merkle.root_sha256.clear();
+            self.manifest.merkle.leaves_count = 0;
         }
 
         let proofs_dir = root.join("proofs");
