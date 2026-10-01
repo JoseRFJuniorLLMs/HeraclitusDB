@@ -24,6 +24,7 @@
 
 use heraclitus_core::{Episode, EventKind, FsyncPolicy, HeraclitusConfig};
 use heraclitus_server::engine::Engine;
+use heraclitus_server::trusted_admin::AdminContext;
 
 /// O prefixo é o que o keystore por agente usa para derivar a chave da titular.
 const TITULAR: &str = "titular:hmac-sha256:carlos";
