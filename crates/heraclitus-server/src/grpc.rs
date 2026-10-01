@@ -310,6 +310,21 @@ impl pb::heraclitus_server::Heraclitus for Service {
             _ => AccessRole::Admin,
         };
         let principal = crate::auth::require(&req, required)?;
+        let client_idempotency_key = req
+            .metadata()
+            .get("x-heraclitus-idempotency-key")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        if client_idempotency_key
+            .as_deref()
+            .is_some_and(|value| value.len() > 128)
+        {
+            return Err(Status::invalid_argument(
+                "x-heraclitus-idempotency-key excede 128 caracteres",
+            ));
+        }
         let r = req.into_inner();
         // R11: `verify` re-varre o log inteiro e `rebuild` replaya-o — minutos
         // em logs grandes. Correr isso no worker async estagnava o reactor do
@@ -340,7 +355,20 @@ impl pb::heraclitus_server::Heraclitus for Service {
                 // garantia que só os testes conseguiam exercer.
                 "legal-holds" => crate::grpc::legal_hold_list(&engine),
                 op @ ("legal-hold-place" | "legal-hold-release") => {
-                    crate::grpc::trusted_legal_hold_op(&engine, &admin_ctx, op, &r.arg)
+                    match client_idempotency_key.as_deref() {
+                        Some(key) => crate::grpc::trusted_legal_hold_op(
+                            &engine,
+                            &admin_ctx,
+                            op,
+                            &r.arg,
+                            key,
+                        ),
+                        None => (
+                            false,
+                            "operação destrutiva exige metadata x-heraclitus-idempotency-key"
+                                .into(),
+                        ),
+                    }
                 }
                 op @ ("regulatory-policy-activate"
                 | "regulatory-evaluate"
@@ -478,14 +506,23 @@ impl pb::heraclitus_server::Heraclitus for Service {
                 }
                 op if op.starts_with("shred:") => {
                     let agent = op.strip_prefix("shred:").unwrap_or("");
-                    let idempotency_key = format!("{}:shred", admin_ctx.request_id);
-                    match engine.shred_as(&admin_ctx, agent, &idempotency_key) {
-                        Ok(true) => (
-                            true,
-                            format!("crypto-shred: key destroyed for agent '{agent}'"),
+                    match client_idempotency_key.as_deref() {
+                        Some(key) => match engine.shred_as(&admin_ctx, agent, key) {
+                            Ok(true) => (
+                                true,
+                                format!("crypto-shred: key destroyed for agent '{agent}'"),
+                            ),
+                            Ok(false) => (
+                                true,
+                                format!("crypto-shred: no key for agent '{agent}'"),
+                            ),
+                            Err(e) => (false, e.to_string()),
+                        },
+                        None => (
+                            false,
+                            "operação destrutiva exige metadata x-heraclitus-idempotency-key"
+                                .into(),
                         ),
-                        Ok(false) => (true, format!("crypto-shred: no key for agent '{agent}'")),
-                        Err(e) => (false, e.to_string()),
                     }
                 }
                 other => (false, format!("unknown admin op: {other}")),
@@ -514,6 +551,7 @@ pub(crate) fn trusted_legal_hold_op(
     ctx: &crate::trusted_admin::AdminContext,
     op: &str,
     arg: &str,
+    idempotency_key: &str,
 ) -> (bool, String) {
     let body = match serde_json::from_str::<serde_json::Value>(arg) {
         Ok(value) => value,
@@ -541,10 +579,9 @@ pub(crate) fn trusted_legal_hold_op(
         _ => return (false, format!("operação de legal hold inválida: {op}")),
     };
 
-    let idempotency_key = format!("{}:{op}:{hold_id}", ctx.request_id);
     let mut admin_op = crate::trusted_admin::AdminOperation::new(
         format!("{op}:{hold_id}"),
-        idempotency_key,
+        idempotency_key.to_string(),
         kind,
         reason,
     );
