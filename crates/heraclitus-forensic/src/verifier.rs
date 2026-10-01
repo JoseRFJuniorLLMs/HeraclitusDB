@@ -51,6 +51,35 @@ pub struct VerificationReport {
     pub notes: Vec<String>,
 }
 
+
+/// Resultado de um verificador externo de confiança.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalTrustState {
+    /// Assinatura/token e cadeia de confiança foram validados.
+    Verified,
+    /// O material é sintaticamente/criptograficamente utilizável, mas a cadeia
+    /// depende de trust anchors que não estão disponíveis neste ambiente.
+    ExternalTrustRequired,
+}
+
+/// Adaptador para HSM/ICP-Brasil/PKI institucional.
+///
+/// O crate forense não embute raízes nem inventa identidade. A aplicação que
+/// possui o trust store injeta um verificador e responde pelo encadeamento.
+pub trait EvidenceTrustVerifier: Send + Sync {
+    fn verify_timestamp(
+        &self,
+        manifest_commitment: &[u8; 32],
+        timestamp: &crate::manifest::TrustedTimestamp,
+    ) -> Result<ExternalTrustState, String>;
+
+    fn verify_signature(
+        &self,
+        manifest_commitment: &[u8; 32],
+        signature: &crate::manifest::EvidenceSignature,
+    ) -> Result<ExternalTrustState, String>;
+}
+
 /// Formato offline da prova de origem HRKL v6 carregada em proofs/merkle.json.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HrklProofDocument {
@@ -118,15 +147,20 @@ pub enum VerifierError {
     BudgetExceeded(String),
     #[error("External trust material is present but not cryptographically verified: {kind} ({count})")]
     ExternalTrustUnverified { kind: &'static str, count: usize },
+    #[error("External trust validation failed for {kind}: {detail}")]
+    ExternalTrustInvalid {
+        kind: &'static str,
+        detail: String,
+    },
 }
 
 fn decode_hex32(label: &str, value: &str) -> Result<[u8; 32], VerifierError> {
     let bytes = hex::decode(value)
         .map_err(|error| VerifierError::InvalidMerkleProof(format!("{label}: hex inválido: {error}")))?;
+    let len = bytes.len();
     bytes.try_into().map_err(|_| {
         VerifierError::InvalidMerkleProof(format!(
-            "{label}: esperado digest de 32 bytes, recebido {}",
-            bytes.len()
+            "{label}: esperado digest de 32 bytes, recebido {len}"
         ))
     })
 }
@@ -241,13 +275,36 @@ pub(crate) fn validate_safe_relative_path(path_str: &str) -> bool {
 
 pub struct EvidenceVerifier {
     package_dir: PathBuf,
+    trust_verifier: Option<std::sync::Arc<dyn EvidenceTrustVerifier>>,
 }
 
 impl EvidenceVerifier {
     pub fn new<P: AsRef<Path>>(package_dir: P) -> Self {
         Self {
             package_dir: package_dir.as_ref().to_path_buf(),
+            trust_verifier: None,
         }
+    }
+
+
+    pub fn with_trust_verifier(
+        mut self,
+        verifier: std::sync::Arc<dyn EvidenceTrustVerifier>,
+    ) -> Self {
+        self.trust_verifier = Some(verifier);
+        self
+    }
+
+    fn manifest_trust_commitment(manifest: &EvidenceManifest) -> Result<[u8; 32], VerifierError> {
+        // Evita circularidade: assinatura e timestamp atestam o manifesto-base,
+        // não bytes que já contêm a própria assinatura/token.
+        let mut canonical = manifest.clone();
+        canonical.trusted_timestamps.clear();
+        canonical.signatures.clear();
+        let bytes = serde_json::to_vec(&canonical)?;
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        Ok(hasher.finalize().into())
     }
 
     fn checked_file(&self, relative: &str, max_bytes: u64) -> Result<PathBuf, VerifierError> {
@@ -336,6 +393,14 @@ impl EvidenceVerifier {
                     | VerifierError::InvalidMerkleProof(_) => {
                         report.merkle_proof = VerificationState::Invalid;
                     }
+                    VerifierError::ExternalTrustInvalid { kind, .. } => {
+                        if *kind == "signature" {
+                            report.signature = VerificationState::Invalid;
+                        } else {
+                            report.timestamp = VerificationState::Invalid;
+                        }
+                        report.certificate_chain = VerificationState::Invalid;
+                    }
                     _ => {
                         report.package_structure = VerificationState::Invalid;
                     }
@@ -361,12 +426,24 @@ impl EvidenceVerifier {
         }
 
         if !manifest.trusted_timestamps.is_empty() {
-            report.timestamp = VerificationState::Unverified;
-            report.certificate_chain = VerificationState::Unverified;
+            report.timestamp = if self.trust_verifier.is_some() {
+                VerificationState::Pass
+            } else {
+                VerificationState::Unverified
+            };
+            report.certificate_chain = report.timestamp;
         }
         if !manifest.signatures.is_empty() {
-            report.signature = VerificationState::Unverified;
-            report.certificate_chain = VerificationState::Unverified;
+            report.signature = if self.trust_verifier.is_some() {
+                VerificationState::Pass
+            } else {
+                VerificationState::Unverified
+            };
+            report.certificate_chain = match (report.certificate_chain, report.signature) {
+                (VerificationState::NotPresent, state) => state,
+                (VerificationState::Pass, VerificationState::Pass) => VerificationState::Pass,
+                _ => VerificationState::Unverified,
+            };
         }
 
         let required_integrity_passed = matches!(
@@ -645,20 +722,56 @@ impl EvidenceVerifier {
             });
         }
 
-        // Até existir validação criptográfica offline de confiança, a presença
-        // destes campos nunca pode ser convertida em PASS. Fail-closed evita que
-        // Ok(manifest) seja confundido com assinatura/timestamp verificados.
+        let commitment = Self::manifest_trust_commitment(&manifest)?;
+
         if !manifest.trusted_timestamps.is_empty() {
-            return Err(VerifierError::ExternalTrustUnverified {
-                kind: "trusted timestamp",
-                count: manifest.trusted_timestamps.len(),
-            });
+            let verifier = self.trust_verifier.as_ref().ok_or(
+                VerifierError::ExternalTrustUnverified {
+                    kind: "trusted timestamp",
+                    count: manifest.trusted_timestamps.len(),
+                },
+            )?;
+            for timestamp in &manifest.trusted_timestamps {
+                match verifier
+                    .verify_timestamp(&commitment, timestamp)
+                    .map_err(|detail| VerifierError::ExternalTrustInvalid {
+                        kind: "trusted timestamp",
+                        detail,
+                    })? {
+                    ExternalTrustState::Verified => {}
+                    ExternalTrustState::ExternalTrustRequired => {
+                        return Err(VerifierError::ExternalTrustUnverified {
+                            kind: "trusted timestamp",
+                            count: manifest.trusted_timestamps.len(),
+                        });
+                    }
+                }
+            }
         }
+
         if !manifest.signatures.is_empty() {
-            return Err(VerifierError::ExternalTrustUnverified {
-                kind: "signature",
-                count: manifest.signatures.len(),
-            });
+            let verifier = self.trust_verifier.as_ref().ok_or(
+                VerifierError::ExternalTrustUnverified {
+                    kind: "signature",
+                    count: manifest.signatures.len(),
+                },
+            )?;
+            for signature in &manifest.signatures {
+                match verifier
+                    .verify_signature(&commitment, signature)
+                    .map_err(|detail| VerifierError::ExternalTrustInvalid {
+                        kind: "signature",
+                        detail,
+                    })? {
+                    ExternalTrustState::Verified => {}
+                    ExternalTrustState::ExternalTrustRequired => {
+                        return Err(VerifierError::ExternalTrustUnverified {
+                            kind: "signature",
+                            count: manifest.signatures.len(),
+                        });
+                    }
+                }
+            }
         }
 
         Ok(manifest)
@@ -673,6 +786,26 @@ mod verifier_regressions {
     };
     use crate::package::EvidencePackageBuilder;
     use tempfile::tempdir;
+
+
+    struct AcceptTrust;
+    impl EvidenceTrustVerifier for AcceptTrust {
+        fn verify_timestamp(
+            &self,
+            _manifest_commitment: &[u8; 32],
+            _timestamp: &crate::manifest::TrustedTimestamp,
+        ) -> Result<ExternalTrustState, String> {
+            Ok(ExternalTrustState::Verified)
+        }
+
+        fn verify_signature(
+            &self,
+            _manifest_commitment: &[u8; 32],
+            _signature: &crate::manifest::EvidenceSignature,
+        ) -> Result<ExternalTrustState, String> {
+            Ok(ExternalTrustState::Verified)
+        }
+    }
 
     fn manifest() -> EvidenceManifest {
         EvidenceManifest {
@@ -906,6 +1039,33 @@ mod verifier_regressions {
             verify_hrkl_object_proof(&proof),
             Err(VerifierError::InvalidMerkleProof(_))
         ));
+    }
+
+
+    #[test]
+    fn injected_trust_verifier_can_promote_validated_material() {
+        let dir = tempdir().unwrap();
+        let package = dir.path().join("pkg");
+        let mut m = manifest();
+        m.trusted_timestamps.push(crate::manifest::TrustedTimestamp {
+            authority: "ACT-test".into(),
+            timestamp_secs: 1,
+            token: "opaque".into(),
+        });
+        m.signatures.push(crate::manifest::EvidenceSignature {
+            signer_identity: "CN=test".into(),
+            signature_hex: "opaque".into(),
+            algorithm: "test".into(),
+        });
+        let mut builder = EvidencePackageBuilder::new(m);
+        builder.build(&package).unwrap();
+
+        let verifier = EvidenceVerifier::new(&package)
+            .with_trust_verifier(std::sync::Arc::new(AcceptTrust));
+        assert!(verifier.verify().is_ok());
+        let report = verifier.verify_report();
+        assert_eq!(report.timestamp, VerificationState::Pass);
+        assert_eq!(report.signature, VerificationState::Pass);
     }
 
 }
