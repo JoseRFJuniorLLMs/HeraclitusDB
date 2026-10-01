@@ -137,6 +137,8 @@ pub enum VerifierError {
     LeavesCountMismatch { expected: u64, actual: u64 },
     #[error("Invalid HRKL Merkle proof: {0}")]
     InvalidMerkleProof(String),
+    #[error("Proof document digest mismatch: expected {expected}, got {actual}")]
+    ProofDigestMismatch { expected: String, actual: String },
     #[error("Unsupported evidence schema version: {0}")]
     UnsupportedSchema(String),
     #[error("Missing file: {0}")]
@@ -368,7 +370,8 @@ impl EvidenceVerifier {
                     }
                     VerifierError::MerkleRootMismatch { .. }
                     | VerifierError::LeavesCountMismatch { .. }
-                    | VerifierError::InvalidMerkleProof(_) => {
+                    | VerifierError::InvalidMerkleProof(_)
+                    | VerifierError::ProofDigestMismatch { .. } => {
                         report.merkle_proof = VerificationState::Invalid;
                     }
                     _ => report.package_structure = VerificationState::Invalid,
@@ -632,6 +635,21 @@ impl EvidenceVerifier {
         // HRKL v6 e referenciar exatamente o objeto/LSN do manifesto.
         let proofs_path = self.checked_file("proofs/merkle.json", MAX_PROOF_BYTES)?;
         let proofs_bytes = fs::read(&proofs_path)?;
+        let mut proofs_hasher = Sha256::new();
+        proofs_hasher.update(&proofs_bytes);
+        let actual_proofs_sha256 = hex::encode(proofs_hasher.finalize());
+        if manifest.merkle.proofs_sha256.is_empty()
+            || manifest.merkle.proofs_sha256 != actual_proofs_sha256
+        {
+            return Err(VerifierError::ProofDigestMismatch {
+                expected: if manifest.merkle.proofs_sha256.is_empty() {
+                    "<missing>".into()
+                } else {
+                    manifest.merkle.proofs_sha256.clone()
+                },
+                actual: actual_proofs_sha256,
+            });
+        }
         let proof_value: serde_json::Value = serde_json::from_slice(&proofs_bytes)?;
         let proof_is_absent = proof_value.is_null()
             || proof_value
@@ -863,6 +881,7 @@ mod verifier_regressions {
                 root_blake3: String::new(),
                 root_sha256: String::new(),
                 leaves_count: 0,
+                proofs_sha256: String::new(),
             },
             custody_digest: String::new(),
             export_identity: "tester".into(),
@@ -1107,6 +1126,21 @@ mod verifier_regressions {
         let report = verifier.verify_report();
         assert_eq!(report.timestamp, VerificationState::Pass);
         assert_eq!(report.signature, VerificationState::Pass);
+    }
+
+
+    #[test]
+    fn tampered_proof_document_is_rejected_by_manifest_digest() {
+        let dir = tempdir().unwrap();
+        let package = dir.path().join("pkg");
+        let mut builder = EvidencePackageBuilder::new(manifest());
+        builder.build(&package).unwrap();
+
+        fs::write(package.join("proofs/merkle.json"), b"{\"changed\":true}").unwrap();
+        assert!(matches!(
+            EvidenceVerifier::new(&package).verify(),
+            Err(VerifierError::ProofDigestMismatch { .. })
+        ));
     }
 
 }
