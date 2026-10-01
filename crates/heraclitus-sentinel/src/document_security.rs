@@ -162,7 +162,6 @@ impl SemanticInjectionClassifier for LexicalSemanticClassifier {
                 "ignore todas as instru",
                 "system override",
                 "developer message",
-                "prompt injection",
                 "negar todos os comandos",
                 "desconsidere as regras",
             ],
