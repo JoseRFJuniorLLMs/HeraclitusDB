@@ -3622,7 +3622,11 @@ mod tests {
             "test",
             vec!["admin".into()],
         );
-        crate::grpc::trusted_legal_hold_op(engine, &ctx, op, arg)
+        let key = format!(
+            "test:{op}:{}",
+            blake3::hash(arg.as_bytes()).to_hex()
+        );
+        crate::grpc::trusted_legal_hold_op(engine, &ctx, op, arg, &key)
     }
 
     /// Auditoria 2026-09-05 (`grpc.rs:521`, CONFIRMADO): as escritas do RPC
