@@ -184,6 +184,35 @@ impl EncryptionEnvelopeV2 {
         })
     }
 
+    /// Constrói o AAD canônico interno. O cabeçalho faz parte do compromisso
+    /// criptográfico; alterar tenant/key/epoch/algoritmo/nonce invalida a tag.
+    fn authenticated_aad(
+        tenant: &TenantId,
+        key_id: &str,
+        epoch: u64,
+        algorithm: &str,
+        nonce: &[u8; 12],
+        caller_aad: &[u8],
+    ) -> Vec<u8> {
+        fn push_len_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+            let len = u32::try_from(bytes.len()).expect("campo de AAD excede u32::MAX");
+            out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(bytes);
+        }
+
+        let mut out = Vec::with_capacity(
+            32 + tenant.as_str().len() + key_id.len() + algorithm.len() + caller_aad.len(),
+        );
+        out.extend_from_slice(b"HeraclitusDB/EnvelopeV2/HeaderAAD/v1");
+        push_len_bytes(&mut out, tenant.as_str().as_bytes());
+        push_len_bytes(&mut out, key_id.as_bytes());
+        out.extend_from_slice(&epoch.to_be_bytes());
+        push_len_bytes(&mut out, algorithm.as_bytes());
+        out.extend_from_slice(nonce);
+        push_len_bytes(&mut out, caller_aad);
+        out
+    }
+
     /// Sela dados e cria o envelope binário V2.
     pub fn seal(
         key: &[u8; 32],
@@ -193,69 +222,80 @@ impl EncryptionEnvelopeV2 {
         key_id: String,
         epoch: u64,
     ) -> Vec<u8> {
+        const ALGORITHM: &str = "ChaCha20-Poly1305";
+
         let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
         let mut nonce = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce);
 
         let aad_digest = *blake3::hash(aad).as_bytes();
+        let bound_aad = Self::authenticated_aad(
+            &tenant,
+            &key_id,
+            epoch,
+            ALGORITHM,
+            &nonce,
+            aad,
+        );
 
         let ct = cipher
             .encrypt(
                 Nonce::from_slice(&nonce),
                 Payload {
                     msg: plaintext,
-                    aad,
+                    aad: &bound_aad,
                 },
             )
             .expect("chacha20poly1305 encrypt nunca falha para chave/nonce validos");
 
         let mut result = Vec::new();
-        // version = 2 (u16)
         result.extend_from_slice(&2u16.to_be_bytes());
 
-        // tenant (tamanho + bytes)
         let tenant_bytes = tenant.as_str().as_bytes();
         let tenant_len: u16 = tenant_bytes.len().try_into().expect("tenant id excede u16::MAX");
         result.extend_from_slice(&tenant_len.to_be_bytes());
         result.extend_from_slice(tenant_bytes);
 
-        // key_id
         let key_id_bytes = key_id.as_bytes();
         let key_id_len: u16 = key_id_bytes.len().try_into().expect("key_id excede u16::MAX");
         result.extend_from_slice(&key_id_len.to_be_bytes());
         result.extend_from_slice(key_id_bytes);
 
-        // key_epoch
         result.extend_from_slice(&epoch.to_be_bytes());
 
-        // algorithm
-        let algo = "ChaCha20-Poly1305";
-        let algo_bytes = algo.as_bytes();
+        let algo_bytes = ALGORITHM.as_bytes();
         let algo_len: u16 = algo_bytes.len().try_into().expect("algorithm excede u16::MAX");
         result.extend_from_slice(&algo_len.to_be_bytes());
         result.extend_from_slice(algo_bytes);
 
-        // nonce
         result.extend_from_slice(&nonce);
-
-        // aad_digest
         result.extend_from_slice(&aad_digest);
-
-        // ciphertext
         result.extend_from_slice(&ct);
-
         result
     }
 
     /// Abre o envelope binário V2 e retorna os dados em texto plano.
     pub fn open(key: &[u8; 32], envelope_bytes: &[u8], expected_aad: &[u8]) -> Option<Vec<u8>> {
-        let header = Self::peek_header(envelope_bytes)?;
+        const ALGORITHM: &str = "ChaCha20-Poly1305";
 
-        // Verificar aad_digest com BLAKE3
+        let header = Self::peek_header(envelope_bytes)?;
+        if header.algorithm != ALGORITHM {
+            return None;
+        }
+
         let expected_digest = *blake3::hash(expected_aad).as_bytes();
         if header.aad_digest != expected_digest {
             return None;
         }
+
+        let bound_aad = Self::authenticated_aad(
+            &header.tenant,
+            &header.key_id,
+            header.key_epoch,
+            &header.algorithm,
+            &header.nonce,
+            expected_aad,
+        );
 
         let ct = &envelope_bytes[header.ciphertext_offset..];
         let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
@@ -264,11 +304,13 @@ impl EncryptionEnvelopeV2 {
                 Nonce::from_slice(&header.nonce),
                 Payload {
                     msg: ct,
-                    aad: expected_aad,
+                    aad: &bound_aad,
                 },
             )
             .ok()
     }
+}
+
 }
 
 /// Traço para provedores de chaves
@@ -283,44 +325,55 @@ pub trait KeyProvider: Send + Sync {
     fn health(&self) -> KeyProviderHealth;
 }
 
-/// Provedor de chaves baseado em software para testes e dev
+/// Provedor de chaves baseado em software para testes e dev.
+///
+/// Mantém material de wrapping por época. Rotacionar cria uma nova época sem
+/// destruir as anteriores; destruir exige a KeyRef exata.
 pub struct SoftwareKeyProvider {
-    master_keys: Arc<Mutex<HashMap<TenantId, [u8; 32]>>>,
-    epochs: Arc<Mutex<HashMap<TenantId, u64>>>,
+    state: Arc<Mutex<SoftwareKeyState>>,
+}
+
+#[derive(Default)]
+struct SoftwareKeyState {
+    epochs: HashMap<TenantId, u64>,
+    master_keys: HashMap<(TenantId, u64), [u8; 32]>,
 }
 
 impl SoftwareKeyProvider {
     /// Cria uma nova instância de SoftwareKeyProvider
     pub fn new() -> Self {
         Self {
-            master_keys: Arc::new(Mutex::new(HashMap::new())),
-            epochs: Arc::new(Mutex::new(HashMap::new())),
+            state: Arc::new(Mutex::new(SoftwareKeyState::default())),
         }
     }
 
-    #[allow(dead_code)]
-    fn get_or_create_master_key(&self, tenant: &TenantId) -> [u8; 32] {
-        let mut keys = self.master_keys.lock().unwrap();
-        if let Some(k) = keys.get(tenant) {
-            *k
-        } else {
-            let mut new_key = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut new_key);
-            keys.insert(tenant.clone(), new_key);
-            new_key
-        }
+    fn key_id(tenant: &TenantId, epoch: u64) -> String {
+        format!("{}-key-{}", tenant.as_str(), epoch)
     }
-    
-    fn get_epoch(&self, tenant: &TenantId) -> u64 {
-        let mut epochs = self.epochs.lock().unwrap();
-        *epochs.entry(tenant.clone()).or_insert(1)
+
+    fn current_epoch(state: &mut SoftwareKeyState, tenant: &TenantId) -> u64 {
+        *state.epochs.entry(tenant.clone()).or_insert(1)
     }
-    
-    fn increment_epoch(&self, tenant: &TenantId) -> u64 {
-        let mut epochs = self.epochs.lock().unwrap();
-        let e = epochs.entry(tenant.clone()).or_insert(1);
-        *e += 1;
-        *e
+
+    fn current_master_key(&self, tenant: &TenantId) -> (KeyRef, [u8; 32]) {
+        let mut state = self.state.lock().unwrap();
+        let epoch = Self::current_epoch(&mut state, tenant);
+        let master = *state
+            .master_keys
+            .entry((tenant.clone(), epoch))
+            .or_insert_with(|| {
+                let mut key = [0u8; 32];
+                rand::thread_rng().fill_bytes(&mut key);
+                key
+            });
+        (
+            KeyRef {
+                tenant: tenant.clone(),
+                key_id: Self::key_id(tenant, epoch),
+                epoch,
+            },
+            master,
+        )
     }
 }
 
@@ -345,32 +398,35 @@ impl KeyProvider for SoftwareKeyProvider {
     }
 
     fn generate_data_key(&self, tenant: &TenantId) -> Result<(KeyRef, [u8; 32]), String> {
+        let (key_ref, _) = self.current_master_key(tenant);
         let mut data_key = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut data_key);
-        
-        let epoch = self.get_epoch(tenant);
-        
-        let key_ref = KeyRef {
-            tenant: tenant.clone(),
-            key_id: format!("{}-key-{}", tenant.as_str(), epoch),
-            epoch,
-        };
-        
         Ok((key_ref, data_key))
     }
 
-    fn wrap_data_key(&self, tenant: &TenantId, data_key: &[u8; 32]) -> Result<WrappedDataKey, String> {
-        let master = self.get_or_create_master_key(tenant);
-        let epoch = self.get_epoch(tenant);
+    fn wrap_data_key(
+        &self,
+        tenant: &TenantId,
+        data_key: &[u8; 32],
+    ) -> Result<WrappedDataKey, String> {
+        let (key_ref, master) = self.current_master_key(tenant);
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&master));
         let mut nonce = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce);
+
+        let mut wrap_aad = Vec::new();
+        wrap_aad.extend_from_slice(b"HeraclitusDB/SoftwareKeyProvider/wrap/v1");
+        wrap_aad.extend_from_slice(key_ref.tenant.as_str().as_bytes());
+        wrap_aad.push(0);
+        wrap_aad.extend_from_slice(key_ref.key_id.as_bytes());
+        wrap_aad.extend_from_slice(&key_ref.epoch.to_be_bytes());
+
         let ct = cipher
             .encrypt(
                 Nonce::from_slice(&nonce),
                 Payload {
                     msg: data_key,
-                    aad: tenant.as_str().as_bytes(),
+                    aad: &wrap_aad,
                 },
             )
             .map_err(|e| format!("wrap error: {e}"))?;
@@ -379,39 +435,61 @@ impl KeyProvider for SoftwareKeyProvider {
         wrapped.extend_from_slice(&ct);
 
         Ok(WrappedDataKey {
-            key_ref: KeyRef {
-                tenant: tenant.clone(),
-                key_id: format!("{}-key-{}", tenant.as_str(), epoch),
-                epoch,
-            },
+            key_ref,
             wrapped_ciphertext: wrapped,
             wrapping_algorithm: "ChaCha20-Poly1305".into(),
-            created_at_secs: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+            created_at_secs: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
         })
     }
 
     fn unwrap_data_key(&self, key: &WrappedDataKey) -> Result<[u8; 32], String> {
+        if key.key_ref.key_id != Self::key_id(&key.key_ref.tenant, key.key_ref.epoch) {
+            return Err("KeyRef inconsistente: key_id não corresponde ao tenant/epoch".into());
+        }
+        if key.wrapping_algorithm != "ChaCha20-Poly1305" {
+            return Err(format!(
+                "algoritmo de wrapping não suportado: {}",
+                key.wrapping_algorithm
+            ));
+        }
+
         let master = {
-            let keys = self.master_keys.lock().unwrap();
-            keys.get(&key.key_ref.tenant).copied().ok_or_else(|| {
-                format!(
-                    "Chave mestre para tenant {} não encontrada (chave destruída ou inexistente)",
-                    key.key_ref.tenant.as_str()
-                )
-            })?
+            let state = self.state.lock().unwrap();
+            state
+                .master_keys
+                .get(&(key.key_ref.tenant.clone(), key.key_ref.epoch))
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "Chave mestre {} época {} não encontrada (destruída ou inexistente)",
+                        key.key_ref.key_id, key.key_ref.epoch
+                    )
+                })?
         };
+
         if key.wrapped_ciphertext.len() < 12 {
             return Err("ciphertext encapsulado inválido (menor que nonce)".into());
         }
         let nonce = &key.wrapped_ciphertext[..12];
         let ct = &key.wrapped_ciphertext[12..];
+
+        let mut wrap_aad = Vec::new();
+        wrap_aad.extend_from_slice(b"HeraclitusDB/SoftwareKeyProvider/wrap/v1");
+        wrap_aad.extend_from_slice(key.key_ref.tenant.as_str().as_bytes());
+        wrap_aad.push(0);
+        wrap_aad.extend_from_slice(key.key_ref.key_id.as_bytes());
+        wrap_aad.extend_from_slice(&key.key_ref.epoch.to_be_bytes());
+
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&master));
         let pt = cipher
             .decrypt(
                 Nonce::from_slice(nonce),
                 Payload {
                     msg: ct,
-                    aad: key.key_ref.tenant.as_str().as_bytes(),
+                    aad: &wrap_aad,
                 },
             )
             .map_err(|e| format!("desencapsulamento falhou: {e}"))?;
@@ -420,29 +498,43 @@ impl KeyProvider for SoftwareKeyProvider {
     }
 
     fn rotate(&self, tenant: &TenantId) -> Result<KeyRef, String> {
-        let epoch = self.increment_epoch(tenant);
-        
-        let mut keys = self.master_keys.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        let current = Self::current_epoch(&mut state, tenant);
+        let epoch = current
+            .checked_add(1)
+            .ok_or_else(|| "epoch de chave excedeu u64::MAX".to_string())?;
+        state.epochs.insert(tenant.clone(), epoch);
+
         let mut new_key = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut new_key);
-        keys.insert(tenant.clone(), new_key);
-        
+        state.master_keys.insert((tenant.clone(), epoch), new_key);
+
         Ok(KeyRef {
             tenant: tenant.clone(),
-            key_id: format!("{}-key-{}", tenant.as_str(), epoch),
+            key_id: Self::key_id(tenant, epoch),
             epoch,
         })
     }
 
     fn destroy(&self, key: &KeyRef) -> Result<DestroyReceipt, String> {
-        let mut keys = self.master_keys.lock().unwrap();
-        let existed = keys.remove(&key.tenant).is_some();
+        if key.key_id != Self::key_id(&key.tenant, key.epoch) {
+            return Err("KeyRef inconsistente: recusa destruir chave diferente da referência".into());
+        }
+
+        let existed = self
+            .state
+            .lock()
+            .unwrap()
+            .master_keys
+            .remove(&(key.tenant.clone(), key.epoch))
+            .is_some();
         let destroyed_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
         let mut hasher = blake3::Hasher::new();
+        hasher.update(b"HeraclitusDB/SoftwareKeyProvider/destroy-receipt/v1");
         hasher.update(key.tenant.as_str().as_bytes());
         hasher.update(key.key_id.as_bytes());
         hasher.update(&key.epoch.to_be_bytes());
@@ -453,6 +545,7 @@ impl KeyProvider for SoftwareKeyProvider {
         Ok(DestroyReceipt {
             key_ref: key.clone(),
             destroyed_at_secs: destroyed_at,
+            // Marcador de desenvolvimento; não é assinatura criptográfica institucional.
             provider_signature: Some(format!("sig-software-{}", proof_digest)),
             proof_digest,
         })
@@ -545,4 +638,68 @@ mod tests {
         let unwrap_after_shred = provider.unwrap_data_key(&wrapped);
         assert!(unwrap_after_shred.is_err(), "unwrap deveria falhar após crypto-shred");
     }
+
+    #[test]
+    fn rotation_preserves_historical_wrapped_keys() {
+        let provider = SoftwareKeyProvider::new();
+        let tenant = TenantId::new("tenant-rotation".to_string()).unwrap();
+        let (_, data_key) = provider.generate_data_key(&tenant).unwrap();
+        let old = provider.wrap_data_key(&tenant, &data_key).unwrap();
+
+        let rotated = provider.rotate(&tenant).unwrap();
+        assert_eq!(rotated.epoch, old.key_ref.epoch + 1);
+
+        let recovered = provider.unwrap_data_key(&old).unwrap();
+        assert_eq!(recovered, data_key);
+    }
+
+    #[test]
+    fn destroying_stale_epoch_does_not_destroy_current_epoch() {
+        let provider = SoftwareKeyProvider::new();
+        let tenant = TenantId::new("tenant-stale".to_string()).unwrap();
+
+        let (_, old_data_key) = provider.generate_data_key(&tenant).unwrap();
+        let old = provider.wrap_data_key(&tenant, &old_data_key).unwrap();
+        provider.rotate(&tenant).unwrap();
+
+        let (_, current_data_key) = provider.generate_data_key(&tenant).unwrap();
+        let current = provider.wrap_data_key(&tenant, &current_data_key).unwrap();
+
+        provider.destroy(&old.key_ref).unwrap();
+
+        assert!(provider.unwrap_data_key(&old).is_err());
+        assert_eq!(provider.unwrap_data_key(&current).unwrap(), current_data_key);
+    }
+
+    #[test]
+    fn envelope_header_is_authenticated() {
+        let tenant = TenantId::new("tenant-auth-header".to_string()).unwrap();
+        let mut key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut key);
+        let aad = b"aad";
+        let plaintext = b"payload";
+        let original = EncryptionEnvelopeV2::seal(
+            &key,
+            plaintext,
+            aad,
+            tenant,
+            "key-1".into(),
+            1,
+        );
+
+        let header = EncryptionEnvelopeV2::peek_header(&original).unwrap();
+
+        // Troca um byte do key_id sem mudar comprimentos nem ciphertext.
+        let mut tampered = original.clone();
+        let key_pos = 2 + 2 + header.tenant.as_str().len() + 2;
+        tampered[key_pos] ^= 0x01;
+        assert!(EncryptionEnvelopeV2::open(&key, &tampered, aad).is_none());
+
+        // Troca o epoch no cabeçalho.
+        let mut tampered_epoch = original.clone();
+        let epoch_pos = key_pos + header.key_id.len();
+        tampered_epoch[epoch_pos + 7] ^= 0x01;
+        assert!(EncryptionEnvelopeV2::open(&key, &tampered_epoch, aad).is_none());
+    }
+
 }
