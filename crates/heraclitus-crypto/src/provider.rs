@@ -376,7 +376,7 @@ pub struct SoftwareKeyProvider {
 #[derive(Default)]
 struct SoftwareKeyState {
     epochs: HashMap<TenantId, u64>,
-    master_keys: HashMap<(TenantId, u64), [u8; 32]>,
+    master_keys: HashMap<(TenantId, String, u64), [u8; 32]>,
 }
 
 impl SoftwareKeyProvider {
@@ -400,7 +400,7 @@ impl SoftwareKeyProvider {
         let epoch = Self::current_epoch(&mut state, tenant);
         let master = *state
             .master_keys
-            .entry((tenant.clone(), epoch))
+            .entry((tenant.clone(), Self::key_id(tenant, epoch), epoch))
             .or_insert_with(|| {
                 let mut key = [0u8; 32];
                 rand::thread_rng().fill_bytes(&mut key);
@@ -500,7 +500,11 @@ impl KeyProvider for SoftwareKeyProvider {
             let state = self.state.lock().unwrap();
             state
                 .master_keys
-                .get(&(key.key_ref.tenant.clone(), key.key_ref.epoch))
+                .get(&(
+                    key.key_ref.tenant.clone(),
+                    key.key_ref.key_id.clone(),
+                    key.key_ref.epoch,
+                ))
                 .copied()
                 .ok_or_else(|| {
                     format!(
@@ -547,7 +551,9 @@ impl KeyProvider for SoftwareKeyProvider {
 
         let mut new_key = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut new_key);
-        state.master_keys.insert((tenant.clone(), epoch), new_key);
+        state
+            .master_keys
+            .insert((tenant.clone(), Self::key_id(tenant, epoch), epoch), new_key);
 
         Ok(KeyRef {
             tenant: tenant.clone(),
@@ -566,7 +572,7 @@ impl KeyProvider for SoftwareKeyProvider {
             .lock()
             .unwrap()
             .master_keys
-            .remove(&(key.tenant.clone(), key.epoch))
+            .remove(&(key.tenant.clone(), key.key_id.clone(), key.epoch))
             .is_some();
         let destroyed_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
