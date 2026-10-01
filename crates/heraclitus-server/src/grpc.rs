@@ -572,13 +572,6 @@ fn legal_hold_effect(
     op: &str,
     arg: &str,
 ) -> (bool, String) {
-    if engine.is_replicated() && op != "legal-holds" {
-        return (
-            false,
-            "operação regulatória direta recusada em nó replicado; o append ainda não passa pelo consenso"
-                .into(),
-        );
-    }
     let body = match serde_json::from_str::<serde_json::Value>(arg) {
         Ok(value) => value,
         // A listagem não precisa de corpo; as outras duas precisam.
