@@ -1142,4 +1142,126 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn four_eyes_does_not_count_requester_as_second_approver() {
+        let protocol = TrustedAdminProtocol::new();
+        protocol.set_approval_verifier(Arc::new(TestApprovalVerifier));
+        let ctx = AdminContext::new("alice", "tenant", vec!["admin".into()]);
+        let mut op = AdminOperation::new(
+            "op-four-eyes",
+            "idem-four-eyes",
+            AdminOperationKind::CryptoShred {
+                agent_id: "subject".into(),
+            },
+            "test",
+        );
+        op.approval_policy = Some(ApprovalPolicy::strict_four_eyes("security_officer"));
+        let digest = op.compute_intent_digest(&ctx);
+        for who in ["alice", "bob"] {
+            op.approvals.push(ApprovalRecord {
+                approver_principal: who.into(),
+                approver_role: "security_officer".into(),
+                approved_intent_digest: digest.clone(),
+                approved_at_secs: 1,
+                signature: Some("verified".into()),
+            });
+        }
+        assert!(matches!(
+            protocol.validate(&ctx, &op),
+            Err(AdminError::ApprovalMissing {
+                required: 2,
+                obtained: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn approval_for_digest_a_is_invalid_after_parameter_change() {
+        let protocol = TrustedAdminProtocol::new();
+        protocol.set_approval_verifier(Arc::new(TestApprovalVerifier));
+        let ctx = AdminContext::new("alice", "tenant", vec!["admin".into()]);
+        let mut op = AdminOperation::new(
+            "op-digest",
+            "idem-digest",
+            AdminOperationKind::Custom {
+                name: "critical".into(),
+                details: "x".into(),
+            },
+            "test",
+        );
+        op.approval_policy = Some(ApprovalPolicy {
+            min_distinct_approvers: 1,
+            requester_may_approve: false,
+            required_roles: vec!["security_officer".into()],
+        });
+        op.parameters_digest = "A".into();
+        let approved_digest = op.compute_intent_digest(&ctx);
+        op.approvals.push(ApprovalRecord {
+            approver_principal: "bob".into(),
+            approver_role: "security_officer".into(),
+            approved_intent_digest: approved_digest,
+            approved_at_secs: 1,
+            signature: Some("verified".into()),
+        });
+
+        op.parameters_digest = "B".into();
+        assert!(matches!(
+            protocol.validate(&ctx, &op),
+            Err(AdminError::ApprovalMissing { .. })
+        ));
+    }
+
+    #[test]
+    fn idempotency_reservation_is_atomic_under_128_way_race() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+
+        let protocol = Arc::new(TrustedAdminProtocol::new());
+        let ctx = AdminContext::new("alice", "tenant", vec!["admin".into()]);
+        let op = Arc::new(AdminOperation::new(
+            "op-race",
+            "idem-race",
+            AdminOperationKind::Custom {
+                name: "race".into(),
+                details: "test".into(),
+            },
+            "test",
+        ));
+        let effects = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(128));
+
+        let mut handles = Vec::new();
+        for _ in 0..128 {
+            let protocol = Arc::clone(&protocol);
+            let ctx = ctx.clone();
+            let op = Arc::clone(&op);
+            let effects = Arc::clone(&effects);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                protocol.execute_admin(
+                    &ctx,
+                    &op,
+                    |_| Ok(1),
+                    |_| {
+                        effects.fetch_add(1, Ordering::SeqCst);
+                        Ok(((), "post".into(), BTreeMap::new()))
+                    },
+                    |_| Ok(2),
+                )
+            }));
+        }
+
+        let mut succeeded = 0usize;
+        for handle in handles {
+            if handle.join().unwrap().is_ok() {
+                succeeded += 1;
+            }
+        }
+        assert_eq!(succeeded, 1);
+        assert_eq!(effects.load(Ordering::SeqCst), 1);
+    }
+
 }
