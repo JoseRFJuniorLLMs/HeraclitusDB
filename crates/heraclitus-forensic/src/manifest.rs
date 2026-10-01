@@ -105,11 +105,12 @@ impl CustodyEntry {
         use sha2::{Sha256, Digest};
         let action_str = serde_json::to_string(&self.action).unwrap_or_default();
         let entry_str = format!(
-            "{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}",
             self.step_index,
             self.timestamp_secs,
             action_str,
             self.operator_principal,
+            self.terminal_or_node,
             self.previous_entry_hash
         );
         let mut hasher = Sha256::new();
