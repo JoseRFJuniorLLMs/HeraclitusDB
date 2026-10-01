@@ -481,12 +481,6 @@ impl TrustedAdminProtocol {
         intent_digest: &str,
         intent_lsn: Lsn,
     ) -> Result<AdminExecutionToken, AdminError> {
-        if intent_lsn == 0 {
-            return Err(AdminError::IntentPersistenceFailed(
-                "persistência retornou LSN 0".into(),
-            ));
-        }
-
         let mut map = self.idempotency_map.lock().unwrap();
         let entry = map
             .get_mut(&op.idempotency_key)
@@ -594,13 +588,7 @@ impl TrustedAdminProtocol {
                     completed_at_secs: now,
                 };
                 let result_lsn = match persist_result(&result) {
-                    Ok(lsn) if lsn != 0 => lsn,
-                    Ok(_) => {
-                        self.mark_unknown(&op.idempotency_key);
-                        return Err(AdminError::UnknownState(
-                            "resultado persistido com LSN 0".into(),
-                        ));
-                    }
+                    Ok(lsn) => lsn,
                     Err(error) => {
                         self.mark_unknown(&op.idempotency_key);
                         return Err(AdminError::UnknownState(format!(
@@ -636,7 +624,7 @@ impl TrustedAdminProtocol {
                     completed_at_secs: now,
                 };
                 match persist_result(&result) {
-                    Ok(lsn) if lsn != 0 => {
+                    Ok(lsn) => {
                         self.record_completion(
                             &op.idempotency_key,
                             digest,
@@ -645,7 +633,7 @@ impl TrustedAdminProtocol {
                             Some(lsn),
                         );
                     }
-                    _ => self.mark_unknown(&op.idempotency_key),
+                    Err(_) => self.mark_unknown(&op.idempotency_key),
                 }
                 Err(AdminError::UnknownState(error.to_string()))
             }
