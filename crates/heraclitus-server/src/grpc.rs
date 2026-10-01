@@ -338,7 +338,7 @@ impl pb::heraclitus_server::Heraclitus for Service {
                 // `ensure_crypto_shred_allowed` do `crypto_shred` bloqueia — mas
                 // nada em produção podia CRIAR um hold, portanto §94 era uma
                 // garantia que só os testes conseguiam exercer.
-                "legal-holds" => crate::grpc::legal_hold_op(&engine, "legal-holds", &r.arg),
+                "legal-holds" => crate::grpc::legal_hold_list(&engine),
                 op @ ("legal-hold-place" | "legal-hold-release") => {
                     crate::grpc::trusted_legal_hold_op(&engine, &admin_ctx, op, &r.arg)
                 }
@@ -551,7 +551,7 @@ pub(crate) fn trusted_legal_hold_op(
     admin_op.parameters_digest = blake3::hash(arg.as_bytes()).to_hex().to_string();
 
     match engine.execute_trusted_admin(ctx, &admin_op, |_token| {
-        let result = legal_hold_op(engine, op, arg);
+        let result = legal_hold_effect(engine, op, arg);
         if !result.0 {
             return Err(crate::trusted_admin::AdminError::ExecutionFailed(result.1));
         }
@@ -567,7 +567,7 @@ pub(crate) fn trusted_legal_hold_op(
 
 /// Efeito de baixo nível do Legal Hold. As superfícies remotas mutáveis devem
 /// chamar `trusted_legal_hold_op`, que persiste a intenção antes deste efeito.
-pub(crate) fn legal_hold_op(
+fn legal_hold_effect(
     engine: &std::sync::Arc<crate::engine::Engine>,
     op: &str,
     arg: &str,
@@ -663,6 +663,14 @@ pub(crate) fn legal_hold_op(
         }
         outra => (false, format!("operação desconhecida: {outra}")),
     }
+}
+
+/// Listagem read-only de Legal Holds. Não produz side effect e, portanto,
+/// não precisa de Durable Intent.
+pub(crate) fn legal_hold_list(
+    engine: &std::sync::Arc<crate::engine::Engine>,
+) -> (bool, String) {
+    legal_hold_effect(engine, "legal-holds", "")
 }
 
 /// SPEC-0046 — superfície operacional do motor regulatório versionado.
