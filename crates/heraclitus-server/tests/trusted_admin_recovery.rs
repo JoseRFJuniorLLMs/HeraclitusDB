@@ -41,12 +41,19 @@ fn durable_intent_without_result_reopens_as_unknown() {
 
     {
         let engine = Engine::open(&cfg).unwrap();
-        let episode = Episode::new(
+        let mut episode = Episode::new(
             "heraclitus-trusted-admin",
             EventKind::Custom("TrustedAdminIntent".into()),
             serde_json::to_vec(&intent).unwrap(),
         );
-        engine.append(episode).unwrap();
+        episode.attrs.insert("audit".into(), "trusted-admin".into());
+        episode.attrs.insert("protocol".into(), "SPEC-0089".into());
+
+        // Simula o estado em disco depois de Durable Intent + crash antes do
+        // Result. Vai direto ao backend deliberadamente: o Engine público deve
+        // rejeitar exatamente este namespace.
+        heraclitus_log::EpisodeLog::append(engine.log.as_ref(), episode).unwrap();
+        heraclitus_log::EpisodeLog::flush(engine.log.as_ref()).unwrap();
     }
 
     let reopened = Engine::open(&cfg).unwrap();
@@ -62,4 +69,30 @@ fn durable_intent_without_result_reopens_as_unknown() {
         .expect("intent must be reconstructed");
     assert_eq!(intent_lsn, 0);
     assert!(result_lsn.is_none());
+}
+
+
+#[test]
+fn public_append_rejects_forged_trusted_admin_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = HeraclitusConfig {
+        data_dir: dir.path().to_path_buf(),
+        fsync: FsyncPolicy::Always,
+        ..HeraclitusConfig::default()
+    };
+    let engine = Engine::open(&cfg).unwrap();
+
+    let mut forged = Episode::new(
+        "writer",
+        EventKind::Custom("TrustedAdminIntent".into()),
+        b"{}".to_vec(),
+    );
+    forged.attrs.insert("audit".into(), "trusted-admin".into());
+    forged.attrs.insert("protocol".into(), "SPEC-0089".into());
+
+    let error = engine.append(forged).unwrap_err();
+    assert!(
+        error.to_string().contains("TrustedAdmin"),
+        "append externo deve explicar o namespace reservado: {error}"
+    );
 }
