@@ -434,8 +434,7 @@ impl<C: SemanticInjectionClassifier> DocumentFirewall<C> {
                     "Document content attempts to cause a tool call, mutation or exfiltration.",
                 );
             }
-
-         }
+        }
 
         let semantic = self.semantic.classify(&normalized_text);
         if semantic.malicious_instruction || semantic.tool_coercion {
