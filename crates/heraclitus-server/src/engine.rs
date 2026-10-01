@@ -817,8 +817,17 @@ impl Engine {
         );
         episode.attrs.insert("audit".into(), "trusted-admin".into());
         episode.attrs.insert("protocol".into(), "SPEC-0089".into());
-        self.append(episode)
-            .map_err(crate::trusted_admin::AdminError::Storage)
+
+        // `append` já aguarda commit por quórum quando a replicação está
+        // ativa. A barreira explícita abaixo cobre o backend local inclusive em
+        // GroupCommit: o token administrativo só é emitido DEPOIS de flush().
+        let lsn = self
+            .append(episode)
+            .map_err(crate::trusted_admin::AdminError::Storage)?;
+        self.log
+            .flush()
+            .map_err(crate::trusted_admin::AdminError::Storage)?;
+        Ok(lsn)
     }
 
     /// Executa operação privilegiada pelo único caminho autorizado.
