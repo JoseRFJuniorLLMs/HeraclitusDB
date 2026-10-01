@@ -858,6 +858,32 @@ impl Engine {
         )
     }
 
+    /// Reconcilia uma operação administrativa UNKNOWN por inspeção do estado
+    /// real, persistindo a conclusão no mesmo log durável.
+    pub fn reconcile_trusted_admin<F>(
+        &self,
+        idempotency_key: &str,
+        inspect: F,
+    ) -> Result<crate::trusted_admin::AdminResult, crate::trusted_admin::AdminError>
+    where
+        F: FnOnce(
+            &crate::trusted_admin::AdminIntent,
+        ) -> Result<
+            (
+                crate::trusted_admin::AdminState,
+                String,
+                std::collections::BTreeMap<String, String>,
+            ),
+            crate::trusted_admin::AdminError,
+        >,
+    {
+        self.trusted_admin.reconcile_admin(
+            idempotency_key,
+            inspect,
+            |result| self.append_trusted_admin_record("TrustedAdminResult", result),
+        )
+    }
+
     fn recover_trusted_admin_state(&self) -> Result<(), HeraclitusError> {
         let head = self.log.head();
         let mut cur = 0u64;
