@@ -48,6 +48,12 @@ pub struct MerkleEvidence {
     pub root_blake3: String,
     pub root_sha256: String,
     pub leaves_count: u64,
+    /// SHA-256 dos bytes canónicos de `proofs/merkle.json`.
+    ///
+    /// Liga a prova ao manifesto; uma assinatura/timestamp do manifesto passa
+    /// então a comprometer também o documento de prova, sem circularidade.
+    #[serde(default)]
+    pub proofs_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
