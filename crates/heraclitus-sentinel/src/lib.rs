@@ -63,9 +63,9 @@ pub use cursor::SentinelCursor;
 pub use detection::{DetectionExpr, DetectionRule, Field, RuleCompileError, RuleEngine, Value};
 pub use document_security::{
     AuthorityLabel, DocumentAnalysis, DocumentFinding, DocumentFirewall, DocumentLayers,
-    DocumentSecurityEvent, DocumentSourceRegion, DocumentSpan, DocumentVerdict,
-    FindingCategory, FindingSeverity, LexicalSemanticClassifier, ReaderPayload,
-    SemanticAssessment, SemanticInjectionClassifier, TrustLabel,
+    DocumentSecurityEvent, DocumentSourceRegion, DocumentSpan, DocumentVerdict, FindingCategory,
+    FindingSeverity, LexicalSemanticClassifier, ReaderPayload, SemanticAssessment,
+    SemanticInjectionClassifier, TrustLabel,
 };
 pub use error::SentinelError;
 pub use event::{

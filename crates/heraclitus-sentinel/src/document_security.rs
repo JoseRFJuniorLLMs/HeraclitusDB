@@ -184,7 +184,8 @@ impl SemanticInjectionClassifier for LexicalSemanticClassifier {
             malicious_instruction: malicious,
             tool_coercion: tool,
             rationale: if malicious || tool {
-                "Deterministic lexical classifier found instruction/tool-coercion language.".to_owned()
+                "Deterministic lexical classifier found instruction/tool-coercion language."
+                    .to_owned()
             } else {
                 "No deterministic semantic indicator matched.".to_owned()
             },
@@ -273,7 +274,12 @@ impl<C: SemanticInjectionClassifier> DocumentFirewall<C> {
     }
 
     pub fn inspect(&self, original_bytes: &[u8], spans: &[DocumentSpan]) -> DocumentAnalysis {
-        let human_text = join_text(spans.iter().filter(|s| s.is_human_visible()).map(|s| &s.text));
+        let human_text = join_text(
+            spans
+                .iter()
+                .filter(|s| s.is_human_visible())
+                .map(|s| &s.text),
+        );
         let machine_text = join_text(spans.iter().map(|s| &s.text));
         let normalized_text = normalize_text(&machine_text);
         let hidden_text = join_text(
@@ -702,10 +708,7 @@ fn parse_hex_color(value: &str) -> Option<(u8, u8, u8)> {
     let value = value.trim().trim_start_matches('#');
     let expanded;
     let value = if value.len() == 3 {
-        expanded = value
-            .chars()
-            .flat_map(|c| [c, c])
-            .collect::<String>();
+        expanded = value.chars().flat_map(|c| [c, c]).collect::<String>();
         expanded.as_str()
     } else {
         value
@@ -747,10 +750,7 @@ mod tests {
         let analysis = DocumentFirewall::default().inspect(b"synthetic-pdf", &[visible, hidden]);
 
         assert_eq!(analysis.verdict, DocumentVerdict::Quarantined);
-        assert!(analysis
-            .findings
-            .iter()
-            .any(|f| f.rule_id == "DOC-HDR-001"));
+        assert!(analysis.findings.iter().any(|f| f.rule_id == "DOC-HDR-001"));
         assert!(analysis.layers.machine_only_tokens > 0);
         assert_eq!(analysis.reader_payload.authority, AuthorityLabel::DataOnly);
         assert_eq!(analysis.reader_payload.trust, TrustLabel::UntrustedDocument);
