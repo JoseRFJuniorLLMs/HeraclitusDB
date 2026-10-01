@@ -128,7 +128,7 @@ mod tests {
         builder.build(&target_dir).expect("Failed to build package");
         
         // Tamper with the object
-        fs::write(target_dir.join("evidence/file1.txt"), b"tampered content").unwrap();
+        fs::write(target_dir.join("evidence/file1.txt"), b"best content").unwrap();
         
         let verifier = EvidenceVerifier::new(&target_dir);
         let result = verifier.verify();
