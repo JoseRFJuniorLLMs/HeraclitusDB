@@ -304,6 +304,7 @@ struct IdempotencyEntry {
 pub struct TrustedAdminProtocol {
     idempotency_map: Mutex<HashMap<String, IdempotencyEntry>>,
     active_operations: RwLock<HashMap<String, AdminState>>,
+    intents: RwLock<HashMap<String, AdminIntent>>,
     approval_verifier: RwLock<Option<Arc<dyn ApprovalVerifier>>>,
 }
 
@@ -318,6 +319,7 @@ impl TrustedAdminProtocol {
         Self {
             idempotency_map: Mutex::new(HashMap::new()),
             active_operations: RwLock::new(HashMap::new()),
+            intents: RwLock::new(HashMap::new()),
             approval_verifier: RwLock::new(None),
         }
     }
@@ -567,6 +569,10 @@ impl TrustedAdminProtocol {
                 return Err(AdminError::IntentPersistenceFailed(error.to_string()));
             }
         };
+        self.intents
+            .write()
+            .unwrap()
+            .insert(op.idempotency_key.clone(), intent.clone());
         let token = self.create_execution_token(op, &digest, intent_lsn)?;
         self.mark_executing(&op.idempotency_key);
 
@@ -666,6 +672,10 @@ impl TrustedAdminProtocol {
     }
 
     pub fn recover_intent(&self, lsn: Lsn, intent: &AdminIntent) {
+        self.intents
+            .write()
+            .unwrap()
+            .insert(intent.idempotency_key.clone(), intent.clone());
         self.idempotency_map.lock().unwrap().insert(
             intent.idempotency_key.clone(),
             IdempotencyEntry {
@@ -704,6 +714,90 @@ impl TrustedAdminProtocol {
                 .unwrap()
                 .insert(result.idempotency_key.clone(), result.status);
         }
+    }
+
+    /// Retorna a intenção durável original para inspeção/reconciliação.
+    pub fn pending_intent(&self, idempotency_key: &str) -> Option<AdminIntent> {
+        self.intents
+            .read()
+            .unwrap()
+            .get(idempotency_key)
+            .cloned()
+    }
+
+    /// Fecha uma operação UNKNOWN sem reexecutar o efeito privilegiado.
+    ///
+    /// `inspect` deve somente observar o estado real do alvo/provider. Não
+    /// recebe `AdminExecutionToken`, logo este caminho não pode chamar uma
+    /// primitiva destrutiva que obedeça ao contrato da SPEC-0089.
+    pub fn reconcile_admin<Inspect, PersistResult>(
+        &self,
+        idempotency_key: &str,
+        inspect: Inspect,
+        persist_result: PersistResult,
+    ) -> Result<AdminResult, AdminError>
+    where
+        Inspect: FnOnce(
+            &AdminIntent,
+        ) -> Result<(AdminState, String, BTreeMap<String, String>), AdminError>,
+        PersistResult: FnOnce(&AdminResult) -> Result<Lsn, AdminError>,
+    {
+        let (intent_digest, intent_lsn, current_state) = {
+            let map = self.idempotency_map.lock().unwrap();
+            let entry = map.get(idempotency_key).ok_or_else(|| {
+                AdminError::PreconditionFailed(format!(
+                    "idempotency key {idempotency_key} não encontrada"
+                ))
+            })?;
+            (entry.intent_digest.clone(), entry.intent_lsn, entry.state)
+        };
+        if current_state != AdminState::Unknown {
+            return Err(AdminError::PreconditionFailed(format!(
+                "reconciliação exige UNKNOWN, estado atual é {current_state:?}"
+            )));
+        }
+
+        let intent = self.pending_intent(idempotency_key).ok_or_else(|| {
+            AdminError::PreconditionFailed(format!(
+                "AdminIntent durável ausente para {idempotency_key}"
+            ))
+        })?;
+        let (status, post_state_digest, provider_receipts) = inspect(&intent)?;
+        if !matches!(
+            status,
+            AdminState::Succeeded | AdminState::Failed | AdminState::Unknown
+        ) {
+            return Err(AdminError::PreconditionFailed(format!(
+                "reconciler só pode concluir SUCCEEDED, FAILED ou UNKNOWN; recebeu {status:?}"
+            )));
+        }
+
+        let result = AdminResult {
+            operation_id: intent.operation_id.clone(),
+            idempotency_key: intent.idempotency_key.clone(),
+            status,
+            post_state_digest,
+            provider_receipts,
+            error_detail: if status == AdminState::Unknown {
+                Some("reconciliação não conseguiu determinar o estado real".into())
+            } else {
+                None
+            },
+            completed_at_secs: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+        let result_lsn = persist_result(&result)?;
+
+        self.record_completion(
+            idempotency_key,
+            intent_digest,
+            status,
+            intent_lsn,
+            Some(result_lsn),
+        );
+        Ok(result)
     }
 
     pub fn query_idempotency(
@@ -1004,6 +1098,48 @@ mod tests {
             protocol.validate(&ctx, &second),
             Err(AdminError::IdempotencyConflict { .. })
         ));
+    }
+
+
+    #[test]
+    fn unknown_is_reconciled_by_inspection_without_execution_token() {
+        let protocol = TrustedAdminProtocol::new();
+        let intent = AdminIntent {
+            operation_id: "op-reconcile".into(),
+            idempotency_key: "idem-reconcile".into(),
+            intent_digest: "digest".into(),
+            principal: "alice".into(),
+            tenant: "tenant".into(),
+            kind: AdminOperationKind::CryptoShred {
+                agent_id: "subject".into(),
+            },
+            target_digest: "target".into(),
+            parameters_digest: "params".into(),
+            reason: "test".into(),
+            approval_policy: None,
+            requested_at_secs: 1,
+            approver_count: 0,
+        };
+        protocol.recover_intent(10, &intent);
+
+        let result = protocol
+            .reconcile_admin(
+                "idem-reconcile",
+                |observed| {
+                    assert_eq!(observed.operation_id, "op-reconcile");
+                    let mut receipts = BTreeMap::new();
+                    receipts.insert("provider_state".into(), "key_absent".into());
+                    Ok((AdminState::Succeeded, "post".into(), receipts))
+                },
+                |_| Ok(11),
+            )
+            .unwrap();
+
+        assert_eq!(result.status, AdminState::Succeeded);
+        assert_eq!(
+            protocol.get_operation_state("idem-reconcile"),
+            Some(AdminState::Succeeded)
+        );
     }
 
 }
