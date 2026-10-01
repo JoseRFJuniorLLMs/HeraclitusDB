@@ -214,7 +214,9 @@ impl EvidenceVerifier {
             let path = self.checked_file(custody_relative, MAX_CUSTODY_BYTES)?;
             let custody_content = fs::read_to_string(&path)?;
             let mut previous_hash = String::new();
+            let mut previous_timestamp = 0u64;
             let mut expected_step = 0u64;
+            let mut seen_hashes = std::collections::HashSet::new();
 
             for line in custody_content.lines().filter(|line| !line.trim().is_empty()) {
                 let entry: CustodyEntry = serde_json::from_str(line)?;
@@ -227,18 +229,25 @@ impl EvidenceVerifier {
                     if !entry.previous_entry_hash.is_empty() {
                         return Err(VerifierError::BrokenCustodyChain { step: 0 });
                     }
-                } else if entry.previous_entry_hash != previous_hash {
+                } else {
+                    if entry.previous_entry_hash != previous_hash
+                        || entry.timestamp_secs < previous_timestamp
+                    {
+                        return Err(VerifierError::BrokenCustodyChain {
+                            step: entry.step_index,
+                        });
+                    }
+                }
+
+                if entry.compute_hash() != entry.entry_hash
+                    || !seen_hashes.insert(entry.entry_hash.clone())
+                {
                     return Err(VerifierError::BrokenCustodyChain {
                         step: entry.step_index,
                     });
                 }
 
-                if entry.compute_hash() != entry.entry_hash {
-                    return Err(VerifierError::BrokenCustodyChain {
-                        step: entry.step_index,
-                    });
-                }
-
+                previous_timestamp = entry.timestamp_secs;
                 previous_hash = entry.entry_hash;
                 expected_step = expected_step
                     .checked_add(1)
@@ -428,4 +437,43 @@ mod verifier_regressions {
             })
         ));
     }
+
+    #[test]
+    fn custody_rejects_time_regression_and_duplicate_hashes() {
+        let dir = tempdir().unwrap();
+        let package = dir.path().join("pkg");
+        let mut builder = EvidencePackageBuilder::new(manifest());
+
+        let mut first = CustodyEntry {
+            step_index: 0,
+            timestamp_secs: 20,
+            action: CustodyAction::Coleta,
+            operator_principal: "a".into(),
+            terminal_or_node: "node-a".into(),
+            previous_entry_hash: String::new(),
+            entry_hash: String::new(),
+        };
+        first.entry_hash = first.compute_hash();
+
+        let mut second = CustodyEntry {
+            step_index: 1,
+            timestamp_secs: 19,
+            action: CustodyAction::Guarda,
+            operator_principal: "b".into(),
+            terminal_or_node: "node-b".into(),
+            previous_entry_hash: first.entry_hash.clone(),
+            entry_hash: String::new(),
+        };
+        second.entry_hash = second.compute_hash();
+
+        builder.add_custody_entry(first);
+        builder.add_custody_entry(second);
+        builder.build(&package).unwrap();
+
+        assert!(matches!(
+            EvidenceVerifier::new(&package).verify(),
+            Err(VerifierError::BrokenCustodyChain { step: 1 })
+        ));
+    }
+
 }
