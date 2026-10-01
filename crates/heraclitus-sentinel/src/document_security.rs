@@ -307,8 +307,7 @@ impl<C: SemanticInjectionClassifier> DocumentFirewall<C> {
 
         let mut findings = Vec::new();
 
-        for (index, span) in spans.iter().enumerate() {
-            let loc = bbox_milli(span.bbox);
+        for span in spans {
             let normalized_span = normalize_text(&span.text);
             let lower = normalized_span.to_lowercase();
 
@@ -319,13 +318,11 @@ impl<C: SemanticInjectionClassifier> DocumentFirewall<C> {
                     FindingCategory::VisualSteganography,
                     FindingSeverity::Critical,
                     span,
-                    loc,
                     format!(
                         "fg={} bg={} font={}pt",
                         span.foreground, span.background, span.font_size_pt
                     ),
                     "Machine-readable text is visually concealed by color or micro-font.",
-                    "HIGH",
                 );
             }
             if span.opacity < 0.08 {
@@ -335,10 +332,8 @@ impl<C: SemanticInjectionClassifier> DocumentFirewall<C> {
                     FindingCategory::LowOpacity,
                     FindingSeverity::High,
                     span,
-                    loc,
                     format!("opacity={:.4}", span.opacity),
                     "Text is effectively transparent to a human reader.",
-                    "HIGH",
                 );
             }
             if span.clipped
@@ -352,10 +347,8 @@ impl<C: SemanticInjectionClassifier> DocumentFirewall<C> {
                     FindingCategory::OffPageOrClipped,
                     FindingSeverity::High,
                     span,
-                    loc,
                     "clipped/off-page/behind-image/tiny-transform".to_owned(),
                     "Text exists in the document structure but is suppressed geometrically.",
-                    "HIGH",
                 );
             }
 
@@ -371,10 +364,8 @@ impl<C: SemanticInjectionClassifier> DocumentFirewall<C> {
                     FindingCategory::UnicodeSteganography,
                     FindingSeverity::High,
                     span,
-                    loc,
                     format!("{invisible_unicode} invisible/bidi Unicode code points"),
                     "Invisible Unicode can fragment instructions and bypass naive filters.",
-                    "HIGH",
                 );
             }
             if looks_fragmented(&span.text) {
@@ -384,10 +375,8 @@ impl<C: SemanticInjectionClassifier> DocumentFirewall<C> {
                     FindingCategory::TokenFragmentation,
                     FindingSeverity::Medium,
                     span,
-                    loc,
                     preview(&span.text),
                     "Artificial character-level fragmentation can evade signature matching.",
-                    "MEDIUM",
                 );
             }
 
@@ -430,10 +419,8 @@ impl<C: SemanticInjectionClassifier> DocumentFirewall<C> {
                     category,
                     FindingSeverity::Critical,
                     span,
-                    loc,
                     preview(&span.text),
                     "Document content attempts to assert instruction authority over an AI system.",
-                    "HIGH",
                 );
             }
             if tool_directive {
@@ -443,15 +430,12 @@ impl<C: SemanticInjectionClassifier> DocumentFirewall<C> {
                     FindingCategory::ToolAbuse,
                     FindingSeverity::Critical,
                     span,
-                    loc,
                     preview(&span.text),
                     "Document content attempts to cause a tool call, mutation or exfiltration.",
-                    "HIGH",
                 );
             }
 
-            let _ = index; // keeps finding order tied to parser order without exposing parser internals.
-        }
+         }
 
         let semantic = self.semantic.classify(&normalized_text);
         if semantic.malicious_instruction || semantic.tool_coercion {
@@ -582,18 +566,21 @@ fn push_finding(
     category: FindingCategory,
     severity: FindingSeverity,
     span: &DocumentSpan,
-    bbox: [i64; 4],
     evidence: String,
     explanation: &str,
-    confidence: &str,
 ) {
+    let confidence = match severity {
+        FindingSeverity::Low => "LOW",
+        FindingSeverity::Medium => "MEDIUM",
+        FindingSeverity::High | FindingSeverity::Critical => "HIGH",
+    };
     out.push(DocumentFinding {
         finding_id: next_id(out.len()),
         rule_id: rule.to_owned(),
         category,
         severity,
         page: span.page,
-        bbox_milli: bbox,
+        bbox_milli: bbox_milli(span.bbox),
         region: span.region,
         evidence,
         explanation: explanation.to_owned(),
