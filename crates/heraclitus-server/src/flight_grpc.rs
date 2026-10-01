@@ -27,12 +27,12 @@ use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
-pub struct HeraclitusFlight {
+struct HeraclitusFlight {
     log: Arc<dyn EpisodeLog>,
 }
 
 impl HeraclitusFlight {
-    pub fn new<L: EpisodeLog + 'static>(log: Arc<L>) -> Self {
+    fn new<L: EpisodeLog + 'static>(log: Arc<L>) -> Self {
         Self { log }
     }
 
