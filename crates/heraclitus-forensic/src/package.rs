@@ -117,6 +117,46 @@ impl EvidencePackageBuilder {
 
         let proofs_dir = root.join("proofs");
         fs::create_dir_all(&proofs_dir)?;
+
+        self.manifest.merkle.origin_roots.clear();
+        if !self.proofs.is_null()
+            && !self
+                .proofs
+                .as_object()
+                .map(|object| object.is_empty())
+                .unwrap_or(false)
+        {
+            let document: crate::verifier::HrklProofDocument =
+                serde_json::from_value(self.proofs.clone())?;
+            let mut roots = std::collections::HashSet::new();
+            for proof in document.proofs {
+                roots.insert(crate::manifest::HrklRootCommitment {
+                    segment_id: proof.segment_id,
+                    generation: proof.generation,
+                    format_version: proof.format_version,
+                    logical_root_hex: proof.logical_root_hex,
+                    leaf_count: proof.leaf_count,
+                });
+            }
+            self.manifest.merkle.origin_roots = roots.into_iter().collect();
+            self.manifest.merkle.origin_roots.sort_by(|a, b| {
+                (
+                    a.segment_id,
+                    a.generation,
+                    a.format_version,
+                    &a.logical_root_hex,
+                    a.leaf_count,
+                )
+                    .cmp(&(
+                        b.segment_id,
+                        b.generation,
+                        b.format_version,
+                        &b.logical_root_hex,
+                        b.leaf_count,
+                    ))
+            });
+        }
+
         let proofs_json = serde_json::to_string_pretty(&self.proofs)?;
         let mut proofs_hasher = Sha256::new();
         proofs_hasher.update(proofs_json.as_bytes());
