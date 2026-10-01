@@ -997,7 +997,29 @@ mod verifier_regressions {
         let package = dir.path().join("pkg");
         let mut builder = EvidencePackageBuilder::new(manifest());
         builder.build(&package).unwrap();
-        fs::write(package.join("proofs/merkle.json"), b"not-json").unwrap();
+
+        // Mantém o compromisso do manifesto coerente com os bytes adulterados
+        // para exercitar especificamente o parser. A proteção contra digest
+        // divergente é coberta por tampered_proof_document_is_rejected_by_manifest_digest.
+        let invalid_proof = b"not-json";
+        fs::write(package.join("proofs/merkle.json"), invalid_proof).unwrap();
+
+        let manifest_path = package.join("manifest.json");
+        let mut evidence_manifest: EvidenceManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        let mut proof_hasher = Sha256::new();
+        proof_hasher.update(invalid_proof);
+        evidence_manifest.merkle.proofs_sha256 = hex::encode(proof_hasher.finalize());
+
+        let manifest_json = serde_json::to_string_pretty(&evidence_manifest).unwrap();
+        fs::write(&manifest_path, manifest_json.as_bytes()).unwrap();
+        let mut manifest_hasher = Sha256::new();
+        manifest_hasher.update(manifest_json.as_bytes());
+        fs::write(
+            package.join("manifest.sha256"),
+            format!("{}  manifest.json\n", hex::encode(manifest_hasher.finalize())),
+        )
+        .unwrap();
 
         assert!(matches!(
             EvidenceVerifier::new(&package).verify(),
