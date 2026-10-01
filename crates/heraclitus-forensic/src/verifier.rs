@@ -1,4 +1,5 @@
 use crate::manifest::{CustodyEntry, EvidenceManifest};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,6 +10,73 @@ const MAX_CUSTODY_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PROOF_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_OBJECTS: usize = 100_000;
 const MAX_TOTAL_OBJECT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+
+const HRKL_DOMAIN_LEAF: &[u8] = b"HRKL6:MERKLE:LEAF";
+const HRKL_DOMAIN_NODE: &[u8] = b"HRKL6:MERKLE:NODE";
+const HRKL_DOMAIN_ROOT: &[u8] = b"HRKL6:MERKLE:ROOT";
+
+/// Estado individual de uma verificação forense (SPEC-0087 §11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationState {
+    Pass,
+    NotPresent,
+    Unverified,
+    Invalid,
+}
+
+/// Resultado técnico agregado. Ausência de confiança externa produz Partial,
+/// nunca Verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverallTechnical {
+    Verified,
+    Partial,
+    Failed,
+}
+
+/// Relatório estruturado para não confundir "manifesto parseou" com prova
+/// institucional completa.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationReport {
+    pub package_structure: VerificationState,
+    pub object_digests: VerificationState,
+    pub custody_chain: VerificationState,
+    pub merkle_proof: VerificationState,
+    pub timestamp: VerificationState,
+    pub signature: VerificationState,
+    pub certificate_chain: VerificationState,
+    pub overall_technical: OverallTechnical,
+    pub notes: Vec<String>,
+}
+
+/// Formato offline da prova de origem HRKL v6 carregada em proofs/merkle.json.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HrklProofDocument {
+    pub schema_version: String,
+    pub proofs: Vec<HrklObjectProof>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HrklObjectProof {
+    pub object_id: String,
+    pub source_lsn: u64,
+    pub segment_id: u64,
+    pub generation: u64,
+    pub format_version: u16,
+    pub canonical_record_hash_hex: String,
+    pub logical_root_hex: String,
+    pub leaf_index: u64,
+    pub leaf_count: u64,
+    pub path: Vec<HrklProofStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HrklProofStep {
+    pub sibling_hex: String,
+    pub sibling_is_left: bool,
+}
 
 #[derive(Debug, Error)]
 pub enum VerifierError {
@@ -38,6 +106,8 @@ pub enum VerifierError {
     MerkleRootMismatch { expected: String, actual: String },
     #[error("Invalid leaves_count: expected {expected}, got {actual}")]
     LeavesCountMismatch { expected: u64, actual: u64 },
+    #[error("Invalid HRKL Merkle proof: {0}")]
+    InvalidMerkleProof(String),
     #[error("Unsupported evidence schema version: {0}")]
     UnsupportedSchema(String),
     #[error("Missing file: {0}")]
@@ -48,6 +118,109 @@ pub enum VerifierError {
     BudgetExceeded(String),
     #[error("External trust material is present but not cryptographically verified: {kind} ({count})")]
     ExternalTrustUnverified { kind: &'static str, count: usize },
+}
+
+fn decode_hex32(label: &str, value: &str) -> Result<[u8; 32], VerifierError> {
+    let bytes = hex::decode(value)
+        .map_err(|error| VerifierError::InvalidMerkleProof(format!("{label}: hex inválido: {error}")))?;
+    bytes.try_into().map_err(|_| {
+        VerifierError::InvalidMerkleProof(format!(
+            "{label}: esperado digest de 32 bytes, recebido {}",
+            bytes.len()
+        ))
+    })
+}
+
+fn hrkl_leaf(record_hash: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(HRKL_DOMAIN_LEAF);
+    hasher.update(record_hash);
+    *hasher.finalize().as_bytes()
+}
+
+fn hrkl_node(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(HRKL_DOMAIN_NODE);
+    hasher.update(left);
+    hasher.update(right);
+    *hasher.finalize().as_bytes()
+}
+
+fn hrkl_seal_root(leaf_count: u64, accumulator: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(HRKL_DOMAIN_ROOT);
+    hasher.update(&leaf_count.to_le_bytes());
+    hasher.update(accumulator);
+    *hasher.finalize().as_bytes()
+}
+
+fn verify_hrkl_object_proof(proof: &HrklObjectProof) -> Result<(), VerifierError> {
+    if proof.format_version != 6 {
+        return Err(VerifierError::InvalidMerkleProof(format!(
+            "objeto {} declara HRKL v{}, esperado v6",
+            proof.object_id, proof.format_version
+        )));
+    }
+    if proof.leaf_count == 0 || proof.leaf_index >= proof.leaf_count {
+        return Err(VerifierError::InvalidMerkleProof(format!(
+            "objeto {} tem leaf_index/count inválidos: {}/{}",
+            proof.object_id, proof.leaf_index, proof.leaf_count
+        )));
+    }
+
+    // Valida a geometria do caminho, incluindo a promoção de folha ímpar. Isso
+    // impede uma lista arbitrária de irmãos que por acaso fecha contra uma raiz.
+    let mut index = proof.leaf_index;
+    let mut width = proof.leaf_count;
+    let mut expected_sides = Vec::new();
+    while width > 1 {
+        let sibling = if index % 2 == 0 {
+            index.checked_add(1).filter(|s| *s < width)
+        } else {
+            Some(index - 1)
+        };
+        if let Some(sibling_index) = sibling {
+            expected_sides.push(sibling_index < index);
+        }
+        index /= 2;
+        width = width.div_ceil(2);
+    }
+    if expected_sides.len() != proof.path.len() {
+        return Err(VerifierError::InvalidMerkleProof(format!(
+            "objeto {} tem {} passos, geometria exige {}",
+            proof.object_id,
+            proof.path.len(),
+            expected_sides.len()
+        )));
+    }
+    for (step, expected_left) in proof.path.iter().zip(expected_sides) {
+        if step.sibling_is_left != expected_left {
+            return Err(VerifierError::InvalidMerkleProof(format!(
+                "objeto {} tem lado de sibling incompatível com leaf_index",
+                proof.object_id
+            )));
+        }
+    }
+
+    let record_hash = decode_hex32("canonical_record_hash", &proof.canonical_record_hash_hex)?;
+    let expected_root = decode_hex32("logical_root", &proof.logical_root_hex)?;
+    let mut acc = hrkl_leaf(&record_hash);
+    for step in &proof.path {
+        let sibling = decode_hex32("sibling", &step.sibling_hex)?;
+        acc = if step.sibling_is_left {
+            hrkl_node(&sibling, &acc)
+        } else {
+            hrkl_node(&acc, &sibling)
+        };
+    }
+    let actual_root = hrkl_seal_root(proof.leaf_count, &acc);
+    if actual_root != expected_root {
+        return Err(VerifierError::InvalidMerkleProof(format!(
+            "objeto {} não fecha contra logical_root",
+            proof.object_id
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_safe_relative_path(path_str: &str) -> bool {
@@ -104,6 +277,123 @@ impl EvidenceVerifier {
             return Err(VerifierError::PathTraversal(relative.to_string()));
         }
         Ok(path)
+    }
+
+    /// Relatório estruturado, separado do contrato legado de `verify()`.
+    ///
+    /// O relatório não promove ausência de confiança externa a PASS. Um pacote
+    /// estruturalmente íntegro mas sem timestamp/assinatura verificáveis é
+    /// `Partial`, como exige a SPEC-0087.
+    pub fn verify_report(&self) -> VerificationReport {
+        let mut report = VerificationReport {
+            package_structure: VerificationState::Pass,
+            object_digests: VerificationState::Pass,
+            custody_chain: VerificationState::Pass,
+            merkle_proof: VerificationState::NotPresent,
+            timestamp: VerificationState::NotPresent,
+            signature: VerificationState::NotPresent,
+            certificate_chain: VerificationState::NotPresent,
+            overall_technical: OverallTechnical::Partial,
+            notes: Vec::new(),
+        };
+
+        let manifest = match self.verify() {
+            Ok(manifest) => manifest,
+            Err(VerifierError::ExternalTrustUnverified { kind, count }) => {
+                // Todos os checks anteriores já passaram. Recarrega apenas o
+                // manifesto para distinguir assinatura de timestamp.
+                match self
+                    .checked_file("manifest.json", MAX_MANIFEST_BYTES)
+                    .and_then(|path| fs::read(path).map_err(VerifierError::Io))
+                    .and_then(|bytes| serde_json::from_slice::<EvidenceManifest>(&bytes).map_err(VerifierError::Json))
+                {
+                    Ok(manifest) => {
+                        report.notes.push(format!(
+                            "{kind}: {count} item(ns) presentes sem verificador de confiança"
+                        ));
+                        manifest
+                    }
+                    Err(error) => {
+                        report.package_structure = VerificationState::Invalid;
+                        report.overall_technical = OverallTechnical::Failed;
+                        report.notes.push(error.to_string());
+                        return report;
+                    }
+                }
+            }
+            Err(error) => {
+                match &error {
+                    VerifierError::ObjectChecksumMismatch { .. }
+                    | VerifierError::ObjectSizeMismatch { .. } => {
+                        report.object_digests = VerificationState::Invalid;
+                    }
+                    VerifierError::BrokenCustodyChain { .. }
+                    | VerifierError::CustodyDigestMismatch { .. } => {
+                        report.custody_chain = VerificationState::Invalid;
+                    }
+                    VerifierError::MerkleRootMismatch { .. }
+                    | VerifierError::LeavesCountMismatch { .. }
+                    | VerifierError::InvalidMerkleProof(_) => {
+                        report.merkle_proof = VerificationState::Invalid;
+                    }
+                    _ => {
+                        report.package_structure = VerificationState::Invalid;
+                    }
+                }
+                report.overall_technical = OverallTechnical::Failed;
+                report.notes.push(error.to_string());
+                return report;
+            }
+        };
+
+        let proofs = self
+            .checked_file("proofs/merkle.json", MAX_PROOF_BYTES)
+            .and_then(|path| fs::read(path).map_err(VerifierError::Io))
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).map_err(VerifierError::Json));
+        if let Ok(value) = proofs {
+            let absent = value.is_null()
+                || value.as_object().map(|object| object.is_empty()).unwrap_or(false);
+            report.merkle_proof = if absent {
+                VerificationState::NotPresent
+            } else {
+                VerificationState::Pass
+            };
+        }
+
+        if !manifest.trusted_timestamps.is_empty() {
+            report.timestamp = VerificationState::Unverified;
+            report.certificate_chain = VerificationState::Unverified;
+        }
+        if !manifest.signatures.is_empty() {
+            report.signature = VerificationState::Unverified;
+            report.certificate_chain = VerificationState::Unverified;
+        }
+
+        let required_integrity_passed = matches!(
+            (
+                report.package_structure,
+                report.object_digests,
+                report.custody_chain
+            ),
+            (
+                VerificationState::Pass,
+                VerificationState::Pass,
+                VerificationState::Pass
+            )
+        );
+        let origin_and_trust_complete = report.merkle_proof == VerificationState::Pass
+            && report.timestamp == VerificationState::Pass
+            && report.signature == VerificationState::Pass
+            && report.certificate_chain == VerificationState::Pass;
+
+        report.overall_technical = if !required_integrity_passed {
+            OverallTechnical::Failed
+        } else if origin_and_trust_complete {
+            OverallTechnical::Verified
+        } else {
+            OverallTechnical::Partial
+        };
+        report
     }
 
     pub fn verify(&self) -> Result<EvidenceManifest, VerifierError> {
@@ -255,11 +545,72 @@ impl EvidenceVerifier {
             }
         }
 
-        // O ficheiro de provas é parte estrutural do pacote. Mesmo antes de um
-        // verificador HRKL completo, bytes arbitrários não podem ser ignorados.
+        // Provas de origem HRKL: JSON válido não basta. Quando presentes, as
+        // provas têm de fechar contra a raiz declarada, respeitar a geometria
+        // HRKL v6 e referenciar exatamente o objeto/LSN do manifesto.
         let proofs_path = self.checked_file("proofs/merkle.json", MAX_PROOF_BYTES)?;
         let proofs_bytes = fs::read(&proofs_path)?;
-        let _proofs: serde_json::Value = serde_json::from_slice(&proofs_bytes)?;
+        let proof_value: serde_json::Value = serde_json::from_slice(&proofs_bytes)?;
+        let proof_is_absent = proof_value.is_null()
+            || proof_value
+                .as_object()
+                .map(|object| object.is_empty())
+                .unwrap_or(false);
+
+        if !proof_is_absent {
+            let document: HrklProofDocument = serde_json::from_value(proof_value)?;
+            if document.schema_version != "hrkl6-inclusion-v1" {
+                return Err(VerifierError::InvalidMerkleProof(format!(
+                    "schema de prova não suportado: {}",
+                    document.schema_version
+                )));
+            }
+            if document.proofs.is_empty() {
+                return Err(VerifierError::InvalidMerkleProof(
+                    "documento de provas não pode estar vazio".into(),
+                ));
+            }
+
+            let objects_by_id: std::collections::HashMap<_, _> = manifest
+                .objects
+                .iter()
+                .map(|object| (object.object_id.as_str(), object))
+                .collect();
+            let mut proven_objects = std::collections::HashSet::new();
+            for proof in &document.proofs {
+                let object = objects_by_id.get(proof.object_id.as_str()).ok_or_else(|| {
+                    VerifierError::InvalidMerkleProof(format!(
+                        "prova referencia objeto inexistente: {}",
+                        proof.object_id
+                    ))
+                })?;
+                if object.source_lsn != Some(proof.source_lsn) {
+                    return Err(VerifierError::InvalidMerkleProof(format!(
+                        "objeto {}: LSN do manifesto {:?} diverge da prova {}",
+                        proof.object_id, object.source_lsn, proof.source_lsn
+                    )));
+                }
+                if !proven_objects.insert(proof.object_id.as_str()) {
+                    return Err(VerifierError::InvalidMerkleProof(format!(
+                        "objeto {} possui prova duplicada",
+                        proof.object_id
+                    )));
+                }
+                verify_hrkl_object_proof(proof)?;
+            }
+
+            let expected: std::collections::HashSet<_> = manifest
+                .objects
+                .iter()
+                .filter(|object| object.source_lsn.is_some())
+                .map(|object| object.object_id.as_str())
+                .collect();
+            if proven_objects != expected {
+                return Err(VerifierError::InvalidMerkleProof(
+                    "documento de provas não cobre exatamente os objetos com source_lsn".into(),
+                ));
+            }
+        }
 
         if !manifest.objects.is_empty() {
             let mut blake3_hasher = blake3::Hasher::new();
@@ -473,6 +824,87 @@ mod verifier_regressions {
         assert!(matches!(
             EvidenceVerifier::new(&package).verify(),
             Err(VerifierError::BrokenCustodyChain { step: 1 })
+        ));
+    }
+
+
+    #[test]
+    fn valid_single_leaf_hrkl_proof_is_accepted_and_reported() {
+        let dir = tempdir().unwrap();
+        let package = dir.path().join("pkg");
+        let mut m = manifest();
+
+        let data = b"evidence";
+        let mut sha = Sha256::new();
+        sha.update(data);
+        let object = crate::manifest::EvidenceObject {
+            object_id: "obj-1".into(),
+            relative_path: "evidence/obj-1.bin".into(),
+            size_bytes: data.len() as u64,
+            sha256_hex: hex::encode(sha.finalize()),
+            blake3_hex: blake3::hash(data).to_hex().to_string(),
+            content_type: "application/octet-stream".into(),
+            source_lsn: Some(7),
+        };
+        m.objects.push(object.clone());
+
+        // O compromisso de objetos do schema 1.0 continua independente da
+        // prova HRKL de origem.
+        let mut b3 = blake3::Hasher::new();
+        b3.update(object.blake3_hex.as_bytes());
+        m.merkle.root_blake3 = b3.finalize().to_hex().to_string();
+        let mut s256 = Sha256::new();
+        s256.update(object.sha256_hex.as_bytes());
+        m.merkle.root_sha256 = hex::encode(s256.finalize());
+        m.merkle.leaves_count = 1;
+
+        let record_hash = [0x42u8; 32];
+        let root = hrkl_seal_root(1, &hrkl_leaf(&record_hash));
+        let proof = HrklProofDocument {
+            schema_version: "hrkl6-inclusion-v1".into(),
+            proofs: vec![HrklObjectProof {
+                object_id: "obj-1".into(),
+                source_lsn: 7,
+                segment_id: 3,
+                generation: 1,
+                format_version: 6,
+                canonical_record_hash_hex: hex::encode(record_hash),
+                logical_root_hex: hex::encode(root),
+                leaf_index: 0,
+                leaf_count: 1,
+                path: vec![],
+            }],
+        };
+
+        let mut builder = EvidencePackageBuilder::new(m);
+        builder.add_object_data(object, data.to_vec());
+        builder.set_proofs(serde_json::to_value(proof).unwrap());
+        builder.build(&package).unwrap();
+
+        let verifier = EvidenceVerifier::new(&package);
+        assert!(verifier.verify().is_ok());
+        let report = verifier.verify_report();
+        assert_eq!(report.merkle_proof, VerificationState::Pass);
+        assert_eq!(report.overall_technical, OverallTechnical::Partial);
+    }
+
+    #[test]
+    fn hrkl_proof_with_wrong_geometry_is_rejected() {
+        let proof = HrklObjectProof {
+            object_id: "obj".into(),
+            source_lsn: 1,
+            segment_id: 1,
+            generation: 1,
+            format_version: 6,
+            canonical_record_hash_hex: hex::encode([1u8; 32]),
+            logical_root_hex: hex::encode([2u8; 32]),
+            leaf_index: 0,
+            leaf_count: 2,
+            path: vec![],
+        };
+        assert!(matches!(
+            verify_hrkl_object_proof(&proof),
+            Err(VerifierError::InvalidMerkleProof(_))
         ));
     }
 
