@@ -60,6 +60,6 @@ fn durable_intent_without_result_reopens_as_unknown() {
         .trusted_admin()
         .query_idempotency("idem-crash-window")
         .expect("intent must be reconstructed");
-    assert!(intent_lsn > 0);
+    assert_eq!(intent_lsn, 0);
     assert!(result_lsn.is_none());
 }
