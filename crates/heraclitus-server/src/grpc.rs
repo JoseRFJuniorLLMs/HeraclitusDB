@@ -318,6 +318,16 @@ impl pb::heraclitus_server::Heraclitus for Service {
         let sentinel = self.sentinel.clone();
         let operation = r.op.clone();
         let audit_principal = principal.name.clone();
+        let admin_roles = principal
+            .roles
+            .iter()
+            .map(|role| format!("{role:?}").to_ascii_lowercase())
+            .collect();
+        let admin_ctx = crate::trusted_admin::AdminContext::new(
+            principal.name.clone(),
+            "default",
+            admin_roles,
+        );
         let (ok, message) = tokio::task::spawn_blocking(move || {
             let result = match r.op.as_str() {
                 "stats" => (true, engine.stats().to_string()),
@@ -328,8 +338,9 @@ impl pb::heraclitus_server::Heraclitus for Service {
                 // `ensure_crypto_shred_allowed` do `crypto_shred` bloqueia — mas
                 // nada em produção podia CRIAR um hold, portanto §94 era uma
                 // garantia que só os testes conseguiam exercer.
-                op @ ("legal-hold-place" | "legal-hold-release" | "legal-holds") => {
-                    crate::grpc::legal_hold_op(&engine, op, &r.arg)
+                "legal-holds" => crate::grpc::legal_hold_op(&engine, "legal-holds", &r.arg),
+                op @ ("legal-hold-place" | "legal-hold-release") => {
+                    crate::grpc::trusted_legal_hold_op(&engine, &admin_ctx, op, &r.arg)
                 }
                 op @ ("regulatory-policy-activate"
                 | "regulatory-evaluate"
@@ -467,7 +478,8 @@ impl pb::heraclitus_server::Heraclitus for Service {
                 }
                 op if op.starts_with("shred:") => {
                     let agent = op.strip_prefix("shred:").unwrap_or("");
-                    match engine.shred(agent) {
+                    let idempotency_key = format!("{}:shred", admin_ctx.request_id);
+                    match engine.shred_as(&admin_ctx, agent, &idempotency_key) {
                         Ok(true) => (
                             true,
                             format!("crypto-shred: key destroyed for agent '{agent}'"),
@@ -497,6 +509,64 @@ impl pb::heraclitus_server::Heraclitus for Service {
 /// diz a verdade.
 ///
 /// Devolve `(ok, mensagem)` como o resto do `admin`.
+pub(crate) fn trusted_legal_hold_op(
+    engine: &std::sync::Arc<crate::engine::Engine>,
+    ctx: &crate::trusted_admin::AdminContext,
+    op: &str,
+    arg: &str,
+) -> (bool, String) {
+    let body = match serde_json::from_str::<serde_json::Value>(arg) {
+        Ok(value) => value,
+        Err(error) => return (false, format!("corpo inválido: {error}")),
+    };
+    let hold_id = match body.get("hold_id").and_then(serde_json::Value::as_str) {
+        Some(value) if !value.trim().is_empty() => value.to_string(),
+        _ => return (false, "hold_id obrigatório".into()),
+    };
+    let reason = body
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    let kind = match op {
+        "legal-hold-place" => crate::trusted_admin::AdminOperationKind::LegalHoldCreate {
+            hold_id: hold_id.clone(),
+            reason: reason.clone(),
+        },
+        "legal-hold-release" => crate::trusted_admin::AdminOperationKind::LegalHoldRelease {
+            hold_id: hold_id.clone(),
+            reason: reason.clone(),
+        },
+        _ => return (false, format!("operação de legal hold inválida: {op}")),
+    };
+
+    let idempotency_key = format!("{}:{op}:{hold_id}", ctx.request_id);
+    let mut admin_op = crate::trusted_admin::AdminOperation::new(
+        format!("{op}:{hold_id}"),
+        idempotency_key,
+        kind,
+        reason,
+    );
+    admin_op.parameters_digest = blake3::hash(arg.as_bytes()).to_hex().to_string();
+
+    match engine.execute_trusted_admin(ctx, &admin_op, |_token| {
+        let result = legal_hold_op(engine, op, arg);
+        if !result.0 {
+            return Err(crate::trusted_admin::AdminError::ExecutionFailed(result.1));
+        }
+        let post = blake3::hash(result.1.as_bytes()).to_hex().to_string();
+        let mut receipts = std::collections::BTreeMap::new();
+        receipts.insert("legal_hold".into(), result.1.clone());
+        Ok((result, post, receipts))
+    }) {
+        Ok(outcome) => outcome.value,
+        Err(error) => (false, error.to_string()),
+    }
+}
+
+/// Efeito de baixo nível do Legal Hold. As superfícies remotas mutáveis devem
+/// chamar `trusted_legal_hold_op`, que persiste a intenção antes deste efeito.
 pub(crate) fn legal_hold_op(
     engine: &std::sync::Arc<crate::engine::Engine>,
     op: &str,
