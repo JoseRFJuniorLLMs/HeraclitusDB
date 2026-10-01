@@ -64,6 +64,7 @@ Esses documentos não significam que todos os seus itens estejam implementados. 
 
 ### Fase D — retenção forte
 1. SPEC-0091;
+- **SPEC-0092** — Document & LLM Injection Firewall: differential humano×máquina, quarantine, eventos Sentinel e autoridade DATA_ONLY. Core de biblioteca implementado; adapters reais de PDF e qualificação institucional pendentes.
 2. modelar cold locations no HRKM;
 3. backend immutable;
 4. receipts;

@@ -22,6 +22,7 @@ pub mod config;
 pub mod correlation;
 pub mod cursor;
 pub mod detection;
+pub mod document_security;
 pub mod error;
 pub mod event;
 pub mod execution;
@@ -60,6 +61,12 @@ pub use correlation::{
 };
 pub use cursor::SentinelCursor;
 pub use detection::{DetectionExpr, DetectionRule, Field, RuleCompileError, RuleEngine, Value};
+pub use document_security::{
+    AuthorityLabel, DocumentAnalysis, DocumentFinding, DocumentFirewall, DocumentLayers,
+    DocumentSecurityEvent, DocumentSourceRegion, DocumentSpan, DocumentVerdict,
+    FindingCategory, FindingSeverity, LexicalSemanticClassifier, ReaderPayload,
+    SemanticAssessment, SemanticInjectionClassifier, TrustLabel,
+};
 pub use error::SentinelError;
 pub use event::{
     DetectorIdentity, EntityRef, EvidenceRef, NetworkEndpoint, Outcome, SecurityCategory,

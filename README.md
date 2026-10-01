@@ -213,6 +213,12 @@ L6  execução governada
 
 Threat Intelligence, TAXII/MISP e outros componentes possuem diferentes graus de implementação e integração. O STATUS.md deve ser consultado antes de qualquer claim de produção.
 
+## Document & LLM Injection Firewall
+
+O Sentinel inclui a base da **SPEC-0092** para tratar documentos destinados a IA como entrada não confiável. O núcleo calcula a diferença entre o que um humano vê e o que o parser entrega à máquina, detecta ocultação/obfuscação/instruções dirigidas a modelos, produz achados explicáveis e gera um payload sanitizado com `authority=DATA_ONLY` e `tools_allowed=false`.
+
+Isso não substitui o Agent Policy Gateway: mesmo um detector que falhe não deve permitir que texto vindo de PDF adquira autoridade para executar ferramentas ou alterar sistemas protegidos.
+
 ## Agent Evidence & Gateway
 
 O projeto inclui:
@@ -243,6 +249,7 @@ As SPECs 0086–0091 reorganizam a evolução do projeto em torno de confiança 
 | **SPEC-0089** | protocolo administrativo fail-closed com Durable Intent | **P0 / Blocker** |
 | **SPEC-0090** | PostgreSQL wire, Flight e interoperabilidade aberta | Proposed |
 | **SPEC-0091** | WORM, retenção externa e Legal Hold reforçado | Proposed |
+| **SPEC-0092** | firewall documental contra prompt injection, visão humano×máquina e autoridade DATA_ONLY | **Core implemented / integration pending** |
 
 Veja o roadmap consolidado em:
 
