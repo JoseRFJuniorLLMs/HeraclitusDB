@@ -117,10 +117,11 @@ impl EvidencePackageBuilder {
 
         let proofs_dir = root.join("proofs");
         fs::create_dir_all(&proofs_dir)?;
-        fs::write(
-            proofs_dir.join("merkle.json"),
-            serde_json::to_string_pretty(&self.proofs)?
-        )?;
+        let proofs_json = serde_json::to_string_pretty(&self.proofs)?;
+        let mut proofs_hasher = Sha256::new();
+        proofs_hasher.update(proofs_json.as_bytes());
+        self.manifest.merkle.proofs_sha256 = hex::encode(proofs_hasher.finalize());
+        fs::write(proofs_dir.join("merkle.json"), proofs_json.as_bytes())?;
 
         let manifest_json = serde_json::to_string_pretty(&self.manifest)?;
         let manifest_path = root.join("manifest.json");
