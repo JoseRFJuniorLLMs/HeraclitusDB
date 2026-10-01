@@ -358,7 +358,7 @@ pub trait KeyProvider: Send + Sync {
     fn provider_id(&self) -> &str;
     fn capabilities(&self) -> KeyCapabilities;
     fn generate_data_key(&self, tenant: &TenantId) -> Result<(KeyRef, [u8; 32]), String>;
-    fn wrap_data_key(&self, tenant: &TenantId, data_key: &[u8; 32]) -> Result<WrappedDataKey, String>;
+    fn wrap_data_key(&self, key_ref: &KeyRef, data_key: &[u8; 32]) -> Result<WrappedDataKey, String>;
     fn unwrap_data_key(&self, key: &WrappedDataKey) -> Result<[u8; 32], String>;
     fn rotate(&self, tenant: &TenantId) -> Result<KeyRef, String>;
     fn destroy(&self, key: &KeyRef) -> Result<DestroyReceipt, String>;
@@ -446,10 +446,29 @@ impl KeyProvider for SoftwareKeyProvider {
 
     fn wrap_data_key(
         &self,
-        tenant: &TenantId,
+        key_ref: &KeyRef,
         data_key: &[u8; 32],
     ) -> Result<WrappedDataKey, String> {
-        let (key_ref, master) = self.current_master_key(tenant);
+        if key_ref.key_id != Self::key_id(&key_ref.tenant, key_ref.epoch) {
+            return Err("KeyRef inconsistente: key_id não corresponde ao tenant/epoch".into());
+        }
+        let master = self
+            .state
+            .lock()
+            .unwrap()
+            .master_keys
+            .get(&(
+                key_ref.tenant.clone(),
+                key_ref.key_id.clone(),
+                key_ref.epoch,
+            ))
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "Chave mestre {} época {} não encontrada (destruída ou inexistente)",
+                    key_ref.key_id, key_ref.epoch
+                )
+            })?;
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&master));
         let mut nonce = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce);
@@ -475,7 +494,7 @@ impl KeyProvider for SoftwareKeyProvider {
         wrapped.extend_from_slice(&ct);
 
         Ok(WrappedDataKey {
-            key_ref,
+            key_ref: key_ref.clone(),
             wrapped_ciphertext: wrapped,
             wrapping_algorithm: "ChaCha20-Poly1305".into(),
             created_at_secs: SystemTime::now()
@@ -667,10 +686,10 @@ mod tests {
         let provider = SoftwareKeyProvider::new();
         let tenant = TenantId::new("tenant-shred".to_string()).unwrap();
 
-        let (_kref, data_key) = provider.generate_data_key(&tenant).unwrap();
+        let (kref, data_key) = provider.generate_data_key(&tenant).unwrap();
 
-        // Encapsula chave de dados
-        let wrapped = provider.wrap_data_key(&tenant, &data_key).expect("wrap falhou");
+        // Encapsula chave de dados sob a referência EXATA devolvida na geração.
+        let wrapped = provider.wrap_data_key(&kref, &data_key).expect("wrap falhou");
 
         // Desencapsula com sucesso
         let unwrapped = provider.unwrap_data_key(&wrapped).expect("unwrap falhou");
@@ -690,8 +709,8 @@ mod tests {
     fn rotation_preserves_historical_wrapped_keys() {
         let provider = SoftwareKeyProvider::new();
         let tenant = TenantId::new("tenant-rotation".to_string()).unwrap();
-        let (_, data_key) = provider.generate_data_key(&tenant).unwrap();
-        let old = provider.wrap_data_key(&tenant, &data_key).unwrap();
+        let (old_ref, data_key) = provider.generate_data_key(&tenant).unwrap();
+        let old = provider.wrap_data_key(&old_ref, &data_key).unwrap();
 
         let rotated = provider.rotate(&tenant).unwrap();
         assert_eq!(rotated.epoch, old.key_ref.epoch + 1);
@@ -705,12 +724,12 @@ mod tests {
         let provider = SoftwareKeyProvider::new();
         let tenant = TenantId::new("tenant-stale".to_string()).unwrap();
 
-        let (_, old_data_key) = provider.generate_data_key(&tenant).unwrap();
-        let old = provider.wrap_data_key(&tenant, &old_data_key).unwrap();
+        let (old_ref, old_data_key) = provider.generate_data_key(&tenant).unwrap();
+        let old = provider.wrap_data_key(&old_ref, &old_data_key).unwrap();
         provider.rotate(&tenant).unwrap();
 
-        let (_, current_data_key) = provider.generate_data_key(&tenant).unwrap();
-        let current = provider.wrap_data_key(&tenant, &current_data_key).unwrap();
+        let (current_ref, current_data_key) = provider.generate_data_key(&tenant).unwrap();
+        let current = provider.wrap_data_key(&current_ref, &current_data_key).unwrap();
 
         provider.destroy(&old.key_ref).unwrap();
 
@@ -766,6 +785,21 @@ mod tests {
 
         envelope[..2].copy_from_slice(&EncryptionEnvelopeV2::LEGACY_VERSION.to_be_bytes());
         assert!(EncryptionEnvelopeV2::open(&key, &envelope, b"aad").is_none());
+    }
+
+
+    #[test]
+    fn wrapping_uses_generated_keyref_even_if_rotation_happens_in_between() {
+        let provider = SoftwareKeyProvider::new();
+        let tenant = TenantId::new("tenant-race".to_string()).unwrap();
+
+        let (generated_ref, data_key) = provider.generate_data_key(&tenant).unwrap();
+        let new_ref = provider.rotate(&tenant).unwrap();
+        assert_ne!(generated_ref.epoch, new_ref.epoch);
+
+        let wrapped = provider.wrap_data_key(&generated_ref, &data_key).unwrap();
+        assert_eq!(wrapped.key_ref, generated_ref);
+        assert_eq!(provider.unwrap_data_key(&wrapped).unwrap(), data_key);
     }
 
 }
