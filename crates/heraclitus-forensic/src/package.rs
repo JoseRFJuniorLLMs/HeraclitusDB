@@ -82,9 +82,10 @@ impl EvidencePackageBuilder {
             self.manifest.custody_digest = String::new();
         }
 
-        // Compromisso determinístico do conjunto exportado. Enquanto a prova HRKL
-        // completa não estiver ligada, estas raízes são do conjunto do pacote e
-        // NÃO devem ser apresentadas como proof path do log de origem.
+        // Compromisso determinístico do conjunto exportado. Campos ausentes
+        // são preenchidos; valores já fornecidos são PRESERVADOS para que o
+        // verificador possa rejeitar metadados adulterados em vez de o builder
+        // "consertar" silenciosamente a evidência.
         if !self.objects_data.is_empty() {
             let mut blake3_hasher = blake3::Hasher::new();
             let mut sha256_hasher = Sha256::new();
@@ -92,15 +93,26 @@ impl EvidencePackageBuilder {
                 blake3_hasher.update(obj.blake3_hex.as_bytes());
                 sha256_hasher.update(obj.sha256_hex.as_bytes());
             }
-            self.manifest.merkle.root_blake3 =
-                blake3_hasher.finalize().to_hex().to_string();
-            self.manifest.merkle.root_sha256 =
-                hex::encode(sha256_hasher.finalize());
-            self.manifest.merkle.leaves_count = self.objects_data.len() as u64;
-        } else {
-            self.manifest.merkle.root_blake3.clear();
-            self.manifest.merkle.root_sha256.clear();
-            self.manifest.merkle.leaves_count = 0;
+            if self.manifest.merkle.root_blake3.is_empty() {
+                self.manifest.merkle.root_blake3 =
+                    blake3_hasher.finalize().to_hex().to_string();
+            } else {
+                let _ = blake3_hasher.finalize();
+            }
+            if self.manifest.merkle.root_sha256.is_empty() {
+                self.manifest.merkle.root_sha256 =
+                    hex::encode(sha256_hasher.finalize());
+            } else {
+                let _ = sha256_hasher.finalize();
+            }
+            if self.manifest.merkle.leaves_count == 0 {
+                self.manifest.merkle.leaves_count = self.objects_data.len() as u64;
+            }
+        } else if self.manifest.merkle.leaves_count == 0
+            && self.manifest.merkle.root_blake3.is_empty()
+            && self.manifest.merkle.root_sha256.is_empty()
+        {
+            // Manifesto vazio coerente: nada a preencher.
         }
 
         let proofs_dir = root.join("proofs");
