@@ -1292,7 +1292,6 @@ mod tests {
             )
             .unwrap();
 
-        let ctx = AdminContext::new("alice", "tenant", vec!["admin".into()]);
         let mut op = AdminOperation::new(
             "op-failed",
             "idem-failed",
