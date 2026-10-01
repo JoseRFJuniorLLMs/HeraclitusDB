@@ -3656,31 +3656,29 @@ impl heraclitus_compliance::ComplianceSink for Engine {
 }
 
 #[cfg(test)]
+fn legal_hold_for_test(
+    engine: &Arc<Engine>,
+    op: &str,
+    arg: &str,
+) -> (bool, String) {
+    if op == "legal-holds" {
+        return crate::grpc::legal_hold_list(engine);
+    }
+    let ctx = crate::trusted_admin::AdminContext::new(
+        "unit-test-admin",
+        "test",
+        vec!["admin".into()],
+    );
+    let key = format!("test:{op}:{}", blake3::hash(arg.as_bytes()).to_hex());
+    crate::grpc::trusted_legal_hold_op(engine, &ctx, op, arg, &key)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use heraclitus_core::FsyncPolicy;
     use heraclitus_query::backend::{replay_graph, LogBackend};
 
-
-    fn legal_hold_for_test(
-        engine: &Arc<Engine>,
-        op: &str,
-        arg: &str,
-    ) -> (bool, String) {
-        if op == "legal-holds" {
-            return crate::grpc::legal_hold_list(engine);
-        }
-        let ctx = crate::trusted_admin::AdminContext::new(
-            "unit-test-admin",
-            "test",
-            vec!["admin".into()],
-        );
-        let key = format!(
-            "test:{op}:{}",
-            blake3::hash(arg.as_bytes()).to_hex()
-        );
-        crate::grpc::trusted_legal_hold_op(engine, &ctx, op, arg, &key)
-    }
 
     /// Auditoria 2026-09-05 (`grpc.rs:521`, CONFIRMADO): as escritas do RPC
     /// admin de compliance iam directas ao log, sem `index_applied`. Um
