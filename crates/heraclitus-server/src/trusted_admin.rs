@@ -45,7 +45,10 @@ pub enum AdminOperationKind {
     /// Exportação forense de custódia privilegiada.
     PrivilegedForensicExport { scope: String },
     /// Alteração de configurações de segurança em tempo de execução.
-    SecurityConfigChange { parameter: String, new_value: String },
+    SecurityConfigChange {
+        parameter: String,
+        new_value: String,
+    },
     /// Ação crítica de cluster / consenso.
     ClusterCriticalAction { action: String, target_node: u64 },
     /// Aprovação humana de ação irreversível (four-eyes).
@@ -68,7 +71,11 @@ pub struct AdminContext {
 }
 
 impl AdminContext {
-    pub fn new(principal: impl Into<String>, tenant: impl Into<String>, roles: Vec<String>) -> Self {
+    pub fn new(
+        principal: impl Into<String>,
+        tenant: impl Into<String>,
+        roles: Vec<String>,
+    ) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -78,7 +85,7 @@ impl AdminContext {
             tenant: tenant.into(),
             roles,
             client_endpoint: None,
-            request_id: format!("req-{}", blake3::hash(format!("{now}").as_bytes()).to_hex()),
+            request_id: heraclitus_core::EventId::new().to_string(),
             requested_at_secs: now,
         }
     }
@@ -159,16 +166,21 @@ impl AdminOperation {
 
     /// Calcula o digest determinístico dos parâmetros da operação.
     pub fn compute_intent_digest(&self, ctx: &AdminContext) -> String {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(self.operation_id.as_bytes());
-        hasher.update(self.idempotency_key.as_bytes());
-        hasher.update(ctx.principal.as_bytes());
-        hasher.update(ctx.tenant.as_bytes());
-        let kind_json = serde_json::to_string(&self.kind).unwrap_or_default();
-        hasher.update(kind_json.as_bytes());
-        hasher.update(self.target_digest.as_bytes());
-        hasher.update(self.reason.as_bytes());
-        hasher.finalize().to_hex().to_string()
+        let bytes = serde_json::to_vec(&(
+            "heraclitus-admin-intent-v2",
+            &self.operation_id,
+            &self.idempotency_key,
+            &ctx.principal,
+            &ctx.tenant,
+            &ctx.roles,
+            &self.kind,
+            &self.target_digest,
+            &self.parameters_digest,
+            &self.reason,
+            &self.approval_policy,
+        ))
+        .expect("administrative intent serializes");
+        blake3::hash(&bytes).to_hex().to_string()
     }
 }
 
@@ -244,7 +256,9 @@ pub enum AdminError {
     #[error("Operação administrativa negada por autorização: {0}")]
     AccessDenied(String),
 
-    #[error("Aprovação four-eyes insuficiente: {detail} (requerido: {required}, obtido: {obtained})")]
+    #[error(
+        "Aprovação four-eyes insuficiente: {detail} (requerido: {required}, obtido: {obtained})"
+    )]
     ApprovalMissing {
         required: usize,
         obtained: usize,
@@ -287,10 +301,15 @@ struct IdempotencyEntry {
     completed_at_secs: Option<u64>,
 }
 
+type ApprovalWitnesses = HashMap<(String, String, String), String>;
+
 /// Gerenciador do Protocolo de Administração Confiável (SPEC-0089).
 pub struct TrustedAdminProtocol {
     idempotency_map: Mutex<HashMap<String, IdempotencyEntry>>,
     active_operations: RwLock<HashMap<String, AdminState>>,
+    execution: Mutex<()>,
+    journal: Mutex<HashMap<String, DurableRecord>>,
+    authenticated_approvals: Mutex<ApprovalWitnesses>,
 }
 
 impl Default for TrustedAdminProtocol {
@@ -304,15 +323,14 @@ impl TrustedAdminProtocol {
         Self {
             idempotency_map: Mutex::new(HashMap::new()),
             active_operations: RwLock::new(HashMap::new()),
+            execution: Mutex::new(()),
+            journal: Mutex::new(HashMap::new()),
+            authenticated_approvals: Mutex::new(HashMap::new()),
         }
     }
 
     /// Valida pré-condições, autorizações e aprovações four-eyes (Fase 1).
-    pub fn validate(
-        &self,
-        ctx: &AdminContext,
-        op: &AdminOperation,
-    ) -> Result<String, AdminError> {
+    pub fn validate(&self, ctx: &AdminContext, op: &AdminOperation) -> Result<String, AdminError> {
         // Validação básica de principal e tenant
         if ctx.principal.trim().is_empty() {
             return Err(AdminError::AccessDenied("Principal vazio".into()));
@@ -321,6 +339,21 @@ impl TrustedAdminProtocol {
             return Err(AdminError::AccessDenied("Tenant vazio".into()));
         }
 
+        if !ctx
+            .roles
+            .iter()
+            .any(|role| role.eq_ignore_ascii_case("admin"))
+        {
+            return Err(AdminError::AccessDenied("Admin role required".into()));
+        }
+        if op.operation_id.is_empty()
+            || op.idempotency_key.is_empty()
+            || op.reason.trim().is_empty()
+        {
+            return Err(AdminError::PreconditionFailed(
+                "operation ID, idempotency key and reason required".into(),
+            ));
+        }
         let intent_digest = op.compute_intent_digest(ctx);
 
         // Verificação de idempotência prévia
@@ -340,7 +373,16 @@ impl TrustedAdminProtocol {
         // Validação de Four-Eyes / Aprovações (SPEC-0089 §9)
         if let Some(policy) = &op.approval_policy {
             let mut distinct_approvers = std::collections::HashSet::new();
+            let authenticated = self.authenticated_approvals.lock().unwrap();
             for app in &op.approvals {
+                if authenticated.get(&(
+                    ctx.tenant.clone(),
+                    app.approver_principal.clone(),
+                    intent_digest.clone(),
+                )) != Some(&app.approver_role)
+                {
+                    continue; // Request-supplied identity/role is not authorization.
+                }
                 if app.approved_intent_digest != intent_digest {
                     return Err(AdminError::ApprovalMissing {
                         required: policy.min_distinct_approvers,
@@ -354,7 +396,9 @@ impl TrustedAdminProtocol {
                 if !policy.requester_may_approve && app.approver_principal == ctx.principal {
                     continue; // O solicitante não pode aprovar a si mesmo se a política proibir
                 }
-                if policy.required_roles.is_empty() || policy.required_roles.contains(&app.approver_role) {
+                if policy.required_roles.is_empty()
+                    || policy.required_roles.contains(&app.approver_role)
+                {
                     distinct_approvers.insert(app.approver_principal.clone());
                 }
             }
@@ -374,6 +418,25 @@ impl TrustedAdminProtocol {
         Ok(intent_digest)
     }
 
+    pub fn authenticate_approval(
+        &self,
+        principal: &AdminContext,
+        digest: &str,
+        role: &str,
+    ) -> Result<(), AdminError> {
+        if !principal.roles.iter().any(|r| r == role) {
+            return Err(AdminError::AccessDenied("approver role unavailable".into()));
+        }
+        self.authenticated_approvals.lock().unwrap().insert(
+            (
+                principal.tenant.clone(),
+                principal.principal.clone(),
+                digest.into(),
+            ),
+            role.into(),
+        );
+        Ok(())
+    }
     /// Registra a conclusão da operação no mapa de idempotência.
     pub fn record_completion(
         &self,
@@ -405,12 +468,27 @@ impl TrustedAdminProtocol {
     }
 
     /// Consulta se uma operação já foi processada anteriormente por idempotency_key.
-    pub fn query_idempotency(&self, idempotency_key: &str) -> Option<(AdminState, Lsn, Option<Lsn>, Option<u64>)> {
+    pub fn query_idempotency(
+        &self,
+        idempotency_key: &str,
+    ) -> Option<(AdminState, Lsn, Option<Lsn>, Option<u64>)> {
         let map = self.idempotency_map.lock().unwrap();
-        map.get(idempotency_key).map(|e| (e.state, e.intent_lsn, e.result_lsn, e.completed_at_secs))
+        map.get(idempotency_key)
+            .map(|e| (e.state, e.intent_lsn, e.result_lsn, e.completed_at_secs))
     }
 
     /// Retorna o estado de uma operação ativa ou registrada por idempotency_key.
+    pub fn operation_state(&self, ctx: &AdminContext, idempotency_key: &str) -> Option<AdminState> {
+        let key = serde_json::to_string(&(&ctx.tenant, &ctx.principal, idempotency_key)).ok()?;
+        self.journal.lock().ok()?.get(&key).map(|r| {
+            if r.result.is_some() {
+                AdminState::Succeeded
+            } else {
+                AdminState::Unknown
+            }
+        })
+    }
+
     pub fn get_operation_state(&self, idempotency_key: &str) -> Option<AdminState> {
         let active = self.active_operations.read().unwrap();
         if let Some(state) = active.get(idempotency_key) {
@@ -421,7 +499,7 @@ impl TrustedAdminProtocol {
     }
 
     /// Cria um token de execução após a persistência da intenção (Fase 2).
-    pub fn create_execution_token(&self, operation_id: String, intent_lsn: Lsn) -> AdminExecutionToken {
+    fn create_execution_token(&self, operation_id: String, intent_lsn: Lsn) -> AdminExecutionToken {
         let mut active = self.active_operations.write().unwrap();
         active.insert(operation_id.clone(), AdminState::IntentDurable);
         drop(active);
@@ -439,13 +517,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn authenticated_approval_cannot_cross_tenants() {
+        let protocol = TrustedAdminProtocol::new();
+        let ctx = AdminContext::new("alice", "tenant-a", vec!["admin".into()]);
+        let mut op = AdminOperation::new(
+            "op",
+            "key",
+            AdminOperationKind::EmergencyGc { target_segment: 1 },
+            "approved cleanup",
+        );
+        op.approval_policy = Some(ApprovalPolicy {
+            min_distinct_approvers: 1,
+            requester_may_approve: false,
+            required_roles: vec!["officer".into()],
+        });
+        let digest = op.compute_intent_digest(&ctx);
+        op.approvals.push(ApprovalRecord {
+            approver_principal: "bob".into(),
+            approver_role: "officer".into(),
+            approved_intent_digest: digest.clone(),
+            approved_at_secs: 1,
+            signature: None,
+        });
+        protocol
+            .authenticate_approval(
+                &AdminContext::new("bob", "tenant-b", vec!["officer".into()]),
+                &digest,
+                "officer",
+            )
+            .unwrap();
+        assert!(protocol.validate(&ctx, &op).is_err());
+        protocol
+            .authenticate_approval(
+                &AdminContext::new("bob", "tenant-a", vec!["officer".into()]),
+                &digest,
+                "officer",
+            )
+            .unwrap();
+        assert!(protocol.validate(&ctx, &op).is_ok());
+        let mut changed = ctx.clone();
+        changed.roles.push("reader".into());
+        assert_ne!(digest, op.compute_intent_digest(&changed));
+    }
+
+    #[test]
     fn four_eyes_policy_enforcement() {
         let protocol = TrustedAdminProtocol::new();
         let ctx = AdminContext::new("alice", "tenant-gov", vec!["admin".into()]);
         let mut op = AdminOperation::new(
             "op-shred-01",
             "idem-shred-01",
-            AdminOperationKind::CryptoShred { agent_id: "agent-x".into() },
+            AdminOperationKind::CryptoShred {
+                agent_id: "agent-x".into(),
+            },
             "LGPD Right to erasure",
         );
         let policy = ApprovalPolicy::strict_four_eyes("security_officer");
@@ -483,6 +607,15 @@ mod tests {
             approved_at_secs: 102,
             signature: None,
         });
+        for name in ["bob", "carol"] {
+            protocol
+                .authenticate_approval(
+                    &AdminContext::new(name, "tenant-gov", vec!["security_officer".into()]),
+                    &intent_digest,
+                    "security_officer",
+                )
+                .unwrap();
+        }
         assert!(protocol.validate(&ctx, &op).is_ok()); // 2 aprovadores distintos atendem a política
     }
 
@@ -493,7 +626,10 @@ mod tests {
         let op1 = AdminOperation::new(
             "op-01",
             "idem-key-1",
-            AdminOperationKind::LegalHoldCreate { hold_id: "h1".into(), reason: "investigation".into() },
+            AdminOperationKind::LegalHoldCreate {
+                hold_id: "h1".into(),
+                reason: "investigation".into(),
+            },
             "Processo 123",
         );
         let digest1 = protocol.validate(&ctx, &op1).unwrap();
@@ -506,12 +642,318 @@ mod tests {
         let op2 = AdminOperation::new(
             "op-02",
             "idem-key-1",
-            AdminOperationKind::LegalHoldCreate { hold_id: "h2_diferente".into(), reason: "outra".into() },
+            AdminOperationKind::LegalHoldCreate {
+                hold_id: "h2_diferente".into(),
+                reason: "outra".into(),
+            },
             "Processo 999",
         );
         assert!(matches!(
             protocol.validate(&ctx, &op2),
             Err(AdminError::IdempotencyConflict { .. })
         ));
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct DurableRecord {
+    key: String,
+    digest: String,
+    operation_id: String,
+    intent: Option<(AdminContext, AdminOperation)>,
+    result: Option<serde_json::Value>,
+    error: Option<String>,
+}
+
+impl TrustedAdminProtocol {
+    pub(crate) fn recover<L: heraclitus_log::EpisodeLog + ?Sized>(
+        &self,
+        log: &L,
+    ) -> Result<(), HeraclitusError> {
+        let mut records: HashMap<String, DurableRecord> = HashMap::new();
+        let mut cur = 0;
+        let head = log.head();
+        while cur < head {
+            let rows = log.scan_capped(cur, head, 16)?;
+            let Some((last, _)) = rows.last() else {
+                break;
+            };
+            for (_, ep) in &rows {
+                if ep.agent_id != "heraclitus-admin" {
+                    continue;
+                }
+                if !matches!(&ep.kind, heraclitus_core::EventKind::Custom(k) if k == "AdminIntent" || k == "AdminResult")
+                {
+                    continue;
+                }
+                let record: DurableRecord = serde_json::from_slice(&ep.content).map_err(|e| {
+                    HeraclitusError::Config(format!("administrative journal corrupt: {e}"))
+                })?;
+                let Some((ctx, op)) = &record.intent else {
+                    return Err(HeraclitusError::Config("journal missing intent".into()));
+                };
+                let key =
+                    serde_json::to_string(&(&ctx.tenant, &ctx.principal, &op.idempotency_key))
+                        .unwrap();
+                if key != record.key
+                    || op.compute_intent_digest(ctx) != record.digest
+                    || op.operation_id != record.operation_id
+                {
+                    return Err(HeraclitusError::Config(
+                        "journal invalid intent binding".into(),
+                    ));
+                }
+                let is_intent =
+                    matches!(&ep.kind, heraclitus_core::EventKind::Custom(k) if k == "AdminIntent");
+                if is_intent
+                    && (record.result.is_some()
+                        || record.error.is_some()
+                        || records.contains_key(&key))
+                {
+                    return Err(HeraclitusError::Config(
+                        "duplicate/invalid administrative intent".into(),
+                    ));
+                }
+                if !is_intent
+                    && (!records.contains_key(&key)
+                        || record.result.is_some() == record.error.is_some())
+                {
+                    return Err(HeraclitusError::Config(
+                        "journal orphan/invalid outcome".into(),
+                    ));
+                }
+                if let Some(previous) = records.get(&record.key) {
+                    if previous.result.is_some()
+                        || previous.error.is_some()
+                        || previous.digest != record.digest
+                        || previous.operation_id != record.operation_id
+                    {
+                        return Err(HeraclitusError::Config(
+                            "administrative journal identity conflict".into(),
+                        ));
+                    }
+                }
+                records.insert(record.key.clone(), record);
+            }
+            cur = last.saturating_add(1);
+        }
+        *self.journal.lock().unwrap() = records;
+        Ok(())
+    }
+
+    /// Serialized intent -> fsync -> effect -> result -> fsync. An incomplete
+    /// or ambiguous execution remains UNKNOWN and is NEVER automatically retried.
+    pub(crate) fn execute<T: Serialize + serde::de::DeserializeOwned>(
+        &self,
+        ctx: &AdminContext,
+        op: &AdminOperation,
+        mut persist: impl FnMut(heraclitus_core::Episode) -> Result<Lsn, HeraclitusError>,
+        effect: impl FnOnce(&AdminExecutionToken) -> Result<T, HeraclitusError>,
+    ) -> Result<T, HeraclitusError> {
+        let _execution = self.execution.lock().map_err(|_| {
+            HeraclitusError::Config("admin execution interrupted; restart and reconcile".into())
+        })?;
+        let digest = self
+            .validate(ctx, op)
+            .map_err(|e| HeraclitusError::Config(e.to_string()))?;
+        // Scope keys by principal and tenant to prevent cross-principal replay.
+        let key =
+            serde_json::to_string(&(&ctx.tenant, &ctx.principal, &op.idempotency_key)).unwrap();
+        if let Some(previous) = self.journal.lock().unwrap().get(&key) {
+            if previous.digest != digest {
+                return Err(HeraclitusError::IdempotencyConflict {
+                    key: op.idempotency_key.clone(),
+                });
+            }
+            if let Some(value) = &previous.result {
+                return serde_json::from_value(value.clone())
+                    .map_err(|e| HeraclitusError::Serialization(e.to_string()));
+            }
+            return Err(HeraclitusError::Config(format!(
+                "administrative operation UNKNOWN; reconciliation required: {}",
+                previous.operation_id
+            )));
+        }
+        let mut record = DurableRecord {
+            key: key.clone(),
+            digest,
+            operation_id: op.operation_id.clone(),
+            intent: Some((ctx.clone(), op.clone())),
+            result: None,
+            error: None,
+        };
+        let event = |kind: &str,
+                     record: &DurableRecord|
+         -> Result<heraclitus_core::Episode, HeraclitusError> {
+            Ok(heraclitus_core::Episode::new(
+                "heraclitus-admin",
+                heraclitus_core::EventKind::Custom(kind.into()),
+                serde_json::to_vec(record)
+                    .map_err(|e| HeraclitusError::Serialization(e.to_string()))?,
+            ))
+        };
+        // Reserve before attempting persistence: an ambiguous write also fails closed.
+        self.journal
+            .lock()
+            .unwrap()
+            .insert(key.clone(), record.clone());
+        let intent_lsn = persist(event("AdminIntent", &record)?)?;
+        let token = self.create_execution_token(op.idempotency_key.clone(), intent_lsn);
+        let result = effect(&token);
+        match &result {
+            Ok(value) => {
+                record.result = Some(
+                    serde_json::to_value(value)
+                        .map_err(|e| HeraclitusError::Serialization(e.to_string()))?,
+                )
+            }
+            Err(error) => record.error = Some(error.to_string()),
+        }
+        persist(event("AdminResult", &record)?)?;
+        self.active_operations
+            .write()
+            .unwrap()
+            .remove(&op.idempotency_key);
+        self.journal.lock().unwrap().insert(key, record);
+        result
+    }
+}
+
+#[cfg(test)]
+mod durable_regressions {
+    use super::*;
+    use heraclitus_log::Log;
+    fn context() -> AdminContext {
+        AdminContext::new("admin", "tenant", vec!["admin".into()])
+    }
+    fn operation() -> AdminOperation {
+        AdminOperation::new(
+            "op",
+            "key",
+            AdminOperationKind::CryptoShred {
+                agent_id: "subject".into(),
+            },
+            "reason",
+        )
+    }
+    #[test]
+    fn digest_has_boundaries_and_binds_operation_policy_and_identity() {
+        let op = operation();
+        let a = context();
+        let mut b = a.clone();
+        b.principal = "admi".into();
+        b.tenant = "ntenant".into();
+        assert_ne!(op.compute_intent_digest(&a), op.compute_intent_digest(&b));
+        let mut other = op.clone();
+        other.operation_id.push('x');
+        assert_ne!(
+            op.compute_intent_digest(&a),
+            other.compute_intent_digest(&a)
+        );
+        b = a.clone();
+        b.roles.clear();
+        assert!(TrustedAdminProtocol::new().validate(&b, &op).is_err());
+    }
+    #[test]
+    fn failed_intent_never_executes_and_same_process_retry_is_unknown() {
+        let p = TrustedAdminProtocol::new();
+        let hits = std::cell::Cell::new(0);
+        let result: Result<bool, _> = p.execute(
+            &context(),
+            &operation(),
+            |_| {
+                Err(HeraclitusError::Config(
+                    "injected persistence failure".into(),
+                ))
+            },
+            |_| {
+                hits.set(hits.get() + 1);
+                Ok(true)
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(hits.get(), 0);
+        assert!(p
+            .execute(
+                &context(),
+                &operation(),
+                |_| Ok(1),
+                |_| {
+                    hits.set(hits.get() + 1);
+                    Ok(true)
+                }
+            )
+            .is_err());
+        assert_eq!(hits.get(), 0);
+    }
+    #[test]
+    fn durable_success_replays_after_restart_without_repeating_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log::open(dir.path(), 1 << 20, heraclitus_core::FsyncPolicy::Always).unwrap();
+        let p = TrustedAdminProtocol::new();
+        let hits = std::cell::Cell::new(0);
+        let persist = |ep| {
+            let lsn = log.append(ep)?;
+            log.flush()?;
+            Ok(lsn)
+        };
+        let effect = |_: &AdminExecutionToken| {
+            hits.set(hits.get() + 1);
+            Ok(serde_json::json!({"receipt":"real"}))
+        };
+        assert!(p.execute(&context(), &operation(), persist, effect).is_ok());
+        assert_eq!(hits.get(), 1);
+        let restarted = TrustedAdminProtocol::new();
+        restarted.recover(&log).unwrap();
+        assert_eq!(
+            restarted
+                .execute(&context(), &operation(), persist, effect)
+                .unwrap()["receipt"],
+            "real"
+        );
+        assert_eq!(hits.get(), 1);
+    }
+    #[test]
+    fn failed_result_is_unknown_after_restart_and_is_not_reexecuted() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log::open(dir.path(), 1 << 20, heraclitus_core::FsyncPolicy::Always).unwrap();
+        let p = TrustedAdminProtocol::new();
+        let writes = std::cell::Cell::new(0);
+        let hits = std::cell::Cell::new(0);
+        let result: Result<bool, _> = p.execute(
+            &context(),
+            &operation(),
+            |ep| {
+                writes.set(writes.get() + 1);
+                if writes.get() == 2 {
+                    return Err(HeraclitusError::Config(
+                        "injected result fsync failure".into(),
+                    ));
+                }
+                let lsn = log.append(ep)?;
+                log.flush()?;
+                Ok(lsn)
+            },
+            |_| {
+                hits.set(hits.get() + 1);
+                Ok(true)
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(hits.get(), 1);
+        let restarted = TrustedAdminProtocol::new();
+        restarted.recover(&log).unwrap();
+        assert!(restarted
+            .execute(
+                &context(),
+                &operation(),
+                |_| Ok(1),
+                |_| {
+                    hits.set(hits.get() + 1);
+                    Ok(true)
+                }
+            )
+            .is_err());
+        assert_eq!(hits.get(), 1);
     }
 }

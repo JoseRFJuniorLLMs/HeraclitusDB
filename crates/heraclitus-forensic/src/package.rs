@@ -1,7 +1,7 @@
-use crate::manifest::{EvidenceManifest, CustodyEntry, EvidenceObject};
-use std::path::Path;
+use crate::manifest::{CustodyEntry, EvidenceManifest, EvidenceObject};
+use sha2::{Digest, Sha256};
 use std::fs;
-use sha2::{Sha256, Digest};
+use std::path::Path;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -46,25 +46,15 @@ impl EvidencePackageBuilder {
     pub fn build<P: AsRef<Path>>(&mut self, target_dir: P) -> Result<(), PackageError> {
         let root = target_dir.as_ref();
         fs::create_dir_all(root)?;
-        
-        let evidence_dir = root.join("evidence");
-        fs::create_dir_all(&evidence_dir)?;
 
         for (obj, data) in &self.objects_data {
             if !crate::verifier::validate_safe_relative_path(&obj.relative_path) {
                 return Err(PackageError::PathTraversal(obj.relative_path.clone()));
             }
 
-            let obj_path = root.join(&obj.relative_path);
-            if let Some(parent) = obj_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&obj_path, data)?;
+            crate::safe_fs::write(root, &obj.relative_path, data)?;
         }
 
-        let provenance_dir = root.join("provenance");
-        fs::create_dir_all(&provenance_dir)?;
-        
         if !self.custody_entries.is_empty() {
             let mut custody_bytes = Vec::new();
             for entry in &self.custody_entries {
@@ -72,7 +62,7 @@ impl EvidencePackageBuilder {
                 custody_bytes.extend_from_slice(json.as_bytes());
                 custody_bytes.push(b'\n');
             }
-            fs::write(provenance_dir.join("custody.jsonl"), &custody_bytes)?;
+            crate::safe_fs::write(root, "provenance/custody.jsonl", &custody_bytes)?;
 
             let mut hasher = Sha256::new();
             hasher.update(&custody_bytes);
@@ -83,30 +73,43 @@ impl EvidencePackageBuilder {
         }
 
         // Se raiz Merkle não foi informada mas há objetos, calcula automaticamente
-        if self.manifest.merkle.root_blake3.is_empty() && !self.objects_data.is_empty() {
+        if self.manifest.merkle.root_blake3.is_empty() {
             let mut hasher = blake3::Hasher::new();
-            for (obj, _) in &self.objects_data {
+            for obj in &self.manifest.objects {
                 hasher.update(obj.blake3_hex.as_bytes());
             }
             self.manifest.merkle.root_blake3 = hasher.finalize().to_hex().to_string();
-            self.manifest.merkle.leaves_count = self.objects_data.len() as u64;
+            self.manifest.merkle.leaves_count = self.manifest.objects.len() as u64;
         }
 
-        let proofs_dir = root.join("proofs");
-        fs::create_dir_all(&proofs_dir)?;
-        fs::write(
-            proofs_dir.join("merkle.json"),
-            serde_json::to_string_pretty(&self.proofs)?
+        let mut sha = Sha256::new();
+        for obj in &self.manifest.objects {
+            sha.update(obj.sha256_hex.as_bytes());
+        }
+        if self.manifest.merkle.root_sha256.is_empty() {
+            self.manifest.merkle.root_sha256 = hex::encode(sha.finalize());
+        }
+        if self.proofs == serde_json::json!({}) {
+            self.proofs = serde_json::json!({"scheme":"object-digests/1", "objects": self.manifest.objects,
+                "root_blake3": self.manifest.merkle.root_blake3, "root_sha256": self.manifest.merkle.root_sha256});
+        }
+        crate::safe_fs::write(
+            root,
+            "proofs/merkle.json",
+            serde_json::to_string_pretty(&self.proofs)?.as_bytes(),
         )?;
 
         let manifest_json = serde_json::to_string_pretty(&self.manifest)?;
-        let manifest_path = root.join("manifest.json");
-        fs::write(&manifest_path, &manifest_json)?;
+        crate::safe_fs::write(root, "manifest.json", manifest_json.as_bytes())?;
 
         let mut hasher = Sha256::new();
         hasher.update(manifest_json.as_bytes());
         let sha256_hex = hex::encode(hasher.finalize());
-        fs::write(root.join("manifest.sha256"), format!("{}  manifest.json\n", sha256_hex))?;
+        crate::safe_fs::write(
+            root,
+            "manifest.sha256",
+            format!("{}  manifest.json\n", sha256_hex).as_bytes(),
+        )?;
 
         Ok(())
     }

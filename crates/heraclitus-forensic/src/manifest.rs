@@ -102,18 +102,19 @@ pub enum CustodyAction {
 
 impl CustodyEntry {
     pub fn compute_hash(&self) -> String {
-        use sha2::{Sha256, Digest};
-        let action_str = serde_json::to_string(&self.action).unwrap_or_default();
-        let entry_str = format!(
-            "{}:{}:{}:{}:{}",
+        use sha2::{Digest, Sha256};
+        let entry_str = serde_json::to_vec(&(
+            "heraclitus-custody-v2",
             self.step_index,
             self.timestamp_secs,
-            action_str,
-            self.operator_principal,
-            self.previous_entry_hash
-        );
+            &self.action,
+            &self.operator_principal,
+            &self.terminal_or_node,
+            &self.previous_entry_hash,
+        ))
+        .expect("custody fields serialize");
         let mut hasher = Sha256::new();
-        hasher.update(entry_str.as_bytes());
+        hasher.update(&entry_str);
         hex::encode(hasher.finalize())
     }
 }

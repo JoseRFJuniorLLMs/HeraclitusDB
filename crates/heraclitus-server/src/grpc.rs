@@ -318,165 +318,245 @@ impl pb::heraclitus_server::Heraclitus for Service {
         let sentinel = self.sentinel.clone();
         let operation = r.op.clone();
         let audit_principal = principal.name.clone();
+        let admin_ctx = crate::trusted_admin::AdminContext::new(
+            principal.name.clone(),
+            "local",
+            principal
+                .roles
+                .iter()
+                .map(|role| format!("{role:?}").to_lowercase())
+                .collect(),
+        );
         let (ok, message) = tokio::task::spawn_blocking(move || {
-            let result = match r.op.as_str() {
-                "stats" => (true, engine.stats().to_string()),
-                // SPEC-0046 §94 / invariante C10 — a porta de entrada do legal
-                // hold. O circuito já existia inteiro e era inalcançável:
-                // `place_legal_hold` persiste o evento e chama
-                // `set_legal_hold_range` no HRKM, o `plan_gc` respeita-o e o
-                // `ensure_crypto_shred_allowed` do `crypto_shred` bloqueia — mas
-                // nada em produção podia CRIAR um hold, portanto §94 era uma
-                // garantia que só os testes conseguiam exercer.
-                op @ ("legal-hold-place" | "legal-hold-release" | "legal-holds") => {
-                    crate::grpc::legal_hold_op(&engine, op, &r.arg)
-                }
-                op @ ("regulatory-policy-activate"
-                | "regulatory-evaluate"
-                | "regulatory-policies"
-                | "regulatory-decisions") => crate::grpc::regulatory_policy_op(&engine, op, &r.arg),
-                op @ ("privacy-assessment" | "privacy-deadline" | "privacy-package"
-                | "privacy-state") => crate::grpc::privacy_incident_op(&engine, op, &r.arg),
-                op
-                @ ("deferred-anchor-prepare" | "deferred-anchor-import" | "deferred-anchors") => {
-                    crate::grpc::deferred_anchor_op(&engine, op, &r.arg)
-                }
-                op @ ("model-bundle-activate" | "model-bundles") => {
-                    crate::grpc::model_bundle_op(&engine, op, &r.arg)
-                }
-                "verify" => match engine.verify() {
-                    Ok(v) => (true, v.to_string()),
-                    Err(e) => (false, e.to_string()),
-                },
-                "sentinel-status" => match sentinel.as_ref() {
-                    Some(runtime) => (
-                        true,
-                        serde_json::to_string(&runtime.status()).unwrap_or_default(),
-                    ),
-                    None => (false, "sentinel desabilitado".into()),
-                },
-                "sentinel-incidents" => match sentinel.as_ref() {
-                    Some(runtime) => match runtime
-                        .query_incidents(heraclitus_sentinel::IncidentFilter::default())
-                    {
-                        Ok(incidents) => {
-                            (true, serde_json::to_string(&incidents).unwrap_or_default())
-                        }
-                        Err(error) => (false, error.to_string()),
-                    },
-                    None => (false, "sentinel desabilitado".into()),
-                },
-                "sentinel-actions" => match sentinel.as_ref() {
-                    Some(runtime) => match runtime.l4_events(None, None, None, 10_000) {
-                        Ok(rows) => {
-                            let values: Vec<_> = rows
-                                .into_iter()
-                                .map(|(lsn, episode)| {
-                                    serde_json::json!({
-                                        "lsn": lsn,
-                                        "kind": episode.kind.label(),
-                                        "attrs": episode.attrs,
-                                        "content": crate::rest::bytes_str(&episode.content),
-                                    })
-                                })
-                                .collect();
-                            (true, serde_json::to_string(&values).unwrap_or_default())
-                        }
-                        Err(error) => (false, error.to_string()),
-                    },
-                    None => (false, "sentinel desabilitado".into()),
-                },
-                "sentinel-checkpoint" => match sentinel.as_ref() {
-                    Some(runtime) => match runtime.checkpoint() {
-                        Ok(lsn) => (true, format!("checkpoint_lsn={lsn}")),
-                        Err(error) => (false, error.to_string()),
-                    },
-                    None => (false, "sentinel desabilitado".into()),
-                },
-                "sentinel-approve" | "sentinel-deny" => match sentinel.as_ref() {
-                    Some(runtime) => {
-                        let body = serde_json::from_str::<serde_json::Value>(&r.arg);
-                        let result = body
-                            .ok()
-                            .and_then(|body| {
-                                Some((
-                                    body.get("incident_id")?.as_str()?.to_owned(),
-                                    body.get("proposal_id")?.as_str()?.to_owned(),
-                                    body.get("approval_id")?.as_str()?.to_owned(),
-                                    body.get("approver")
-                                        .and_then(serde_json::Value::as_str)
-                                        .map(str::to_owned),
-                                    body.get("reason")
-                                        .and_then(serde_json::Value::as_str)
-                                        .unwrap_or("")
-                                        .to_owned(),
-                                ))
-                            })
-                            .ok_or_else(|| {
-                                "arg deve conter incident_id, proposal_id e approval_id".to_string()
-                            })
-                            .and_then(
-                                |(incident_id, proposal_id, approval_id, approver, reason)| {
-                                    // O `approver` vinha do CORPO do pedido: quem
-                                    // alcancasse esta chamada registava uma
-                                    // aprovacao humana em nome de qualquer pessoa,
-                                    // e um registo de aprovacao existe precisamente
-                                    // para atribuir responsabilidade. Passa a ser
-                                    // sempre a identidade AUTENTICADA (a mesma que
-                                    // ja vai para `audit_admin` na linha de baixo —
-                                    // nao fazia sentido a auditoria saber quem era
-                                    // e o registo de aprovacao nao saber).
-                                    //
-                                    // Se o corpo indicar um aprovador, tem de
-                                    // coincidir: 403 em vez de correccao silenciosa,
-                                    // para que a tentativa fique visivel.
-                                    let approver = crate::auth::vincular_aprovador(
-                                        approver.as_deref(),
-                                        &audit_principal,
-                                    )?;
-                                    runtime
-                                        .persist_human_approval_for(
-                                            &incident_id,
-                                            &proposal_id,
-                                            &approval_id,
-                                            approver,
-                                            operation == "sentinel-approve",
-                                            &reason,
-                                        )
-                                        .map(|lsn| format!("approval_lsn={lsn}"))
-                                        .map_err(|error| error.to_string())
-                                },
-                            );
-                        match result {
-                            Ok(message) => (true, message),
-                            Err(error) => (false, error),
+            let dispatch = |token: Option<&crate::trusted_admin::AdminExecutionToken>| {
+                match r.op.as_str() {
+                    "admin-operation-state" => {
+                        let key = serde_json::from_str::<serde_json::Value>(&r.arg).ok()
+                            .and_then(|value| value.get("idempotency_key").and_then(|key| key.as_str()).map(str::to_owned));
+                        match key {
+                            Some(key) => (true, serde_json::json!({ "idempotency_key": key, "state": engine.trusted_admin.operation_state(&admin_ctx, &key) }).to_string()),
+                            None => (false, "idempotency_key required".into()),
                         }
                     }
-                    None => (false, "sentinel desabilitado".into()),
-                },
-                "rebuild" => {
-                    let view = if r.arg.is_empty() {
-                        None
-                    } else {
-                        Some(r.arg.as_str())
-                    };
-                    match engine.rebuild(view) {
-                        Ok(()) => (true, "rebuilt".to_string()),
+                    "stats" => (true, engine.stats().to_string()),
+                    // SPEC-0046 §94 / invariante C10 — a porta de entrada do legal
+                    // hold. O circuito já existia inteiro e era inalcançável:
+                    // `place_legal_hold` persiste o evento e chama
+                    // `set_legal_hold_range` no HRKM, o `plan_gc` respeita-o e o
+                    // `ensure_crypto_shred_allowed` do `crypto_shred` bloqueia — mas
+                    // nada em produção podia CRIAR um hold, portanto §94 era uma
+                    // garantia que só os testes conseguiam exercer.
+                    op @ ("legal-hold-place" | "legal-hold-release" | "legal-holds") => {
+                        crate::grpc::legal_hold_op(&engine, op, &r.arg)
+                    }
+                    op @ ("regulatory-policy-activate"
+                    | "regulatory-evaluate"
+                    | "regulatory-policies"
+                    | "regulatory-decisions") => {
+                        crate::grpc::regulatory_policy_op(&engine, op, &r.arg)
+                    }
+                    op @ ("privacy-assessment" | "privacy-deadline" | "privacy-package"
+                    | "privacy-state") => crate::grpc::privacy_incident_op(&engine, op, &r.arg),
+                    op @ ("deferred-anchor-prepare"
+                    | "deferred-anchor-import"
+                    | "deferred-anchors") => crate::grpc::deferred_anchor_op(&engine, op, &r.arg),
+                    op @ ("model-bundle-activate" | "model-bundles") => {
+                        crate::grpc::model_bundle_op(&engine, op, &r.arg)
+                    }
+                    "verify" => match engine.verify() {
+                        Ok(v) => (true, v.to_string()),
                         Err(e) => (false, e.to_string()),
-                    }
-                }
-                op if op.starts_with("shred:") => {
-                    let agent = op.strip_prefix("shred:").unwrap_or("");
-                    match engine.shred(agent) {
-                        Ok(true) => (
+                    },
+                    "sentinel-status" => match sentinel.as_ref() {
+                        Some(runtime) => (
                             true,
-                            format!("crypto-shred: key destroyed for agent '{agent}'"),
+                            serde_json::to_string(&runtime.status()).unwrap_or_default(),
                         ),
-                        Ok(false) => (true, format!("crypto-shred: no key for agent '{agent}'")),
-                        Err(e) => (false, e.to_string()),
+                        None => (false, "sentinel desabilitado".into()),
+                    },
+                    "sentinel-incidents" => match sentinel.as_ref() {
+                        Some(runtime) => match runtime
+                            .query_incidents(heraclitus_sentinel::IncidentFilter::default())
+                        {
+                            Ok(incidents) => {
+                                (true, serde_json::to_string(&incidents).unwrap_or_default())
+                            }
+                            Err(error) => (false, error.to_string()),
+                        },
+                        None => (false, "sentinel desabilitado".into()),
+                    },
+                    "sentinel-actions" => match sentinel.as_ref() {
+                        Some(runtime) => match runtime.l4_events(None, None, None, 10_000) {
+                            Ok(rows) => {
+                                let values: Vec<_> = rows
+                                    .into_iter()
+                                    .map(|(lsn, episode)| {
+                                        serde_json::json!({
+                                            "lsn": lsn,
+                                            "kind": episode.kind.label(),
+                                            "attrs": episode.attrs,
+                                            "content": crate::rest::bytes_str(&episode.content),
+                                        })
+                                    })
+                                    .collect();
+                                (true, serde_json::to_string(&values).unwrap_or_default())
+                            }
+                            Err(error) => (false, error.to_string()),
+                        },
+                        None => (false, "sentinel desabilitado".into()),
+                    },
+                    "sentinel-checkpoint" => match sentinel.as_ref() {
+                        Some(runtime) => match runtime.checkpoint() {
+                            Ok(lsn) => (true, format!("checkpoint_lsn={lsn}")),
+                            Err(error) => (false, error.to_string()),
+                        },
+                        None => (false, "sentinel desabilitado".into()),
+                    },
+                    "sentinel-approve" | "sentinel-deny" => match sentinel.as_ref() {
+                        Some(runtime) => {
+                            let body = serde_json::from_str::<serde_json::Value>(&r.arg);
+                            let result = body
+                                .ok()
+                                .and_then(|body| {
+                                    Some((
+                                        body.get("incident_id")?.as_str()?.to_owned(),
+                                        body.get("proposal_id")?.as_str()?.to_owned(),
+                                        body.get("approval_id")?.as_str()?.to_owned(),
+                                        body.get("approver")
+                                            .and_then(serde_json::Value::as_str)
+                                            .map(str::to_owned),
+                                        body.get("reason")
+                                            .and_then(serde_json::Value::as_str)
+                                            .unwrap_or("")
+                                            .to_owned(),
+                                    ))
+                                })
+                                .ok_or_else(|| {
+                                    "arg deve conter incident_id, proposal_id e approval_id"
+                                        .to_string()
+                                })
+                                .and_then(
+                                    |(incident_id, proposal_id, approval_id, approver, reason)| {
+                                        // O `approver` vinha do CORPO do pedido: quem
+                                        // alcancasse esta chamada registava uma
+                                        // aprovacao humana em nome de qualquer pessoa,
+                                        // e um registo de aprovacao existe precisamente
+                                        // para atribuir responsabilidade. Passa a ser
+                                        // sempre a identidade AUTENTICADA (a mesma que
+                                        // ja vai para `audit_admin` na linha de baixo —
+                                        // nao fazia sentido a auditoria saber quem era
+                                        // e o registo de aprovacao nao saber).
+                                        //
+                                        // Se o corpo indicar um aprovador, tem de
+                                        // coincidir: 403 em vez de correccao silenciosa,
+                                        // para que a tentativa fique visivel.
+                                        let approver = crate::auth::vincular_aprovador(
+                                            approver.as_deref(),
+                                            &audit_principal,
+                                        )?;
+                                        runtime
+                                            .persist_human_approval_for(
+                                                &incident_id,
+                                                &proposal_id,
+                                                &approval_id,
+                                                approver,
+                                                operation == "sentinel-approve",
+                                                &reason,
+                                            )
+                                            .map(|lsn| format!("approval_lsn={lsn}"))
+                                            .map_err(|error| error.to_string())
+                                    },
+                                );
+                            match result {
+                                Ok(message) => (true, message),
+                                Err(error) => (false, error),
+                            }
+                        }
+                        None => (false, "sentinel desabilitado".into()),
+                    },
+                    "rebuild" => {
+                        let view = if r.arg.is_empty() {
+                            None
+                        } else {
+                            Some(r.arg.as_str())
+                        };
+                        match engine.rebuild(view) {
+                            Ok(()) => (true, "rebuilt".to_string()),
+                            Err(e) => (false, e.to_string()),
+                        }
                     }
+                    op if op.starts_with("shred:") => {
+                        let agent = op.strip_prefix("shred:").unwrap_or("");
+                        match token
+                            .ok_or_else(|| {
+                                heraclitus_core::HeraclitusError::Config(
+                                    "durable admin token required".into(),
+                                )
+                            })
+                            .and_then(|t| engine.shred_effect(agent, t))
+                        {
+                            Ok(true) => (
+                                true,
+                                format!("crypto-shred: key destroyed for agent '{agent}'"),
+                            ),
+                            Ok(false) => {
+                                (true, format!("crypto-shred: no key for agent '{agent}'"))
+                            }
+                            Err(e) => (false, e.to_string()),
+                        }
+                    }
+                    other => (false, format!("unknown admin op: {other}")),
                 }
-                other => (false, format!("unknown admin op: {other}")),
+            };
+            let read_only = !admin_ctx.roles.iter().any(|role| role == "admin")
+                || matches!(
+                    r.op.as_str(),
+                    "stats"
+                        | "admin-operation-state"
+                        | "verify"
+                        | "sentinel-status"
+                        | "sentinel-incidents"
+                        | "sentinel-actions"
+                        | "legal-holds"
+                        | "regulatory-policies"
+                        | "regulatory-decisions"
+                        | "privacy-state"
+                        | "deferred-anchor-prepare"
+                        | "deferred-anchors"
+                        | "model-bundles"
+                );
+            let result = if read_only {
+                dispatch(None)
+            } else {
+                let supplied = serde_json::from_str::<serde_json::Value>(&r.arg)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("idempotency_key")
+                            .and_then(|k| k.as_str())
+                            .map(str::to_owned)
+                    });
+                let key = supplied.unwrap_or_else(|| admin_ctx.request_id.clone());
+                let mut op = crate::trusted_admin::AdminOperation::new(
+                    key.clone(),
+                    key,
+                    crate::trusted_admin::AdminOperationKind::Custom {
+                        name: r.op.clone(),
+                        details: r.arg.clone(),
+                    },
+                    "authenticated Admin RPC",
+                );
+                op.parameters_digest = blake3::hash(r.arg.as_bytes()).to_hex().to_string();
+                match engine.execute_admin(&admin_ctx, &op, |token| {
+                    let result = dispatch(Some(token));
+                    if result.0 {
+                        Ok(result)
+                    } else {
+                        Err(heraclitus_core::HeraclitusError::Config(result.1))
+                    }
+                }) {
+                    Ok(result) => result,
+                    Err(error) => (false, error.to_string()),
+                }
             };
             engine.audit_admin(&operation, result.0, &audit_principal);
             result

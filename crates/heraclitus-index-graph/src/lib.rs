@@ -111,7 +111,7 @@ impl GraphIndex {
     ///   and `AArch64` (no host-endianness dependence).
     pub fn state_hash(&self) -> [u8; 32] {
         let mut h = blake3::Hasher::new();
-        h.update(b"HGRAPH-STATE-v1");
+        h.update(b"HGRAPH-STATE-v2");
         h.update(&(self.dense.len() as u64).to_be_bytes());
         for (i, ev) in self.dense.events().iter().enumerate() {
             h.update(&(i as u32).to_be_bytes());
@@ -126,6 +126,17 @@ impl GraphIndex {
             h.update(&(outs.len() as u32).to_be_bytes());
             for t in outs {
                 h.update(&t.to_be_bytes());
+            }
+        }
+        let mut properties: Vec<_> = self.attr_idx.iter().collect();
+        properties.sort_unstable_by(|a, b| a.key().cmp(b.key()));
+        h.update(&(properties.len() as u64).to_be_bytes());
+        for property in properties {
+            h.update(&(property.key().len() as u64).to_be_bytes());
+            h.update(property.key().as_bytes());
+            h.update(&property.value().len().to_be_bytes());
+            for id in property.value().iter() {
+                h.update(&id.to_be_bytes());
             }
         }
         *h.finalize().as_bytes()
@@ -145,37 +156,71 @@ struct GraphSnapshot {
     watermark: Lsn,
 }
 
+struct DashPairs<'a, K, V>(&'a DashMap<K, V>);
+impl<K: serde::Serialize + Eq + std::hash::Hash, V: serde::Serialize> serde::Serialize
+    for DashPairs<'_, K, V>
+{
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for entry in self.0.iter() {
+            seq.serialize_element(&(entry.key(), entry.value()))?;
+        }
+        seq.end()
+    }
+}
+struct HashPairs<'a>(&'a HashMap<EventId, Lsn>);
+impl serde::Serialize for HashPairs<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for entry in self.0 {
+            seq.serialize_element(&entry)?;
+        }
+        seq.end()
+    }
+}
+struct BitmapPairs<'a>(&'a DashMap<String, RoaringBitmap>);
+impl serde::Serialize for BitmapPairs<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for entry in self.0.iter() {
+            let mut bytes = Vec::with_capacity(entry.value().serialized_size());
+            entry
+                .value()
+                .serialize_into(&mut bytes)
+                .map_err(serde::ser::Error::custom)?;
+            seq.serialize_element(&(entry.key(), bytes))?;
+        }
+        seq.end()
+    }
+}
+#[derive(serde::Serialize)]
+struct GraphSnapshotRef<'a> {
+    out: DashPairs<'a, EventId, Vec<EventId>>,
+    inn: DashPairs<'a, EventId, Vec<EventId>>,
+    attr: BitmapPairs<'a>,
+    by_internal: &'a [EventId],
+    lsn_of: HashPairs<'a>,
+    watermark: Lsn,
+}
+
 impl View for GraphIndex {
     fn name(&self) -> &str {
         "graph"
     }
 
     fn checkpoint(&self, dir: &std::path::Path) -> Result<(), heraclitus_core::HeraclitusError> {
-        let mut attr = Vec::with_capacity(self.attr_idx.len());
-        for e in self.attr_idx.iter() {
-            let mut bytes = Vec::with_capacity(e.value().serialized_size());
-            e.value()
-                .serialize_into(&mut bytes)
-                .map_err(|err| heraclitus_core::HeraclitusError::Serialization(err.to_string()))?;
-            attr.push((e.key().clone(), bytes));
-        }
         heraclitus_views::ckpt::save(
             dir,
             "graph",
-            &GraphSnapshot {
-                out: self
-                    .out
-                    .iter()
-                    .map(|e| (*e.key(), e.value().clone()))
-                    .collect(),
-                inn: self
-                    .inn
-                    .iter()
-                    .map(|e| (*e.key(), e.value().clone()))
-                    .collect(),
-                attr,
-                by_internal: self.dense.events().to_vec(),
-                lsn_of: self.lsn_of.iter().map(|(k, v)| (*k, *v)).collect(),
+            &GraphSnapshotRef {
+                out: DashPairs(&self.out),
+                inn: DashPairs(&self.inn),
+                attr: BitmapPairs(&self.attr_idx),
+                by_internal: self.dense.events(),
+                lsn_of: HashPairs(&self.lsn_of),
                 watermark: self.watermark,
             },
         )
@@ -251,6 +296,17 @@ impl View for GraphIndex {
 mod tests {
     use super::*;
     use heraclitus_core::EventKind;
+
+    #[test]
+    fn state_hash_detects_property_index_changes() {
+        let mut event = Episode::new("x", EventKind::Observation, vec![]);
+        let mut a = GraphIndex::new();
+        a.apply(0, &event);
+        event.attrs.insert("role".into(), "admin".into());
+        let mut b = GraphIndex::new();
+        b.apply(0, &event);
+        assert_ne!(a.state_hash(), b.state_hash());
+    }
 
     #[test]
     fn adjacency_and_attrs() {

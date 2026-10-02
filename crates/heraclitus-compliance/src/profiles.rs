@@ -106,7 +106,8 @@ impl ComplianceProfile {
             controls: vec![ControlDefinition {
                 control_id: "LGPD-Art46".to_string(),
                 title: "Segurança dos Dados".to_string(),
-                requirement: "Adoção de medidas de segurança, técnicas e administrativas".to_string(),
+                requirement: "Adoção de medidas de segurança, técnicas e administrativas"
+                    .to_string(),
                 responsibility: Responsibility::Organization,
                 evidence_requirements: vec![],
                 automated_checks: vec![],
@@ -177,7 +178,7 @@ pub fn evaluate_profile(
     let mut not_assessed_count = 0;
     let mut not_applicable_count = 0;
     let mut external_count = 0;
-    
+
     let mut bindings = Vec::new();
 
     let mut evidence_map: HashMap<String, EvidenceBinding> = HashMap::new();
@@ -264,8 +265,8 @@ mod tests {
             test_reference: "test1".to_string(),
             assessed_at_secs: 100,
         };
-        let report = evaluate_profile(&profile, &[ev.clone()]);
-        
+        let report = evaluate_profile(&profile, std::slice::from_ref(&ev));
+
         assert_eq!(report.controls_evaluated, 1);
         assert_eq!(report.pass_count, 1);
         assert_eq!(report.not_assessed_count, 0);
@@ -277,7 +278,7 @@ mod tests {
     fn test_evaluate_profile_missing_evidence() {
         let profile = ComplianceProfile::lgpd_brazil_profile();
         let report = evaluate_profile(&profile, &[]);
-        
+
         assert_eq!(report.controls_evaluated, 1);
         assert_eq!(report.pass_count, 0);
         assert_eq!(report.not_assessed_count, 1);
@@ -295,7 +296,7 @@ mod tests {
             evidence_requirements: vec![],
             automated_checks: vec![],
         });
-        
+
         let ev1 = EvidenceBinding {
             control_id: "LGPD-Art46".to_string(),
             status: ControlStatus::NotApplicable,

@@ -53,49 +53,75 @@ pub fn events_as_single_ipc<L: EpisodeLog + ?Sized>(
     as_of: Option<u64>,
 ) -> Result<Vec<u8>, AnalyticsError> {
     let to = as_of.unwrap_or(u64::MAX).min(log.head());
-    // Flight faz streaming incremental: lotes fixos de BATCH_ROWS, não o morsel
-    // adaptativo (que agregaria tudo num só batch grande no fio).
-    // R25: scan JANELADO (múltiplo de BATCH_ROWS) — o scan(0, to) antigo
-    // materializava o log inteiro num Vec de Episodes ALÉM dos batches Arrow e
-    // dos bytes IPC (~3× o log em RAM por pedido). Janela = 50×BATCH_ROWS
-    // mantém os lotes cheios no fio, exceto o último de cada janela final.
-    let batches = scan_to_batches_windowed(log, to)?;
-    let mut buf = Vec::new();
+    let mut buf = BoundedIpc(Vec::new());
     {
-        let schema = batches
-            .first()
-            .map(|b| b.schema())
-            .unwrap_or_else(|| Arc::new(datafusion::arrow::datatypes::Schema::empty()));
-        let mut w = StreamWriter::try_new(&mut buf, schema.as_ref())
+        let schema = crate::vectorized::batch_schema();
+        let mut writer = StreamWriter::try_new(&mut buf, schema.as_ref())
             .map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
-        for b in &batches {
-            w.write(b)
-                .map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
-        }
-        w.finish()
+        visit_batches(log, to, |batch| {
+            writer
+                .write(&batch)
+                .map_err(|e| AnalyticsError::Arrow(e.to_string()))
+        })?;
+        writer
+            .finish()
             .map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
     }
-    Ok(buf)
+    Ok(buf.0)
 }
 
-/// R25: varre `[0, to)` em janelas (múltiplas de BATCH_ROWS) e converte cada
-/// janela em RecordBatches — nunca materializa o log inteiro como `Episode`s.
-fn scan_to_batches_windowed<L: EpisodeLog + ?Sized>(
+// The synchronous compatibility APIs return a Vec and therefore need a hard
+// output budget. Large exports use the server's streaming gRPC Flight API.
+const MAX_IPC_BYTES: usize = 128 << 20;
+struct BoundedIpc(Vec<u8>);
+impl std::io::Write for BoundedIpc {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.0.len().saturating_add(bytes.len()) > MAX_IPC_BYTES {
+            return Err(std::io::Error::other(
+                "IPC output exceeds 128MiB; use streaming Flight",
+            ));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn visit_batches<L: EpisodeLog + ?Sized>(
     log: &L,
     to: u64,
-) -> Result<Vec<RecordBatch>, AnalyticsError> {
-    const WINDOW: usize = 50 * BATCH_ROWS;
-    let mut batches = Vec::new();
+    mut visit: impl FnMut(RecordBatch) -> Result<(), AnalyticsError>,
+) -> Result<(), AnalyticsError> {
     let mut cur = 0u64;
+    let mut pending = Vec::new();
+    let mut resident = 0usize;
     while cur < to {
-        let window = log.scan_capped(cur, to, WINDOW)?;
+        let window = log.scan_capped(cur, to, 16)?;
         let Some(&(last, _)) = window.last() else {
             break;
         };
-        batches.extend(episodes_to_batches_sized(&window, BATCH_ROWS)?);
-        cur = last + 1;
+        for row in window {
+            let charge = row.1.resident_bytes();
+            if !pending.is_empty()
+                && (pending.len() >= BATCH_ROWS || resident.saturating_add(charge) > 16 << 20)
+            {
+                for batch in episodes_to_batches_sized(&pending, BATCH_ROWS)? {
+                    visit(batch)?;
+                }
+                pending.clear();
+                resident = 0;
+            }
+            resident = resident.saturating_add(charge);
+            pending.push(row);
+        }
+        cur = last.saturating_add(1);
     }
-    Ok(batches)
+    for batch in episodes_to_batches_sized(&pending, BATCH_ROWS)? {
+        visit(batch)?;
+    }
+    Ok(())
 }
 
 /// Serviço Flight sobre o log real.
@@ -128,13 +154,21 @@ impl FlightService for IpcFlightService {
     fn do_get(&self, ticket: &Ticket) -> Result<Vec<BatchBytes>, String> {
         let as_of = Self::parse_ticket(ticket)?;
         let to = as_of.unwrap_or(u64::MAX).min(self.log.head());
-        // Streaming incremental: lotes fixos de BATCH_ROWS (contrato do fio).
-        // R25: janelado — sem materializar o log inteiro como Episodes.
-        let batches = scan_to_batches_windowed(self.log.as_ref(), to).map_err(|e| e.to_string())?;
-        batches
-            .iter()
-            .map(|b| batch_to_ipc(b).map_err(|e| e.to_string()))
-            .collect()
+        let mut streams = Vec::new();
+        let mut total = 0usize;
+        visit_batches(self.log.as_ref(), to, |batch| {
+            let bytes = batch_to_ipc(&batch)?;
+            total = total.saturating_add(bytes.len());
+            if total > MAX_IPC_BYTES {
+                return Err(AnalyticsError::Arrow(
+                    "IPC output exceeds 128MiB; use streaming Flight".into(),
+                ));
+            }
+            streams.push(bytes);
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+        Ok(streams)
     }
 
     /// Ingere batches IPC como episódios (colunas exigidas: `agent_id`,

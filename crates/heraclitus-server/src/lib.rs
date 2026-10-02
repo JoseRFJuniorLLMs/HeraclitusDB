@@ -52,7 +52,7 @@ pub async fn serve_with_agent_plane(
     plane: agent_plane::AgentPlane,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), HeraclitusError> {
-    serve_inner(config, Some(plane), shutdown, Boot::auto()).await
+    serve_inner(config, Some(plane), shutdown, Boot::auto(), None).await
 }
 
 /// Like [`serve`], but with an explicit boot narrator. `serve` uses
@@ -66,11 +66,27 @@ pub async fn serve_with(
 ) -> Result<(), HeraclitusError> {
     #[cfg(feature = "agent")]
     {
-        serve_inner(config, None, shutdown, boot).await
+        serve_inner(config, None, shutdown, boot, None).await
     }
     #[cfg(not(feature = "agent"))]
     {
-        serve_inner(config, shutdown, boot).await
+        serve_inner(config, shutdown, boot, None).await
+    }
+}
+
+/// Readiness fires after engine recovery and all listeners have bound.
+pub async fn serve_with_readiness(
+    config: HeraclitusConfig,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ready: impl FnOnce() -> Result<(), HeraclitusError> + Send + 'static,
+) -> Result<(), HeraclitusError> {
+    #[cfg(feature = "agent")]
+    {
+        serve_inner(config, None, shutdown, Boot::auto(), Some(Box::new(ready))).await
+    }
+    #[cfg(not(feature = "agent"))]
+    {
+        serve_inner(config, shutdown, Boot::auto(), Some(Box::new(ready))).await
     }
 }
 
@@ -80,6 +96,7 @@ async fn serve_inner(
     #[cfg(feature = "agent")] agent: Option<agent_plane::AgentPlane>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     boot: Boot,
+    ready: Option<Box<dyn FnOnce() -> Result<(), HeraclitusError> + Send>>,
 ) -> Result<(), HeraclitusError> {
     // `HeraclitusConfig` também pode ser construído diretamente por embedding
     // (sem `load`); os gates de segurança precisam valer nos dois caminhos.
@@ -1177,11 +1194,17 @@ async fn serve_inner(
             }
         ),
     );
-    boot.ready(&grpc_addr.to_string(), &rest_addr.to_string());
+    let grpc_listener = tokio::net::TcpListener::bind(grpc_addr).await?;
+    let grpc_local = grpc_listener.local_addr()?;
+    let incoming = tonic::transport::server::TcpIncoming::from(grpc_listener);
+    if let Some(ready) = ready {
+        ready()?;
+    }
+    boot.ready(&grpc_local.to_string(), &rest_addr.to_string());
     let _ = heraclitus_platform::notify_ready();
     grpc_server
         .add_service(svc)
-        .serve_with_shutdown(grpc_addr, shutdown)
+        .serve_with_incoming_shutdown(incoming, shutdown)
         .await
         .map_err(|e| HeraclitusError::Config(format!("grpc serve: {e}")))?;
     #[cfg(feature = "agent")]

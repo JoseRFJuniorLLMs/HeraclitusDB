@@ -170,7 +170,8 @@ mod tests {
             };
             f.write_all(&hdr.encode()).unwrap();
             for (i, p) in payloads.iter().enumerate() {
-                let rec = encode_record(format::FORMAT_VERSION, 100 + i as u64, 500 + i as u64, p).unwrap();
+                let rec = encode_record(format::FORMAT_VERSION, 100 + i as u64, 500 + i as u64, p)
+                    .unwrap();
                 hashes.push(format::record_leaf(format::FORMAT_VERSION, &rec));
                 f.write_all(&rec).unwrap();
             }
@@ -231,7 +232,11 @@ mod tests {
         }
         let seg = MappedSegment::open(&path).unwrap();
         let got: Vec<Result<Lsn, _>> = seg.records().map(|r| r.map(|(l, _, _)| l)).collect();
-        assert_eq!(got.len(), 2, "deve retornar o primeiro OK e o segundo Err(Corruption)");
+        assert_eq!(
+            got.len(),
+            2,
+            "deve retornar o primeiro OK e o segundo Err(Corruption)"
+        );
         assert_eq!(got[0].as_ref().unwrap(), &0);
         assert!(matches!(got[1], Err(HeraclitusError::Corruption { .. })));
     }

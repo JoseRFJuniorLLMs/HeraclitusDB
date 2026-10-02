@@ -3336,6 +3336,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "sha1",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.20",
@@ -3376,6 +3377,7 @@ dependencies = [
  "dashmap",
  "rand 0.8.7",
  "tempfile",
+ "zeroize",
 ]
 
 [[package]]
@@ -3394,9 +3396,12 @@ name = "heraclitus-forensic"
 version = "3.0.1"
 dependencies = [
  "blake3",
+ "heraclitus-compliance",
  "heraclitus-core",
  "heraclitus-crypto",
  "hex",
+ "libc",
+ "p256",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3717,6 +3722,7 @@ version = "3.0.1"
 dependencies = [
  "blake3",
  "heraclitus-core",
+ "heraclitus-log",
  "heraclitus-views",
  "serde",
  "serde_json",

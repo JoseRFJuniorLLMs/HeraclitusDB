@@ -19,6 +19,7 @@ rand = { workspace = true }
 der = { workspace = true }
 const-oid = { workspace = true }
 sha2 = { workspace = true }
+sha1 = "0.10"
 p256 = { workspace = true }
 # async daemon (carimbagem por linha d'água)
 tokio = { workspace = true }

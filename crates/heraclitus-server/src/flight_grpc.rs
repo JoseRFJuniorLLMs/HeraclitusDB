@@ -63,20 +63,77 @@ impl FlightService for HeraclitusFlight {
     async fn do_get(&self, req: Request<Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
         let as_of = Self::parse_ticket(req.get_ref())?;
         let log = self.log.clone();
-        // Materialização fora do executor async (o scan lê disco).
-        let batches = tokio::task::spawn_blocking(move || {
-            let to = as_of.unwrap_or(u64::MAX).min(log.head());
-            let events = log.scan(0, to).map_err(|e| e.to_string())?;
-            // Streaming Flight: lotes fixos de BATCH_ROWS (contrato do fio).
-            episodes_to_batches_sized(&events, BATCH_ROWS).map_err(|e| e.to_string())
-        })
-        .await
-        .map_err(|e| Status::internal(format!("join: {e}")))?
-        .map_err(Status::internal)?;
-
-        // O encoder OFICIAL do protocolo: RecordBatches → FlightData frames.
+        static ADMISSION: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::OnceLock::new();
+        let permit = ADMISSION
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2)))
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("Flight busy"))?;
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tokio::task::spawn_blocking(move || {
+            let produce = || -> Result<(), arrow_flight::error::FlightError> {
+                let to = as_of.unwrap_or(u64::MAX).min(log.head());
+                let mut cursor = 0;
+                let mut pending = Vec::new();
+                let mut bytes = 0;
+                while cursor < to && !tx.is_closed() {
+                    let rows = log.scan_capped(cursor, to, 16).map_err(|e| {
+                        arrow_flight::error::FlightError::ExternalError(Box::new(e))
+                    })?;
+                    if rows.is_empty() {
+                        break;
+                    }
+                    for row in rows {
+                        cursor = row.0.saturating_add(1);
+                        let size = row.1.resident_bytes();
+                        if size > 16 << 20 {
+                            return Err(arrow_flight::error::FlightError::ProtocolError(
+                                "Flight row exceeds 16MiB".into(),
+                            ));
+                        }
+                        if !pending.is_empty()
+                            && (pending.len() == BATCH_ROWS || bytes + size > 16 << 20)
+                        {
+                            for batch in
+                                episodes_to_batches_sized(&pending, BATCH_ROWS).map_err(|e| {
+                                    arrow_flight::error::FlightError::ExternalError(Box::new(e))
+                                })?
+                            {
+                                if tx.blocking_send(Ok(batch)).is_err() {
+                                    return Ok(());
+                                }
+                            }
+                            pending.clear();
+                            bytes = 0;
+                        }
+                        bytes += size;
+                        pending.push(row);
+                    }
+                }
+                if !pending.is_empty() && !tx.is_closed() {
+                    for batch in episodes_to_batches_sized(&pending, BATCH_ROWS)
+                        .map_err(|e| arrow_flight::error::FlightError::ExternalError(Box::new(e)))?
+                    {
+                        if tx.blocking_send(Ok(batch)).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Ok(())
+            };
+            if let Err(error) = produce() {
+                let _ = tx.blocking_send(Err(error));
+            }
+        });
+        // Admission covers the stream lifetime, including buffered batches.
+        // Dropping a cancelled stream releases the permit and closes the queue.
+        let batches = futures::stream::unfold((rx, permit), |(mut rx, permit)| async move {
+            rx.recv().await.map(|batch| (batch, (rx, permit)))
+        });
         let stream = FlightDataEncoderBuilder::new()
-            .build(futures::stream::iter(batches.into_iter().map(Ok)))
+            .with_schema(heraclitus_analytics::vectorized::batch_schema())
+            .build(batches)
             .map_err(|e| Status::internal(e.to_string()))
             .boxed();
         Ok(Response::new(stream))
@@ -158,6 +215,11 @@ pub async fn serve_flight<L: EpisodeLog + 'static>(
         .await
         .map_err(|e| format!("flight bind {addr}: {e}"))?;
     let local = listener.local_addr().map_err(|e| e.to_string())?;
+    if !local.ip().is_loopback() {
+        return Err(
+            "Flight has no authenticated transport; only loopback listeners are supported".into(),
+        );
+    }
     let svc = FlightServiceServer::new(HeraclitusFlight::new(log));
     let handle = tokio::spawn(async move {
         let incoming = tonic::transport::server::TcpIncoming::from(listener);

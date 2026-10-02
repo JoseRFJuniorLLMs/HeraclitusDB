@@ -214,6 +214,18 @@ pub fn verificar_criticas(cert: &Certificate, policy: &RestricoesPolicy) -> Resu
         }
     }
     for ext in exts.iter() {
+        // Constraints must never be waived or ignored simply because an
+        // issuer made them noncritical. Until policy-tree processing exists,
+        // decline chains which instruct us to map/constrain/inhibit policies.
+        if ["2.5.29.33", "2.5.29.36", "2.5.29.54"]
+            .iter()
+            .any(|oid| ext.extn_id.to_string() == *oid)
+        {
+            return Err(erro(format!(
+                "certificate policy restriction {} is unsupported; chain refused",
+                ext.extn_id
+            )));
+        }
         if !ext.critical {
             continue;
         }
@@ -455,4 +467,24 @@ fn ip_cobre(base: &[u8], nome: &[u8]) -> bool {
         .zip(mask.iter())
         .zip(nome.iter())
         .all(|((a, m), n)| (a & m) == (n & m))
+}
+
+#[cfg(test)]
+mod policy_restriction_regressions {
+    use super::*;
+    #[test]
+    fn unsupported_policy_restrictions_cannot_be_ignored_or_waived() {
+        let mut cert = crate::test_pki::chain_de_teste().tsa;
+        for oid in ["2.5.29.33", "2.5.29.36", "2.5.29.54"] {
+            let ext = x509_cert::ext::Extension {
+                extn_id: oid.parse().unwrap(),
+                critical: false,
+                extn_value: der::asn1::OctetString::new(vec![0x30, 0]).unwrap(),
+            };
+            cert.tbs_certificate.extensions = Some(vec![ext]);
+            let mut policy = RestricoesPolicy::default();
+            policy.criticas_toleradas.insert(oid.parse().unwrap());
+            assert!(verificar_criticas(&cert, &policy).is_err());
+        }
+    }
 }

@@ -95,6 +95,28 @@ pub struct Episode {
 }
 
 impl Episode {
+    /// Conservative resident estimate, including allocation capacity and the
+    /// memtable adjacency overlay. It is an admission estimate, not RSS.
+    pub fn resident_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.content.capacity()
+            + self.agent_id.capacity()
+            + self.session_id.capacity()
+            + self.parents.capacity() * (std::mem::size_of::<EventId>() + 32)
+            + self
+                .attrs
+                .iter()
+                .map(|(k, v)| k.capacity() + v.capacity() + 96)
+                .sum::<usize>()
+            + self.embedding.as_ref().map_or(0, |p| {
+                (p.hyp.capacity() + p.sph.capacity() + p.euc.capacity()) * 4
+            })
+            + match &self.kind {
+                EventKind::Custom(s) => s.capacity(),
+                _ => 0,
+            }
+    }
+
     pub fn new(agent_id: impl Into<String>, kind: EventKind, content: Vec<u8>) -> Self {
         Self {
             id: EventId::new(),

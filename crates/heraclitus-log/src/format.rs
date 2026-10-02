@@ -173,7 +173,7 @@ pub fn encode_record(
         ))
     })?;
     let mut buf = Vec::with_capacity(RECORD_HEADER_LEN + payload.len());
-    buf.extend_from_slice(&len_u32.to_le_bytes());           // [0..4]   len
+    buf.extend_from_slice(&len_u32.to_le_bytes()); // [0..4]   len
     buf.extend_from_slice(&[0u8; 4]); //                       [4..8]   crc (filled below)
     buf.extend_from_slice(&lsn.to_le_bytes()); //              [8..16]  lsn
     buf.extend_from_slice(&hlc.to_le_bytes()); //              [16..24] hlc

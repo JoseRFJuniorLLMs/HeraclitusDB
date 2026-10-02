@@ -56,10 +56,20 @@ pub struct ImmutableReceipt {
 
 /// Interface para armazenamento de objetos imutáveis com políticas de retenção.
 pub trait ImmutableStore: Send + Sync {
-    fn put_immutable(&self, object_id: &str, data: &[u8], retention: &RetentionPolicy) -> Result<ImmutableReceipt, String>;
+    fn put_immutable(
+        &self,
+        object_id: &str,
+        data: &[u8],
+        retention: &RetentionPolicy,
+    ) -> Result<ImmutableReceipt, String>;
     fn head(&self, object_id: &str) -> Result<ImmutableMetadata, String>;
     fn verify_retention(&self, object_id: &str) -> Result<RetentionStatus, String>;
-    fn set_legal_hold(&self, object_id: &str, hold: bool, reason: &str) -> Result<ImmutableReceipt, String>;
+    fn set_legal_hold(
+        &self,
+        object_id: &str,
+        hold: bool,
+        reason: &str,
+    ) -> Result<ImmutableReceipt, String>;
 }
 
 #[derive(Clone)]
@@ -88,14 +98,17 @@ impl LocalWormBackend {
             .unwrap_or_default()
             .as_secs()
     }
-    
+
     fn compute_digest(data: &[u8]) -> String {
         blake3::hash(data).to_hex().to_string()
     }
 
     /// Recupera os dados binários do objeto armazenado.
     pub fn get_data(&self, object_id: &str) -> Result<Vec<u8>, String> {
-        let store = self.store.read().map_err(|_| "Falha ao adquirir o lock".to_string())?;
+        let store = self
+            .store
+            .read()
+            .map_err(|_| "Falha ao adquirir o lock".to_string())?;
         if let Some(record) = store.get(object_id) {
             Ok(record.data.clone())
         } else {
@@ -129,7 +142,10 @@ impl ImmutableStore for LocalWormBackend {
         data: &[u8],
         retention: &RetentionPolicy,
     ) -> Result<ImmutableReceipt, String> {
-        let mut store = self.store.write().map_err(|_| "Falha ao adquirir o lock".to_string())?;
+        let mut store = self
+            .store
+            .write()
+            .map_err(|_| "Falha ao adquirir o lock".to_string())?;
 
         // WORM: não permite sobrescrever um objeto que já existe
         if store.contains_key(object_id) {
@@ -174,7 +190,10 @@ impl ImmutableStore for LocalWormBackend {
     }
 
     fn head(&self, object_id: &str) -> Result<ImmutableMetadata, String> {
-        let store = self.store.read().map_err(|_| "Falha ao adquirir o lock".to_string())?;
+        let store = self
+            .store
+            .read()
+            .map_err(|_| "Falha ao adquirir o lock".to_string())?;
         if let Some(record) = store.get(object_id) {
             let mut meta = record.metadata.clone();
             meta.retention_status = Self::eval_retention(&record.policy, Self::current_time_secs());
@@ -185,9 +204,15 @@ impl ImmutableStore for LocalWormBackend {
     }
 
     fn verify_retention(&self, object_id: &str) -> Result<RetentionStatus, String> {
-        let store = self.store.read().map_err(|_| "Falha ao adquirir o lock".to_string())?;
+        let store = self
+            .store
+            .read()
+            .map_err(|_| "Falha ao adquirir o lock".to_string())?;
         if let Some(record) = store.get(object_id) {
-            Ok(Self::eval_retention(&record.policy, Self::current_time_secs()))
+            Ok(Self::eval_retention(
+                &record.policy,
+                Self::current_time_secs(),
+            ))
         } else {
             Err("Objeto não encontrado".to_string())
         }
@@ -199,7 +224,10 @@ impl ImmutableStore for LocalWormBackend {
         hold: bool,
         reason: &str,
     ) -> Result<ImmutableReceipt, String> {
-        let mut store = self.store.write().map_err(|_| "Falha ao adquirir o lock".to_string())?;
+        let mut store = self
+            .store
+            .write()
+            .map_err(|_| "Falha ao adquirir o lock".to_string())?;
         if let Some(record) = store.get_mut(object_id) {
             record.policy.legal_hold = hold;
             if hold {
@@ -207,8 +235,9 @@ impl ImmutableStore for LocalWormBackend {
             } else {
                 record.policy.reason.clear();
             }
-            record.metadata.retention_status = Self::eval_retention(&record.policy, Self::current_time_secs());
-            
+            record.metadata.retention_status =
+                Self::eval_retention(&record.policy, Self::current_time_secs());
+
             let mut receipt = record.receipt.clone();
             receipt.trusted_time_secs = Self::current_time_secs();
             record.receipt = receipt.clone();
@@ -279,17 +308,19 @@ mod tests {
         };
 
         let obj_id = "doc3";
-        store.put_immutable(obj_id, b"legal hold test", &policy).unwrap();
+        store
+            .put_immutable(obj_id, b"legal hold test", &policy)
+            .unwrap();
 
         // Ativa o legal hold
         store.set_legal_hold(obj_id, true, "investigação").unwrap();
-        
+
         let status_on = store.verify_retention(obj_id).unwrap();
         assert_eq!(status_on, RetentionStatus::IndefiniteLegalHold);
 
         // Desativa o legal hold
         store.set_legal_hold(obj_id, false, "").unwrap();
-        
+
         let status_off = store.verify_retention(obj_id).unwrap();
         assert_eq!(status_off, RetentionStatus::Unprotected);
     }

@@ -30,13 +30,13 @@ pub mod ckpt {
         name: &str,
         value: &T,
     ) -> Result<(), HeraclitusError> {
-        let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard())
-            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
         let tmp = dir.join(format!("{name}.ckpt.tmp"));
         {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&bytes)?;
-            f.sync_all()?;
+            let mut f = std::io::BufWriter::with_capacity(64 << 10, std::fs::File::create(&tmp)?);
+            bincode::serde::encode_into_std_write(value, &mut f, bincode::config::standard())
+                .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+            f.flush()?;
+            f.get_ref().sync_all()?;
         }
         std::fs::rename(&tmp, dir.join(format!("{name}.ckpt")))?;
         Ok(())
@@ -109,6 +109,8 @@ pub struct ViewRegistry {
     /// saltado). Enquanto estiver a `true`, `checkpoint()` é um no-op — ver
     /// [`ViewRegistry::mark_unmaterialized`].
     nao_materializado: bool,
+    checkpoint_watermarks: Vec<Option<Lsn>>,
+    dirty: Vec<bool>,
 }
 
 impl ViewRegistry {
@@ -145,6 +147,8 @@ impl ViewRegistry {
             watermarks,
             watermarks_vec: Vec::new(),
             nao_materializado: false,
+            checkpoint_watermarks: Vec::new(),
+            dirty: Vec::new(),
         })
     }
 
@@ -154,6 +158,8 @@ impl ViewRegistry {
         self.names.push(name);
         self.watermarks_vec.push(wm);
         self.views.push(view);
+        self.checkpoint_watermarks.push(None);
+        self.dirty.push(true);
     }
 
     pub fn view_names(&self) -> Vec<String> {
@@ -174,6 +180,7 @@ impl ViewRegistry {
         }
         for (i, v) in self.views.iter_mut().enumerate() {
             v.apply(lsn, event);
+            self.dirty[i] = true;
             if lsn > self.watermarks_vec[i] {
                 self.watermarks_vec[i] = lsn;
             }
@@ -232,6 +239,7 @@ impl ViewRegistry {
     pub fn mark_unmaterialized(&mut self) {
         for v in self.views.iter_mut() {
             v.reset();
+            self.checkpoint_watermarks.fill(None);
         }
         self.reset_watermarks();
         self.nao_materializado = true;
@@ -299,6 +307,8 @@ impl ViewRegistry {
                 );
             }
             self.watermarks_vec[i] = do_snapshot;
+            self.checkpoint_watermarks[i] = Some(do_snapshot);
+            self.dirty[i] = false;
         }
 
         let from = self
@@ -313,7 +323,7 @@ impl ViewRegistry {
         let mut applied = 0u64;
         let mut cur = from;
         while cur <= head {
-            let batch = log.scan_capped(cur, head + 1, 100_000)?;
+            let batch = log.scan_capped(cur, head, 256)?;
             if batch.is_empty() {
                 break;
             }
@@ -326,6 +336,7 @@ impl ViewRegistry {
                     let wm = self.watermarks_vec[i];
                     if wm == 0 || *lsn > wm {
                         v.apply(*lsn, ep);
+                        self.dirty[i] = true;
                         self.watermarks_vec[i] = *lsn;
                         applied += 1;
                     }
@@ -384,6 +395,7 @@ impl ViewRegistry {
                 .unwrap_or(true)
             {
                 v.reset();
+                self.checkpoint_watermarks.fill(None);
                 self.watermarks_vec[i] = 0;
                 self.watermarks.remove(&self.names[i]);
             }
@@ -391,7 +403,7 @@ impl ViewRegistry {
         let head = log.head();
         let mut cur = 0u64;
         while cur < head {
-            let batch = log.scan_capped(cur, head, 100_000)?;
+            let batch = log.scan_capped(cur, head, 256)?;
             let Some(&(last, _)) = batch.last() else {
                 break;
             };
@@ -405,6 +417,7 @@ impl ViewRegistry {
                         .unwrap_or(true)
                     {
                         v.apply(*lsn, ep);
+                        self.dirty[i] = true;
                         self.watermarks_vec[i] = *lsn;
                     }
                 }
@@ -436,8 +449,12 @@ impl ViewRegistry {
             );
             return Ok(());
         }
-        for v in &self.views {
-            v.checkpoint(&self.dir)?;
+        for (i, v) in self.views.iter().enumerate() {
+            if self.dirty[i] || self.checkpoint_watermarks[i] != Some(v.watermark()) {
+                v.checkpoint(&self.dir)?;
+                self.checkpoint_watermarks[i] = Some(v.watermark());
+                self.dirty[i] = false;
+            }
         }
         self.sync_watermarks_map();
         self.persist_watermarks()
@@ -560,6 +577,66 @@ mod tests {
             *self.state.lock().unwrap() = (0, 0);
             self.wm = 0;
         }
+    }
+
+    #[test]
+    fn unchanged_restored_view_is_not_rewritten_but_live_change_is() {
+        struct CountedCheckpoint {
+            inner: SnapshotView,
+            calls: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl View for CountedCheckpoint {
+            fn name(&self) -> &str {
+                self.inner.name()
+            }
+            fn watermark(&self) -> Lsn {
+                self.inner.watermark()
+            }
+            fn apply(&mut self, lsn: Lsn, event: &Episode) {
+                self.inner.apply(lsn, event);
+            }
+            fn reset(&mut self) {
+                self.inner.reset();
+            }
+            fn restore(&mut self, dir: &Path) -> Result<bool, HeraclitusError> {
+                self.inner.restore(dir)
+            }
+            fn checkpoint(&self, dir: &Path) -> Result<(), HeraclitusError> {
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.inner.checkpoint(dir)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let log = heraclitus_log::Log::open(dir.path().join("log"), 1 << 20, FsyncPolicy::Always)
+            .unwrap();
+        for _ in 0..3 {
+            log.append(Episode::new("a", EventKind::Observation, vec![]))
+                .unwrap();
+        }
+        let state = Arc::new(Mutex::new((0, 0)));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut first = ViewRegistry::open(dir.path()).unwrap();
+        first.register(Box::new(CountedCheckpoint {
+            inner: SnapshotView {
+                state: state.clone(),
+                wm: 0,
+            },
+            calls: calls.clone(),
+        }));
+        first.catch_up(&log).unwrap();
+        first.checkpoint().unwrap();
+        let mut restored = ViewRegistry::open(dir.path()).unwrap();
+        restored.register(Box::new(CountedCheckpoint {
+            inner: SnapshotView { state, wm: 0 },
+            calls: calls.clone(),
+        }));
+        assert_eq!(restored.catch_up(&log).unwrap(), 0);
+        restored.checkpoint().unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        restored.apply(3, &Episode::new("a", EventKind::Observation, vec![]));
+        restored.checkpoint().unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 
     /// O `watermarks.json` não pode mandar sobre o snapshot restaurado.

@@ -10,6 +10,7 @@ blake3 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 dashmap = { workspace = true }
 rand = { workspace = true }
+zeroize = "1"
 
 [dev-dependencies]
 tempfile = { workspace = true }

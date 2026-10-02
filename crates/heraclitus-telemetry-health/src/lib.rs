@@ -796,11 +796,38 @@ fn combine_trust(
     }
 }
 
+#[derive(Clone)]
+struct HistorySource(std::sync::Arc<dyn heraclitus_log::EpisodeLog>);
+impl std::fmt::Debug for HistorySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CanonicalLog")
+    }
+}
+
+type ReducedHistory = (
+    BTreeMap<SensorIdentity, ReducedSensor>,
+    BTreeMap<SensorIdentity, Lsn>,
+);
+
 /// Deterministic view. Events are retained by LSN so historical snapshots are
 /// reconstructed with the same exclusive bound used by `AS OF LSN` queries.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TelemetryHealthGraph {
     events: BTreeMap<Lsn, TelemetryHealthEnvelope>,
+    #[serde(skip)]
+    history: Option<HistorySource>,
+    #[serde(skip)]
+    cache_valid: bool,
+    #[serde(skip)]
+    highest_retained_lsn: Option<Lsn>,
+    #[serde(skip)]
+    event_sizes: BTreeMap<Lsn, usize>,
+    #[serde(skip)]
+    event_bytes: usize,
+    #[serde(skip)]
+    current: BTreeMap<SensorIdentity, ReducedSensor>,
+    #[serde(skip)]
+    latest: BTreeMap<SensorIdentity, Lsn>,
     rejected_payload_lsns: BTreeSet<Lsn>,
     watermark: Lsn,
 }
@@ -810,13 +837,84 @@ impl TelemetryHealthGraph {
         Self::default()
     }
 
+    /// In a server, historical envelopes stay in HRKL. Only the current
+    /// sensor state and a bounded tail are resident in this view.
+    pub fn with_log<L: heraclitus_log::EpisodeLog + 'static>(log: std::sync::Arc<L>) -> Self {
+        Self {
+            history: Some(HistorySource(log)),
+            ..Self::default()
+        }
+    }
+
+    fn retain(&mut self, lsn: Lsn, envelope: TelemetryHealthEnvelope) {
+        if self.events.contains_key(&lsn) {
+            return;
+        }
+        if self.highest_retained_lsn.is_none_or(|last| lsn > last)
+            && (self.cache_valid || (self.highest_retained_lsn.is_none() && self.events.is_empty()))
+        {
+            self.cache_valid = true;
+            self.current
+                .entry(envelope.identity.clone())
+                .or_default()
+                .apply(lsn, &envelope);
+            self.latest.insert(envelope.identity.clone(), lsn);
+        } else if self.history.is_some() {
+            match self.replay_history(self.watermark.max(lsn).saturating_add(1)) {
+                Ok((current, latest)) => {
+                    self.current = current;
+                    self.latest = latest;
+                    self.cache_valid = true;
+                }
+                Err(_) => {
+                    self.cache_valid = false;
+                }
+            }
+        } else {
+            self.cache_valid = true;
+            // Standalone callers may insert out of order; rebuild canonically.
+            self.events.insert(lsn, envelope.clone());
+            self.current.clear();
+            self.latest.clear();
+            for (l, e) in &self.events {
+                self.current
+                    .entry(e.identity.clone())
+                    .or_default()
+                    .apply(*l, e);
+                self.latest.insert(e.identity.clone(), *l);
+            }
+        }
+        self.highest_retained_lsn = Some(
+            self.highest_retained_lsn
+                .unwrap_or(0)
+                .max(lsn)
+                .max(self.events.last_key_value().map_or(0, |(last, _)| *last)),
+        );
+        let charge = serde_json::to_vec(&envelope).map_or(0, |b| b.len());
+        self.events.insert(lsn, envelope);
+        self.event_bytes += charge;
+        self.event_sizes.insert(lsn, charge);
+        if self.history.is_some() {
+            while self.events.len() > 1024 || self.event_bytes > 8 << 20 {
+                if let Some((old, _)) = self.events.pop_first() {
+                    self.event_bytes -= self.event_sizes.remove(&old).unwrap_or(0);
+                } else {
+                    break;
+                }
+            }
+            while self.rejected_payload_lsns.len() > 1024 {
+                self.rejected_payload_lsns.pop_first();
+            }
+        }
+    }
+
     pub fn apply_envelope(
         &mut self,
         lsn: Lsn,
         envelope: TelemetryHealthEnvelope,
     ) -> Result<(), HeraclitusError> {
         envelope.validate()?;
-        self.events.entry(lsn).or_insert(envelope);
+        self.retain(lsn, envelope);
         self.watermark = self.watermark.max(lsn);
         Ok(())
     }
@@ -927,32 +1025,84 @@ impl TelemetryHealthGraph {
         *blake3::hash(&bytes).as_bytes()
     }
 
-    fn reduce_as_of(&self, exclusive_lsn: Lsn) -> BTreeMap<SensorIdentity, ReducedSensor> {
+    fn replay_history(&self, exclusive_lsn: Lsn) -> Result<ReducedHistory, HeraclitusError> {
+        let source = self.history.as_ref().expect("history source required");
         let mut sensors = BTreeMap::new();
-        for (lsn, envelope) in self.events.range(..exclusive_lsn) {
-            sensors
-                .entry(envelope.identity.clone())
-                .or_insert_with(|| ReducedSensor {
-                    integrity: IntegrityStatus::Unknown,
-                    ..Default::default()
-                })
-                .apply(*lsn, envelope);
+        let mut latest = BTreeMap::new();
+        let mut cursor = 0;
+        while cursor < exclusive_lsn {
+            let rows = source.0.scan_capped(cursor, exclusive_lsn, 16)?;
+            let Some((last, _)) = rows.last() else {
+                break;
+            };
+            for (lsn, ep) in &rows {
+                if !matches!(&ep.kind, EventKind::Custom(k) if k == TELEMETRY_HEALTH_KIND) {
+                    continue;
+                }
+                if let Ok(envelope) = serde_json::from_slice::<TelemetryHealthEnvelope>(&ep.content)
+                {
+                    if envelope.validate().is_err() {
+                        continue;
+                    }
+                    sensors
+                        .entry(envelope.identity.clone())
+                        .or_insert_with(ReducedSensor::default)
+                        .apply(*lsn, &envelope);
+                    latest.insert(envelope.identity, *lsn);
+                }
+            }
+            cursor = last.saturating_add(1);
+        }
+        Ok((sensors, latest))
+    }
+
+    pub fn try_snapshots_as_of(
+        &self,
+        exclusive_lsn: Lsn,
+    ) -> Result<Vec<TelemetryHealthSnapshot>, HeraclitusError> {
+        Ok(self
+            .try_reduce_as_of(exclusive_lsn)?
+            .into_iter()
+            .map(|(identity, state)| state.snapshot(identity, exclusive_lsn))
+            .collect())
+    }
+
+    fn reduce_as_of(&self, exclusive_lsn: Lsn) -> BTreeMap<SensorIdentity, ReducedSensor> {
+        // Compatibility API: absence is Unknown to the health gate. Callers
+        // needing diagnostics should use try_snapshots_as_of.
+        self.try_reduce_as_of(exclusive_lsn).unwrap_or_default()
+    }
+
+    fn try_reduce_as_of(
+        &self,
+        exclusive_lsn: Lsn,
+    ) -> Result<BTreeMap<SensorIdentity, ReducedSensor>, HeraclitusError> {
+        let mut sensors = BTreeMap::new();
+        let mut latest = BTreeMap::new();
+        if self.cache_valid && exclusive_lsn > self.watermark {
+            sensors = self.current.clone();
+            latest = self.latest.clone();
+        } else if self.history.is_some() {
+            (sensors, latest) = self.replay_history(exclusive_lsn)?;
+        } else {
+            for (lsn, envelope) in self.events.range(..exclusive_lsn) {
+                sensors
+                    .entry(envelope.identity.clone())
+                    .or_insert_with(ReducedSensor::default)
+                    .apply(*lsn, envelope);
+                latest.insert(envelope.identity.clone(), *lsn);
+            }
         }
         for (identity, state) in &mut sensors {
             if state.freshness().status == FreshnessStatus::Silent {
-                // Derived finding: its evidence is the latest included LSN, not
-                // a fabricated attack event. The status remains query-time pure.
-                let lsn = self
-                    .events
-                    .range(..exclusive_lsn)
-                    .rev()
-                    .find(|(_, envelope)| &envelope.identity == identity)
-                    .map(|(lsn, _)| *lsn)
-                    .unwrap_or(0);
-                state.finding(HealthFindingKind::SensorSilent, lsn, 1);
+                state.finding(
+                    HealthFindingKind::SensorSilent,
+                    latest.get(identity).copied().unwrap_or(0),
+                    1,
+                );
             }
         }
-        sensors
+        Ok(sensors)
     }
 }
 
@@ -973,7 +1123,7 @@ impl View for TelemetryHealthGraph {
                 Ok(envelope)
             }) {
             Ok(envelope) => {
-                self.events.entry(lsn).or_insert(envelope);
+                self.retain(lsn, envelope);
             }
             Err(_) => {
                 self.rejected_payload_lsns.insert(lsn);
@@ -987,6 +1137,12 @@ impl View for TelemetryHealthGraph {
     }
 
     fn checkpoint(&self, dir: &Path) -> Result<(), HeraclitusError> {
+        if !self.cache_valid && (self.highest_retained_lsn.is_some() || !self.events.is_empty()) {
+            return Err(HeraclitusError::StorageEngine(
+                "cannot checkpoint an invalid telemetry cache; replay the canonical log first"
+                    .into(),
+            ));
+        }
         let mut events = Vec::with_capacity(self.events.len());
         for (lsn, envelope) in &self.events {
             let encoded = serde_json::to_vec(envelope)
@@ -995,9 +1151,12 @@ impl View for TelemetryHealthGraph {
         }
         heraclitus_views::ckpt::save(
             dir,
-            self.name(),
+            "telemetry-health-v2",
             &TelemetryHealthCheckpoint {
                 events,
+                current_json: serde_json::to_vec(&self.current.iter().collect::<Vec<_>>())
+                    .map_err(|e| HeraclitusError::Serialization(e.to_string()))?,
+                latest: self.latest.iter().map(|(id, l)| (id.clone(), *l)).collect(),
                 rejected_payload_lsns: self.rejected_payload_lsns.iter().copied().collect(),
                 watermark: self.watermark,
             },
@@ -1006,7 +1165,7 @@ impl View for TelemetryHealthGraph {
 
     fn restore(&mut self, dir: &Path) -> Result<bool, HeraclitusError> {
         let Some(snapshot) =
-            heraclitus_views::ckpt::load::<TelemetryHealthCheckpoint>(dir, self.name())?
+            heraclitus_views::ckpt::load::<TelemetryHealthCheckpoint>(dir, "telemetry-health-v2")?
         else {
             return Ok(false);
         };
@@ -1022,7 +1181,28 @@ impl View for TelemetryHealthGraph {
             }
             events.insert(lsn, envelope);
         }
+        let current: Vec<(SensorIdentity, ReducedSensor)> =
+            match serde_json::from_slice(&snapshot.current_json) {
+                Ok(value) => value,
+                Err(_) => {
+                    self.reset();
+                    return Ok(false);
+                }
+            };
         *self = Self {
+            cache_valid: true,
+            highest_retained_lsn: snapshot.latest.iter().map(|(_, l)| *l).max(),
+            event_sizes: events
+                .iter()
+                .map(|(l, e)| (*l, serde_json::to_vec(e).map_or(0, |b| b.len())))
+                .collect(),
+            event_bytes: events
+                .values()
+                .map(|e| serde_json::to_vec(e).map_or(0, |b| b.len()))
+                .sum(),
+            history: self.history.clone(),
+            current: current.into_iter().collect(),
+            latest: snapshot.latest.into_iter().collect(),
             events,
             rejected_payload_lsns: snapshot.rejected_payload_lsns.into_iter().collect(),
             watermark: snapshot.watermark,
@@ -1031,12 +1211,14 @@ impl View for TelemetryHealthGraph {
     }
 
     fn state_hash(&self) -> Option<[u8; 32]> {
-        let bytes = serde_json::to_vec(self).ok()?;
-        Some(*blake3::hash(&bytes).as_bytes())
+        Some(self.state_hash_as_of(self.watermark.saturating_add(1)))
     }
 
     fn reset(&mut self) {
-        *self = Self::default();
+        *self = Self {
+            history: self.history.clone(),
+            ..Self::default()
+        };
     }
 }
 
@@ -1045,6 +1227,8 @@ impl View for TelemetryHealthGraph {
 /// self-describing deserializer, which bincode intentionally is not.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TelemetryHealthCheckpoint {
+    current_json: Vec<u8>,
+    latest: Vec<(SensorIdentity, Lsn)>,
     events: Vec<(Lsn, Vec<u8>)>,
     rejected_payload_lsns: Vec<Lsn>,
     watermark: Lsn,
@@ -1080,6 +1264,84 @@ mod tests {
             connector_digest: digest(),
             approved: true,
         })
+    }
+
+    #[test]
+    fn serde_roundtrip_rebuilds_cache_before_accepting_new_or_delayed_events() {
+        let mut original = TelemetryHealthGraph::new();
+        original
+            .apply_envelope(1, envelope(1, expectation(Some(3))))
+            .unwrap();
+        original
+            .apply_envelope(3, envelope(3, activated()))
+            .unwrap();
+        let mut restored: TelemetryHealthGraph =
+            serde_json::from_slice(&serde_json::to_vec(&original).unwrap()).unwrap();
+        for lsn in [2, 4] {
+            let event = envelope(
+                lsn,
+                TelemetryHealthEvent::HealthEvaluationTick(HealthEvaluationTick {
+                    evaluated_at_micros: lsn,
+                }),
+            );
+            original.apply_envelope(lsn, event.clone()).unwrap();
+            restored.apply_envelope(lsn, event).unwrap();
+            assert_eq!(original.state_hash_as_of(5), restored.state_hash_as_of(5));
+        }
+    }
+
+    #[test]
+    fn canonical_log_history_survives_tail_eviction_out_of_order_and_restart() {
+        use heraclitus_log::Log;
+        let dir = tempfile::tempdir().unwrap();
+        let log = std::sync::Arc::new(
+            Log::open(dir.path(), 1 << 20, heraclitus_core::FsyncPolicy::Always).unwrap(),
+        );
+        let mut bounded = TelemetryHealthGraph::with_log(log.clone());
+        let mut reference = TelemetryHealthGraph::new();
+        let mut delayed = None;
+        for i in 0..1500 {
+            let envelope = envelope(
+                i,
+                if i == 0 {
+                    expectation(Some(0))
+                } else {
+                    TelemetryHealthEvent::HealthEvaluationTick(HealthEvaluationTick {
+                        evaluated_at_micros: i,
+                    })
+                },
+            );
+            let ep = Episode::new(
+                "sensor",
+                EventKind::Custom(TELEMETRY_HEALTH_KIND.into()),
+                serde_json::to_vec(&envelope).unwrap(),
+            );
+            let lsn = log.append(ep).unwrap();
+            reference.apply_envelope(lsn, envelope.clone()).unwrap();
+            if i == 1400 {
+                delayed = Some((lsn, envelope));
+            } else {
+                bounded.apply_envelope(lsn, envelope).unwrap();
+            }
+        }
+        let (lsn, envelope) = delayed.unwrap();
+        bounded.apply_envelope(lsn, envelope).unwrap();
+        assert!(bounded.events.len() <= 1024);
+        assert!(bounded.event_bytes <= 8 << 20);
+        for bound in [1, 100, 1401, 1500] {
+            assert_eq!(
+                bounded.state_hash_as_of(bound),
+                reference.state_hash_as_of(bound)
+            );
+        }
+        bounded.checkpoint(dir.path()).unwrap();
+        let mut restarted = TelemetryHealthGraph::with_log(log);
+        assert!(restarted.restore(dir.path()).unwrap());
+        assert_eq!(restarted.state_hash(), reference.state_hash());
+        assert_eq!(
+            restarted.state_hash_as_of(100),
+            reference.state_hash_as_of(100)
+        );
     }
 
     #[test]

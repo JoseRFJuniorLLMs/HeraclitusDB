@@ -110,7 +110,7 @@ impl EncryptionEnvelopeV2 {
         let mut offset = 0;
         let version = u16::from_be_bytes(envelope_bytes[offset..offset + 2].try_into().ok()?);
         offset += 2;
-        if version != 2 {
+        if version != 2 && version != 3 {
             return None;
         }
 
@@ -118,7 +118,8 @@ impl EncryptionEnvelopeV2 {
         if envelope_bytes.len() < offset + 2 {
             return None;
         }
-        let tenant_len = u16::from_be_bytes(envelope_bytes[offset..offset + 2].try_into().ok()?) as usize;
+        let tenant_len =
+            u16::from_be_bytes(envelope_bytes[offset..offset + 2].try_into().ok()?) as usize;
         offset += 2;
         if envelope_bytes.len() < offset + tenant_len {
             return None;
@@ -131,12 +132,15 @@ impl EncryptionEnvelopeV2 {
         if envelope_bytes.len() < offset + 2 {
             return None;
         }
-        let key_id_len = u16::from_be_bytes(envelope_bytes[offset..offset + 2].try_into().ok()?) as usize;
+        let key_id_len =
+            u16::from_be_bytes(envelope_bytes[offset..offset + 2].try_into().ok()?) as usize;
         offset += 2;
         if envelope_bytes.len() < offset + key_id_len {
             return None;
         }
-        let key_id = std::str::from_utf8(&envelope_bytes[offset..offset + key_id_len]).ok()?.to_string();
+        let key_id = std::str::from_utf8(&envelope_bytes[offset..offset + key_id_len])
+            .ok()?
+            .to_string();
         offset += key_id_len;
 
         // key_epoch
@@ -150,12 +154,15 @@ impl EncryptionEnvelopeV2 {
         if envelope_bytes.len() < offset + 2 {
             return None;
         }
-        let algo_len = u16::from_be_bytes(envelope_bytes[offset..offset + 2].try_into().ok()?) as usize;
+        let algo_len =
+            u16::from_be_bytes(envelope_bytes[offset..offset + 2].try_into().ok()?) as usize;
         offset += 2;
         if envelope_bytes.len() < offset + algo_len {
             return None;
         }
-        let algorithm = std::str::from_utf8(&envelope_bytes[offset..offset + algo_len]).ok()?.to_string();
+        let algorithm = std::str::from_utf8(&envelope_bytes[offset..offset + algo_len])
+            .ok()?
+            .to_string();
         offset += algo_len;
 
         // nonce (12 bytes)
@@ -199,29 +206,25 @@ impl EncryptionEnvelopeV2 {
 
         let aad_digest = *blake3::hash(aad).as_bytes();
 
-        let ct = cipher
-            .encrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: plaintext,
-                    aad,
-                },
-            )
-            .expect("chacha20poly1305 encrypt nunca falha para chave/nonce validos");
-
         let mut result = Vec::new();
         // version = 2 (u16)
-        result.extend_from_slice(&2u16.to_be_bytes());
+        result.extend_from_slice(&3u16.to_be_bytes());
 
         // tenant (tamanho + bytes)
         let tenant_bytes = tenant.as_str().as_bytes();
-        let tenant_len: u16 = tenant_bytes.len().try_into().expect("tenant id excede u16::MAX");
+        let tenant_len: u16 = tenant_bytes
+            .len()
+            .try_into()
+            .expect("tenant id excede u16::MAX");
         result.extend_from_slice(&tenant_len.to_be_bytes());
         result.extend_from_slice(tenant_bytes);
 
         // key_id
         let key_id_bytes = key_id.as_bytes();
-        let key_id_len: u16 = key_id_bytes.len().try_into().expect("key_id excede u16::MAX");
+        let key_id_len: u16 = key_id_bytes
+            .len()
+            .try_into()
+            .expect("key_id excede u16::MAX");
         result.extend_from_slice(&key_id_len.to_be_bytes());
         result.extend_from_slice(key_id_bytes);
 
@@ -231,7 +234,10 @@ impl EncryptionEnvelopeV2 {
         // algorithm
         let algo = "ChaCha20-Poly1305";
         let algo_bytes = algo.as_bytes();
-        let algo_len: u16 = algo_bytes.len().try_into().expect("algorithm excede u16::MAX");
+        let algo_len: u16 = algo_bytes
+            .len()
+            .try_into()
+            .expect("algorithm excede u16::MAX");
         result.extend_from_slice(&algo_len.to_be_bytes());
         result.extend_from_slice(algo_bytes);
 
@@ -241,15 +247,36 @@ impl EncryptionEnvelopeV2 {
         // aad_digest
         result.extend_from_slice(&aad_digest);
 
-        // ciphertext
+        // Version 3 binds the complete encoded header and caller context.
+        let mut authenticated = b"heraclitus-envelope-v3\0".to_vec();
+        authenticated.extend_from_slice(&result);
+        authenticated.extend_from_slice(aad);
+        let ct = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &authenticated,
+                },
+            )
+            .expect("chacha20poly1305 encrypt nunca falha para chave/nonce validos");
+
         result.extend_from_slice(&ct);
 
         result
     }
 
-    /// Abre o envelope binário V2 e retorna os dados em texto plano.
+    /// Abre o envelope autenticado V3 e retorna os dados em texto plano.
     pub fn open(key: &[u8; 32], envelope_bytes: &[u8], expected_aad: &[u8]) -> Option<Vec<u8>> {
         let header = Self::peek_header(envelope_bytes)?;
+        // Legacy V2 did not authenticate its routing metadata. Never silently
+        // downgrade: migration must explicitly use open_legacy_v2.
+        if header.version != 3 || header.algorithm != "ChaCha20-Poly1305" {
+            return None;
+        }
+        let mut authenticated = b"heraclitus-envelope-v3\0".to_vec();
+        authenticated.extend_from_slice(&envelope_bytes[..header.ciphertext_offset]);
+        authenticated.extend_from_slice(expected_aad);
 
         // Verificar aad_digest com BLAKE3
         let expected_digest = *blake3::hash(expected_aad).as_bytes();
@@ -264,7 +291,35 @@ impl EncryptionEnvelopeV2 {
                 Nonce::from_slice(&header.nonce),
                 Payload {
                     msg: ct,
-                    aad: expected_aad,
+                    aad: &authenticated,
+                },
+            )
+            .ok()
+    }
+    /// Explicit migration-only decoder for unauthenticated V2 routing metadata.
+    /// Callers must supply trusted expected routing information independently.
+    pub fn open_legacy_v2(
+        key: &[u8; 32],
+        bytes: &[u8],
+        aad: &[u8],
+        expected: &KeyRef,
+    ) -> Option<Vec<u8>> {
+        let h = Self::peek_header(bytes)?;
+        if h.version != 2
+            || h.algorithm != "ChaCha20-Poly1305"
+            || h.tenant != expected.tenant
+            || h.key_id != expected.key_id
+            || h.key_epoch != expected.epoch
+            || h.aad_digest != *blake3::hash(aad).as_bytes()
+        {
+            return None;
+        }
+        ChaCha20Poly1305::new(Key::from_slice(key))
+            .decrypt(
+                Nonce::from_slice(&h.nonce),
+                Payload {
+                    msg: &bytes[h.ciphertext_offset..],
+                    aad,
                 },
             )
             .ok()
@@ -276,7 +331,11 @@ pub trait KeyProvider: Send + Sync {
     fn provider_id(&self) -> &str;
     fn capabilities(&self) -> KeyCapabilities;
     fn generate_data_key(&self, tenant: &TenantId) -> Result<(KeyRef, [u8; 32]), String>;
-    fn wrap_data_key(&self, tenant: &TenantId, data_key: &[u8; 32]) -> Result<WrappedDataKey, String>;
+    fn wrap_data_key(
+        &self,
+        tenant: &TenantId,
+        data_key: &[u8; 32],
+    ) -> Result<WrappedDataKey, String>;
     fn unwrap_data_key(&self, key: &WrappedDataKey) -> Result<[u8; 32], String>;
     fn rotate(&self, tenant: &TenantId) -> Result<KeyRef, String>;
     fn destroy(&self, key: &KeyRef) -> Result<DestroyReceipt, String>;
@@ -285,48 +344,71 @@ pub trait KeyProvider: Send + Sync {
 
 /// Provedor de chaves baseado em software para testes e dev
 pub struct SoftwareKeyProvider {
-    master_keys: Arc<Mutex<HashMap<TenantId, [u8; 32]>>>,
-    epochs: Arc<Mutex<HashMap<TenantId, u64>>>,
+    state: Arc<Mutex<HashMap<TenantId, TenantKeys>>>,
+}
+
+struct TenantKeys {
+    epoch: u64,
+    keys: HashMap<u64, Option<[u8; 32]>>,
+}
+
+fn key_reference(tenant: &TenantId, epoch: u64) -> KeyRef {
+    KeyRef {
+        tenant: tenant.clone(),
+        key_id: format!("{}-key-{}", tenant.as_str(), epoch),
+        epoch,
+    }
+}
+
+fn reference_aad(key: &KeyRef) -> Vec<u8> {
+    let mut bytes = b"heraclitus-key-wrap-v2\0".to_vec();
+    for part in [key.tenant.as_str().as_bytes(), key.key_id.as_bytes()] {
+        bytes.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(part);
+    }
+    bytes.extend_from_slice(&key.epoch.to_be_bytes());
+    bytes
 }
 
 impl SoftwareKeyProvider {
-    /// Cria uma nova instância de SoftwareKeyProvider
     pub fn new() -> Self {
         Self {
-            master_keys: Arc::new(Mutex::new(HashMap::new())),
-            epochs: Arc::new(Mutex::new(HashMap::new())),
+            state: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    #[allow(dead_code)]
-    fn get_or_create_master_key(&self, tenant: &TenantId) -> [u8; 32] {
-        let mut keys = self.master_keys.lock().unwrap();
-        if let Some(k) = keys.get(tenant) {
-            *k
-        } else {
-            let mut new_key = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut new_key);
-            keys.insert(tenant.clone(), new_key);
-            new_key
-        }
-    }
-    
-    fn get_epoch(&self, tenant: &TenantId) -> u64 {
-        let mut epochs = self.epochs.lock().unwrap();
-        *epochs.entry(tenant.clone()).or_insert(1)
-    }
-    
-    fn increment_epoch(&self, tenant: &TenantId) -> u64 {
-        let mut epochs = self.epochs.lock().unwrap();
-        let e = epochs.entry(tenant.clone()).or_insert(1);
-        *e += 1;
-        *e
+    fn current(&self, tenant: &TenantId) -> Result<(KeyRef, [u8; 32]), String> {
+        let mut state = self.state.lock().map_err(|_| "key provider poisoned")?;
+        let keys = state.entry(tenant.clone()).or_insert_with(|| {
+            let mut key = [0; 32];
+            rand::thread_rng().fill_bytes(&mut key);
+            TenantKeys {
+                epoch: 1,
+                keys: HashMap::from([(1, Some(key))]),
+            }
+        });
+        let key = keys
+            .keys
+            .get(&keys.epoch)
+            .copied()
+            .flatten()
+            .ok_or("current epoch destroyed; rotate before creating new wrapped keys")?;
+        Ok((key_reference(tenant, keys.epoch), key))
     }
 }
 
 impl Default for SoftwareKeyProvider {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for TenantKeys {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        for key in self.keys.values_mut().flatten() {
+            key.zeroize();
+        }
     }
 }
 
@@ -347,22 +429,20 @@ impl KeyProvider for SoftwareKeyProvider {
     fn generate_data_key(&self, tenant: &TenantId) -> Result<(KeyRef, [u8; 32]), String> {
         let mut data_key = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut data_key);
-        
-        let epoch = self.get_epoch(tenant);
-        
-        let key_ref = KeyRef {
-            tenant: tenant.clone(),
-            key_id: format!("{}-key-{}", tenant.as_str(), epoch),
-            epoch,
-        };
-        
+
+        let (key_ref, _) = self.current(tenant)?;
         Ok((key_ref, data_key))
     }
 
-    fn wrap_data_key(&self, tenant: &TenantId, data_key: &[u8; 32]) -> Result<WrappedDataKey, String> {
-        let master = self.get_or_create_master_key(tenant);
-        let epoch = self.get_epoch(tenant);
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&master));
+    fn wrap_data_key(
+        &self,
+        tenant: &TenantId,
+        data_key: &[u8; 32],
+    ) -> Result<WrappedDataKey, String> {
+        let (key_ref, master) = self.current(tenant)?;
+        let master = zeroize::Zeroizing::new(master);
+        let aad = reference_aad(&key_ref);
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(master.as_ref()));
         let mut nonce = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut nonce);
         let ct = cipher
@@ -370,7 +450,7 @@ impl KeyProvider for SoftwareKeyProvider {
                 Nonce::from_slice(&nonce),
                 Payload {
                     msg: data_key,
-                    aad: tenant.as_str().as_bytes(),
+                    aad: &aad,
                 },
             )
             .map_err(|e| format!("wrap error: {e}"))?;
@@ -379,64 +459,81 @@ impl KeyProvider for SoftwareKeyProvider {
         wrapped.extend_from_slice(&ct);
 
         Ok(WrappedDataKey {
-            key_ref: KeyRef {
-                tenant: tenant.clone(),
-                key_id: format!("{}-key-{}", tenant.as_str(), epoch),
-                epoch,
-            },
+            key_ref,
             wrapped_ciphertext: wrapped,
-            wrapping_algorithm: "ChaCha20-Poly1305".into(),
-            created_at_secs: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+            wrapping_algorithm: "ChaCha20-Poly1305/keyref-v2".into(),
+            created_at_secs: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
         })
     }
 
     fn unwrap_data_key(&self, key: &WrappedDataKey) -> Result<[u8; 32], String> {
-        let master = {
-            let keys = self.master_keys.lock().unwrap();
-            keys.get(&key.key_ref.tenant).copied().ok_or_else(|| {
-                format!(
-                    "Chave mestre para tenant {} não encontrada (chave destruída ou inexistente)",
-                    key.key_ref.tenant.as_str()
-                )
-            })?
-        };
+        if key.wrapping_algorithm != "ChaCha20-Poly1305/keyref-v2"
+            || key.key_ref != key_reference(&key.key_ref.tenant, key.key_ref.epoch)
+        {
+            return Err("invalid key reference or wrapping algorithm".into());
+        }
+        let master = self
+            .state
+            .lock()
+            .map_err(|_| "key provider poisoned")?
+            .get(&key.key_ref.tenant)
+            .and_then(|k| k.keys.get(&key.key_ref.epoch))
+            .copied()
+            .flatten()
+            .ok_or("key epoch destroyed or unknown")?;
+        let master = zeroize::Zeroizing::new(master);
+        let aad = reference_aad(&key.key_ref);
         if key.wrapped_ciphertext.len() < 12 {
             return Err("ciphertext encapsulado inválido (menor que nonce)".into());
         }
         let nonce = &key.wrapped_ciphertext[..12];
         let ct = &key.wrapped_ciphertext[12..];
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&master));
-        let pt = cipher
-            .decrypt(
-                Nonce::from_slice(nonce),
-                Payload {
-                    msg: ct,
-                    aad: key.key_ref.tenant.as_str().as_bytes(),
-                },
-            )
-            .map_err(|e| format!("desencapsulamento falhou: {e}"))?;
-        pt.try_into()
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(master.as_ref()));
+        let pt = zeroize::Zeroizing::new(
+            cipher
+                .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad: &aad })
+                .map_err(|e| format!("desencapsulamento falhou: {e}"))?,
+        );
+        pt.as_slice()
+            .try_into()
             .map_err(|_| "tamanho de chave desencapsulada incorreto".into())
     }
 
     fn rotate(&self, tenant: &TenantId) -> Result<KeyRef, String> {
-        let epoch = self.increment_epoch(tenant);
-        
-        let mut keys = self.master_keys.lock().unwrap();
-        let mut new_key = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut new_key);
-        keys.insert(tenant.clone(), new_key);
-        
-        Ok(KeyRef {
-            tenant: tenant.clone(),
-            key_id: format!("{}-key-{}", tenant.as_str(), epoch),
-            epoch,
-        })
+        // Initialize before advancing, including rotate on a new tenant.
+        let _ = self.current(tenant);
+        let mut state = self.state.lock().map_err(|_| "key provider poisoned")?;
+        let keys = state.get_mut(tenant).ok_or("tenant unavailable")?;
+        let epoch = keys.epoch.checked_add(1).ok_or("key epoch overflow")?;
+        let mut key = [0; 32];
+        rand::thread_rng().fill_bytes(&mut key);
+        keys.keys.insert(epoch, Some(key));
+        {
+            use zeroize::Zeroize;
+            key.zeroize();
+        }
+        keys.epoch = epoch;
+        Ok(key_reference(tenant, epoch))
     }
 
     fn destroy(&self, key: &KeyRef) -> Result<DestroyReceipt, String> {
-        let mut keys = self.master_keys.lock().unwrap();
-        let existed = keys.remove(&key.tenant).is_some();
+        if *key != key_reference(&key.tenant, key.epoch) {
+            return Err("invalid key reference".into());
+        }
+        let mut state = self.state.lock().map_err(|_| "key provider poisoned")?;
+        let slot = state
+            .get_mut(&key.tenant)
+            .and_then(|k| k.keys.get_mut(&key.epoch))
+            .ok_or("unknown key reference")?;
+        let existed = slot.is_some();
+        if let Some(key_bytes) = slot.as_mut() {
+            use zeroize::Zeroize;
+            key_bytes.zeroize();
+        }
+        *slot = None;
         let destroyed_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -453,7 +550,7 @@ impl KeyProvider for SoftwareKeyProvider {
         Ok(DestroyReceipt {
             key_ref: key.clone(),
             destroyed_at_secs: destroyed_at,
-            provider_signature: Some(format!("sig-software-{}", proof_digest)),
+            provider_signature: None, // Software receipts are checksums, not signatures.
             proof_digest,
         })
     }
@@ -468,55 +565,94 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rotation_preserves_history_and_stale_destroy_is_exact() {
+        let p = SoftwareKeyProvider::new();
+        let t = TenantId::new("tenant".into()).unwrap();
+        let old = p.wrap_data_key(&t, &[9; 32]).unwrap();
+        p.rotate(&t).unwrap();
+        let new = p.wrap_data_key(&t, &[8; 32]).unwrap();
+        assert_eq!(p.unwrap_data_key(&old).unwrap(), [9; 32]);
+        p.destroy(&old.key_ref).unwrap();
+        assert!(p.unwrap_data_key(&old).is_err());
+        assert_eq!(p.unwrap_data_key(&new).unwrap(), [8; 32]);
+        let mut forged = new.clone();
+        forged.key_ref.key_id.push('x');
+        assert!(p.destroy(&forged.key_ref).is_err());
+        assert!(p.unwrap_data_key(&forged).is_err());
+        assert_eq!(p.unwrap_data_key(&new).unwrap(), [8; 32]);
+    }
+
+    #[test]
+    fn header_mutation_is_authenticated_and_legacy_downgrade_is_rejected() {
+        let key = [7; 32];
+        let bytes = EncryptionEnvelopeV2::seal(
+            &key,
+            b"secret",
+            b"ctx",
+            TenantId::new("t1".into()).unwrap(),
+            "key-1".into(),
+            1,
+        );
+        let header = EncryptionEnvelopeV2::peek_header(&bytes).unwrap();
+        for i in 0..header.ciphertext_offset {
+            let mut mutated = bytes.clone();
+            mutated[i] ^= 1;
+            assert!(
+                EncryptionEnvelopeV2::open(&key, &mutated, b"ctx").is_none(),
+                "accepted byte {i}"
+            );
+        }
+        assert_eq!(
+            EncryptionEnvelopeV2::open(&key, &bytes, b"ctx").unwrap(),
+            b"secret"
+        );
+    }
+    #[test]
     fn test_software_key_provider() {
         let provider = SoftwareKeyProvider::new();
         let tenant = TenantId::new("tenant-1".to_string()).unwrap();
-        
+
         assert_eq!(provider.provider_id(), "software-v1");
         assert_eq!(provider.health(), KeyProviderHealth::Ready);
-        
+
         let (key_ref, _data_key) = provider.generate_data_key(&tenant).unwrap();
         assert_eq!(key_ref.tenant, tenant);
         assert_eq!(key_ref.epoch, 1);
-        
+
         let rotated_ref = provider.rotate(&tenant).unwrap();
         assert_eq!(rotated_ref.epoch, 2);
-        
+
         let receipt = provider.destroy(&rotated_ref).unwrap();
         assert_eq!(receipt.key_ref.epoch, 2);
     }
-    
+
     #[test]
     fn test_encryption_envelope_v2() {
         let tenant = TenantId::new("tenant-abc".to_string()).unwrap();
         let key_id = "key-123".to_string();
         let epoch = 1;
-        
+
         let mut key = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut key);
-        
+
         let plaintext = b"Mensagem ultra secreta!";
         let aad = b"Contexto de autenticacao";
-        
-        let envelope_bytes = EncryptionEnvelopeV2::seal(
-            &key,
-            plaintext,
-            aad,
-            tenant,
-            key_id,
-            epoch
-        );
-        
-        let opened = EncryptionEnvelopeV2::open(&key, &envelope_bytes, aad).expect("Falha ao abrir o envelope");
+
+        let envelope_bytes =
+            EncryptionEnvelopeV2::seal(&key, plaintext, aad, tenant, key_id, epoch);
+
+        let opened = EncryptionEnvelopeV2::open(&key, &envelope_bytes, aad)
+            .expect("Falha ao abrir o envelope");
         assert_eq!(opened, plaintext);
-        
+
         // AAD errado deve falhar
         let wrong_aad = b"Contexto alterado";
         let opened_wrong = EncryptionEnvelopeV2::open(&key, &envelope_bytes, wrong_aad);
         assert!(opened_wrong.is_none());
 
         // Inspecionar cabeçalho sem possuir a chave
-        let header = EncryptionEnvelopeV2::peek_header(&envelope_bytes).expect("Falha ao ler header");
+        let header =
+            EncryptionEnvelopeV2::peek_header(&envelope_bytes).expect("Falha ao ler header");
         assert_eq!(header.tenant.as_str(), "tenant-abc");
         assert_eq!(header.key_id, "key-123");
         assert_eq!(header.key_epoch, 1);
@@ -530,7 +666,9 @@ mod tests {
         let (_kref, data_key) = provider.generate_data_key(&tenant).unwrap();
 
         // Encapsula chave de dados
-        let wrapped = provider.wrap_data_key(&tenant, &data_key).expect("wrap falhou");
+        let wrapped = provider
+            .wrap_data_key(&tenant, &data_key)
+            .expect("wrap falhou");
 
         // Desencapsula com sucesso
         let unwrapped = provider.unwrap_data_key(&wrapped).expect("unwrap falhou");
@@ -539,10 +677,13 @@ mod tests {
         // Executa crypto-shred da chave mestre do tenant
         let receipt = provider.destroy(&wrapped.key_ref).expect("destroy falhou");
         assert!(!receipt.proof_digest.is_empty());
-        assert!(receipt.provider_signature.is_some());
+        assert!(receipt.provider_signature.is_none());
 
         // Nova tentativa de unwrap deve falhar (chave destruída)
         let unwrap_after_shred = provider.unwrap_data_key(&wrapped);
-        assert!(unwrap_after_shred.is_err(), "unwrap deveria falhar após crypto-shred");
+        assert!(
+            unwrap_after_shred.is_err(),
+            "unwrap deveria falhar após crypto-shred"
+        );
     }
 }

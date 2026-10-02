@@ -209,12 +209,30 @@ mod service_runner {
             })
         };
 
-        set_state(
-            ServiceState::Running,
-            ServiceControlAccept::STOP | ServiceControlAccept::PRESHUTDOWN,
-            0,
-        )?;
-        tracing::info!(service = super::SERVICE_NAME, "running");
+        set_state(ServiceState::StartPending, ServiceControlAccept::empty(), 0)?;
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(true));
+        let progress = pending.clone();
+        let heartbeat = std::thread::spawn(move || {
+            let mut checkpoint = 1;
+            loop {
+                std::thread::sleep(Duration::from_secs(2));
+                let guard = progress.lock().unwrap();
+                if !*guard {
+                    break;
+                }
+                checkpoint += 1;
+                let _ = status_handle.set_service_status(ServiceStatus {
+                    service_type: SERVICE_TYPE,
+                    current_state: ServiceState::StartPending,
+                    controls_accepted: ServiceControlAccept::empty(),
+                    exit_code: ServiceExitCode::Win32(0),
+                    checkpoint,
+                    wait_hint: Duration::from_secs(60),
+                    process_id: None,
+                });
+            }
+        });
+        let ready_pending = pending.clone();
 
         let rt = tokio::runtime::Runtime::new()?;
         let result = rt.block_on(async move {
@@ -226,13 +244,38 @@ mod service_runner {
                 let _ = shutdown_rx.recv();
                 let _ = async_tx.send(());
             });
-            heraclitus_server::serve(config, async move {
-                let _ = async_rx.await;
-                tracing::info!("shutdown signal received");
-            })
+            heraclitus_server::serve_with_readiness(
+                config,
+                async move {
+                    let _ = async_rx.await;
+                    tracing::info!("shutdown signal received");
+                },
+                move || {
+                    let mut guard = ready_pending.lock().unwrap();
+                    *guard = false;
+                    status_handle
+                        .set_service_status(ServiceStatus {
+                            service_type: SERVICE_TYPE,
+                            current_state: ServiceState::Running,
+                            controls_accepted: ServiceControlAccept::STOP
+                                | ServiceControlAccept::PRESHUTDOWN,
+                            exit_code: ServiceExitCode::Win32(0),
+                            checkpoint: 0,
+                            wait_hint: Duration::ZERO,
+                            process_id: None,
+                        })
+                        .map_err(|e| {
+                            heraclitus_core::HeraclitusError::Config(format!("SCM readiness: {e}"))
+                        })?;
+                    tracing::info!(service = super::SERVICE_NAME, "ready");
+                    Ok(())
+                },
+            )
             .await
         });
 
+        *pending.lock().unwrap() = false;
+        let _ = heartbeat.join();
         let exit_code = if let Err(e) = &result {
             tracing::error!(error = %e, "serve failed");
             1

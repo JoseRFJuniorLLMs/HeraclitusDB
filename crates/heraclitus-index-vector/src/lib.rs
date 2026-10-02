@@ -199,6 +199,19 @@ struct VectorSnapshot {
     tombstones: Vec<u32>,
 }
 
+#[derive(Serialize)]
+struct VectorSnapshotRef<'a> {
+    m: usize,
+    ef_construction: usize,
+    nodes: &'a [Node],
+    entry: Option<u32>,
+    ids: &'a [EventId],
+    lsns: &'a [Lsn],
+    watermark: Lsn,
+    sig: &'a Signature,
+    tombstones: Vec<u32>,
+}
+
 const VECTOR_CKPT_FILE: &str = "vector.ckpt";
 
 impl VectorIndex {
@@ -656,31 +669,18 @@ impl VectorIndex {
     /// atómica (tmp + rename). Correção nunca depende disto: sem checkpoint, a
     /// view reconstrói-se do LSN 0 (ver `heraclitus_views`).
     pub fn save_checkpoint(&self, dir: &Path) -> Result<(), HeraclitusError> {
-        let snap = VectorSnapshot {
+        let snap = VectorSnapshotRef {
             m: self.m,
             ef_construction: self.ef_construction,
-            nodes: self.nodes.clone(),
+            nodes: &self.nodes,
             entry: self.entry,
-            ids: self.ids.clone(),
-            lsns: self.lsns.clone(),
+            ids: &self.ids,
+            lsns: &self.lsns,
             watermark: self.watermark,
-            sig: self.metric.sig.clone(),
+            sig: &self.metric.sig,
             tombstones: self.tombstones.iter().collect(),
         };
-        let bytes = bincode::serde::encode_to_vec(&snap, bincode::config::standard())
-            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
-        let tmp = dir.join("vector.ckpt.tmp");
-        // fsync ANTES do rename (alinhado com views::ckpt::save): sem ele, um
-        // crash pós-rename podia deixar um ficheiro vazio/parcial — degradava
-        // com segurança para rebuild, mas custava o boot inteiro.
-        {
-            use std::io::Write as _;
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&bytes)?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, dir.join(VECTOR_CKPT_FILE))?;
-        Ok(())
+        heraclitus_views::ckpt::save(dir, "vector", &snap)
     }
 
     /// #12 — Restaura o HNSW do checkpoint. Devolve `false` se não houver

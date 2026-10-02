@@ -207,6 +207,24 @@ fn crc32_ieee(partes: &[&[u8]]) -> u32 {
     !crc
 }
 
+// CRC is computed while encoding, without an encoded snapshot in RAM.
+struct CrcWriter<W> {
+    inner: W,
+    crc: u32,
+}
+impl<W: std::io::Write> std::io::Write for CrcWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(bytes)?;
+        for &byte in &bytes[..n] {
+            self.crc = TABELA_CRC32[((self.crc ^ byte as u32) & 0xff) as usize] ^ (self.crc >> 8);
+        }
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Dimensão do cabeçalho v6: magic (4) + versão (2) + CRC (4).
 const CABECALHO_V6: usize = 10;
 
@@ -394,6 +412,126 @@ struct CompressedSnapshot {
     exact_packed: HashMap<AttrKey, Vec<u8>>,
     numeric_plain: HashMap<u32, BTreeMap<u64, Vec<Lsn>>>,
     numeric_packed: HashMap<u32, BTreeMap<u64, Vec<u8>>>,
+}
+
+// Serialize the existing v6 wire layout while retaining only one compressed
+// posting column at a time. No resident postings or dictionaries are cloned.
+#[derive(Serialize)]
+struct StreamingSnapshot<'a> {
+    watermark: Lsn,
+    applied: bool,
+    fields: &'a [Box<str>],
+    values: &'a [Box<str>],
+    exact_plain: ExactColumns<'a>,
+    exact_packed: ExactColumns<'a>,
+    numeric_plain: NumericColumns<'a>,
+    numeric_packed: NumericColumns<'a>,
+}
+struct ExactColumns<'a> {
+    columns: &'a HashMap<AttrKey, Vec<Lsn>>,
+    packed: bool,
+}
+impl Serialize for ExactColumns<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let count = self
+            .columns
+            .values()
+            .filter(|v| escolher_forma(v).is_some() == self.packed)
+            .count();
+        let mut map = serializer.serialize_map(Some(count))?;
+        for (key, values) in self.columns {
+            match escolher_forma(values) {
+                Some(blob) if self.packed => map.serialize_entry(key, &blob)?,
+                None if !self.packed => map.serialize_entry(key, values)?,
+                _ => {}
+            }
+        }
+        map.end()
+    }
+}
+struct NumericColumns<'a> {
+    columns: &'a HashMap<u32, BTreeMap<u64, Vec<Lsn>>>,
+    packed: bool,
+}
+struct NumericValues<'a> {
+    values: &'a BTreeMap<u64, Vec<Lsn>>,
+    packed: bool,
+}
+impl Serialize for NumericValues<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let count = self
+            .values
+            .values()
+            .filter(|v| escolher_forma(v).is_some() == self.packed)
+            .count();
+        let mut map = serializer.serialize_map(Some(count))?;
+        for (key, values) in self.values {
+            match escolher_forma(values) {
+                Some(blob) if self.packed => map.serialize_entry(key, &blob)?,
+                None if !self.packed => map.serialize_entry(key, values)?,
+                _ => {}
+            }
+        }
+        map.end()
+    }
+}
+impl Serialize for NumericColumns<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let count = self
+            .columns
+            .values()
+            .filter(|by_value| {
+                by_value
+                    .values()
+                    .any(|v| escolher_forma(v).is_some() == self.packed)
+            })
+            .count();
+        let mut map = serializer.serialize_map(Some(count))?;
+        for (field, by_value) in self.columns {
+            if by_value
+                .values()
+                .any(|v| escolher_forma(v).is_some() == self.packed)
+            {
+                map.serialize_entry(
+                    field,
+                    &NumericValues {
+                        values: by_value,
+                        packed: self.packed,
+                    },
+                )?;
+            }
+        }
+        map.end()
+    }
+}
+impl<'a> From<&'a ResidentSnapshot> for StreamingSnapshot<'a> {
+    fn from(s: &'a ResidentSnapshot) -> Self {
+        Self {
+            watermark: s.watermark,
+            applied: s.applied,
+            fields: &s.dictionary.fields.strings,
+            values: &s.dictionary.values.strings,
+            exact_plain: ExactColumns {
+                columns: &s.exact,
+                packed: false,
+            },
+            exact_packed: ExactColumns {
+                columns: &s.exact,
+                packed: true,
+            },
+            numeric_plain: NumericColumns {
+                columns: &s.numeric,
+                packed: false,
+            },
+            numeric_packed: NumericColumns {
+                columns: &s.numeric,
+                packed: true,
+            },
+        }
+    }
 }
 
 impl From<&ResidentSnapshot> for CompressedSnapshot {
@@ -1095,23 +1233,28 @@ impl AttrIndex {
         // v6: magic + versão + CRC-32 + bincode do snapshot com as colunas
         // comprimidas. O CRC cobre `versão || corpo` (R89 — ver
         // `FORMAT_CURRENT`), para que um byte trocado na versão não passe.
-        let comprimido = CompressedSnapshot::from(&self.inner);
-        let corpo = bincode::serde::encode_to_vec(&comprimido, BINCODE_CFG)
-            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+        let comprimido = StreamingSnapshot::from(&self.inner);
         let cabeca = FORMAT_CURRENT.to_le_bytes();
-        let crc = crc32_ieee(&[&cabeca, &corpo]);
-        let mut bytes = Vec::with_capacity(corpo.len() + CABECALHO_V6);
-        bytes.extend_from_slice(MAGIC_V2);
-        bytes.extend_from_slice(&cabeca);
-        bytes.extend_from_slice(&crc.to_le_bytes());
-        bytes.extend_from_slice(&corpo);
         let dst = dir.as_ref().join(SNAPSHOT_FILE);
         let tmp = dir.as_ref().join(format!("{SNAPSHOT_FILE}.tmp"));
         {
-            use std::io::Write as _;
+            use std::io::{Seek, SeekFrom, Write};
             let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&bytes)?;
-            f.sync_all()?;
+            f.write_all(MAGIC_V2)?;
+            f.write_all(&cabeca)?;
+            f.write_all(&[0; 4])?;
+            let mut writer = CrcWriter {
+                inner: std::io::BufWriter::with_capacity(64 << 10, f),
+                crc: !crc32_ieee(&[&cabeca]),
+            };
+            bincode::serde::encode_into_std_write(&comprimido, &mut writer, BINCODE_CFG)
+                .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+            writer.flush()?;
+            let checksum = !writer.crc;
+            let file = writer.inner.get_mut();
+            file.seek(SeekFrom::Start(6))?;
+            file.write_all(&checksum.to_le_bytes())?;
+            file.sync_all()?;
         }
         std::fs::rename(&tmp, &dst)?;
         Ok(())

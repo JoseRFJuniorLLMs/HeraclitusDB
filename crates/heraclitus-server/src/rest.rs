@@ -505,7 +505,43 @@ async fn sentinel_status(Extension(runtime): Extension<Option<Arc<SentinelRuntim
     .into_response()
 }
 
+fn rest_admin(
+    principal: &Principal,
+    operation: &str,
+    parameters: serde_json::Value,
+    key: Option<String>,
+) -> (
+    crate::trusted_admin::AdminContext,
+    crate::trusted_admin::AdminOperation,
+) {
+    let ctx = crate::trusted_admin::AdminContext::new(
+        principal.name.clone(),
+        "local",
+        principal
+            .roles
+            .iter()
+            .map(|r| format!("{r:?}").to_lowercase())
+            .collect(),
+    );
+    let key = key.unwrap_or_else(|| ctx.request_id.clone());
+    let mut op = crate::trusted_admin::AdminOperation::new(
+        key.clone(),
+        key,
+        crate::trusted_admin::AdminOperationKind::Custom {
+            name: operation.into(),
+            details: parameters.to_string(),
+        },
+        "authenticated REST administration",
+    );
+    op.parameters_digest = blake3::hash(parameters.to_string().as_bytes())
+        .to_hex()
+        .to_string();
+    (ctx, op)
+}
+
 async fn sentinel_checkpoint(
+    State(engine): State<Arc<Engine>>,
+    Extension(principal): Extension<Principal>,
     Extension(runtime): Extension<Option<Arc<SentinelRuntime>>>,
 ) -> Response {
     let Some(runtime) = runtime else {
@@ -516,7 +552,21 @@ async fn sentinel_checkpoint(
     // reactor tem um número fixo delas, portanto bastam alguns pedidos destes em
     // paralelo para o servidor deixar de aceitar QUALQUER pedido, incluindo os
     // que não tocam no disco. O vizinho `sentinel_incident_why` já fazia isto.
-    match tokio::task::spawn_blocking(move || runtime.checkpoint()).await {
+    let (ctx, op) = rest_admin(
+        &principal,
+        "sentinel-checkpoint",
+        serde_json::json!({}),
+        None,
+    );
+    match tokio::task::spawn_blocking(move || {
+        engine.execute_admin(&ctx, &op, |_| {
+            runtime
+                .checkpoint()
+                .map_err(|e| heraclitus_core::HeraclitusError::Config(e.to_string()))
+        })
+    })
+    .await
+    {
         Ok(Ok(lsn)) => Json(serde_json::json!({ "checkpoint_lsn": lsn })).into_response(),
         Ok(Err(error)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1134,6 +1184,7 @@ async fn replay(
 
 /// `POST /replay[?executar=1]` — o mesmo, com autorização para reconstruir.
 async fn replay_post(
+    Extension(principal): Extension<Principal>,
     State(engine): State<Arc<Engine>>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
@@ -1141,7 +1192,33 @@ async fn replay_post(
         q.get("executar").map(|s| s.as_str()),
         Some("1") | Some("true")
     );
-    replay_executar(State(engine), executar).await
+    if !executar {
+        return replay_executar(State(engine), false).await;
+    }
+    let (ctx, op) = rest_admin(
+        &principal,
+        "rebuild",
+        serde_json::json!({"executar":true}),
+        q.get("idempotency_key").cloned(),
+    );
+    match tokio::task::spawn_blocking(move || {
+        engine.execute_admin(&ctx, &op, |_| {
+            let value = engine.replay_prova(true);
+            if value.get("erro").is_some() {
+                return Err(heraclitus_core::HeraclitusError::Config(value.to_string()));
+            }
+            Ok(value)
+        })
+    })
+    .await
+    {
+        Ok(Ok(value)) => Json(value).into_response(),
+        result => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("administrative replay: {result:?}"),
+        )
+            .into_response(),
+    }
 }
 
 async fn replay_executar(State(engine): State<Arc<Engine>>, executar: bool) -> Response {
@@ -1263,6 +1340,7 @@ async fn titular_acessos(
 async fn titular_eliminar(
     State(engine): State<Arc<Engine>>,
     Extension(erasure): Extension<ErasureAllowed>,
+    Extension(principal): Extension<Principal>,
     Path(id): Path<String>,
     Json(corpo): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -1286,7 +1364,32 @@ async fn titular_eliminar(
         );
     }
     let alvo = id.clone();
-    let r = tokio::task::spawn_blocking(move || engine.shred(&alvo)).await;
+    let ctx = crate::trusted_admin::AdminContext::new(
+        principal.name,
+        "local",
+        principal
+            .roles
+            .iter()
+            .map(|role| format!("{role:?}").to_lowercase())
+            .collect(),
+    );
+    let key = corpo
+        .get("idempotency_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&ctx.request_id)
+        .to_owned();
+    let op = crate::trusted_admin::AdminOperation::new(
+        key.clone(),
+        key,
+        crate::trusted_admin::AdminOperationKind::CryptoShred {
+            agent_id: alvo.clone(),
+        },
+        "authenticated REST erasure",
+    );
+    let r = tokio::task::spawn_blocking(move || {
+        engine.execute_admin(&ctx, &op, |token| engine.shred_effect(&alvo, token))
+    })
+    .await;
     match r {
         Ok(Ok(destruida)) => (
             StatusCode::OK,
@@ -1555,6 +1658,7 @@ async fn tier_sealed(State(engine): State<Arc<Engine>>) -> Response {
 /// upload corre inline (aceitável para admin; não é hot-path).
 #[cfg(feature = "tier")]
 async fn tier_demote(
+    Extension(principal): Extension<Principal>,
     State(engine): State<Arc<Engine>>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
@@ -1578,12 +1682,24 @@ async fn tier_demote(
             .into_response();
     };
     // demote faz fs::read + blake3 + encode Parquet + fsync — fora do reactor.
+    let (ctx, op) = rest_admin(
+        &principal,
+        "tier-demote",
+        body.clone(),
+        body.get("idempotency_key")
+            .and_then(|k| k.as_str())
+            .map(str::to_owned),
+    );
     let res = tokio::task::spawn_blocking(move || {
-        tokio::runtime::Handle::current().block_on(engine.demote_segment_any(seg))
+        engine.execute_admin(&ctx, &op, |_| {
+            let receipt =
+                tokio::runtime::Handle::current().block_on(engine.demote_segment_any(seg))?;
+            Ok(demotion_receipt_json(&receipt))
+        })
     })
     .await;
     match res {
-        Ok(Ok(r)) => Json(demotion_receipt_json(&r)).into_response(),
+        Ok(Ok(r)) => Json(r).into_response(),
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, format!("tier: {e}")).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")).into_response(),
     }
@@ -1717,39 +1833,46 @@ async fn compliance_status(State(engine): State<Arc<Engine>>) -> Response {
 async fn telemetry_health(
     State(engine): State<Arc<Engine>>,
     Query(query): Query<TelemetryHealthQuery>,
-) -> Json<serde_json::Value> {
+) -> Response {
     let as_of_lsn = query.as_of_lsn.unwrap_or_else(|| engine.head());
     // `spawn_blocking`: `telemetry_health_all` toma os locks dos índices e, com
     // `as_of`, reconstrói o estado a partir do log. Ver o comentário do
     // `/sentinel/checkpoint`.
-    let sensors: Vec<_> = tokio::task::spawn_blocking(move || {
-        engine
-            .telemetry_health_all(Some(as_of_lsn))
-            .into_iter()
-            .filter(|snapshot| {
-                query
-                    .tenant_id
-                    .as_ref()
-                    .is_none_or(|value| &snapshot.identity.tenant_id == value)
-                    && query
-                        .datasource_id
+    let result = tokio::task::spawn_blocking(
+        move || -> Result<Vec<_>, heraclitus_core::HeraclitusError> {
+            Ok(engine
+                .try_telemetry_health_all(Some(as_of_lsn))?
+                .into_iter()
+                .filter(|snapshot| {
+                    query
+                        .tenant_id
                         .as_ref()
-                        .is_none_or(|value| &snapshot.identity.datasource_id == value)
-                    && query
-                        .sensor_id
-                        .as_ref()
-                        .is_none_or(|value| &snapshot.identity.sensor_id == value)
-            })
-            .collect()
-    })
-    .await
-    .unwrap_or_default();
+                        .is_none_or(|value| &snapshot.identity.tenant_id == value)
+                        && query
+                            .datasource_id
+                            .as_ref()
+                            .is_none_or(|value| &snapshot.identity.datasource_id == value)
+                        && query
+                            .sensor_id
+                            .as_ref()
+                            .is_none_or(|value| &snapshot.identity.sensor_id == value)
+                })
+                .collect())
+        },
+    )
+    .await;
+    let sensors = match result {
+        Ok(Ok(sensors)) => sensors,
+        Ok(Err(error)) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"telemetry_history_unavailable", "message":error.to_string()}))).into_response(),
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"telemetry_query_join_failed", "message":error.to_string()}))).into_response(),
+    };
     Json(serde_json::json!({
         "schema": "heraclitus-telemetry-health-snapshot/1.0",
         "as_of_lsn": as_of_lsn,
         "count": sensors.len(),
         "sensors": sensors,
     }))
+    .into_response()
 }
 
 async fn metrics(

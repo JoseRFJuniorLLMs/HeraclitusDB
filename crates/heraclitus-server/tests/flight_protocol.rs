@@ -60,3 +60,50 @@ async fn flight_client_does_doget_over_real_grpc() {
     // Ticket desconhecido → erro gRPC limpo, não crash.
     assert!(client.do_get(Ticket::new("hack")).await.is_err());
 }
+
+#[tokio::test]
+async fn unauthenticated_flight_cannot_bind_public_interface() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+    assert!(serve_flight(log, "0.0.0.0:0")
+        .await
+        .unwrap_err()
+        .contains("loopback"));
+}
+
+#[tokio::test]
+async fn flight_exports_large_content_metadata_without_json_expansion() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = Arc::new(Log::open(dir.path(), 16 << 20, FsyncPolicy::Always).unwrap());
+    log.append(Episode::new(
+        "large",
+        EventKind::Observation,
+        vec![255; 6 << 20],
+    ))
+    .unwrap();
+    let (addr, handle) = serve_flight(log, "127.0.0.1:0").await.unwrap();
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = FlightClient::new(channel);
+    let batches: Vec<_> = client
+        .do_get(Ticket::new("events"))
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        1
+    );
+    let lengths = batches[0]
+        .column(4)
+        .as_any()
+        .downcast_ref::<heraclitus_analytics::datafusion::arrow::array::UInt64Array>()
+        .unwrap();
+    assert_eq!(lengths.value(0), 6 << 20);
+    handle.abort();
+}

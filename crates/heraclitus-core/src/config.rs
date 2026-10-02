@@ -1383,7 +1383,8 @@ impl HeraclitusConfig {
             }
             if !self.encryption_at_rest || !self.audit_queries || !self.audit_admin {
                 return Err(invalid(
-                    "produção exige encryption_at_rest=true, audit_queries=true e audit_admin=true".into(),
+                    "produção exige encryption_at_rest=true, audit_queries=true e audit_admin=true"
+                        .into(),
                 ));
             }
             if self.access_credentials.is_empty() || self.auth_token.is_some() {

@@ -72,11 +72,26 @@ pub(crate) fn kind_label(k: &EventKind) -> String {
 /// Tecto por omissão de linhas materializadas numa sessão de analytics.
 pub const DEFAULT_MAX_ROWS: usize = 5_000_000;
 /// Tecto por omissão (aproximado) de bytes residentes numa sessão de analytics.
-pub const DEFAULT_MAX_BYTES: usize = 512 * 1024 * 1024;
+pub const DEFAULT_MAX_BYTES: usize = 128 * 1024 * 1024;
+
+struct BoundedJson(Vec<u8>);
+impl std::io::Write for BoundedJson {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.0.len().saturating_add(bytes.len()) > 32 << 20 {
+            return Err(std::io::Error::other("SQL output exceeds 32MiB"));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Sessão de analytics com a tabela `events` materializada do log.
 pub struct LogAnalytics {
     ctx: SessionContext,
+    _admission: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl LogAnalytics {
@@ -123,6 +138,13 @@ impl LogAnalytics {
         max_rows: usize,
         max_bytes: usize,
     ) -> Result<Self, AnalyticsError> {
+        static ADMISSION: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+            std::sync::OnceLock::new();
+        let admission = ADMISSION
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2)))
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| AnalyticsError::Sql("analytics busy (two resident sessions)".into()))?;
         let head = log.head();
         let to = as_of.unwrap_or(head).min(head);
         let mut approx_bytes: usize = 0;
@@ -140,7 +162,7 @@ impl LogAnalytics {
 
         let mut cur = 0u64;
         while cur < to {
-            let batch = log.scan_capped(cur, to, 50_000)?;
+            let batch = log.scan_capped(cur, to, 16)?;
             let Some(&(last, _)) = batch.last() else {
                 break;
             };
@@ -154,10 +176,21 @@ impl LogAnalytics {
                         + attrs.len()
                         + e.agent_id.len()
                         + e.session_id.len()
-                        + 40
+                        + 40 + 6 * std::mem::size_of::<String>()
                         + 26 // ULID em texto
                         + 16, // rótulo de kind (estimativa)
                 );
+                if lsns.len() >= max_rows || approx_bytes > max_bytes {
+                    return Err(AnalyticsError::Budget {
+                        limit: if lsns.len() >= max_rows {
+                            format!("max_rows={max_rows}")
+                        } else {
+                            format!("max_bytes={max_bytes}")
+                        },
+                        rows: lsns.len() + 1,
+                        bytes: approx_bytes,
+                    });
+                }
                 lsns.push(*lsn);
                 ids.push(e.id.to_string());
                 agents.push(e.agent_id.clone());
@@ -218,12 +251,29 @@ impl LogAnalytics {
         )
         .map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
 
-        let ctx = SessionContext::new();
+        use datafusion::execution::{
+            memory_pool::GreedyMemoryPool, runtime_env::RuntimeEnvBuilder,
+        };
+        static POOL: std::sync::OnceLock<Arc<GreedyMemoryPool>> = std::sync::OnceLock::new();
+        let pool = POOL
+            .get_or_init(|| Arc::new(GreedyMemoryPool::new(256 << 20)))
+            .clone();
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(pool)
+            .build_arc()
+            .map_err(|e| AnalyticsError::Sql(e.to_string()))?;
+        let config = datafusion::prelude::SessionConfig::new()
+            .with_batch_size(1024)
+            .with_target_partitions(2);
+        let ctx = SessionContext::new_with_config_rt(config, runtime);
         let table = MemTable::try_new(schema, vec![vec![batch]])
             .map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
         ctx.register_table("events", Arc::new(table))
             .map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
-        Ok(Self { ctx })
+        Ok(Self {
+            ctx,
+            _admission: admission,
+        })
     }
 
     /// Executa SQL sobre `events` e devolve as linhas como `Vec` de objetos
@@ -242,11 +292,21 @@ impl LogAnalytics {
             .sql_with_options(query, opts)
             .await
             .map_err(|e| AnalyticsError::Sql(e.to_string()))?;
+        // Push the output bound into the plan before execution/collection.
         let batches = df
+            .limit(0, Some(10_001))
+            .map_err(|e| AnalyticsError::Sql(e.to_string()))?
             .collect()
             .await
             .map_err(|e| AnalyticsError::Sql(e.to_string()))?;
-        let buf = Vec::new();
+        if batches.iter().map(|b| b.num_rows()).sum::<usize>() > 10_000 {
+            return Err(AnalyticsError::Budget {
+                limit: "output rows=10000; add LIMIT".into(),
+                rows: 10_001,
+                bytes: 0,
+            });
+        }
+        let buf = BoundedJson(Vec::new());
         let mut writer = datafusion::arrow::json::ArrayWriter::new(buf);
         for b in &batches {
             writer
@@ -256,7 +316,14 @@ impl LogAnalytics {
         writer
             .finish()
             .map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
-        let bytes = writer.into_inner();
+        let bytes = writer.into_inner().0;
+        if bytes.len() > 32 << 20 {
+            return Err(AnalyticsError::Budget {
+                limit: "output bytes=32MiB".into(),
+                rows: 0,
+                bytes: bytes.len(),
+            });
+        }
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
@@ -375,5 +442,38 @@ mod tests {
         }
         // E o SELECT legítimo continua a funcionar.
         assert!(a.sql("SELECT COUNT(*) AS n FROM events").await.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod audit_budget_tests {
+    use super::*;
+    #[tokio::test]
+    async fn output_limit_is_applied_before_collecting_large_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let log =
+            heraclitus_log::Log::open(dir.path(), 1 << 20, heraclitus_core::FsyncPolicy::Always)
+                .unwrap();
+        let analytics = LogAnalytics::from_log(&log, None).unwrap();
+        let error = analytics
+            .sql("SELECT value FROM generate_series(1, 100000) AS t(value)")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AnalyticsError::Budget { .. }), "{error}");
+        assert_eq!(
+            analytics
+                .sql("SELECT value FROM generate_series(1, 100000) AS t(value) LIMIT 3")
+                .await
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+    #[test]
+    fn json_budget_refuses_growth_before_allocation() {
+        use std::io::Write;
+        let mut output = BoundedJson(vec![0; (32 << 20) - 1]);
+        assert!(output.write_all(&[1, 2]).is_err());
+        assert_eq!(output.0.len(), (32 << 20) - 1);
     }
 }

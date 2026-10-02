@@ -472,7 +472,7 @@ impl Engine {
         };
         let telemetry_health = {
             let p = boot.phase("Telemetry Health / Sensor Trust");
-            let health = Arc::new(RwLock::new(TelemetryHealthGraph::new()));
+            let health = Arc::new(RwLock::new(TelemetryHealthGraph::with_log(log.clone())));
             p.ok("Coverage · Freshness · Completeness · Integrity · Trust");
             health
         };
@@ -584,7 +584,7 @@ impl Engine {
                     let mut cur = if idx.is_empty() { 0 } else { idx.watermark() };
                     let mut built = false;
                     while cur <= head {
-                        let batch = log.scan_capped(cur, head + 1, 100_000)?;
+                        let batch = log.scan_capped(cur, head, 256)?;
                         if batch.is_empty() {
                             break;
                         }
@@ -683,6 +683,7 @@ impl Engine {
             engine.attr.read().unwrap().save(&engine.attr_dir)?;
             std::fs::remove_file(&privacy_rebuild_marker)?;
         }
+        engine.trusted_admin.recover(engine.log.as_ref())?;
         Ok(engine)
     }
 
@@ -721,11 +722,12 @@ impl Engine {
             &episode.kind,
             EventKind::Custom(kind) if kind == "AgentEvidence"
         );
+        self.views.lock().unwrap().apply(lsn, episode);
+        self.attr.write().unwrap().apply(lsn, episode);
+        // Count/byte eviction is safe only AFTER synchronous view publication.
         if !agent_evidence {
             self.memtable.apply(lsn, episode.clone());
         }
-        self.views.lock().unwrap().apply(lsn, episode);
-        self.attr.write().unwrap().apply(lsn, episode);
     }
 
     /// Meta-auditoria: regista a execução de uma query como EVENTO no log
@@ -777,7 +779,12 @@ impl Engine {
 
     /// Registra operação administrativa com garantia transacional síncrona (fail-closed).
     /// Se a gravação no log de auditoria falhar, a operação inteira deve falhar.
-    pub fn audit_admin_strict(&self, operation: &str, ok: bool, principal: &str) -> Result<Lsn, HeraclitusError> {
+    pub fn audit_admin_strict(
+        &self,
+        operation: &str,
+        ok: bool,
+        principal: &str,
+    ) -> Result<Lsn, HeraclitusError> {
         if !self.audit_admin {
             return Ok(0);
         }
@@ -1182,7 +1189,7 @@ impl Engine {
         let head = self.log.head();
         let mut cur = 0u64;
         while cur < head {
-            let batch = self.log.scan_capped(cur, head, 100_000)?;
+            let batch = self.log.scan_capped(cur, head, 256)?;
             let Some(&(last, _)) = batch.last() else {
                 break;
             };
@@ -1303,7 +1310,7 @@ impl Engine {
         let mut out = Vec::new();
         let mut cur = 0u64;
         while cur < head {
-            let batch = self.log.scan_capped(cur, head, 100_000)?;
+            let batch = self.log.scan_capped(cur, head, 256)?;
             let Some(&(last, _)) = batch.last() else {
                 break;
             };
@@ -1758,11 +1765,18 @@ impl Engine {
 
     /// Snapshot ordenado de todos os sensores conhecidos até o LSN exclusivo.
     pub fn telemetry_health_all(&self, as_of_lsn: Option<Lsn>) -> Vec<TelemetryHealthSnapshot> {
+        self.try_telemetry_health_all(as_of_lsn).unwrap_or_default()
+    }
+
+    pub fn try_telemetry_health_all(
+        &self,
+        as_of_lsn: Option<Lsn>,
+    ) -> Result<Vec<TelemetryHealthSnapshot>, HeraclitusError> {
         let bound = as_of_lsn.unwrap_or_else(|| self.log.head());
         self.telemetry_health
-            .write()
-            .unwrap()
-            .snapshots_as_of(bound)
+            .read()
+            .map_err(|_| HeraclitusError::StorageEngine("telemetry view lock poisoned".into()))?
+            .try_snapshots_as_of(bound)
     }
 
     /// SPEC-0071 §3/§4.1 — os eventos canónicos de segurança, `AS OF LSN`.
@@ -2039,9 +2053,57 @@ impl Engine {
     /// sealed content becomes permanently unreadable. The log is never mutated.
     /// Errors if encryption at rest is disabled.
     pub fn shred(&self, agent_id: &str) -> Result<bool, HeraclitusError> {
+        let ctx = crate::trusted_admin::AdminContext::new(
+            "embedded-admin",
+            "local",
+            vec!["admin".into()],
+        );
+        let op = crate::trusted_admin::AdminOperation::new(
+            ctx.request_id.clone(),
+            ctx.request_id.clone(),
+            crate::trusted_admin::AdminOperationKind::CryptoShred {
+                agent_id: agent_id.into(),
+            },
+            "embedded crypto-shred",
+        );
+        self.execute_admin(&ctx, &op, |token| self.shred_effect(agent_id, token))
+    }
+
+    pub(crate) fn execute_admin<T: serde::Serialize + serde::de::DeserializeOwned>(
+        &self,
+        ctx: &crate::trusted_admin::AdminContext,
+        op: &crate::trusted_admin::AdminOperation,
+        effect: impl FnOnce(&crate::trusted_admin::AdminExecutionToken) -> Result<T, HeraclitusError>,
+    ) -> Result<T, HeraclitusError> {
+        if self.is_replicated() {
+            return Err(HeraclitusError::Config("destructive administration requires cluster-wide reconciliation; refused on replicated node".into()));
+        }
+        self.trusted_admin.execute(
+            ctx,
+            op,
+            |ep| {
+                let lsn = self.append_internal(ep)?;
+                self.log.flush()?;
+                Ok(lsn)
+            },
+            effect,
+        )
+    }
+
+    pub(crate) fn shred_effect(
+        &self,
+        agent_id: &str,
+        _token: &crate::trusted_admin::AdminExecutionToken,
+    ) -> Result<bool, HeraclitusError> {
+        if agent_id == "heraclitus-admin" {
+            return Err(HeraclitusError::Config(
+                "administrative journal cannot be shredded".into(),
+            ));
+        }
         let ks = self.keystore.as_ref().ok_or_else(|| {
             HeraclitusError::Config("encryption at rest is disabled; nothing to shred".into())
         })?;
+        let indexing = self.index_gate.write().unwrap();
         self.ensure_crypto_shred_allowed(agent_id)?;
         std::fs::create_dir_all(&self.attr_dir)?;
         let marker = self.attr_dir.join("privacy-rebuild-required");
@@ -2082,7 +2144,7 @@ impl Engine {
         let head = self.log.head();
         let mut cur = 0u64;
         while cur <= head {
-            let batch = self.log.scan_capped(cur, head.saturating_add(1), 100_000)?;
+            let batch = self.log.scan_capped(cur, head, 256)?;
             let Some(&(last, _)) = batch.last() else {
                 break;
             };
@@ -2118,6 +2180,7 @@ impl Engine {
         receipt
             .attrs
             .insert("operation".into(), "crypto-shred".into());
+        drop(indexing);
         self.append(receipt)?;
         std::fs::remove_file(marker)?;
         Ok(destroyed || recovery_pending)
@@ -2162,7 +2225,7 @@ impl Engine {
             .collect();
         let mut cursor = 0;
         while cursor < head {
-            let batch = self.log.scan_capped(cursor, head, 100_000)?;
+            let batch = self.log.scan_capped(cursor, head, 256)?;
             let Some((last_lsn, _)) = batch.last() else {
                 break;
             };
@@ -2209,6 +2272,13 @@ impl Engine {
     /// Append + synchronously index into memtable AND views.
     /// Read-your-own-writes holds for every index path.
     pub fn append(&self, episode: Episode) -> Result<Lsn, HeraclitusError> {
+        if episode.agent_id == "heraclitus-admin"
+            || matches!(&episode.kind, EventKind::Custom(k) if k == "AdminIntent" || k == "AdminResult")
+        {
+            return Err(HeraclitusError::Query(
+                "administrative journal is reserved to authenticated execution".into(),
+            ));
+        }
         // O kind `hvm_isa` é RESERVADO ao ledger soberano. Qualquer cliente podia
         // escolhê-lo num Append normal (gRPC/REST/GQL) e o efeito era duplo e
         // IRREVERSÍVEL (o log é imutável): (1) `is_hvm` fazia o episódio ser
@@ -2255,6 +2325,13 @@ impl Engine {
         episode: Episode,
         key: &str,
     ) -> Result<(Lsn, bool, String), HeraclitusError> {
+        if episode.agent_id == "heraclitus-admin"
+            || matches!(&episode.kind, EventKind::Custom(k) if k == "AdminIntent" || k == "AdminResult")
+        {
+            return Err(HeraclitusError::Query(
+                "administrative journal is reserved to authenticated execution".into(),
+            ));
+        }
         if is_sentinel_reserved(&episode) {
             return Err(HeraclitusError::Query(
                 "tipos, agente e atributos sentinel.* / sec.* são reservados ao pipeline interno"
@@ -2350,6 +2427,7 @@ impl Engine {
             &episode.attrs,
             &episode.valid_from,
             &episode.valid_to,
+            &episode.parents,
         ))
         .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
         let payload_hash = blake3::hash(&canonical).to_hex().to_string();
@@ -2373,7 +2451,22 @@ impl Engine {
                     context: "idempotency index".into(),
                     detail: format!("LSN {lsn} ausente para a chave {key}"),
                 })?;
-            if existing.attrs.get(IDEMPOTENCY_HASH_ATTR) == Some(&payload_hash) {
+            let legacy = serde_json::to_vec(&(
+                &episode.agent_id,
+                &episode.session_id,
+                &episode.kind,
+                &episode.content,
+                &episode.embedding,
+                &episode.attrs,
+                &episode.valid_from,
+                &episode.valid_to,
+            ))
+            .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
+            let legacy_hash = blake3::hash(&legacy).to_hex().to_string();
+            if existing.parents == episode.parents
+                && (existing.attrs.get(IDEMPOTENCY_HASH_ATTR) == Some(&payload_hash)
+                    || existing.attrs.get(IDEMPOTENCY_HASH_ATTR) == Some(&legacy_hash))
+            {
                 return Ok((lsn, true, existing.id.to_string()));
             }
             return Err(HeraclitusError::IdempotencyConflict {
@@ -2517,6 +2610,7 @@ impl Engine {
             "head": self.log.head(),
             "storage_format": self.log.format().as_str(),
             "memtable": self.memtable.len(),
+            "memtable_bytes_estimated": self.memtable.resident_bytes(),
             // Contagens: leitura pura. Com `.write()` cada uma esperava pelo
             // checkpoint em curso, e era isso que punha o `/stats` a 44 s.
             "vector_indexed": self.vector.read().unwrap().len(),
@@ -3531,6 +3625,44 @@ mod tests {
             engine.append(e).unwrap();
         }
         ids
+    }
+    #[test]
+    fn idempotency_binds_causal_parents_and_rejects_journal_forgery() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path());
+        let mut first = Episode::new("agent", EventKind::Observation, b"same".to_vec());
+        first.parents.push(heraclitus_core::EventId::new());
+        engine
+            .append_idempotent(first.clone(), "causal-retry")
+            .unwrap();
+        assert!(
+            engine
+                .append_idempotent(first.clone(), "causal-retry")
+                .unwrap()
+                .1
+        );
+        first.parents.clear();
+        assert!(matches!(
+            engine.append_idempotent(first, "causal-retry"),
+            Err(HeraclitusError::IdempotencyConflict { .. })
+        ));
+        assert!(engine
+            .append(Episode::new(
+                "heraclitus-admin",
+                EventKind::Custom("AdminIntent".into()),
+                b"{}".to_vec()
+            ))
+            .is_err());
+        assert!(engine
+            .append_idempotent(
+                Episode::new(
+                    "forged",
+                    EventKind::Custom("AdminResult".into()),
+                    b"{}".to_vec()
+                ),
+                "forged"
+            )
+            .is_err());
     }
 
     fn engine_in(dir: &std::path::Path) -> Engine {

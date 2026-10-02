@@ -88,6 +88,7 @@ impl PostingList {
         out
     }
 
+    #[cfg(test)]
     fn pairs(&self) -> Vec<(u32, u32)> {
         self.iter().collect()
     }
@@ -659,32 +660,54 @@ struct TextSnapshot {
     watermark: Lsn,
 }
 
+// Encode the legacy map layout one posting list at a time. Resident
+// compressed postings and document arrays are never cloned together.
+struct PostingPairsRef<'a>(&'a PostingList);
+impl serde::Serialize for PostingPairsRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(self.0.len))?;
+        for pair in self.0.iter() {
+            seq.serialize_element(&pair)?;
+        }
+        seq.end()
+    }
+}
+struct PostingSnapshotRef<'a>(&'a TextIndex);
+impl serde::Serialize for PostingSnapshotRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.terms.len()))?;
+        for (term, id) in &self.0.terms {
+            map.serialize_entry(term, &PostingPairsRef(&self.0.postings[*id as usize]))?;
+        }
+        map.end()
+    }
+}
+#[derive(serde::Serialize)]
+struct TextSnapshotRef<'a> {
+    postings: PostingSnapshotRef<'a>,
+    doc_len: &'a [u32],
+    ids: &'a [EventId],
+    lsns: &'a [Lsn],
+    total_len: u64,
+    watermark: Lsn,
+}
+
 impl View for TextIndex {
     fn name(&self) -> &str {
         "text"
     }
 
     fn checkpoint(&self, dir: &std::path::Path) -> Result<(), heraclitus_core::HeraclitusError> {
-        // O formato persistido permanece compatível com o snapshot anterior.
-        // TermId e blocos são estado derivado e barato de reconstruir; não há
-        // motivo para invalidar checkpoints por uma optimização residente.
-        let postings: HashMap<String, Vec<(u32, u32)>> = self
-            .terms
-            .iter()
-            .filter_map(|(term, id)| {
-                self.postings
-                    .get(*id as usize)
-                    .map(|list| (term.clone(), list.pairs()))
-            })
-            .collect();
         heraclitus_views::ckpt::save(
             dir,
             "text",
-            &TextSnapshot {
-                postings,
-                doc_len: self.doc_len.clone(),
-                ids: self.ids.clone(),
-                lsns: self.lsns.clone(),
+            &TextSnapshotRef {
+                postings: PostingSnapshotRef(self),
+                doc_len: &self.doc_len,
+                ids: &self.ids,
+                lsns: &self.lsns,
                 total_len: self.total_len,
                 watermark: self.watermark,
             },

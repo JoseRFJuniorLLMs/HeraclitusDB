@@ -547,6 +547,7 @@ impl IcpBrasilTimestampVerifier {
                 "SignerInfo sem signedAttrs: forma não suportada".into(),
             )
         })?;
+        verificar_ess_binding(attrs, signer_cert)?;
         let attrs_der = reencode_signed_attrs(attrs)?;
         // No CMS, o `signatureAlgorithm` para RSA PKCS#1 v1.5 e `rsaEncryption`
         // (RFC 3370 §3.2) — um OID que NAO carrega digest. O digest vem do
@@ -1097,6 +1098,109 @@ fn ski_de(cert: &Certificate) -> Option<Vec<u8>> {
 /// campo no `SignerInfo` vem com uma etiqueta `[0] IMPLICIT`. Reconstituir o
 /// `SET OF` explícito é obrigatório: assinar sobre os bytes tal como aparecem
 /// no token daria uma verificação que falha sempre.
+#[derive(Clone, Debug, der::Sequence)]
+struct EssIssuerSerial {
+    issuer: x509_cert::ext::pkix::name::GeneralNames,
+    serial_number: x509_cert::serial_number::SerialNumber,
+}
+#[derive(Clone, Debug, der::Sequence)]
+struct EssCertId {
+    cert_hash: der::asn1::OctetString,
+    issuer_serial: Option<EssIssuerSerial>,
+}
+#[derive(Clone, Debug, der::Sequence)]
+struct EssCertIdV2 {
+    hash_algorithm: Option<x509_cert::spki::AlgorithmIdentifierOwned>,
+    cert_hash: der::asn1::OctetString,
+    issuer_serial: Option<EssIssuerSerial>,
+}
+#[derive(Clone, Debug, der::Sequence)]
+struct EssSigningCertificate {
+    certs: Vec<EssCertId>,
+    policies: Option<der::Any>,
+}
+#[derive(Clone, Debug, der::Sequence)]
+struct EssSigningCertificateV2 {
+    certs: Vec<EssCertIdV2>,
+    policies: Option<der::Any>,
+}
+
+fn verificar_ess_binding(
+    attrs: &cms::signed_data::SignedAttributes,
+    signer: &Certificate,
+) -> Result<(), CompError> {
+    use der::Tagged;
+    use sha2::Digest;
+    let der = signer.to_der().map_err(|e| verify_err(e.to_string()))?;
+    let mut seen = std::collections::BTreeSet::new();
+    for attr in attrs.iter() {
+        if !seen.insert(attr.oid) {
+            return Err(verify_err("duplicate signed attribute OID".into()));
+        }
+        let (hash, expected, issuer) = match attr.oid.to_string().as_str() {
+            "1.2.840.113549.1.9.16.2.12" => {
+                let value = valor_unico(attr, "signingCertificate")?
+                    .to_der()
+                    .map_err(|e| verify_err(e.to_string()))?;
+                let refs = EssSigningCertificate::from_der(&value)
+                    .map_err(|e| verify_err(e.to_string()))?;
+                let first = refs
+                    .certs
+                    .first()
+                    .ok_or_else(|| verify_err("ESSCertID empty".into()))?;
+                (
+                    first.cert_hash.as_bytes().to_vec(),
+                    sha1::Sha1::digest(&der).to_vec(),
+                    first.issuer_serial.clone(),
+                )
+            }
+            "1.2.840.113549.1.9.16.2.47" => {
+                let value = valor_unico(attr, "signingCertificateV2")?
+                    .to_der()
+                    .map_err(|e| verify_err(e.to_string()))?;
+                let refs = EssSigningCertificateV2::from_der(&value)
+                    .map_err(|e| verify_err(e.to_string()))?;
+                let first = refs
+                    .certs
+                    .first()
+                    .ok_or_else(|| verify_err("ESSCertIDv2 empty".into()))?;
+                let digest = match &first.hash_algorithm {
+                    None => crate::algoritmos::Digest::Sha256,
+                    Some(alg) => {
+                        if alg
+                            .parameters
+                            .as_ref()
+                            .is_some_and(|p| p.tag() != der::Tag::Null)
+                        {
+                            return Err(verify_err("ESS digest parameters unsupported".into()));
+                        }
+                        crate::algoritmos::Digest::do_oid(&alg.oid)
+                            .ok_or_else(|| verify_err("ESS digest unsupported".into()))?
+                    }
+                };
+                (
+                    first.cert_hash.as_bytes().to_vec(),
+                    digest.digerir(&der),
+                    first.issuer_serial.clone(),
+                )
+            }
+            _ => continue,
+        };
+        if hash != expected {
+            return Err(verify_err(
+                "ESS reference does not bind the signing certificate".into(),
+            ));
+        }
+        if let Some(issuer) = issuer {
+            if issuer.serial_number != signer.tbs_certificate.serial_number || !issuer.issuer.iter().any(|n|
+                matches!(n,x509_cert::ext::pkix::name::GeneralName::DirectoryName(name) if name == &signer.tbs_certificate.issuer)) {
+                return Err(verify_err("ESS issuer/serial mismatch".into()));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn reencode_signed_attrs(attrs: &cms::signed_data::SignedAttributes) -> Result<Vec<u8>, CompError> {
     let mut set: SetOfVec<x509_cert::attr::Attribute> = SetOfVec::new();
     for attr in attrs.iter() {
@@ -2746,5 +2850,65 @@ mod testes_extensoes_tstinfo {
             .unwrap_err()
             .to_string();
         assert!(erro.contains("crítica"), "{erro}");
+    }
+}
+
+#[cfg(test)]
+mod ess_regressions {
+    use super::*;
+    #[test]
+    fn ess_references_bind_exact_certificate_and_reject_duplicate_attributes() {
+        use sha2::Digest;
+        let cert = crate::test_pki::chain_de_teste().tsa;
+        for legacy in [false, true] {
+            let hash = if legacy {
+                sha1::Sha1::digest(cert.to_der().unwrap()).to_vec()
+            } else {
+                sha2::Sha256::digest(cert.to_der().unwrap()).to_vec()
+            };
+            for tampered in [false, true] {
+                let mut hash = hash.clone();
+                if tampered {
+                    hash[0] ^= 1;
+                }
+                let value = if legacy {
+                    EssSigningCertificate {
+                        certs: vec![EssCertId {
+                            cert_hash: der::asn1::OctetString::new(hash).unwrap(),
+                            issuer_serial: None,
+                        }],
+                        policies: None,
+                    }
+                    .to_der()
+                    .unwrap()
+                } else {
+                    EssSigningCertificateV2 {
+                        certs: vec![EssCertIdV2 {
+                            hash_algorithm: None,
+                            cert_hash: der::asn1::OctetString::new(hash).unwrap(),
+                            issuer_serial: None,
+                        }],
+                        policies: None,
+                    }
+                    .to_der()
+                    .unwrap()
+                };
+                let attr = x509_cert::attr::Attribute {
+                    oid: if legacy {
+                        "1.2.840.113549.1.9.16.2.12"
+                    } else {
+                        "1.2.840.113549.1.9.16.2.47"
+                    }
+                    .parse()
+                    .unwrap(),
+                    values: der::asn1::SetOfVec::try_from(
+                        vec![der::Any::from_der(&value).unwrap()],
+                    )
+                    .unwrap(),
+                };
+                let attrs = der::asn1::SetOfVec::try_from(vec![attr]).unwrap();
+                assert_eq!(verificar_ess_binding(&attrs, &cert).is_err(), tampered);
+            }
+        }
     }
 }

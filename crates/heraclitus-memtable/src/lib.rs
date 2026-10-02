@@ -13,6 +13,8 @@ use std::sync::RwLock;
 
 pub struct Memtable {
     cap: usize,
+    byte_cap: usize,
+    bytes: std::sync::atomic::AtomicUsize,
     entries: RwLock<VecDeque<(Lsn, Episode)>>,
     adjacency: DashMap<EventId, Vec<EventId>>,
 }
@@ -26,8 +28,14 @@ pub struct ScoredHit {
 
 impl Memtable {
     pub fn new(cap: usize) -> Self {
+        Self::with_byte_budget(cap, 64 << 20)
+    }
+
+    pub fn with_byte_budget(cap: usize, byte_cap: usize) -> Self {
         Self {
             cap,
+            byte_cap,
+            bytes: std::sync::atomic::AtomicUsize::new(0),
             entries: RwLock::new(VecDeque::new()),
             adjacency: DashMap::new(),
         }
@@ -38,6 +46,10 @@ impl Memtable {
         // Audit #12: hold the write lock for the whole publication so the
         // adjacency overlay never exposes an edge to a half-published event.
         let mut entries = self.entries.write().unwrap();
+        self.bytes.fetch_add(
+            episode.resident_bytes(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         for parent in &episode.parents {
             self.adjacency.entry(*parent).or_default().push(episode.id);
         }
@@ -48,8 +60,12 @@ impl Memtable {
         // voltarem a ser assíncronas (o desenho original do §3.4), esta
         // evicção TEM de passar a respeitar o watermark (só evictar ≤ wm),
         // senão perde-se read-your-own-writes.
-        while entries.len() > self.cap {
+        while entries.len() > self.cap || self.resident_bytes() > self.byte_cap {
             if let Some((_, evicted)) = entries.pop_front() {
+                self.bytes.fetch_sub(
+                    evicted.resident_bytes(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 self.forget_adjacency(&evicted);
             }
         }
@@ -60,6 +76,10 @@ impl Memtable {
         let mut entries = self.entries.write().unwrap();
         while matches!(entries.front(), Some((l, _)) if *l <= watermark) {
             if let Some((_, evicted)) = entries.pop_front() {
+                self.bytes.fetch_sub(
+                    evicted.resident_bytes(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 self.forget_adjacency(&evicted);
             }
         }
@@ -83,6 +103,10 @@ impl Memtable {
         self.entries.read().unwrap().len()
     }
 
+    pub fn resident_bytes(&self) -> usize {
+        self.bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -90,8 +114,10 @@ impl Memtable {
     /// Remove toda a cauda materializada. Usado por operações de privacidade
     /// antes de reconstruir as views a partir do log já crypto-shredded.
     pub fn clear(&self) {
-        self.entries.write().unwrap().clear();
+        let mut entries = self.entries.write().unwrap();
+        entries.clear();
         self.adjacency.clear();
+        self.bytes.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Exact brute-force KNN over the tail (≤ cap points — fine, §3.4).
@@ -256,5 +282,39 @@ mod tests {
         let out = merge_hits(mem, view, 10, true);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].lsn, 9);
+    }
+}
+
+#[cfg(test)]
+mod byte_budget_regression {
+    use super::*;
+    #[test]
+    fn bytes_and_adjacency_are_released_by_eviction_prune_and_clear() {
+        let mem = Memtable::with_byte_budget(100, 2048);
+        let parent = EventId::new();
+        for lsn in 0..20 {
+            let mut e = Episode::new(
+                "agent",
+                heraclitus_core::EventKind::Observation,
+                vec![0; 512],
+            );
+            e.parents.push(parent);
+            mem.apply(lsn, e);
+            assert!(mem.resident_bytes() <= 2048);
+            assert_eq!(mem.children_of(&parent).len(), mem.len());
+        }
+        mem.prune_below(20);
+        assert_eq!(mem.resident_bytes(), 0);
+        assert!(mem.children_of(&parent).is_empty());
+        mem.apply(
+            21,
+            Episode::new(
+                "agent",
+                heraclitus_core::EventKind::Observation,
+                vec![0; 16],
+            ),
+        );
+        mem.clear();
+        assert_eq!(mem.resident_bytes(), 0);
     }
 }

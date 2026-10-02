@@ -11,6 +11,20 @@ excluído (é cache, dá falsos positivos).
 > cada afirmação falsa/enganosa com a evidência. O estado real da plataforma e o
 > roteiro estão em [../PLANO-SPECS.md](../PLANO-SPECS.md).
 
+## Atualização 2026-10-01 — SPEC-0086–0091
+
+Ver [matriz de correções e limites](../../CORRECOES-AUDITORIAS-2026-10-01.md).
+
+| SPEC | Estado verificado no código |
+|---|---|
+| 0086 | Provider de software corrigido e envelope autenticado v3; HSM/KMS e atestação externa não qualificados |
+| 0087 | Integridade/custódia e verificação com confiança explícita; perfil de objetos não comprova inclusão HRKL |
+| 0088 | Modelos e perfis presentes; ESS binding/recusa de políticas não suportadas; homologação externa pendente |
+| 0089 | Intenção durável integrada às mutações REST/gRPC; recuperação conserva UNKNOWN; efeitos administrativos em cluster bloqueados |
+| 0090 | Contratos/adaptadores não equivalem a interoperabilidade comprovada com órgão real |
+| 0091 | Contratos de imutabilidade/legal hold não equivalem a bucket WORM provisionado e auditado |
+
+
 ## BLOQUEIOS DE PRODUÇÃO — 2026-08-30 (5)
 
 Esta nota **substitui** três afirmações da nota "MARCO 0" abaixo, que
