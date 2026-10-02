@@ -67,3 +67,7 @@ config.carga.toml
 /release/
 .antigravity/
 
+# Temporary scraping / WAF challenge files
+download-planilhas.js
+servidores_page.html
+

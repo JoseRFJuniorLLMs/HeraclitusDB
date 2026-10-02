@@ -25,6 +25,9 @@ Esses documentos não significam que todos os seus itens estejam implementados. 
 | 0089 | Trusted Administration Protocol | P0 BLOCKER | durable intent antes de operação privilegiada, fail-closed e reconcile |
 | 0090 | Government Interoperability | P1 | PostgreSQL wire, Flight, formatos abertos, BI sem plugins no core |
 | 0091 | Immutable External Storage & Legal Hold | P1 | WORM/object retention, receipts e fronteira externa de imutabilidade |
+| 0092 | Document & LLM Injection Firewall | P0 / Security | differential humano×máquina, quarentena, eventos Sentinel e autoridade DATA_ONLY |
+| 0093 | Document Ingestion & Geometry Adapter | P1 | adapter de PDF/Office, extração de bbox/opacidade/camadas e canonização |
+| 0094 | Forensic Document Evidence & Visualizer | P1 | pacote forense verificável, Merkle leaf documental, causal graph e visualização pericial |
 
 ## 3. Ordem recomendada de implementação
 
@@ -33,9 +36,17 @@ Esses documentos não significam que todos os seus itens estejam implementados. 
         |
         +--> 0086 Key Management / HSM
         |         |
-        |         +--> 0087 Forensic Evidence
-        |
-        +--> 0091 WORM / Legal Hold
+        |         +--> 0087 Forensic Evidence <---------+
+        |                                               |
+        +--> 0091 WORM / Legal Hold                     |
+                                                        |
+0074-0085 Agent Gateway / Sentinel                      |
+        |                                               |
+        +--> 0092 Document Injection Firewall           |
+                  |                                     |
+                  +--> 0093 Document Geometry Adapter   |
+                  |                                     |
+                  +--> 0094 Forensic Document Evidence -+
 
 0046 Compliance ----------------> 0088 Profiles as Code
 
@@ -62,13 +73,15 @@ Esses documentos não significam que todos os seus itens estejam implementados. 
 5. timestamp/assinatura;
 6. relatório.
 
-### Fase D — retenção forte
-1. SPEC-0091;
-- **SPEC-0092** — Document & LLM Injection Firewall: differential humano×máquina, quarantine, eventos Sentinel e autoridade DATA_ONLY. Core de biblioteca implementado; adapters reais de PDF e qualificação institucional pendentes.
-2. modelar cold locations no HRKM;
-3. backend immutable;
-4. receipts;
-5. qualificação.
+### Fase D — retenção forte e segurança documental
+1. SPEC-0091 (WORM / Legal Hold);
+2. **SPEC-0092** — Document & LLM Injection Firewall: differential humano×máquina, quarentena, eventos Sentinel e autoridade DATA_ONLY (*Core de biblioteca implementado; adapters reais de PDF e qualificação institucional pendentes*);
+3. **SPEC-0093** — Document Ingestion & Structural Geometry Adapter (*adapter PDF/Office, bboxes, cores, opacidade e OCR*);
+4. **SPEC-0094** — Forensic Document Evidence & Causal Visualizer (*pacote forense auditável, prova Merkle, grafo causal e UI pericial*);
+5. modelar cold locations no HRKM;
+6. backend immutable;
+7. receipts;
+8. qualificação.
 
 ### Fase E — compliance e integração
 1. SPEC-0088;
