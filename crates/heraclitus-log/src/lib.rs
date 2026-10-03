@@ -2516,7 +2516,22 @@ fn varrer_segmentos_em_paralelo(
 ) -> Result<Vec<Option<SegmentScan>>, HeraclitusError> {
     let varrer_um = |id: SegmentId| -> Result<SegmentScan, HeraclitusError> {
         let path = segment_path(dir, id);
-        scan_segment_file(&path, id, !tem_rodape_selado(&path))
+        let parece_selado = tem_rodape_selado(&path);
+        let scan = scan_segment_file(&path, id, !parece_selado)?;
+        // `tem_rodape_selado` é só uma ESPREITADELA ao magic dos últimos 60
+        // bytes, e esses bytes podem ser conteúdo do cliente (auditoria
+        // recursiva 2026-10-03, iteração 1): um episódio com "HFTR" na posição
+        // certa fazia saltar os leaf hashes de um segmento SEM rodapé. A cauda
+        // era então adoptada com `record_hashes = []` (e `seal_file` selava um
+        // segmento antigo com contagem 0), o rodapé do roll seguinte gravava a
+        // contagem e a raiz só dos registos novos, o `verify()` acusava
+        // adulteração e a abertura seguinte recusava arrancar. A prova de que
+        // há rodapé é o varrimento tê-lo encontrado: se não encontrou, os
+        // hashes são precisos e varre-se de novo — custo só no falso positivo.
+        if parece_selado && !scan.sealed {
+            return scan_segment_file(&path, id, true);
+        }
+        Ok(scan)
     };
 
     // Abaixo de dois segmentos, arrancar threads custa mais do que poupa.
@@ -2589,8 +2604,10 @@ fn tem_rodape_selado(path: &Path) -> bool {
     if ler_exato_em(&f, &mut buf, len - format::FOOTER_LEN as u64).is_err() {
         return false;
     }
-    // Só aceita como selado se o rodapé DESCODIFICA — um magic solto no meio
-    // de dados não chega.
+    // ATENÇÃO: `SegmentFooter::decode` só confirma o magic, portanto isto é um
+    // PALPITE — conteúdo do cliente pode terminar em "HFTR" nesta posição. O
+    // chamador confirma com `scan.sealed` e volta a varrer com hashes quando
+    // o palpite falha (auditoria recursiva 2026-10-03, iteração 1).
     SegmentFooter::decode(&buf).is_some()
 }
 
