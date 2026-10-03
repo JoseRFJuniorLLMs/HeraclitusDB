@@ -961,6 +961,27 @@ impl V6Log {
         let state = self.lock_state()?;
         let head = state.next_lsn;
         let end = to.min(head);
+        // Sem segmento activo, os LSN confirmados que não chegaram ao manifesto
+        // (seal falhado ANTES do commit: estado degradado) não estão em lado
+        // nenhum que a varredura saiba ler. Devolver Ok sem eles era omitir
+        // dados confirmados em silêncio (revisão de 2026-10-03, segunda
+        // ronda); falha-se alto. No estado pendente (seal publicado) o
+        // manifesto cobre tudo até `next_lsn` e nada é recusado.
+        if state.active.is_none() && from < end {
+            let catalogado = next_lsn_from_manifest(&state.manifest)?;
+            if end > catalogado {
+                return Err(HeraclitusError::StorageEngine(format!(
+                    "HRKL v6 sem segmento activo{}: os LSN {}..{end} confirmados não estão \
+                     catalogados; reinicie o processo para os reconciliar",
+                    state
+                        .degradado
+                        .as_deref()
+                        .map(|m| format!(" ({m})"))
+                        .unwrap_or_default(),
+                    catalogado.max(from)
+                )));
+            }
+        }
         let mut candidatos = Vec::new();
         if from < end {
             for desc in state
@@ -3298,6 +3319,32 @@ mod tests {
     #[test]
     fn recuperacao_do_segmento_seguinte_sob_group_commit() {
         recuperacao_do_segmento_seguinte(FsyncPolicy::GroupCommit { interval_ms: 2 });
+    }
+
+    /// Segunda ronda da revisão (2026-10-03): em estado degradado (seal
+    /// falhado antes do commit), os LSN confirmados do segmento perdido não
+    /// estão no manifesto e a varredura devolvia Ok SEM eles. Tem de falhar
+    /// alto; LSN catalogados continuam legíveis por varredura.
+    #[test]
+    fn varredura_em_estado_degradado_nao_omite_lsn_confirmados() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
+        log.append(event(0)).unwrap();
+        log.append(event(1)).unwrap();
+        log.seal_active().unwrap(); // LSN 0..2 catalogados
+        log.append(event(2)).unwrap();
+        log.append(event(3)).unwrap(); // LSN 2..4 só no activo
+        {
+            // Simula o seal falhado antes do commit: writer perdido, estado
+            // degradado, `next_lsn` intacto.
+            let mut state = log.lock_state().unwrap();
+            state.active = None;
+            state.degradado = Some("seal falhado (simulado)".into());
+        }
+        let erro = log.scan_capped(0, log.head(), usize::MAX).unwrap_err();
+        assert!(erro.to_string().contains("não estão catalogados"), "{erro}");
+        let catalogados = log.scan_capped(0, 2, usize::MAX).unwrap();
+        assert_eq!(catalogados.len(), 2);
     }
 
     fn recuperacao_do_segmento_seguinte(politica: FsyncPolicy) {

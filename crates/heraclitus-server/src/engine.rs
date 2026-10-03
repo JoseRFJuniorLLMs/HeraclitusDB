@@ -2401,6 +2401,67 @@ impl Engine {
 
     /// Append + synchronously index into memtable AND views.
     /// Read-your-own-writes holds for every index path.
+    /// As verificações ESTÁTICAS que `append`/`append_idempotent` fazem antes
+    /// de escrever, sem escrever nada: namespaces reservados (diário
+    /// administrativo, H-VM, sentinel, compliance), atributos de idempotência
+    /// e o formato da chave.
+    ///
+    /// Existe para o `AppendBatch` validar o lote INTEIRO antes do primeiro
+    /// append (revisão de 2026-10-03, segunda ronda): estas regras só corriam
+    /// dentro do append, e um item reservado falhava depois de os anteriores
+    /// já estarem gravados, com o mesmo código de erro de uma recusa à entrada.
+    pub fn validar_append(&self, episode: &Episode, key: &str) -> Result<(), HeraclitusError> {
+        if episode.agent_id == "heraclitus-admin"
+            || matches!(&episode.kind, EventKind::Custom(k) if k == "AdminIntent" || k == "AdminResult")
+        {
+            return Err(HeraclitusError::Query(
+                "administrative journal is reserved to authenticated execution".into(),
+            ));
+        }
+        if vm_bridge::is_hvm(episode) {
+            return Err(HeraclitusError::Query(format!(
+                "o kind '{}' é reservado ao ledger H-VM",
+                vm_bridge::HVM_KIND
+            )));
+        }
+        if is_sentinel_reserved(episode) {
+            return Err(HeraclitusError::Query(
+                "tipos, agente e atributos sentinel.* / sec.* são reservados ao pipeline interno"
+                    .into(),
+            ));
+        }
+        if is_compliance_reserved(episode) {
+            return Err(HeraclitusError::Query(
+                "tipos, agente e atributos compliance.* são reservados ao motor regulatório".into(),
+            ));
+        }
+        if episode.attrs.contains_key(IDEMPOTENCY_KEY_ATTR)
+            || episode.attrs.contains_key(IDEMPOTENCY_HASH_ATTR)
+        {
+            return Err(HeraclitusError::Query(
+                "atributos de idempotência são reservados; use AppendRequest.idempotency_key"
+                    .into(),
+            ));
+        }
+        if !key.is_empty() {
+            if self.log_only {
+                return Err(HeraclitusError::Config(
+                    "Append idempotente não é permitido em HERACLITUS_LOG_ONLY".into(),
+                ));
+            }
+            if key.len() > 80
+                || !key
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.'))
+            {
+                return Err(HeraclitusError::Query(
+                    "idempotency_key deve ter 1..80 caracteres ASCII [A-Za-z0-9._:-]".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn append(&self, episode: Episode) -> Result<Lsn, HeraclitusError> {
         if episode.agent_id == "heraclitus-admin"
             || matches!(&episode.kind, EventKind::Custom(k) if k == "AdminIntent" || k == "AdminResult")

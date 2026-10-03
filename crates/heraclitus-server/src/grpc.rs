@@ -223,11 +223,43 @@ impl pb::heraclitus_server::Heraclitus for Service {
             )));
         }
         let mut episodios = Vec::with_capacity(items.len());
+        // Segunda ronda da revisão (2026-10-03): a validação "antes do
+        // primeiro append" tem de incluir TUDO o que o append recusaria —
+        //  - as regras estáticas do engine (namespaces reservados, chave);
+        //  - a dimensão do embedding DENTRO do lote: com o índice vazio, o
+        //    `embedding_layout()` era None para todos os itens e um lote com
+        //    dimensões misturadas entrava inteiro (R60);
+        //  - a mesma chave de idempotência duas vezes no lote.
+        let mut dimensao = self.engine.embedding_layout();
+        let mut chaves = std::collections::HashSet::new();
         for (i, item) in items.into_iter().enumerate() {
-            episodios.push(
-                self.episodio_do_pedido(item, &principal.name)
-                    .map_err(|s| Status::new(s.code(), format!("item {i}: {}", s.message())))?,
-            );
+            let com_indice =
+                |s: Status| Status::new(s.code(), format!("item {i}: {}", s.message()));
+            let (e, key) = self
+                .episodio_do_pedido(item, &principal.name)
+                .map_err(com_indice)?;
+            self.engine
+                .validar_append(&e, &key)
+                .map_err(|err| com_indice(status_do_append(err)))?;
+            if let Some(p) = &e.embedding {
+                let esta = (p.hyp.len(), p.sph.len(), p.euc.len());
+                match dimensao {
+                    None => dimensao = Some(esta),
+                    Some(vigor) if vigor != esta => {
+                        return Err(com_indice(Status::invalid_argument(format!(
+                            "embedding H{}⊗S{}⊗E{} é incomparável com H{}⊗S{}⊗E{} do lote",
+                            esta.0, esta.1, esta.2, vigor.0, vigor.1, vigor.2
+                        ))));
+                    }
+                    Some(_) => {}
+                }
+            }
+            if !key.is_empty() && !chaves.insert(key.clone()) {
+                return Err(com_indice(Status::invalid_argument(format!(
+                    "idempotency_key '{key}' repetida no mesmo lote"
+                ))));
+            }
+            episodios.push((e, key));
         }
         let engine = self.engine.clone();
         let resultado = tokio::task::spawn_blocking(move || {
@@ -679,20 +711,28 @@ impl pb::heraclitus_server::Heraclitus for Service {
                 // recusava por conflito de digest — quem pediu nunca conseguia
                 // reconciliar; com um alvo inexistente, a reconciliação
                 // encontrava a sua própria reserva e gravava dois resultados
-                // para a mesma chave. A chave própria deriva do alvo (um retry
-                // do MESMO pedido continua idempotente) e nunca coincide com
-                // ele.
+                // para a mesma chave.
+                //
+                // Segunda ronda da revisão: a chave própria derivava só do
+                // alvo, e então UMA tentativa falhada (um `outcome` mal
+                // escrito, evidência em falta) ficava gravada como Failed e
+                // bloqueava para sempre esse alvo a esse administrador — um
+                // pedido corrigido batia em conflito de digest. Agora (1) os
+                // argumentos são validados ANTES de qualquer intenção durável,
+                // e (2) a chave é o hash do pedido COMPLETO: o mesmo pedido
+                // repetido é idempotente, um pedido corrigido é outra tentativa.
+                // O hash também elimina a ambiguidade de juntar campos com ':'.
+                if r.op == "admin-reconcile" {
+                    if let Err(motivo) = validar_pedido_de_reconciliacao(corpo.as_ref()) {
+                        engine.audit_admin(&operation, false, &audit_principal);
+                        return (false, motivo);
+                    }
+                }
                 let key = if r.op == "admin-reconcile" {
-                    supplied
-                        .map(|alvo| {
-                            format!(
-                                "admin-reconcile:{}:{}:{alvo}",
-                                campo("tenant").unwrap_or_else(|| admin_ctx.tenant.clone()),
-                                campo("principal")
-                                    .unwrap_or_else(|| admin_ctx.principal.clone()),
-                            )
-                        })
-                        .unwrap_or_else(|| admin_ctx.request_id.clone())
+                    format!(
+                        "admin-reconcile:{}",
+                        blake3::hash(r.arg.as_bytes()).to_hex()
+                    )
                 } else {
                     supplied.unwrap_or_else(|| admin_ctx.request_id.clone())
                 };
@@ -725,6 +765,23 @@ impl pb::heraclitus_server::Heraclitus for Service {
         .map_err(internal)?;
         Ok(Response::new(pb::AdminResponse { ok, message }))
     }
+}
+
+/// Validação dos argumentos do `admin-reconcile` ANTES do `execute_admin`:
+/// um erro aqui não deixa rasto durável no diário (nem bloqueia retries).
+fn validar_pedido_de_reconciliacao(corpo: Option<&serde_json::Value>) -> Result<(), String> {
+    let corpo = corpo.ok_or_else(|| "corpo inválido: JSON esperado".to_string())?;
+    let campo = |nome: &str| corpo.get(nome).and_then(|v| v.as_str());
+    if campo("idempotency_key").is_none_or(str::is_empty) {
+        return Err("idempotency_key obrigatório".into());
+    }
+    if !matches!(campo("outcome"), Some("succeeded") | Some("failed")) {
+        return Err("outcome tem de ser \"succeeded\" ou \"failed\"".into());
+    }
+    if campo("evidence").is_none_or(|e| e.trim().is_empty()) {
+        return Err("reconciliação exige evidência do efeito real".into());
+    }
+    Ok(())
 }
 
 /// `Admin op="admin-reconcile"`: `arg = {"idempotency_key", "outcome":
@@ -1391,6 +1448,105 @@ mod testes_dimensao_do_embedding {
             engine.trusted_admin().operation_state(&ctx, "K-1"),
             Some(crate::trusted_admin::AdminState::Reconciled)
         );
+    }
+
+    /// Segunda ronda da revisão: uma tentativa de reconciliação com um
+    /// argumento errado ficava gravada como Failed sob uma chave derivada só
+    /// do alvo, e o pedido corrigido batia em conflito — o alvo ficava
+    /// irreconciliável para sempre por esse administrador.
+    #[tokio::test]
+    async fn reconciliacao_com_argumento_errado_nao_bloqueia_o_pedido_corrigido() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = motor(dir.path());
+            deixar_unknown(&engine, "K-2");
+            let svc = Service::new(engine.clone());
+            let errado = svc
+                .admin(pedido_admin(
+                    "admin-reconcile",
+                    serde_json::json!({
+                        "idempotency_key": "K-2",
+                        "outcome": "sucesso",
+                        "evidence": "ok",
+                    }),
+                ))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(!errado.ok);
+            let certo = svc
+                .admin(pedido_admin(
+                    "admin-reconcile",
+                    serde_json::json!({
+                        "idempotency_key": "K-2",
+                        "outcome": "succeeded",
+                        "evidence": "ok",
+                    }),
+                ))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(certo.ok, "{}", certo.message);
+        }
+        let engine = motor(dir.path());
+        let ctx = crate::trusted_admin::AdminContext::new("chefe", "local", vec!["admin".into()]);
+        assert_eq!(
+            engine.trusted_admin().operation_state(&ctx, "K-2"),
+            Some(crate::trusted_admin::AdminState::Reconciled)
+        );
+    }
+
+    /// Segunda ronda: num índice vazio o `embedding_layout()` era None para
+    /// todos os itens e um lote com dimensões misturadas entrava inteiro.
+    #[tokio::test]
+    async fn append_batch_recusa_dimensoes_misturadas_dentro_do_lote() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = motor(dir.path());
+        let svc = Service::new(engine.clone());
+        let mut a = item("a", "d-1");
+        a.hyp = vec![0.1, 0.2, 0.3];
+        let mut b = item("b", "d-2");
+        b.hyp = vec![0.1; 5];
+        let erro = svc.append_batch(lote(vec![a, b])).await.unwrap_err();
+        assert_eq!(erro.code(), tonic::Code::InvalidArgument);
+        assert!(erro.message().contains("item 1"), "{}", erro.message());
+        assert_eq!(engine.head(), 0, "nada gravado");
+    }
+
+    /// Segunda ronda: regras do engine (namespaces reservados, chave) só
+    /// corriam dentro do append — um item reservado falhava depois de os
+    /// anteriores estarem gravados.
+    #[tokio::test]
+    async fn append_batch_valida_as_regras_do_engine_antes_de_escrever() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = motor(dir.path());
+        let svc = Service::new(engine.clone());
+        let mut reservado = item("x", "r-2");
+        reservado.agent_id = "heraclitus-admin".into();
+        let erro = svc
+            .append_batch(lote(vec![item("ok", ""), reservado]))
+            .await
+            .unwrap_err();
+        assert!(erro.message().contains("item 1"), "{}", erro.message());
+        assert_eq!(engine.head(), 0, "o item 0 não pode ter sido gravado");
+
+        let chave_ma = item("y", "tem espaços");
+        assert!(svc
+            .append_batch(lote(vec![item("ok", ""), chave_ma]))
+            .await
+            .is_err());
+        assert_eq!(engine.head(), 0);
+
+        let repetida = svc
+            .append_batch(lote(vec![item("p", "mesma"), item("q", "mesma")]))
+            .await
+            .unwrap_err();
+        assert!(
+            repetida.message().contains("repetida"),
+            "{}",
+            repetida.message()
+        );
+        assert_eq!(engine.head(), 0);
     }
 
     /// Revisão de 2026-10-03 (achado 11, crítico): reconciliar uma chave que
