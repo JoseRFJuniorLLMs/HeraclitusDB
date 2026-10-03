@@ -259,7 +259,14 @@ impl KeyStore {
             Err(e) => return Err(e),
         };
         if bytes.len() != 32 {
-            return Ok(None);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "key file {} has {} bytes; expected 32",
+                    path.display(),
+                    bytes.len()
+                ),
+            ));
         }
         let mut k = [0u8; 32];
         k.copy_from_slice(&bytes);
@@ -718,6 +725,27 @@ mod testes_shred {
         // Depois de um shred verdadeiro, sim, `Ok(None)`.
         assert!(fria.shred("ana").unwrap());
         assert_eq!(fria.try_get("ana").unwrap(), None);
+    }
+
+    #[test]
+    fn malformed_existing_key_is_not_shredding() {
+        let (d, ks) = loja();
+        ks.get_or_create("ana").unwrap();
+        let path = ks.key_path("ana");
+        for len in [0, 1, 31, 33, 64] {
+            std::fs::write(&path, vec![1u8; len]).unwrap();
+            let fria = KeyStore::open(d.path()).unwrap();
+            assert_eq!(
+                fria.try_get("ana").unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert!(!fria.was_shredded("ana"));
+        }
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            KeyStore::open(d.path()).unwrap().try_get("ana").unwrap(),
+            None
+        );
     }
 
     /// Stress: leitores concorrentes durante um shred nunca veem zeros nem a
