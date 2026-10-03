@@ -387,8 +387,14 @@ mod tests {
 
         let seg_path = key.segment_path();
         let hrki_path = key.hrki_path();
-        tier.store.put(&seg_path, vec![1, 2, 3].into()).await.unwrap();
-        tier.store.put(&hrki_path, vec![4, 5, 6].into()).await.unwrap();
+        tier.store
+            .put(&seg_path, vec![1, 2, 3].into())
+            .await
+            .unwrap();
+        tier.store
+            .put(&hrki_path, vec![4, 5, 6].into())
+            .await
+            .unwrap();
 
         let r = tier
             .collect_cold_locations(&[seg_path.to_string()])

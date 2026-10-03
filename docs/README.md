@@ -25,6 +25,9 @@ Bem-vindo ao portal documental versionado do HeraclitusDB.
 - [`BLOQUEIOS-PRODUCAO.md`](BLOQUEIOS-PRODUCAO.md) — pendências relevantes para produção.
 - [`AUDITORIA-2026-09-05.md`](AUDITORIA-2026-09-05.md) — auditoria técnica.
 - [`AUDITORIA-RECURSIVA-2026-09-05.md`](AUDITORIA-RECURSIVA-2026-09-05.md) — auditoria recursiva detalhada.
+- [`CORRECOES-AUDITORIAS-2026-10-01.md`](CORRECOES-AUDITORIAS-2026-10-01.md) — correções das SPECs 0086–0091.
+- [`CORRECOES-AUDITORIAS-2026-10-02.md`](CORRECOES-AUDITORIAS-2026-10-02.md) — correções e matriz de estabilização de produção.
+- [`CORRECOES-AUDITORIAS-2026-10-03.md`](CORRECOES-AUDITORIAS-2026-10-03.md) — correções das auditorias recursivas (Rondas 3 a 7).
 
 ## Convenção de maturidade
 

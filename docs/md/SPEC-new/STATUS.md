@@ -24,6 +24,19 @@ Ver [matriz de correções e limites](../../CORRECOES-AUDITORIAS-2026-10-01.md).
 | 0090 | Contratos/adaptadores não equivalem a interoperabilidade comprovada com órgão real |
 | 0091 | Contratos de imutabilidade/legal hold não equivalem a bucket WORM provisionado e auditado |
 
+## Atualização 2026-10-03 — Auditorias Recursivas (Rondas 3 a 7)
+
+Ver [matriz de correções e limites](../../CORRECOES-AUDITORIAS-2026-10-03.md) e [auditorias de 2026-10-02](../../CORRECOES-AUDITORIAS-2026-10-02.md).
+
+| Componente / SPEC | Estado verificado no código |
+|---|---|
+| **SPEC-0050** (Cold Tier & Compaction) | Imutabilidade dupla assegurada em segmentos e Parquet (`put_immutable_segment`, `put_immutable_parquet`); isolamento atômico de scratch de repack por invocação; recusa de sobrescrita de gerações compactadas legadas divergentes; retenção de falhas transitórias de sidecars no GC frio (`ColdCollectReport`). |
+| **SPEC-0074 / SPEC-0085** (Agent In-Flight Dedupe) | Coordenação atômica de evidências em voo (`InFlightGuard`): evidência só é admitida em memória após persistência confirmada no log; formatação da chave calculada em conflitos; desbloqueio e notificações seguras no Drop mesmo sob pânico. |
+| **Raft Durabilidade** | Validação estrita da fronteira de commit e do WAL antes de qualquer truncamento; rejeição de logs sem purga com lacunas iniciais (`last_purged == None`); proteção contra corrupção em arranque. |
+| **Views / Projeções** | Alinhamento do laço de replay para limite superior exclusivo (`cur < head`), eliminando varreduras de I/O desnecessárias; reinicialização determinística do cursor em watermark 0; integridade de cabeçalho v1 e CRC32 mantida. |
+| **Crypto KeyStore** | Detecção imediata de arquivos de chave corrompidos com tamanho > 32 bytes (`fail-fast`) retornando `InvalidData: expected 32`, sem spin-wait nem erros enganosos de artefacto de crash. |
+
+
 
 ## BLOQUEIOS DE PRODUÇÃO — 2026-08-30 (5)
 
