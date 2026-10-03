@@ -2102,10 +2102,18 @@ impl Engine {
         let head = self.log.head();
         let mut achados = Vec::new();
         let mut cur = 0u64;
+        // Um erro de leitura NÃO pode virar uma lista curta com aspecto de
+        // completa (revisão de 2026-10-03, terceira ronda): é o relatório de
+        // acessos de um titular (LGPD art. 18). O erro sai no JSON e o REST
+        // responde com erro em vez de 200.
+        let mut erro: Option<String> = None;
         while cur < head && achados.len() < limite {
             let lote = match self.log.scan_capped(cur, head, 20_000) {
                 Ok(l) => l,
-                Err(_) => break,
+                Err(e) => {
+                    erro = Some(e.to_string());
+                    break;
+                }
             };
             let Some(&(ultimo, _)) = lote.last() else {
                 break;
@@ -2134,7 +2142,15 @@ impl Engine {
             }
             cur = ultimo + 1;
         }
-        serde_json::json!({ "titular": agent_id, "acessos": achados })
+        match erro {
+            None => serde_json::json!({ "titular": agent_id, "acessos": achados }),
+            Some(erro) => serde_json::json!({
+                "titular": agent_id,
+                "acessos": achados,
+                "completo": false,
+                "error": erro,
+            }),
+        }
     }
 
     /// Crypto-shred (§3.10): destroy an agent's encryption key so all of its

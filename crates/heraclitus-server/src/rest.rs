@@ -1513,11 +1513,18 @@ async fn titular(
 async fn titular_acessos(
     State(engine): State<Arc<Engine>>,
     Path(id): Path<String>,
-) -> Json<serde_json::Value> {
+) -> (StatusCode, Json<serde_json::Value>) {
     let out = tokio::task::spawn_blocking(move || engine.titular_acessos(&id, 100))
         .await
         .unwrap_or_else(|e| serde_json::json!({ "error": format!("join: {e}") }));
-    Json(out)
+    // Um relatório incompleto (erro de leitura do log) não pode sair como
+    // 200: quem o recebe toma-o pela lista completa de acessos do titular.
+    let estado = if out.get("error").is_some() {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    (estado, Json(out))
 }
 
 /// `POST /titular/:id/eliminar` — crypto-shred (LGPD art. 18, VI).
