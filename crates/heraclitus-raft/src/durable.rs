@@ -193,6 +193,44 @@ impl FileRaftLog {
 
         let wal_path = dir.join("entries.wal");
         let (entries, last_purged, valid_len, saw_compaction) = Self::replay(&wal_path)?;
+        // Auditoria recursiva, iteração 3: validar a fronteira comprometida
+        // durável ANTES de alterar o WAL. Um prefixo corrompido pode parecer
+        // uma escrita final interrompida; a recuperação não pode descartar
+        // entradas já comprometidas.
+        let meta = Self::load_meta(&dir.join("meta.bin"))?;
+        if let Some(committed) = meta.committed {
+            let covered_by_purge = last_purged
+                .is_some_and(|purged| purged.index > committed.index || purged == committed);
+            if !covered_by_purge {
+                let start = last_purged.map_or_else(
+                    || {
+                        entries
+                            .first_key_value()
+                            .map_or(committed.index, |(&index, _)| index)
+                    },
+                    |purged| purged.index.saturating_add(1),
+                );
+                let mut expected = start;
+                let mut contiguous = start <= committed.index;
+                if contiguous {
+                    for (&index, _) in entries.range(start..=committed.index) {
+                        if index != expected {
+                            contiguous = false;
+                            break;
+                        }
+                        expected = expected.saturating_add(1);
+                    }
+                }
+                if !contiguous
+                    || entries.get(&committed.index).map(|e| e.log_id) != Some(committed)
+                    || expected != committed.index.saturating_add(1)
+                {
+                    return Err(StorageError::from(StorageIOError::read_logs(io_err(
+                        "WAL raft does not cover durable committed frontier; refusing to truncate",
+                    ))));
+                }
+            }
+        }
 
         // Trunca a cauda meia-escrita (o último registo incompleto após crash).
         let wal = OpenOptions::new()
@@ -209,8 +247,6 @@ impl FileRaftLog {
             .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
         // A entrada de diretório do WAL recém-criado tem de ser durável também.
         fsync_dir(&dir);
-
-        let meta = Self::load_meta(&dir.join("meta.bin"))?;
 
         let mut inner = Inner {
             dir,
@@ -606,6 +642,9 @@ mod tests {
         {
             let mut log = FileRaftLog::open(dir.path()).unwrap();
             append(&mut log, vec![entry(1, 1, "a"), entry(2, 1, "b")]).await;
+            log.save_committed(Some(entry(2, 1, "b").log_id))
+                .await
+                .unwrap();
         }
         // Simula um crash a meio da escrita do 3.º registo: acrescenta um prefixo
         // de comprimento a dizer 999 bytes mas só 3 bytes de payload.
@@ -641,6 +680,58 @@ mod tests {
                 .index,
             3
         );
+    }
+
+    #[tokio::test]
+    async fn corrupt_length_preserves_wal_covering_committed_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut log = FileRaftLog::open(dir.path()).unwrap();
+            append(
+                &mut log,
+                vec![entry(1, 1, "a"), entry(2, 1, "b"), entry(3, 1, "c")],
+            )
+            .await;
+            log.save_committed(Some(entry(3, 1, "c").log_id))
+                .await
+                .unwrap();
+        }
+        let path = dir.path().join("entries.wal");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(FileRaftLog::open(dir.path()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn purged_committed_frontier_is_valid_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut log = FileRaftLog::open(dir.path()).unwrap();
+            append(&mut log, vec![entry(1, 1, "a"), entry(2, 1, "b")]).await;
+            log.save_committed(Some(entry(2, 1, "b").log_id))
+                .await
+                .unwrap();
+            log.purge(entry(2, 1, "b").log_id).await.unwrap();
+        }
+        assert!(FileRaftLog::open(dir.path()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn invalid_meta_does_not_modify_a_torn_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let log = FileRaftLog::open(dir.path()).unwrap();
+            log.append_sync(vec![entry(1, 1, "a")]).unwrap();
+        }
+        let path = dir.path().join("entries.wal");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(&[1, 2, 3]);
+        std::fs::write(&path, &bytes).unwrap();
+        std::fs::write(dir.path().join("meta.bin"), b"invalid metadata").unwrap();
+        assert!(FileRaftLog::open(dir.path()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
     #[tokio::test]
