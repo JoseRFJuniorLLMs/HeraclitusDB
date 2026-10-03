@@ -439,3 +439,75 @@ fn append_do_mesmo_agente_depois_do_shred_nao_torna_os_antigos_em_adulteracao_v6
         }
     );
 }
+
+/// Auditoria recursiva 2026-10-03, iteração 1: com a cifra ligada, uma falha
+/// de I/O ao ler o ficheiro de chave de um agente (permissões endurecidas,
+/// atributo só-de-leitura, violação de partilha de um antivírus/backup) fazia
+/// o `read`/`scan` devolver o tombstone `[shredded]` com `Ok` — uma chave viva
+/// relatada como apagada, e copiada assim pelo `migrate-encrypted`. Tem de ser
+/// erro. Um directório no lugar do ficheiro de chave dá um erro de leitura
+/// determinista em Unix e Windows (e não `NotFound`).
+macro_rules! chave_ilegivel_nao_e_shred {
+    ($abrir:expr) => {{
+        let abrir = $abrir;
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("log");
+        let keys_dir = dir.path().join("keys");
+        let log = abrir(&log_dir, KeyStore::open(&keys_dir).unwrap());
+        let lsn = log
+            .append(Episode::new(
+                "titular:hmac-sha256:abc",
+                EventKind::Custom("OperationalFact".into()),
+                b"segredo vivo".to_vec(),
+            ))
+            .unwrap();
+        drop(log);
+
+        let chaves: Vec<_> = std::fs::read_dir(&keys_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "key"))
+            .collect();
+        assert_eq!(chaves.len(), 1);
+        let chave = &chaves[0];
+        let guardada = dir.path().join("chave.bak");
+        std::fs::rename(chave, &guardada).unwrap();
+        std::fs::create_dir(chave).unwrap();
+
+        // Keystore novo (cache vazia), como depois de um restart.
+        let log = abrir(&log_dir, KeyStore::open(&keys_dir).unwrap());
+        match log.read(lsn) {
+            Err(_) => {}
+            Ok(Some((_, ep))) => panic!(
+                "chave ilegível devolvida como Ok (content={:?}): erro de I/O                  confundido com crypto-shredding",
+                String::from_utf8_lossy(&ep.content)
+            ),
+            Ok(None) => panic!("o registo desapareceu"),
+        }
+        assert!(
+            log.scan(0, u64::MAX).is_err(),
+            "o scan não pode devolver tombstones para uma chave que existe"
+        );
+
+        // Reposta a chave, o mesmo log volta a ler o conteúdo real.
+        std::fs::remove_dir(chave).unwrap();
+        std::fs::rename(&guardada, chave).unwrap();
+        let (_, ep) = log.read(lsn).unwrap().unwrap();
+        assert_eq!(ep.content, b"segredo vivo");
+    }};
+}
+
+#[test]
+fn chave_ilegivel_nao_e_confundida_com_crypto_shred() {
+    chave_ilegivel_nao_e_shred!(|dir: &std::path::Path, keys: std::sync::Arc<KeyStore>| {
+        Log::open_with_keystore(dir, 1 << 20, FsyncPolicy::Always, Some(keys)).unwrap()
+    });
+}
+
+#[test]
+fn chave_ilegivel_nao_e_confundida_com_crypto_shred_v6() {
+    chave_ilegivel_nao_e_shred!(|dir: &std::path::Path, keys: std::sync::Arc<KeyStore>| {
+        Log::open_v6_with_keystore(dir, 1 << 20, FsyncPolicy::Always, Some(keys)).unwrap()
+    });
+}

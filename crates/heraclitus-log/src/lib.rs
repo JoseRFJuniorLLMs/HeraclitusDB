@@ -559,7 +559,12 @@ pub(crate) fn decrypt_storage_episode_in_place(
         return Ok(());
     }
 
-    let Some(key) = ks.get(&ep.agent_id) else {
+    // Auditoria recursiva 2026-10-03, iteração 1: `try_get` e não `get`. O
+    // `get` devolvia `None` também em qualquer falha de I/O no ficheiro da
+    // chave (permissões, violação de partilha, EMFILE...), e aqui isso virava
+    // tombstone com `Ok` — uma chave viva relatada como apagada, e copiada
+    // assim de forma durável pelo `migrate-encrypted`. Erro de I/O é erro.
+    let Some(key) = ks.try_get(&ep.agent_id)? else {
         // Ausência é a semântica normal de crypto-shredding, não corrupção.
         apply_shredded_tombstone(ep);
         return Ok(());

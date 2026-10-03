@@ -197,9 +197,26 @@ impl KeyStore {
     }
 
     fn read_key(path: &Path) -> Option<[u8; 32]> {
-        let bytes = std::fs::read(path).ok()?;
+        Self::read_key_checked(path).ok().flatten()
+    }
+
+    /// Como [`Self::read_key`], mas distingue "não há chave" (`Ok(None)`) de
+    /// "não foi possível ler o ficheiro" (`Err`).
+    ///
+    /// Auditoria recursiva 2026-10-03, iteração 1: o leitor de episódios
+    /// cifrados trata "sem chave" como crypto-shredding e devolve o tombstone
+    /// `[shredded]` com `Ok`. Com o `.ok()?` toda a falha de I/O (permissões,
+    /// violação de partilha de um antivírus/backup, EMFILE...) virava "sem
+    /// chave", e uma chave viva era relatada como apagada — e copiada assim,
+    /// de forma durável, pelo `migrate-encrypted`. Só `NotFound` é ausência.
+    fn read_key_checked(path: &Path) -> io::Result<Option<[u8; 32]>> {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
         if bytes.len() != 32 {
-            return None;
+            return Ok(None);
         }
         let mut k = [0u8; 32];
         k.copy_from_slice(&bytes);
@@ -209,9 +226,9 @@ impl KeyStore {
         // do lock — se alguma vez a ordenacao falhar, o pior caso passa a ser
         // "chave nova" em vez de "cifrar com zeros".
         if k.iter().all(|&b| b == 0) {
-            return None;
+            return Ok(None);
         }
-        Some(k)
+        Ok(Some(k))
     }
 
     /// Fetch the agent's key, generating and persisting one on first use.
@@ -291,23 +308,39 @@ impl KeyStore {
 
     /// Fetch the agent's key if it still exists (`None` if never created or
     /// already shredded).
+    ///
+    /// Engole erros de I/O como `None`: serve apenas para quem tolera essa
+    /// ambiguidade. Quem decide "foi crypto-shredded" a partir da resposta tem
+    /// de usar [`Self::try_get`].
     pub fn get(&self, agent_id: &str) -> Option<[u8; 32]> {
+        self.try_get(agent_id).ok().flatten()
+    }
+
+    /// Fetch the agent's key: `Ok(None)` only when there is no key (never
+    /// created or already shredded); any I/O failure is an `Err`.
+    ///
+    /// Auditoria recursiva 2026-10-03, iteração 1: ver
+    /// [`Self::read_key_checked`]. O fsync de publicação também propaga o erro
+    /// — uma chave que se leu mas não se consegue tornar durável é uma falha,
+    /// não um apagamento.
+    pub fn try_get(&self, agent_id: &str) -> io::Result<Option<[u8; 32]>> {
         // Mesma corrida que o `get_or_create`: cache -> ficheiro -> insere.
         let _g = self.guarda.read().unwrap_or_else(|e| e.into_inner());
         if let Some(k) = self.cache.get(agent_id) {
-            return Some(*k);
+            return Ok(Some(*k));
         }
-        let k = Self::read_key(&self.key_path(agent_id))?;
+        let path = self.key_path(agent_id);
+        let Some(k) = Self::read_key_checked(&path)? else {
+            return Ok(None);
+        };
         std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(self.key_path(agent_id))
-            .ok()?
-            .sync_all()
-            .ok()?;
-        sync_dir(&self.dir).ok()?;
+            .open(&path)?
+            .sync_all()?;
+        sync_dir(&self.dir)?;
         self.cache.insert(agent_id.to_string(), k);
-        Some(k)
+        Ok(Some(k))
     }
 
     /// Crypto-shred (SPEC-0050 §98): destroy the agent's key, so the events
@@ -595,6 +628,39 @@ mod testes_shred {
         // Shred de um agente sem chave nao inventa marca.
         assert!(!ks.shred("ninguem").unwrap());
         assert!(!ks.was_shredded("ninguem"));
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 1: uma falha de I/O ao ler a
+    /// chave NÃO é ausência. O leitor de episódios decide "crypto-shredded" a
+    /// partir de `Ok(None)`; se um erro de leitura também desse `None`, uma
+    /// chave viva era relatada como apagada. Um directório no lugar do
+    /// ficheiro dá um erro de leitura determinista em Unix e Windows.
+    #[test]
+    fn erro_de_io_na_chave_nao_e_confundido_com_shred() {
+        let (d, ks) = loja();
+        let k = ks.get_or_create("ana").unwrap();
+        let path = ks.key_path("ana");
+        let guardada = d.path().join("ana.key.bak");
+        std::fs::rename(&path, &guardada).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        // Instância nova: cache vazia, como depois de um restart.
+        let fria = KeyStore::open(d.path()).unwrap();
+        assert!(
+            fria.try_get("ana").is_err(),
+            "ficheiro de chave ilegível tem de ser erro, não `Ok(None)`"
+        );
+        // Ausência real continua a ser `Ok(None)`.
+        assert_eq!(fria.try_get("ninguem").unwrap(), None);
+
+        // Reposta a chave, volta a abrir — e nada ficou envenenado na cache.
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&guardada, &path).unwrap();
+        assert_eq!(fria.try_get("ana").unwrap(), Some(k));
+
+        // Depois de um shred verdadeiro, sim, `Ok(None)`.
+        assert!(fria.shred("ana").unwrap());
+        assert_eq!(fria.try_get("ana").unwrap(), None);
     }
 
     /// Stress: leitores concorrentes durante um shred nunca veem zeros nem a
