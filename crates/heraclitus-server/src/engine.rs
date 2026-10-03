@@ -144,6 +144,32 @@ fn is_compliance_reserved(episode: &Episode) -> bool {
         )
 }
 
+/// Kinds da meta-auditoria (`audit_query`, `audit_admin`,
+/// `audit_admin_strict`). O relatório de acessos do titular só aceita estes.
+const AUDIT_KINDS: &[&str] = &["AuditQuery", "AuditAdmin"];
+
+/// O mesmo contrato de `is_sentinel_reserved`, para a meta-auditoria.
+///
+/// Auditoria recursiva 2026-10-03, iteração 2: os eventos de auditoria
+/// genuínos são `Custom("AuditQuery")`/`Custom("AuditAdmin")` banais, e nada
+/// impedia um Writer (Append gRPC ou `CREATE (n:AuditAdmin {...})` em GQL) de
+/// escrever um igual. O `titular_acessos` (LGPD art. 18) apresentava-o como
+/// acesso real — um `shred:<titular>` por um "dpo" que nunca o fez — e o log
+/// é imutável, a falsificação ficava para sempre. Reservam-se os kinds e o
+/// agente dedicado; o atributo genérico `audit` não, porque é um nome que
+/// clientes podem usar nos seus dados — em vez disso o relatório passa a
+/// exigir também o kind reservado.
+fn is_audit_reserved(episode: &Episode) -> bool {
+    episode.agent_id == "heraclitus-audit"
+        || matches!(
+            &episode.kind,
+            EventKind::Custom(kind) if AUDIT_KINDS.contains(&kind.as_str())
+        )
+}
+
+const AUDIT_RESERVADO: &str =
+    "os kinds AuditQuery/AuditAdmin e o agente heraclitus-audit são reservados à meta-auditoria";
+
 pub struct Engine {
     /// Backend append-only selecionado explicitamente na configuração.
     /// `legacy` continua sendo o default; `v6` nunca é inferido nem migrado.
@@ -836,7 +862,9 @@ impl Engine {
         e.attrs.insert("principal".into(), principal.into());
         e.attrs
             .insert("ok".into(), if ok { "true".into() } else { "false".into() });
-        let _ = self.append(e);
+        // `append_internal`: os kinds de auditoria são reservados no `append`
+        // externo (auditoria recursiva 2026-10-03, iteração 2).
+        let _ = self.append_internal(e);
     }
 
     /// Registra toda tentativa de operação administrativa, inclusive falhas (auditoria C3/B2).
@@ -855,7 +883,7 @@ impl Engine {
         e.attrs.insert("operation".into(), operation.into());
         e.attrs
             .insert("ok".into(), if ok { "true".into() } else { "false".into() });
-        if let Err(err) = self.append(e) {
+        if let Err(err) = self.append_internal(e) {
             eprintln!(
                 "AVISO DE SEGURANÇA: Falha ao persistir evento de auditoria administrativa \
                  (op: {operation}, principal: {principal}): {err:?}"
@@ -884,7 +912,7 @@ impl Engine {
         e.attrs.insert("operation".into(), operation.into());
         e.attrs
             .insert("ok".into(), if ok { "true".into() } else { "false".into() });
-        self.append(e)
+        self.append_internal(e)
     }
 
     /// Retorna o protocolo de administração confiável (SPEC-0089).
@@ -2243,7 +2271,14 @@ impl Engine {
                 break;
             };
             for (lsn, ep) in &lote {
-                let e_auditoria = ep.attrs.contains_key("audit");
+                // Auditoria recursiva 2026-10-03, iteração 2: o atributo
+                // `audit` sozinho vinha do cliente; só os kinds reservados
+                // (`is_audit_reserved`) provam que foi o servidor a escrever.
+                let e_auditoria = ep.attrs.contains_key("audit")
+                    && matches!(
+                        &ep.kind,
+                        EventKind::Custom(kind) if AUDIT_KINDS.contains(&kind.as_str())
+                    );
                 if !e_auditoria {
                     continue;
                 }
@@ -2604,7 +2639,7 @@ impl Engine {
     /// Read-your-own-writes holds for every index path.
     /// As verificações ESTÁTICAS que `append`/`append_idempotent` fazem antes
     /// de escrever, sem escrever nada: namespaces reservados (diário
-    /// administrativo, H-VM, sentinel, compliance), atributos de idempotência
+    /// administrativo, H-VM, sentinel, compliance, meta-auditoria), atributos de idempotência
     /// e o formato da chave.
     ///
     /// Existe para o `AppendBatch` validar o lote INTEIRO antes do primeiro
@@ -2635,6 +2670,9 @@ impl Engine {
             return Err(HeraclitusError::Query(
                 "tipos, agente e atributos compliance.* são reservados ao motor regulatório".into(),
             ));
+        }
+        if is_audit_reserved(episode) {
+            return Err(HeraclitusError::Query(AUDIT_RESERVADO.into()));
         }
         if episode.attrs.contains_key(IDEMPOTENCY_KEY_ATTR)
             || episode.attrs.contains_key(IDEMPOTENCY_HASH_ATTR)
@@ -2700,6 +2738,9 @@ impl Engine {
                 "tipos, agente e atributos compliance.* são reservados ao motor regulatório".into(),
             ));
         }
+        if is_audit_reserved(&episode) {
+            return Err(HeraclitusError::Query(AUDIT_RESERVADO.into()));
+        }
         if episode.attrs.contains_key(IDEMPOTENCY_KEY_ATTR)
             || episode.attrs.contains_key(IDEMPOTENCY_HASH_ATTR)
         {
@@ -2739,6 +2780,9 @@ impl Engine {
             return Err(HeraclitusError::Query(
                 "tipos, agente e atributos compliance.* são reservados ao motor regulatório".into(),
             ));
+        }
+        if is_audit_reserved(&episode) {
+            return Err(HeraclitusError::Query(AUDIT_RESERVADO.into()));
         }
         if key.is_empty() {
             // O `EventId` é gerado por `Episode::new` ANTES de chegar aqui, e
@@ -4333,6 +4377,72 @@ mod tests {
         let r = engine.titular_acessos("maria-x", 100);
         assert_eq!(r["acessos"].as_array().unwrap().len(), 6, "{r}");
         assert_eq!(r["truncado"], false, "{r}");
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 2: um Writer escrevia um
+    /// `AuditAdmin` forjado (Append ou `CREATE` em GQL) e o relatório LGPD do
+    /// titular mostrava um crypto-shred por um "dpo" que nunca aconteceu.
+    #[test]
+    fn auditoria_nao_se_forja_pelo_append_externo() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            audit_admin: true,
+            ..Default::default()
+        };
+        let engine = Engine::open(&cfg).unwrap();
+
+        let forjado = |agente: &str, kind: &str| {
+            let mut e = Episode::new(
+                agente,
+                EventKind::Custom(kind.into()),
+                b"shred:titular-123".to_vec(),
+            );
+            e.attrs.insert("audit".into(), "admin".into());
+            e.attrs.insert("principal".into(), "dpo".into());
+            e.attrs
+                .insert("operation".into(), "shred:titular-123".into());
+            e.attrs.insert("ok".into(), "true".into());
+            e
+        };
+        // Os três caminhos externos: append, append idempotente e a
+        // validação prévia do AppendBatch.
+        assert!(engine.append(forjado("attacker", "AuditAdmin")).is_err());
+        assert!(engine.append(forjado("attacker", "AuditQuery")).is_err());
+        assert!(engine
+            .append_idempotent(forjado("attacker", "AuditAdmin"), "forja-1")
+            .is_err());
+        assert!(engine
+            .validar_append(&forjado("attacker", "AuditAdmin"), "")
+            .is_err());
+        // O agente dedicado também não se personifica.
+        assert!(engine
+            .append(forjado("heraclitus-audit", "Observacao"))
+            .is_err());
+
+        // GQL CREATE vai pelo mesmo `Engine::append`.
+        let gql = r#"CREATE (n:AuditAdmin {audit: "admin", principal: "dpo", operation: "shred:titular-123", ok: "true"})"#;
+        assert!(heraclitus_query::execute(gql, &engine).is_err());
+
+        // O atributo `audit` continua livre para dados de clientes, mas num
+        // kind qualquer já não conta como prova de acesso.
+        assert!(engine.append(forjado("attacker", "Observacao")).is_ok());
+        let r = engine.titular_acessos("titular-123", 100);
+        assert_eq!(r["total"], 0, "nenhuma auditoria forjada pode constar: {r}");
+
+        // A meta-auditoria genuína continua a ser escrita e listada.
+        engine.audit_admin("shred:titular-123", true, "admin-real");
+        engine
+            .audit_admin_strict("shred:titular-123", true, "admin-real")
+            .unwrap();
+        let r = engine.titular_acessos("titular-123", 100);
+        assert_eq!(r["total"], 2, "{r}");
+        assert!(r["acessos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["principal"] == "admin-real"));
     }
 
     #[test]
