@@ -138,6 +138,14 @@ fn token_name(lsn: u64) -> String {
     format!("{lsn:020}.tst")
 }
 
+fn sync_receipts_dir(dir: &Path) -> Result<(), CompError> {
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 /// Grava o token num ficheiro **novo**, nunca sobre um que já exista.
 ///
 /// Auditoria recursiva 2026-10-03, iteração 2: o worker arranca sempre com
@@ -173,6 +181,7 @@ fn write_token_new(dir: &Path, lsn: u64, token: &[u8]) -> Result<String, CompErr
         };
         f.write_all(token)?;
         f.sync_all()?;
+        sync_receipts_dir(dir)?;
         return Ok(name);
     }
     unreachable!("u32 esgotado a procurar um nome livre para o token")
@@ -223,11 +232,15 @@ pub fn persist(
         .append(true)
         .open(manifest_path(dir))?;
     f.write_all(line.as_bytes())?;
+    f.sync_all()?;
+    sync_receipts_dir(dir)?;
 
     Ok(receipt)
 }
 
 /// Read all receipts from the manifest, oldest first.
+/// Uma escrita interrompida antes do reconhecimento pode deixar a última linha
+/// incompleta. É erro para recuperação explícita; nunca se descarta evidência.
 pub fn load_manifest(dir: impl AsRef<Path>) -> Result<Vec<LegalReceipt>, CompError> {
     let path = manifest_path(dir.as_ref());
     if !path.exists() {
@@ -344,6 +357,38 @@ mod tests {
         assert_eq!(read_token(dir.path(), &all[0]).unwrap(), b"token-t1");
         assert_eq!(read_token(dir.path(), &all[1]).unwrap(), b"token-t2");
         assert_eq!(read_token(dir.path(), &all[2]).unwrap(), b"token-t3");
+    }
+
+    #[test]
+    fn malformed_manifest_tail_is_reported_and_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let commitment = Commitment {
+            lsn: 42,
+            root: [3u8; 32],
+            segments: 2,
+            domain: crate::commit::CommitmentDomain::LegacyPhysical,
+        };
+        let receipt = persist(
+            dir.path(),
+            &commitment,
+            &[4u8; 32],
+            "ACT-dev",
+            TimestampEvidence {
+                recorded_unix_ms: 1700,
+                authority_gen_unix_ms: Some(1700),
+                validation_state: TimestampValidationState::DevelopmentOnly,
+                tsa_policy_oid: None,
+            },
+            b"token",
+        )
+        .unwrap();
+        let path = manifest_path(dir.path());
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"{\"lsn\":");
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(load_manifest(dir.path()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(read_token(dir.path(), &receipt).unwrap(), b"token");
     }
 
     #[test]
