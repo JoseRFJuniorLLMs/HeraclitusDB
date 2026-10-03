@@ -46,7 +46,10 @@ pub fn router(runtime: Arc<AgentRuntime>) -> Router {
         // Muitos coletores também aceitam estes dois. Respondemos de forma
         // honesta: não os ingerimos (não são evidência de agente), mas
         // devolvemos sucesso para que o exporter da aplicação não fique em
-        // retry infinito por causa de um sinal que não pedimos.
+        // retry infinito por causa de um sinal que não pedimos. Mesmo sendo
+        // descartados, passam pelo MESMO gate de autenticação de traces: quando
+        // `require_auth` está ligado, toda a superfície OTLP/HTTP tem uma única
+        // semântica de acesso.
         .route("/v1/metrics", post(not_ingested))
         .route("/v1/logs", post(not_ingested))
         .layer(axum::extract::DefaultBodyLimit::max(limite))
@@ -181,7 +184,13 @@ async fn traces(
     (StatusCode::OK, Json(payload)).into_response()
 }
 
-async fn not_ingested() -> Response {
+async fn not_ingested(
+    State(runtime): State<Arc<AgentRuntime>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = ingest_gate(&runtime, &headers) {
+        return r;
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({
