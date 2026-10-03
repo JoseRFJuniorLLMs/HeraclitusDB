@@ -141,6 +141,20 @@ pub struct RawSegmentWriter {
     /// [`RawSegmentWriter::offset_of`]: 8 B por registo, ~136 KiB num segmento
     /// activo de 8 MiB com registos de ~500 B.
     offsets: Vec<u64>,
+    /// Auditoria recursiva 2026-10-03, iteração 1: um `write_all` que falha a
+    /// meio (ENOSPC, EDQUOT, EFBIG depois de uma escrita curta) deixava `k`
+    /// bytes de lixo no ficheiro sem mexer em `bytes_written`; o retry do
+    /// mesmo LSN caía depois do lixo, era confirmado ao cliente e ficava
+    /// ilegível (o offset apontava para o lixo e o percurso parava no CRC
+    /// errado) — e no arranque o `repair_active_tail` cortava-o como cauda
+    /// rasgada, reutilizando o LSN. Agora o `append` corta o ficheiro de volta
+    /// para `bytes_written`; se nem isso conseguir, o writer fica envenenado e
+    /// recusa `append`/`seal` até a recuperação do arranque tratar da cauda.
+    envenenado: bool,
+    /// Injecção de falhas para os testes: escreve só os primeiros `k` bytes
+    /// do próximo registo e devolve erro, como um disco que enche a meio.
+    #[cfg(test)]
+    falha_parcial: Option<usize>,
 }
 
 /// Parâmetros de criação de um segmento.
@@ -203,6 +217,9 @@ impl RawSegmentWriter {
             monotonic_hlc: true,
             bytes_written: FILE_HEADER_LEN as u64,
             offsets: Vec::new(),
+            envenenado: false,
+            #[cfg(test)]
+            falha_parcial: None,
         })
     }
 
@@ -268,7 +285,12 @@ impl RawSegmentWriter {
         }
 
         let bytes_written = std::fs::metadata(path)?.len();
-        let file = OpenOptions::new().read(true).append(true).open(path)?;
+        // Sem `append(true)`: no Windows esse modo abre o handle sem
+        // FILE_WRITE_DATA e o `set_len` do rollback do `append` falharia
+        // sempre. O cursor é posto à mão no fim (auditoria recursiva
+        // 2026-10-03, iteração 1).
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        file.seek(SeekFrom::Start(bytes_written))?;
         Ok(Self {
             file,
             header: scan.header,
@@ -283,6 +305,9 @@ impl RawSegmentWriter {
             monotonic_hlc,
             bytes_written,
             offsets,
+            envenenado: false,
+            #[cfg(test)]
+            falha_parcial: None,
         })
     }
 
@@ -315,8 +340,18 @@ impl RawSegmentWriter {
         if payload.len() > HARD_MAX_RECORD_BYTES {
             return Err(corrupt("hrkl v6 raw writer", "record exceeds hard maximum"));
         }
+        self.recusar_se_envenenado()?;
         let bytes = encode_raw_record(lsn, hlc, payload);
-        self.file.write_all(&bytes)?;
+        if let Err(e) = self.escrever(&bytes) {
+            // Nenhum estado foi actualizado ainda; basta o ficheiro voltar a
+            // terminar em `bytes_written` para o retry do mesmo LSN cair no
+            // sítio certo. Se o corte falhar, a cauda tem lixo que só o
+            // `repair_active_tail` do arranque sabe remover com segurança.
+            if self.reverter_cauda().is_err() {
+                self.envenenado = true;
+            }
+            return Err(e.into());
+        }
         self.offsets.push(self.bytes_written);
         self.bytes_written += bytes.len() as u64;
 
@@ -334,6 +369,39 @@ impl RawSegmentWriter {
         self.record_count += 1;
         self.acc.push_record_hash(canonical_record_hash);
         Ok(())
+    }
+
+    fn escrever(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(k) = self.falha_parcial.take() {
+            self.file.write_all(&bytes[..k.min(bytes.len())])?;
+            return Err(std::io::Error::other("falha parcial injectada"));
+        }
+        self.file.write_all(bytes)
+    }
+
+    /// Repõe o ficheiro e o cursor em `bytes_written`, descartando os bytes de
+    /// uma escrita parcial.
+    fn reverter_cauda(&mut self) -> std::io::Result<()> {
+        self.file.set_len(self.bytes_written)?;
+        self.file.seek(SeekFrom::Start(self.bytes_written))?;
+        Ok(())
+    }
+
+    fn recusar_se_envenenado(&self) -> V6Result<()> {
+        if self.envenenado {
+            return Err(corrupt(
+                "hrkl v6 raw writer",
+                "writer poisoned: a partial write could not be rolled back;                  restart so recovery repairs the active tail",
+            ));
+        }
+        Ok(())
+    }
+
+    /// `true` se uma escrita parcial não pôde ser revertida e o writer recusa
+    /// novas escritas.
+    pub fn is_poisoned(&self) -> bool {
+        self.envenenado
     }
 
     pub fn sync(&mut self) -> V6Result<()> {
@@ -365,6 +433,9 @@ impl RawSegmentWriter {
     /// §22 — o seal **não espera pela compressão**. Quem chama roda para o
     /// segmento seguinte imediatamente e delega o packing a um worker.
     pub fn seal(mut self) -> V6Result<FooterV6> {
+        // Um footer escrito depois de lixo seria inalcançável: o scan pára no
+        // lixo e o `reconcile_raw` falharia depois do rename.
+        self.recusar_se_envenenado()?;
         let mut flags = 0u32;
         if self.contiguous && self.record_count > 0 {
             flags |= footer_flags::CONTIGUOUS_LSN;
@@ -966,6 +1037,61 @@ mod tests {
         drop(w);
         let retomado = RawSegmentWriter::resume(&path, &|_, _, _| Ok([0u8; 32])).unwrap();
         confere(&retomado);
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 1: uma escrita parcial que
+    /// falha não pode deixar lixo antes do retry do mesmo LSN — tanto num
+    /// writer criado como num retomado (que no Windows abria em modo append e
+    /// não conseguia cortar o ficheiro).
+    #[test]
+    fn escrita_parcial_falhada_e_revertida_antes_do_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("9.active.hrkl");
+        let mut w = RawSegmentWriter::create(
+            &path,
+            SegmentInit {
+                segment_id: 9,
+                created_hlc: 1,
+                first_lsn: 1,
+                writer_epoch: 1,
+                storage_namespace_id: [4; 16],
+            },
+        )
+        .unwrap();
+        w.append(1, 10, b"primeiro", &h(1)).unwrap();
+
+        let verifica = |w: &mut RawSegmentWriter, lsn: u64| {
+            let antes = w.bytes_written();
+            w.falha_parcial = Some(7);
+            assert!(w
+                .append(lsn, 10 + lsn, b"retry deste registo", &h(lsn as u8))
+                .is_err());
+            assert!(!w.is_poisoned());
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), antes);
+            w.append(lsn, 10 + lsn, b"retry deste registo", &h(lsn as u8))
+                .unwrap();
+            w.sync().unwrap();
+            let off = w.offset_of(lsn).unwrap();
+            let r = read_raw_record_at(&path, off, lsn)
+                .unwrap()
+                .expect("registo legível");
+            assert_eq!(r.payload, b"retry deste registo");
+            assert!(find_raw_record(&path, lsn).unwrap().record.is_some());
+        };
+        verifica(&mut w, 2);
+        drop(w);
+
+        // Sem cauda rasgada: o arranque não corta nada.
+        assert_eq!(repair_active_tail(&path).unwrap(), None);
+        let mut w = RawSegmentWriter::resume(&path, &|_, _, _| Ok([0u8; 32])).unwrap();
+        verifica(&mut w, 3);
+        w.append(4, 14, b"quarto", &h(4)).unwrap();
+        drop(w);
+
+        let scan = scan_raw_segment(&path).unwrap();
+        assert!(scan.torn_at.is_none());
+        let lsns: Vec<u64> = scan.records.iter().map(|r| r.lsn).collect();
+        assert_eq!(lsns, vec![1, 2, 3, 4]);
     }
 
     #[test]
