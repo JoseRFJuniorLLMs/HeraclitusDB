@@ -407,4 +407,37 @@ upstream_url = "http://mcp:9000"
         };
         assert!(plane.validate(&host).is_err());
     }
+
+    /// Auditoria recursiva 2026-10-03, iteração 2: o plano por omissão (sem
+    /// `[agent_black_box]` nem `[agent_gateway]`) tem o módulo desligado mas a
+    /// Consola ligada em `0.0.0.0:8080` sem credencial. Em produção isso tem de
+    /// ser recusado — antes `validate` devolvia Ok e o servidor arrancava a
+    /// Consola aberta com todos os papéis.
+    #[test]
+    fn producao_recusa_consola_publica_com_o_modulo_desligado() {
+        let host = HeraclitusConfig {
+            production_mode: true,
+            tls_cert_path: Some("cert.pem".into()),
+            tls_key_path: Some("key.pem".into()),
+            ..Default::default()
+        };
+        let mut plane = AgentPlane::default();
+        assert!(!plane.enabled(), "pressuposto: módulo desligado");
+        let err = plane.validate(&host).unwrap_err().to_string();
+        assert!(err.contains("console.addr"), "{err}");
+
+        plane.black_box.console.basic_auth = "admin:a-strong-local-password".into();
+        assert!(plane.validate(&host).is_ok(), "TLS + credencial é aceite");
+
+        plane.black_box.console.basic_auth.clear();
+        plane.black_box.console.addr = "127.0.0.1:8080".into();
+        assert!(plane.validate(&host).is_ok(), "loopback é aceite");
+
+        assert!(
+            AgentPlane::default()
+                .validate(&HeraclitusConfig::default())
+                .is_ok(),
+            "o perfil de dev não muda"
+        );
+    }
 }

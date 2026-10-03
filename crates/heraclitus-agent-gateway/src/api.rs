@@ -209,6 +209,20 @@ async fn red_team_record(
     if let Err(e) = principal.require(Operation::ChangeCapture) {
         return forbidden(e);
     }
+    // Com o módulo desligado a porta da Consola continua de pé (SPEC-0077
+    // §21/§48), mas não pode ser uma via de escrita no log: o `warm()` não
+    // correu, o índice de deduplicação está vazio, e o contrato de
+    // `build_runtime` é "nenhuma rota de agente com conteúdo". Auditoria
+    // recursiva 2026-10-03, iteração 2: antes, cada POST com um `sequence`
+    // novo virava um episódio durável num log que não se apaga.
+    if !runtime.config.enabled && !runtime.gateway.enabled {
+        return problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AGENT_MODULE_DISABLED",
+            "o módulo de agentes está desligado neste servidor; nenhuma evidência foi gravada",
+            "ligue-o com [agent_black_box] enabled = true se quer registar telemetria do laboratório",
+        );
+    }
     for (label, value, max) in [
         ("attack_id", input.attack_id.as_str(), 128usize),
         ("vector", input.vector.as_str(), 128usize),

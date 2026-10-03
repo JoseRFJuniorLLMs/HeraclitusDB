@@ -145,9 +145,14 @@ async fn serve_inner(
         // Só os listeners do MÓDULO continuam atrás do interruptor — o
         // `spawn` gateia OTLP/HTTP, OTLP/gRPC e o proxy MCP um a um.
         {
-            if plane.enabled() {
-                plane.validate(&config)?;
-            }
+            // Validar SEMPRE, não só com o módulo ligado: a Consola sobe de
+            // qualquer forma, e o gate de produção do `console.addr` vive aqui.
+            // Auditoria recursiva 2026-10-03, iteração 2: atrás de
+            // `plane.enabled()`, `production_mode = true` sem `[agent_black_box]`
+            // servia a Consola em `0.0.0.0:8080` sem autenticação. Com o módulo
+            // desligado os restantes gates (OTLP, gateway, enforce) já
+            // devolvem Ok por si, por isso o perfil de dev não muda.
+            plane.validate(&config)?;
             let runtime = agent_plane::build_runtime(engine.clone(), &plane, &config)?;
             let services = heraclitus_agent_gateway::spawn(runtime, rx).await?;
             // Duas linhas de arranque, porque são dois factos diferentes: onde

@@ -363,6 +363,28 @@ impl AgentBlackBoxConfig {
         tls_configured: bool,
         auth_configured: bool,
     ) -> Result<(), ConfigError> {
+        // A Consola sobe INDEPENDENTEMENTE do módulo (SPEC-0077 §21/§48: o
+        // servidor chama `spawn` mesmo com `enabled = false`), por isso o gate
+        // de produção do `console.addr` tem de correr ANTES do retorno
+        // antecipado. Auditoria recursiva 2026-10-03, iteração 2: com o gate
+        // depois do `if !self.enabled`, um servidor em `production_mode` sem
+        // secção `[agent_black_box]` arrancava a Consola em `0.0.0.0:8080`, sem
+        // autenticação e com todos os papéis para qualquer chamador.
+        if production
+            && self.console.enabled
+            && !self.console.addr.is_empty()
+            && !is_loopback(&self.console.addr)
+            && (!tls_configured || !auth_configured)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "console.addr = `{}` não é loopback e o perfil é de produção: \
+                 exige TLS e autenticação (SPEC-0074 §23). A Consola arranca mesmo \
+                 com o módulo de agentes desligado: use um endereço loopback, \
+                 configure agent_black_box.console.basic_auth (ou identity OIDC) \
+                 ou desligue-a com agent_black_box.console.enabled = false",
+                self.console.addr
+            )));
+        }
         if !self.enabled {
             return Ok(());
         }
@@ -416,7 +438,6 @@ impl AgentBlackBoxConfig {
             for (nome, addr) in [
                 ("otlp.http_addr", &self.otlp.http_addr),
                 ("otlp.grpc_addr", &self.otlp.grpc_addr),
-                ("console.addr", &self.console.addr),
             ] {
                 if !addr.is_empty() && !is_loopback(addr) && (!tls_configured || !auth_configured) {
                     return Err(ConfigError::Invalid(format!(
@@ -575,6 +596,32 @@ mod tests {
         c.console.basic_auth.clear();
         c.otlp.require_auth = false;
         assert!(c.validate(false, false, false).is_ok(), "dev não é gateado");
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 2: a Consola arranca mesmo com
+    /// o módulo desligado, por isso o gate de produção do `console.addr` não
+    /// pode depender de `enabled`. Antes, o default (`0.0.0.0:8080`, sem
+    /// credencial) passava em produção só porque o módulo estava desligado.
+    #[test]
+    fn producao_gateia_a_consola_mesmo_com_o_modulo_desligado() {
+        let mut c = AgentBlackBoxConfig::default();
+        assert!(!c.enabled, "o pressuposto do teste é o default desligado");
+        let err = c.validate(true, false, false).unwrap_err().to_string();
+        assert!(err.contains("console.addr"), "{err}");
+        assert!(c.validate(true, true, false).is_err(), "TLS sem auth");
+        assert!(c.validate(true, false, true).is_err(), "auth sem TLS");
+        assert!(c.validate(true, true, true).is_ok());
+        assert!(c.validate(false, false, false).is_ok(), "dev não é gateado");
+
+        c.console.addr = "127.0.0.1:8080".into();
+        assert!(c.validate(true, false, false).is_ok(), "loopback é aceite");
+
+        c.console.addr = "0.0.0.0:8080".into();
+        c.console.enabled = false;
+        assert!(
+            c.validate(true, false, false).is_ok(),
+            "sem Consola não há listener a gatear"
+        );
     }
 
     #[test]

@@ -234,3 +234,62 @@ async fn os_assets_das_duas_consolas_nao_colidem() {
     assert_eq!(status, 200);
     assert!(js.contains("/api/v1/agent/status"));
 }
+
+async fn post_json(url: &str, corpo: serde_json::Value) -> (u16, String) {
+    use http_body_util::{BodyExt, Full};
+    use hyper_util::client::legacy::Client;
+    use hyper_util::rt::TokioExecutor;
+
+    let client: Client<
+        hyper_util::client::legacy::connect::HttpConnector,
+        Full<hyper::body::Bytes>,
+    > = Client::builder(TokioExecutor::new()).build_http();
+    let resp = client
+        .request(
+            hyper::Request::builder()
+                .method("POST")
+                .uri(url)
+                .header("content-type", "application/json")
+                .body(Full::new(hyper::body::Bytes::from(corpo.to_string())))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
+#[tokio::test]
+async fn modulo_desligado_nao_aceita_escritas_red_team() {
+    // Auditoria recursiva 2026-10-03, iteração 2: a porta da Consola sobe com
+    // o módulo desligado, e o POST do laboratório red-team gravava evidência
+    // durável no log append-only — sem `warm()`, sem módulo, e (no perfil por
+    // omissão) sem autenticação. Com o módulo desligado tem de ser recusado.
+    let evento = |sequence: u64| {
+        serde_json::json!({
+            "attack_id": "rt-001",
+            "campaign_id": "sandbox-demo",
+            "vector": "mcp-policy-deny",
+            "target": "mcp://sandbox/exec",
+            "phase": "result",
+            "result": "blocked",
+            "sequence": sequence
+        })
+    };
+
+    let f = arrancar(false).await;
+    let url = format!("{}/api/v1/agent/red-team/events", f.url);
+    let (status, corpo) = post_json(&url, evento(1)).await;
+    assert_eq!(status, 503, "{corpo}");
+    assert!(corpo.contains("AGENT_MODULE_DISABLED"), "{corpo}");
+    assert!(!corpo.contains("\"accepted\""), "{corpo}");
+
+    // O controlo: com o módulo ligado, o mesmo pedido é aceite — o 503 acima
+    // vem do interruptor, não de um corpo mal formado.
+    let f = arrancar(true).await;
+    let url = format!("{}/api/v1/agent/red-team/events", f.url);
+    let (status, corpo) = post_json(&url, evento(1)).await;
+    assert_eq!(status, 200, "{corpo}");
+    assert!(corpo.contains("\"accepted\":true"), "{corpo}");
+}
