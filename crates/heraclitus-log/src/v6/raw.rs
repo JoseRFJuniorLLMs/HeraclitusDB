@@ -137,6 +137,10 @@ pub struct RawSegmentWriter {
     contiguous: bool,
     monotonic_hlc: bool,
     bytes_written: u64,
+    /// Offset (desde o início do ficheiro) de cada registo, por ordem. Ver
+    /// [`RawSegmentWriter::offset_of`]: 8 B por registo, ~136 KiB num segmento
+    /// activo de 8 MiB com registos de ~500 B.
+    offsets: Vec<u64>,
 }
 
 /// Parâmetros de criação de um segmento.
@@ -198,6 +202,7 @@ impl RawSegmentWriter {
             contiguous: true,
             monotonic_hlc: true,
             bytes_written: FILE_HEADER_LEN as u64,
+            offsets: Vec::new(),
         })
     }
 
@@ -242,8 +247,12 @@ impl RawSegmentWriter {
         let mut expected_lsn = scan.header.first_lsn;
         let mut contiguous = true;
         let mut monotonic_hlc = true;
+        let mut offsets = Vec::with_capacity(scan.records.len());
+        let mut offset = FILE_HEADER_LEN as u64;
 
         for record in &scan.records {
+            offsets.push(offset);
+            offset += (RAW_RECORD_HEADER_LEN + record.payload.len()) as u64;
             acc.push_record_hash(&canonical_hasher(record.lsn, record.hlc, &record.payload)?);
             if record.lsn != expected_lsn {
                 contiguous = false;
@@ -273,7 +282,25 @@ impl RawSegmentWriter {
             contiguous,
             monotonic_hlc,
             bytes_written,
+            offsets,
         })
+    }
+
+    /// Offset do registo `lsn` no ficheiro, se este writer o escreveu (ou o
+    /// reconstruiu no `resume`) e os LSN forem contíguos.
+    ///
+    /// otimizacao-20m / auditoria 2026-09-05 (refutador de engine.rs:728/799),
+    /// conferido em 2026-10-02: uma leitura pontual no segmento activo
+    /// percorria o ficheiro desde o cabeçalho até ao LSN pedido — O(posição)
+    /// por leitura, e o activo é onde caem as leituras mais quentes (recall
+    /// sobre a memtable, AS OF recentes). Com o offset, é um `seek` e um
+    /// registo.
+    pub fn offset_of(&self, lsn: Lsn) -> Option<u64> {
+        if !self.contiguous {
+            return None;
+        }
+        let indice = usize::try_from(lsn.checked_sub(self.header.first_lsn)?).ok()?;
+        self.offsets.get(indice).copied()
     }
 
     /// Acrescenta um registo. `canonical_record_hash` é o hash lógico já
@@ -290,6 +317,7 @@ impl RawSegmentWriter {
         }
         let bytes = encode_raw_record(lsn, hlc, payload);
         self.file.write_all(&bytes)?;
+        self.offsets.push(self.bytes_written);
         self.bytes_written += bytes.len() as u64;
 
         if lsn != self.next_expected_lsn {
@@ -629,6 +657,44 @@ pub struct RawLookup {
 /// migração e perícia), e o comportamento anterior — `find` sobre todos os
 /// registos do ficheiro — encontrava o alvo estivesse ele onde estivesse. A
 /// paragem no alvo é a poupança que não custa nenhuma suposição nova.
+/// Lê UM registo num offset conhecido (ver [`RawSegmentWriter::offset_of`]).
+///
+/// Mesma descodificação de [`decode_raw_record`] (CRC incluído) e os mesmos
+/// tectos de comprimento de [`percorrer_raw_segmento`]. `Ok(None)` quando o
+/// que está no offset não é o registo pedido (cauda rasgada, CRC, outro LSN):
+/// quem chama recua para o percurso completo, que é a definição.
+pub fn read_raw_record_at(path: &Path, offset: u64, alvo: Lsn) -> V6Result<Option<RawRecord>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = File::open(path)?;
+    let tamanho = file.metadata()?.len();
+    if offset < FILE_HEADER_LEN as u64 || offset + RAW_RECORD_HEADER_LEN as u64 > tamanho {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; RAW_RECORD_HEADER_LEN];
+    file.read_exact(&mut buf)?;
+    if buf[..4] == FOOTER_MAGIC {
+        return Ok(None);
+    }
+    let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let restante = tamanho.saturating_sub(offset + RAW_RECORD_HEADER_LEN as u64);
+    if len > HARD_MAX_RECORD_BYTES || len as u64 > restante {
+        return Ok(None);
+    }
+    buf.resize(RAW_RECORD_HEADER_LEN + len, 0);
+    file.read_exact(&mut buf[RAW_RECORD_HEADER_LEN..])?;
+    match decode_raw_record(&buf) {
+        RawDecoded::Record {
+            lsn, hlc, payload, ..
+        } if lsn == alvo => Ok(Some(RawRecord {
+            lsn,
+            hlc,
+            payload: payload.to_vec(),
+        })),
+        _ => Ok(None),
+    }
+}
+
 pub fn find_raw_record(path: &Path, alvo: Lsn) -> V6Result<RawLookup> {
     let mut encontrado = None;
     let bytes_percorridos = percorrer_raw_segmento(path, |lsn, hlc, payload| {
@@ -855,6 +921,51 @@ mod tests {
         let mut x = [0u8; 32];
         x[0] = i;
         x
+    }
+
+    /// O offset que o writer regista (e reconstrói no `resume`) aponta para
+    /// o mesmo registo que o percurso completo encontra; um offset errado não
+    /// devolve outro registo, devolve `None` (e o motor recua para o
+    /// percurso).
+    #[test]
+    fn offset_do_writer_le_o_mesmo_registo_que_o_percurso() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("7.active.hrkl");
+        let mut w = RawSegmentWriter::create(
+            &path,
+            SegmentInit {
+                segment_id: 7,
+                created_hlc: 1,
+                first_lsn: 100,
+                writer_epoch: 1,
+                storage_namespace_id: [3; 16],
+            },
+        )
+        .unwrap();
+        for i in 0..50u64 {
+            let payload = vec![i as u8; (i as usize * 37) % 300 + 1];
+            w.append(100 + i, 1_000 + i, &payload, &h(i as u8)).unwrap();
+        }
+        w.sync().unwrap();
+        let confere = |w: &RawSegmentWriter| {
+            for lsn in 100..150u64 {
+                let off = w.offset_of(lsn).expect("offset conhecido");
+                let directo = read_raw_record_at(&path, off, lsn).unwrap().unwrap();
+                let percorrido = find_raw_record(&path, lsn).unwrap().record.unwrap();
+                assert_eq!(directo.lsn, percorrido.lsn);
+                assert_eq!(directo.hlc, percorrido.hlc);
+                assert_eq!(directo.payload, percorrido.payload);
+                // Offset de outro registo: não pode servir este LSN.
+                let outro = w.offset_of(if lsn == 100 { 101 } else { 100 }).unwrap();
+                assert!(read_raw_record_at(&path, outro, lsn).unwrap().is_none());
+            }
+            assert!(w.offset_of(99).is_none());
+            assert!(w.offset_of(150).is_none());
+        };
+        confere(&w);
+        drop(w);
+        let retomado = RawSegmentWriter::resume(&path, &|_, _, _| Ok([0u8; 32])).unwrap();
+        confere(&retomado);
     }
 
     #[test]

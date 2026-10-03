@@ -852,7 +852,7 @@ impl V6Log {
                 .as_ref()
                 .filter(|active| lsn >= active.writer.header().first_lsn);
             if let Some(active) = activo {
-                ReadSource::Active(active.path.clone())
+                ReadSource::Active(active.path.clone(), active.writer.offset_of(lsn))
             } else {
                 let desc = state.manifest.find_segment_for_lsn(lsn).ok_or_else(|| {
                     HeraclitusError::Corruption {
@@ -882,8 +882,17 @@ impl V6Log {
         // PACKED ao lado já fazia o equivalente (descomprime um bloco, não o
         // segmento).
         let found = match source {
-            ReadSource::Active(path) => match find_raw_record(&path, lsn) {
-                Ok(achado) => achado.record.map(|r| (r.lsn, r.payload)),
+            ReadSource::Active(path, offset) => match offset
+                .map(|o| super::raw::read_raw_record_at(&path, o, lsn))
+                .transpose()
+                .map(Option::flatten)
+                .and_then(|directo| match directo {
+                    Some(r) => Ok(Some(r)),
+                    // Sem offset, ou o offset não confere: o percurso
+                    // completo, que é a definição.
+                    None => find_raw_record(&path, lsn).map(|a| a.record),
+                }) {
+                Ok(achado) => achado.map(|r| (r.lsn, r.payload)),
                 // O ficheiro deixou de existir: alguem selou o segmento entre a
                 // resolucao do caminho e a abertura. Nao e erro — e a corrida.
                 Err(_) if !path.exists() => return Err(TentativaFalhou::Rolou),
@@ -2640,7 +2649,8 @@ impl From<HeraclitusError> for TentativaFalhou {
 }
 
 enum ReadSource {
-    Active(PathBuf),
+    /// Caminho do activo e, se o writer o souber, o offset do registo.
+    Active(PathBuf, Option<u64>),
     Sealed(PathBuf, PhysicalLayout),
 }
 
