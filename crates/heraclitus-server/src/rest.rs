@@ -2236,7 +2236,24 @@ async fn verify_segment(
     // aqui como `Err`, e saía com HTTP 200 e um `{"error": ...}` — um probe que
     // só olhe ao estado lia "segmento íntegro". Mesmo contrato do `verify`.
     match tokio::task::spawn_blocking(move || engine.verify_segment(segment)).await {
-        Ok(Ok(v)) => (StatusCode::OK, Json(v)),
+        Ok(Ok(v)) => {
+            // Auditoria recursiva 2026-10-03, iteração 2: no log Legacy a
+            // adulteração de um segmento selado NÃO chega como `Err` —
+            // `Log::verify_segment` dobra a corrupção em `valid: false` e
+            // devolve `Ok`, pelo que isto saía como 200 enquanto o `/verify`
+            // do mesmo ficheiro já dava 500. Só o selado conta: no ativo um
+            // `valid: false` pode ser uma cauda ainda a ser escrita, que é
+            // exatamente o que o `Log::verify` também deixa de fora. O corpo
+            // (raízes computada e guardada) é mantido para diagnóstico.
+            let selado_invalido = v["found"] == true && v["sealed"] == true && v["valid"] == false;
+            if selado_invalido {
+                let mut corpo = v;
+                corpo["ok"] = serde_json::Value::Bool(false);
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(corpo))
+            } else {
+                (StatusCode::OK, Json(v))
+            }
+        }
         Ok(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
@@ -2328,6 +2345,90 @@ mod verify_segment_tests {
             StatusCode::INTERNAL_SERVER_ERROR,
             "uma adulteração detectada não pode viajar como 200"
         );
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 2: o mesmo contrato no log
+    /// Legacy, onde a adulteração chega como `Ok({"valid": false})` e não como
+    /// `Err`. Antes da correção respondia 200.
+    #[tokio::test]
+    async fn segmento_legacy_adulterado_nao_responde_200() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            segment_max_bytes: 8192, // força sealing rápido
+            storage_format: heraclitus_core::StorageFormat::Legacy,
+            ..Default::default()
+        };
+        let engine = Arc::new(Engine::open(&cfg).unwrap());
+        for i in 0..500 {
+            engine
+                .append(Episode::new(
+                    "a",
+                    EventKind::Observation,
+                    format!("evento de enchimento numero {i} para selar o segmento").into_bytes(),
+                ))
+                .unwrap();
+        }
+        let sealed = engine.sealed_segment_ids();
+        assert!(!sealed.is_empty(), "deve haver >=1 segmento selado");
+        let seg = sealed[0];
+
+        let intacto = verify_segment(State(engine.clone()), Path(seg))
+            .await
+            .into_response();
+        assert_eq!(intacto.status(), StatusCode::OK, "segmento intacto");
+
+        // Ficheiro Legacy: `{id:020}.hrkl`, em qualquer subdirectório.
+        let nome = format!("{seg:020}.hrkl");
+        let mut ficheiro = None;
+        let mut pendentes = vec![dir.path().to_path_buf()];
+        while let Some(d) = pendentes.pop() {
+            for entrada in std::fs::read_dir(&d).unwrap() {
+                let p = entrada.unwrap().path();
+                if p.is_dir() {
+                    pendentes.push(p);
+                } else if p.file_name().is_some_and(|n| n == nome.as_str()) {
+                    ficheiro = Some(p);
+                }
+            }
+        }
+        let ficheiro = ficheiro.expect("ficheiro Legacy do segmento selado");
+
+        // Vira um byte a meio (um registo, não o cabeçalho) sem truncar o
+        // ficheiro — truncar falharia no Windows se estiver mapeado.
+        let len = std::fs::metadata(&ficheiro).unwrap().len();
+        let meio = len / 2;
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&ficheiro)
+            .unwrap();
+        let mut byte = [0u8; 1];
+        f.seek(SeekFrom::Start(meio)).unwrap();
+        std::io::Read::read_exact(&mut f, &mut byte).unwrap();
+        byte[0] ^= 0xFF;
+        f.seek(SeekFrom::Start(meio)).unwrap();
+        f.write_all(&byte).unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let adulterado = verify_segment(State(engine.clone()), Path(seg))
+            .await
+            .into_response();
+        assert_eq!(
+            adulterado.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "uma adulteração detectada no Legacy não pode viajar como 200"
+        );
+        let corpo = axum::body::to_bytes(adulterado.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let corpo: serde_json::Value = serde_json::from_slice(&corpo).unwrap();
+        assert_eq!(corpo["valid"], false, "o corpo mantém o diagnóstico");
+        assert_eq!(corpo["ok"], false);
     }
 }
 
