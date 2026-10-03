@@ -3327,7 +3327,9 @@ mod meta_auditoria_tests {
         };
         let lista = acessos["acessos"].as_array().unwrap();
         assert!(
-            lista.iter().any(|a| a["principal"] == "auditora" && a["ok"] == "true"),
+            lista
+                .iter()
+                .any(|a| a["principal"] == "auditora" && a["ok"] == "true"),
             "a leitura REST tem de ficar registada com a identidade autenticada: {acessos}"
         );
     }

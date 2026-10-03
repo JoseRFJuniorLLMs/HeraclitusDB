@@ -640,7 +640,12 @@ pub(crate) fn admin_reconcile_op(
     let outcome = match campo("outcome") {
         Some("succeeded") => crate::trusted_admin::ReconciledOutcome::Succeeded,
         Some("failed") => crate::trusted_admin::ReconciledOutcome::Failed,
-        _ => return (false, "outcome tem de ser \"succeeded\" ou \"failed\"".into()),
+        _ => {
+            return (
+                false,
+                "outcome tem de ser \"succeeded\" ou \"failed\"".into(),
+            )
+        }
     };
     let evidence = campo("evidence").unwrap_or("");
     let principal = campo("principal").unwrap_or(&reconciler.principal);

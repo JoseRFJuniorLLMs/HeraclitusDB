@@ -2,6 +2,8 @@
 
 Base auditada: `e354a99c0651438981722600ddb5a0801a5c530d` (v3.0.1). Integrados os commits concorrentes até `ef4b6f5168dd83436c3abd5f62db830fa15e2fea` antes da aplicação. Esta nota atualiza o estado; relatórios históricos continuam preservados.
 
+> **Atualização (2026-10-02):** várias pendências abaixo foram fechadas depois desta nota — Flight autenticado, meta-auditoria REST, reconciliação administrativa, checkpoints com CRC e em streaming, comparação de nomes X.509 RFC 5280 e cache de CRL, top-k, timeouts Raft, entre outras. O estado atual está em `CORRECOES-AUDITORIAS-2026-10-02.md`.
+
 ## Implementação desta rodada
 
 | Origem / achado | Alteração | Alcance e limite |

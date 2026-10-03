@@ -834,7 +834,9 @@ fn chave_de(key: &OrderKey, l: Lsn, e: &Episode) -> ChaveOrdem {
     match key {
         OrderKey::Field(field) => ChaveOrdem::Json(field_of(l, e, field).unwrap_or(Json::Null)),
         // Sem embedding vai para o fim (asc), como sempre foi.
-        OrderKey::Dist(kind, v) => ChaveOrdem::Dist(eval_dist(*kind, v, e).unwrap_or(f64::INFINITY)),
+        OrderKey::Dist(kind, v) => {
+            ChaveOrdem::Dist(eval_dist(*kind, v, e).unwrap_or(f64::INFINITY))
+        }
     }
 }
 

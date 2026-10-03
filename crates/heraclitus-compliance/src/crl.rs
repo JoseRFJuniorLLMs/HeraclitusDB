@@ -491,7 +491,7 @@ fn verificar_ambito(crl: &CertificateList, e_ca: bool) -> Result<(), CompError> 
 /// pasta) tem o serial revogado numa e ausente noutra, e a primeira que
 /// aparecesse decidia. O ficheiro que o `read_dir` devolvesse primeiro passava
 /// a ser a política de revogação do órgão.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn crls_utilizaveis<'a>(
     crls: &'a [CertificateList],
     emissor: &x509_cert::Certificate,
@@ -527,7 +527,8 @@ fn crls_utilizaveis<'a>(
         // A CRL é uma afirmação da AC. Sem verificar a assinatura, qualquer um
         // que escreva na pasta pode declarar um certificado como não revogado —
         // e é essa a resposta que passa despercebida.
-        let chave = AssinaturasVerificadas::chave(emissor, &crl.signature_algorithm, &tbs, assinatura);
+        let chave =
+            AssinaturasVerificadas::chave(emissor, &crl.signature_algorithm, &tbs, assinatura);
         if !chave.is_some_and(|k| assinaturas_ok.contem(&k)) {
             if let Err(e) =
                 verificar_assinatura(emissor, &crl.signature_algorithm, &tbs, assinatura)

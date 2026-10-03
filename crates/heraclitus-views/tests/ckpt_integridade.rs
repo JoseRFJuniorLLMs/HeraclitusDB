@@ -23,7 +23,10 @@ fn estado() -> Estado {
 fn ida_e_volta() {
     let dir = tempfile::tempdir().unwrap();
     ckpt::save(dir.path(), "v", &estado()).unwrap();
-    assert_eq!(ckpt::load::<Estado>(dir.path(), "v").unwrap(), Some(estado()));
+    assert_eq!(
+        ckpt::load::<Estado>(dir.path(), "v").unwrap(),
+        Some(estado())
+    );
 }
 
 #[test]
@@ -67,7 +70,10 @@ fn formato_antigo_sem_cabecalho_continua_a_ler_se() {
     let dir = tempfile::tempdir().unwrap();
     let antigo = bincode::serde::encode_to_vec(estado(), bincode::config::standard()).unwrap();
     std::fs::write(dir.path().join("v.ckpt"), antigo).unwrap();
-    assert_eq!(ckpt::load::<Estado>(dir.path(), "v").unwrap(), Some(estado()));
+    assert_eq!(
+        ckpt::load::<Estado>(dir.path(), "v").unwrap(),
+        Some(estado())
+    );
 }
 
 #[test]

@@ -91,7 +91,10 @@ fn arranque_e_checkpoint_sem_eventos_novos_nao_regravam_o_indice_de_atributos() 
         engine.checkpoint_views().unwrap();
     }
     let com_novo = carimbo(&snapshot);
-    assert_ne!(antes.1, com_novo.1, "evento novo tem de chegar ao checkpoint");
+    assert_ne!(
+        antes.1, com_novo.1,
+        "evento novo tem de chegar ao checkpoint"
+    );
 
     let engine = abrir(dir.path());
     assert_eq!(contar(&engine, "alfa"), 20);

@@ -262,7 +262,9 @@ impl TrustStore {
         // ou outra capitalização e continuar a ser a mesma raiz.
         let bucket = self
             .by_subject
-            .entry(crate::nomes::chave_canonica(&anchor.certificate.tbs_certificate.subject))
+            .entry(crate::nomes::chave_canonica(
+                &anchor.certificate.tbs_certificate.subject,
+            ))
             .or_default();
         // Recarregar a mesma âncora duas vezes não a duplica: o
         // `anchors_for_issuer` seria percorrido duas vezes pelo mesmo

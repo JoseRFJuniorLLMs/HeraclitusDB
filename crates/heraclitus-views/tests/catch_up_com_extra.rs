@@ -66,9 +66,7 @@ fn o_extra_recebe_a_sua_cauda_na_mesma_passagem_das_views() {
         vistos: do_extra.clone(),
         wm: 0,
     };
-    registry
-        .catch_up_com(&log, Some((&mut extra, 3)))
-        .unwrap();
+    registry.catch_up_com(&log, Some((&mut extra, 3))).unwrap();
 
     assert_eq!(*das_views.lock().unwrap(), vec![0, 1, 2, 3, 4, 5, 7]);
     assert_eq!(

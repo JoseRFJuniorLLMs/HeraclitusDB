@@ -2538,7 +2538,9 @@ impl V6Log {
             )));
         }
         let Some(id) = state.ativo_pendente else {
-            return Err(HeraclitusError::StorageEngine("V6Log sem segmento ativo".into()));
+            return Err(HeraclitusError::StorageEngine(
+                "V6Log sem segmento ativo".into(),
+            ));
         };
         let caminho = active_path(&self.segments_dir, id);
         if let Ok(meta) = std::fs::metadata(&caminho) {
@@ -3270,8 +3272,14 @@ mod tests {
         // `create_new` falhar depois de o seal estar publicado.
         let bloqueio = active_path(&log.segments_dir, atual + 1);
         std::fs::create_dir_all(&bloqueio).unwrap();
-        assert!(log.seal_active().is_err(), "criar o segmento seguinte falhou");
-        assert!(log.degradado().is_none(), "o seal foi publicado: não é degradação");
+        assert!(
+            log.seal_active().is_err(),
+            "criar o segmento seguinte falhou"
+        );
+        assert!(
+            log.degradado().is_none(),
+            "o seal foi publicado: não é degradação"
+        );
         assert!(log.append(event(1)).is_err(), "ainda bloqueado");
         assert!(
             log.read(0).unwrap().is_some(),

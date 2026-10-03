@@ -3397,7 +3397,11 @@ impl QueryBackend for Engine {
         // candidatos válidos mais abaixo no ranking. Agora o fetch cresce até
         // haver `k` sobreviventes ou a fonte deixar de devolver mais.
         let k = k.min(MAX_TOP_K);
-        let mut fetch = if as_of.is_some() { k.saturating_mul(4) } else { k };
+        let mut fetch = if as_of.is_some() {
+            k.saturating_mul(4)
+        } else {
+            k
+        };
         loop {
             // Auditoria 2026-09-05, A56: usa-se o `Episode` que a hidratação
             // já trouxe, em vez de reler o mesmo LSN do log — mesmo ranking,
@@ -3468,7 +3472,11 @@ impl QueryBackend for Engine {
         }
         let in_snapshot = |lsn: Lsn| as_of.map(|b| lsn < b).unwrap_or(true);
         let indexados = self.vector.read().unwrap().len();
-        let mut fetch = if as_of.is_some() { k.saturating_mul(4) } else { k };
+        let mut fetch = if as_of.is_some() {
+            k.saturating_mul(4)
+        } else {
+            k
+        };
         let mut candidatos: Vec<(Lsn, f32)>;
         loop {
             let hits = self.vector.read().unwrap().search(&dims, fetch, 128, None);
@@ -4162,7 +4170,11 @@ mod tests {
         };
         let engine = Engine::open(&cfg).unwrap();
         engine
-            .append(Episode::new("titular-b", EventKind::Observation, b"x".to_vec()))
+            .append(Episode::new(
+                "titular-b",
+                EventKind::Observation,
+                b"x".to_vec(),
+            ))
             .unwrap();
         let ctx = crate::trusted_admin::AdminContext::new("chefe", "local", vec!["admin".into()]);
         let hold = crate::trusted_admin::AdminOperation::new(
@@ -4538,15 +4550,17 @@ mod tests {
         };
         for ronda in 0..5u8 {
             for i in 0..7u8 {
-                engine
-                    .hvm_upsert(vec![b'k', i], vec![ronda, i])
-                    .unwrap();
+                engine.hvm_upsert(vec![b'k', i], vec![ronda, i]).unwrap();
                 engine
                     .append(Episode::new("a", EventKind::Observation, vec![ronda, i]))
                     .unwrap();
             }
             engine.hvm_delete(vec![b'k', ronda]).unwrap();
-            assert_eq!(engine.hvm_state().unwrap(), integral(&engine), "ronda {ronda}");
+            assert_eq!(
+                engine.hvm_state().unwrap(),
+                integral(&engine),
+                "ronda {ronda}"
+            );
         }
         // Segunda leitura sem escritas: nada novo, o mesmo estado.
         assert_eq!(engine.hvm_state().unwrap(), integral(&engine));

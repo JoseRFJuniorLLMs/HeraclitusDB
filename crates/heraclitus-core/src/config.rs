@@ -842,12 +842,16 @@ impl HeraclitusConfig {
     /// `id=endereço` separado por vírgulas. Valores inválidos são erro — um
     /// nó que arranca com o id errado divide o cluster em silêncio.
     fn apply_replication_env(&mut self) -> Result<(), HeraclitusError> {
-        let invalid = |nome: &str, v: &str| {
-            HeraclitusError::Config(format!("{nome} inválido: {v:?}"))
-        };
+        let invalid =
+            |nome: &str, v: &str| HeraclitusError::Config(format!("{nome} inválido: {v:?}"));
         if let Ok(v) = std::env::var("HERACLITUS_RAFT_NODE_ID") {
-            let id: u64 = v.trim().parse().map_err(|_| invalid("HERACLITUS_RAFT_NODE_ID", &v))?;
-            self.replication.get_or_insert_with(Default::default).node_id = id;
+            let id: u64 = v
+                .trim()
+                .parse()
+                .map_err(|_| invalid("HERACLITUS_RAFT_NODE_ID", &v))?;
+            self.replication
+                .get_or_insert_with(Default::default)
+                .node_id = id;
         }
         let Some(rep) = self.replication.as_mut() else {
             return Ok(());
@@ -1769,7 +1773,10 @@ max_graph_hops = 6
         let nomes = [
             ("HERACLITUS_RAFT_NODE_ID", "3"),
             ("HERACLITUS_RAFT_ADDR", "10.0.0.3:8474"),
-            ("HERACLITUS_RAFT_PEERS", "1=10.0.0.1:8474, 2=10.0.0.2:8474,3=10.0.0.3:8474"),
+            (
+                "HERACLITUS_RAFT_PEERS",
+                "1=10.0.0.1:8474, 2=10.0.0.2:8474,3=10.0.0.3:8474",
+            ),
             ("HERACLITUS_RAFT_BOOTSTRAP", "false"),
             ("HERACLITUS_RAFT_TRANSPORT", "grpc"),
             ("HERACLITUS_RAFT_TLS_CA", "/etc/heraclitus/ca.pem"),
@@ -1802,7 +1809,10 @@ max_graph_hops = 6
         assert_eq!(rep.peers[&2], "10.0.0.2:8474");
         assert!(!rep.bootstrap);
         assert_eq!(rep.transport, RaftTransport::Grpc);
-        assert_eq!(rep.tls_ca_path, Some(PathBuf::from("/etc/heraclitus/ca.pem")));
+        assert_eq!(
+            rep.tls_ca_path,
+            Some(PathBuf::from("/etc/heraclitus/ca.pem"))
+        );
         assert!(duplicado.is_err(), "id repetido em PEERS tem de ser erro");
     }
 

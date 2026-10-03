@@ -195,7 +195,11 @@ impl GrpcConnection {
     /// timeout nenhum — um par que aceita a ligação e deixa de responder
     /// prendia o replicador desse par para sempre. Expira como `Unreachable`,
     /// para o openraft recuar e tentar de novo.
-    async fn rpc<F, Fut>(&mut self, ttl: std::time::Duration, chamada: F) -> Result<Vec<u8>, Unreachable>
+    async fn rpc<F, Fut>(
+        &mut self,
+        ttl: std::time::Duration,
+        chamada: F,
+    ) -> Result<Vec<u8>, Unreachable>
     where
         F: FnOnce(RaftTransportClient<tonic::transport::Channel>) -> Fut,
         Fut: std::future::Future<Output = Result<tonic::Response<RaftEnvelope>, tonic::Status>>,
@@ -229,7 +233,8 @@ impl RaftNetwork<TypeConfig> for GrpcConnection {
         let payload = encode(&rpc).map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
         let env = self
             .rpc(option.hard_ttl(), move |mut c| async move {
-                c.append_entries(Request::new(RaftEnvelope { payload })).await
+                c.append_entries(Request::new(RaftEnvelope { payload }))
+                    .await
             })
             .await
             .map_err(RPCError::Unreachable)?;

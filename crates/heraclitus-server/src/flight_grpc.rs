@@ -291,24 +291,20 @@ pub async fn serve_flight<L: EpisodeLog + 'static>(
         .map_err(|e| format!("flight addr {addr}: {e}"))?
         .collect();
     if resolvidos.is_empty() || resolvidos.iter().any(|a| !a.ip().is_loopback()) {
-        return Err(
-            "Flight has no TLS transport; only loopback listeners are supported".into(),
-        );
+        return Err("Flight has no TLS transport; only loopback listeners are supported".into());
     }
     let listener = tokio::net::TcpListener::bind(resolvidos.as_slice())
         .await
         .map_err(|e| format!("flight bind {addr}: {e}"))?;
     let local = listener.local_addr().map_err(|e| e.to_string())?;
     if !local.ip().is_loopback() {
-        return Err(
-            "Flight has no TLS transport; only loopback listeners are supported".into(),
-        );
+        return Err("Flight has no TLS transport; only loopback listeners are supported".into());
     }
     let FlightGuard { auth, audit } = guard;
-    let svc = FlightServiceServer::with_interceptor(
-        HeraclitusFlight::new(log, audit),
-        move |req| auth.authenticate(req),
-    );
+    let svc =
+        FlightServiceServer::with_interceptor(HeraclitusFlight::new(log, audit), move |req| {
+            auth.authenticate(req)
+        });
     let handle = tokio::spawn(async move {
         let incoming = tonic::transport::server::TcpIncoming::from(listener);
         let _ = tonic::transport::Server::builder()

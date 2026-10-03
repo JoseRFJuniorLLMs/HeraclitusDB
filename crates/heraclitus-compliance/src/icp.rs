@@ -1057,14 +1057,13 @@ fn encontrar_signatario<'a>(
     sid: &cms::signed_data::SignerIdentifier,
 ) -> Result<&'a Certificate, CompError> {
     match sid {
-        cms::signed_data::SignerIdentifier::IssuerAndSerialNumber(ias) => {
-            pool.iter()
-                .find(|c| {
-                    crate::nomes::nomes_equivalentes(&c.tbs_certificate.issuer, &ias.issuer)
-                        && c.tbs_certificate.serial_number == ias.serial_number
-                })
-                .ok_or_else(|| verify_err("certificado do signatário não vem no token".into()))
-        }
+        cms::signed_data::SignerIdentifier::IssuerAndSerialNumber(ias) => pool
+            .iter()
+            .find(|c| {
+                crate::nomes::nomes_equivalentes(&c.tbs_certificate.issuer, &ias.issuer)
+                    && c.tbs_certificate.serial_number == ias.serial_number
+            })
+            .ok_or_else(|| verify_err("certificado do signatário não vem no token".into())),
         cms::signed_data::SignerIdentifier::SubjectKeyIdentifier(skid) => {
             let alvo = skid.0.as_bytes();
             pool.iter()
@@ -1821,7 +1820,11 @@ mod tests {
         );
         let mut crls = crate::crl::CrlStore::new();
         crls.acrescentar(crl);
-        assert_eq!(crls.for_issuer_name(&chain.root.tbs_certificate.subject).len(), 1);
+        assert_eq!(
+            crls.for_issuer_name(&chain.root.tbs_certificate.subject)
+                .len(),
+            1
+        );
         assert_eq!(crls.for_issuer(&chain.root_subject_der).len(), 1);
     }
 

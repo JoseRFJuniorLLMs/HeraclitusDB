@@ -227,8 +227,12 @@ async fn flight_nao_aborta_com_evento_maior_que_16_mib() {
         vec![7; 20 << 20],
     ))
     .unwrap();
-    log.append(Episode::new("a", EventKind::Observation, b"depois".to_vec()))
-        .unwrap();
+    log.append(Episode::new(
+        "a",
+        EventKind::Observation,
+        b"depois".to_vec(),
+    ))
+    .unwrap();
     let (addr, handle) = serve_flight(log, "127.0.0.1:0", aberto()).await.unwrap();
     let mut client = cliente(addr, None).await;
     let batches: Vec<_> = client

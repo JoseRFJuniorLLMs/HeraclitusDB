@@ -150,7 +150,9 @@ mod tests {
             let completa = lsns(&format!("MATCH (n) RETURN n ORDER BY n.score {dir}"));
             assert_eq!(completa.len(), 500);
             for k in [0usize, 1, 3, 10, 64, 200, 499, 500, 600] {
-                let topk = lsns(&format!("MATCH (n) RETURN n ORDER BY n.score {dir} LIMIT {k}"));
+                let topk = lsns(&format!(
+                    "MATCH (n) RETURN n ORDER BY n.score {dir} LIMIT {k}"
+                ));
                 assert_eq!(
                     topk,
                     completa[..k.min(500)].to_vec(),

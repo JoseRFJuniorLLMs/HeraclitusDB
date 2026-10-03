@@ -423,8 +423,7 @@ fn dn_cobre(base: &Name, nome: &Name) -> Result<bool, CompError> {
     // nome que é, de facto, seu descendente (falha fechada, mas falha); numa
     // subtree EXCLUÍDA, a mesma diferença deixava passar o que devia ser
     // recusado.
-    Ok(b
-        .iter()
+    Ok(b.iter()
         .zip(n.iter())
         .all(|(rb, rn)| crate::nomes::rdns_equivalentes(rb, rn)))
 }

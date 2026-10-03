@@ -48,7 +48,11 @@ pub fn chave_canonica(nome: &Name) -> Vec<u8> {
 
 /// `true` se os dois nomes são o mesmo nome segundo a RFC 5280 §7.1.
 pub fn nomes_equivalentes(a: &Name, b: &Name) -> bool {
-    a.0.len() == b.0.len() && a.0.iter().zip(b.0.iter()).all(|(x, y)| rdns_equivalentes(x, y))
+    a.0.len() == b.0.len()
+        && a.0
+            .iter()
+            .zip(b.0.iter())
+            .all(|(x, y)| rdns_equivalentes(x, y))
 }
 
 /// `true` se os dois RDNs têm o mesmo conjunto de (tipo, valor).
@@ -107,7 +111,7 @@ fn texto_de_diretorio(tag: u8, bytes: &[u8]) -> Option<String> {
         0x14 => Some(bytes.iter().map(|&b| b as char).collect()),
         // BMPString: UCS-2 big-endian.
         0x1E => {
-            if bytes.len() % 2 != 0 {
+            if !bytes.len().is_multiple_of(2) {
                 return None;
             }
             let unidades: Vec<u16> = bytes
@@ -118,7 +122,7 @@ fn texto_de_diretorio(tag: u8, bytes: &[u8]) -> Option<String> {
         }
         // UniversalString: UCS-4 big-endian.
         0x1C => {
-            if bytes.len() % 4 != 0 {
+            if !bytes.len().is_multiple_of(4) {
                 return None;
             }
             bytes
@@ -163,7 +167,9 @@ mod tests {
         let mut copia = Name::from_der(&der).unwrap();
         let rdns = &mut copia.0;
         let original = rdns[rdn].0.iter().next().unwrap().clone();
-        let texto = std::str::from_utf8(original.value.value()).unwrap().to_owned();
+        let texto = std::str::from_utf8(original.value.value())
+            .unwrap()
+            .to_owned();
         let valor = if para_utf8 {
             Any::encode_from(&Utf8StringRef::new(&texto).unwrap()).unwrap()
         } else {
@@ -182,7 +188,11 @@ mod tests {
         let a = nome("CN=AC Raiz,O=ICP-Brasil,C=BR");
         let b = trocar_tipo(&a, 1, true);
         let c = trocar_tipo(&a, 1, false);
-        assert_ne!(b.to_der().unwrap(), c.to_der().unwrap(), "montagem: DER diferentes");
+        assert_ne!(
+            b.to_der().unwrap(),
+            c.to_der().unwrap(),
+            "montagem: DER diferentes"
+        );
         assert!(nomes_equivalentes(&b, &c));
         assert_eq!(chave_canonica(&b), chave_canonica(&c));
     }

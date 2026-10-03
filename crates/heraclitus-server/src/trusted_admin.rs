@@ -503,7 +503,11 @@ impl TrustedAdminProtocol {
         // Um `error` gravado é Failed (o efeito devolveu erro), não Unknown:
         // reportá-lo como Unknown mandava o operador reconciliar uma operação
         // que já tinha desfecho.
-        self.journal.lock().ok()?.get(&key).map(DurableRecord::estado)
+        self.journal
+            .lock()
+            .ok()?
+            .get(&key)
+            .map(DurableRecord::estado)
     }
 
     pub fn get_operation_state(&self, idempotency_key: &str) -> Option<AdminState> {
@@ -828,62 +832,57 @@ impl TrustedAdminProtocol {
         records: &mut HashMap<String, DurableRecord>,
         ep: &heraclitus_core::Episode,
     ) -> Result<(), HeraclitusError> {
-                if ep.agent_id != "heraclitus-admin" {
-                    return Ok(());
-                }
-                if !matches!(&ep.kind, heraclitus_core::EventKind::Custom(k) if k == "AdminIntent" || k == "AdminResult")
-                {
-                    return Ok(());
-                }
-                let record: DurableRecord = serde_json::from_slice(&ep.content).map_err(|e| {
-                    HeraclitusError::Config(format!("administrative journal corrupt: {e}"))
-                })?;
-                let Some((ctx, op)) = &record.intent else {
-                    return Err(HeraclitusError::Config("journal missing intent".into()));
-                };
-                let key =
-                    serde_json::to_string(&(&ctx.tenant, &ctx.principal, &op.idempotency_key))
-                        .unwrap();
-                if key != record.key
-                    || op.compute_intent_digest(ctx) != record.digest
-                    || op.operation_id != record.operation_id
-                {
-                    return Err(HeraclitusError::Config(
-                        "journal invalid intent binding".into(),
-                    ));
-                }
-                let is_intent =
-                    matches!(&ep.kind, heraclitus_core::EventKind::Custom(k) if k == "AdminIntent");
-                if is_intent
-                    && (record.result.is_some()
-                        || record.error.is_some()
-                        || records.contains_key(&key))
-                {
-                    return Err(HeraclitusError::Config(
-                        "duplicate/invalid administrative intent".into(),
-                    ));
-                }
-                if !is_intent
-                    && (!records.contains_key(&key)
-                        || record.result.is_some() == record.error.is_some())
-                {
-                    return Err(HeraclitusError::Config(
-                        "journal orphan/invalid outcome".into(),
-                    ));
-                }
-                if let Some(previous) = records.get(&record.key) {
-                    if previous.result.is_some()
-                        || previous.error.is_some()
-                        || previous.digest != record.digest
-                        || previous.operation_id != record.operation_id
-                    {
-                        return Err(HeraclitusError::Config(
-                            "administrative journal identity conflict".into(),
-                        ));
-                    }
-                }
-                records.insert(record.key.clone(), record);
-                Ok(())
+        if ep.agent_id != "heraclitus-admin" {
+            return Ok(());
+        }
+        if !matches!(&ep.kind, heraclitus_core::EventKind::Custom(k) if k == "AdminIntent" || k == "AdminResult")
+        {
+            return Ok(());
+        }
+        let record: DurableRecord = serde_json::from_slice(&ep.content)
+            .map_err(|e| HeraclitusError::Config(format!("administrative journal corrupt: {e}")))?;
+        let Some((ctx, op)) = &record.intent else {
+            return Err(HeraclitusError::Config("journal missing intent".into()));
+        };
+        let key =
+            serde_json::to_string(&(&ctx.tenant, &ctx.principal, &op.idempotency_key)).unwrap();
+        if key != record.key
+            || op.compute_intent_digest(ctx) != record.digest
+            || op.operation_id != record.operation_id
+        {
+            return Err(HeraclitusError::Config(
+                "journal invalid intent binding".into(),
+            ));
+        }
+        let is_intent =
+            matches!(&ep.kind, heraclitus_core::EventKind::Custom(k) if k == "AdminIntent");
+        if is_intent
+            && (record.result.is_some() || record.error.is_some() || records.contains_key(&key))
+        {
+            return Err(HeraclitusError::Config(
+                "duplicate/invalid administrative intent".into(),
+            ));
+        }
+        if !is_intent
+            && (!records.contains_key(&key) || record.result.is_some() == record.error.is_some())
+        {
+            return Err(HeraclitusError::Config(
+                "journal orphan/invalid outcome".into(),
+            ));
+        }
+        if let Some(previous) = records.get(&record.key) {
+            if previous.result.is_some()
+                || previous.error.is_some()
+                || previous.digest != record.digest
+                || previous.operation_id != record.operation_id
+            {
+                return Err(HeraclitusError::Config(
+                    "administrative journal identity conflict".into(),
+                ));
+            }
+        }
+        records.insert(record.key.clone(), record);
+        Ok(())
     }
 
     /// Serialized intent -> fsync -> effect -> result -> fsync. An incomplete
@@ -1103,7 +1102,10 @@ mod durable_regressions {
             Err(HeraclitusError::Config("chave não existe no HSM".into()))
         };
         assert!(p.execute(&context(), &operation(), persist, falha).is_err());
-        assert_eq!(p.operation_state(&context(), "key"), Some(AdminState::Failed));
+        assert_eq!(
+            p.operation_state(&context(), "key"),
+            Some(AdminState::Failed)
+        );
         let erro = p
             .execute(&context(), &operation(), persist, falha)
             .unwrap_err()
@@ -1128,7 +1130,9 @@ mod durable_regressions {
             |ep| {
                 writes.set(writes.get() + 1);
                 if writes.get() == 2 {
-                    return Err(HeraclitusError::Config("injected result fsync failure".into()));
+                    return Err(HeraclitusError::Config(
+                        "injected result fsync failure".into(),
+                    ));
                 }
                 let lsn = log.append(ep)?;
                 log.flush()?;
@@ -1147,7 +1151,10 @@ mod durable_regressions {
         deixar_unknown(log);
         let p = TrustedAdminProtocol::new();
         p.recover(log).unwrap();
-        assert_eq!(p.operation_state(&context(), "key"), Some(AdminState::Unknown));
+        assert_eq!(
+            p.operation_state(&context(), "key"),
+            Some(AdminState::Unknown)
+        );
 
         let revisor = AdminContext::new("revisora", "tenant", vec!["admin".into()]);
         let persist = |ep| {
@@ -1157,7 +1164,15 @@ mod durable_regressions {
         };
         // Sem evidência: recusado.
         assert!(p
-            .reconcile(&revisor, "tenant", "admin", "key", ReconciledOutcome::Succeeded, " ", persist)
+            .reconcile(
+                &revisor,
+                "tenant",
+                "admin",
+                "key",
+                ReconciledOutcome::Succeeded,
+                " ",
+                persist
+            )
             .is_err());
         assert_eq!(
             p.reconcile(
@@ -1174,7 +1189,15 @@ mod durable_regressions {
         );
         // Uma segunda reconciliação não pode gravar outro resultado.
         assert!(p
-            .reconcile(&revisor, "tenant", "admin", "key", ReconciledOutcome::Failed, "x", persist)
+            .reconcile(
+                &revisor,
+                "tenant",
+                "admin",
+                "key",
+                ReconciledOutcome::Failed,
+                "x",
+                persist
+            )
             .is_err());
 
         // O restart lê o resultado reconciliado (o `recover` aceita-o) e o

@@ -1322,8 +1322,14 @@ mod testes_acumulador {
         assert!(restaurado.restore(dir.path()).unwrap());
         let obtido = restaurado.search("rio fogo mudanca", 25);
         assert_eq!(
-            esperado.iter().map(|h| (h.id, h.lsn, h.score.to_bits())).collect::<Vec<_>>(),
-            obtido.iter().map(|h| (h.id, h.lsn, h.score.to_bits())).collect::<Vec<_>>()
+            esperado
+                .iter()
+                .map(|h| (h.id, h.lsn, h.score.to_bits()))
+                .collect::<Vec<_>>(),
+            obtido
+                .iter()
+                .map(|h| (h.id, h.lsn, h.score.to_bits()))
+                .collect::<Vec<_>>()
         );
         // E o checkpoint seguinte já sai no v2, que também restaura igual.
         restaurado.checkpoint(dir.path()).unwrap();
