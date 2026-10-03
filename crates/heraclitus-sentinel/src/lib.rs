@@ -1902,6 +1902,78 @@ impl SentinelRuntime {
         self.l4_events_com_janela(kind, incident_id, as_of_lsn, limit, JANELA)
     }
 
+    /// Número de aprovações humanas realmente PENDENTES: decisões de política
+    /// `RequireHumanApproval` persistidas cujo `approval_id` ainda não tem um
+    /// `SecurityApproval` (aprovar OU negar) no log.
+    ///
+    /// Auditoria recursiva 2026-10-03, iteração 1 — o dashboard contava os
+    /// `SecurityApproval`, que são decisões humanas JÁ TOMADAS (negações
+    /// incluídas), e publicava esse número como `pending_approvals`: três
+    /// pedidos em aberto davam 0 e, depois de decididos, davam 3. Além disso
+    /// lia só as primeiras 10 000 linhas L4 (por LSN crescente), pelo que as
+    /// decisões mais recentes deixavam de contar num log com muito L4.
+    ///
+    /// Percorre o log inteiro em lotes (a mesma janela de `l4_events`), sem
+    /// tecto de linhas: o que se guarda são só os dois conjuntos de IDs, e a
+    /// memória fica O(janela + nº de aprovações), não O(log).
+    pub fn pending_approvals(&self) -> Result<usize, SentinelError> {
+        const JANELA: usize = 20_000;
+        self.pending_approvals_com_janela(JANELA)
+    }
+
+    /// Corpo de `pending_approvals` com a janela injectável, para o teste
+    /// poder atravessar fronteiras de lote com um log pequeno.
+    fn pending_approvals_com_janela(&self, janela: usize) -> Result<usize, SentinelError> {
+        let janela = janela.max(1);
+        let upper = self.inner.log.head();
+        self.inner
+            .metrics
+            .l4_scans_total
+            .fetch_add(1, Ordering::Relaxed);
+        let mut pedidas: HashSet<String> = HashSet::new();
+        let mut decididas: HashSet<String> = HashSet::new();
+        let mut cursor: Lsn = 0;
+        while cursor < upper {
+            let lote = self.inner.log.scan_capped(cursor, upper, janela)?;
+            let Some(&(ultimo, _)) = lote.last() else {
+                break;
+            };
+            for (_, episode) in lote {
+                let EventKind::Custom(event_kind) = &episode.kind else {
+                    continue;
+                };
+                if !episode_is_generated(&episode) {
+                    continue;
+                }
+                match event_kind.as_str() {
+                    "SecurityPolicyDecision" => {
+                        let Ok(payload) =
+                            serde_json::from_slice::<serde_json::Value>(&episode.content)
+                        else {
+                            continue;
+                        };
+                        if let Some(approval_id) = payload
+                            .get("decision")
+                            .and_then(|decision| decision.get("RequireHumanApproval"))
+                            .and_then(|approval| approval.get("approval_id"))
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            pedidas.insert(approval_id.to_owned());
+                        }
+                    }
+                    "SecurityApproval" => {
+                        if let Some(approval_id) = episode.attrs.get("sentinel.approval_id") {
+                            decididas.insert(approval_id.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            cursor = cursor_apos_lote(cursor, ultimo)?;
+        }
+        Ok(pedidas.difference(&decididas).count())
+    }
+
     /// Auditoria 2026-09-05, A39 — o corpo de `l4_events`, com a janela
     /// injectável para o teste de equivalência poder exercitar as fronteiras
     /// dos lotes com um log pequeno.
@@ -4445,6 +4517,126 @@ mod tests {
             block_on(runtime.execute_authorized_action(&executor, authorized)).unwrap();
         assert!(high_result.success);
         assert_eq!(count_custom(&log, "SecurityApproval"), 1);
+        runtime.shutdown();
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 1 — `pending_approvals` tem
+    /// de contar os pedidos `RequireHumanApproval` ainda sem decisão humana,
+    /// não os `SecurityApproval` (que são decisões já tomadas, negações
+    /// incluídas). O dashboard publicava o contrário: 0 com três pedidos em
+    /// aberto, 3 depois de todos decididos.
+    #[test]
+    fn pending_approvals_conta_pedidos_sem_decisao() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let runtime = SentinelRuntime::start(
+            log.clone(),
+            SentinelConfig {
+                enabled: true,
+                mode: SentinelMode::Assist,
+                queue_capacity: 8,
+                worker_threads: 1,
+                pipeline_version: 1,
+                catch_up_batch: 32,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let evidence = vec![
+            EvidenceRef {
+                lsn: 0,
+                event_id: EventId::new(),
+            },
+            EvidenceRef {
+                lsn: 1,
+                event_id: EventId::new(),
+            },
+        ];
+        let assessment = EvidenceFusion::new(FusionWeights::default(), "v1")
+            .unwrap()
+            .fuse(
+                EntityRef::new("User", "alice"),
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+                evidence.clone(),
+            )
+            .unwrap();
+        let incident = SecurityIncident {
+            incident_id: "inc-1".into(),
+            state: IncidentState::New,
+            severity: 8,
+            risk_score: 1.0,
+            subjects: vec![EntityRef::new("User", "alice")],
+            signals: vec!["s1".into(), "s2".into()],
+            evidence: evidence.clone(),
+            first_seen_lsn: 0,
+            last_seen_lsn: 0,
+            mitre: Vec::new(),
+        };
+        assert_eq!(runtime.pending_approvals().unwrap(), 0);
+
+        let mut pedidos = Vec::new();
+        for n in 0..3 {
+            let proposal = ActionProposal {
+                proposal_id: format!("p-{n}"),
+                incident_id: "inc-1".into(),
+                action: SecurityAction::QuarantineHost {
+                    host_id: format!("host-{n}"),
+                    ttl_secs: 60,
+                },
+                rationale: "host containment".into(),
+                evidence: evidence.clone(),
+                expected_effect: "quarentena temporária".into(),
+                requested_ttl: Some(60),
+            };
+            let (decision, _) = runtime
+                .evaluate_and_persist_policy(&incident, &assessment, &proposal)
+                .unwrap();
+            let PolicyDecision::RequireHumanApproval { approval_id, .. } = decision else {
+                panic!("esperava aprovação humana, recebeu {decision:?}");
+            };
+            pedidos.push((proposal.proposal_id, approval_id));
+        }
+        // Três pedidos em aberto, nenhuma decisão: o código antigo dava 0.
+        assert_eq!(count_custom(&log, "SecurityApproval"), 0);
+        assert_eq!(runtime.pending_approvals().unwrap(), 3);
+        // Fronteiras de lote: o resultado não pode depender da janela.
+        for janela in [1, 2, 3] {
+            assert_eq!(runtime.pending_approvals_com_janela(janela).unwrap(), 3);
+        }
+
+        // Uma aprovação e uma negação: as duas fecham o pedido.
+        let (proposta, approval) = &pedidos[0];
+        runtime
+            .persist_human_approval_for("inc-1", proposta, approval, "analyst", true, "ok")
+            .unwrap();
+        let (proposta, approval) = &pedidos[1];
+        runtime
+            .persist_human_approval_for("inc-1", proposta, approval, "analyst", false, "não")
+            .unwrap();
+        assert_eq!(runtime.pending_approvals().unwrap(), 1);
+
+        // Tudo decidido: nada pendente (o código antigo dava 3).
+        let (proposta, approval) = &pedidos[2];
+        runtime
+            .persist_human_approval_for("inc-1", proposta, approval, "analyst", false, "não")
+            .unwrap();
+        assert_eq!(count_custom(&log, "SecurityApproval"), 3);
+        assert_eq!(runtime.pending_approvals().unwrap(), 0);
+        for janela in [1, 2, 3] {
+            assert_eq!(runtime.pending_approvals_com_janela(janela).unwrap(), 0);
+        }
         runtime.shutdown();
     }
 

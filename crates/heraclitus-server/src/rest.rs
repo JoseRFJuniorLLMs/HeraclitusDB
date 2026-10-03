@@ -1121,12 +1121,16 @@ async fn sentinel_dashboard(
     let result = tokio::task::spawn_blocking(move || {
         let status = runtime.status();
         let incidents = runtime.current_incidents();
-        let actions = runtime.l4_events(None, None, None, 10_000)?;
-        Ok::<_, heraclitus_sentinel::SentinelError>((status, incidents, actions))
+        // Auditoria recursiva 2026-10-03, iteração 1: contar aqui os
+        // `SecurityApproval` das primeiras 10 000 linhas L4 dava as decisões
+        // humanas JÁ tomadas, não as pendentes, e ignorava as mais recentes.
+        // O runtime calcula "pedidas e ainda sem decisão" sobre o log inteiro.
+        let approvals = runtime.pending_approvals()?;
+        Ok::<_, heraclitus_sentinel::SentinelError>((status, incidents, approvals))
     })
     .await;
     match result {
-        Ok(Ok((status, incidents, actions))) => {
+        Ok(Ok((status, incidents, approvals))) => {
             let active = incidents
                 .iter()
                 .filter(|incident| {
@@ -1139,10 +1143,6 @@ async fn sentinel_dashboard(
             let critical = incidents
                 .iter()
                 .filter(|incident| incident.severity >= 8)
-                .count();
-            let approvals = actions
-                .iter()
-                .filter(|(_, episode)| matches!(&episode.kind, heraclitus_core::EventKind::Custom(kind) if kind == "SecurityApproval"))
                 .count();
             Json(serde_json::json!({
                 "status": status,
@@ -3483,5 +3483,124 @@ mod meta_auditoria_tests {
             assert!(codigo == 200, "{caminho}: {codigo}");
         }
         assert_eq!(engine.head(), antes, "sondas não podem escrever no log");
+    }
+}
+
+#[cfg(test)]
+mod dashboard_tests {
+    use super::*;
+    use heraclitus_core::{EventId, FsyncPolicy};
+    use heraclitus_log::AnyLog;
+    use heraclitus_sentinel::{
+        ActionProposal, EntityRef, EvidenceFusion, EvidenceRef, FusionWeights, PolicyDecision,
+        SecurityAction, SecurityIncident, SentinelConfig, SentinelMode,
+    };
+
+    async fn pending_do_dashboard(runtime: &Arc<SentinelRuntime>) -> u64 {
+        let resposta = sentinel_dashboard(Extension(Some(runtime.clone()))).await;
+        assert_eq!(resposta.status(), StatusCode::OK);
+        let corpo = axum::body::to_bytes(resposta.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&corpo).unwrap();
+        json["pending_approvals"].as_u64().unwrap()
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 1 — o `pending_approvals` do
+    /// dashboard contava os `SecurityApproval` (decisões humanas JÁ tomadas):
+    /// com três pedidos em aberto mostrava 0 e, depois de todos decididos,
+    /// mostrava 3. Tem de mostrar 3 e depois 0.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dashboard_conta_aprovacoes_pendentes_e_nao_decididas() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let runtime = Arc::new(
+            SentinelRuntime::start(
+                log,
+                SentinelConfig {
+                    enabled: true,
+                    mode: SentinelMode::Assist,
+                    queue_capacity: 8,
+                    worker_threads: 1,
+                    pipeline_version: 1,
+                    catch_up_batch: 32,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap(),
+        );
+        let evidence = vec![
+            EvidenceRef {
+                lsn: 0,
+                event_id: EventId::new(),
+            },
+            EvidenceRef {
+                lsn: 1,
+                event_id: EventId::new(),
+            },
+        ];
+        let assessment = EvidenceFusion::new(FusionWeights::default(), "v1")
+            .unwrap()
+            .fuse(
+                EntityRef::new("User", "alice"),
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+                evidence.clone(),
+            )
+            .unwrap();
+        let incident = SecurityIncident {
+            incident_id: "inc-1".into(),
+            state: IncidentState::New,
+            severity: 8,
+            risk_score: 1.0,
+            subjects: vec![EntityRef::new("User", "alice")],
+            signals: vec!["s1".into(), "s2".into()],
+            evidence: evidence.clone(),
+            first_seen_lsn: 0,
+            last_seen_lsn: 0,
+            mitre: Vec::new(),
+        };
+        let mut pedidos = Vec::new();
+        for n in 0..3 {
+            let proposal = ActionProposal {
+                proposal_id: format!("p-{n}"),
+                incident_id: "inc-1".into(),
+                action: SecurityAction::QuarantineHost {
+                    host_id: format!("host-{n}"),
+                    ttl_secs: 60,
+                },
+                rationale: "host containment".into(),
+                evidence: evidence.clone(),
+                expected_effect: "quarentena temporária".into(),
+                requested_ttl: Some(60),
+            };
+            let (decision, _) = runtime
+                .evaluate_and_persist_policy(&incident, &assessment, &proposal)
+                .unwrap();
+            let PolicyDecision::RequireHumanApproval { approval_id, .. } = decision else {
+                panic!("esperava aprovação humana, recebeu {decision:?}");
+            };
+            pedidos.push((proposal.proposal_id, approval_id));
+        }
+        assert_eq!(pending_do_dashboard(&runtime).await, 3);
+
+        for (n, (proposta, approval)) in pedidos.iter().enumerate() {
+            runtime
+                .persist_human_approval_for("inc-1", proposta, approval, "analyst", n == 0, "r")
+                .unwrap();
+        }
+        assert_eq!(pending_do_dashboard(&runtime).await, 0);
+        runtime.shutdown();
     }
 }
