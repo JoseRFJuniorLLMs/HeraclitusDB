@@ -663,14 +663,39 @@ impl pb::heraclitus_server::Heraclitus for Service {
             let result = if read_only {
                 dispatch(None)
             } else {
-                let supplied = serde_json::from_str::<serde_json::Value>(&r.arg)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("idempotency_key")
-                            .and_then(|k| k.as_str())
-                            .map(str::to_owned)
-                    });
-                let key = supplied.unwrap_or_else(|| admin_ctx.request_id.clone());
+                let corpo = serde_json::from_str::<serde_json::Value>(&r.arg).ok();
+                let campo = |nome: &str| {
+                    corpo
+                        .as_ref()
+                        .and_then(|v| v.get(nome))
+                        .and_then(|k| k.as_str())
+                        .map(str::to_owned)
+                };
+                let supplied = campo("idempotency_key");
+                // No `admin-reconcile` a `idempotency_key` do `arg` é a da
+                // operação-ALVO. Usá-la também como chave da PRÓPRIA
+                // reconciliação (revisão de 2026-10-03) fazia duas coisas
+                // erradas: com o mesmo principal, o `execute` via o alvo e
+                // recusava por conflito de digest — quem pediu nunca conseguia
+                // reconciliar; com um alvo inexistente, a reconciliação
+                // encontrava a sua própria reserva e gravava dois resultados
+                // para a mesma chave. A chave própria deriva do alvo (um retry
+                // do MESMO pedido continua idempotente) e nunca coincide com
+                // ele.
+                let key = if r.op == "admin-reconcile" {
+                    supplied
+                        .map(|alvo| {
+                            format!(
+                                "admin-reconcile:{}:{}:{alvo}",
+                                campo("tenant").unwrap_or_else(|| admin_ctx.tenant.clone()),
+                                campo("principal")
+                                    .unwrap_or_else(|| admin_ctx.principal.clone()),
+                            )
+                        })
+                        .unwrap_or_else(|| admin_ctx.request_id.clone())
+                } else {
+                    supplied.unwrap_or_else(|| admin_ctx.request_id.clone())
+                };
                 let mut op = crate::trusted_admin::AdminOperation::new(
                     key.clone(),
                     key,
@@ -1287,6 +1312,116 @@ mod testes_dimensao_do_embedding {
             idempotency_key: chave.into(),
             ..Default::default()
         }
+    }
+
+    fn pedido_admin(op: &str, arg: serde_json::Value) -> Request<pb::AdminRequest> {
+        let mut req = Request::new(pb::AdminRequest {
+            op: op.into(),
+            arg: arg.to_string(),
+        });
+        req.extensions_mut().insert(Principal {
+            name: "chefe".into(),
+            roles: Arc::new(vec![AccessRole::Admin]),
+        });
+        req
+    }
+
+    /// Deixa uma operação UNKNOWN do principal `chefe`: a intenção chega ao
+    /// log, o resultado não (falha injectada na segunda escrita).
+    fn deixar_unknown(engine: &Engine, chave: &str) {
+        use crate::trusted_admin::{AdminContext, AdminOperation, AdminOperationKind};
+        let ctx = AdminContext::new("chefe", "local", vec!["admin".into()]);
+        let op = AdminOperation::new(
+            chave,
+            chave,
+            AdminOperationKind::Custom {
+                name: "operacao-de-teste".into(),
+                details: String::new(),
+            },
+            "teste",
+        );
+        let escritas = std::cell::Cell::new(0);
+        let resultado: Result<bool, _> = engine.trusted_admin().execute(
+            &ctx,
+            &op,
+            |ep| {
+                escritas.set(escritas.get() + 1);
+                if escritas.get() == 2 {
+                    return Err(heraclitus_core::HeraclitusError::Config(
+                        "falha injectada ao gravar o resultado".into(),
+                    ));
+                }
+                let lsn = engine.log.append(ep)?;
+                engine.log.flush()?;
+                Ok(lsn)
+            },
+            |_| Ok(true),
+        );
+        assert!(resultado.is_err());
+    }
+
+    /// Revisão de 2026-10-03 (achado 13): o próprio requerente não conseguia
+    /// reconciliar a sua operação UNKNOWN — a chave do alvo era reutilizada
+    /// como chave da reconciliação e o `execute` recusava por conflito.
+    #[tokio::test]
+    async fn quem_pediu_a_operacao_consegue_reconcilia_la_e_o_servidor_volta_a_arrancar() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = motor(dir.path());
+            deixar_unknown(&engine, "K-1");
+            let svc = Service::new(engine.clone());
+            let r = svc
+                .admin(pedido_admin(
+                    "admin-reconcile",
+                    serde_json::json!({
+                        "idempotency_key": "K-1",
+                        "outcome": "succeeded",
+                        "evidence": "efeito confirmado fora do sistema",
+                    }),
+                ))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(r.ok, "{}", r.message);
+        }
+        // O diário tem de continuar válido: o arranque seguinte não pode recusar.
+        let engine = motor(dir.path());
+        let ctx = crate::trusted_admin::AdminContext::new("chefe", "local", vec!["admin".into()]);
+        assert_eq!(
+            engine.trusted_admin().operation_state(&ctx, "K-1"),
+            Some(crate::trusted_admin::AdminState::Reconciled)
+        );
+    }
+
+    /// Revisão de 2026-10-03 (achado 11, crítico): reconciliar uma chave que
+    /// NÃO existe fazia a reconciliação encontrar a sua própria reserva e
+    /// gravar dois resultados para a mesma chave — o arranque seguinte
+    /// recusava o diário e o servidor deixava de arrancar.
+    #[tokio::test]
+    async fn reconciliar_uma_chave_inexistente_falha_sem_partir_o_arranque() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = motor(dir.path());
+            let svc = Service::new(engine.clone());
+            let r = svc
+                .admin(pedido_admin(
+                    "admin-reconcile",
+                    serde_json::json!({
+                        "idempotency_key": "nunca-existiu",
+                        "outcome": "succeeded",
+                        "evidence": "x",
+                    }),
+                ))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(
+                !r.ok,
+                "reconciliar o inexistente tem de falhar: {}",
+                r.message
+            );
+        }
+        let _engine = motor(dir.path());
     }
 
     /// `AppendBatch` (otimizacao-20m §3.6): grava por ordem numa só ida e

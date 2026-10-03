@@ -2199,6 +2199,7 @@ impl Engine {
             idempotency_key,
             outcome,
             evidence,
+            self.log.as_ref(),
             |ep| {
                 let lsn = self.append_internal(ep)?;
                 self.log.flush()?;

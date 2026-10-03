@@ -546,6 +546,14 @@ impl V6Log {
                         let Some(state) = weak.upgrade() else { break; };
                         let Ok(mut state) = state.lock() else { break; };
                         if state.sync_error.is_some() { break; }
+                        // Sem segmento activo (seal falhado: pendente ou degradado)
+                        // não há writer para sincronizar. Não é uma falha de fsync:
+                        // o estado próprio desse caso já recusa as escritas e deixa
+                        // as leituras de LSN selado funcionar. Envenenar aqui com
+                        // `sync_error` bloqueava também as leituras, para sempre.
+                        if state.dirty && state.active.is_none() && (state.ativo_pendente.is_some() || state.degradado.is_some()) {
+                            state.dirty = false;
+                        }
                         if state.dirty && (stopping || state.last_sync.elapsed() >= period) {
                             let result = state.active.as_mut().ok_or_else(|| std::io::Error::other("V6 active segment unavailable"))
                                 .and_then(|active| active.writer.sync().map_err(std::io::Error::other));
@@ -2472,9 +2480,15 @@ impl V6Log {
         // O seal está publicado: o estado em disco é coerente. Se criar o
         // segmento seguinte falhar (p.ex. disco cheio momentâneo), o próximo
         // append volta a tentar em vez de exigir reinício.
+        // O seal fez `sync_data` do segmento selado: não resta nada por
+        // sincronizar. Limpar `dirty` ANTES de tentar o segmento seguinte —
+        // senão, sob GroupCommit, o worker de fsync encontrava `dirty` sem
+        // segmento activo e convertia o estado recuperável num `sync_error`
+        // permanente que bloqueava escritas E leituras (revisão de 2026-10-03).
+        state.dirty = false;
+        state.last_sync = Instant::now();
         state.ativo_pendente = Some(id.saturating_add(1));
         self.repor_ativo(state)?;
-        state.last_sync = Instant::now();
         Ok(())
     }
 
@@ -3274,8 +3288,21 @@ mod tests {
     /// tentar e recupera; nada se perde e o log reabre íntegro.
     #[test]
     fn falha_a_criar_o_segmento_seguinte_recupera_no_proximo_append() {
+        recuperacao_do_segmento_seguinte(FsyncPolicy::Always);
+    }
+
+    /// O mesmo sob GroupCommit — o DEFAULT. A revisão de 2026-10-03 mostrou
+    /// que o worker de fsync encontrava `dirty` sem segmento activo e
+    /// envenenava o motor com `sync_error`: escritas E leituras falhavam até
+    /// reiniciar, e a recuperação a quente nunca acontecia.
+    #[test]
+    fn recuperacao_do_segmento_seguinte_sob_group_commit() {
+        recuperacao_do_segmento_seguinte(FsyncPolicy::GroupCommit { interval_ms: 2 });
+    }
+
+    fn recuperacao_do_segmento_seguinte(politica: FsyncPolicy) {
         let dir = tempfile::tempdir().unwrap();
-        let log = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
+        let log = V6Log::open(dir.path(), 1 << 20, politica).unwrap();
         log.append(event(0)).unwrap();
         let atual = log.lock_state().unwrap().active.as_ref().unwrap().id;
         // Um directório no caminho do próximo segmento activo faz o
@@ -3291,6 +3318,9 @@ mod tests {
             "o seal foi publicado: não é degradação"
         );
         assert!(log.append(event(1)).is_err(), "ainda bloqueado");
+        // Dá tempo ao worker de fsync (GroupCommit) de correr várias vezes
+        // com o segmento pendente.
+        std::thread::sleep(Duration::from_millis(60));
         assert!(
             log.read(0).unwrap().is_some(),
             "com a escrita bloqueada, as leituras de LSN selado continuam"
