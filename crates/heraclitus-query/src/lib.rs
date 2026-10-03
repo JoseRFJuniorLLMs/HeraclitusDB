@@ -1232,6 +1232,61 @@ mod tests {
         );
     }
 
+    /// Auditoria recursiva 2026-10-03, iteração 2: a profundidade de
+    /// `SIMULATE ... THEN` é limitada — no limite passa (e a ordem dos
+    /// prefixos preserva-se: o primeiro é o mais exterior), acima é recusada
+    /// tanto no `parse` como no `required_access` usado pelo RBAC do gRPC.
+    #[test]
+    fn simulate_nesting_depth_is_bounded() {
+        let nested = |depth: usize| {
+            let mut q = String::new();
+            for i in 0..depth {
+                q.push_str(&format!("SIMULATE ADD EDGE(\"a{i}\",\"b\",\"t\") THEN "));
+            }
+            q.push_str("DECIDE()");
+            q
+        };
+        let ok = parse(&nested(ast::MAX_SIMULATE_DEPTH)).unwrap();
+        let mut cur = &ok.stmt;
+        for i in 0..ast::MAX_SIMULATE_DEPTH {
+            match cur {
+                Stmt::Simulate { from, then, .. } => {
+                    assert_eq!(from, &format!("a{i}"), "ordem dos prefixos");
+                    cur = then;
+                }
+                other => panic!("esperava Simulate no nível {i}, veio {other:?}"),
+            }
+        }
+        assert!(matches!(cur, Stmt::Decide { .. }));
+        assert_eq!(
+            required_access(&nested(ast::MAX_SIMULATE_DEPTH)).unwrap(),
+            QueryAccess::Write
+        );
+
+        let over = nested(ast::MAX_SIMULATE_DEPTH + 1);
+        assert!(parse(&over).is_err(), "acima do limite tem de ser recusado");
+        assert!(required_access(&over).is_err());
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 2: ~1 MiB de prefixos SIMULATE
+    /// (o teto MAX_GQL_BYTES do gRPC) numa thread com a pilha de 2 MiB de um
+    /// worker tokio tem de dar um erro limpo — antes, o parser recursivo do
+    /// pest rebentava a pilha e abortava o processo inteiro.
+    #[test]
+    fn huge_simulate_nesting_fails_cleanly_on_worker_stack() {
+        let level = "SIMULATEADDEDGE(\"\",\"\",\"\")THEN";
+        let mut q = level.repeat((1 << 20) / level.len());
+        q.push_str("MATCH (n) RETURN n");
+        let r = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || required_access(&q).map_err(|e| e.to_string()))
+            .unwrap()
+            .join()
+            .expect("o parse não pode entrar em pânico");
+        let err = r.expect_err("profundidade gigante tem de ser recusada");
+        assert!(err.contains("SIMULATE nesting"), "{err}");
+    }
+
     #[test]
     fn simulate_counterfactual_isolates_divergence() {
         // M16: two triangles joined by a bridge edge A1-B1 form one community.

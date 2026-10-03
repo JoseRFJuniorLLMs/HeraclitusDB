@@ -9,7 +9,14 @@ explain = { ^"EXPLAIN" }
 // M18 consistency contract: fail explicitly unless the backend has reached LSN X.
 require = { ^"REQUIRE" ~ ^"LSN" ~ ">=" ~ int }
 
-stmt = { simulate_stmt | match_stmt | create_stmt | recall_stmt | nearest_stmt | provenance_stmt | neighbors_stmt | traverse_stmt | fuse_stmt | resolve_stmt | cluster_stmt | hypotheses_stmt | why_stmt | community_stmt | metrics_stmt | decide_stmt | adapt_stmt }
+// Auditoria recursiva 2026-10-03, iteração 2: o SIMULATE era recursivo na
+// gramática (`simulate_stmt = { ... ~ ^"THEN" ~ stmt }`), pelo que ~30 000
+// níveis num pedido de 1 MiB rebentavam a pilha do worker tokio no parser
+// recursivo do pest, abortando o processo inteiro. Os prefixos SIMULATE são
+// agora uma REPETIÇÃO (`*`, iterativa no pest) antes do statement base; a
+// profundidade é limitada em `ast::build_stmt` antes de qualquer aninhamento.
+stmt = { simulate_clause* ~ base_stmt }
+base_stmt = _{ match_stmt | create_stmt | recall_stmt | nearest_stmt | provenance_stmt | neighbors_stmt | traverse_stmt | fuse_stmt | resolve_stmt | cluster_stmt | hypotheses_stmt | why_stmt | community_stmt | metrics_stmt | decide_stmt | adapt_stmt }
 
 // ---- MATCH ----
 match_stmt = { ^"MATCH" ~ pattern ~ where_clause? ~ valid_at? ~ as_of? ~ return_clause ~ order_by? ~ limit? }
@@ -80,7 +87,8 @@ metrics_stmt = { ^"METRICS" ~ "(" ~ string ~ ")" ~ as_of? }
 // M15 decision layer: DECIDE() evaluates rules and emits Action events [AS OF ...]
 decide_stmt = { ^"DECIDE" ~ "(" ~ ")" ~ as_of? }
 // M16 counterfactual engine: SIMULATE ADD/REMOVE EDGE ("from", "to", "etype") THEN <stmt>
-simulate_stmt = { ^"SIMULATE" ~ simulate_op ~ ^"EDGE" ~ "(" ~ string ~ "," ~ string ~ "," ~ string ~ ")" ~ ^"THEN" ~ stmt }
+// (prefixo de `stmt` — ver acima: repetição em vez de recursão)
+simulate_clause = { ^"SIMULATE" ~ simulate_op ~ ^"EDGE" ~ "(" ~ string ~ "," ~ string ~ "," ~ string ~ ")" ~ ^"THEN" }
 simulate_op = { ^"ADD" | ^"REMOVE" }
 // M17 adaptive rules: ADAPT() learns the decision threshold from feedback [AS OF ...]
 adapt_stmt = { ^"ADAPT" ~ "(" ~ ")" ~ as_of? }

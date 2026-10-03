@@ -251,8 +251,43 @@ pub fn build_query(pair: Pair<Rule>) -> Result<Query, HeraclitusError> {
     })
 }
 
+/// Profundidade máxima de `SIMULATE ... THEN` aninhados numa query.
+///
+/// Auditoria recursiva 2026-10-03, iteração 2: sem limite, um único pedido
+/// (Reader basta) com dezenas de milhares de níveis rebentava a pilha no
+/// parse/lowering/plan/Drop — todos recursivos por nível — abortando o
+/// servidor; e, mesmo com poucas centenas de níveis, cada nível mantém vivas
+/// cópias completas do grafo temporal durante a execução (OOM). Composições
+/// contrafactuais reais usam um punhado de arestas; 8 chega com folga e
+/// limita a memória a um múltiplo pequeno e conhecido do grafo.
+pub const MAX_SIMULATE_DEPTH: usize = 8;
+
 fn build_stmt(pair: Pair<Rule>) -> Result<Stmt, HeraclitusError> {
-    let inner = pair.into_inner().next().ok_or_else(|| perr("empty stmt"))?;
+    // A gramática dá `simulate_clause* ~ base_stmt` (plano, sem recursão);
+    // o limite é verificado ANTES de construir qualquer aninhamento.
+    let mut clauses = Vec::new();
+    let mut base = None;
+    for p in pair.into_inner() {
+        if p.as_rule() == Rule::simulate_clause {
+            if clauses.len() >= MAX_SIMULATE_DEPTH {
+                return Err(perr(format!(
+                    "SIMULATE nesting exceeds the maximum depth of {MAX_SIMULATE_DEPTH}"
+                )));
+            }
+            clauses.push(p);
+        } else {
+            base = Some(p);
+        }
+    }
+    let mut stmt = build_base_stmt(base.ok_or_else(|| perr("empty stmt"))?)?;
+    // O SIMULATE mais exterior é o primeiro prefixo: embrulhar de dentro para fora.
+    for clause in clauses.into_iter().rev() {
+        stmt = build_simulate(clause, stmt)?;
+    }
+    Ok(stmt)
+}
+
+fn build_base_stmt(inner: Pair<Rule>) -> Result<Stmt, HeraclitusError> {
     match inner.as_rule() {
         Rule::match_stmt => build_match(inner).map(Stmt::Match),
         Rule::create_stmt => build_create(inner).map(Stmt::Create),
@@ -498,36 +533,35 @@ fn build_stmt(pair: Pair<Rule>) -> Result<Stmt, HeraclitusError> {
                 .transpose()?;
             Ok(Stmt::Adapt { as_of })
         }
-        Rule::simulate_stmt => {
-            let mut op = SimulateOp::AddEdge;
-            let mut strs = Vec::new();
-            let mut then = None;
-            for p in inner.into_inner() {
-                match p.as_rule() {
-                    Rule::simulate_op => {
-                        if p.as_str().eq_ignore_ascii_case("remove") {
-                            op = SimulateOp::RemoveEdge;
-                        }
-                    }
-                    Rule::string => strs.push(unquote(p.as_str())),
-                    Rule::stmt => then = Some(Box::new(build_stmt(p)?)),
-                    _ => {}
-                }
-            }
-            if strs.len() < 3 {
-                return Err(perr("SIMULATE EDGE needs (from, to, etype)"));
-            }
-            let then = then.ok_or_else(|| perr("SIMULATE needs a THEN statement"))?;
-            Ok(Stmt::Simulate {
-                op,
-                from: strs[0].clone(),
-                to: strs[1].clone(),
-                etype: strs[2].clone(),
-                then,
-            })
-        }
         r => Err(perr(format!("unexpected stmt {r:?}"))),
     }
+}
+
+/// Embrulha `then` num `Stmt::Simulate` a partir de um `simulate_clause`.
+fn build_simulate(clause: Pair<Rule>, then: Stmt) -> Result<Stmt, HeraclitusError> {
+    let mut op = SimulateOp::AddEdge;
+    let mut strs = Vec::new();
+    for p in clause.into_inner() {
+        match p.as_rule() {
+            Rule::simulate_op => {
+                if p.as_str().eq_ignore_ascii_case("remove") {
+                    op = SimulateOp::RemoveEdge;
+                }
+            }
+            Rule::string => strs.push(unquote(p.as_str())),
+            _ => {}
+        }
+    }
+    if strs.len() < 3 {
+        return Err(perr("SIMULATE EDGE needs (from, to, etype)"));
+    }
+    Ok(Stmt::Simulate {
+        op,
+        from: strs[0].clone(),
+        to: strs[1].clone(),
+        etype: strs[2].clone(),
+        then: Box::new(then),
+    })
 }
 
 fn build_match(pair: Pair<Rule>) -> Result<MatchStmt, HeraclitusError> {

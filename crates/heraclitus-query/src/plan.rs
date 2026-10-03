@@ -1762,6 +1762,10 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
             // do SIMULATE exterior (o VirtualBackend devolve o overlay).
             let base = be.graph()?;
             let virt = materialize_virtual(&base, *op, from, to, etype);
+            // Auditoria recursiva 2026-10-03, iteração 2: libertar a cópia base
+            // antes da recursão — senão cada nível aninhado retinha DUAS cópias
+            // completas do grafo até ao fim da execução.
+            drop(base);
             let vb = VirtualBackend::new(be, virt);
             execute(then, &vb)
         }
