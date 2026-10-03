@@ -700,6 +700,10 @@ impl AnpdPackageReceipt {
     }
 }
 
+/// Marcador escrito no lugar de um identificador negado pela política de
+/// exportação, nos ficheiros do pacote que não são documentos sanitizados.
+const REDACTED_BY_EXPORT_POLICY: &str = "[removido pela política de exportação]";
+
 pub struct AnpdCommunicationPackage {
     files: BTreeMap<String, Vec<u8>>,
     receipt_digest: String,
@@ -792,6 +796,28 @@ impl AnpdCommunicationPackage {
             .get("summary")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("[conteúdo removido pela política de exportação]");
+        // Auditoria recursiva 2026-10-03, iteração 2: os identificadores
+        // também saem do pacote externo em report.md e evidence-manifest.json.
+        // Antes eram copiados em bruto mesmo quando a política os negava, e o
+        // privacy-sanitization.json declarava-os removidos — "um caminho
+        // negado ganha sempre" tem de valer para TODOS os ficheiros do pacote
+        // (há operadores cujos IDs embutem número de processo ou nome do
+        // titular). O incident_id vive em dois documentos; negar qualquer um
+        // deles basta para o considerar sensível. O recibo e os attrs do
+        // episódio ficam no ledger interno e mantêm o ID verdadeiro.
+        let incident_id_denied = export_policy.is_denied("assessment.incident_id")
+            || export_policy.is_denied("incident.incident_id");
+        let assessment_id_denied = export_policy.is_denied("assessment.assessment_id");
+        let exported_incident_id = if incident_id_denied {
+            REDACTED_BY_EXPORT_POLICY
+        } else {
+            assessment.incident_id.as_str()
+        };
+        let exported_assessment_id = if assessment_id_denied {
+            REDACTED_BY_EXPORT_POLICY
+        } else {
+            assessment.assessment_id.as_str()
+        };
 
         let report = format!(
             "# Comunicação de incidente — rascunho\n\n\
@@ -801,8 +827,8 @@ impl AnpdCommunicationPackage {
              Prazo calculado: {}\n\n\
              Estado: aguardando autorização humana.\n\n\
              ## Resumo\n\n{}\n",
-            assessment.incident_id,
-            assessment.assessment_id,
+            exported_incident_id,
+            exported_assessment_id,
             deadline.authority,
             deadline.deadline_at,
             safe_summary
@@ -815,8 +841,8 @@ impl AnpdCommunicationPackage {
             .collect();
         let manifest = PackageManifest {
             schema_version: 1,
-            incident_id: assessment.incident_id.clone(),
-            assessment_id: assessment.assessment_id.clone(),
+            incident_id: exported_incident_id.to_owned(),
+            assessment_id: exported_assessment_id.to_owned(),
             policy: assessment.policy.clone(),
             export_policy: export_policy.identity.clone(),
             submission_state: SubmissionState::AwaitingHumanAuthorization,
@@ -1244,6 +1270,85 @@ mod tests {
             .flat_map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
             .collect::<Vec<_>>();
         assert!(!String::from_utf8_lossy(&all_files).contains("000.000.000-00"));
+    }
+
+    #[test]
+    fn privacy_export_redacts_denied_ids_in_report_and_manifest() {
+        // Auditoria recursiva 2026-10-03, iteração 2: IDs negados não podem
+        // reaparecer em report.md nem em evidence-manifest.json.
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("redacted-ids-package");
+        let mut assessment = assessment();
+        assessment.incident_id = "processo-4711-joao-titular".into();
+        assessment.assessment_id = "avaliacao-4711-joao-titular".into();
+        let deadline = RegulatoryDeadline::calculate(
+            "processo-4711-joao-titular",
+            0,
+            &deadline_policy(BusinessCalendar::default()),
+        )
+        .unwrap();
+        let data = IncidentPackageData {
+            summary: "safe summary".into(),
+            affected_assets: vec!["portal".into()],
+            affected_data: [("category".into(), "credential".into())]
+                .into_iter()
+                .collect(),
+            mitigation_actions: vec!["rotation".into()],
+            timeline: assessment.evidence.clone(),
+            evidence_anchor_ids: vec![],
+        };
+        let policy = PrivacyExportPolicy::new(
+            "anpd-export",
+            "2026.3",
+            0,
+            [
+                "assessment".into(),
+                "incident".into(),
+                "affected_data".into(),
+                "mitigation".into(),
+                "timeline".into(),
+            ]
+            .into_iter()
+            .collect(),
+            [
+                "assessment.incident_id".into(),
+                "assessment.assessment_id".into(),
+                "incident.incident_id".into(),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .unwrap();
+        let receipt = AnpdCommunicationPackage::build(&assessment, &deadline, &data, &policy)
+            .unwrap()
+            .write_to(&output)
+            .unwrap();
+        // O recibo fica no ledger interno e continua a identificar o incidente.
+        assert_eq!(receipt.incident_id, "processo-4711-joao-titular");
+
+        let sanitization: PrivacySanitizationReport = serde_json::from_slice(
+            &std::fs::read(output.join("privacy-sanitization.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(sanitization
+            .removed_paths
+            .contains("assessment.incident_id"));
+        assert!(sanitization
+            .removed_paths
+            .contains("assessment.assessment_id"));
+        assert!(sanitization.removed_paths.contains("incident.incident_id"));
+        let manifest: PackageManifest =
+            serde_json::from_slice(&std::fs::read(output.join("evidence-manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest.incident_id, REDACTED_BY_EXPORT_POLICY);
+        assert_eq!(manifest.assessment_id, REDACTED_BY_EXPORT_POLICY);
+        let report = std::fs::read_to_string(output.join("report.md")).unwrap();
+        assert!(report.contains(REDACTED_BY_EXPORT_POLICY));
+        let all_files = std::fs::read_dir(&output)
+            .unwrap()
+            .flat_map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
+            .collect::<Vec<_>>();
+        assert!(!String::from_utf8_lossy(&all_files).contains("4711-joao-titular"));
     }
 
     #[test]
