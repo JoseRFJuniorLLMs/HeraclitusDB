@@ -138,6 +138,46 @@ fn token_name(lsn: u64) -> String {
     format!("{lsn:020}.tst")
 }
 
+/// Grava o token num ficheiro **novo**, nunca sobre um que já exista.
+///
+/// Auditoria recursiva 2026-10-03, iteração 2: o worker arranca sempre com
+/// `last_lsn = 0`, por isso depois de um reinício sem segmento novo selado
+/// volta a ancorar a mesma marca d'água — e o `heraclitus anchor` corrido
+/// duas vezes sobre uma base quieta faz o mesmo. Com `std::fs::write` o
+/// segundo carimbo truncava `<lsn>.tst` e destruía o primeiro, que é a prova
+/// mais antiga do estado; a linha antiga do manifesto ficava a apontar para
+/// um token que já não a descreve (outro `genTime`, ou até outro formato se o
+/// modo da ACT mudou entre arranques — falso alarme de adulteração). E a
+/// escrita não era atómica: um crash a meio truncava um recibo já válido.
+///
+/// O primeiro token de cada LSN mantém o nome histórico; os seguintes ganham
+/// um sufixo `-N`. `create_new` garante que nenhum ficheiro existente é
+/// tocado: um crash a meio deixa, quando muito, um ficheiro novo parcial que
+/// nenhuma linha do manifesto referencia (a linha só é escrita depois).
+fn write_token_new(dir: &Path, lsn: u64, token: &[u8]) -> Result<String, CompError> {
+    use std::io::Write;
+    for n in 0u32.. {
+        let name = if n == 0 {
+            token_name(lsn)
+        } else {
+            format!("{lsn:020}-{n}.tst")
+        };
+        let mut f = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(&name))
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        };
+        f.write_all(token)?;
+        f.sync_all()?;
+        return Ok(name);
+    }
+    unreachable!("u32 esgotado a procurar um nome livre para o token")
+}
+
 /// Persist a token + manifest entry, returning the receipt.
 /// O domínio que um recibo sem o campo necessariamente usou: antes do HRKL v6
 /// só existiam raízes físicas.
@@ -158,8 +198,7 @@ pub fn persist(
     let dir = dir.as_ref();
     std::fs::create_dir_all(dir)?;
 
-    let token_file = token_name(commitment.lsn);
-    std::fs::write(dir.join(&token_file), token)?;
+    let token_file = write_token_new(dir, commitment.lsn, token)?;
 
     let receipt = LegalReceipt {
         lsn: commitment.lsn,
@@ -266,6 +305,45 @@ mod tests {
         let all = load_manifest(dir.path()).unwrap();
         assert_eq!(all, vec![r.clone()]);
         assert_eq!(read_token(dir.path(), &r).unwrap(), b"token-bytes");
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 2: reancorar a mesma marca
+    /// d'água (reinício sem segmento novo, ou `anchor` repetido) não pode
+    /// destruir o token anterior. Cada linha do manifesto tem de continuar a
+    /// ler exactamente o token que tinha quando foi escrita.
+    #[test]
+    fn reancorar_o_mesmo_lsn_nao_destroi_o_token_anterior() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Commitment {
+            lsn: 42,
+            root: [3u8; 32],
+            segments: 2,
+            domain: crate::commit::CommitmentDomain::LegacyPhysical,
+        };
+        let imprint = [4u8; 32];
+        let ev = |t: u64| TimestampEvidence {
+            recorded_unix_ms: t,
+            authority_gen_unix_ms: Some(t),
+            validation_state: TimestampValidationState::DevelopmentOnly,
+            tsa_policy_oid: None,
+        };
+        let r1 = persist(dir.path(), &c, &imprint, "ACT-dev", ev(1), b"token-t1").unwrap();
+        let r2 = persist(dir.path(), &c, &imprint, "ACT-dev", ev(2), b"token-t2").unwrap();
+        let r3 = persist(dir.path(), &c, &imprint, "ACT-dev", ev(3), b"token-t3").unwrap();
+
+        assert_ne!(r1.token_file, r2.token_file);
+        assert_ne!(r2.token_file, r3.token_file);
+        assert_eq!(
+            r1.token_file,
+            token_name(42),
+            "o primeiro mantém o nome histórico"
+        );
+
+        let all = load_manifest(dir.path()).unwrap();
+        assert_eq!(all, vec![r1, r2, r3]);
+        assert_eq!(read_token(dir.path(), &all[0]).unwrap(), b"token-t1");
+        assert_eq!(read_token(dir.path(), &all[1]).unwrap(), b"token-t2");
+        assert_eq!(read_token(dir.path(), &all[2]).unwrap(), b"token-t3");
     }
 
     #[test]
