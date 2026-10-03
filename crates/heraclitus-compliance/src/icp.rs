@@ -2457,6 +2457,63 @@ mod tests {
         assert!(erro.to_string().contains("excludedSubtree"), "{erro}");
     }
 
+    /// Auditoria recursiva 2026-10-03, iteracao 2 — restricoes ANINHADAS sao
+    /// uma interseccao (RFC 5280 §6.1.4(g)), nao uma reuniao. A raiz restringe
+    /// o intermedio a `O=ICP-Brasil`; o intermedio restringe-se a si proprio a
+    /// `OU=Fiscal,O=ICP-Brasil`. Uma folha em `OU=Presidencia` cai na subtree
+    /// larga da raiz mas NAO na do intermedio — e era aceite, porque bastava
+    /// QUALQUER subtree acumulada cobrir o nome.
+    #[test]
+    fn restricoes_aninhadas_sao_interseccao_e_nao_reuniao() {
+        let c = test_pki::cadeia_tres_niveis(test_pki::OpcoesRestricoes {
+            raiz_permite_dn: Some("O=ICP-Brasil".into()),
+            sub_permite_dn: Some("OU=Fiscal,O=ICP-Brasil".into()),
+            sub_dn: Some("CN=AC Intermedia,OU=Fiscal,O=ICP-Brasil".into()),
+            folha_dn: Some("CN=ACT Oficial,OU=Presidencia,O=ICP-Brasil".into()),
+            ..Default::default()
+        });
+        let (token, v) = token_e_verificador(&c, TimestampValidationPolicy::default());
+        let erro = v.verify(&token, &imprint(), None, AGORA_MS).unwrap_err();
+        assert!(
+            erro.to_string().contains("permittedSubtree"),
+            "a restricao do intermedio tem de recusar a folha fora dela: {erro}"
+        );
+    }
+
+    /// A variante pior: o intermedio ALARGA-se a si proprio para um espaco de
+    /// nomes que a raiz nunca autorizou. A folha cai na subtree acrescentada e
+    /// escapava a restricao da raiz por completo.
+    #[test]
+    fn um_intermedio_nao_alarga_o_que_a_raiz_lhe_permitiu() {
+        let c = test_pki::cadeia_tres_niveis(test_pki::OpcoesRestricoes {
+            raiz_permite_dn: Some("O=ICP-Brasil".into()),
+            sub_permite_dn: Some("O=Outra".into()),
+            sub_dn: Some("CN=AC Intermedia,O=ICP-Brasil".into()),
+            folha_dn: Some("CN=ACT,O=Outra".into()),
+            ..Default::default()
+        });
+        let (token, v) = token_e_verificador(&c, TimestampValidationPolicy::default());
+        let erro = v.verify(&token, &imprint(), None, AGORA_MS).unwrap_err();
+        assert!(erro.to_string().contains("permittedSubtree"), "{erro}");
+    }
+
+    /// E a metade positiva: uma folha dentro das DUAS subtrees passa. Sem isto,
+    /// uma implementacao que recusasse qualquer restricao aninhada passaria os
+    /// dois testes anteriores.
+    #[test]
+    fn restricoes_aninhadas_aceitam_o_nome_dentro_de_ambas() {
+        let c = test_pki::cadeia_tres_niveis(test_pki::OpcoesRestricoes {
+            raiz_permite_dn: Some("O=ICP-Brasil".into()),
+            sub_permite_dn: Some("OU=Fiscal,O=ICP-Brasil".into()),
+            sub_dn: Some("CN=AC Intermedia,OU=Fiscal,O=ICP-Brasil".into()),
+            folha_dn: Some("CN=ACT de Teste,OU=Fiscal,O=ICP-Brasil".into()),
+            ..Default::default()
+        });
+        let (token, v) = token_e_verificador(&c, TimestampValidationPolicy::default());
+        v.verify(&token, &imprint(), None, AGORA_MS)
+            .expect("uma folha dentro de ambas as subtrees tem de passar");
+    }
+
     /// §4.2.1.9 — uma raiz com `pathLenConstraint: 0` nao autoriza nenhum
     /// intermedio abaixo de si. O campo era descodificado e deitado fora.
     #[test]

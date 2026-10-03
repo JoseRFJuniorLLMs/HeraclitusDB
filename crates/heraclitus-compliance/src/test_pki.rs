@@ -671,6 +671,10 @@ pub struct OpcoesRestricoes {
     pub raiz_permite_dn: Option<String>,
     /// `excludedSubtrees` da RAIZ.
     pub raiz_exclui_dn: Option<String>,
+    /// `permittedSubtrees` do INTERMEDIO. Permite restricoes ANINHADAS (raiz e
+    /// intermedio restringidos), que e onde a interseccao entre ACs se prova
+    /// (auditoria recursiva 2026-10-03, iteracao 2).
+    pub sub_permite_dn: Option<String>,
     /// `pathLenConstraint` da AC intermedia.
     pub sub_path_len: Option<u8>,
     /// `pathLenConstraint` da raiz.
@@ -738,7 +742,7 @@ pub fn cadeia_tres_niveis(opcoes: OpcoesRestricoes) -> CadeiaTresNiveis {
     // --- intermedio -----------------------------------------------------
     let sub_key = chave(37);
     let sub_spki = SubjectPublicKeyInfoOwned::from_key(*sub_key.verifying_key()).expect("spki sub");
-    let sb = CertificateBuilder::new(
+    let mut sb = CertificateBuilder::new(
         Profile::SubCA {
             issuer: root.tbs_certificate.subject.clone(),
             path_len_constraint: opcoes.sub_path_len,
@@ -755,6 +759,13 @@ pub fn cadeia_tres_niveis(opcoes: OpcoesRestricoes) -> CadeiaTresNiveis {
         &root_key,
     )
     .expect("builder do intermedio");
+    if let Some(d) = opcoes.sub_permite_dn.as_deref() {
+        sb.add_extension(&NameConstraints {
+            permitted_subtrees: Some(vec![subtree(d)]),
+            excluded_subtrees: None,
+        })
+        .expect("nameConstraints do intermedio");
+    }
     let sub: Certificate = sb.build::<DerSignature>().expect("assinar intermedio");
 
     // --- folha ----------------------------------------------------------

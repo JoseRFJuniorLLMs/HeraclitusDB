@@ -252,7 +252,17 @@ pub fn verificar_criticas(cert: &Certificate, policy: &RestricoesPolicy) -> Resu
 /// As restrições que uma AC impõe a tudo o que emite.
 #[derive(Debug, Clone, Default)]
 pub struct Restricoes {
-    permitidos: Vec<GeneralSubtree>,
+    /// Um conjunto de `permittedSubtrees` POR AC, e não uma lista achatada.
+    ///
+    /// Auditoria recursiva 2026-10-03, iteração 2: a lista era achatada e a
+    /// verificação aceitava o nome se QUALQUER subtree acumulada o cobrisse —
+    /// uma reunião entre ACs, e não a intersecção da RFC 5280 §6.1.4(g). Uma AC
+    /// restringida pelo emissor a `OU=Fiscal,O=Org` emitia para
+    /// `OU=Presidencia,O=Org` porque a subtree mais larga da raiz (`O=Org`)
+    /// cobria o nome; e uma sub-AC podia acrescentar `O=Outra` às suas próprias
+    /// restrições e escapar à raiz por completo. A reunião só é correcta DENTRO
+    /// das subtrees de um mesmo certificado.
+    permitidos: Vec<Vec<GeneralSubtree>>,
     excluidos: Vec<GeneralSubtree>,
 }
 
@@ -276,10 +286,13 @@ impl Restricoes {
             ))
         })?;
         // A intersecção é acumulativa: uma AC nunca pode ALARGAR o que o seu
-        // emissor lhe permitiu. Juntar os conjuntos e exigir que o nome satisfaça
-        // todos é exactamente a intersecção.
+        // emissor lhe permitiu. Por isso cada AC guarda o SEU conjunto e
+        // `verificar` exige que o nome satisfaça cada um deles (intersecção);
+        // juntar tudo numa lista só daria a reunião.
         if let Some(p) = nc.permitted_subtrees {
-            self.permitidos.extend(p);
+            if !p.is_empty() {
+                self.permitidos.push(p);
+            }
         }
         if let Some(x) = nc.excluded_subtrees {
             self.excluidos.extend(x);
@@ -319,27 +332,33 @@ impl Restricoes {
             // há regra nenhuma para o tipo deste nome, o nome não é restringido —
             // é o que diz §4.2.1.10, e o contrário recusaria tudo o que uma AC
             // restringisse apenas por DNS.
-            let mesmo_tipo: Vec<&GeneralSubtree> = self
-                .permitidos
-                .iter()
-                .filter(|s| mesmo_tipo(&s.base, nome))
-                .collect();
-            if mesmo_tipo.is_empty() {
-                continue;
-            }
-            let mut algum = false;
-            for sub in mesmo_tipo {
-                if bate(&sub.base, nome)? {
-                    algum = true;
-                    break;
+            //
+            // Intersecção entre ACs (§6.1.4(g)): o nome tem de cair em pelo
+            // menos uma subtree de CADA AC que tenha regra para o seu tipo.
+            // Dentro de um mesmo certificado, as subtrees somam-se (reunião).
+            for conjunto in &self.permitidos {
+                let mesmo_tipo: Vec<&GeneralSubtree> = conjunto
+                    .iter()
+                    .filter(|s| mesmo_tipo(&s.base, nome))
+                    .collect();
+                if mesmo_tipo.is_empty() {
+                    continue;
                 }
-            }
-            if !algum {
-                return Err(erro(format!(
-                    "nameConstraints: o nome de `{}` não cai em nenhuma permittedSubtree do \
-                     emissor — a AC que o emitiu não estava autorizada a emitir para este nome",
-                    cert.tbs_certificate.subject
-                )));
+                let mut algum = false;
+                for sub in mesmo_tipo {
+                    if bate(&sub.base, nome)? {
+                        algum = true;
+                        break;
+                    }
+                }
+                if !algum {
+                    return Err(erro(format!(
+                        "nameConstraints: o nome de `{}` não cai em nenhuma permittedSubtree de \
+                         uma das ACs do caminho — a AC que o emitiu não estava autorizada a \
+                         emitir para este nome",
+                        cert.tbs_certificate.subject
+                    )));
+                }
             }
         }
         Ok(())
