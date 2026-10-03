@@ -2033,9 +2033,34 @@ impl Log {
         // mensagem de erro serem reproduzíveis entre corridas.
         let scans = self.varrer_para_verificacao(&paths)?;
 
-        for (path, scan) in paths.iter().zip(scans) {
+        let n_selados_no_catalogo = catalog.sealed.len();
+        for (i, (path, scan)) in paths.iter().zip(scans).enumerate() {
             report.segments += 1;
             report.records += scan.locs.len() as u64;
+            // O catálogo é a autoridade sobre QUAIS segmentos estão selados: um
+            // selado no catálogo já tem rodapé escrito e sincronizado. Se a
+            // re-varredura não chega ao rodapé (registo com CRC violado, magic
+            // do rodapé sobrescrito) ou o rodapé não bate com os registos,
+            // `scan.sealed` fica falso / `corruption_detected` verdadeiro — e
+            // antes o segmento caía silenciosamente para "não selado", saindo
+            // de `sealed` E de `merkle_ok` ao mesmo tempo. Resultado: `verify`
+            // devolvia `Ok` e o `/verify` do servidor respondia `"ok": true`
+            // com bit rot ou adulteração num selado, enquanto `verify_segment`
+            // (que já testa `corruption_detected`) dizia `valid: false`.
+            // O ativo continua de fora: pode estar a receber escritas em
+            // paralelo e uma cauda a meio não é corrupção (auditoria recursiva
+            // 2026-10-03, iteração 1).
+            let selado_no_catalogo = i < n_selados_no_catalogo;
+            if (selado_no_catalogo || scan.sealed) && (scan.corruption_detected || !scan.sealed) {
+                return Err(HeraclitusError::Corruption {
+                    context: format!("{}", path.display()),
+                    detail: format!(
+                        "segmento selado ilegível na re-varredura (offset {} de {} bytes; \
+                         CRC violado ou rodapé danificado) — bit rot ou adulteração",
+                        scan.valid_len, scan.file_len
+                    ),
+                });
+            }
             if scan.sealed {
                 report.sealed += 1;
                 let root = merkle_root(&scan.record_hashes);
