@@ -1595,6 +1595,105 @@ mod tests {
         assert!(ids(&vazio).is_empty(), "estado vazio: {vazio}");
     }
 
+    /// Fixture comum aos testes de idempotência do DECIDE: estrela H (LSN
+    /// 0..3, dispara `flag_anomaly:H`) e aresta de fraude X->Y (LSN 4).
+    fn decide_fixture() -> (tempfile::TempDir, LogBackend) {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
+        let edge = |from: &str, to: &str, etype: &str, conf: &str| {
+            let mut e = Episode::new("ag", EventKind::Observation, vec![]);
+            e.attrs.insert("edge_from".into(), from.into());
+            e.attrs.insert("edge_to".into(), to.into());
+            e.attrs.insert("edge_type".into(), etype.into());
+            e.attrs.insert("confidence".into(), conf.into());
+            e
+        };
+        for leaf in ["L1", "L2", "L3", "L4"] {
+            log.append(edge("H", leaf, "socio_de", "1.0")).unwrap();
+        }
+        log.append(edge("X", "Y", "fraud_partner", "0.9")).unwrap();
+        (dir, LogBackend::new(log))
+    }
+
+    /// Conta os eventos Action no log com o `action_id` dado.
+    fn contar_acoes(be: &LogBackend, action_id: &str) -> usize {
+        execute("MATCH (n:Action) RETURN n", be)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row.to_string().contains(&format!("\"{action_id}\"")))
+            .count()
+    }
+
+    #[test]
+    fn decide_as_of_e_idempotente() {
+        // Auditoria recursiva 2026-10-03, iteração 2: o conjunto de
+        // idempotência era construído só com `[0, k)`, mas as acções são
+        // anexadas à cabeça (>= k). Repetir `DECIDE () AS OF LSN k` anexava
+        // os mesmos `action_id` de novo, a cada execução.
+        let (_dir, be) = decide_fixture();
+
+        let v1 = execute("DECIDE () AS OF LSN 4", &be).unwrap();
+        assert_eq!(v1["fired"].as_array().unwrap().len(), 1, "{v1}");
+        assert_eq!(contar_acoes(&be, "flag_anomaly:H"), 1);
+
+        // Repetir o MESMO AS OF: nada novo, tudo saltado.
+        let v2 = execute("DECIDE () AS OF LSN 4", &be).unwrap();
+        assert!(
+            v2["fired"].as_array().unwrap().is_empty(),
+            "duplicado: {v2}"
+        );
+        assert_eq!(v2["skipped"].as_array().unwrap().len(), 1, "{v2}");
+        assert_eq!(contar_acoes(&be, "flag_anomaly:H"), 1);
+
+        // AS OF posterior: só a fraude é nova; a anomalia (anexada no LSN 5,
+        // fora de [0, 5)) continua a contar como já disparada.
+        let v3 = execute("DECIDE () AS OF LSN 5", &be).unwrap();
+        let fired: Vec<&str> = v3["fired"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["action_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(fired, vec!["flag_fraud:X->Y"], "{v3}");
+        assert_eq!(contar_acoes(&be, "flag_anomaly:H"), 1);
+
+        // Um `DECIDE ()` à cabeça seguido de um AS OF no passado também não
+        // re-dispara as acções da cabeça.
+        let (_dir2, be2) = decide_fixture();
+        execute("DECIDE ()", &be2).unwrap();
+        let v4 = execute("DECIDE () AS OF LSN 4", &be2).unwrap();
+        assert!(
+            v4["fired"].as_array().unwrap().is_empty(),
+            "duplicado: {v4}"
+        );
+        assert_eq!(contar_acoes(&be2, "flag_anomaly:H"), 1);
+        assert_eq!(contar_acoes(&be2, "flag_fraud:X->Y"), 1);
+    }
+
+    #[test]
+    fn decide_concorrente_nao_duplica_acoes() {
+        // Auditoria recursiva 2026-10-03, iteração 2: sem lock na janela
+        // varrimento → anexação, DECIDEs concorrentes viam o mesmo `existing`
+        // e anexavam todos as mesmas acções. Várias rondas para dar ao
+        // escalonador hipóteses de entrelaçar as threads.
+        for _ in 0..10 {
+            let (_dir, be) = decide_fixture();
+            let barreira = std::sync::Barrier::new(8);
+            std::thread::scope(|s| {
+                for _ in 0..8 {
+                    s.spawn(|| {
+                        barreira.wait();
+                        execute("DECIDE ()", &be).unwrap();
+                    });
+                }
+            });
+            assert_eq!(contar_acoes(&be, "flag_anomaly:H"), 1);
+            assert_eq!(contar_acoes(&be, "flag_fraud:X->Y"), 1);
+        }
+    }
+
     #[test]
     fn graph_analytics_via_gql() {
         // M14: two fraud rings; COMMUNITY/METRICS detect and score them.

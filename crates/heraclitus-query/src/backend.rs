@@ -513,6 +513,13 @@ struct AttributeIndex {
 // M29: TRAIT DE CONSULTA UNIFICADO COM RESOLUÇÃO DINÂMICA DE SENTINELAS
 // =========================================================================
 
+/// Serializa a janela varrimento → anexação do `DECIDE` (auditoria recursiva
+/// 2026-10-03, iteração 2). É global ao processo porque `decide` é um método
+/// por omissão do trait, sem estado próprio onde guardar um lock por backend;
+/// o custo é serializar DECIDEs de backends distintos, raros e curtos face ao
+/// dano de duplicar acções num log append-only.
+static DECIDE_LOCK: Mutex<()> = Mutex::new(());
+
 pub trait QueryBackend {
     fn scan(&self, as_of: Option<Lsn>) -> Result<Vec<(Lsn, Episode)>, HeraclitusError>;
     fn scan_range(&self, from: Lsn, to: Lsn) -> Result<Vec<(Lsn, Episode)>, HeraclitusError>;
@@ -733,8 +740,6 @@ pub trait QueryBackend {
         policy: DecisionPolicy,
         as_of: Option<Lsn>,
     ) -> Result<DecisionReport, HeraclitusError> {
-        let bound = self.resolve_as_of_bound(as_of)?;
-
         // Auditoria 2026-09-05 (A33): o grafo vem de `graph()` e NÃO de um
         // replay de `scan_range`. Dentro de `SIMULATE ... THEN DECIDE`, `self`
         // é o `VirtualBackend`, cujo `scan_range` delega no log REAL (só
@@ -752,12 +757,28 @@ pub trait QueryBackend {
         // `as_of` de `decision::evaluate` (`alive_at`/`aggregate_as_of`), com a
         // MESMA convenção de fronteira exclusiva de todas as outras leituras
         // (`as_of_point`): `AS OF LSN k` observa os LSN `[0, k)`. O
-        // `scan_range(0, bound)` fica APENAS para o conjunto de idempotência,
-        // que é semântica de log e não de grafo.
+        // `scan_range` fica APENAS para o conjunto de idempotência, que é
+        // semântica de log e não de grafo.
+        //
+        // Auditoria recursiva 2026-10-03, iteração 2: o conjunto de
+        // idempotência varre o log INTEIRO (`[0, head)`) e não `[0, bound)`.
+        // As acções são sempre anexadas à cabeça (LSN >= head >= bound), logo
+        // um `DECIDE () AS OF LSN k` nunca via as acções que ele próprio (ou
+        // um `DECIDE ()` anterior) já tinha disparado: cada repetição anexava
+        // de novo os mesmos `action_id` — duplicados permanentes num log
+        // append-only, e tudo o que reage a eventos Action disparava N vezes.
+        // O AS OF limita o que se AVALIA (o grafo, via `as_of_point`), não o
+        // que já foi FEITO: uma acção é um evento único no log, seja qual for
+        // o ponto temporal de onde disparou. Pela mesma razão, a janela
+        // varrimento → anexação fica sob `DECIDE_LOCK`: sem ele, dois
+        // `DECIDE ()` concorrentes (o gRPC corre cada um no seu
+        // `spawn_blocking`) viam o mesmo `existing` e anexavam ambos todas as
+        // acções novas.
+        let _guard = DECIDE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let g = self.graph()?;
         let mut existing = BTreeSet::new();
 
-        let snapshot_events = self.scan_range(0, bound)?;
+        let snapshot_events = self.scan_range(0, self.head()?)?;
         for (_, e) in snapshot_events {
             if e.kind == EventKind::Action {
                 if let Some(act_id) = e.attrs.get("action_id") {
