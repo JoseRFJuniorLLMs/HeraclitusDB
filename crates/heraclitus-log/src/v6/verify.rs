@@ -21,7 +21,7 @@ use super::header::PhysicalLayout;
 use super::merkle::{build_inclusion_proof, InclusionProof, MerkleAccumulatorV1};
 use super::packed::{open_packed, BlockSource, PackedSegmentReader, ScanCounters};
 use super::packer::CanonicalHasher;
-use super::raw::{scan_raw_segment, RawScan};
+use super::raw::{footer_no_eof_alem_do_rasgo, scan_raw_segment, RawScan};
 use super::receipts::{attestation_for, AttestationEnvelopeV1};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -106,10 +106,28 @@ fn verify_raw(
         torn_at,
     } = scan_raw_segment(path)?;
     let mut notes = Vec::new();
+    // Auditoria recursiva 2026-10-03, iteração 1: um bit rodado no registo k
+    // de um RAW SELADO faz a varredura parar em k (`torn_at`) sem nunca chegar
+    // ao footer que continua válido no EOF. Sem esta verificação o relatório
+    // chamava-lhe "cauda activa" e devolvia `physical_ok = true` — o
+    // `heraclitus verify` (nível Physical) dava "passed" e saía com 0 num
+    // segmento adulterado cujos registos depois de k nunca foram lidos. É o
+    // mesmo predicado que `repair_active_tail` usa para recusar truncar.
+    let selado_com_registo_corrompido = match torn_at {
+        Some(at) => footer_no_eof_alem_do_rasgo(path, at)?,
+        None => false,
+    };
     let footer = match footer {
         Some(f) => f,
         None => {
-            notes.push("segment is not sealed (active tail)".into());
+            if selado_com_registo_corrompido {
+                notes.push(format!(
+                    "sealed segment has a corrupt record at offset {};                      the records after it and the footer were not verified",
+                    torn_at.unwrap_or(0)
+                ));
+            } else {
+                notes.push("segment is not sealed (active tail)".into());
+            }
             FooterV6 {
                 record_count: records.len() as u64,
                 min_lsn: records.first().map(|r| r.lsn).unwrap_or(0),
@@ -124,7 +142,7 @@ fn verify_raw(
             }
         }
     };
-    if let Some(at) = torn_at {
+    if let (Some(at), false) = (torn_at, selado_com_registo_corrompido) {
         notes.push(format!("torn tail at offset {at}"));
     }
 
@@ -138,7 +156,7 @@ fn verify_raw(
         block_count: 0,
         declared_root: footer.logical_root,
         recomputed_root: None,
-        physical_ok: true,
+        physical_ok: !selado_com_registo_corrompido,
         logical_ok: None,
         counters: ScanCounters::default(),
         notes,
@@ -523,6 +541,67 @@ mod tests {
         let r = verify_segment(&packed, IntegrityLevel::Physical, 1 << 26, None).unwrap();
         assert!(!r.physical_ok);
         assert!(!r.notes.is_empty());
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 1: um registo corrompido a
+    /// meio de um RAW selado não pode passar por "cauda activa que acaba
+    /// cedo". Antes, Fast e Physical davam `is_ok()` porque a varredura parava
+    /// no registo estragado e nunca via o footer válido no EOF.
+    #[test]
+    fn raw_selado_com_registo_corrompido_a_meio_falha_a_verificacao_fisica() {
+        let d = dir_teste("raw-selado-corrompido");
+        let raw = d.join("s.hrkl");
+        escreve_raw(&raw, 50);
+
+        let mut bytes = std::fs::read(&raw).unwrap();
+        let meio = bytes.len() / 2;
+        bytes[meio] ^= 0xff;
+        std::fs::write(&raw, &bytes).unwrap();
+
+        for nivel in [IntegrityLevel::Fast, IntegrityLevel::Physical] {
+            let r = verify_segment(&raw, nivel, 1 << 26, None).unwrap();
+            assert!(!r.physical_ok, "{nivel:?}: {:?}", r.notes);
+            assert!(!r.is_ok());
+            assert!(r.record_count < 50);
+            assert!(
+                r.notes.iter().any(|n| n.contains("sealed segment")),
+                "{:?}",
+                r.notes
+            );
+            assert!(!r.notes.iter().any(|n| n.contains("active tail")));
+        }
+    }
+
+    /// Contraprova: uma cauda activa genuinamente rasgada (sem footer) continua
+    /// a ser fisicamente válida até ao rasgo — o rasgo é esperado (§123).
+    #[test]
+    fn cauda_activa_rasgada_continua_fisicamente_valida() {
+        let d = dir_teste("cauda-rasgada");
+        let raw = d.join("s.active.hrkl");
+        let init = SegmentInit {
+            segment_id: 5,
+            created_hlc: 1,
+            first_lsn: 500,
+            writer_epoch: 1,
+            storage_namespace_id: [0x9A; 16],
+        };
+        let mut w = RawSegmentWriter::create(&raw, init).unwrap();
+        for i in 0..20u64 {
+            let p = format!("registo {i} com conteudo").into_bytes();
+            w.append(500 + i, 10 + i, &p, &hasher(500 + i, 10 + i, &p).unwrap())
+                .unwrap();
+        }
+        w.sync().unwrap();
+        drop(w);
+        let mut bytes = std::fs::read(&raw).unwrap();
+        bytes.extend_from_slice(&[0x5Au8; 300]);
+        std::fs::write(&raw, &bytes).unwrap();
+
+        let r = verify_segment(&raw, IntegrityLevel::Physical, 1 << 26, None).unwrap();
+        assert!(r.is_ok(), "{:?}", r.notes);
+        assert_eq!(r.record_count, 20);
+        assert!(r.notes.iter().any(|n| n.contains("active tail")));
+        assert!(r.notes.iter().any(|n| n.contains("torn tail")));
     }
 
     #[test]

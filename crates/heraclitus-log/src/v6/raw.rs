@@ -932,11 +932,7 @@ pub fn repair_active_tail(path: &Path) -> V6Result<Option<u64>> {
     // nada. Checá-lo distingue uma cauda de footer parcial (não selada,
     // portanto recuperável) de corrupção interna num segmento selado (falha
     // dura).
-    let len = std::fs::metadata(path)?.len();
-    let footer_cabe_depois_do_rasgo = len
-        .checked_sub(FOOTER_LEN as u64)
-        .is_some_and(|inicio| inicio >= at);
-    if footer_cabe_depois_do_rasgo && (read_footer(path)?.is_some() || footer_magic_at_eof(path)?) {
+    if footer_no_eof_alem_do_rasgo(path, at)? {
         return Err(corrupt(
             "hrkl v6 raw recovery",
             "refusing to truncate a sealed segment; this is hard corruption",
@@ -946,6 +942,21 @@ pub fn repair_active_tail(path: &Path) -> V6Result<Option<u64>> {
     file.set_len(at)?;
     file.sync_all()?;
     Ok(Some(at))
+}
+
+/// `true` se o EOF de um RAW cuja varredura rasgou em `at` mostra um footer
+/// (válido, ou com magic e CRC partido) que começa em `>= at` — ou seja, se o
+/// ficheiro está selado e o "rasgo" é corrupção interna, não cauda activa.
+///
+/// Partilhado por [`repair_active_tail`] e pelo `verify` (auditoria recursiva
+/// 2026-10-03, iteração 1): o `verify` tratava este caso como cauda activa e
+/// reportava `physical_ok` num segmento selado com um registo corrompido.
+pub(super) fn footer_no_eof_alem_do_rasgo(path: &Path, at: u64) -> V6Result<bool> {
+    let len = std::fs::metadata(path)?.len();
+    let footer_cabe_depois_do_rasgo = len
+        .checked_sub(FOOTER_LEN as u64)
+        .is_some_and(|inicio| inicio >= at);
+    Ok(footer_cabe_depois_do_rasgo && (read_footer(path)?.is_some() || footer_magic_at_eof(path)?))
 }
 
 /// O footer que **sela** de facto um segmento RAW: válido no EOF *e* alcançado
