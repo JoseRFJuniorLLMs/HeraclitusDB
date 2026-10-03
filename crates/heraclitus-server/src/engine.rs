@@ -2753,7 +2753,7 @@ impl Engine {
             let lsn = self.append(episode)?;
             return Ok((lsn, false, id));
         }
-        self.append_idempotent_validated(episode, key)
+        self.append_idempotent_validated(episode, key, false)
     }
 
     /// O shard que serializa esta chave. Chaves diferentes que caiam no mesmo
@@ -2780,10 +2780,13 @@ impl Engine {
         &self.case_locks[indice]
     }
 
+    /// `aceita_indice_parcial`: `true` SÓ para o Sentinel interno — ver
+    /// `append_sentinel_derived` (auditoria recursiva 2026-10-03, iteração 2).
     fn append_idempotent_validated(
         &self,
         mut episode: Episode,
         key: &str,
+        aceita_indice_parcial: bool,
     ) -> Result<(Lsn, bool, String), HeraclitusError> {
         if self.log_only {
             return Err(HeraclitusError::Config(
@@ -2799,7 +2802,7 @@ impl Engine {
         // sempre. Varrer o buraco a cada pedido não escala no modo que existe
         // precisamente para bases grandes demais; recusar é a resposta honesta
         // (o cliente repete depois de um arranque normal).
-        if self.attr_incompleto() {
+        if !aceita_indice_parcial && self.attr_incompleto() {
             return Err(HeraclitusError::Config(IDEMPOTENCIA_SEM_INDICE.into()));
         }
         if key.len() > 80
@@ -2944,7 +2947,17 @@ impl Engine {
                 "append_sentinel_derived exige episódio derivado válido do Sentinel".into(),
             ));
         }
-        self.append_idempotent_validated(episode, idempotency_key)
+        // Auditoria recursiva 2026-10-03, iteração 2: a recusa da iteração 1
+        // (índice de atributos com buraco → sem append idempotente) apanhava
+        // também este caminho, e sob HERACLITUS_SKIP_VIEW_REPLAY o Sentinel
+        // inteiro parava — o `worker_loop` repetia o mesmo LSN para sempre,
+        // sem SecurityEvent, sinal, incidente, acção L4 nem checkpoint. Para o
+        // Sentinel a recusa não compra nada: ele deduplica pelo seu próprio
+        // estado, reconstruído do LOG no arranque (`passagem_de_ids`), não pelo
+        // índice; e a regra dele é que perder uma observação é pior do que
+        // emiti-la duas vezes. O índice continua a apanhar as chaves fora do
+        // buraco e as desta sessão. O LOG_ONLY continua recusado, como antes.
+        self.append_idempotent_validated(episode, idempotency_key, true)
             .map(|(lsn, _, _)| lsn)
     }
 
