@@ -2127,16 +2127,28 @@ impl Engine {
     /// **Ressalva:** é uma procura por menção no texto registado, não um
     /// índice de "acessos a este titular". Uma consulta que devolva dados dele
     /// sem o nomear não aparece. É o que a informação atual permite afirmar.
+    ///
+    /// Devolve as `limite` menções MAIS RECENTES, com `total` (todas as que
+    /// existem) e `truncado` (se ficaram mais antigas de fora).
     pub fn titular_acessos(&self, agent_id: &str, limite: usize) -> serde_json::Value {
         let head = self.log.head();
-        let mut achados = Vec::new();
+        // Auditoria recursiva 2026-10-03, iteração 1: a varredura parava nas
+        // `limite` PRIMEIRAS menções (as mais antigas) e respondia sem marca
+        // de corte. A própria meta-auditoria REST (cada GET /titular/X fica no
+        // log com X no texto) enchia esse teto, e os acessos mais recentes —
+        // os que interessam, p.ex. o de um intruso — desapareciam do
+        // relatório. Agora varre-se o log inteiro, guardam-se as `limite`
+        // MAIS RECENTES (por ordem de LSN) e o total e o corte saem no JSON.
+        let mut achados: std::collections::VecDeque<serde_json::Value> =
+            std::collections::VecDeque::new();
+        let mut total = 0usize;
         let mut cur = 0u64;
         // Um erro de leitura NÃO pode virar uma lista curta com aspecto de
         // completa (revisão de 2026-10-03, terceira ronda): é o relatório de
         // acessos de um titular (LGPD art. 18). O erro sai no JSON e o REST
         // responde com erro em vez de 200.
         let mut erro: Option<String> = None;
-        while cur < head && achados.len() < limite {
+        while cur < head {
             let lote = match self.log.scan_capped(cur, head, 20_000) {
                 Ok(l) => l,
                 Err(e) => {
@@ -2157,7 +2169,14 @@ impl Engine {
                 if !texto.contains(agent_id) && !operacao.contains(agent_id) {
                     continue;
                 }
-                achados.push(serde_json::json!({
+                total += 1;
+                if limite == 0 {
+                    continue;
+                }
+                if achados.len() >= limite {
+                    achados.pop_front();
+                }
+                achados.push_back(serde_json::json!({
                     "lsn": lsn,
                     "t_ms": ep.ts_hlc >> 16,
                     "tipo": ep.attrs.get("audit").cloned().unwrap_or_default(),
@@ -2165,17 +2184,26 @@ impl Engine {
                     "operacao": operacao,
                     "ok": ep.attrs.get("ok").cloned().unwrap_or_default(),
                 }));
-                if achados.len() >= limite {
-                    break;
-                }
             }
             cur = ultimo + 1;
         }
+        let achados: Vec<serde_json::Value> = achados.into();
+        // `truncado: true` = há `total - acessos.len()` menções MAIS ANTIGAS
+        // fora da resposta; as listadas são as mais recentes. Quem recebe o
+        // relatório tem de poder distinguir uma lista cortada de uma completa.
+        let truncado = total > achados.len();
         match erro {
-            None => serde_json::json!({ "titular": agent_id, "acessos": achados }),
+            None => serde_json::json!({
+                "titular": agent_id,
+                "acessos": achados,
+                "total": total,
+                "truncado": truncado,
+            }),
             Some(erro) => serde_json::json!({
                 "titular": agent_id,
                 "acessos": achados,
+                "total": total,
+                "truncado": truncado,
                 "completo": false,
                 "error": erro,
             }),
@@ -3995,6 +4023,45 @@ mod tests {
             ..Default::default()
         };
         Engine::open(&cfg).unwrap()
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 1: `titular_acessos` parava
+    /// nas `limite` menções MAIS ANTIGAS e respondia sem marca de corte — as
+    /// consultas de rotina enchiam o teto e o acesso posterior de um intruso
+    /// nunca aparecia no relatório LGPD art. 18.
+    #[test]
+    fn acessos_do_titular_mostram_os_mais_recentes_e_marcam_o_corte() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            audit_queries: true,
+            ..Default::default()
+        };
+        let engine = Engine::open(&cfg).unwrap();
+        for _ in 0..5 {
+            engine.audit_query("REST GET /titular/maria-x", true, "auditora");
+        }
+        engine.audit_query("REST GET /titular/maria-x", true, "intruso");
+
+        let r = engine.titular_acessos("maria-x", 3);
+        let lista = r["acessos"].as_array().unwrap();
+        assert_eq!(lista.len(), 3, "{r}");
+        assert_eq!(
+            lista.last().unwrap()["principal"],
+            "intruso",
+            "o acesso mais recente tem de constar: {r}"
+        );
+        assert_eq!(r["total"], 6, "{r}");
+        assert_eq!(r["truncado"], true, "o corte tem de ser explícito: {r}");
+        // Ordem por LSN preservada dentro da janela.
+        let lsns: Vec<u64> = lista.iter().map(|a| a["lsn"].as_u64().unwrap()).collect();
+        assert!(lsns.windows(2).all(|w| w[0] < w[1]), "{r}");
+
+        // Sem corte: lista completa e `truncado: false`.
+        let r = engine.titular_acessos("maria-x", 100);
+        assert_eq!(r["acessos"].as_array().unwrap().len(), 6, "{r}");
+        assert_eq!(r["truncado"], false, "{r}");
     }
 
     #[test]
