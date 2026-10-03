@@ -450,6 +450,18 @@ impl ViewRegistry {
             // as ferramentas lêem), e é reescrito a partir da verdade logo
             // abaixo.
             let do_snapshot = v.watermark();
+            // Auditoria recursiva, iteração 3: snapshots legados usam zero
+            // tanto para uma view vazia como para uma que já aplicou LSN 0.
+            // Reiniciar antes do replay evita que views não idempotentes
+            // acumulem esse evento em cada arranque.
+            if do_snapshot == 0 {
+                v.reset();
+                self.watermarks_vec[i] = 0;
+                self.watermarks.remove(&self.names[i]);
+                self.checkpoint_watermarks[i] = None;
+                self.dirty[i] = true;
+                continue;
+            }
             let do_json = self.watermarks.get(&self.names[i]).copied().unwrap_or(0);
             if do_json != do_snapshot {
                 tracing::warn!(
@@ -818,6 +830,55 @@ mod tests {
             *self.state.lock().unwrap() = (0, 0);
             self.wm = 0;
         }
+    }
+
+    #[test]
+    fn restored_zero_watermark_does_not_accumulate_on_repeated_boots() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = heraclitus_log::Log::open(dir.path().join("log"), 1 << 20, FsyncPolicy::Always)
+            .unwrap();
+        assert_eq!(
+            log.append(Episode::new("a", EventKind::Observation, vec![]))
+                .unwrap(),
+            0
+        );
+        for _ in 0..4 {
+            let state = Arc::new(Mutex::new((0, 0)));
+            let mut registry = ViewRegistry::open(dir.path()).unwrap();
+            registry.register(Box::new(SnapshotView {
+                state: state.clone(),
+                wm: 0,
+            }));
+            registry.catch_up(&log).unwrap();
+            assert_eq!(*state.lock().unwrap(), (1, 0));
+            registry.checkpoint().unwrap();
+        }
+    }
+
+    #[test]
+    fn empty_checkpoint_still_receives_first_lsn_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = heraclitus_log::Log::open(dir.path().join("log"), 1 << 20, FsyncPolicy::Always)
+            .unwrap();
+        let mut empty = ViewRegistry::open(dir.path()).unwrap();
+        empty.register(Box::new(SnapshotView {
+            state: Arc::new(Mutex::new((0, 0))),
+            wm: 0,
+        }));
+        empty.checkpoint().unwrap();
+        assert_eq!(
+            log.append(Episode::new("a", EventKind::Observation, vec![]))
+                .unwrap(),
+            0
+        );
+        let state = Arc::new(Mutex::new((0, 0)));
+        let mut restored = ViewRegistry::open(dir.path()).unwrap();
+        restored.register(Box::new(SnapshotView {
+            state: state.clone(),
+            wm: 0,
+        }));
+        restored.catch_up(&log).unwrap();
+        assert_eq!(*state.lock().unwrap(), (1, 0));
     }
 
     #[test]
