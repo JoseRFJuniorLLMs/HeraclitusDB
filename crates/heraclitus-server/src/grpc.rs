@@ -33,6 +33,21 @@ fn internal(e: impl std::fmt::Display) -> Status {
     Status::internal(e.to_string())
 }
 
+/// Erro do `append_idempotent` -> estado gRPC (o mesmo para `Append` e
+/// `AppendBatch`).
+fn status_do_append(e: heraclitus_core::HeraclitusError) -> Status {
+    match e {
+        heraclitus_core::HeraclitusError::IdempotencyConflict { .. } => {
+            Status::already_exists(e.to_string())
+        }
+        heraclitus_core::HeraclitusError::Query(_) => Status::invalid_argument(e.to_string()),
+        _ => internal(e),
+    }
+}
+
+/// Itens por `AppendBatch` (o lote inteiro continua sob `MAX_REQUEST_BYTES`).
+pub const MAX_BATCH_ITEMS: usize = 1000;
+
 /// Tecto de um PEDIDO gRPC (descodificação). Ver o comentário em
 /// `lib.rs::serve`.
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -74,14 +89,16 @@ fn episode_json(lsn: u64, e: &Episode) -> String {
     .to_string()
 }
 
-#[tonic::async_trait]
-impl pb::heraclitus_server::Heraclitus for Service {
-    async fn append(
+impl Service {
+    /// Valida um `AppendRequest` e constrói o `Episode` — a MESMA regra para
+    /// o `Append` e para cada item do `AppendBatch`, para as duas portas nunca
+    /// divergirem no que aceitam.
+    #[allow(clippy::result_large_err)]
+    fn episodio_do_pedido(
         &self,
-        req: Request<pb::AppendRequest>,
-    ) -> Result<Response<pb::AppendResponse>, Status> {
-        let principal = crate::auth::require(&req, AccessRole::Writer)?;
-        let r = req.into_inner();
+        r: pb::AppendRequest,
+        principal: &str,
+    ) -> Result<(Episode, String), Status> {
         let idempotency_key = r.idempotency_key.clone();
         let kind = match r.kind.as_str() {
             "" | "Observation" => EventKind::Observation,
@@ -146,7 +163,7 @@ impl pb::heraclitus_server::Heraclitus for Service {
         e.attrs = r.attrs.into_iter().collect();
         e.attrs.insert(
             "__heraclitus_authenticated_principal".into(),
-            principal.name,
+            principal.to_owned(),
         );
         for p in r.parents {
             e.parents.push(
@@ -154,6 +171,18 @@ impl pb::heraclitus_server::Heraclitus for Service {
                     .map_err(|_| Status::invalid_argument("bad parent ULID"))?,
             );
         }
+        Ok((e, idempotency_key))
+    }
+}
+
+#[tonic::async_trait]
+impl pb::heraclitus_server::Heraclitus for Service {
+    async fn append(
+        &self,
+        req: Request<pb::AppendRequest>,
+    ) -> Result<Response<pb::AppendResponse>, Status> {
+        let principal = crate::auth::require(&req, AccessRole::Writer)?;
+        let (e, idempotency_key) = self.episodio_do_pedido(req.into_inner(), &principal.name)?;
         // `append` BLOQUEIA (fsync do log e, com replicação, o commit por quórum
         // do raft). Correr isso num worker assíncrono estagnaria o reactor sob
         // escrita concorrente — daí `spawn_blocking`, o padrão correto para uma
@@ -163,20 +192,73 @@ impl pb::heraclitus_server::Heraclitus for Service {
             tokio::task::spawn_blocking(move || engine.append_idempotent(e, &idempotency_key))
                 .await
                 .map_err(internal)?
-                .map_err(|e| match e {
-                    heraclitus_core::HeraclitusError::IdempotencyConflict { .. } => {
-                        Status::already_exists(e.to_string())
-                    }
-                    heraclitus_core::HeraclitusError::Query(_) => {
-                        Status::invalid_argument(e.to_string())
-                    }
-                    _ => internal(e),
-                })?;
+                .map_err(status_do_append)?;
         Ok(Response::new(pb::AppendResponse {
             lsn: result.0,
             deduplicated: result.1,
             event_id: result.2,
         }))
+    }
+
+    /// Vários appends numa só ida e volta (otimizacao-20m §3.6, conferido em
+    /// 2026-10-02): o RPC era só unário, com um `spawn_blocking` por evento,
+    /// e um produtor com milhares de eventos pagava uma ida e volta de rede e
+    /// uma tarefa por cada um.
+    ///
+    /// TODOS os itens são validados antes de se escrever o primeiro (um item
+    /// inválido não deixa metade do lote gravado). A escrita não é atómica:
+    /// por ordem, e a primeira falha pára o lote com o número de itens já
+    /// gravados na mensagem — com `idempotency_key` por item, repetir o lote
+    /// inteiro é seguro.
+    async fn append_batch(
+        &self,
+        req: Request<pb::AppendBatchRequest>,
+    ) -> Result<Response<pb::AppendBatchResponse>, Status> {
+        let principal = crate::auth::require(&req, AccessRole::Writer)?;
+        let items = req.into_inner().items;
+        if items.len() > MAX_BATCH_ITEMS {
+            return Err(Status::invalid_argument(format!(
+                "lote com {} itens excede o tecto de {MAX_BATCH_ITEMS}",
+                items.len()
+            )));
+        }
+        let mut episodios = Vec::with_capacity(items.len());
+        for (i, item) in items.into_iter().enumerate() {
+            episodios.push(
+                self.episodio_do_pedido(item, &principal.name)
+                    .map_err(|s| Status::new(s.code(), format!("item {i}: {}", s.message())))?,
+            );
+        }
+        let engine = self.engine.clone();
+        let resultado = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::with_capacity(episodios.len());
+            for (i, (e, key)) in episodios.into_iter().enumerate() {
+                match engine.append_idempotent(e, &key) {
+                    Ok((lsn, deduplicated, event_id)) => out.push(pb::AppendResponse {
+                        lsn,
+                        deduplicated,
+                        event_id,
+                    }),
+                    Err(err) => return Err((i, out.len(), err)),
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(internal)?;
+        match resultado {
+            Ok(results) => Ok(Response::new(pb::AppendBatchResponse { results })),
+            Err((i, gravados, err)) => {
+                let s = status_do_append(err);
+                Err(Status::new(
+                    s.code(),
+                    format!(
+                        "item {i} falhou depois de {gravados} itens gravados: {}",
+                        s.message()
+                    ),
+                ))
+            }
+        }
     }
 
     async fn query(
@@ -1187,6 +1269,71 @@ mod testes_dimensao_do_embedding {
             roles: Arc::new(vec![AccessRole::Writer]),
         });
         req
+    }
+
+    fn lote(itens: Vec<pb::AppendRequest>) -> Request<pb::AppendBatchRequest> {
+        let mut req = Request::new(pb::AppendBatchRequest { items: itens });
+        req.extensions_mut().insert(Principal {
+            name: "escritor".into(),
+            roles: Arc::new(vec![AccessRole::Writer]),
+        });
+        req
+    }
+
+    fn item(conteudo: &str, chave: &str) -> pb::AppendRequest {
+        pb::AppendRequest {
+            agent_id: "cliente".into(),
+            content: conteudo.as_bytes().to_vec(),
+            idempotency_key: chave.into(),
+            ..Default::default()
+        }
+    }
+
+    /// `AppendBatch` (otimizacao-20m §3.6): grava por ordem numa só ida e
+    /// volta; um item inválido recusa o lote ANTES de escrever; e, com chaves
+    /// por item, repetir o lote é idempotente.
+    #[tokio::test]
+    async fn append_batch_grava_valida_antes_e_repete_sem_duplicar() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = motor(dir.path());
+        let svc = Service::new(engine.clone());
+        let itens = || {
+            (0..5)
+                .map(|i| item(&format!("e{i}"), &format!("k-{i}")))
+                .collect()
+        };
+
+        let r = svc.append_batch(lote(itens())).await.unwrap().into_inner();
+        assert_eq!(r.results.len(), 5);
+        let lsns: Vec<u64> = r.results.iter().map(|x| x.lsn).collect();
+        assert!(lsns.windows(2).all(|p| p[0] < p[1]), "por ordem: {lsns:?}");
+        assert!(r.results.iter().all(|x| !x.deduplicated));
+        let head = engine.head();
+
+        // Repetir o lote inteiro: mesmos LSN, nada novo no log.
+        let de_novo = svc.append_batch(lote(itens())).await.unwrap().into_inner();
+        assert_eq!(
+            de_novo.results.iter().map(|x| x.lsn).collect::<Vec<_>>(),
+            lsns
+        );
+        assert!(de_novo.results.iter().all(|x| x.deduplicated));
+        assert_eq!(engine.head(), head);
+
+        // Um item inválido (atributo reservado) recusa o lote sem gravar nada.
+        let mut mau = itens();
+        mau[3].attrs.insert("__heraclitus_x".into(), "y".into());
+        mau[0] = item("novo", "k-novo");
+        let erro = svc.append_batch(lote(mau)).await.unwrap_err();
+        assert_eq!(erro.code(), tonic::Code::InvalidArgument);
+        assert!(erro.message().contains("item 3"), "{}", erro.message());
+        assert_eq!(engine.head(), head, "validação antes de escrever");
+
+        // Tecto de itens.
+        let demais = (0..=MAX_BATCH_ITEMS)
+            .map(|i| item("x", &format!("t-{i}")))
+            .collect();
+        assert!(svc.append_batch(lote(demais)).await.is_err());
+        assert_eq!(engine.head(), head);
     }
 
     /// Auditoria 2026-09-05, vaga 2 (R60): o caminho de ingestão do gRPC — o

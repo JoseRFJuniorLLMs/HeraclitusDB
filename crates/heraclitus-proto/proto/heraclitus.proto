@@ -5,6 +5,11 @@ package heraclitus.v1;
 // Admin{rebuild, demote, stats}.
 service Heraclitus {
   rpc Append (AppendRequest) returns (AppendResponse);
+  // Batch of appends in ONE round trip (otimizacao-20m §3.6). NOT atomic:
+  // items are applied in order and the first failure stops the batch; the
+  // error says how many items were appended before it. Use a per-item
+  // idempotency_key to make a retry of the whole batch safe.
+  rpc AppendBatch (AppendBatchRequest) returns (AppendBatchResponse);
   rpc Query (QueryRequest) returns (QueryResponse);
   rpc Recall (RecallRequest) returns (QueryResponse);
   rpc Subscribe (SubscribeRequest) returns (stream EventMessage);
@@ -32,6 +37,8 @@ message AppendResponse {
   bool deduplicated = 2;
   string event_id = 3; // ULID of the original or newly appended episode
 }
+message AppendBatchRequest { repeated AppendRequest items = 1; }
+message AppendBatchResponse { repeated AppendResponse results = 1; }
 
 message QueryRequest { string gql = 1; }    // GQL subset incl. EXPLAIN/AS OF
 message QueryResponse { string json = 1; }  // rows (or plan text) as JSON
