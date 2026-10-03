@@ -270,11 +270,24 @@ impl View for GraphIndex {
             self.out.entry(*parent).or_default().push(event.id);
             self.inn.entry(event.id).or_default().push(*parent);
         }
+        // otimizacao-20m §3.4/§3.7 (conferido em 2026-10-02): um `format!`
+        // por atributo por evento, mesmo quando a chave já existia. A chave é
+        // montada num buffer reutilizado e só é alocada como `String` própria
+        // na primeira vez que o par campo=valor aparece.
+        let mut chave = String::new();
         for (k, v) in &event.attrs {
-            self.attr_idx
-                .entry(format!("{k}={v}"))
-                .or_default()
-                .insert(internal);
+            chave.clear();
+            chave.push_str(k);
+            chave.push('=');
+            chave.push_str(v);
+            if let Some(mut bitmap) = self.attr_idx.get_mut(chave.as_str()) {
+                bitmap.insert(internal);
+            } else {
+                self.attr_idx
+                    .entry(chave.clone())
+                    .or_default()
+                    .insert(internal);
+            }
         }
         self.watermark = self.watermark.max(lsn); // avanço-só (entrega fora de ordem)
     }

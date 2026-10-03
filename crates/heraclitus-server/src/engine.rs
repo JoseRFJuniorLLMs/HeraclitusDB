@@ -745,14 +745,33 @@ impl Engine {
     }
 
     pub fn index_applied(&self, lsn: Lsn, episode: &Episode) {
+        if self.vai_para_a_memtable(lsn, episode) {
+            self.memtable.apply(lsn, episode.clone());
+        }
+    }
+
+    /// Como [`index_applied`](Self::index_applied), consumindo o Episode: o
+    /// último consumidor (a memtable) recebe-o por move em vez de por clone.
+    /// otimizacao-20m §3.7 (conferido em 2026-10-02): cada append fazia uma
+    /// cópia profunda do episódio — conteúdo, attrs e embedding — só para a
+    /// memtable, logo a seguir a o log já o ter clonado.
+    fn index_applied_owned(&self, lsn: Lsn, episode: Episode) {
+        if self.vai_para_a_memtable(lsn, &episode) {
+            self.memtable.apply(lsn, episode);
+        }
+    }
+
+    /// Publica nas views e no índice de atributos; `true` se o episódio deve
+    /// ainda ir para a memtable.
+    fn vai_para_a_memtable(&self, lsn: Lsn, episode: &Episode) -> bool {
         if self.log_only {
-            return;
+            return false;
         }
         // Frames H-VM (`hvm_isa`) não entram nas views/attr/memtable — vivem no
         // replay do VM. Excluí-los aqui e nos replays de boot mantém os índices
         // (e o `state_hash`) idênticos ao vivo vs. reconstruídos.
         if vm_bridge::is_hvm(episode) {
-            return;
+            return false;
         }
         let agent_evidence = matches!(
             &episode.kind,
@@ -761,9 +780,7 @@ impl Engine {
         self.views.lock().unwrap().apply(lsn, episode);
         self.attr.write().unwrap().apply(lsn, episode);
         // Count/byte eviction is safe only AFTER synchronous view publication.
-        if !agent_evidence {
-            self.memtable.apply(lsn, episode.clone());
-        }
+        !agent_evidence
     }
 
     /// Meta-auditoria: regista a execução de uma query como EVENTO no log
@@ -2592,17 +2609,13 @@ impl Engine {
         episode
             .attrs
             .insert(IDEMPOTENCY_HASH_ATTR.into(), payload_hash);
+        // O id é o do próprio Episode: nem o log nem o raft o reatribuem.
+        // Antes relia-se o registo acabado de escrever só para o obter — no
+        // V6 uma leitura pontual percorre o segmento activo desde o cabeçalho
+        // (otimizacao-20m §3.5, conferido em 2026-10-02), por cada append
+        // idempotente.
+        let id = episode.id.to_string();
         let lsn = self.append_internal(episode)?;
-        let id = self
-            .log
-            .read(lsn)?
-            .ok_or_else(|| HeraclitusError::Corruption {
-                context: "append response".into(),
-                detail: format!("LSN {lsn} não pôde ser relido"),
-            })?
-            .1
-            .id
-            .to_string();
         Ok((lsn, false, id))
     }
 
@@ -2633,7 +2646,7 @@ impl Engine {
         // lock: dois appends nunca esperam um pelo outro.
         let _voo = self.begin_indexing();
         let (lsn, stamped) = self.log.append_stamped(episode)?;
-        self.index_applied(lsn, &stamped);
+        self.index_applied_owned(lsn, stamped);
         Ok(lsn)
     }
 
