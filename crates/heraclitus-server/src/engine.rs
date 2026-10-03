@@ -2951,6 +2951,20 @@ impl Engine {
         // `ViewRegistry::rebuild` — um rebuild de UMA view só não a baixa,
         // porque as outras continuam vazias. O índice de atributos NÃO é tocado
         // por este caminho, por isso a bandeira dele fica como está (A47).
+        //
+        // Auditoria recursiva 2026-10-03, iteração 1 — barreira de indexação.
+        // Um append em voo já está no log (o head cobre-o) mas ainda espera
+        // pelo lock das views para o `index_applied`. Sem o lado exclusivo do
+        // `index_gate`, o rebuild repunha as views, lia o head e aplicava esse
+        // LSN; o append aplicava-o DEPOIS outra vez. A `ActivationStore` não é
+        // idempotente (`touch` conta cada acesso): o acesso ficava duplicado,
+        // inflava o ACT-R no recall e o checkpoint seguinte gravava-o.
+        // Ao contrário do checkpoint, a barreira NÃO pode ser largada antes do
+        // fim: o head é lido dentro do `ViewRegistry::rebuild`, e um append
+        // que entrasse entre largar a barreira e essa leitura voltava a cair
+        // na janela. Mesma ordem de locks que o `shred_effect`
+        // (index_gate → views).
+        let _indexacao = self.index_gate.write().unwrap();
         self.views.lock().unwrap().rebuild(&self.log, view)?;
         Ok(())
     }
@@ -5950,6 +5964,56 @@ mod tests {
             v.as_array().unwrap().len(),
             1,
             "o episodio em voo ficou fora do indice de atributos para sempre: {v}"
+        );
+    }
+
+    /// O `view rebuild` aplicava DUAS vezes um append em voo (auditoria
+    /// recursiva 2026-10-03, iteração 1).
+    ///
+    /// Sem a barreira do `index_gate`, o rebuild repunha as views e aplicava
+    /// tudo ate ao head — incluindo um LSN ja commitado mas ainda por indexar —
+    /// e o append aplicava-o depois outra vez. A `ActivationStore` conta cada
+    /// `touch`, por isso o acesso ficava duplicado. A janela e materializada
+    /// com `begin_indexing`, como nos testes do checkpoint acima.
+    #[test]
+    fn rebuild_nao_aplica_duas_vezes_um_append_em_voo() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(engine_in(dir.path()));
+        engine
+            .append(Episode::new(
+                "ag",
+                EventKind::Observation,
+                b"antes".to_vec(),
+            ))
+            .unwrap();
+
+        let ep = Episode::new("ag", EventKind::Observation, b"em voo".to_vec());
+        let id = ep.id;
+        let voo = engine.begin_indexing();
+        let (lsn, carimbado) = engine.log.append_stamped(ep).unwrap();
+
+        let e2 = engine.clone();
+        let h = std::thread::spawn(move || e2.rebuild(None).unwrap());
+        // Margem larga: com dados minusculos, sem a barreira o rebuild termina
+        // muito antes disto e ja aplicou o LSN em voo.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        engine.index_applied(lsn, &carimbado);
+        drop(voo);
+        h.join().unwrap();
+
+        let agora = (carimbado.ts_hlc >> 16) + 1;
+        let apos_corrida = engine.activation.read().unwrap().score(&id, agora);
+        // Referencia: um rebuild sem nenhum append em voo aplica cada LSN uma
+        // unica vez — e o mesmo que um replay do LSN 0.
+        engine.rebuild(None).unwrap();
+        let referencia = engine.activation.read().unwrap().score(&id, agora);
+        assert!(
+            referencia.is_some(),
+            "o episodio tem de estar na activation"
+        );
+        assert_eq!(
+            apos_corrida, referencia,
+            "o append em voo foi contado duas vezes pela activation"
         );
     }
 
