@@ -2422,7 +2422,30 @@ impl Engine {
             HeraclitusError::Config("encryption at rest is disabled; nothing to shred".into())
         })?;
         let indexing = self.index_gate.write().unwrap();
-        self.ensure_crypto_shred_allowed(agent_id)?;
+        // Auditoria recursiva 2026-10-03, iteração 2: um titular shredded
+        // ANTES de a marca `.shredded` existir não a tem. Se entretanto voltou
+        // a escrever (chave nova K2), os registos antigos falham o AEAD com
+        // uma chave viva e o scan de conformidade abaixo abortava em `Crypto`
+        // antes do `ks.shred` — que, sem ficheiro de chave, também saía sem
+        // marcar. Repetir o shred nunca reparava o titular. Marca-se primeiro
+        // (marca + chave viva é inofensivo: a chave real continua a abrir os
+        // seus registos) e o scan devolve-os como tombstones; a marca só fica
+        // se o shred avançar ou se o scan vir registos já apagados deste
+        // titular — evidência de um shred anterior. Veto ou no-op sem
+        // evidência desfazem a marca criada aqui.
+        let marca_nova = ks.mark_shredded(agent_id)?;
+        let ja_apagado = match self.ensure_crypto_shred_allowed(agent_id) {
+            Ok(ja_apagado) => ja_apagado,
+            Err(e) => {
+                if marca_nova {
+                    // O veto é o erro a reportar; se desmarcar falhar fica
+                    // "marca + chave viva", o mesmo estado inofensivo de um
+                    // crash a meio do `KeyStore::shred`.
+                    let _ = ks.unmark_shredded(agent_id);
+                }
+                return Err(e);
+            }
+        };
         std::fs::create_dir_all(&self.attr_dir)?;
         let marker = self.attr_dir.join("privacy-rebuild-required");
         let recovery_pending = marker.exists();
@@ -2448,6 +2471,13 @@ impl Engine {
         // Frames H-VM desta titular deixam de se decifrar: o estado em cache
         // já não é o que um replay integral daria.
         self.invalidar_hvm();
+        if !destroyed && !ja_apagado && marca_nova {
+            // Nenhuma chave destruída e nenhum registo apagado deste titular
+            // no log (id nunca usado, ou só registos em claro): a marca criada
+            // acima não tem fundamento e só enfraquecia a detecção de
+            // adulteração dos registos futuros deste id.
+            ks.unmark_shredded(agent_id)?;
+        }
         if !destroyed && !recovery_pending {
             // Sem chave e sem operação interrompida: idempotência normal.
             let _ = std::fs::remove_file(&marker);
@@ -2514,7 +2544,12 @@ impl Engine {
     /// has not sealed yet. Regulatory `PreventDestruction`, an unexpired
     /// regulatory `RetainForSeconds` window, protected retention classes and
     /// non-public classification independently veto the operation.
-    fn ensure_crypto_shred_allowed(&self, agent_id: &str) -> Result<(), HeraclitusError> {
+    ///
+    /// Devolve `true` se o scan encontrou registos deste titular que já saem
+    /// como tombstone de crypto-shred — evidência de que uma chave dele já foi
+    /// destruída (auditoria recursiva 2026-10-03, iteração 2; ver
+    /// `shred_effect`).
+    fn ensure_crypto_shred_allowed(&self, agent_id: &str) -> Result<bool, HeraclitusError> {
         let head = self.log.head();
         let state = RegulatoryState::replay(self.log.as_ref(), head).map_err(|error| {
             HeraclitusError::Config(format!(
@@ -2589,6 +2624,7 @@ impl Engine {
                 )
             })
             .collect();
+        let mut ja_apagado = false;
         let mut cursor = 0;
         while cursor < head {
             let batch = self.log.scan_capped(cursor, head, 256)?;
@@ -2598,6 +2634,14 @@ impl Engine {
             for (lsn, episode) in &batch {
                 if episode.agent_id != agent_id {
                     continue;
+                }
+                if episode.content == heraclitus_crypto::SHREDDED
+                    && episode
+                        .attrs
+                        .get("__heraclitus_shredded")
+                        .is_some_and(|v| v == "true")
+                {
+                    ja_apagado = true;
                 }
                 if let Some((hold_id, _, _)) = active_holds
                     .iter()
@@ -2632,7 +2676,7 @@ impl Engine {
             }
             cursor = last_lsn.saturating_add(1);
         }
-        Ok(())
+        Ok(ja_apagado)
     }
 
     /// Append + synchronously index into memtable AND views.
@@ -4916,6 +4960,9 @@ mod tests {
             engine.log.read(lsn).unwrap().unwrap().1.content,
             b"protected"
         );
+        // Auditoria recursiva 2026-10-03, iteração 2: o veto desfaz a marca
+        // `.shredded` que o `shred_effect` escreve antes do gate.
+        assert!(!engine.keystore.as_ref().unwrap().was_shredded(agent));
 
         regulatory
             .release_legal_hold(LegalHoldRelease {
@@ -4930,6 +4977,81 @@ mod tests {
             engine.log.read(lsn).unwrap().unwrap().1.content,
             heraclitus_crypto::SHREDDED
         );
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 2: um titular shredded ANTES
+    /// de a marca `.shredded` existir (chave apagada, sem marca) tem de ficar
+    /// reparado ao repetir o shred — tanto se ainda não voltou a escrever
+    /// (caso A: o `KeyStore::shred` saía cedo sem chave) como se já criou a
+    /// chave nova K2 (caso B: o scan de conformidade abortava em `Crypto`
+    /// antes do shred). Um shred de um id sem registos não deixa marca.
+    #[test]
+    fn repetir_shred_repara_titular_apagado_antes_da_marca() {
+        fn scan_integral(engine: &Engine) -> Result<usize, HeraclitusError> {
+            let head = engine.log.head().saturating_add(1);
+            Ok(engine.log.scan_capped(0, head, usize::MAX)?.len())
+        }
+        fn shred_pre_marca(cfg: &HeraclitusConfig, agent: &str) {
+            // O que um shred anterior à correcção deixava em disco: a chave
+            // apagada e nenhuma marca.
+            let hex: String = agent.bytes().map(|b| format!("{b:02x}")).collect();
+            let keys = cfg.data_dir.join("keys");
+            std::fs::remove_file(keys.join(format!("{hex}.key"))).unwrap();
+            assert!(!keys.join(format!("{hex}.shredded")).exists());
+        }
+        let evento = |agent: &str, texto: &[u8]| {
+            Episode::new(
+                agent,
+                EventKind::Custom("PersonalData".into()),
+                texto.to_vec(),
+            )
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            storage_format: heraclitus_core::StorageFormat::V6,
+            encryption_at_rest: true,
+            ..Default::default()
+        };
+        let a = "titular:hmac-sha256:caso-a";
+        let b = "titular:hmac-sha256:caso-b";
+        let engine = Engine::open(&cfg).unwrap();
+        let lsn_a = engine.append(evento(a, b"antigo a")).unwrap();
+        let lsn_b = engine.append(evento(b, b"antigo b")).unwrap();
+        drop(engine);
+        shred_pre_marca(&cfg, a);
+        shred_pre_marca(&cfg, b);
+        let engine = Engine::open(&cfg).unwrap();
+        let ks = engine.keystore.clone().unwrap();
+
+        // Caso B: o titular voltou a escrever (K2) antes da actualização; o
+        // log inteiro já não se lia e repetir o shred abortava no gate.
+        engine.append(evento(b, b"novo b")).unwrap();
+        assert!(matches!(
+            scan_integral(&engine),
+            Err(HeraclitusError::Crypto(_))
+        ));
+        assert!(engine.shred(b).unwrap(), "o shred repetido destrói K2");
+        assert!(ks.was_shredded(b));
+
+        // Caso A: sem chave; o shred repetido é um no-op mas tem de marcar.
+        assert!(!engine.shred(a).unwrap());
+        assert!(ks.was_shredded(a));
+        engine.append(evento(a, b"novo a")).unwrap();
+        scan_integral(&engine).expect("o scan integral nao pode abortar");
+        for lsn in [lsn_a, lsn_b] {
+            let (_, ep) = engine.log.read(lsn).unwrap().unwrap();
+            assert_eq!(ep.content, heraclitus_crypto::SHREDDED);
+        }
+
+        // Id sem registos: nada a reparar, nenhuma marca inventada.
+        assert!(!engine.shred("titular:hmac-sha256:nunca-usado").unwrap());
+        assert!(!ks.was_shredded("titular:hmac-sha256:nunca-usado"));
+        drop(engine);
+        let reaberto = Engine::open(&cfg).unwrap();
+        scan_integral(&reaberto).expect("reabrir nao pode abortar");
     }
 
     /// §3.9/§2.6 — a task de distill consolida clusters em Facts pelo caminho

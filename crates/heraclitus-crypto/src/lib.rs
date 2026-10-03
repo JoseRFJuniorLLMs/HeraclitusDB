@@ -196,6 +196,49 @@ impl KeyStore {
         self.shred_marker_path(agent_id).exists()
     }
 
+    /// Escreve a marca de [`Self::was_shredded`] SEM tocar na chave.
+    /// Devolve `true` se a marca não existia (foi esta chamada que a criou).
+    ///
+    /// Auditoria recursiva 2026-10-03, iteração 2: os shreds feitos antes de
+    /// a marca existir não a têm, e [`Self::shred`] não a pode escrever para
+    /// eles — sem ficheiro de chave sai cedo, e com a chave nova K2 o scan de
+    /// conformidade do servidor aborta em `Crypto` antes de lá chegar. O
+    /// `shred_effect` do servidor usa isto para marcar ANTES do scan e, com a
+    /// evidência que o scan recolhe, decidir se a marca fica.
+    pub fn mark_shredded(&self, agent_id: &str) -> io::Result<bool> {
+        let _g = self.guarda.write().unwrap_or_else(|e| e.into_inner());
+        let existia = self.was_shredded(agent_id);
+        self.escrever_marca(agent_id)?;
+        Ok(!existia)
+    }
+
+    /// Remove a marca de [`Self::was_shredded`]. Só serve para desfazer uma
+    /// marca que o PRÓPRIO chamador acabou de criar com
+    /// [`Self::mark_shredded`] (`true`) e que não se confirmou — remover a
+    /// marca de um shred real voltava a fazer os registos apagados parecerem
+    /// adulteração. Auditoria recursiva 2026-10-03, iteração 2.
+    pub fn unmark_shredded(&self, agent_id: &str) -> io::Result<()> {
+        let _g = self.guarda.write().unwrap_or_else(|e| e.into_inner());
+        match std::fs::remove_file(self.shred_marker_path(agent_id)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        }
+        sync_dir(&self.dir)
+    }
+
+    /// Cria a marca de forma durável (ficheiro E entrada de directório).
+    /// Idempotente; o chamador segura a `guarda` em escrita.
+    fn escrever_marca(&self, agent_id: &str) -> io::Result<()> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.shred_marker_path(agent_id))?
+            .sync_all()?;
+        sync_dir(&self.dir)
+    }
+
     fn read_key(path: &Path) -> Option<[u8; 32]> {
         Self::read_key_checked(path).ok().flatten()
     }
@@ -389,13 +432,7 @@ impl KeyStore {
         // pode ser repetido — e nunca "chave destruída sem marca", que era o
         // estado que fazia uma chave nova posterior parecer adulteração.
         // Falhar aqui aborta o shred sem tocar na chave.
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(self.shred_marker_path(agent_id))?
-            .sync_all()?;
-        sync_dir(&self.dir)?;
+        self.escrever_marca(agent_id)?;
         // Sobrescrever antes de remover, para os bytes da chave não ficarem no
         // disco. O `sync_all` a seguir não é zelo: sem ele os zeros ficam em
         // buffers e o bloco original pode sobreviver à falha.
@@ -628,6 +665,26 @@ mod testes_shred {
         // Shred de um agente sem chave nao inventa marca.
         assert!(!ks.shred("ninguem").unwrap());
         assert!(!ks.was_shredded("ninguem"));
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 2: um agente shredded antes
+    /// de a marca existir (sem chave, sem marca) pode ser marcado sem chave;
+    /// a marca é persistente, `mark_shredded` diz se foi ela que a criou, e
+    /// `unmark_shredded` desfaz só essa marca sem tocar em chaves.
+    #[test]
+    fn marca_de_shred_pode_ser_escrita_e_desfeita_sem_chave() {
+        let (d, ks) = loja();
+        assert!(ks.mark_shredded("antigo").unwrap(), "marca nova");
+        assert!(!ks.mark_shredded("antigo").unwrap(), "idempotente");
+        assert!(ks.was_shredded("antigo"));
+        assert_eq!(ks.agent_count(), 0, "a marca nao cria chave");
+        assert!(KeyStore::open(d.path()).unwrap().was_shredded("antigo"));
+        let viva = ks.get_or_create("viva").unwrap();
+        assert!(ks.mark_shredded("viva").unwrap());
+        ks.unmark_shredded("viva").unwrap();
+        assert!(!ks.was_shredded("viva"));
+        assert_eq!(ks.get("viva"), Some(viva), "desmarcar nao toca na chave");
+        ks.unmark_shredded("nunca-marcado").unwrap();
     }
 
     /// Auditoria recursiva 2026-10-03, iteração 1: uma falha de I/O ao ler a
