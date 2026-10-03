@@ -2428,7 +2428,24 @@ impl V6Log {
             }
             active.writer.append(lsn, episode.ts_hlc, &payload, &hash)?;
             if sync_now {
-                active.writer.sync()?;
+                if let Err(err) = active.writer.sync() {
+                    // Auditoria recursiva 2026-10-03, iteração 1: o `append`
+                    // acima já avançou o writer (registo no ficheiro,
+                    // `next_expected_lsn = lsn + 1`) mas `state.next_lsn` não
+                    // avança num erro. Sem mais nada, todo o append seguinte
+                    // falhava com "engine LSN does not match"; e um seal nesse
+                    // estado (roll ou `seal_active`) catalogava o LSN `lsn` e
+                    // abria a cauda nova com `first_lsn = lsn` — o mesmo LSN
+                    // em dois segmentos e um arranque que recusa abrir. Depois
+                    // de um fsync falhado o estado da cache de páginas é
+                    // desconhecido; trata-se como o worker de GroupCommit já
+                    // trata: envenena o motor até ao arranque, que é quem
+                    // repara a cauda activa.
+                    let motivo = format!("fsync do append do LSN {lsn} falhou: {err}");
+                    tracing::error!(%motivo, "V6 foreground fsync failed; writes disabled");
+                    state.sync_error = Some(motivo);
+                    return Err(err);
+                }
             }
         }
         if sync_now {
@@ -2634,7 +2651,7 @@ impl V6Log {
             .map_err(|_| HeraclitusError::StorageEngine("mutex do V6Log envenenado".into()))?;
         if let Some(error) = &state.sync_error {
             return Err(HeraclitusError::StorageEngine(format!(
-                "V6 background fsync failed: {error}"
+                "V6 fsync failed; restart required: {error}"
             )));
         }
         Ok(state)
@@ -3345,6 +3362,60 @@ mod tests {
         assert!(erro.to_string().contains("não estão catalogados"), "{erro}");
         let catalogados = log.scan_capped(0, 2, usize::MAX).unwrap();
         assert_eq!(catalogados.len(), 2);
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 1: um fsync falhado DEPOIS de
+    /// o writer aceitar o registo deixava o writer em `n + 1` e o motor em
+    /// `n`. Os appends seguintes falhavam com "engine LSN does not match" e um
+    /// `seal_active` passava, catalogava o LSN `n` e abria a cauda nova com
+    /// `first_lsn = n`: o append seguinte voltava a gravar o LSN `n` (agora
+    /// noutro segmento) e o arranque recusava abrir a base. Agora o motor fica
+    /// envenenado e o arranque reabre-o sem problemas.
+    #[test]
+    fn fsync_falhado_no_append_envenena_e_o_arranque_reabre() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let log = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
+            log.append(event(0)).unwrap();
+            log.lock_state()
+                .unwrap()
+                .active
+                .as_mut()
+                .unwrap()
+                .writer
+                .falha_sync = true;
+            assert!(log.append(event(1)).is_err(), "o fsync falhou");
+            assert_eq!(log.head(), 1, "o LSN 1 não foi confirmado");
+            let erro = log.append(event(2)).unwrap_err();
+            assert!(erro.to_string().contains("fsync"), "{erro}");
+            assert!(
+                log.seal_active().is_err(),
+                "selar com writer e motor dessincronizados duplicava o LSN 1"
+            );
+            assert!(log.append(event(2)).is_err(), "continua envenenado");
+            assert_eq!(log.head(), 1);
+        }
+        let log = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always)
+            .expect("o arranque tem de reabrir depois de um fsync falhado");
+        assert_eq!(
+            log.read(0).unwrap().unwrap().1.content,
+            b"payload-0".to_vec()
+        );
+        let lsn = log.append(event(3)).unwrap();
+        assert_eq!(lsn + 1, log.head());
+        log.seal_active().unwrap();
+        drop(log);
+        let log = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
+        assert_eq!(
+            log.read(lsn).unwrap().unwrap().1.content,
+            b"payload-3".to_vec()
+        );
+        let todos = log.scan_capped(0, log.head(), usize::MAX).unwrap();
+        assert_eq!(
+            todos.len() as u64,
+            log.head(),
+            "LSN sem buracos nem duplicados"
+        );
     }
 
     fn recuperacao_do_segmento_seguinte(politica: FsyncPolicy) {

@@ -155,6 +155,10 @@ pub struct RawSegmentWriter {
     /// do próximo registo e devolve erro, como um disco que enche a meio.
     #[cfg(test)]
     falha_parcial: Option<usize>,
+    /// Injecção de falhas para os testes: o próximo `sync` devolve erro sem
+    /// tocar no ficheiro, como um `fsync` com EIO/ENOSPC.
+    #[cfg(test)]
+    pub(crate) falha_sync: bool,
 }
 
 /// Parâmetros de criação de um segmento.
@@ -220,6 +224,8 @@ impl RawSegmentWriter {
             envenenado: false,
             #[cfg(test)]
             falha_parcial: None,
+            #[cfg(test)]
+            falha_sync: false,
         })
     }
 
@@ -308,6 +314,8 @@ impl RawSegmentWriter {
             envenenado: false,
             #[cfg(test)]
             falha_parcial: None,
+            #[cfg(test)]
+            falha_sync: false,
         })
     }
 
@@ -405,6 +413,10 @@ impl RawSegmentWriter {
     }
 
     pub fn sync(&mut self) -> V6Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.falha_sync) {
+            return Err(std::io::Error::other("falha de fsync injectada").into());
+        }
         self.file.sync_data()?;
         Ok(())
     }
