@@ -65,6 +65,22 @@ Depois dos commits acima, uma revisão independente só de leitura reviu as alte
 
 O caso do cliente que desliga não tem teste automático: provocar o EOF a meio do handler de forma determinística exige controlo do socket que os testes atuais não têm.
 
+Corrigido depois da primeira ronda, e revisto nas rondas seguintes:
+
+- **Índice de offsets do segmento ativo V6** (`05814c2`): a leitura pontual vai direta ao registo.
+- **`AppendBatch`** (`7185faf`): vários appends numa só ida e volta.
+
+**Segunda ronda** (sobre as correções e os commits novos): 5 confirmados, todos corrigidos em `bb9b010`.
+
+- A chave da reconciliação derivada só do alvo bloqueava para sempre um alvo depois de uma tentativa falhada. Agora há validação antes da intenção e a chave é o hash do pedido completo.
+- Dentro de um lote, as dimensões de embedding misturadas eram aceites com o índice vazio.
+- A validação do lote não incluía as regras do engine nem chaves repetidas (`Engine::validar_append`).
+- Em estado degradado, as varreduras omitiam em silêncio LSN confirmados mas não catalogados. Agora falham alto.
+
+**Terceira ronda:** 1 confirmado, de gravidade baixa. O relatório de acessos do titular engolia o erro de varredura e respondia 200 com uma lista vazia. Agora responde 503 e indica o erro (`55d67cb`).
+
+**Quarta ronda** (fecho, sobre `55d67cb`): 0 confirmados. Os dois levantados foram refutados por 3/3: o limite de 100 resultados do relatório é intencional, e o 503 também cobre um `JoinError`. A revisão convergiu.
+
 ## Continua aberto (não declarar encerrado)
 
 1. **Exige decisão ou infraestrutura externa:** HSM/PKCS#11 e atestação de destruição; ACT credenciada e raízes ICP-Brasil oficiais; bucket WORM; homologação institucional e RIPD; cluster real (reconciliação administrativa distribuída, `/tier/demote` com store partilhado, que também é recusado pelo `execute_admin` em nós replicados); soak de 20 M em hardware alvo.
@@ -75,11 +91,9 @@ O caso do cliente que desliga não tem teste automático: provocar o EOF a meio 
    - provas de inclusão HRKL no pacote forense e integração do `heraclitus-forensic` como export/verify de produção;
    - árvore completa de políticas X.509 (RFC 5280 §6.1) e normalização NFKC completa da RFC 4518.
 3. **Código médio ainda por fazer:**
-   - índice LSN→offset nos segmentos RAW v6;
    - verificação do seal V6 fora do mutex do writer (hoje relê o segmento três vezes no seal);
    - reparação a quente de um seal falhado antes do commit (hoje degrada e exige arranque, por desenho);
    - `Arc<Episode>` ponta a ponta (o log ainda clona uma vez no `append_stamped`);
-   - RPC de append em lote;
    - compactação do cold tier v6;
    - distill em cluster;
    - AAD do AEAD com `event_id` (exige versão de formato);
