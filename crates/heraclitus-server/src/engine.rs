@@ -486,6 +486,26 @@ impl Engine {
             health
         };
 
+        // O índice de atributos abre ANTES do replay das views, para os dois
+        // serem alimentados na MESMA passagem pelo log (boot.md P1-C,
+        // conferido em 2026-10-02 — antes o log era varrido e decifrado duas
+        // vezes no arranque). Os avisos sobre o checkpoint saem na fase dele.
+        let attr_dir = config.data_dir.join("views");
+        let (mut attr_indice, attr_estado) = if privacy_rebuild {
+            // Rebuild forçado não chega a ler ficheiro nenhum: nada a
+            // reportar (e nada a avisar — a lentidão foi pedida).
+            (AttrIndex::new(), AberturaCheckpoint::Ausente)
+        } else {
+            AttrIndex::open_reportando(&attr_dir)
+        };
+        // A cauda do índice começa DEPOIS do watermark (inclusivo).
+        let attr_desde = if attr_indice.has_applied() || !attr_indice.is_empty() {
+            attr_indice.watermark().saturating_add(1)
+        } else {
+            0
+        };
+        let mut attr_alimentado = false;
+
         // The slow phase on a big log: replay the tail into every view. The
         // spinner moves here while millions of events stream through.
         let registry = {
@@ -535,7 +555,8 @@ impl Engine {
                 registry.mark_unmaterialized();
                 p.ok("PULADO — HERACLITUS_SKIP_VIEW_REPLAY (views vazias; checkpoint inibido até `view rebuild`)");
             } else {
-                registry.catch_up(&log)?;
+                registry.catch_up_com(&log, Some((&mut attr_indice, attr_desde)))?;
+                attr_alimentado = true;
                 let wm = registry.min_watermark();
                 // Fast boot: persiste já o estado materializado — o próximo
                 // arranque restaura os snapshots e replaya SÓ a cauda
@@ -553,7 +574,6 @@ impl Engine {
 
         // Índice secundário de atributos: carrega o checkpoint e replaya só a
         // cauda (arranque rápido); num log virgem constrói tudo uma vez e grava.
-        let attr_dir = config.data_dir.join("views");
         let attr = {
             let p = boot.phase("Índice de atributos (campo → LSN)");
             // Auditoria 2026-09-05, vaga 2 (R90): abrir REPORTANDO. Um
@@ -561,13 +581,7 @@ impl Engine {
             // integral; sem este aviso a linha da fase é idêntica nos dois
             // casos e uma corrupção recorrente nunca é notada. Mesmo padrão do
             // `ViewRegistry::open` (heraclitus-views/src/lib.rs:122).
-            let (indice, estado) = if privacy_rebuild {
-                // Rebuild forçado não chega a ler ficheiro nenhum: nada a
-                // reportar (e nada a avisar — a lentidão foi pedida).
-                (AttrIndex::new(), AberturaCheckpoint::Ausente)
-            } else {
-                AttrIndex::open_reportando(&attr_dir)
-            };
+            let (indice, estado) = (attr_indice, attr_estado);
             match &estado {
                 AberturaCheckpoint::Ilegivel => tracing::warn!(
                     path = %attr_dir.join("attr_index.bin").display(),
@@ -599,6 +613,12 @@ impl Engine {
                     } else {
                         0
                     };
+                    // Já alimentado na passagem das views (`catch_up_com`):
+                    // este laço só corre no rebuild pós-shred, em que as views
+                    // são reconstruídas por outro caminho.
+                    if attr_alimentado {
+                        cur = head.saturating_add(1);
+                    }
                     while cur <= head {
                         let batch = log.scan_capped(cur, head, 256)?;
                         if batch.is_empty() {

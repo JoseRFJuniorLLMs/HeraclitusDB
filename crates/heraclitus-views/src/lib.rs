@@ -397,6 +397,23 @@ impl ViewRegistry {
 
     /// On startup: replay `(watermark, head]` for each view com vetores diretos.
     pub fn catch_up<L: EpisodeLog + ?Sized>(&mut self, log: &L) -> Result<u64, HeraclitusError> {
+        self.catch_up_com(log, None)
+    }
+
+    /// Como [`catch_up`](Self::catch_up), entregando também cada evento a um
+    /// índice EXTRA que não está registado (o índice de atributos do
+    /// servidor), a partir do LSN `desde` dele, na MESMA passagem pelo log.
+    ///
+    /// Auditoria boot.md P1-C (conferida em 2026-10-02): o arranque varria e
+    /// decifrava o log duas vezes — uma para as views, outra só para o índice
+    /// de atributos. O extra recebe exactamente o que o seu laço antigo
+    /// recebia: todos os eventos com LSN >= `desde` excepto frames H-VM
+    /// (o `AgentEvidence` é tratado pelo próprio `apply` dele).
+    pub fn catch_up_com<L: EpisodeLog + ?Sized>(
+        &mut self,
+        log: &L,
+        mut extra: Option<(&mut dyn View, Lsn)>,
+    ) -> Result<u64, HeraclitusError> {
         let dir = self.dir.clone();
         for (i, v) in self.views.iter_mut().enumerate() {
             if !v.restore(&dir)? {
@@ -450,6 +467,13 @@ impl ViewRegistry {
             .map(|w| if w > 0 { w + 1 } else { 0 })
             .min()
             .unwrap_or(0);
+        // O extra pode estar mais atrás do que as views (checkpoint dele mais
+        // antigo, ou ilegível): a passagem começa no mais atrasado dos dois.
+        let from = match &extra {
+            Some((_, desde)) if self.views.is_empty() => *desde,
+            Some((_, desde)) => from.min(*desde),
+            None => from,
+        };
 
         let head = log.head();
         let mut applied = 0u64;
@@ -483,6 +507,11 @@ impl ViewRegistry {
             }
             let last = batch.last().unwrap().0;
             for (lsn, ep) in &batch {
+                if let Some((indice, desde)) = extra.as_mut() {
+                    if *lsn >= *desde && !heraclitus_log::vm_bridge::is_hvm(ep) {
+                        indice.apply(*lsn, ep);
+                    }
+                }
                 if heraclitus_log::vm_bridge::is_hvm(ep) || is_agent_evidence(ep) {
                     continue;
                 }
