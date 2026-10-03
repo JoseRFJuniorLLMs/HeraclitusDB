@@ -903,17 +903,14 @@ pub fn repair_active_tail(path: &Path) -> V6Result<Option<u64>> {
     // chega a observar o footer que continua válido no EOF. Nesse caso o
     // ficheiro já está selado e truncá-lo em `torn_at` apagaria história.
     //
-    // A presença de um footer válido no fim é a definição de segmento selado
-    // (§24), independentemente de a passagem pelos registos conseguir chegar
-    // até ele. Checá-lo primeiro também distingue uma cauda de footer parcial
-    // (não selada, portanto recuperável) de corrupção interna num segmento
-    // selado (falha dura).
-    if read_footer(path)?.is_some() || footer_magic_at_eof(path)? {
-        return Err(corrupt(
-            "hrkl v6 raw recovery",
-            "refusing to truncate a sealed segment; this is hard corruption",
-        ));
-    }
+    // Mas os últimos 128 bytes do ficheiro só PODEM ser um footer se
+    // começarem numa fronteira de registo a que a varredura não chegou
+    // (`>= torn_at`). Auditoria recursiva 2026-10-03, iteração 1: a versão
+    // anterior olhava para o EOF ANTES de varrer e sem esta condição. Numa
+    // cauda activa sem footer, esses bytes são o fim do payload do último
+    // registo — conteúdo do cliente. Um evento com `"HFTR"` em EOF-128 fazia
+    // o arranque recusar para sempre ("refusing to truncate a sealed
+    // segment") uma cauda que a varredura lia limpa até ao EOF.
     let scan = scan_raw_segment(path)?;
     if scan.footer.is_some() {
         return Err(corrupt(
@@ -921,15 +918,55 @@ pub fn repair_active_tail(path: &Path) -> V6Result<Option<u64>> {
             "refusing to truncate a sealed segment; this is hard corruption",
         ));
     }
-    match scan.torn_at {
-        Some(at) => {
-            let file = OpenOptions::new().write(true).open(path)?;
-            file.set_len(at)?;
-            file.sync_all()?;
-            Ok(Some(at))
-        }
-        None => Ok(None),
+    // Varredura limpa até ao EOF numa fronteira de registo: não há cauda nem
+    // footer. Seja o que for que esteja em EOF-128, está dentro de um registo
+    // com CRC válido.
+    let Some(at) = scan.torn_at else {
+        return Ok(None);
+    };
+    // A presença de um footer válido no fim é a definição de segmento selado
+    // (§24), independentemente de a passagem pelos registos conseguir chegar
+    // até ele. Um footer verdadeiro começa sempre em `>= torn_at` (todos os
+    // registos antes de `torn_at` são íntegros e o footer vem depois deles);
+    // um "footer" que comece antes está dentro de um registo válido e não sela
+    // nada. Checá-lo distingue uma cauda de footer parcial (não selada,
+    // portanto recuperável) de corrupção interna num segmento selado (falha
+    // dura).
+    let len = std::fs::metadata(path)?.len();
+    let footer_cabe_depois_do_rasgo = len
+        .checked_sub(FOOTER_LEN as u64)
+        .is_some_and(|inicio| inicio >= at);
+    if footer_cabe_depois_do_rasgo && (read_footer(path)?.is_some() || footer_magic_at_eof(path)?) {
+        return Err(corrupt(
+            "hrkl v6 raw recovery",
+            "refusing to truncate a sealed segment; this is hard corruption",
+        ));
     }
+    let file = OpenOptions::new().write(true).open(path)?;
+    file.set_len(at)?;
+    file.sync_all()?;
+    Ok(Some(at))
+}
+
+/// O footer que **sela** de facto um segmento RAW: válido no EOF *e* alcançado
+/// pela varredura de registos, isto é, a começar numa fronteira de registo.
+///
+/// Auditoria recursiva 2026-10-03, iteração 1. [`read_footer`] só descodifica
+/// os últimos 128 bytes; isso basta para um RAW selado (chega ao disco por
+/// rename de um ficheiro já completo), mas não para decidir se uma cauda
+/// `.active` está selada: aí esses bytes podem ser o fim do payload do último
+/// registo, e um cliente pode lá pôr uma imagem de footer com CRC correcto (o
+/// CRC do footer não tem chave). O motor renomeava então a cauda para
+/// `.g0000.raw.hrkl` e o `reconcile_raw` falhava em todos os arranques
+/// seguintes ("final RAW generation has no valid footer").
+///
+/// O `read_footer` fica como filtro barato: a varredura só corre quando o EOF
+/// já parece um footer.
+pub fn read_sealing_footer(path: &Path) -> V6Result<Option<FooterV6>> {
+    if read_footer(path)?.is_none() {
+        return Ok(None);
+    }
+    Ok(scan_raw_segment(path)?.footer)
 }
 
 /// Detecta um footer que parece existir no fim mas não passa o CRC. Não o
@@ -1507,5 +1544,91 @@ mod tests {
             repair_active_tail(&path).is_err(),
             "header corrompido tem de falhar alto, nao ser tratado como toco"
         );
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 1: os últimos 128 bytes de uma
+    /// cauda activa são, sem footer, o fim do payload do último registo —
+    /// conteúdo do cliente. Nem um `"HFTR"` solto nem uma imagem completa de
+    /// footer (CRC sem chave, portanto forjável) lá dentro podem fazer a cauda
+    /// passar por selada: a varredura lê-a limpa até ao EOF.
+    #[test]
+    fn footer_forjado_no_payload_do_ultimo_registo_nao_sela_a_cauda() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = SegmentInit {
+            segment_id: 11,
+            created_hlc: 1,
+            first_lsn: 0,
+            writer_epoch: 1,
+            storage_namespace_id: [6u8; 16],
+        };
+        let imagem = FooterV6 {
+            record_count: 0,
+            min_lsn: 0,
+            max_lsn: 0,
+            min_hlc: 0,
+            max_hlc: 0,
+            block_count: 0,
+            flags: 0,
+            block_directory_offset: 0,
+            block_directory_len: 0,
+            logical_root: [0u8; 32],
+        }
+        .encode();
+        // Só o magic em EOF-128; e a imagem inteira a fechar o ficheiro.
+        let mut so_magic = vec![b'x'; 300];
+        so_magic[300 - FOOTER_LEN..300 - FOOTER_LEN + 4].copy_from_slice(&FOOTER_MAGIC);
+        let mut imagem_inteira = vec![b'x'; 300];
+        imagem_inteira[300 - FOOTER_LEN..].copy_from_slice(&imagem);
+
+        for (nome, ultimo) in [("magic", so_magic), ("imagem", imagem_inteira)] {
+            let path = dir.path().join(format!("{nome}.active.hrkl"));
+            let mut w = RawSegmentWriter::create(&path, init).unwrap();
+            w.append(0, 1, b"primeiro", &h(1)).unwrap();
+            w.append(1, 2, &ultimo, &h(2)).unwrap();
+            w.sync().unwrap();
+            drop(w);
+            let tamanho = std::fs::metadata(&path).unwrap().len();
+
+            let scan = scan_raw_segment(&path).unwrap();
+            assert_eq!(scan.records.len(), 2, "{nome}");
+            assert!(scan.footer.is_none() && scan.torn_at.is_none(), "{nome}");
+            assert!(
+                read_sealing_footer(&path).unwrap().is_none(),
+                "{nome}: footer dentro de um registo nao sela a cauda"
+            );
+            assert_eq!(
+                repair_active_tail(&path).unwrap(),
+                None,
+                "{nome}: cauda integra recusada no arranque"
+            );
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), tamanho);
+        }
+    }
+
+    /// Contraprova: com uma cauda rasgada DEPOIS de um segmento selado cujo
+    /// footer começa numa fronteira de registo além do rasgo, a recusa
+    /// mantém-se (o footer verdadeiro começa sempre em `>= torn_at`).
+    #[test]
+    fn footer_verdadeiro_alem_do_rasgo_continua_a_ser_recusado() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("12.active.hrkl");
+        let init = SegmentInit {
+            segment_id: 12,
+            created_hlc: 1,
+            first_lsn: 0,
+            writer_epoch: 1,
+            storage_namespace_id: [7u8; 16],
+        };
+        let mut w = RawSegmentWriter::create(&path, init).unwrap();
+        w.append(0, 1, b"primeiro registo", &h(1)).unwrap();
+        w.append(1, 2, b"segundo registo", &h(2)).unwrap();
+        w.seal().unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[FILE_HEADER_LEN + 30] ^= 0xFF; // payload do 1.º registo
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert!(read_sealing_footer(&path).unwrap().is_none());
+        assert!(repair_active_tail(&path).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), bytes.len() as u64);
     }
 }

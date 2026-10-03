@@ -43,8 +43,8 @@ use super::manifest::{
 use super::packed::{open_packed, PackOptions, ScanCounters};
 use super::packer::{pack_segment, PackOutcome};
 use super::raw::{
-    find_raw_record, percorrer_raw_segmento, read_footer, repair_active_tail, scan_raw_segment,
-    ControloVarredura, RawSegmentWriter, SegmentInit,
+    find_raw_record, percorrer_raw_segmento, read_footer, read_sealing_footer, repair_active_tail,
+    scan_raw_segment, ControloVarredura, RawSegmentWriter, SegmentInit,
 };
 use super::receipts::{persist_pack_receipt, physical_digest_of_file};
 use super::verify::{verify_segment as verify_segment_file, IntegrityLevel, VerifyReport};
@@ -457,7 +457,12 @@ impl V6Log {
         if let Some((id, path)) = active_from_disk.as_ref() {
             let header = read_v6_header(path)?;
             check_header_identity(&header, *id, namespace, PhysicalLayout::Raw)?;
-            if read_footer(path)?.is_some() {
+            // `read_sealing_footer` e não `read_footer`: os últimos 128 bytes de
+            // uma cauda activa podem ser payload do cliente com uma imagem de
+            // footer válida lá dentro. Renomear nesse caso deixava um RAW que
+            // nenhum arranque seguinte consegue reconciliar (auditoria
+            // recursiva 2026-10-03, iteração 1).
+            if read_sealing_footer(path)?.is_some() {
                 let final_path = raw_path(&segments_dir, *id);
                 if final_path.exists() {
                     return Err(corrupt(
