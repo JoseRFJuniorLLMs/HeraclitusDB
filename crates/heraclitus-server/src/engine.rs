@@ -1770,7 +1770,10 @@ impl Engine {
     /// resultado diz `amostrado: true` — uma distribuicao calculada sobre parte
     /// dos dados nao pode ser apresentada como se fosse sobre todos.
     pub fn fonte_detalhe(&self, agente: &str, amostra_max: usize) -> serde_json::Value {
-        let lsns: Vec<Lsn> = self.attr.read().unwrap().lookup("_agent", agente).to_vec();
+        let (lsns, varrido) = match self.lsns_do_agente(agente) {
+            Ok(r) => r,
+            Err(e) => return serde_json::json!({ "agente": agente, "error": e.to_string() }),
+        };
         let total = lsns.len();
         // Amostra pelas pontas: os mais RECENTES importam mais para saber o que
         // a fonte faz agora, mas os primeiros mostram como comecou.
@@ -1825,7 +1828,48 @@ impl Engine {
             "principais": principais,
             "sessoes": sessoes.len(),
             "bytes_medios": bytes.checked_div(n).unwrap_or(0),
+            "via_varrimento": varrido,
         })
+    }
+
+    /// LSNs dos eventos cujo `agent_id` é EXATAMENTE `agent_id`, e se vieram
+    /// de um varrimento do log (`true`) em vez do índice `_agent` (`false`).
+    ///
+    /// Auditoria recursiva 2026-10-03, iteração 1: `titular` e
+    /// `fonte_detalhe` liam só `lookup("_agent", ..)`. O índice deixa de fora
+    /// `agent_id` acima de 80 bytes (o *ingest* aceita qualquer comprimento)
+    /// e guarda-os aparados, por isso um titular com id comprido — como o
+    /// `titular:hmac-sha256:<64 hex>` do próprio projeto — saía com 0 eventos
+    /// e `indexado: true`: a declaração falsa "não temos nada sobre si". Quando
+    /// o índice não PODE ter a resposta, varre-se o log. É caro (um passe ao
+    /// log inteiro), mas é a única resposta verdadeira, e só acontece para ids
+    /// que o índice não guarda.
+    ///
+    /// O varrimento aplica os MESMOS filtros que o caminho do índice (sem
+    /// frames H-VM, sem `AgentEvidence`) para as duas vias contarem o mesmo.
+    fn lsns_do_agente(&self, agent_id: &str) -> Result<(Vec<Lsn>, bool), HeraclitusError> {
+        if heraclitus_index_attr::agente_indexavel(agent_id) {
+            let attr = self.attr.read().unwrap();
+            return Ok((attr.lookup("_agent", agent_id).to_vec(), false));
+        }
+        let head = self.log.head();
+        let mut lsns = Vec::new();
+        let mut cur = 0u64;
+        while cur < head {
+            let lote = self.log.scan_capped(cur, head, 20_000)?;
+            let Some(&(ultimo, _)) = lote.last() else {
+                break;
+            };
+            for (lsn, ep) in &lote {
+                let agent_evidence =
+                    matches!(&ep.kind, EventKind::Custom(k) if k == "AgentEvidence");
+                if ep.agent_id == agent_id && !agent_evidence && !vm_bridge::is_hvm(ep) {
+                    lsns.push(*lsn);
+                }
+            }
+            cur = ultimo + 1;
+        }
+        Ok((lsns, true))
     }
 
     /// Campos indexados e a cardinalidade de cada um.
@@ -2049,9 +2093,17 @@ impl Engine {
     /// devolver zero eventos e deixar alguém concluir que não há dados
     /// nenhuns sobre a pessoa. Nesse caso, `rebuild` resolve.
     pub fn titular(&self, agent_id: &str, limite: usize) -> serde_json::Value {
-        let lsns: Vec<Lsn> = {
-            let attr = self.attr.read().unwrap();
-            attr.lookup("_agent", agent_id).to_vec()
+        // Um erro de leitura no varrimento NÃO pode virar "0 eventos" (LGPD
+        // art. 18): sai como erro, com `indexado: false`.
+        let (lsns, varrido) = match self.lsns_do_agente(agent_id) {
+            Ok(r) => r,
+            Err(e) => {
+                return serde_json::json!({
+                    "titular": agent_id,
+                    "indexado": false,
+                    "error": e.to_string(),
+                })
+            }
         };
         // O índice conhece o campo `_agent`? Se não conhecer, foi construído
         // antes desta funcionalidade — e aí "0 eventos" NÃO é uma resposta, é
@@ -2112,7 +2164,12 @@ impl Engine {
             // recursiva 2026-10-03, iteração 1: antes saía `true` com uma
             // contagem por baixo). A contagem acima não é de confiança; um
             // arranque normal resolve.
-            "indexado": agentes_indexados > 0 && !self.attr_incompleto(),
+            //
+            // Com `via_varrimento: true` a contagem saiu do próprio log (id que
+            // o índice não guarda — auditoria recursiva 2026-10-03, iteração
+            // 1) e não depende do estado do índice: é de confiança.
+            "indexado": varrido || (agentes_indexados > 0 && !self.attr_incompleto()),
+            "via_varrimento": varrido,
             "agentes_indexados": agentes_indexados,
             "amostra": amostra,
         })
@@ -3936,6 +3993,53 @@ mod tests {
         // E por rótulo.
         let v = heraclitus_query::execute("MATCH (n:LegalHold) RETURN n", engine.as_ref()).unwrap();
         assert_eq!(v.as_array().map(|a| a.len()), Some(1), "{v}");
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 1: um `agent_id` acima de 80
+    /// bytes (o formato `titular:hmac-sha256:<64 hex>` tem 84) não entra no
+    /// índice `_agent`, e `titular` respondia 0 eventos com `indexado: true` —
+    /// "não temos nada sobre si" para quem tem dados no log.
+    #[test]
+    fn titular_com_id_fora_do_indice_conta_os_eventos_do_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path());
+        // Outra fonte, de id curto: põe `agentes_indexados > 0`.
+        engine
+            .append(Episode::new("ana", EventKind::Observation, b"x".to_vec()))
+            .unwrap();
+        let longo = format!("titular:hmac-sha256:{}", "ab".repeat(32));
+        assert!(longo.len() > 80, "montagem: o id tem de exceder o limite");
+        for i in 0..3 {
+            engine
+                .append(Episode::new(
+                    longo.as_str(),
+                    EventKind::Custom("Consulta".into()),
+                    format!("registo {i}").into_bytes(),
+                ))
+                .unwrap();
+        }
+        // Mesmo titular com espaço à volta: é OUTRO agent_id e não conta.
+        engine
+            .append(Episode::new(
+                format!(" {longo}").as_str(),
+                EventKind::Observation,
+                b"y".to_vec(),
+            ))
+            .unwrap();
+
+        let t = engine.titular(&longo, 10);
+        assert_eq!(t["eventos"], 3, "titular com id longo: {t}");
+        assert_eq!(t["tipos"]["Consulta"], 3, "{t}");
+        assert_eq!(t["indexado"], true, "{t}");
+        assert_eq!(t["amostra"].as_array().map(|a| a.len()), Some(3), "{t}");
+
+        let f = engine.fonte_detalhe(&longo, 10);
+        assert_eq!(f["eventos"], 3, "fonte_detalhe com id longo: {f}");
+
+        // O caminho do índice continua a servir os ids curtos.
+        let curto = engine.titular("ana", 10);
+        assert_eq!(curto["eventos"], 1, "{curto}");
+        assert_eq!(curto["via_varrimento"], false, "{curto}");
     }
 
     /// Auditoria recursiva 2026-10-03, iteração 1: `AgentEvidence` nunca entra

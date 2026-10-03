@@ -95,6 +95,22 @@ pub fn valor_indexavel(valor: &str) -> bool {
     v.len() <= MAX_VALUE_LEN && !SKIP_VALUES.iter().any(|s| s.eq_ignore_ascii_case(v))
 }
 
+/// O índice tem um posting `_agent` guardado EXATAMENTE com esta grafia de
+/// `agent_id`? Se NÃO, `lookup("_agent", agent_id)` devolve vazio mesmo com
+/// eventos desse titular no log — e quem pergunta tem de varrer.
+///
+/// Auditoria recursiva 2026-10-03, iteração 1: o *ingest* não limita o
+/// comprimento do `agent_id`, mas o `apply` só indexa `_agent` até
+/// `MAX_VALUE_LEN` bytes, e guarda o valor aparado. Um titular no formato de
+/// pseudonimização do próprio projeto (`titular:hmac-sha256:<64 hex>`, 84
+/// bytes) ficava fora do índice e o `GET /titular/<id>` respondia "0 eventos"
+/// com `indexado: true`. Usa o MESMO limite que o `apply`, para o `Engine` e
+/// o índice nunca divergirem sobre o que lá está.
+pub fn agente_indexavel(agent_id: &str) -> bool {
+    let a = agent_id.trim();
+    a == agent_id && !a.is_empty() && a.len() <= MAX_VALUE_LEN
+}
+
 /// Atributo reservado onde o `Engine` grava a chave de idempotência de um
 /// `Append` (o `Engine` reexporta esta constante como `IDEMPOTENCY_KEY_ATTR`).
 ///
