@@ -2476,8 +2476,9 @@ impl Engine {
     ///
     /// Legal holds are resolved from their append-only events, not only from
     /// sealed-segment HRKM flags, so a hold also protects an active tail that
-    /// has not sealed yet. Regulatory `PreventDestruction`, protected retention
-    /// classes and non-public classification independently veto the operation.
+    /// has not sealed yet. Regulatory `PreventDestruction`, an unexpired
+    /// regulatory `RetainForSeconds` window, protected retention classes and
+    /// non-public classification independently veto the operation.
     fn ensure_crypto_shred_allowed(&self, agent_id: &str) -> Result<(), HeraclitusError> {
         let head = self.log.head();
         let state = RegulatoryState::replay(self.log.as_ref(), head).map_err(|error| {
@@ -2497,6 +2498,50 @@ impl Engine {
                 "crypto-shred bloqueado pela decisão regulatória {}",
                 record.decision.decision_id
             )));
+        }
+        // `RetainForSeconds` é uma obrigação de retenção mínima (o dashboard
+        // conta-a como "Retention Exception" ao lado de `PreventDestruction`)
+        // e a SPEC-0046 §34 manda o crypto-shred respeitar as obrigações
+        // legais ANTES de destruir a chave. Antes só `PreventDestruction`
+        // vetava: uma avaliação persistida com retenção de um ano deixava o
+        // shred destruir a chave um minuto depois (auditoria recursiva
+        // 2026-10-03, iteração 2). A decisão não traz início de retenção
+        // explícito, por isso a janela ancora no carimbo com que o log gravou
+        // a própria avaliação: a obrigação nunca começa DEPOIS de ser
+        // registada, logo a âncora só pode sobre-proteger (fail-closed).
+        // Avaliação ilegível ou sem carimbo também veta.
+        let agora_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        for record in state
+            .decisions
+            .iter()
+            .filter(|record| record.decision.context.subject_id == agent_id)
+        {
+            let Some(segundos) = record
+                .decision
+                .requirements
+                .iter()
+                .filter_map(|requirement| match requirement.effect {
+                    RequirementEffect::RetainForSeconds { seconds } => Some(seconds),
+                    _ => None,
+                })
+                .max()
+            else {
+                continue;
+            };
+            let expirada = self
+                .ts_ms(record.lsn)
+                .filter(|registada_ms| *registada_ms != 0)
+                .is_some_and(|registada_ms| {
+                    agora_ms >= registada_ms.saturating_add(segundos.saturating_mul(1000))
+                });
+            if !expirada {
+                return Err(HeraclitusError::Config(format!(
+                    "crypto-shred bloqueado pela retenção de {segundos}s da decisão regulatória {}",
+                    record.decision.decision_id
+                )));
+            }
         }
 
         let active_holds: Vec<_> = state
@@ -6506,6 +6551,109 @@ mod regulatory_entrypoint_tests {
         assert!(
             engine.shred(subject).is_err(),
             "a decisão persistida precisa bloquear a destruição real"
+        );
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 2: uma decisão persistida com
+    /// `RetainForSeconds` era ignorada pelo gate do crypto-shred (só
+    /// `PreventDestruction` vetava), e a chave do titular era destruída dentro
+    /// da janela de retenção. A retenção tem de vetar enquanto a janela
+    /// (ancorada no carimbo da avaliação) não expirar, e deixar de vetar
+    /// depois dela — senão a decisão append-only bloquearia para sempre.
+    #[test]
+    fn retencao_regulatoria_bloqueia_crypto_shred_ate_expirar() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            encryption_at_rest: true,
+            ..Default::default()
+        };
+        let engine = Arc::new(Engine::open(&cfg).unwrap());
+        let longa = "agent-7";
+        let curta = "agent-8";
+        for (agente, kind) in [(longa, "IncidentRecord"), (curta, "ShortIncident")] {
+            engine
+                .append(Episode::new(
+                    agente,
+                    EventKind::Custom(kind.into()),
+                    b"incident evidence".to_vec(),
+                ))
+                .unwrap();
+        }
+        let regra = |rule_id: &str, kind: &str, seconds: u64| RegulatoryRule {
+            rule_id: rule_id.into(),
+            predicate: CompliancePredicate {
+                event_kind: Some(kind.into()),
+                retention_class: Some(RetentionClass::IncidentEvidence),
+                attr_equals: BTreeMap::new(),
+            },
+            requirements: vec![ComplianceRequirement {
+                requirement_id: format!("retain-{rule_id}"),
+                legal_basis: "GSI/PR IN 1".into(),
+                effect: RequirementEffect::RetainForSeconds { seconds },
+            }],
+        };
+        let policy = ConfiguredRegulatoryPolicy::new(
+            "gov-br-retention",
+            "2026.1",
+            0,
+            vec![
+                regra("incident-evidence", "IncidentRecord", 31_536_000),
+                regra("short-evidence", "ShortIncident", 1),
+            ],
+        )
+        .unwrap();
+        let activation = PolicyActivation {
+            policy,
+            activated_by: "dpo@example.test".into(),
+            approval_ref: "change-0046".into(),
+        };
+        let (ok, message) = crate::grpc::regulatory_policy_op(
+            &engine,
+            "regulatory-policy-activate",
+            &serde_json::to_string(&activation).unwrap(),
+        );
+        assert!(ok, "{message}");
+        for (agente, kind) in [(longa, "IncidentRecord"), (curta, "ShortIncident")] {
+            let context = ComplianceContext {
+                subject_id: agente.into(),
+                event_kind: kind.into(),
+                attrs: BTreeMap::new(),
+                retention_class: RetentionClass::IncidentEvidence,
+                effective_at: 0,
+                as_of_lsn: engine.log.head().saturating_sub(1),
+            };
+            let request = serde_json::json!({
+                "policy_id": "gov-br-retention",
+                "context": context,
+            });
+            let (ok, decision) = crate::grpc::regulatory_policy_op(
+                &engine,
+                "regulatory-evaluate",
+                &request.to_string(),
+            );
+            assert!(ok, "{decision}");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&decision).unwrap()["decision"]
+                    ["requirements"][0]["effect"]["effect"],
+                "retain_for_seconds"
+            );
+        }
+
+        let erro = engine
+            .shred(longa)
+            .expect_err("a retenção de um ano tem de bloquear o crypto-shred");
+        assert!(erro.to_string().contains("retenção"), "{erro}");
+
+        std::thread::sleep(std::time::Duration::from_millis(1_200));
+        assert!(
+            engine.shred(curta).unwrap(),
+            "expirada a janela, a retenção deixa de vetar"
+        );
+        assert!(
+            engine.shred(longa).is_err(),
+            "a retenção longa continua a vetar"
         );
     }
 
