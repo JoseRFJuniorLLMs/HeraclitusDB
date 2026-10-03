@@ -113,6 +113,66 @@ mod tests {
         (dir, LogBackend::new(log))
     }
 
+    /// Top-k de `ORDER BY <campo> LIMIT k` (conferência de 2026-10-02): o
+    /// acumulador guarda ~2k candidatos e compacta periodicamente; o
+    /// resultado tem de ser IDÊNTICO ao da ordenação completa — incluindo
+    /// empates (desfeitos pela ordem de chegada), valores ausentes (NULL),
+    /// texto misturado com números e DESC.
+    #[test]
+    fn top_k_e_identico_a_ordenacao_completa() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(Log::open(dir.path(), 1 << 22, FsyncPolicy::Always).unwrap());
+        for i in 0..500u32 {
+            let mut e = Episode::new("a", EventKind::Observation, format!("e{i}").into_bytes());
+            match i % 7 {
+                0 => {} // sem o campo -> NULL
+                1 => {
+                    e.attrs.insert("score".into(), "texto".into());
+                }
+                _ => {
+                    // Muitos empates: só 13 valores distintos.
+                    e.attrs.insert("score".into(), ((i * 37) % 13).to_string());
+                }
+            }
+            log.append(e).unwrap();
+        }
+        let be = LogBackend::new(log);
+        let lsns = |gql: &str| -> Vec<u64> {
+            execute(gql, &be)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["lsn"].as_u64().unwrap())
+                .collect()
+        };
+        for dir in ["ASC", "DESC"] {
+            let completa = lsns(&format!("MATCH (n) RETURN n ORDER BY n.score {dir}"));
+            assert_eq!(completa.len(), 500);
+            for k in [0usize, 1, 3, 10, 64, 200, 499, 500, 600] {
+                let topk = lsns(&format!("MATCH (n) RETURN n ORDER BY n.score {dir} LIMIT {k}"));
+                assert_eq!(
+                    topk,
+                    completa[..k.min(500)].to_vec(),
+                    "ORDER BY n.score {dir} LIMIT {k}"
+                );
+            }
+        }
+        // E a ordenação completa é estável: entre empates, LSN crescente.
+        let completa = lsns("MATCH (n) RETURN n ORDER BY n.score ASC");
+        let score = |lsn: u64| -> Option<u32> {
+            match lsn % 7 {
+                0 | 1 => None,
+                _ => Some(((lsn as u32) * 37) % 13),
+            }
+        };
+        for par in completa.windows(2) {
+            if score(par[0]).is_some() && score(par[0]) == score(par[1]) {
+                assert!(par[0] < par[1], "empate fora da ordem de chegada: {par:?}");
+            }
+        }
+    }
+
     #[test]
     fn explain_works() {
         let s =

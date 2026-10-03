@@ -824,6 +824,126 @@ fn cmp_order(a: &Json, b: &Json) -> std::cmp::Ordering {
     }
 }
 
+/// Chave de ordenação de uma linha, calculada UMA vez.
+enum ChaveOrdem {
+    Json(Json),
+    Dist(f64),
+}
+
+fn chave_de(key: &OrderKey, l: Lsn, e: &Episode) -> ChaveOrdem {
+    match key {
+        OrderKey::Field(field) => ChaveOrdem::Json(field_of(l, e, field).unwrap_or(Json::Null)),
+        // Sem embedding vai para o fim (asc), como sempre foi.
+        OrderKey::Dist(kind, v) => ChaveOrdem::Dist(eval_dist(*kind, v, e).unwrap_or(f64::INFINITY)),
+    }
+}
+
+/// A MESMA ordem que o `sort_by` anterior: `cmp_order` para campos (R3),
+/// `total_cmp` para distâncias; DESC é a inversa.
+fn cmp_chave(a: &ChaveOrdem, b: &ChaveOrdem, asc: bool) -> std::cmp::Ordering {
+    let ord = match (a, b) {
+        (ChaveOrdem::Json(x), ChaveOrdem::Json(y)) => cmp_order(x, y),
+        (ChaveOrdem::Dist(x), ChaveOrdem::Dist(y)) => x.total_cmp(y),
+        // Uma só chave por consulta: nunca se misturam.
+        _ => std::cmp::Ordering::Equal,
+    };
+    if asc {
+        ord
+    } else {
+        ord.reverse()
+    }
+}
+
+/// Ordenação estável por chave pré-calculada, cortada nas primeiras `k`.
+fn ordenar_por_chave(
+    rows: Vec<(Lsn, Episode)>,
+    key: &OrderKey,
+    asc: bool,
+    k: usize,
+) -> Vec<(Lsn, Episode)> {
+    let chaves: Vec<ChaveOrdem> = rows.iter().map(|(l, e)| chave_de(key, *l, e)).collect();
+    let mut idx: Vec<usize> = (0..rows.len()).collect();
+    // `sort_by` é estável: empates mantêm a ordem de chegada.
+    idx.sort_by(|&a, &b| cmp_chave(&chaves[a], &chaves[b], asc));
+    idx.truncate(k);
+    let mut slots: Vec<Option<(Lsn, Episode)>> = rows.into_iter().map(Some).collect();
+    idx.into_iter().filter_map(|i| slots[i].take()).collect()
+}
+
+/// Acumula as linhas aceites de um MATCH. Em modo top-k guarda no máximo
+/// ~2k candidatos (com a chave e a ordem de chegada) e descarta os piores
+/// periodicamente; fora dele é um `Vec` simples. O tecto QUERY_SCAN_CAP conta
+/// linhas ACEITES nos dois modos — a mesma regra de antes.
+struct Acumulador<'k> {
+    topk: Option<(&'k OrderKey, bool, usize)>,
+    linhas: Vec<(Lsn, Episode)>,
+    chaves: Vec<(ChaveOrdem, usize)>,
+    aceites: usize,
+}
+
+impl<'k> Acumulador<'k> {
+    fn novo(topk: Option<(&'k OrderKey, bool, usize)>) -> Self {
+        Self {
+            topk,
+            linhas: Vec::new(),
+            chaves: Vec::new(),
+            aceites: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.linhas.len()
+    }
+
+    fn push(&mut self, l: Lsn, e: Episode) -> Result<(), HeraclitusError> {
+        if self.aceites == QUERY_SCAN_CAP {
+            return Err(HeraclitusError::Query(
+                "query materialization limit exceeded; no partial result returned".into(),
+            ));
+        }
+        self.aceites += 1;
+        if let Some((key, _, k)) = self.topk {
+            self.chaves.push((chave_de(key, l, &e), self.aceites));
+            self.linhas.push((l, e));
+            if self.linhas.len() >= k.saturating_mul(2).saturating_add(64) {
+                self.compactar();
+            }
+        } else {
+            self.linhas.push((l, e));
+        }
+        Ok(())
+    }
+
+    /// Fica só com as `k` melhores, já ordenadas (empate → chegada).
+    fn compactar(&mut self) {
+        let Some((_, asc, k)) = self.topk else {
+            return;
+        };
+        let chaves = std::mem::take(&mut self.chaves);
+        let linhas = std::mem::take(&mut self.linhas);
+        let mut idx: Vec<usize> = (0..linhas.len()).collect();
+        idx.sort_by(|&a, &b| {
+            cmp_chave(&chaves[a].0, &chaves[b].0, asc).then(chaves[a].1.cmp(&chaves[b].1))
+        });
+        idx.truncate(k);
+        let mut slots_l: Vec<Option<(Lsn, Episode)>> = linhas.into_iter().map(Some).collect();
+        let mut slots_c: Vec<Option<(ChaveOrdem, usize)>> = chaves.into_iter().map(Some).collect();
+        for i in idx {
+            if let (Some(l), Some(c)) = (slots_l[i].take(), slots_c[i].take()) {
+                self.linhas.push(l);
+                self.chaves.push(c);
+            }
+        }
+    }
+
+    fn terminar(mut self) -> Vec<(Lsn, Episode)> {
+        if self.topk.is_some() {
+            self.compactar();
+        }
+        self.linhas
+    }
+}
+
 /// Push a pattern-variable equality (`var = "x"` or `var.field = "x"`) from the
 /// WHERE clause down into the graph query. Returns the literal if found.
 /// Um `OR` desqualifica o pushdown (correção R1): a igualdade pode valer só
@@ -1287,37 +1407,51 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                 }
                 _ => (None, false),
             };
-            let mut rows: Vec<(Lsn, Episode)> = match fonte {
+            // TOP-K (auditoria GPT-SOL §5 / 2026-09-08, conferida em
+            // 2026-10-02): com `ORDER BY <campo> LIMIT k` (campo que não seja
+            // o LSN) materializavam-se até QUERY_SCAN_CAP = 250 000 episódios
+            // inteiros para ordenar e devolver `k`. O acumulador guarda no
+            // máximo ~2k candidatos e vai descartando os piores; a chave de
+            // ordenação é calculada UMA vez por linha (antes, `field_of` era
+            // recalculado dentro do comparador, O(n log n) vezes). Empates
+            // desfazem-se pela ordem de chegada — exactamente o que a ordenação
+            // estável fazia — e o tecto de linhas aceites mantém-se, para a
+            // latência do pior caso não mudar.
+            let ordem = order_by.as_ref().map(|(key, asc)| (key, *asc));
+            let topk = match (ordem, limit, tecto) {
+                (Some(o), Some(k), None) => Some((o.0, o.1, *k as usize)),
+                _ => None,
+            };
+            let mut acc = Acumulador::novo(topk);
+            match fonte {
                 Some(Fonte::Lsns(mut lsns)) => {
                     if inverter {
                         lsns.reverse();
                     }
-                    let mut out = Vec::new();
                     for l in lsns {
-                        if tecto.is_some_and(|k| out.len() >= k) {
+                        if tecto.is_some_and(|k| acc.len() >= k) {
                             break;
                         }
                         if let Some((l, e)) = be.read_lsn(l)? {
                             if aceita(l, &e) {
-                                if out.len() == QUERY_SCAN_CAP {
-                                    return Err(HeraclitusError::Query("query materialization limit exceeded; no partial result returned".into()));
-                                }
-                                out.push((l, e));
+                                acc.push(l, e)?;
                             }
                         }
                     }
-                    out
                 }
-                Some(Fonte::Linhas(linhas)) => crate::backend::complete_query_rows(
-                    linhas.into_iter().filter(|(l, e)| aceita(*l, e)).collect(),
-                )?,
+                Some(Fonte::Linhas(linhas)) => {
+                    for (l, e) in crate::backend::complete_query_rows(
+                        linhas.into_iter().filter(|(l, e)| aceita(*l, e)).collect(),
+                    )? {
+                        acc.push(l, e)?;
+                    }
+                }
                 None => {
                     // Page by LSN ranges, not by returned row count (shredded
                     // records leave holes). Every range has at most 4096 LSNs.
                     let (mut lo, mut hi) = lsn_window(conditions, bound);
-                    let mut out = Vec::new();
                     'pages: while lo < hi {
-                        if tecto.is_some_and(|k| out.len() >= k) {
+                        if tecto.is_some_and(|k| acc.len() >= k) {
                             break;
                         }
                         let (start, end) = if inverter {
@@ -1332,11 +1466,8 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                         }
                         for (lsn, episode) in page {
                             if aceita(lsn, &episode) {
-                                if out.len() == QUERY_SCAN_CAP {
-                                    return Err(HeraclitusError::Query("query materialization limit exceeded; no partial result returned".into()));
-                                }
-                                out.push((lsn, episode));
-                                if tecto.is_some_and(|k| out.len() >= k) {
+                                acc.push(lsn, episode)?;
+                                if tecto.is_some_and(|k| acc.len() >= k) {
                                     break 'pages;
                                 }
                             }
@@ -1347,33 +1478,14 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                             lo = end;
                         }
                     }
-                    out
                 }
-            };
-            if let Some((key, asc)) = order_by {
-                match key {
-                    // Correção R3: comparação numérica (com coerção) em vez de
-                    // comparar as representações string dos valores JSON.
-                    OrderKey::Field(field) => rows.sort_by(|(la, ea), (lb, eb)| {
-                        let a = field_of(*la, ea, field).unwrap_or(Json::Null);
-                        let b = field_of(*lb, eb, field).unwrap_or(Json::Null);
-                        let ord = cmp_order(&a, &b);
-                        if *asc {
-                            ord
-                        } else {
-                            ord.reverse()
-                        }
-                    }),
-                    // Ordenação numérica por distância; sem embedding vai para o fim.
-                    OrderKey::Dist(kind, v) => rows.sort_by(|(_, ea), (_, eb)| {
-                        let a = eval_dist(*kind, v, ea).unwrap_or(f64::INFINITY);
-                        let b = eval_dist(*kind, v, eb).unwrap_or(f64::INFINITY);
-                        if *asc {
-                            a.total_cmp(&b)
-                        } else {
-                            b.total_cmp(&a)
-                        }
-                    }),
+            }
+            let mut rows = acc.terminar();
+            // Sem top-k mas com ORDER BY (sem LIMIT): ordenação estável com a
+            // chave calculada uma vez por linha.
+            if topk.is_none() {
+                if let Some((key, asc)) = ordem {
+                    rows = ordenar_por_chave(rows, key, asc, usize::MAX);
                 }
             }
             if let Some(l) = limit {
