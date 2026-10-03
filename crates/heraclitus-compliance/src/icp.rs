@@ -854,7 +854,33 @@ impl IcpBrasilTimestampVerifier {
         // o erro do `.is_ok()` era engolido e o operador procurava a âncora
         // errada.
         let mut porque = String::new();
-        match self.procurar_ancora(&mut caminho, pool, &mut porque) {
+        // Auditoria recursiva 2026-10-03, iteração 2 — orçamento GLOBAL de
+        // verificações de assinatura para toda a procura. O backtracking só
+        // excluía o que já estava no caminho (DER igual), e um token com N ACs
+        // do mesmo nome e da mesma chave, distintas só no serial, fazia-o
+        // experimentar todas as ordenações: ~N!/(N-8)! verificações (≈3e11 com
+        // as 31 que o tecto deixa passar), antes de se olhar para a assinatura
+        // do carimbo — DoS sem precisar de ACT nenhuma. O tecto de
+        // certificados pressupunha custo linear; o orçamento torna-o verdade:
+        // cada nível pode experimentar o conjunto inteiro mais uma âncora, e
+        // nada além disso. Uma cadeia real (3–4 certificados, rollover
+        // incluído) gasta uma fracção disto.
+        let mut orcamento = Orcamento {
+            restante: pool
+                .len()
+                .saturating_add(1)
+                .saturating_mul(self.policy.max_chain_depth.saturating_add(1)),
+            esgotado: false,
+        };
+        let achou = self.procurar_ancora(&mut caminho, pool, &mut porque, &mut orcamento);
+        if orcamento.esgotado {
+            return Err(verify_err(format!(
+                "construção da cadeia excedeu o orçamento de verificações de assinatura \
+                 para {} certificados: o conjunto do token tem caminhos alternativos a mais",
+                pool.len()
+            )));
+        }
+        match achou {
             Some(c) => Ok(c),
             None => Err(verify_err(if porque.is_empty() {
                 format!(
@@ -875,7 +901,11 @@ impl IcpBrasilTimestampVerifier {
         caminho: &mut Vec<Certificate>,
         pool: &[Certificate],
         porque: &mut String,
+        orcamento: &mut Orcamento,
     ) -> Option<Cadeia> {
+        if orcamento.esgotado {
+            return None;
+        }
         if caminho.len() > self.policy.max_chain_depth {
             if porque.is_empty() {
                 *porque = format!(
@@ -891,6 +921,9 @@ impl IcpBrasilTimestampVerifier {
         // Uma âncora fecha a cadeia. Procura-se primeiro no trust store: se o
         // emissor é confiável, não interessa que o token traga uma cópia dele.
         for anchor in self.trust_store.anchors_for_issuer(&issuer_der) {
+            if !orcamento.gastar() {
+                return None;
+            }
             match verificar_emissao(&atual, &anchor.certificate, &self.policy.algoritmos) {
                 Ok(()) => {
                     return Some(Cadeia {
@@ -929,6 +962,9 @@ impl IcpBrasilTimestampVerifier {
                 }
                 continue;
             }
+            if !orcamento.gastar() {
+                return None;
+            }
             if let Err(e) = verificar_emissao(&atual, candidato, &self.policy.algoritmos) {
                 if porque.is_empty() {
                     *porque = e.to_string();
@@ -936,12 +972,35 @@ impl IcpBrasilTimestampVerifier {
                 continue;
             }
             caminho.push(candidato.clone());
-            if let Some(c) = self.procurar_ancora(caminho, pool, porque) {
+            if let Some(c) = self.procurar_ancora(caminho, pool, porque, orcamento) {
                 return Some(c);
             }
             caminho.pop();
+            if orcamento.esgotado {
+                return None;
+            }
         }
         None
+    }
+}
+
+/// Orçamento de verificações de assinatura de uma construção de cadeia
+/// (auditoria recursiva 2026-10-03, iteração 2). Esgotado, a procura pára em
+/// todos os níveis e a cadeia é recusada — nunca aceite por falta de esforço.
+struct Orcamento {
+    restante: usize,
+    esgotado: bool,
+}
+
+impl Orcamento {
+    /// Reserva uma verificação; `false` quando já não há orçamento.
+    fn gastar(&mut self) -> bool {
+        if self.restante == 0 {
+            self.esgotado = true;
+            return false;
+        }
+        self.restante -= 1;
+        true
     }
 }
 
@@ -1282,11 +1341,21 @@ fn verificar_assinatura(
     crate::algoritmos::verificar(cert, alg, mensagem, assinatura, politica)
 }
 
+// Auditoria recursiva 2026-10-03, iteração 2 — contador de verificações de
+// emissão, só nos testes: é a medida de esforço que prova que a construção da
+// cadeia deixou de ser exponencial, sem depender do relógio da máquina.
+#[cfg(test)]
+thread_local! {
+    static VERIFICACOES_EMISSAO: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn verificar_emissao(
     filho: &Certificate,
     emissor: &Certificate,
     politica: &crate::algoritmos::PoliticaAlgoritmos,
 ) -> Result<(), CompError> {
+    #[cfg(test)]
+    VERIFICACOES_EMISSAO.with(|c| c.set(c.get() + 1));
     let tbs = filho
         .tbs_certificate
         .to_der()
@@ -2807,6 +2876,66 @@ mod tests {
             .verify(&token, &imprint(), None, AGORA_MS)
             .unwrap_err();
         assert!(erro.to_string().contains("digestAlgorithms"), "{erro}");
+    }
+
+    fn verificacoes_emissao() -> usize {
+        VERIFICACOES_EMISSAO.with(|c| c.get())
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 2. Seis ACs com o mesmo nome e
+    /// a mesma chave bastavam para o backtracking experimentar todas as
+    /// ordenações: ~2000 verificações de assinatura (e ~3e11 com as 31 que o
+    /// tecto de certificados deixa passar). Com o orçamento, o esforço fica
+    /// linear no tamanho do conjunto e a cadeia é recusada.
+    #[test]
+    fn um_ninho_de_acs_com_a_mesma_chave_nao_torna_a_cadeia_exponencial() {
+        let (ninho, resto) = test_pki::ninho_de_acs_com_a_mesma_chave(6);
+        let mut pool = vec![ninho.tsa.clone(), ninho.root.clone()];
+        pool.extend(resto);
+        let v = verificador(&test_pki::chain_de_teste());
+
+        let antes = verificacoes_emissao();
+        let resultado = v.construir_cadeia(&ninho.tsa, &pool);
+        let gastas = verificacoes_emissao() - antes;
+
+        let erro = resultado.err().expect("o ninho não chega a nenhuma âncora");
+        assert!(erro.to_string().contains("orçamento"), "{erro}");
+        let teto = (pool.len() + 1) * (TimestampValidationPolicy::default().max_chain_depth + 1);
+        assert!(
+            gastas <= teto,
+            "{gastas} verificações de emissão para um conjunto de {} certificados (teto {teto})",
+            pool.len()
+        );
+    }
+
+    /// O mesmo ataque pelo caminho real, com o conjunto no tecto (folha + 31
+    /// ACs): sem o orçamento, `verify` não regressava — e tudo isto antes de se
+    /// olhar para a assinatura do carimbo, portanto sem ACT nenhuma.
+    #[test]
+    fn um_token_com_31_acs_sosias_e_recusado_sem_esforco_exponencial() {
+        let (ninho, resto) = test_pki::ninho_de_acs_com_a_mesma_chave(31);
+        let token = test_pki::token_de_teste(
+            &ninho,
+            &imprint(),
+            AGORA_S,
+            None,
+            OpcoesToken {
+                certs_extra: resto,
+                ..Default::default()
+            },
+        );
+        let v = verificador(&test_pki::chain_de_teste());
+
+        let antes = verificacoes_emissao();
+        let erro = v.verify(&token, &imprint(), None, AGORA_MS).unwrap_err();
+        let gastas = verificacoes_emissao() - antes;
+
+        assert!(erro.to_string().contains("orçamento"), "{erro}");
+        let teto = 33 * (TimestampValidationPolicy::default().max_chain_depth + 1);
+        assert!(
+            gastas <= teto,
+            "{gastas} verificações de emissão (teto {teto})"
+        );
     }
 }
 

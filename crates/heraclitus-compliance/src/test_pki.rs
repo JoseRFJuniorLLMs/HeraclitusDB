@@ -858,6 +858,84 @@ pub fn sosia_do_intermedio(c: &CadeiaTresNiveis) -> Certificate {
     sb.build::<DerSignature>().expect("assinar sosia")
 }
 
+/// Um ninho de `n` certificados de AC com o MESMO sujeito (`CN=Ninho`), o
+/// mesmo emissor e a MESMA chave, todos auto-emitidos e distintos só no
+/// serial, mais uma folha de ACT emitida por esse nome com essa chave.
+///
+/// Auditoria recursiva 2026-10-03, iteração 2: é o token que um atacante
+/// monta sem precisar de nenhuma ACT. Cada AC do ninho é um emissor válido de
+/// qualquer outra, o nome não bate com nenhuma âncora, e a construção da
+/// cadeia com backtracking tentava TODAS as ordenações — da ordem de
+/// `n!/(n-8)!` verificações de assinatura antes de olhar sequer para a
+/// assinatura do próprio carimbo.
+///
+/// Devolve a cadeia (a folha em `tsa`, a primeira AC em `root`) e as restantes
+/// ACs, para irem em `OpcoesToken::certs_extra`.
+pub fn ninho_de_acs_com_a_mesma_chave(n: u32) -> (Chain, Vec<Certificate>) {
+    assert!(n >= 1, "o ninho precisa de pelo menos uma AC");
+    let key = chave(61);
+    let spki = || SubjectPublicKeyInfoOwned::from_key(*key.verifying_key()).expect("spki ninho");
+    let acs: Vec<Certificate> = (0..n)
+        .map(|i| {
+            CertificateBuilder::new(
+                Profile::SubCA {
+                    issuer: nome("Ninho"),
+                    path_len_constraint: None,
+                },
+                SerialNumber::from(1_000u32 + i),
+                validade_larga(),
+                nome("Ninho"),
+                spki(),
+                &key,
+            )
+            .expect("builder AC do ninho")
+            .build::<DerSignature>()
+            .expect("assinar AC do ninho")
+        })
+        .collect();
+
+    let mut fb = CertificateBuilder::new(
+        Profile::Leaf {
+            issuer: nome("Ninho"),
+            enable_key_agreement: false,
+            enable_key_encipherment: false,
+        },
+        SerialNumber::from(999u32),
+        validade_larga(),
+        nome("ACT do Ninho"),
+        spki(),
+        &key,
+    )
+    .expect("builder folha do ninho");
+    fb.add_extension(&ExtendedKeyUsage(vec![ID_KP_TIME_STAMPING]))
+        .expect("eku");
+    let folha: Certificate = fb.build::<DerSignature>().expect("assinar folha do ninho");
+    let folha_der = folha.to_der().expect("der folha do ninho");
+
+    let mut resto = acs;
+    let primeira = resto.remove(0);
+    let primeira_der = primeira.to_der().expect("der AC do ninho");
+    let subject_der = primeira
+        .tbs_certificate
+        .subject
+        .to_der()
+        .expect("subject der");
+    (
+        Chain {
+            root_key: key.clone(),
+            root: primeira,
+            root_der: primeira_der,
+            root_subject_der: subject_der,
+            tsa_key: key,
+            tsa: folha,
+            tsa_der: folha_der,
+            rsa_folha: None,
+            rsa_digest: None,
+        },
+        resto,
+    )
+}
+
 /// `extendedKeyUsage` forcado a NAO critico. O builder decide a criticidade
 /// sozinho (critico quando nao ha `anyExtendedKeyUsage`), portanto a unica
 /// forma de produzir o caso nao conforme e envolver o tipo.
