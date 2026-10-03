@@ -881,6 +881,28 @@ impl AttrIndex {
     /// Auditoria 2026-09-05, vaga 2 (R90).
     pub fn open_reportando(dir: impl AsRef<Path>) -> (Self, AberturaCheckpoint) {
         let path = dir.as_ref().join(SNAPSHOT_FILE);
+        // Formato corrente: CRC e descodificação em streaming, sem ler o
+        // ficheiro inteiro para memória (boot.md "streaming restore",
+        // conferido em 2026-10-02 — o ficheiro e o índice descodificado
+        // coexistiam em RAM no arranque). `None` = não é o formato corrente:
+        // cai no caminho de compatibilidade abaixo, que só corre uma vez.
+        match Self::abrir_corrente_em_streaming(&path) {
+            Ok(Some(Some(inner))) => {
+                return (
+                    AttrIndex {
+                        inner,
+                        dirty: Default::default(),
+                    },
+                    AberturaCheckpoint::Carregado,
+                )
+            }
+            Ok(Some(None)) => return (AttrIndex::new(), AberturaCheckpoint::Ilegivel),
+            Ok(None) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return (AttrIndex::new(), AberturaCheckpoint::Ausente)
+            }
+            Err(e) => return (AttrIndex::new(), AberturaCheckpoint::ErroIo(e.to_string())),
+        }
         match std::fs::read(&path) {
             Ok(bytes) => {
                 // v2 (comprimido) traz magic; v1 (bincode cru) não. Ler os dois
@@ -1226,6 +1248,49 @@ impl AttrIndex {
 
     pub fn is_empty(&self) -> bool {
         self.inner.exact.is_empty()
+    }
+
+    /// Lê um checkpoint no formato CORRENTE (magic + v6 + CRC) em duas
+    /// passagens de streaming: primeiro o CRC (R89: verificado ANTES de
+    /// descodificar), depois a descodificação. `Ok(None)` = outro formato;
+    /// `Ok(Some(None))` = formato corrente mas recusado (CRC/corpo).
+    #[allow(clippy::type_complexity)]
+    fn abrir_corrente_em_streaming(
+        path: &Path,
+    ) -> std::io::Result<Option<Option<ResidentSnapshot>>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(path)?;
+        let mut cabeca = [0u8; CABECALHO_V6];
+        if f.read_exact(&mut cabeca).is_err()
+            || &cabeca[..4] != MAGIC_V2
+            || u16::from_le_bytes([cabeca[4], cabeca[5]]) != FORMAT_CURRENT
+        {
+            return Ok(None);
+        }
+        let crc_lido = u32::from_le_bytes([cabeca[6], cabeca[7], cabeca[8], cabeca[9]]);
+        // O CRC cobre `versão || corpo`, como na escrita.
+        let mut crc = !crc32_ieee(&[&cabeca[4..6]]);
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = f.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            for &byte in &buf[..n] {
+                crc = TABELA_CRC32[((crc ^ byte as u32) & 0xff) as usize] ^ (crc >> 8);
+            }
+        }
+        drop(buf);
+        if !crc != crc_lido {
+            return Ok(Some(None));
+        }
+        f.seek(SeekFrom::Start(CABECALHO_V6 as u64))?;
+        let mut r = std::io::BufReader::with_capacity(1 << 20, f);
+        Ok(Some(
+            bincode::serde::decode_from_std_read::<CompressedSnapshot, _, _>(&mut r, BINCODE_CFG)
+                .ok()
+                .and_then(|snapshot| snapshot.expand()),
+        ))
     }
 
     /// `true` se houve `apply`/`reset` desde o último `save` bem-sucedido.
