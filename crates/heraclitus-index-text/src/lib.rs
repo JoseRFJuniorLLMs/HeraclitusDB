@@ -648,8 +648,10 @@ impl TextIndex {
     }
 }
 
-/// Snapshot serializável do índice (fast boot): `by_event` é reconstruído de
-/// `ids` no restore, por isso não é persistido.
+/// Layout ANTIGO do checkpoint (até 2026-10-02), que o leitor
+/// `TextoRestaurado` continua a aceitar. Só os testes o gravam, para provar essa
+/// compatibilidade.
+#[cfg(test)]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct TextSnapshot {
     postings: HashMap<String, Vec<(u32, u32)>>,
@@ -660,8 +662,8 @@ struct TextSnapshot {
     watermark: Lsn,
 }
 
-// Encode the legacy map layout one posting list at a time. Resident
-// compressed postings and document arrays are never cloned together.
+// Pares `(doc, tf)` de uma posting, codificados um a um a partir da lista
+// comprimida residente (sem a expandir para um `Vec`).
 struct PostingPairsRef<'a>(&'a PostingList);
 impl serde::Serialize for PostingPairsRef<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -673,25 +675,250 @@ impl serde::Serialize for PostingPairsRef<'_> {
         seq.end()
     }
 }
-struct PostingSnapshotRef<'a>(&'a TextIndex);
-impl serde::Serialize for PostingSnapshotRef<'_> {
+
+// ── Checkpoint v2 (conferência de 2026-10-02, boot.md P2 "compact text") ──
+//
+// O restauro do formato antigo tinha TRÊS cópias das postings em RAM no pico:
+// o `HashMap<String, Vec<(u32, u32)>>` expandido descodificado, o `Vec`
+// ordenado feito a partir dele, e as `PostingList` comprimidas a serem
+// construídas — num índice cujo checkpoint chegou a 4,4 GB. A causa é a
+// ordem dos campos: as postings vinham PRIMEIRO e o `doc_len` (de que a
+// compressão precisa) só depois, portanto nada podia ser comprimido antes de
+// tudo estar expandido em memória.
+//
+// O v2 grava os arrays por documento primeiro e as postings por ordem de
+// termo; o leitor constrói cada `PostingList` comprimida à medida que lê os
+// pares, validando doc ids e ordem no caminho. Pico: o índice comprimido mais
+// um par de cada vez.
+//
+// O ficheiro continua a chamar-se `text.ckpt`, e a versão é distinguida pelo
+// conteúdo: o bincode é sequencial e codifica o comprimento de um mapa como
+// um u64 varint, logo o PRIMEIRO elemento de qualquer dos formatos é um u64 —
+// o magic v2, ou o número de termos do formato antigo (que nunca chega perto
+// do magic). Um só leitor serve os dois, sem dupla leitura nem avisos falsos.
+
+/// Primeiro elemento do checkpoint v2 ("HRKTXT02").
+const TEXT_CKPT_V2_MAGIC: u64 = 0x3230_5458_544B_5248;
+
+/// Postings do v2: sequência `(termo, pares)` por ordem crescente de termo.
+struct PostingsV2Ref<'a>(&'a TextIndex);
+impl serde::Serialize for PostingsV2Ref<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(self.0.terms.len()))?;
-        for (term, id) in &self.0.terms {
-            map.serialize_entry(term, &PostingPairsRef(&self.0.postings[*id as usize]))?;
+        use serde::ser::SerializeSeq;
+        let mut termos: Vec<(&String, &TermId)> = self.0.terms.iter().collect();
+        termos.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let mut seq = serializer.serialize_seq(Some(termos.len()))?;
+        for (termo, id) in termos {
+            seq.serialize_element(&(termo, PostingPairsRef(&self.0.postings[*id as usize])))?;
         }
-        map.end()
+        seq.end()
     }
 }
-#[derive(serde::Serialize)]
-struct TextSnapshotRef<'a> {
-    postings: PostingSnapshotRef<'a>,
-    doc_len: &'a [u32],
-    ids: &'a [EventId],
-    lsns: &'a [Lsn],
+
+struct TextSnapshotV2Ref<'a>(&'a TextIndex);
+impl serde::Serialize for TextSnapshotV2Ref<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeTuple;
+        let idx = self.0;
+        let mut t = serializer.serialize_tuple(7)?;
+        t.serialize_element(&TEXT_CKPT_V2_MAGIC)?;
+        t.serialize_element(&idx.doc_len)?;
+        t.serialize_element(&idx.ids)?;
+        t.serialize_element(&idx.lsns)?;
+        t.serialize_element(&idx.total_len)?;
+        t.serialize_element(&idx.watermark)?;
+        t.serialize_element(&PostingsV2Ref(idx))?;
+        t.end()
+    }
+}
+
+/// O que um checkpoint de texto (v2 ou antigo) descodifica.
+struct TextoRestaurado {
+    termos: Vec<(String, PostingList)>,
+    doc_len: Vec<u32>,
+    ids: Vec<EventId>,
+    lsns: Vec<Lsn>,
     total_len: u64,
     watermark: Lsn,
+}
+
+impl<'de> serde::Deserialize<'de> for TextoRestaurado {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = TextoRestaurado;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("checkpoint do índice de texto")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                use serde::de::Error;
+                let falta = || A::Error::custom("checkpoint de texto truncado");
+                let primeiro: u64 = seq.next_element()?.ok_or_else(falta)?;
+                if primeiro == TEXT_CKPT_V2_MAGIC {
+                    let doc_len: Vec<u32> = seq.next_element()?.ok_or_else(falta)?;
+                    let ids: Vec<EventId> = seq.next_element()?.ok_or_else(falta)?;
+                    let lsns: Vec<Lsn> = seq.next_element()?.ok_or_else(falta)?;
+                    let total_len: u64 = seq.next_element()?.ok_or_else(falta)?;
+                    let watermark: Lsn = seq.next_element()?.ok_or_else(falta)?;
+                    if ids.len() != doc_len.len() || lsns.len() != doc_len.len() {
+                        return Err(A::Error::custom("arrays por documento incoerentes"));
+                    }
+                    let termos = seq
+                        .next_element_seed(TermosSeed { doc_len: &doc_len })?
+                        .ok_or_else(falta)?;
+                    return Ok(TextoRestaurado {
+                        termos,
+                        doc_len,
+                        ids,
+                        lsns,
+                        total_len,
+                        watermark,
+                    });
+                }
+                // Formato antigo: `primeiro` é o comprimento do mapa
+                // `postings`; seguem-se as entradas e depois os arrays. As
+                // postings só se podem comprimir depois do `doc_len`, portanto
+                // aqui o pico antigo mantém-se — mas só uma vez: o checkpoint
+                // seguinte já é v2.
+                let mut expandidas: Vec<(String, Vec<(u32, u32)>)> =
+                    Vec::with_capacity((primeiro as usize).min(1 << 20));
+                for _ in 0..primeiro {
+                    expandidas.push(seq.next_element()?.ok_or_else(falta)?);
+                }
+                let doc_len: Vec<u32> = seq.next_element()?.ok_or_else(falta)?;
+                let ids: Vec<EventId> = seq.next_element()?.ok_or_else(falta)?;
+                let lsns: Vec<Lsn> = seq.next_element()?.ok_or_else(falta)?;
+                let total_len: u64 = seq.next_element()?.ok_or_else(falta)?;
+                let watermark: Lsn = seq.next_element()?.ok_or_else(falta)?;
+                let n_docs = ids.len();
+                if doc_len.len() != n_docs || lsns.len() != n_docs {
+                    return Err(A::Error::custom("arrays por documento incoerentes"));
+                }
+                if expandidas
+                    .iter()
+                    .flat_map(|(_, pares)| pares)
+                    .any(|(doc, _)| *doc as usize >= n_docs)
+                {
+                    return Err(A::Error::custom("posting com doc_id fora de intervalo"));
+                }
+                expandidas.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                let termos = expandidas
+                    .into_iter()
+                    .map(|(termo, pares)| (termo, PostingList::from_pairs(pares, &doc_len)))
+                    .collect();
+                Ok(TextoRestaurado {
+                    termos,
+                    doc_len,
+                    ids,
+                    lsns,
+                    total_len,
+                    watermark,
+                })
+            }
+        }
+        // `usize::MAX` elementos: o bincode é sequencial e não codifica a
+        // aridade de um tuplo; o visitor lê exactamente o que o formato tem.
+        d.deserialize_tuple(usize::MAX, V)
+    }
+}
+
+/// Sequência de termos do v2: cada um vira logo uma `PostingList` comprimida.
+struct TermosSeed<'a> {
+    doc_len: &'a [u32],
+}
+impl<'de> serde::de::DeserializeSeed<'de> for TermosSeed<'_> {
+    type Value = Vec<(String, PostingList)>;
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_seq(self)
+    }
+}
+impl<'de> serde::de::Visitor<'de> for TermosSeed<'_> {
+    type Value = Vec<(String, PostingList)>;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("postings v2")
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        use serde::de::Error;
+        let mut out: Vec<(String, PostingList)> =
+            Vec::with_capacity(seq.size_hint().unwrap_or(0).min(1 << 20));
+        while let Some(termo) = seq.next_element_seed(TermoSeed {
+            doc_len: self.doc_len,
+        })? {
+            // Termos estritamente crescentes (o escritor ordena): garante que
+            // não há termos repetidos e que os ids saem determinísticos.
+            if out.last().is_some_and(|(anterior, _)| anterior >= &termo.0) {
+                return Err(A::Error::custom("termos fora de ordem ou repetidos"));
+            }
+            out.push(termo);
+        }
+        Ok(out)
+    }
+}
+
+struct TermoSeed<'a> {
+    doc_len: &'a [u32],
+}
+impl<'de> serde::de::DeserializeSeed<'de> for TermoSeed<'_> {
+    type Value = (String, PostingList);
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_tuple(2, self)
+    }
+}
+impl<'de> serde::de::Visitor<'de> for TermoSeed<'_> {
+    type Value = (String, PostingList);
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("(termo, pares)")
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        use serde::de::Error;
+        let termo: String = seq
+            .next_element()?
+            .ok_or_else(|| A::Error::custom("termo em falta"))?;
+        let lista = seq
+            .next_element_seed(ParesSeed {
+                doc_len: self.doc_len,
+            })?
+            .ok_or_else(|| A::Error::custom("pares em falta"))?;
+        Ok((termo, lista))
+    }
+}
+
+/// Pares `(doc, tf)` de um termo, comprimidos à medida que chegam.
+struct ParesSeed<'a> {
+    doc_len: &'a [u32],
+}
+impl<'de> serde::de::DeserializeSeed<'de> for ParesSeed<'_> {
+    type Value = PostingList;
+    fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        d.deserialize_seq(self)
+    }
+}
+impl<'de> serde::de::Visitor<'de> for ParesSeed<'_> {
+    type Value = PostingList;
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("pares (doc, tf)")
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        use serde::de::Error;
+        let mut lista = PostingList::default();
+        while let Some((doc, tf)) = seq.next_element::<(u32, u32)>()? {
+            // COERÊNCIA antes de adoptar: um doc_id fora de intervalo não
+            // falhava aqui, falhava depois numa pesquisa que entra em pânico e
+            // envenena o lock do índice. Ordem estrita: o `push` comprime
+            // deltas e exige docs crescentes.
+            let Some(&dl) = self.doc_len.get(doc as usize) else {
+                return Err(A::Error::custom("posting com doc_id fora de intervalo"));
+            };
+            if lista.len > 0 && doc <= lista.last_doc {
+                return Err(A::Error::custom("posting fora de ordem"));
+            }
+            lista.push(doc, tf, dl);
+        }
+        Ok(lista)
+    }
 }
 
 impl View for TextIndex {
@@ -700,50 +927,23 @@ impl View for TextIndex {
     }
 
     fn checkpoint(&self, dir: &std::path::Path) -> Result<(), heraclitus_core::HeraclitusError> {
-        heraclitus_views::ckpt::save(
-            dir,
-            "text",
-            &TextSnapshotRef {
-                postings: PostingSnapshotRef(self),
-                doc_len: &self.doc_len,
-                ids: &self.ids,
-                lsns: &self.lsns,
-                total_len: self.total_len,
-                watermark: self.watermark,
-            },
-        )
+        heraclitus_views::ckpt::save(dir, "text", &TextSnapshotV2Ref(self))
     }
 
     fn restore(&mut self, dir: &std::path::Path) -> Result<bool, heraclitus_core::HeraclitusError> {
-        let Some(snap) = heraclitus_views::ckpt::load::<TextSnapshot>(dir, "text")? else {
+        // Um checkpoint que descodifica mas é incoerente é recusado DENTRO do
+        // leitor (erro de serde -> `None` -> rebuild): ver `ParesSeed`.
+        let Some(snap) = heraclitus_views::ckpt::load::<TextoRestaurado>(dir, "text")? else {
             return Ok(false);
         };
-        let TextSnapshot {
-            postings,
+        let TextoRestaurado {
+            termos,
             doc_len,
             ids,
             lsns,
             total_len,
             watermark,
         } = snap;
-        // COERÊNCIA antes de adoptar o checkpoint. Um checkpoint que descodifica
-        // mas é inconsistente — um `doc_id` numa posting além do número de
-        // documentos, ou os arrays por-documento com tamanhos diferentes — não
-        // falhava aqui: falhava DEPOIS, num índice fora de limites durante a
-        // pesquisa, que entra em pânico e ENVENENA o RwLock do índice (todas as
-        // pesquisas seguintes abortam). O contrato do checkpoint é degradar para
-        // rebuild quando é inutilizável; validar aqui honra-o.
-        let n_docs = ids.len();
-        if doc_len.len() != n_docs || lsns.len() != n_docs {
-            return Ok(false);
-        }
-        if postings
-            .values()
-            .flatten()
-            .any(|(doc_id, _tf)| *doc_id as usize >= n_docs)
-        {
-            return Ok(false);
-        }
         self.by_event = ids
             .iter()
             .enumerate()
@@ -751,12 +951,10 @@ impl View for TextIndex {
             .collect();
         self.terms.clear();
         self.postings.clear();
-        let mut ordered: Vec<(String, Vec<(u32, u32)>)> = postings.into_iter().collect();
-        ordered.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        for (term, pairs) in ordered {
+        for (termo, lista) in termos {
             let id = self.postings.len() as TermId;
-            self.terms.insert(term, id);
-            self.postings.push(PostingList::from_pairs(pairs, &doc_len));
+            self.terms.insert(termo, id);
+            self.postings.push(lista);
         }
         self.doc_len = doc_len;
         self.ids = ids;
@@ -1092,6 +1290,72 @@ mod testes_acumulador {
             );
         }
         assert!(restaurado.postings.iter().all(|p| !p.blocks.is_empty()));
+    }
+
+    /// Checkpoints gravados no layout ANTIGO (postings primeiro) continuam a
+    /// restaurar, com as mesmas respostas: o primeiro arranque depois da
+    /// actualização não pode forçar um rebuild integral.
+    #[test]
+    fn checkpoint_no_layout_antigo_continua_a_restaurar() {
+        let idx = corpus(300, 77);
+        let esperado = idx.search("rio fogo mudanca", 25);
+        let dir = tempfile::tempdir().unwrap();
+        let postings: HashMap<String, Vec<(u32, u32)>> = idx
+            .terms
+            .iter()
+            .map(|(t, id)| (t.clone(), idx.postings[*id as usize].pairs()))
+            .collect();
+        heraclitus_views::ckpt::save(
+            dir.path(),
+            "text",
+            &TextSnapshot {
+                postings,
+                doc_len: idx.doc_len.clone(),
+                ids: idx.ids.clone(),
+                lsns: idx.lsns.clone(),
+                total_len: idx.total_len,
+                watermark: idx.watermark,
+            },
+        )
+        .unwrap();
+        let mut restaurado = TextIndex::new();
+        assert!(restaurado.restore(dir.path()).unwrap());
+        let obtido = restaurado.search("rio fogo mudanca", 25);
+        assert_eq!(
+            esperado.iter().map(|h| (h.id, h.lsn, h.score.to_bits())).collect::<Vec<_>>(),
+            obtido.iter().map(|h| (h.id, h.lsn, h.score.to_bits())).collect::<Vec<_>>()
+        );
+        // E o checkpoint seguinte já sai no v2, que também restaura igual.
+        restaurado.checkpoint(dir.path()).unwrap();
+        let mut de_novo = TextIndex::new();
+        assert!(de_novo.restore(dir.path()).unwrap());
+        assert_eq!(de_novo.search("rio fogo mudanca", 25).len(), esperado.len());
+    }
+
+    /// v2 com uma posting fora de ordem (ou fora de intervalo) degrada para
+    /// rebuild em vez de construir uma lista comprimida inválida.
+    #[test]
+    fn checkpoint_v2_com_posting_fora_de_ordem_degrada() {
+        struct Envenenado;
+        impl serde::Serialize for Envenenado {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeTuple;
+                let mut t = s.serialize_tuple(7)?;
+                t.serialize_element(&TEXT_CKPT_V2_MAGIC)?;
+                t.serialize_element(&vec![1u32, 1, 1])?;
+                t.serialize_element(&vec![EventId::new(), EventId::new(), EventId::new()])?;
+                t.serialize_element(&vec![0u64, 1, 2])?;
+                t.serialize_element(&3u64)?;
+                t.serialize_element(&2u64)?;
+                t.serialize_element(&vec![("gato".to_string(), vec![(2u32, 1u32), (1, 1)])])?;
+                t.end()
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        heraclitus_views::ckpt::save(dir.path(), "text", &Envenenado).unwrap();
+        let mut fresco = TextIndex::new();
+        assert!(!fresco.restore(dir.path()).unwrap());
+        let _ = fresco.search("gato", 3);
     }
 
     #[test]
