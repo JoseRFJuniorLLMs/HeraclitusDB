@@ -35,7 +35,7 @@ use super::canonical::CANONICAL_CODEC_V1;
 use super::compress::PackingProfile;
 use super::error::{corrupt, V6Result, HARD_MAX_BLOCK_BYTES};
 use super::header::FileHeaderV6;
-use super::hrki::{caminho_sidecar, construir_para_packed, Hrki, IndexPolicySet};
+use super::hrki::{caminho_sidecar, construir_para_packed, Hrki, IndexPolicy, IndexPolicySet};
 use super::manifest::{
     attach_parquet, attach_sidecar, quarantine_generation as quarantine_manifest_generation,
     record_pack, register_sealed_raw, set_legal_hold, ManifestStore, HRKM_MAGIC,
@@ -52,6 +52,18 @@ use super::verify::{verify_segment as verify_segment_file, IntegrityLevel, Verif
 const SEGMENTS_DIR: &str = "segments";
 const MANIFESTS_DIR: &str = "manifests";
 const RAW_GENERATION: u32 = 0;
+
+/// Built-ins que [`V6Log::scan_builtin_eq_capped`] poda pelo Bloom do HRKI,
+/// sondando o filtro com o valor EM CLARO.
+///
+/// Auditoria recursiva 2026-10-03, iteração 1: o sidecar só grava o hash da
+/// política, não a política de cada campo, por isso o leitor não consegue saber
+/// se o filtro de `agent_id` guarda o valor ou `keyed_blake3(index_key, valor)`.
+/// Um sidecar `HashedEquality` destes campos fazia a sonda em claro falhar em
+/// quase todos os PACKED, que eram podados em silêncio — o falso negativo que o
+/// HRKI nunca pode produzir. [`V6Log::build_pending_hrki`] recusa, por isso,
+/// publicar tal sidecar no manifest.
+const BUILTINS_PODADOS_EM_CLARO: [&str; 2] = ["agent_id", "session_id"];
 
 /// Escritor/reader v6 com manifesto `.hrkm` persistente.
 ///
@@ -1299,7 +1311,7 @@ impl V6Log {
         to: Lsn,
         max: usize,
     ) -> Result<crate::store::PrunedScan, TentativaFalhou> {
-        if !matches!(field, "agent_id" | "session_id") {
+        if !BUILTINS_PODADOS_EM_CLARO.contains(&field) {
             return Ok(None);
         }
         if max == 0 {
@@ -1850,6 +1862,19 @@ impl V6Log {
         index_key: Option<[u8; 32]>,
         fpr: f64,
     ) -> Result<Vec<HrkiBuildOutcome>, HeraclitusError> {
+        // Auditoria recursiva 2026-10-03, iteração 1: um sidecar anexado aqui é
+        // consumido por `scan_builtin_eq_capped`, que sonda o Bloom com o valor
+        // em claro. Com `HashedEquality` o filtro guarda digests com chave e a
+        // sonda daria "ausente" em quase todos os segmentos: as linhas PACKED
+        // sumiam de uma resposta `Ok`. Recusa-se antes de tocar no disco.
+        for campo in BUILTINS_PODADOS_EM_CLARO {
+            if policy.politica_de(campo) == IndexPolicy::HashedEquality {
+                return Err(HeraclitusError::Config(format!(
+                    "HRKI: '{campo}' não pode ser HashedEquality — a varredura podada \
+                     sonda o filtro com o valor em claro e perderia linhas PACKED"
+                )));
+            }
+        }
         let _building = self
             .sidecar_lock
             .lock()
@@ -4255,6 +4280,62 @@ mod tests {
             restored.blocks_read, 0,
             "todos os segmentos deviam ser podados"
         );
+    }
+
+    #[test]
+    fn hrki_hashed_em_builtin_e_recusado_e_nao_poda_linhas() {
+        // Auditoria recursiva 2026-10-03, iteração 1: um sidecar com
+        // `agent_id` em HashedEquality era anexado ao manifest e a varredura
+        // podada, ao sondar o Bloom com "alice" em claro, descartava todos os
+        // PACKED — devolvia `Ok` sem as linhas desses segmentos.
+        use super::super::hrki::{IndexPolicy, IndexPolicySet};
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = V6Log::open(dir.path(), 420, FsyncPolicy::Always).unwrap();
+        for i in 0..30 {
+            let mut e = event(i);
+            e.agent_id = "alice".into();
+            log.append(e).unwrap();
+        }
+        log.seal_active().unwrap();
+        log.pack_pending(PackingProfile::Balanced).unwrap();
+
+        for campo in ["agent_id", "session_id"] {
+            let policy = IndexPolicySet::new().com(campo, IndexPolicy::HashedEquality);
+            let erro = log
+                .build_pending_hrki(&policy, Some([7u8; 32]), 0.01)
+                .unwrap_err();
+            assert!(
+                matches!(&erro, HeraclitusError::Config(m) if m.contains(campo)),
+                "HashedEquality em '{campo}' tinha de ser recusado, veio {erro:?}"
+            );
+        }
+        assert!(
+            log.manifest().segments_v2.iter().all(|d| d.hrki.is_none()),
+            "nenhum sidecar hashed pode ter sido anexado ao manifest"
+        );
+
+        let (alice, _) = log
+            .scan_builtin_eq_capped("agent_id", "alice", 0, log.head(), usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(alice.len(), 30, "a varredura podada perdeu linhas PACKED");
+
+        // HashedEquality num attr continua permitido: só os built-ins sondados
+        // em claro são recusados.
+        let attr = IndexPolicySet::new()
+            .com("agent_id", IndexPolicy::PublicTechnical)
+            .com("segredo", IndexPolicy::HashedEquality);
+        assert!(!log
+            .build_pending_hrki(&attr, Some([7u8; 32]), 0.01)
+            .unwrap()
+            .is_empty());
+        let (alice, stats) = log
+            .scan_builtin_eq_capped("agent_id", "alice", 0, log.head(), usize::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!(alice.len(), 30);
+        assert!(stats.hrki_used > 0);
     }
 
     #[test]
