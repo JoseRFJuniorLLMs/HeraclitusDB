@@ -169,20 +169,27 @@ impl ColdTierV6 {
             )));
         }
 
-        std::fs::create_dir_all(scratch)?;
-        let origem = scratch.join(format!(
+        static REPACK_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let job_id = format!(
+            "{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+            REPACK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let job_scratch = scratch.join(format!("repack-{job_id}"));
+        std::fs::create_dir_all(&job_scratch)?;
+        let origem = job_scratch.join(format!(
             "repack-{:010}-g{}.origem.hrkl",
             receipt.segment_id, receipt.generation
         ));
-        let alvo = scratch.join(format!(
+        let alvo = job_scratch.join(format!(
             "repack-{:010}-g{target_generation}.alvo.hrkl",
             receipt.segment_id
         ));
-        let _limpeza = Limpeza(vec![origem.clone(), alvo.clone()]);
-        // Um alvo deixado por uma corrida anterior faria `repack_segment`
-        // recusar («target generation already exists»), o que aqui seria um
-        // falso positivo: a imutabilidade que interessa é a da chave no bucket,
-        // não a de um ficheiro de scratch.
+        let _limpeza = LimpezaDir(job_scratch);
         let _ = std::fs::remove_file(&alvo);
         std::fs::write(&origem, &bytes)?;
 
@@ -286,8 +293,10 @@ impl ColdTierV6 {
             // O sidecar entra no relatório só quando existia: listá-lo sempre
             // como `already_absent` encheria o relatório de ruído, já que a
             // maioria das gerações não tem `.hrki` publicado.
-            if self.store.head(&sidecar).await.is_ok() {
-                self.remove_one(&sidecar, &mut report).await;
+            match self.store.head(&sidecar).await {
+                Ok(_) => self.remove_one(&sidecar, &mut report).await,
+                Err(object_store::Error::NotFound { .. }) => {}
+                Err(e) => report.failed.push((sidecar.to_string(), e.to_string())),
             }
         }
         Ok(report)
@@ -304,14 +313,12 @@ impl ColdTierV6 {
     }
 }
 
-/// Remove ficheiros de scratch no fim, incluindo no caminho de erro (`?`).
-struct Limpeza(Vec<PathBuf>);
+/// Remove o directório de scratch dedicado no fim, incluindo no caminho de erro (`?`).
+struct LimpezaDir(PathBuf);
 
-impl Drop for Limpeza {
+impl Drop for LimpezaDir {
     fn drop(&mut self) {
-        for p in &self.0 {
-            let _ = std::fs::remove_file(p);
-        }
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -362,6 +369,26 @@ mod tests {
             .unwrap();
         assert!(r.removed.is_empty());
         assert_eq!(r.already_absent, vec![key.segment_path().to_string()]);
+        assert!(r.is_clean());
+    }
+
+    #[tokio::test]
+    async fn recolha_com_sidecar_presente_remove_ambos() {
+        let dir = tempfile::tempdir().unwrap();
+        let tier = ColdTierV6::open_local(dir.path()).unwrap();
+        let key = GenerationKey::new([0xAB; 16], 3, [0xCD; 32], 2);
+
+        let seg_path = key.segment_path();
+        let hrki_path = key.hrki_path();
+        tier.store.put(&seg_path, vec![1, 2, 3].into()).await.unwrap();
+        tier.store.put(&hrki_path, vec![4, 5, 6].into()).await.unwrap();
+
+        let r = tier
+            .collect_cold_locations(&[seg_path.to_string()])
+            .await
+            .unwrap();
+        assert_eq!(r.removed, vec![seg_path.to_string(), hrki_path.to_string()]);
+        assert!(r.failed.is_empty());
         assert!(r.is_clean());
     }
 
