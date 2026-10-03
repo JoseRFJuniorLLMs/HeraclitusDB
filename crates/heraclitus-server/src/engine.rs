@@ -3315,6 +3315,19 @@ impl Engine {
     }
 }
 
+/// Kinds cujos episódios o `AttrIndex::apply` consome SEM criar postings
+/// gerais (`_kind`, `_agent`, atributos): hoje só `AgentEvidence`, que vive no
+/// plano de evidência dedicado (SPEC-0085).
+///
+/// Auditoria recursiva 2026-10-03, iteração 1: o índice responde "não há" para
+/// estes kinds sem nunca os ter visto; quem consulta por eles tem de recuar
+/// para o varrimento do log. A comparação é insensível à capitalização porque
+/// o pós-filtro de rótulo do planner também o é — um `agentevidence` casa com
+/// os episódios `AgentEvidence`, que o índice não conhece.
+fn kind_fora_do_indice_attr(kind: &str) -> bool {
+    kind.eq_ignore_ascii_case("AgentEvidence")
+}
+
 /// The engine IS the real `QueryBackend` for the GQL layer: HNSW for
 /// NEAREST, two-stage for RECALL, graph index for PROVENANCE.
 impl QueryBackend for Engine {
@@ -3324,6 +3337,16 @@ impl QueryBackend for Engine {
         as_of: Option<Lsn>,
     ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
         if !heraclitus_index_attr::valor_indexavel(label) {
+            return Ok(None);
+        }
+        // Auditoria recursiva 2026-10-03, iteração 1: o `AttrIndex::apply`
+        // NUNCA indexa `AgentEvidence` sob `_kind` (SPEC-0085). Com outros
+        // kinds no log o campo é conhecido, o rótulo não aparece em
+        // `field_values` e devolvia-se `Some(vazio)` — o planner tomava-o como
+        // resposta final e `MATCH (n:AgentEvidence)` dava zero linhas sobre
+        // episódios que o varrimento devolve. A SPEC-0085 §5 manda recuar para
+        // o log canónico quando o kind não está representado no índice geral.
+        if kind_fora_do_indice_attr(label) {
             return Ok(None);
         }
         // Auditoria recursiva 2026-10-03, iteração 1: com o índice parcial o
@@ -3432,6 +3455,13 @@ impl QueryBackend for Engine {
         // Recuar para o varrimento é a resposta certa; o pós-filtro do planner
         // faz o resto.
         if !heraclitus_index_attr::valor_indexavel(value) {
+            return Ok(None);
+        }
+        // Auditoria recursiva 2026-10-03, iteração 1: `WHERE n.kind =
+        // "AgentEvidence"` chega aqui como `_kind` (pseudo-atributo do
+        // planner) e tinha o mesmo `Some(vazio)` do `kind_lookup_lsns` — o
+        // kind nunca entra no índice geral. Varre-se o log.
+        if field == "_kind" && kind_fora_do_indice_attr(value) {
             return Ok(None);
         }
         // Auditoria recursiva 2026-10-03, iteração 1: "não conheço" pelo lado
@@ -3905,6 +3935,45 @@ mod tests {
         );
         // E por rótulo.
         let v = heraclitus_query::execute("MATCH (n:LegalHold) RETURN n", engine.as_ref()).unwrap();
+        assert_eq!(v.as_array().map(|a| a.len()), Some(1), "{v}");
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 1: `AgentEvidence` nunca entra
+    /// no índice `_kind` (SPEC-0085), mas com outros kinds no log o campo é
+    /// conhecido e `kind_lookup_lsns` devolvia `Some(vazio)` — o rótulo dava
+    /// zero linhas enquanto o varrimento devolvia as evidências.
+    #[test]
+    fn rotulo_agent_evidence_recua_para_o_varrimento() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path());
+        engine
+            .append(Episode::new(
+                "app",
+                EventKind::Custom("Nota".into()),
+                b"n".to_vec(),
+            ))
+            .unwrap();
+        for i in 0..2 {
+            engine
+                .append(Episode::new(
+                    "agente",
+                    EventKind::Custom("AgentEvidence".into()),
+                    format!("ev-{i}").into_bytes(),
+                ))
+                .unwrap();
+        }
+        let todas = heraclitus_query::execute("MATCH (n) RETURN n", &engine).unwrap();
+        assert_eq!(todas.as_array().map(|a| a.len()), Some(3), "{todas}");
+        for gql in [
+            "MATCH (n:AgentEvidence) RETURN n",
+            "MATCH (n:agentevidence) RETURN n",
+            "MATCH (n) WHERE n.kind = \"AgentEvidence\" RETURN n",
+        ] {
+            let v = heraclitus_query::execute(gql, &engine).unwrap();
+            assert_eq!(v.as_array().map(|a| a.len()), Some(2), "{gql}: {v}");
+        }
+        // O índice continua a servir os kinds que indexa.
+        let v = heraclitus_query::execute("MATCH (n:Nota) RETURN n", &engine).unwrap();
         assert_eq!(v.as_array().map(|a| a.len()), Some(1), "{v}");
     }
 
