@@ -2233,13 +2233,107 @@ async fn verify(State(engine): State<Arc<Engine>>) -> (StatusCode, Json<serde_js
 async fn verify_segment(
     State(engine): State<Arc<Engine>>,
     Path(segment): Path<u64>,
-) -> Json<serde_json::Value> {
-    let out = match tokio::task::spawn_blocking(move || engine.verify_segment(segment)).await {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => serde_json::json!({ "error": e.to_string() }),
-        Err(e) => serde_json::json!({ "error": format!("join: {e}") }),
-    };
-    Json(out)
+) -> (StatusCode, Json<serde_json::Value>) {
+    // Auditoria recursiva 2026-10-03, iteração 1: o `verify` acima já tinha
+    // deixado de devolver 200 numa falha de integridade, mas este irmão ficou
+    // para trás. Em v6 toda a adulteração de um segmento selado (digest físico
+    // catalogado que não bate, relatório lógico falhado, erro de I/O) chega
+    // aqui como `Err`, e saía com HTTP 200 e um `{"error": ...}` — um probe que
+    // só olhe ao estado lia "segmento íntegro". Mesmo contrato do `verify`.
+    match tokio::task::spawn_blocking(move || engine.verify_segment(segment)).await {
+        Ok(Ok(v)) => (StatusCode::OK, Json(v)),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": e.to_string() })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("join: {e}") })),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod verify_segment_tests {
+    use super::*;
+    use heraclitus_core::{Episode, EventKind, FsyncPolicy, HeraclitusConfig};
+
+    /// Ficheiros físicos (gerações seladas) do segmento `id` em qualquer
+    /// subdirectório do data_dir — nome `{id:020}.gNNNN.<layout>.hrkl`.
+    fn geracoes_seladas(dir: &std::path::Path, id: u64) -> Vec<std::path::PathBuf> {
+        let prefixo = format!("{id:020}.g");
+        let mut out = Vec::new();
+        let mut pendentes = vec![dir.to_path_buf()];
+        while let Some(d) = pendentes.pop() {
+            for entrada in std::fs::read_dir(&d).unwrap() {
+                let p = entrada.unwrap().path();
+                if p.is_dir() {
+                    pendentes.push(p);
+                    continue;
+                }
+                let nome = p.file_name().unwrap().to_string_lossy().into_owned();
+                if nome.starts_with(&prefixo) && nome.ends_with(".hrkl") {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 1: `GET /verify/:segment`
+    /// sobre um segmento selado adulterado tem de sair com estado de erro, não
+    /// 200. Antes da correção o handler devolvia sempre 200 com `{"error"}`.
+    #[tokio::test]
+    async fn segmento_adulterado_nao_responde_200() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            segment_max_bytes: 8192, // força sealing rápido
+            ..Default::default()
+        };
+        let engine = Arc::new(Engine::open(&cfg).unwrap());
+        for i in 0..500 {
+            engine
+                .append(Episode::new(
+                    "a",
+                    EventKind::Observation,
+                    format!("evento de enchimento numero {i} para selar o segmento").into_bytes(),
+                ))
+                .unwrap();
+        }
+        let sealed = engine.sealed_segment_ids();
+        assert!(!sealed.is_empty(), "deve haver >=1 segmento selado");
+        let seg = sealed[0];
+
+        // Controlo: o segmento intacto responde 200 e `valid: true`.
+        let intacto = verify_segment(State(engine.clone()), Path(seg))
+            .await
+            .into_response();
+        assert_eq!(intacto.status(), StatusCode::OK, "segmento intacto");
+
+        // Adultera um byte a meio de cada geração física do segmento.
+        let ficheiros = geracoes_seladas(dir.path(), seg);
+        assert!(
+            !ficheiros.is_empty(),
+            "geração selada do segmento {seg} no disco"
+        );
+        for f in &ficheiros {
+            let mut bytes = std::fs::read(f).unwrap();
+            let meio = bytes.len() / 2;
+            bytes[meio] ^= 0xFF;
+            std::fs::write(f, &bytes).unwrap();
+        }
+
+        let adulterado = verify_segment(State(engine.clone()), Path(seg))
+            .await
+            .into_response();
+        assert_eq!(
+            adulterado.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "uma adulteração detectada não pode viajar como 200"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "analytics"))]
