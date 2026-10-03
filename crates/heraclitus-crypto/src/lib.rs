@@ -325,19 +325,35 @@ impl KeyStore {
                         // Perdedor: o vencedor pode estar a meio do write_all —
                         // espera curta e limitada pela chave completa (32 bytes).
                         let mut got = None;
+                        let mut last_err = None;
                         for _ in 0..100 {
-                            if let Some(k) = Self::read_key(&path) {
-                                got = Some(k);
-                                break;
+                            match Self::read_key_checked(&path) {
+                                Ok(Some(k)) => {
+                                    got = Some(k);
+                                    break;
+                                }
+                                Ok(None) => {}
+                                Err(err) => {
+                                    if let Ok(meta) = std::fs::metadata(&path) {
+                                        if meta.len() > 32 {
+                                            return Err(err);
+                                        }
+                                    }
+                                    last_err = Some(err);
+                                }
                             }
                             std::thread::sleep(std::time::Duration::from_millis(1));
                         }
-                        got.ok_or_else(|| {
-                            io::Error::new(
+                        if let Some(k) = got {
+                            k
+                        } else if let Some(err) = last_err {
+                            return Err(err);
+                        } else {
+                            return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 "ficheiro de chave existe mas está incompleto (artefacto de crash?)",
-                            )
-                        })?
+                            ));
+                        }
                     }
                     Err(e) => return Err(e),
                 }
@@ -745,6 +761,20 @@ mod testes_shred {
         assert_eq!(
             KeyStore::open(d.path()).unwrap().try_get("ana").unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn get_or_create_fails_fast_on_oversized_key_file() {
+        let (d, ks) = loja();
+        let path = ks.key_path("ana");
+        std::fs::write(&path, vec![7u8; 64]).unwrap();
+        let fria = KeyStore::open(d.path()).unwrap();
+        let err = fria.get_or_create("ana").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("expected 32"),
+            "deve preservar a razão de integridade: {err}"
         );
     }
 
