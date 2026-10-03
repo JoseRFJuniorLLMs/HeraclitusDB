@@ -503,7 +503,7 @@ impl ViewRegistry {
         }
         let inicio = std::time::Instant::now();
         let mut ultimo_aviso = inicio;
-        while cur <= head {
+        while cur < head {
             if ultimo_aviso.elapsed() >= std::time::Duration::from_secs(10) {
                 ultimo_aviso = std::time::Instant::now();
                 let feitos = cur.saturating_sub(from);
