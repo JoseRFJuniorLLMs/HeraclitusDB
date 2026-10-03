@@ -95,6 +95,28 @@ pub fn valor_indexavel(valor: &str) -> bool {
     v.len() <= MAX_VALUE_LEN && !SKIP_VALUES.iter().any(|s| s.eq_ignore_ascii_case(v))
 }
 
+/// Atributo reservado onde o `Engine` grava a chave de idempotência de um
+/// `Append` (o `Engine` reexporta esta constante como `IDEMPOTENCY_KEY_ATTR`).
+///
+/// Este campo NÃO segue a regra de `valor_indexavel`, porque o índice não é
+/// aqui um acelerador opcional: é a ÚNICA estrutura que o `Engine` consulta
+/// para distinguir a primeira escrita de um retry. Auditoria recursiva
+/// 2026-10-03, iteração 1: a chave passava a validação com valores como `0`,
+/// `true`, `null` ou `sim`, mas o *ingest* saltava-os (SKIP_VALUES) — a
+/// procura do retry vinha sempre vazia e o exactly-once quebrava em silêncio,
+/// deixando duplicados (ou eventos diferentes com a mesma chave) para sempre
+/// no log append-only. O mesmo para `AgentEvidence`, que não indexava atributo
+/// nenhum.
+pub const IDEMPOTENCY_KEY_FIELD: &str = "__heraclitus_idempotency_key";
+
+/// A chave de idempotência do episódio, tal como o índice a guarda (aparada),
+/// se a tiver. Ignora só o que nunca pode ser uma chave válida (vazio ou acima
+/// de MAX_VALUE_LEN — o `Engine` recusa chaves com mais de 80 caracteres).
+fn chave_de_idempotencia(event: &Episode) -> Option<&str> {
+    let v = event.attrs.get(IDEMPOTENCY_KEY_FIELD)?.trim();
+    (!v.is_empty() && v.len() <= MAX_VALUE_LEN).then_some(v)
+}
+
 /// Magic do checkpoint comprimido. Um ficheiro v1 (bincode cru) nunca começa
 /// por estes bytes, por isso a presença dele distingue os formatos sem ambiguidade.
 const MAGIC_V2: &[u8; 4] = b"HATR";
@@ -1367,6 +1389,14 @@ impl View for AttrIndex {
         // gaining any application-query capability. Consume the LSN so boot
         // does not replay it forever, but create no generic postings.
         if matches!(&event.kind, EventKind::Custom(kind) if kind == "AgentEvidence") {
+            // Excepção única: a chave de idempotência. Sem ela, um `Append`
+            // idempotente de `AgentEvidence` nunca reconhecia o retry e
+            // duplicava (auditoria recursiva 2026-10-03, iteração 1). É um
+            // posting por append idempotente — não o envelope de alta
+            // cardinalidade que a SPEC-0085 quer manter fora daqui.
+            if let Some(chave) = chave_de_idempotencia(event) {
+                self.inner.upsert_exact(IDEMPOTENCY_KEY_FIELD, chave, lsn);
+            }
             self.inner.watermark = self.inner.watermark.max(lsn);
             self.inner.applied = true;
             return;
@@ -1429,10 +1459,20 @@ impl View for AttrIndex {
             // A MESMA decisão que `valor_indexavel` — e agora é literalmente
             // ela, para o índice e a consulta nunca divergirem sobre o que está
             // indexado. `eq_ignore_ascii_case` compara sem alocar.
-            if !valor_indexavel(v) {
+            let indexavel = valor_indexavel(v);
+            // A chave de idempotência entra SEMPRE no índice exato, mesmo
+            // quando é um SKIP_VALUE (`0`, `true`, ...): é por este lookup que
+            // o `Engine` deteta o retry (auditoria recursiva 2026-10-03,
+            // iteração 1). O resto do tratamento não muda.
+            let chave_idem =
+                field == IDEMPOTENCY_KEY_FIELD && chave_de_idempotencia(event).is_some();
+            if !(indexavel || chave_idem) {
                 continue;
             }
             let key = self.inner.upsert_exact(field, v, lsn);
+            if !indexavel {
+                continue;
+            }
             // Valor numérico entra também no índice ordenado (range filtering).
             // Os SKIP_VALUES continuam de fora — "0"/"-1" ubíquos gerariam
             // postings gigantes sem poder discriminante.
@@ -1613,6 +1653,48 @@ mod tests {
         );
         assert!(idx.lookup("agent.tool", "exec").is_empty());
         assert!(idx.lookup("_agent", "hostile-agent").is_empty());
+        assert!(idx.lookup("_kind", "AgentEvidence").is_empty());
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 1: a chave de idempotência é
+    /// indexada mesmo quando o valor é um SKIP_VALUE e mesmo em
+    /// `AgentEvidence` — o `Engine` deteta retries só por este lookup.
+    #[test]
+    fn idempotency_key_is_indexed_even_when_skip_value_or_agent_evidence() {
+        let mut idx = AttrIndex::new();
+        for (lsn, chave) in ["0", "-1", "TRUE", "null", "Sim", "nao", "none"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut e = ep("11222333000144", "OMEGA LTDA");
+            e.attrs.insert(IDEMPOTENCY_KEY_FIELD.into(), chave.into());
+            idx.apply(lsn as Lsn, &e);
+            assert_eq!(idx.lookup(IDEMPOTENCY_KEY_FIELD, chave), &[lsn as Lsn]);
+        }
+        // Valores de utilizador continuam sujeitos aos SKIP_VALUES.
+        let mut e = ep("11222333000144", "OMEGA LTDA");
+        e.attrs.insert("ativo".into(), "0".into());
+        idx.apply(10, &e);
+        assert!(idx.lookup("ativo", "0").is_empty());
+        // O SKIP_VALUE da chave não entra no índice numérico (range).
+        assert!(idx
+            .lookup_range(
+                IDEMPOTENCY_KEY_FIELD,
+                Bound::Included(-1.0),
+                Bound::Included(0.0)
+            )
+            .is_empty());
+
+        let mut ev = Episode::new(
+            "agent",
+            EventKind::Custom("AgentEvidence".into()),
+            b"{}".to_vec(),
+        );
+        ev.attrs.insert("agent.tool".into(), "exec".into());
+        ev.attrs.insert(IDEMPOTENCY_KEY_FIELD.into(), "ev-1".into());
+        idx.apply(20, &ev);
+        assert_eq!(idx.lookup(IDEMPOTENCY_KEY_FIELD, "ev-1"), &[20]);
+        assert!(idx.lookup("agent.tool", "exec").is_empty());
         assert!(idx.lookup("_kind", "AgentEvidence").is_empty());
     }
 

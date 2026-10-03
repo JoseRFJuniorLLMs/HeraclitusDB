@@ -43,7 +43,10 @@ const IDEMPOTENCY_SHARDS: usize = 64;
 /// pesquisa de vizinhos — é uma exportação, e para isso há o Flight.
 pub const MAX_TOP_K: usize = 10_000;
 
-pub const IDEMPOTENCY_KEY_ATTR: &str = "__heraclitus_idempotency_key";
+/// Definida no índice de atributos, que a trata como campo especial (indexa-a
+/// mesmo com valores SKIP_VALUES) — uma só fonte para os dois nunca divergirem
+/// (auditoria recursiva 2026-10-03, iteração 1).
+pub const IDEMPOTENCY_KEY_ATTR: &str = heraclitus_index_attr::IDEMPOTENCY_KEY_FIELD;
 pub const IDEMPOTENCY_HASH_ATTR: &str = "__heraclitus_idempotency_hash";
 
 const SENTINEL_DERIVED_KINDS: &[&str] = &[
@@ -4231,6 +4234,50 @@ mod tests {
             (original, true),
             "o índice reconstruído do log tem de deduplicar depois de restart"
         );
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 1: chaves válidas que são
+    /// SKIP_VALUES do índice (`0`, `true`, `null`, ...) e appends de
+    /// `AgentEvidence` nunca eram encontradas pelo lookup do retry — cada
+    /// retry gravava uma cópia nova e um payload diferente não dava conflito.
+    #[test]
+    fn idempotency_dedups_skip_value_keys_and_agent_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path());
+        let casos = [
+            ("0", EventKind::Observation),
+            ("true", EventKind::Observation),
+            ("NULL", EventKind::Observation),
+            ("sim", EventKind::Observation),
+            ("ev-1", EventKind::Custom("AgentEvidence".into())),
+        ];
+        for (key, kind) in casos {
+            let make = || Episode::new("producer", kind.clone(), b"same".to_vec());
+            let (lsn, deduplicated, id) = engine.append_idempotent(make(), key).unwrap();
+            assert!(!deduplicated, "{key}");
+            let head = engine.snapshot();
+            let retry = engine.append_idempotent(make(), key).unwrap();
+            assert_eq!(retry, (lsn, true, id), "retry da chave {key}");
+            assert_eq!(engine.snapshot(), head, "retry de {key} avançou o log");
+            let mut outro = make();
+            outro.content = b"different".to_vec();
+            assert!(
+                matches!(
+                    engine.append_idempotent(outro, key),
+                    Err(HeraclitusError::IdempotencyConflict { .. })
+                ),
+                "payload diferente sob a chave {key}"
+            );
+        }
+        drop(engine);
+        let reopened = engine_in(dir.path());
+        let retry = reopened
+            .append_idempotent(
+                Episode::new("producer", EventKind::Observation, b"same".to_vec()),
+                "0",
+            )
+            .unwrap();
+        assert!(retry.1, "o índice reconstruído tem de deduplicar a chave 0");
     }
 
     /// SPEC-0089 §14 (conferência de 2026-10-02): o token de execução era
