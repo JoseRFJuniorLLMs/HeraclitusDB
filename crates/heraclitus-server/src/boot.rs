@@ -159,11 +159,19 @@ impl Boot {
                     },
                 }
             }
-            Mode::Log => Phase {
-                label: label.to_string(),
-                start: Instant::now(),
-                kind: PhaseKind::Log,
-            },
+            Mode::Log => {
+                // Auditoria boot.md P0 (conferida em 2026-10-02): em modo
+                // serviço (journald/SCM) só o FIM de cada fase ficava no log.
+                // Uma fase que demora uma hora — ou que pendura — não deixava
+                // rasto nenhum de ter começado; a última linha do journal era a
+                // fase anterior, que tinha acabado bem.
+                tracing::info!("{} — a começar", label);
+                Phase {
+                    label: label.to_string(),
+                    start: Instant::now(),
+                    kind: PhaseKind::Log,
+                }
+            }
             Mode::Silent => Phase {
                 label: label.to_string(),
                 start: Instant::now(),

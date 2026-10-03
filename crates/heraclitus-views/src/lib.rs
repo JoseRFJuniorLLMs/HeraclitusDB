@@ -454,7 +454,29 @@ impl ViewRegistry {
         let head = log.head();
         let mut applied = 0u64;
         let mut cur = from;
+        // Auditoria boot.md P0/P1 (conferida em 2026-10-02): o replay não
+        // dizia nada até acabar. Num log grande são minutos ou horas em que o
+        // operador não distingue "a avançar" de "pendurado". Progresso a cada
+        // 10 s, com o ritmo e a estimativa do que falta.
+        if head > from {
+            tracing::info!(desde = from, ate = head, "views: replay da cauda a começar");
+        }
+        let inicio = std::time::Instant::now();
+        let mut ultimo_aviso = inicio;
         while cur <= head {
+            if ultimo_aviso.elapsed() >= std::time::Duration::from_secs(10) {
+                ultimo_aviso = std::time::Instant::now();
+                let feitos = cur.saturating_sub(from);
+                let ritmo = feitos as f64 / inicio.elapsed().as_secs_f64().max(1e-9);
+                let faltam = head.saturating_sub(cur);
+                tracing::info!(
+                    lsn = cur,
+                    head,
+                    eventos_por_s = ritmo as u64,
+                    faltam_s = (faltam as f64 / ritmo.max(1.0)) as u64,
+                    "views: replay em curso"
+                );
+            }
             let batch = log.scan_capped(cur, head, 256)?;
             if batch.is_empty() {
                 break;

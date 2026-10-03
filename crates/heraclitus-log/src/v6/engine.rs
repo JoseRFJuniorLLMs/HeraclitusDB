@@ -213,6 +213,14 @@ struct V6State {
     last_sync: Instant,
     dirty: bool,
     sync_error: Option<String>,
+    /// Um seal CHEGOU a ser publicado no manifesto mas a criação do segmento
+    /// seguinte falhou: o estado em disco é coerente e o próximo append
+    /// volta a tentar criar este id. Ver `V6Log::repor_ativo`.
+    ativo_pendente: Option<SegmentId>,
+    /// Um seal falhou ANTES de o manifesto o registar (I/O ao selar, rename,
+    /// reconcile, commit): o directório e o manifesto podem divergir e só o
+    /// arranque os reconcilia. Os appends recusam com este motivo.
+    degradado: Option<String>,
 }
 
 struct ActiveSegment {
@@ -519,6 +527,8 @@ impl V6Log {
             last_sync: Instant::now(),
             dirty: false,
             sync_error: None,
+            ativo_pendente: None,
+            degradado: None,
         }));
         let (sync_stop, sync_worker) = match &fsync {
             FsyncPolicy::Always => (None, None),
@@ -612,6 +622,7 @@ impl V6Log {
     /// Força a barreira física do segmento activo.
     pub fn flush(&self) -> Result<(), HeraclitusError> {
         let mut state = self.lock_state()?;
+        self.repor_ativo(&mut state)?;
         let active = state
             .active
             .as_mut()
@@ -832,11 +843,15 @@ impl V6Log {
             if lsn >= state.next_lsn {
                 return Ok(None);
             }
-            let active = state
+            // Sem segmento activo (seal falhado, à espera de o repor) os LSNs
+            // já selados continuam no manifesto: as leituras não podem cair
+            // com a escrita. Antes, uma falha de escrita tornava também todas
+            // as leituras impossíveis ("V6Log sem segmento ativo").
+            let activo = state
                 .active
                 .as_ref()
-                .ok_or_else(|| HeraclitusError::StorageEngine("V6Log sem segmento ativo".into()))?;
-            if lsn >= active.writer.header().first_lsn {
+                .filter(|active| lsn >= active.writer.header().first_lsn);
+            if let Some(active) = activo {
                 ReadSource::Active(active.path.clone())
             } else {
                 let desc = state.manifest.find_segment_for_lsn(lsn).ok_or_else(|| {
@@ -2362,6 +2377,7 @@ impl V6Log {
         }
         let sync_now = should_sync(&self.fsync, state.last_sync);
         {
+            self.repor_ativo(state)?;
             let active = state
                 .active
                 .as_mut()
@@ -2390,6 +2406,7 @@ impl V6Log {
     }
 
     fn seal_active_locked(&self, state: &mut V6State) -> Result<(), HeraclitusError> {
+        self.repor_ativo(state)?;
         // A colisao de caminho verifica-se ANTES de tocar no estado.
         //
         // Estava a ser verificada depois do `take()` e depois do `seal()`, que
@@ -2433,6 +2450,31 @@ impl V6Log {
             return Ok(());
         }
 
+        // Daqui até ao commit do manifesto, uma falha deixa o directório e o
+        // manifesto possivelmente divergentes e o writer já consumido: o motor
+        // fica DEGRADADO com o motivo, e os appends passam a dizê-lo (antes:
+        // "V6Log sem segmento ativo", sem pista de que era preciso reiniciar).
+        // Não se improvisa reparação a quente — ver a nota acima.
+        let id = active.id;
+        if let Err(err) = self.selar_e_publicar(state, active) {
+            state.degradado = Some(format!("seal do segmento {id} falhou a meio: {err}"));
+            return Err(err);
+        }
+        // O seal está publicado: o estado em disco é coerente. Se criar o
+        // segmento seguinte falhar (p.ex. disco cheio momentâneo), o próximo
+        // append volta a tentar em vez de exigir reinício.
+        state.ativo_pendente = Some(id.saturating_add(1));
+        self.repor_ativo(state)?;
+        state.last_sync = Instant::now();
+        Ok(())
+    }
+
+    /// Sela o writer, renomeia para o nome imutável e publica no manifesto.
+    fn selar_e_publicar(
+        &self,
+        state: &mut V6State,
+        active: ActiveSegment,
+    ) -> Result<(), HeraclitusError> {
         let footer = active.writer.seal()?;
         // Ja verificado acima, antes de o estado ser tocado; aqui fica so como
         // rede, porque entre as duas verificacoes nada mais cria este nome.
@@ -2472,16 +2514,71 @@ impl V6Log {
             state.manifest = before;
             return Err(err);
         }
+        Ok(())
+    }
+
+    /// Garante um segmento activo antes de escrever.
+    ///
+    /// Auditoria 2026-09-05 §5 #7 (conferida em 2026-10-02): um seal que
+    /// falhava depois do `take()` deixava `state.active = None` para sempre.
+    /// Dos casos possíveis, um é seguro de recuperar a quente — o seal foi
+    /// publicado e só a criação do segmento seguinte falhou: o manifesto está
+    /// coerente e nenhum LSN foi escrito no segmento por criar, portanto um
+    /// ficheiro activo deixado a meio (só cabeçalho, ou menos) pode ser
+    /// removido e recriado. Os outros deixam `degradado` e exigem o arranque,
+    /// que é quem reconcilia directório e manifesto.
+    fn repor_ativo(&self, state: &mut V6State) -> Result<(), HeraclitusError> {
+        if state.active.is_some() {
+            return Ok(());
+        }
+        if let Some(motivo) = &state.degradado {
+            return Err(HeraclitusError::StorageEngine(format!(
+                "HRKL v6 degradado ({motivo}); reinicie o processo para reconciliar o \
+                 directório com o manifesto"
+            )));
+        }
+        let Some(id) = state.ativo_pendente else {
+            return Err(HeraclitusError::StorageEngine("V6Log sem segmento ativo".into()));
+        };
+        let caminho = active_path(&self.segments_dir, id);
+        if let Ok(meta) = std::fs::metadata(&caminho) {
+            if meta.is_dir() {
+                // Não é um resto nosso (só criamos ficheiros): não se apaga
+                // nada, tenta-se de novo no próximo append.
+                return Err(HeraclitusError::StorageEngine(format!(
+                    "não foi possível criar o segmento activo {}: o caminho é um directório",
+                    caminho.display()
+                )));
+            }
+            if meta.len() > super::header::FILE_HEADER_LEN as u64 {
+                state.degradado = Some(format!(
+                    "ficheiro activo {} com {} bytes de uma criação falhada",
+                    caminho.display(),
+                    meta.len()
+                ));
+                return Err(HeraclitusError::StorageEngine(format!(
+                    "HRKL v6 degradado: {} já tem dados; reinicie o processo",
+                    caminho.display()
+                )));
+            }
+            std::fs::remove_file(&caminho)?;
+        }
         state.active = Some(create_active(
             &self.segments_dir,
-            active.id.saturating_add(1),
+            id,
             state.next_lsn,
             state.manifest.storage_namespace_id,
             &self.hlc,
             state.manifest.manifest_generation,
         )?);
-        state.last_sync = Instant::now();
+        state.ativo_pendente = None;
         Ok(())
+    }
+
+    /// O motivo, se o motor ficou degradado por um seal falhado a meio (só o
+    /// arranque o repõe). Para sondas de saúde e diagnóstico.
+    pub fn degradado(&self) -> Option<String> {
+        self.state.lock().ok().and_then(|s| s.degradado.clone())
     }
 
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, V6State>, HeraclitusError> {
@@ -3157,6 +3254,40 @@ mod tests {
         drop(log);
         let reopened = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
         assert!(reopened.read(0).unwrap().is_some());
+    }
+
+    /// Auditoria 2026-09-05 §5 #7 (conferida em 2026-10-02): uma falha a
+    /// criar o segmento seguinte DEPOIS de o seal estar publicado deixava o
+    /// motor sem segmento activo até reiniciar. Agora o próximo append volta a
+    /// tentar e recupera; nada se perde e o log reabre íntegro.
+    #[test]
+    fn falha_a_criar_o_segmento_seguinte_recupera_no_proximo_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
+        log.append(event(0)).unwrap();
+        let atual = log.lock_state().unwrap().active.as_ref().unwrap().id;
+        // Um directório no caminho do próximo segmento activo faz o
+        // `create_new` falhar depois de o seal estar publicado.
+        let bloqueio = active_path(&log.segments_dir, atual + 1);
+        std::fs::create_dir_all(&bloqueio).unwrap();
+        assert!(log.seal_active().is_err(), "criar o segmento seguinte falhou");
+        assert!(log.degradado().is_none(), "o seal foi publicado: não é degradação");
+        assert!(log.append(event(1)).is_err(), "ainda bloqueado");
+        assert!(
+            log.read(0).unwrap().is_some(),
+            "com a escrita bloqueada, as leituras de LSN selado continuam"
+        );
+
+        std::fs::remove_dir(&bloqueio).unwrap();
+        assert_eq!(log.append(event(1)).unwrap(), 1, "recupera sem reiniciar");
+        assert_eq!(log.append(event(2)).unwrap(), 2);
+        drop(log);
+
+        let reaberto = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
+        assert_eq!(reaberto.head(), 3);
+        for lsn in 0..3 {
+            assert!(reaberto.read(lsn).unwrap().is_some(), "lsn {lsn}");
+        }
     }
 
     fn event(i: u64) -> Episode {

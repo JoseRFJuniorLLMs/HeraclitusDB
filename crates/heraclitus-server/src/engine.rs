@@ -2799,7 +2799,10 @@ impl Engine {
                 "parquet_export_lag_lsn {}\n",
                 "canonical_verify_failures {}\n",
                 "physical_crc_failures {}\n",
-                "heraclitus_hlc_skew_ms {}\n"
+                "heraclitus_hlc_skew_ms {}\n",
+                // 1 = um seal falhou a meio e só o arranque reconcilia; os
+                // appends estão a ser recusados (`V6Log::degradado`).
+                "hrkl_degraded {}\n"
             ),
             m.hrkl_append_bytes_total,
             m.hrkl_raw_bytes,
@@ -2822,6 +2825,7 @@ impl Engine {
             m.canonical_verify_failures,
             m.physical_crc_failures,
             log.hlc_skew_ms(),
+            u8::from(log.degradado().is_some()),
         ))
     }
 
