@@ -195,6 +195,9 @@ pub struct Engine {
     /// R16: serializa o par (ler head → append) das escritas H-VM, para que
     /// dois upserts concorrentes nunca carimbem o mesmo lsn na VmInstruction.
     hvm_lock: Mutex<()>,
+    /// Estado H-VM dobrado até ao cursor (próximo LSN por ver). Ver
+    /// [`Engine::hvm_state`].
+    hvm_cache: Mutex<Option<(Lsn, VmState)>>,
     /// Ponto de consistência para o checkpoint: nenhum append pode estar EM VOO
     /// (já no log, ainda por indexar) quando um snapshot é tirado.
     ///
@@ -679,6 +682,7 @@ impl Engine {
             audit_admin: config.audit_admin,
             replication: std::sync::OnceLock::new(),
             hvm_lock: Mutex::new(()),
+            hvm_cache: Mutex::new(None),
             index_gate: std::sync::RwLock::new(()),
             idempotency_locks: (0..IDEMPOTENCY_SHARDS).map(|_| Mutex::new(())).collect(),
             case_locks: (0..IDEMPOTENCY_SHARDS).map(|_| Mutex::new(())).collect(),
@@ -887,10 +891,22 @@ impl Engine {
             // caso do `Engine::shred`. Não gravar preserva o checkpoint
             // anterior, que descreve fielmente um estado mais antigo: o boot
             // seguinte replaya mais log e acerta.
-            let voo = self.index_gate.write().unwrap();
-            let mut views = self.views.lock().unwrap();
-            drop(voo);
-            views.checkpoint()?;
+            //
+            // Auditoria boot.md P0-D (conferida em 2026-10-02): a barreira e o
+            // lock do registry são tomados POR VIEW, e o lock é largado entre
+            // views. Antes, o lock ficava preso durante a serialização + fsync
+            // de todas as views seguidas e cada append (o `index_applied`
+            // precisa dele) esperava pela soma. Cada snapshot leva o seu
+            // watermark, que é a autoridade no arranque; a barreira por view
+            // continua a garantir que esse watermark não salta um LSN em voo.
+            let n = self.views.lock().unwrap().view_count();
+            for i in 0..n {
+                let voo = self.index_gate.write().unwrap();
+                let mut views = self.views.lock().unwrap();
+                drop(voo);
+                views.checkpoint_view(i)?;
+            }
+            self.views.lock().unwrap().finish_checkpoint()?;
         }
         // O índice de atributos tem a sua PRÓPRIA marca e a sua própria guarda
         // (A47), e esta chamada não pode ser saltada só porque as views
@@ -975,9 +991,26 @@ impl Engine {
     }
 
     /// Replay the H-VM ledger from the log into a deterministic [`VmState`].
+    ///
+    /// O estado fica em cache com o cursor do último LSN visto e cada chamada
+    /// aplica só a cauda nova (antes, cada pedido replayava o log inteiro). O
+    /// log é append-only, portanto o prefixo já dobrado não muda — excepto
+    /// quando a visibilidade do passado muda: crypto-shred (o frame deixa de
+    /// se decifrar), rebuild e demote invalidam a cache e o próximo pedido
+    /// faz o replay integral, que é a definição.
     pub fn hvm_state(&self) -> Result<VmState, HeraclitusError> {
         let vm = ConsistencyVirtualMachine::new(VmVersion(1));
-        vm_bridge::replay_vm(&self.log, &vm)
+        let mut cache = self.hvm_cache.lock().unwrap();
+        let (from, state) = cache.take().unwrap_or_default();
+        // Um erro deixa a cache vazia: o próximo pedido refaz tudo do zero.
+        let (state, next) = vm_bridge::replay_vm_from(&self.log, &vm, state, from)?;
+        *cache = Some((next, state.clone()));
+        Ok(state)
+    }
+
+    /// Invalida o estado H-VM em cache (ver [`Engine::hvm_state`]).
+    fn invalidar_hvm(&self) {
+        *self.hvm_cache.lock().unwrap() = None;
     }
 
     /// Materialize the H-VM ledger into a Bᵋ-tree (Fractal Tree) and persist it
@@ -1131,6 +1164,7 @@ impl Engine {
         &self,
         segment_id: SegmentId,
     ) -> Result<heraclitus_tier::AnyDemotionReceipt, HeraclitusError> {
+        self.invalidar_hvm();
         match self.log.as_ref() {
             AnyLog::Legacy(_) => self
                 .demote_legacy_segment(segment_id)
@@ -2107,11 +2141,49 @@ impl Engine {
         )
     }
 
+    /// Reconcilia uma operação administrativa UNKNOWN (SPEC-0089 §9) — ver
+    /// [`crate::trusted_admin::TrustedAdminProtocol::reconcile`]. Tem de ser
+    /// chamada de dentro do efeito de um `execute_admin` (é ela própria uma
+    /// operação administrativa com intenção e resultado no diário).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reconcile_admin(
+        &self,
+        reconciler: &crate::trusted_admin::AdminContext,
+        tenant: &str,
+        principal: &str,
+        idempotency_key: &str,
+        outcome: crate::trusted_admin::ReconciledOutcome,
+        evidence: &str,
+    ) -> Result<crate::trusted_admin::AdminState, HeraclitusError> {
+        self.trusted_admin.reconcile(
+            reconciler,
+            tenant,
+            principal,
+            idempotency_key,
+            outcome,
+            evidence,
+            |ep| {
+                let lsn = self.append_internal(ep)?;
+                self.log.flush()?;
+                Ok(lsn)
+            },
+        )
+    }
+
     pub(crate) fn shred_effect(
         &self,
         agent_id: &str,
-        _token: &crate::trusted_admin::AdminExecutionToken,
+        token: &crate::trusted_admin::AdminExecutionToken,
     ) -> Result<bool, HeraclitusError> {
+        // O token só existe depois de uma intenção durável (o construtor é
+        // privado ao protocolo); aqui verifica-se que essa intenção era
+        // MESMO destruir a chave deste titular, e não outra operação.
+        if !token.authorizes_crypto_shred(agent_id) {
+            return Err(HeraclitusError::Config(format!(
+                "admin token {} was not issued for crypto-shred of '{agent_id}'",
+                token.operation_id()
+            )));
+        }
         if agent_id == "heraclitus-admin" {
             return Err(HeraclitusError::Config(
                 "administrative journal cannot be shredded".into(),
@@ -2144,6 +2216,9 @@ impl Engine {
         }
 
         let destroyed = ks.shred(agent_id)?;
+        // Frames H-VM desta titular deixam de se decifrar: o estado em cache
+        // já não é o que um replay integral daria.
+        self.invalidar_hvm();
         if !destroyed && !recovery_pending {
             // Sem chave e sem operação interrompida: idempotência normal.
             let _ = std::fs::remove_file(&marker);
@@ -2600,6 +2675,7 @@ impl Engine {
     }
 
     pub fn rebuild(&self, view: Option<&str>) -> Result<(), HeraclitusError> {
+        self.invalidar_hvm();
         // `view rebuild` SEM nome reconstrói todas as views do LSN 0: é a
         // saída documentada de um arranque com o replay saltado, e é aí que as
         // views deixam de estar incompletas e voltam a poder ser persistidas
@@ -2722,7 +2798,8 @@ impl Engine {
                 "cold_bytes_downloaded {}\n",
                 "parquet_export_lag_lsn {}\n",
                 "canonical_verify_failures {}\n",
-                "physical_crc_failures {}\n"
+                "physical_crc_failures {}\n",
+                "heraclitus_hlc_skew_ms {}\n"
             ),
             m.hrkl_append_bytes_total,
             m.hrkl_raw_bytes,
@@ -2744,6 +2821,7 @@ impl Engine {
             m.parquet_export_lag_lsn,
             m.canonical_verify_failures,
             m.physical_crc_failures,
+            log.hlc_skew_ms(),
         ))
     }
 
@@ -4032,6 +4110,42 @@ mod tests {
         );
     }
 
+    /// SPEC-0089 §14 (conferência de 2026-10-02): o token de execução era
+    /// ignorado pelo `shred_effect`. Um token emitido para OUTRA operação —
+    /// aqui, um legal hold — destruía a chave de qualquer titular, e o diário
+    /// ficava a descrever uma operação diferente da executada.
+    #[test]
+    fn shred_effect_recusa_token_de_outra_operacao() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            encryption_at_rest: true,
+            ..Default::default()
+        };
+        let engine = Engine::open(&cfg).unwrap();
+        engine
+            .append(Episode::new("titular-b", EventKind::Observation, b"x".to_vec()))
+            .unwrap();
+        let ctx = crate::trusted_admin::AdminContext::new("chefe", "local", vec!["admin".into()]);
+        let hold = crate::trusted_admin::AdminOperation::new(
+            "op-hold",
+            "k-hold",
+            crate::trusted_admin::AdminOperationKind::LegalHoldCreate {
+                hold_id: "h1".into(),
+                reason: "processo".into(),
+            },
+            "processo",
+        );
+        let erro = engine
+            .execute_admin(&ctx, &hold, |token| engine.shred_effect("titular-b", token))
+            .unwrap_err()
+            .to_string();
+        assert!(erro.contains("not issued for crypto-shred"), "{erro}");
+        // A chave sobreviveu: o shred legítimo ainda a encontra e destrói.
+        assert!(engine.shred("titular-b").unwrap());
+    }
+
     #[test]
     fn shred_rebuilds_all_derived_state_and_queries_keep_working() {
         let dir = tempfile::tempdir().unwrap();
@@ -4371,6 +4485,39 @@ mod tests {
             Some(&b"bob".to_vec())
         );
         assert!(!state2.memory_layers.contains_key(b"user:1".as_slice()));
+    }
+
+    /// Estado H-VM em cache (conferência de 2026-10-02): cada leitura aplica
+    /// só a cauda nova. Tem de ser SEMPRE igual ao replay integral — com
+    /// escritas H-VM e episódios normais intercalados entre leituras, e
+    /// depois de um rebuild (que invalida a cache).
+    #[test]
+    fn hvm_state_incremental_e_igual_ao_replay_integral() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path());
+        let integral = |engine: &Engine| {
+            let vm = ConsistencyVirtualMachine::new(VmVersion(1));
+            vm_bridge::replay_vm(&engine.log, &vm).unwrap()
+        };
+        for ronda in 0..5u8 {
+            for i in 0..7u8 {
+                engine
+                    .hvm_upsert(vec![b'k', i], vec![ronda, i])
+                    .unwrap();
+                engine
+                    .append(Episode::new("a", EventKind::Observation, vec![ronda, i]))
+                    .unwrap();
+            }
+            engine.hvm_delete(vec![b'k', ronda]).unwrap();
+            assert_eq!(engine.hvm_state().unwrap(), integral(&engine), "ronda {ronda}");
+        }
+        // Segunda leitura sem escritas: nada novo, o mesmo estado.
+        assert_eq!(engine.hvm_state().unwrap(), integral(&engine));
+        engine.rebuild(None).unwrap();
+        assert_eq!(engine.hvm_state().unwrap(), integral(&engine));
+        drop(engine);
+        let reaberto = engine_in(dir.path());
+        assert_eq!(reaberto.hvm_state().unwrap(), integral(&reaberto));
     }
 
     #[test]

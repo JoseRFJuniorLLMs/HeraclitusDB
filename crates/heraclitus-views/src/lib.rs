@@ -581,19 +581,73 @@ impl ViewRegistry {
             );
             return Ok(());
         }
-        for (i, v) in self.views.iter().enumerate() {
-            if self.dirty[i] || self.checkpoint_watermarks[i] != Some(v.watermark()) {
-                v.checkpoint(&self.dir)?;
-                self.checkpoint_watermarks[i] = Some(v.watermark());
-                self.dirty[i] = false;
-            }
+        for i in 0..self.views.len() {
+            self.checkpoint_view(i)?;
+        }
+        self.finish_checkpoint()
+    }
+
+    /// Número de views registadas (para checkpoints view a view).
+    pub fn view_count(&self) -> usize {
+        self.views.len()
+    }
+
+    /// Checkpoint de UMA view, se estiver suja. `Ok(true)` = gravou.
+    ///
+    /// Auditoria boot.md P0-D (conferida em 2026-10-02): o `Engine` segurava
+    /// o lock do registry durante a serialização + fsync de TODAS as views
+    /// seguidas, e o `index_applied` de cada append precisa desse lock — a
+    /// escrita parava pela soma de todos os checkpoints. Cada snapshot leva o
+    /// seu próprio watermark, que é a autoridade no arranque (`catch_up`),
+    /// portanto as views não precisam de ser gravadas no MESMO instante: o
+    /// chamador pode largar o lock entre views e as escritas avançam entre
+    /// elas. No-op silencioso enquanto as views não estiverem materializadas
+    /// (o aviso sai em [`finish_checkpoint`](Self::finish_checkpoint)).
+    pub fn checkpoint_view(&mut self, i: usize) -> Result<bool, HeraclitusError> {
+        if self.nao_materializado {
+            return Ok(false);
+        }
+        let v = &self.views[i];
+        if self.dirty[i] || self.checkpoint_watermarks[i] != Some(v.watermark()) {
+            v.checkpoint(&self.dir)?;
+            self.checkpoint_watermarks[i] = Some(v.watermark());
+            self.dirty[i] = false;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Fecha uma ronda de checkpoints: grava o `watermarks.json`.
+    pub fn finish_checkpoint(&mut self) -> Result<(), HeraclitusError> {
+        if self.nao_materializado {
+            tracing::warn!(
+                "views não materializadas (replay saltado no arranque): checkpoint SALTADO \
+                 para não gravar snapshots que não descrevem o log; corre `view rebuild` \
+                 ou reinicia sem HERACLITUS_SKIP_VIEW_REPLAY"
+            );
+            return Ok(());
         }
         self.sync_watermarks_map();
-        self.persist_watermarks()
+        // Depois de uma ronda de checkpoints o JSON descreve os SNAPSHOTS em
+        // disco (o watermark com que cada um foi gravado), não o estado vivo:
+        // com checkpoints view a view as escritas avançam entre views, e gravar
+        // o watermark vivo faria o JSON divergir do snapshot — e o arranque
+        // avisaria de uma divergência que não é problema nenhum.
+        let em_disco: HashMap<&str, Lsn> = self
+            .names
+            .iter()
+            .zip(&self.checkpoint_watermarks)
+            .filter_map(|(nome, wm)| wm.map(|wm| (nome.as_str(), wm)))
+            .collect();
+        self.persist_watermarks_map(&em_disco)
     }
 
     fn persist_watermarks(&self) -> Result<(), HeraclitusError> {
-        let raw = serde_json::to_string_pretty(&self.watermarks)
+        self.persist_watermarks_map(&self.watermarks)
+    }
+
+    fn persist_watermarks_map(&self, mapa: &impl serde::Serialize) -> Result<(), HeraclitusError> {
+        let raw = serde_json::to_string_pretty(mapa)
             .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
         let tmp = self.dir.join("watermarks.json.tmp");
         {

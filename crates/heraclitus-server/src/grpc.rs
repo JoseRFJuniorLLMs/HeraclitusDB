@@ -411,6 +411,11 @@ impl pb::heraclitus_server::Heraclitus for Service {
                     op @ ("model-bundle-activate" | "model-bundles") => {
                         crate::grpc::model_bundle_op(&engine, op, &r.arg)
                     }
+                    // SPEC-0089 §9 — resolver uma operação UNKNOWN depois de
+                    // verificar o efeito real. Admin (cai no ramo por omissão
+                    // do mapa de papéis) e corre dentro do `execute_admin`,
+                    // portanto a própria reconciliação fica no diário.
+                    "admin-reconcile" => admin_reconcile_op(&engine, &admin_ctx, &r.arg),
                     "verify" => match engine.verify() {
                         Ok(v) => (true, v.to_string()),
                         Err(e) => (false, e.to_string()),
@@ -612,6 +617,40 @@ impl pb::heraclitus_server::Heraclitus for Service {
         .await
         .map_err(internal)?;
         Ok(Response::new(pb::AdminResponse { ok, message }))
+    }
+}
+
+/// `Admin op="admin-reconcile"`: `arg = {"idempotency_key", "outcome":
+/// "succeeded"|"failed", "evidence", "principal"?, "tenant"?}`. `principal`
+/// e `tenant` identificam QUEM pediu a operação original (a chave do diário é
+/// por tenant+principal+chave); por omissão, quem reconcilia.
+pub(crate) fn admin_reconcile_op(
+    engine: &std::sync::Arc<crate::engine::Engine>,
+    reconciler: &crate::trusted_admin::AdminContext,
+    arg: &str,
+) -> (bool, String) {
+    let body = match serde_json::from_str::<serde_json::Value>(arg) {
+        Ok(value) => value,
+        Err(error) => return (false, format!("corpo inválido: {error}")),
+    };
+    let campo = |nome: &str| body.get(nome).and_then(|v| v.as_str());
+    let Some(key) = campo("idempotency_key") else {
+        return (false, "idempotency_key obrigatório".into());
+    };
+    let outcome = match campo("outcome") {
+        Some("succeeded") => crate::trusted_admin::ReconciledOutcome::Succeeded,
+        Some("failed") => crate::trusted_admin::ReconciledOutcome::Failed,
+        _ => return (false, "outcome tem de ser \"succeeded\" ou \"failed\"".into()),
+    };
+    let evidence = campo("evidence").unwrap_or("");
+    let principal = campo("principal").unwrap_or(&reconciler.principal);
+    let tenant = campo("tenant").unwrap_or(&reconciler.tenant);
+    match engine.reconcile_admin(reconciler, tenant, principal, key, outcome, evidence) {
+        Ok(state) => (
+            true,
+            serde_json::json!({ "idempotency_key": key, "state": state }).to_string(),
+        ),
+        Err(error) => (false, error.to_string()),
     }
 }
 

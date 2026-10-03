@@ -66,11 +66,27 @@ pub fn replay_vm<L: EpisodeLog + ?Sized>(
     log: &L,
     vm: &ConsistencyVirtualMachine,
 ) -> Result<VmState, HeraclitusError> {
-    let mut state = VmState::default();
+    replay_vm_from(log, vm, VmState::default(), 0).map(|(state, _)| state)
+}
+
+/// Continua um replay H-VM: dobra sobre `state` os frames a partir do LSN
+/// `from` e devolve o estado e o cursor seguinte (o primeiro LSN ainda não
+/// visto). `replay_vm` é o caso `from = 0`.
+///
+/// Existe para o servidor poder manter o estado em cache e aplicar só a
+/// cauda (GPT-SOL §5 P2 / falta_fazer.md:81, conferido em 2026-10-02): cada
+/// `GET /hvm/state` replayava o log INTEIRO. A janela desceu de 100 000 para
+/// 4096 episódios — eram 100 000 episódios decifrados em RAM de uma vez.
+pub fn replay_vm_from<L: EpisodeLog + ?Sized>(
+    log: &L,
+    vm: &ConsistencyVirtualMachine,
+    mut state: VmState,
+    from: Lsn,
+) -> Result<(VmState, Lsn), HeraclitusError> {
     let head = log.head();
-    let mut cur: Lsn = 0;
+    let mut cur: Lsn = from;
     while cur <= head {
-        let batch = log.scan_capped(cur, head + 1, 100_000)?;
+        let batch = log.scan_capped(cur, head + 1, 4096)?;
         if batch.is_empty() {
             break;
         }
@@ -84,7 +100,7 @@ pub fn replay_vm<L: EpisodeLog + ?Sized>(
         }
         cur = last + 1;
     }
-    Ok(state)
+    Ok((state, cur))
 }
 
 /// Replay the log's H-VM frames straight into a Bᵋ-tree (Fractal Tree),

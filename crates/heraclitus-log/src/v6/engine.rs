@@ -655,6 +655,14 @@ impl V6Log {
         &self.root
     }
 
+    /// Quantos ms o HLC deste log está à frente do relógio de parede (0 se
+    /// alinhado). BUGS.md:2311 (conferido em 2026-10-02): o tecto de skew foi
+    /// recusado por desenho (hlc.rs), e a alternativa era OBSERVAR o skew —
+    /// mas `Hlc::skew_ms` não tinha nenhum chamador.
+    pub fn hlc_skew_ms(&self) -> u64 {
+        self.hlc.skew_ms()
+    }
+
     pub fn metrics_snapshot(&self) -> Result<V6MetricsSnapshot, HeraclitusError> {
         let manifest = self.manifest();
         let mut raw_bytes = 0u64;

@@ -1456,31 +1456,6 @@ impl Log {
         Ok(())
     }
 
-    pub fn resolve_lsn_from_consensus_index(&self, target_raft_index: u64) -> Lsn {
-        let catalog = self.catalog.load();
-
-        if let Some(entry) = catalog.active.index.entries.iter().rev().find(|e| {
-            let r_idx = u64::from_le_bytes(e.opaque_meta[8..16].try_into().unwrap_or([0u8; 8]));
-            r_idx <= target_raft_index
-        }) {
-            return entry.lsn + 1;
-        }
-
-        for container in catalog.sealed.iter().rev() {
-            if let Some(entry) = container.index.entries.iter().rev().find(|e| {
-                let r_idx = u64::from_le_bytes(e.opaque_meta[8..16].try_into().unwrap_or([0u8; 8]));
-                r_idx <= target_raft_index
-            }) {
-                return entry.lsn + 1;
-            }
-        }
-        // R13: sem entrada classificável, o default é PROTETOR — devolver o
-        // head bloqueia qualquer truncate (`from_lsn < allowed_max` rejeita),
-        // em vez do antigo `0`, que desligava a proteção de quórum por completo
-        // num log misto/ilegível.
-        self.head()
-    }
-
     pub fn read_committed(
         &self,
         lsn: Lsn,

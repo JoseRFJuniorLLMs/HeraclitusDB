@@ -157,8 +157,10 @@ impl LogAnalytics {
         let mut kinds: Vec<String> = Vec::new();
         let mut contents: Vec<String> = Vec::new();
         let mut attrs_json: Vec<String> = Vec::new();
-        let mut valid_from: Vec<u64> = Vec::new();
-        let mut valid_to: Vec<u64> = Vec::new();
+        let mut parents_json: Vec<String> = Vec::new();
+        let mut valid_from: Vec<Option<u64>> = Vec::new();
+        let mut valid_to: Vec<Option<u64>> = Vec::new();
+        let mut embeddings_json: Vec<Option<String>> = Vec::new();
 
         let mut cur = 0u64;
         while cur < to {
@@ -169,11 +171,24 @@ impl LogAnalytics {
             for (lsn, e) in &batch {
                 let content = String::from_utf8_lossy(&e.content).into_owned();
                 let attrs = serde_json::to_string(&e.attrs).unwrap_or_else(|_| "{}".into());
+                // As MESMAS codificações do Parquet do cold tier
+                // (heraclitus-tier `segment_to_parquet`), para o mesmo SQL dar o
+                // mesmo resultado sobre o log quente e sobre o arquivo frio.
+                let parents = serde_json::to_string(
+                    &e.parents.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+                )
+                .unwrap_or_else(|_| "[]".into());
+                let embedding = e
+                    .embedding
+                    .as_ref()
+                    .map(|p| serde_json::to_string(p).unwrap_or_else(|_| "null".into()));
                 // Custo residente aproximado desta linha: as colunas variáveis
                 // dominam; os 5 campos fixos (u64) somam 40 bytes.
                 approx_bytes = approx_bytes.saturating_add(
                     content.len()
                         + attrs.len()
+                        + parents.len()
+                        + embedding.as_ref().map_or(0, String::len)
                         + e.agent_id.len()
                         + e.session_id.len()
                         + 40 + 6 * std::mem::size_of::<String>()
@@ -199,8 +214,10 @@ impl LogAnalytics {
                 kinds.push(kind_label(&e.kind));
                 contents.push(content);
                 attrs_json.push(attrs);
-                valid_from.push(e.valid_from.unwrap_or(0));
-                valid_to.push(e.valid_to.unwrap_or(0));
+                valid_from.push(e.valid_from);
+                valid_to.push(e.valid_to);
+                parents_json.push(parents);
+                embeddings_json.push(embedding);
             }
 
             if lsns.len() > max_rows {
@@ -229,9 +246,15 @@ impl LogAnalytics {
             Field::new("kind", DataType::Utf8, false),
             Field::new("content", DataType::Utf8, false),
             Field::new("attrs_json", DataType::Utf8, false),
-            // 0 = ausente (aberto); o SQL pode filtrar `valid_from > 0`.
-            Field::new("valid_from", DataType::UInt64, false),
-            Field::new("valid_to", DataType::UInt64, false),
+            Field::new("parents_json", DataType::Utf8, false),
+            // Bi-temporalidade: NULL = aberto, como no Parquet do cold tier.
+            // Era `0` não-nulo, e 0 é um instante real — o mesmo SQL dava
+            // resultados diferentes sobre o log quente e sobre o arquivo frio
+            // (falta_fazer.md:241-244). `valid_from > 0` continua a filtrar os
+            // abertos (NULL > 0 não é verdadeiro).
+            Field::new("valid_from", DataType::UInt64, true),
+            Field::new("valid_to", DataType::UInt64, true),
+            Field::new("embedding_json", DataType::Utf8, true),
         ]));
 
         let batch = RecordBatch::try_new(
@@ -245,8 +268,10 @@ impl LogAnalytics {
                 Arc::new(StringArray::from(kinds)),
                 Arc::new(StringArray::from(contents)),
                 Arc::new(StringArray::from(attrs_json)),
+                Arc::new(StringArray::from(parents_json)),
                 Arc::new(UInt64Array::from(valid_from)),
                 Arc::new(UInt64Array::from(valid_to)),
+                Arc::new(StringArray::from(embeddings_json)),
             ],
         )
         .map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
@@ -337,6 +362,12 @@ impl LogAnalytics {
     }
 }
 
+/// Os testes que abrem sessões partilham o semáforo GLOBAL de admissão (duas
+/// sessões residentes). Em paralelo, três testes com uma sessão cada faziam um
+/// deles falhar com "analytics busy" ao acaso; este lock serializa-os.
+#[cfg(test)]
+pub(crate) static SESSOES_DE_TESTE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,6 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn sql_group_by_over_the_log() {
+        let _sessoes = SESSOES_DE_TESTE.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let log = Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
         for i in 0..12 {
@@ -379,7 +411,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cols[0]["kind"], "Observation");
-        assert_eq!(cols[0]["valid_from"], 0);
+        // Ausente = NULL (como no Parquet do cold tier), não o instante 0.
+        assert!(cols[0]["valid_from"].is_null(), "{:?}", cols[0]);
+        let abertos = a
+            .sql("SELECT COUNT(*) AS n FROM events WHERE valid_from IS NULL")
+            .await
+            .unwrap();
+        assert_eq!(abertos[0]["n"], 12);
+        let pais = a
+            .sql("SELECT parents_json FROM events WHERE lsn = 0")
+            .await
+            .unwrap();
+        assert_eq!(pais[0]["parents_json"], "[]");
     }
 
     /// ADMISSION CONTROL: o scan era janelado mas as colunas ACUMULAM ao longo
@@ -389,6 +432,7 @@ mod tests {
     /// (não cancela a tarefa bloqueante). O corte tem de ser DENTRO do trabalho.
     #[test]
     fn materializacao_respeita_o_orcamento() {
+        let _sessoes = SESSOES_DE_TESTE.blocking_lock();
         let dir = tempfile::tempdir().unwrap();
         let log = Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
         for i in 0..40 {
@@ -428,6 +472,7 @@ mod tests {
 
     #[tokio::test]
     async fn sql_refuses_ddl_dml_and_statements() {
+        let _sessoes = SESSOES_DE_TESTE.lock().await;
         // O endpoint é read-only IMPOSTO: sem isto, `CREATE EXTERNAL TABLE ...
         // LOCATION` lia ficheiros arbitrários do servidor via /sql.
         let dir = tempfile::tempdir().unwrap();
@@ -454,6 +499,7 @@ mod audit_budget_tests {
     use super::*;
     #[tokio::test]
     async fn output_limit_is_applied_before_collecting_large_results() {
+        let _sessoes = SESSOES_DE_TESTE.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let log =
             heraclitus_log::Log::open(dir.path(), 1 << 20, heraclitus_core::FsyncPolicy::Always)

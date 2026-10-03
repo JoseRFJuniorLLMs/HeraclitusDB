@@ -228,12 +228,32 @@ pub struct AdminResult {
 pub struct AdminExecutionToken {
     operation_id: String,
     intent_lsn: Lsn,
+    /// A operação para que a intenção foi autorizada e gravada.
+    kind: AdminOperationKind,
     _private: (),
 }
 
 impl AdminExecutionToken {
     pub fn operation_id(&self) -> &str {
         &self.operation_id
+    }
+
+    /// `true` se este token foi emitido para destruir a chave de `agent_id`.
+    ///
+    /// Conferência de 2026-10-02 (SPEC-0089 §14): o `shred_effect` recebia o
+    /// token e ignorava-o (`_token`). Qualquer token — de um legal hold, de
+    /// uma aprovação do Sentinel — servia para destruir a chave de qualquer
+    /// titular, e a intenção gravada no diário descrevia outra operação.
+    pub fn authorizes_crypto_shred(&self, agent_id: &str) -> bool {
+        match &self.kind {
+            AdminOperationKind::CryptoShred { agent_id: alvo } => alvo == agent_id,
+            // O RPC `Admin op="shred:<id>"` grava a intenção como Custom com
+            // o nome da operação — o mesmo texto que o despachante executa.
+            AdminOperationKind::Custom { name, .. } => {
+                name.strip_prefix("shred:") == Some(agent_id)
+            }
+            _ => false,
+        }
     }
 
     pub fn intent_lsn(&self) -> Lsn {
@@ -480,13 +500,10 @@ impl TrustedAdminProtocol {
     /// Retorna o estado de uma operação ativa ou registrada por idempotency_key.
     pub fn operation_state(&self, ctx: &AdminContext, idempotency_key: &str) -> Option<AdminState> {
         let key = serde_json::to_string(&(&ctx.tenant, &ctx.principal, idempotency_key)).ok()?;
-        self.journal.lock().ok()?.get(&key).map(|r| {
-            if r.result.is_some() {
-                AdminState::Succeeded
-            } else {
-                AdminState::Unknown
-            }
-        })
+        // Um `error` gravado é Failed (o efeito devolveu erro), não Unknown:
+        // reportá-lo como Unknown mandava o operador reconciliar uma operação
+        // que já tinha desfecho.
+        self.journal.lock().ok()?.get(&key).map(DurableRecord::estado)
     }
 
     pub fn get_operation_state(&self, idempotency_key: &str) -> Option<AdminState> {
@@ -499,7 +516,12 @@ impl TrustedAdminProtocol {
     }
 
     /// Cria um token de execução após a persistência da intenção (Fase 2).
-    fn create_execution_token(&self, operation_id: String, intent_lsn: Lsn) -> AdminExecutionToken {
+    fn create_execution_token(
+        &self,
+        operation_id: String,
+        intent_lsn: Lsn,
+        kind: AdminOperationKind,
+    ) -> AdminExecutionToken {
         let mut active = self.active_operations.write().unwrap();
         active.insert(operation_id.clone(), AdminState::IntentDurable);
         drop(active);
@@ -507,6 +529,7 @@ impl TrustedAdminProtocol {
         AdminExecutionToken {
             operation_id,
             intent_lsn,
+            kind,
             _private: (),
         }
     }
@@ -663,28 +686,154 @@ struct DurableRecord {
     intent: Option<(AdminContext, AdminOperation)>,
     result: Option<serde_json::Value>,
     error: Option<String>,
+    /// Quem resolveu manualmente uma operação UNKNOWN (SPEC-0089 §9). Campo
+    /// opcional com `default`: diários gravados antes dele continuam a ler-se.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reconciled_by: Option<String>,
+}
+
+impl DurableRecord {
+    fn estado(&self) -> AdminState {
+        match (&self.result, &self.error, &self.reconciled_by) {
+            (_, _, Some(_)) => AdminState::Reconciled,
+            (Some(_), _, None) => AdminState::Succeeded,
+            (None, Some(_), None) => AdminState::Failed,
+            (None, None, None) => AdminState::Unknown,
+        }
+    }
+}
+
+/// O desfecho que quem reconcilia declara para uma operação UNKNOWN, depois
+/// de verificar o efeito real fora do sistema (chave existe ou não no HSM,
+/// hold aplicado ou não, ...).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconciledOutcome {
+    Succeeded,
+    Failed,
 }
 
 impl TrustedAdminProtocol {
+    /// Resolve uma operação UNKNOWN (SPEC-0089 §9).
+    ///
+    /// Conferência de 2026-10-02: `AdminState::Reconciled` existia e nunca
+    /// era usado. Uma operação interrompida entre o efeito e o resultado
+    /// ficava UNKNOWN para sempre — o protocolo recusa repeti-la (correcto) e
+    /// não oferecia saída nenhuma além de a contornar com OUTRA chave de
+    /// idempotência, que é exactamente o duplicado que o protocolo existe
+    /// para impedir.
+    ///
+    /// Grava um `AdminResult` para a intenção pendente, com o desfecho
+    /// declarado, a evidência e quem reconciliou; o `recover` aceita-o como
+    /// qualquer outro resultado. Só aceita operações sem resultado, e verifica
+    /// e grava sob o lock do diário: duas reconciliações concorrentes não
+    /// podem gravar dois resultados (o segundo faria o `recover` recusar o
+    /// arranque).
+    ///
+    /// Chamado de DENTRO de um `execute` (a própria reconciliação é uma
+    /// operação administrativa auditada), portanto não toma o lock de
+    /// execução.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reconcile(
+        &self,
+        reconciler: &AdminContext,
+        tenant: &str,
+        principal: &str,
+        idempotency_key: &str,
+        outcome: ReconciledOutcome,
+        evidence: &str,
+        mut persist: impl FnMut(heraclitus_core::Episode) -> Result<Lsn, HeraclitusError>,
+    ) -> Result<AdminState, HeraclitusError> {
+        if evidence.trim().is_empty() {
+            return Err(HeraclitusError::Config(
+                "reconciliação exige evidência do efeito real".into(),
+            ));
+        }
+        let key = serde_json::to_string(&(tenant, principal, idempotency_key)).unwrap();
+        let mut journal = self.journal.lock().unwrap();
+        let Some(record) = journal.get(&key) else {
+            return Err(HeraclitusError::Config(format!(
+                "operação administrativa desconhecida: {idempotency_key}"
+            )));
+        };
+        if record.estado() != AdminState::Unknown {
+            return Err(HeraclitusError::Config(format!(
+                "operação {} já está {:?}; nada a reconciliar",
+                record.operation_id,
+                record.estado()
+            )));
+        }
+        let mut resolvido = record.clone();
+        resolvido.reconciled_by = Some(reconciler.principal.clone());
+        match outcome {
+            ReconciledOutcome::Succeeded => {
+                resolvido.result = Some(serde_json::json!({
+                    "reconciled": true,
+                    "evidence": evidence,
+                }))
+            }
+            ReconciledOutcome::Failed => {
+                resolvido.error = Some(format!("reconciled as failed: {evidence}"))
+            }
+        }
+        persist(heraclitus_core::Episode::new(
+            "heraclitus-admin",
+            heraclitus_core::EventKind::Custom("AdminResult".into()),
+            serde_json::to_vec(&resolvido)
+                .map_err(|e| HeraclitusError::Serialization(e.to_string()))?,
+        ))?;
+        journal.insert(key, resolvido);
+        Ok(AdminState::Reconciled)
+    }
+
     pub(crate) fn recover<L: heraclitus_log::EpisodeLog + ?Sized>(
         &self,
         log: &L,
     ) -> Result<(), HeraclitusError> {
         let mut records: HashMap<String, DurableRecord> = HashMap::new();
-        let mut cur = 0;
         let head = log.head();
-        while cur < head {
-            let rows = log.scan_capped(cur, head, 16)?;
-            let Some((last, _)) = rows.last() else {
-                break;
-            };
+        // Conferência de 2026-10-02: a reconstrução do diário corria em CADA
+        // `Engine::open` varrendo o log INTEIRO em janelas de 16 e decifrando
+        // cada episódio só para o descartar pelo `agent_id` — custo O(log) no
+        // arranque, pago até nos arranques log-only. O scan podado por
+        // built-in só salta um segmento quando o Bloom PROVA a ausência (e um
+        // sidecar ausente/corrompido cai no `.hrkl`), por isso a correcção do
+        // diário não passa a depender de nenhum índice derivado. Sem a
+        // capacidade (log legado) mantém-se a varredura completa.
+        if let Some((rows, _)) =
+            log.scan_builtin_eq_capped("agent_id", "heraclitus-admin", 0, head, usize::MAX)?
+        {
             for (_, ep) in &rows {
+                Self::aplicar_registo(&mut records, ep)?;
+            }
+        } else {
+            let mut cur = 0;
+            while cur < head {
+                let rows = log.scan_capped(cur, head, 16)?;
+                let Some((last, _)) = rows.last() else {
+                    break;
+                };
+                for (_, ep) in &rows {
+                    Self::aplicar_registo(&mut records, ep)?;
+                }
+                cur = last.saturating_add(1);
+            }
+        }
+        *self.journal.lock().unwrap() = records;
+        Ok(())
+    }
+
+    /// Valida e incorpora um evento do diário administrativo; ignora tudo o
+    /// que não for `AdminIntent`/`AdminResult` do agente `heraclitus-admin`.
+    fn aplicar_registo(
+        records: &mut HashMap<String, DurableRecord>,
+        ep: &heraclitus_core::Episode,
+    ) -> Result<(), HeraclitusError> {
                 if ep.agent_id != "heraclitus-admin" {
-                    continue;
+                    return Ok(());
                 }
                 if !matches!(&ep.kind, heraclitus_core::EventKind::Custom(k) if k == "AdminIntent" || k == "AdminResult")
                 {
-                    continue;
+                    return Ok(());
                 }
                 let record: DurableRecord = serde_json::from_slice(&ep.content).map_err(|e| {
                     HeraclitusError::Config(format!("administrative journal corrupt: {e}"))
@@ -734,11 +883,7 @@ impl TrustedAdminProtocol {
                     }
                 }
                 records.insert(record.key.clone(), record);
-            }
-            cur = last.saturating_add(1);
-        }
-        *self.journal.lock().unwrap() = records;
-        Ok(())
+                Ok(())
     }
 
     /// Serialized intent -> fsync -> effect -> result -> fsync. An incomplete
@@ -765,9 +910,33 @@ impl TrustedAdminProtocol {
                     key: op.idempotency_key.clone(),
                 });
             }
-            if let Some(value) = &previous.result {
-                return serde_json::from_value(value.clone())
-                    .map_err(|e| HeraclitusError::Serialization(e.to_string()));
+            // Um retry com a mesma chave devolve o desfecho GRAVADO, nunca
+            // re-executa. Antes, um `error` gravado (o efeito falhou de forma
+            // definitiva) era respondido como "UNKNOWN; reconciliation
+            // required" — mandava reconciliar uma operação que não tinha nada
+            // por reconciliar.
+            match previous.estado() {
+                AdminState::Succeeded => {
+                    if let Some(value) = &previous.result {
+                        return serde_json::from_value(value.clone())
+                            .map_err(|e| HeraclitusError::Serialization(e.to_string()));
+                    }
+                }
+                AdminState::Failed => {
+                    return Err(HeraclitusError::Config(format!(
+                        "administrative operation previously FAILED (not re-executed): {}: {}",
+                        previous.operation_id,
+                        previous.error.as_deref().unwrap_or("")
+                    )));
+                }
+                AdminState::Reconciled => {
+                    return Err(HeraclitusError::Config(format!(
+                        "administrative operation was RECONCILED by {} (not re-executed): {}",
+                        previous.reconciled_by.as_deref().unwrap_or("?"),
+                        previous.operation_id
+                    )));
+                }
+                _ => {}
             }
             return Err(HeraclitusError::Config(format!(
                 "administrative operation UNKNOWN; reconciliation required: {}",
@@ -781,6 +950,7 @@ impl TrustedAdminProtocol {
             intent: Some((ctx.clone(), op.clone())),
             result: None,
             error: None,
+            reconciled_by: None,
         };
         let event = |kind: &str,
                      record: &DurableRecord|
@@ -798,7 +968,8 @@ impl TrustedAdminProtocol {
             .unwrap()
             .insert(key.clone(), record.clone());
         let intent_lsn = persist(event("AdminIntent", &record)?)?;
-        let token = self.create_execution_token(op.idempotency_key.clone(), intent_lsn);
+        let token =
+            self.create_execution_token(op.idempotency_key.clone(), intent_lsn, op.kind.clone());
         let result = effect(&token);
         match &result {
             Ok(value) => {
@@ -913,6 +1084,153 @@ mod durable_regressions {
         );
         assert_eq!(hits.get(), 1);
     }
+    /// Conferência de 2026-10-02: um efeito que devolve erro tem desfecho
+    /// (Failed), não é UNKNOWN. O estado reportava Unknown e um retry pedia
+    /// "reconciliation required" para uma operação sem nada por reconciliar.
+    #[test]
+    fn efeito_com_erro_fica_failed_e_o_retry_devolve_a_falha_sem_reexecutar() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log::open(dir.path(), 1 << 20, heraclitus_core::FsyncPolicy::Always).unwrap();
+        let p = TrustedAdminProtocol::new();
+        let hits = std::cell::Cell::new(0);
+        let persist = |ep| {
+            let lsn = log.append(ep)?;
+            log.flush()?;
+            Ok(lsn)
+        };
+        let falha = |_: &AdminExecutionToken| -> Result<bool, HeraclitusError> {
+            hits.set(hits.get() + 1);
+            Err(HeraclitusError::Config("chave não existe no HSM".into()))
+        };
+        assert!(p.execute(&context(), &operation(), persist, falha).is_err());
+        assert_eq!(p.operation_state(&context(), "key"), Some(AdminState::Failed));
+        let erro = p
+            .execute(&context(), &operation(), persist, falha)
+            .unwrap_err()
+            .to_string();
+        assert!(erro.contains("previously FAILED"), "{erro}");
+        assert_eq!(hits.get(), 1, "retry não re-executa o efeito");
+
+        let reiniciado = TrustedAdminProtocol::new();
+        reiniciado.recover(&log).unwrap();
+        assert_eq!(
+            reiniciado.operation_state(&context(), "key"),
+            Some(AdminState::Failed)
+        );
+    }
+
+    fn deixar_unknown<L: heraclitus_log::EpisodeLog>(log: &L) {
+        let p = TrustedAdminProtocol::new();
+        let writes = std::cell::Cell::new(0);
+        let _: Result<bool, _> = p.execute(
+            &context(),
+            &operation(),
+            |ep| {
+                writes.set(writes.get() + 1);
+                if writes.get() == 2 {
+                    return Err(HeraclitusError::Config("injected result fsync failure".into()));
+                }
+                let lsn = log.append(ep)?;
+                log.flush()?;
+                Ok(lsn)
+            },
+            |_| Ok(true),
+        );
+    }
+
+    /// SPEC-0089 §9: `AdminState::Reconciled` nunca era usado — uma operação
+    /// UNKNOWN ficava presa para sempre, e a única saída era repeti-la com
+    /// outra chave (o duplicado que o protocolo existe para impedir).
+    fn reconciliacao_resolve_unknown_e_sobrevive_ao_restart<L: heraclitus_log::EpisodeLog>(
+        log: &L,
+    ) {
+        deixar_unknown(log);
+        let p = TrustedAdminProtocol::new();
+        p.recover(log).unwrap();
+        assert_eq!(p.operation_state(&context(), "key"), Some(AdminState::Unknown));
+
+        let revisor = AdminContext::new("revisora", "tenant", vec!["admin".into()]);
+        let persist = |ep| {
+            let lsn = log.append(ep)?;
+            log.flush()?;
+            Ok(lsn)
+        };
+        // Sem evidência: recusado.
+        assert!(p
+            .reconcile(&revisor, "tenant", "admin", "key", ReconciledOutcome::Succeeded, " ", persist)
+            .is_err());
+        assert_eq!(
+            p.reconcile(
+                &revisor,
+                "tenant",
+                "admin",
+                "key",
+                ReconciledOutcome::Succeeded,
+                "HSM confirma a chave destruída (ticket 42)",
+                persist,
+            )
+            .unwrap(),
+            AdminState::Reconciled
+        );
+        // Uma segunda reconciliação não pode gravar outro resultado.
+        assert!(p
+            .reconcile(&revisor, "tenant", "admin", "key", ReconciledOutcome::Failed, "x", persist)
+            .is_err());
+
+        // O restart lê o resultado reconciliado (o `recover` aceita-o) e o
+        // retry continua a não re-executar.
+        let reiniciado = TrustedAdminProtocol::new();
+        reiniciado.recover(log).unwrap();
+        assert_eq!(
+            reiniciado.operation_state(&context(), "key"),
+            Some(AdminState::Reconciled)
+        );
+        let hits = std::cell::Cell::new(0);
+        let erro = reiniciado
+            .execute(&context(), &operation(), persist, |_| {
+                hits.set(hits.get() + 1);
+                Ok(true)
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(erro.contains("RECONCILED"), "{erro}");
+        assert_eq!(hits.get(), 0);
+    }
+
+    #[test]
+    fn reconciliacao_no_log_legado() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Log::open(dir.path(), 1 << 20, heraclitus_core::FsyncPolicy::Always).unwrap();
+        reconciliacao_resolve_unknown_e_sobrevive_ao_restart(&log);
+    }
+
+    /// No V6 o `recover` usa o scan podado por `agent_id` em vez de decifrar o
+    /// log inteiro. Com ruído de outros agentes antes, entre e depois das
+    /// entradas do diário, o resultado tem de ser o mesmo.
+    #[test]
+    fn reconciliacao_no_v6_com_recover_podado() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = heraclitus_log::v6::V6Log::open(
+            dir.path(),
+            8 << 20,
+            heraclitus_core::FsyncPolicy::Always,
+        )
+        .unwrap();
+        for i in 0..50 {
+            log.append(heraclitus_core::Episode::new(
+                "outro-agente",
+                heraclitus_core::EventKind::Observation,
+                format!("ruido {i}").into_bytes(),
+            ))
+            .unwrap();
+        }
+        assert!(log
+            .scan_builtin_eq_capped("agent_id", "heraclitus-admin", 0, log.head(), usize::MAX)
+            .unwrap()
+            .is_some());
+        reconciliacao_resolve_unknown_e_sobrevive_ao_restart(&log);
+    }
+
     #[test]
     fn failed_result_is_unknown_after_restart_and_is_not_reexecuted() {
         let dir = tempfile::tempdir().unwrap();

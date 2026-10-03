@@ -1568,6 +1568,17 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                 .clone()
                 .or_else(|| eq_filter(conditions, rel_var, "type"));
             let rows = be.match_edges(src.as_deref(), etype.as_deref(), dst.as_deref(), bound)?;
+            // O MESMO tecto do padrão de nó (conferência de 2026-10-02): o
+            // padrão de relação ordenava e projectava para JSON TODAS as
+            // arestas candidatas, sem limite — um `MATCH (a)-[r]->(b)` sobre um
+            // grafo grande construía milhões de objectos JSON numa resposta.
+            if rows.len() > QUERY_SCAN_CAP {
+                return Err(HeraclitusError::Query(format!(
+                    "padrão de relação com {} arestas candidatas excede {QUERY_SCAN_CAP}; \
+                     restrinja a origem, o destino ou o tipo (nenhum resultado parcial devolvido)",
+                    rows.len()
+                )));
+            }
             let mut kept: Vec<&EdgeRow> = rows
                 .iter()
                 // Bi-temporal em ARESTAS (V2.4): VALID AT filtra pelo valid

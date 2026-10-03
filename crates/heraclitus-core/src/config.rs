@@ -832,6 +832,84 @@ impl HeraclitusConfig {
     /// `HERACLITUS_DATA_DIR`, `HERACLITUS_STORAGE_FORMAT=legacy|v6`,
     /// `HERACLITUS_GRPC_ADDR`, `HERACLITUS_REST_ADDR`, and
     /// `HERACLITUS_FSYNC=always|group_commit:<ms>`.
+    /// Variáveis `HERACLITUS_RAFT_*` (falta_fazer.md:106, conferido em
+    /// 2026-10-02): a replicação era a única secção sem override por
+    /// ambiente, o que obrigava a um ficheiro TOML por nó num cluster que, de
+    /// resto, se configura todo por ambiente (contentores, systemd).
+    ///
+    /// `HERACLITUS_RAFT_NODE_ID` liga a replicação (cria a secção se faltar);
+    /// as restantes só ajustam uma secção existente. `HERACLITUS_RAFT_PEERS` é
+    /// `id=endereço` separado por vírgulas. Valores inválidos são erro — um
+    /// nó que arranca com o id errado divide o cluster em silêncio.
+    fn apply_replication_env(&mut self) -> Result<(), HeraclitusError> {
+        let invalid = |nome: &str, v: &str| {
+            HeraclitusError::Config(format!("{nome} inválido: {v:?}"))
+        };
+        if let Ok(v) = std::env::var("HERACLITUS_RAFT_NODE_ID") {
+            let id: u64 = v.trim().parse().map_err(|_| invalid("HERACLITUS_RAFT_NODE_ID", &v))?;
+            self.replication.get_or_insert_with(Default::default).node_id = id;
+        }
+        let Some(rep) = self.replication.as_mut() else {
+            return Ok(());
+        };
+        if let Ok(v) = std::env::var("HERACLITUS_RAFT_ADDR") {
+            if !v.is_empty() {
+                rep.raft_addr = v;
+            }
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_RAFT_PEERS") {
+            let mut peers = std::collections::BTreeMap::new();
+            for par in v.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                let (id, addr) = par
+                    .split_once('=')
+                    .ok_or_else(|| invalid("HERACLITUS_RAFT_PEERS", &v))?;
+                let id: u64 = id
+                    .trim()
+                    .parse()
+                    .map_err(|_| invalid("HERACLITUS_RAFT_PEERS", &v))?;
+                if addr.trim().is_empty() || peers.insert(id, addr.trim().to_string()).is_some() {
+                    return Err(invalid("HERACLITUS_RAFT_PEERS", &v));
+                }
+            }
+            rep.peers = peers;
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_RAFT_BOOTSTRAP") {
+            rep.bootstrap = parse_strict_bool("HERACLITUS_RAFT_BOOTSTRAP", &v)?;
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_RAFT_TRANSPORT") {
+            rep.transport = match v.as_str() {
+                "tcp" => RaftTransport::Tcp,
+                "grpc" => RaftTransport::Grpc,
+                _ => return Err(invalid("HERACLITUS_RAFT_TRANSPORT", &v)),
+            };
+        }
+        let caminho = |nome: &str| {
+            std::env::var(nome)
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+        };
+        if let Some(p) = caminho("HERACLITUS_RAFT_DIR") {
+            rep.raft_dir = p;
+        }
+        if let Some(p) = caminho("HERACLITUS_RAFT_SM_DIR") {
+            rep.sm_dir = p;
+        }
+        if let Some(p) = caminho("HERACLITUS_RAFT_TLS_CERT") {
+            rep.tls_cert_path = Some(p);
+        }
+        if let Some(p) = caminho("HERACLITUS_RAFT_TLS_KEY") {
+            rep.tls_key_path = Some(p);
+        }
+        if let Some(p) = caminho("HERACLITUS_RAFT_TLS_CA") {
+            rep.tls_ca_path = Some(p);
+        }
+        if let Ok(v) = std::env::var("HERACLITUS_RAFT_TLS_SERVER_NAME") {
+            rep.tls_server_name = v;
+        }
+        Ok(())
+    }
+
     pub fn apply_env(&mut self) -> Result<(), HeraclitusError> {
         if let Ok(v) = std::env::var("HERACLITUS_DATA_DIR") {
             self.data_dir = PathBuf::from(v);
@@ -1131,6 +1209,7 @@ impl HeraclitusConfig {
                 self.cold_tier_path = PathBuf::from(v);
             }
         }
+        self.apply_replication_env()?;
         if let Ok(v) = std::env::var("HERACLITUS_COMPLIANCE_TSA_URL") {
             if !v.is_empty() {
                 // O modo vem do ESQUEMA, não é fixo em "http". Antes, pôr um
@@ -1683,6 +1762,48 @@ max_graph_hops = 6
         cfg.sentinel.mode = SentinelMode::Autonomous;
         let error = cfg.validate_security().unwrap_err().to_string();
         assert!(error.contains("autonomous") && error.contains("bloqueado"));
+    }
+
+    #[test]
+    fn replicacao_configura_se_por_ambiente() {
+        let nomes = [
+            ("HERACLITUS_RAFT_NODE_ID", "3"),
+            ("HERACLITUS_RAFT_ADDR", "10.0.0.3:8474"),
+            ("HERACLITUS_RAFT_PEERS", "1=10.0.0.1:8474, 2=10.0.0.2:8474,3=10.0.0.3:8474"),
+            ("HERACLITUS_RAFT_BOOTSTRAP", "false"),
+            ("HERACLITUS_RAFT_TRANSPORT", "grpc"),
+            ("HERACLITUS_RAFT_TLS_CA", "/etc/heraclitus/ca.pem"),
+        ];
+        let anteriores: Vec<_> = nomes
+            .iter()
+            .map(|(n, v)| {
+                let antes = std::env::var_os(n);
+                std::env::set_var(n, v);
+                (*n, antes)
+            })
+            .collect();
+        let mut cfg = HeraclitusConfig::default();
+        let ok = cfg.apply_replication_env();
+
+        std::env::set_var("HERACLITUS_RAFT_PEERS", "1=a:1,1=b:2");
+        let duplicado = HeraclitusConfig::default().apply_replication_env();
+        for (n, antes) in anteriores {
+            match antes {
+                Some(v) => std::env::set_var(n, v),
+                None => std::env::remove_var(n),
+            }
+        }
+
+        ok.unwrap();
+        let rep = cfg.replication.expect("NODE_ID liga a replicação");
+        assert_eq!(rep.node_id, 3);
+        assert_eq!(rep.raft_addr, "10.0.0.3:8474");
+        assert_eq!(rep.peers.len(), 3);
+        assert_eq!(rep.peers[&2], "10.0.0.2:8474");
+        assert!(!rep.bootstrap);
+        assert_eq!(rep.transport, RaftTransport::Grpc);
+        assert_eq!(rep.tls_ca_path, Some(PathBuf::from("/etc/heraclitus/ca.pem")));
+        assert!(duplicado.is_err(), "id repetido em PEERS tem de ser erro");
     }
 
     #[test]

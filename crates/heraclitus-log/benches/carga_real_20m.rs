@@ -12,8 +12,6 @@
 //!  5. **`verify()` integral** — o custo forense (crc de cada registo + raiz
 //!     Merkle de cada segmento selado) nunca foi medido a esta escala. É o
 //!     número que decide se a auditoria é praticável em produção;
-//!  6. **`resolve_lsn_from_consensus_index`** — a auditoria marcou-o como O(n)
-//!     por inspeção e deixou-o por medir (secção 7).
 //!
 //! A fase do segmento de 256 MiB do bench de 1M NÃO existe aqui: a 10M levou
 //! 28 494 s (7,9 h) e a 20M passaria de 30 h. O ponto já está provado.
@@ -322,21 +320,9 @@ fn main() {
         lidos as f64 / dt.as_secs_f64()
     );
 
-    // ── 4. CONSENSO · resolve_lsn_from_consensus_index ──────────────────────
-    // A auditoria (secção 7) marcou-o O(n) por inspeção e deixou-o por medir.
-    println!("-- 4. CONSENSO · resolve_lsn_from_consensus_index ---------------");
-    let mut lat_cons = Vec::with_capacity(200);
-    for k in 0..200u64 {
-        let t = Instant::now();
-        let _ = log.resolve_lsn_from_consensus_index(k * 7 + 1);
-        lat_cons.push(t.elapsed());
-    }
-    println!(
-        "    200 chamadas: p50 {:.2?} · p95 {:.2?} · max {:.2?}\n",
-        pct(&mut lat_cons, 0.50),
-        pct(&mut lat_cons, 0.95),
-        pct(&mut lat_cons, 1.0)
-    );
+    // (Secção 4 removida em 2026-10-02 com a função medida,
+    // `resolve_lsn_from_consensus_index`: código morto, sem chamadores em
+    // produção desde a remoção do raft v0 — auditoria falta.md R13.)
 
     // ── 5. LEITURA SOB ESCRITA ──────────────────────────────────────────────
     println!("-- 5. LEITURA SOB ESCRITA · 4 leitores + 4 escritores -----------");
