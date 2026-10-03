@@ -159,7 +159,11 @@ pub mod ckpt {
         let mut comprimento = [0u8; 8];
         comprimento.copy_from_slice(&cabeca[10..18]);
         let corpo = u64::from_le_bytes(comprimento);
-        if tamanho != CABECALHO as u64 + corpo {
+        // `checked_add`: o comprimento vem do cabeçalho, que o CRC não cobre;
+        // com `overflow-checks` uma soma que transborda entrava em pânico no
+        // arranque (revisão de 2026-10-03), e um checkpoint ilegível nunca pode
+        // impedir o boot.
+        if (CABECALHO as u64).checked_add(corpo) != Some(tamanho) {
             return Err(format!(
                 "comprimento {tamanho} não bate com o cabeçalho ({CABECALHO} + {corpo})"
             ));

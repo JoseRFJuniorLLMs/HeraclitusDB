@@ -1570,17 +1570,6 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                 .clone()
                 .or_else(|| eq_filter(conditions, rel_var, "type"));
             let rows = be.match_edges(src.as_deref(), etype.as_deref(), dst.as_deref(), bound)?;
-            // O MESMO tecto do padrão de nó (conferência de 2026-10-02): o
-            // padrão de relação ordenava e projectava para JSON TODAS as
-            // arestas candidatas, sem limite — um `MATCH (a)-[r]->(b)` sobre um
-            // grafo grande construía milhões de objectos JSON numa resposta.
-            if rows.len() > QUERY_SCAN_CAP {
-                return Err(HeraclitusError::Query(format!(
-                    "padrão de relação com {} arestas candidatas excede {QUERY_SCAN_CAP}; \
-                     restrinja a origem, o destino ou o tipo (nenhum resultado parcial devolvido)",
-                    rows.len()
-                )));
-            }
             let mut kept: Vec<&EdgeRow> = rows
                 .iter()
                 // Bi-temporal em ARESTAS (V2.4): VALID AT filtra pelo valid
@@ -1596,6 +1585,25 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                 // antes, condições não-empurráveis eram ignoradas em silêncio).
                 .filter(|r| edge_matches(conditions, r, from_var, to_var, rel_var))
                 .collect();
+            // O MESMO tecto do padrão de nó (conferência de 2026-10-02): o
+            // padrão de relação ordenava e projectava TODAS as arestas sem
+            // limite. Conta-se como no nó — linhas que PASSAM os filtros, e
+            // sem ORDER BY o LIMIT corta antes (revisão de 2026-10-03: contar
+            // os candidatos antes do WHERE fazia falhar consultas que só
+            // devolvem poucas linhas num grafo com mais de 250 000 arestas).
+            if order_by.is_none() {
+                if let Some(l) = limit {
+                    kept.truncate(*l as usize);
+                }
+            }
+            if kept.len() > QUERY_SCAN_CAP {
+                return Err(HeraclitusError::Query(format!(
+                    "padrão de relação com {} arestas que passam o filtro excede \
+                     {QUERY_SCAN_CAP}; restrinja a consulta ou use LIMIT (nenhum resultado \
+                     parcial devolvido)",
+                    kept.len()
+                )));
+            }
             // Auditoria 2026-09-05: ORDER BY ANTES do LIMIT — com 5 000 arestas
             // e `ORDER BY r.belief DESC LIMIT 10`, o planner devolvia as 10
             // primeiras na ordem do BTreeMap (lexicográfica do edge id) como se

@@ -4,8 +4,10 @@
 //! saía com menos de `k` linhas — ou nenhuma — sem aviso, embora existissem
 //! candidatos válidos mais abaixo no ranking.
 //!
-//! Também fixa o tecto de `k`: `NEAREST(.., 4000000000)` era aceite e pedia ao
-//! HNSW um `ef` desse tamanho e a hidratação do índice inteiro.
+//! Um `k` absurdo (`NEAREST(.., 4000000000)`) tem de ser aceite sem rebentar.
+//! Nota honesta (revisão de 2026-10-03): este teste NÃO mede o tecto
+//! `MAX_TOP_K` em si — com 65 pontos, devolver no máximo 65 também acontecia
+//! sem tecto. Medi-lo exigiria um índice com mais de 10 000 pontos.
 
 use heraclitus_core::{Episode, EventKind, FsyncPolicy, HeraclitusConfig, ProductPoint};
 use heraclitus_server::engine::Engine;
@@ -58,7 +60,7 @@ fn nearest_as_of_devolve_k_linhas_mesmo_com_os_vizinhos_todos_depois_do_corte() 
     let gql = format!("NEAREST([0.5, 0.0], 5) AS OF LSN {corte}");
     assert_eq!(linhas(&engine, &gql), 5, "AS OF não pode encolher o top-k");
 
-    // `k` absurdo: aceite mas limitado — devolve no máximo o que existe.
+    // `k` absurdo: aceite sem rebentar (não prova o tecto — ver o topo).
     let n = linhas(&engine, "NEAREST([0.5, 0.0], 4000000000)");
     assert!(n <= 65, "{n}");
 }

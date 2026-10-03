@@ -86,3 +86,17 @@ fn versao_desconhecida_e_recusada() {
     std::fs::write(&path, &bytes).unwrap();
     assert_eq!(ckpt::load::<Estado>(dir.path(), "v").unwrap(), None);
 }
+
+/// Revisão de 2026-10-03: o comprimento do corpo vem do cabeçalho, que o CRC
+/// não cobre. `u64::MAX` fazia `CABECALHO + corpo` transbordar — com
+/// `overflow-checks` era um pânico no arranque. Tem de degradar para rebuild.
+#[test]
+fn comprimento_absurdo_no_cabecalho_degrada_sem_panico() {
+    let dir = tempfile::tempdir().unwrap();
+    ckpt::save(dir.path(), "v", &estado()).unwrap();
+    let path = dir.path().join("v.ckpt");
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[10..18].copy_from_slice(&u64::MAX.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+    assert_eq!(ckpt::load::<Estado>(dir.path(), "v").unwrap(), None);
+}

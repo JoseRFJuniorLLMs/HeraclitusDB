@@ -44,6 +44,27 @@ Três revisores percorreram todas as auditorias (`AUDITORIA-GERAL-HERACLITUSDB-2
 | boot.md P1-C | O arranque varria e decifrava o log duas vezes (views e índice de atributos). | Uma só passagem (`catch_up_com`) alimenta os dois. | `catch_up_com_extra.rs` |
 | otimizacao-20m §3.5/§3.7 | Releitura do registo acabado de escrever no `append_idempotent`; cópia profunda de cada episódio para a memtable; `format!` por atributo por evento no grafo. | Id do próprio Episode; posse passada à memtable; chave montada num buffer e alocada só quando é nova. | suíte do servidor, `heraclitus-index-graph` |
 
+## Revisão adversarial desta ronda (2026-10-03)
+
+Depois dos commits acima, uma revisão independente só de leitura reviu as alterações por áreas (Flight/REST, gRPC/engine/query, Raft/checkpoints, X.509, top-k, administração, engine/boot, armazenamento). Cada achado foi testado por três refutadores com critérios diferentes (correção, reprodução, impacto/pré-existência). Resultado: 23 achados levantados, **14 confirmados**, 9 refutados. Os 14 foram todos corrigidos com teste de regressão:
+
+| Gravidade | Defeito (nos commits desta ronda) | Correção |
+|---|---|---|
+| crítico | `admin-reconcile` reutilizava a chave do ALVO como chave da própria reconciliação. Com um alvo inexistente, gravava dois resultados para a mesma chave e o arranque seguinte recusava o diário: o servidor deixava de arrancar. | Chave própria derivada do alvo; o protocolo recusa reconciliar a operação em execução. (S) |
+| alto | `reconcile` confiava no diário em memória (reservas sem intenção no log; resultados que entraram mas reportaram falha) e gravava resultados órfãos ou duplicados. | Consulta o diário no LOG: sem intenção recusa; com resultado, adota-o. |
+| médio | Quem pediu a operação não conseguia reconciliá-la (conflito de digest). | Chave derivada. (S) |
+| médio | Sob GroupCommit (o default), o worker de fsync convertia o segmento pendente num `sync_error` permanente que bloqueava escritas e leituras. | O seal já faz fsync: `dirty` é limpo antes de tentar o segmento seguinte, e o worker não envenena o motor sem segmento ativo. (S) |
+| médio | O tecto do padrão de relação contava as arestas candidatas antes do WHERE e do LIMIT. | Conta as que passam o filtro; sem ORDER BY, o LIMIT corta antes. |
+| médio | O texto da meta-auditoria REST usava o caminho codificado e omitia a query: titulares com caracteres codificados não apareciam no relatório de acessos. | Caminho e query descodificados. |
+| médio | Um cliente que desligasse a meio contornava a meta-auditoria REST (o efeito corre em `spawn_blocking`). | Handler e auditoria correm numa tarefa desacoplada do pedido. |
+| médio | Aprovações do Sentinel pelo REST passaram a ser recusadas em cluster (o `execute_admin` recusa em nós replicados). | Em cluster mantém-se o caminho anterior, com meta-auditoria. |
+| baixo | Approve/deny recusados antes do protocolo não deixavam auditoria. | O middleware audita-os. |
+| baixo | O Flight auditava `ok=true` antes da admissão (um "Flight busy" ficava registado como leitura). | Auditoria depois da admissão. |
+| baixo | `CABECALHO + corpo` do checkpoint podia transbordar (pânico com `overflow-checks`). | `checked_add`. |
+| baixo | Três testes não provavam o que diziam: pré-bind do Flight, tecto de `k` e cache de CRL. | Mensagem pré-bind distinta e testada; teste da cache conta chamadas ao verificador; comentário do tecto de `k` corrigido (não é medido). |
+
+O caso do cliente que desliga não tem teste automático: provocar o EOF a meio do handler de forma determinística exige controlo do socket que os testes atuais não têm.
+
 ## Continua aberto (não declarar encerrado)
 
 1. **Exige decisão ou infraestrutura externa:** HSM/PKCS#11 e atestação de destruição; ACT credenciada e raízes ICP-Brasil oficiais; bucket WORM; homologação institucional e RIPD; cluster real (reconciliação administrativa distribuída, `/tier/demote` com store partilhado, que também é recusado pelo `execute_admin` em nós replicados); soak de 20 M em hardware alvo.

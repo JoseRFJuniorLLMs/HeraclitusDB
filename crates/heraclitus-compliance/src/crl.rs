@@ -811,3 +811,94 @@ mod testes_ambito {
         assert!(verificar_idp(&so_utilizador, false).is_ok());
     }
 }
+
+#[cfg(test)]
+mod testes_cache_assinatura {
+    use super::*;
+    use der::Decode;
+
+    const INICIO_S: u64 = 1_700_000_000;
+    const AGORA_MS: u64 = (INICIO_S + 60) * 1000;
+
+    fn crls_da_raiz(chain: &crate::test_pki::Chain) -> Vec<CertificateList> {
+        let der = crate::test_pki::crl_de_teste(
+            &chain.root,
+            &chain.root_key,
+            INICIO_S,
+            Some(INICIO_S + 86_400),
+            vec![],
+        );
+        vec![CertificateList::from_der(&der).unwrap()]
+    }
+
+    fn tempo(t: &x509_cert::time::Time) -> Result<u64, CompError> {
+        Ok(t.to_unix_duration().as_millis() as u64)
+    }
+
+    /// Revisão de 2026-10-03: o teste anterior só olhava para o TAMANHO da
+    /// cache, que fica em 1 quer a cache seja lida quer não. Aqui conta-se
+    /// quantas vezes o verificador corre: uma, em três consultas.
+    #[test]
+    fn a_assinatura_e_verificada_uma_vez_em_varias_consultas() {
+        let chain = crate::test_pki::chain_de_teste();
+        let crls = crls_da_raiz(&chain);
+        let cache = AssinaturasVerificadas::default();
+        let chamadas = std::cell::Cell::new(0);
+        let verificar = |_: &x509_cert::Certificate,
+                         _: &x509_cert::spki::AlgorithmIdentifierOwned,
+                         _: &[u8],
+                         _: &[u8]|
+         -> Result<(), CompError> {
+            chamadas.set(chamadas.get() + 1);
+            Ok(())
+        };
+        for _ in 0..3 {
+            let boas = crls_utilizaveis(
+                &crls,
+                &chain.root,
+                false,
+                AGORA_MS,
+                &CrlPolicy::default(),
+                &verificar,
+                &tempo,
+                &cache,
+            )
+            .unwrap();
+            assert_eq!(boas.len(), 1);
+        }
+        assert_eq!(chamadas.get(), 1, "a 2.ª e a 3.ª consultas usam a cache");
+    }
+
+    /// Uma falha nunca fica em cache: cada consulta volta a verificar, e a
+    /// CRL continua recusada.
+    #[test]
+    fn uma_falha_de_assinatura_nunca_e_lembrada() {
+        let chain = crate::test_pki::chain_de_teste();
+        let crls = crls_da_raiz(&chain);
+        let cache = AssinaturasVerificadas::default();
+        let chamadas = std::cell::Cell::new(0);
+        let recusa = |_: &x509_cert::Certificate,
+                      _: &x509_cert::spki::AlgorithmIdentifierOwned,
+                      _: &[u8],
+                      _: &[u8]|
+         -> Result<(), CompError> {
+            chamadas.set(chamadas.get() + 1);
+            Err(CompError::Verify("assinatura não confere".into()))
+        };
+        for _ in 0..2 {
+            assert!(crls_utilizaveis(
+                &crls,
+                &chain.root,
+                false,
+                AGORA_MS,
+                &CrlPolicy::default(),
+                &recusa,
+                &tempo,
+                &cache,
+            )
+            .is_err());
+        }
+        assert_eq!(chamadas.get(), 2);
+        assert!(cache.is_empty());
+    }
+}

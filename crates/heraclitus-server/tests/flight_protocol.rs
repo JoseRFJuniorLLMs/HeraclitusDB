@@ -207,8 +207,12 @@ async fn flight_recusa_endereco_publico_antes_do_bind() {
     let log = Arc::new(Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap());
     let erro = serve_flight(log, "0.0.0.0:0", aberto()).await.unwrap_err();
     assert!(erro.contains("loopback"), "{erro}");
+    // A mensagem da guarda pré-bind é distinta da pós-bind: o teste tem de
+    // falhar se a verificação antes do bind for removida (revisão de
+    // 2026-10-03 — antes as duas mensagens eram iguais e o teste passava
+    // sempre).
     assert!(
-        !erro.contains("bind"),
+        erro.contains("refused before bind"),
         "a recusa tem de acontecer antes do bind: {erro}"
     );
 }

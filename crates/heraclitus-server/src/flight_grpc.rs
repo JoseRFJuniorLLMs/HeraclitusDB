@@ -127,8 +127,6 @@ impl FlightService for HeraclitusFlight {
                 return Err(status);
             }
         };
-        self.audit(&principal.name, &format!("FLIGHT DoGet {ticket}"), true)
-            .await;
         let log = self.log.clone();
         static ADMISSION: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
             std::sync::OnceLock::new();
@@ -137,6 +135,12 @@ impl FlightService for HeraclitusFlight {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("Flight busy"))?;
+        // Auditado DEPOIS da admissão (revisão de 2026-10-03): antes, um
+        // pedido recusado com "Flight busy" ficava registado como leitura
+        // bem-sucedida do log inteiro, e cada recusa custava um append com
+        // fsync que o tecto de admissão não limitava.
+        self.audit(&principal.name, &format!("FLIGHT DoGet {ticket}"), true)
+            .await;
         let (tx, rx) = tokio::sync::mpsc::channel(2);
         tokio::task::spawn_blocking(move || {
             let produce = || -> Result<(), arrow_flight::error::FlightError> {
@@ -291,7 +295,7 @@ pub async fn serve_flight<L: EpisodeLog + 'static>(
         .map_err(|e| format!("flight addr {addr}: {e}"))?
         .collect();
     if resolvidos.is_empty() || resolvidos.iter().any(|a| !a.ip().is_loopback()) {
-        return Err("Flight has no TLS transport; only loopback listeners are supported".into());
+        return Err("Flight has no TLS transport; only loopback listeners are supported (refused before bind)".into());
     }
     let listener = tokio::net::TcpListener::bind(resolvidos.as_slice())
         .await

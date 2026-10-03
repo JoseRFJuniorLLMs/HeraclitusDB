@@ -383,11 +383,47 @@ fn classe_auditoria(metodo: &Method, caminho: &str) -> Option<bool> {
         ["metrics"] | ["stats"] | ["state"] | ["telemetry", "health"] => None,
         ["compliance", "status"] | ["sentinel", "status"] | ["sentinel", "dashboard"] => None,
         ["verify", ..] | ["sql"] => None,
-        // Auditadas no handler com o nome da operação do gRPC
-        // (`sentinel-approve`/`sentinel-deny`), dentro do `execute_admin`.
-        ["sentinel", "incidents", _, "approve"] | ["sentinel", "incidents", _, "deny"] => None,
         _ => Some(papel == AccessRole::Admin),
     }
+}
+
+/// Texto do registo de meta-auditoria: método, caminho e query DESCODIFICADOS.
+///
+/// Revisão de 2026-10-03: usava-se o caminho cru, codificado em percentagem,
+/// enquanto o handler recebe o `Path(id)` descodificado e o
+/// `titular_acessos` procura o titular por substring nesse texto — um
+/// identificador com qualquer carácter codificado nunca aparecia no relatório
+/// de acessos (LGPD art. 18). A query string (p.ex. `?subject_id=`) também
+/// não ficava registada.
+fn texto_de_auditoria(metodo: &Method, uri: &axum::http::Uri) -> String {
+    let mut texto = format!("REST {metodo} {}", decodificar_percentagem(uri.path()));
+    if let Some(query) = uri.query() {
+        texto.push('?');
+        texto.push_str(&decodificar_percentagem(&query.replace('+', " ")));
+    }
+    texto.chars().take(500).collect()
+}
+
+/// Descodificação `%XX` (UTF-8 com perdas); sequências inválidas ficam como
+/// estão.
+fn decodificar_percentagem(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let alto = (bytes[i + 1] as char).to_digit(16);
+            let baixo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(a), Some(b)) = (alto, baixo) {
+                out.push((a * 16 + b) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn aplicar_meta_auditoria(routes: Router, engine: Arc<Engine>) -> Router {
@@ -398,28 +434,42 @@ fn aplicar_meta_auditoria(routes: Router, engine: Arc<Engine>) -> Router {
             let Some(admin) = classe else {
                 return next.run(req).await;
             };
-            let texto: String = format!("REST {} {}", req.method(), req.uri().path())
-                .chars()
-                .take(500)
-                .collect();
+            let texto = texto_de_auditoria(req.method(), req.uri());
             let principal = req
                 .extensions()
                 .get::<Principal>()
                 .map(|p| p.name.clone())
                 .unwrap_or_else(|| "anonimo".into());
-            let resposta = next.run(req).await;
-            let ok = resposta.status().is_success();
-            // Append bloqueante (fsync em Always): fora do reactor, e aguardado
-            // para o registo existir antes de a resposta sair.
-            let _ = tokio::task::spawn_blocking(move || {
-                if admin {
-                    engine.audit_admin(&texto, ok, &principal);
-                } else {
-                    engine.audit_query(&texto, ok, &principal);
-                }
-            })
-            .await;
-            resposta
+            // Handler e auditoria correm numa tarefa DESACOPLADA do pedido
+            // (revisão de 2026-10-03): o hyper larga o futuro do pedido
+            // quando o cliente fecha a ligação, mas os efeitos dos handlers
+            // correm em `spawn_blocking`, que não se cancela. Com a auditoria
+            // no mesmo futuro, desligar a meio deixava o efeito gravado e
+            // nenhum registo de quem o fez. Numa tarefa própria, a auditoria
+            // acontece sempre que o handler acaba.
+            let tarefa = tokio::spawn(async move {
+                let resposta = next.run(req).await;
+                let ok = resposta.status().is_success();
+                // Append bloqueante (fsync em Always): fora do reactor, e
+                // aguardado para o registo existir antes de a resposta sair.
+                let _ = tokio::task::spawn_blocking(move || {
+                    if admin {
+                        engine.audit_admin(&texto, ok, &principal);
+                    } else {
+                        engine.audit_query(&texto, ok, &principal);
+                    }
+                })
+                .await;
+                resposta
+            });
+            match tarefa.await {
+                Ok(resposta) => resposta,
+                Err(erro) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("handler interrompido: {erro}"),
+                )
+                    .into_response(),
+            }
         }
     }))
 }
@@ -869,8 +919,12 @@ async fn sentinel_approval(
         "authenticated REST sentinel approval",
     );
     op.parameters_digest = blake3::hash(details.as_bytes()).to_hex().to_string();
+    // A meta-auditoria é a do middleware (que também vê as recusas antes
+    // daqui: aprovador trocado, Sentinel indisponível, corpo inválido —
+    // revisão de 2026-10-03). `operation`/`principal` ficam no diário do
+    // `execute_admin`.
     let result = tokio::task::spawn_blocking(move || {
-        let result = engine.execute_admin(&ctx, &op, |_token| {
+        let aprovar = || {
             runtime
                 .persist_human_approval_for(
                     &incident_id,
@@ -881,9 +935,20 @@ async fn sentinel_approval(
                     &body.reason,
                 )
                 .map_err(|error| heraclitus_core::HeraclitusError::Config(error.to_string()))
-        });
-        engine.audit_admin(operation, result.is_ok(), &principal.name);
-        result
+        };
+        if engine.is_replicated() {
+            // O `execute_admin` recusa SEMPRE em nós replicados (falta o
+            // protocolo de reconciliação distribuída). Antes desta ronda o
+            // REST aprovava no líder; passar pelo `execute_admin` deixou o
+            // cluster sem NENHUMA porta para aprovar ou recusar uma acção do
+            // Sentinel (revisão de 2026-10-03). Aqui mantém-se o caminho
+            // anterior — a aprovação continua a passar pelo consenso e pela
+            // meta-auditoria; só o diário de intenção fica de fora, como no
+            // resto da administração em cluster.
+            aprovar()
+        } else {
+            engine.execute_admin(&ctx, &op, |_token| aprovar())
+        }
     })
     .await;
     match result {
@@ -3270,11 +3335,18 @@ mod meta_auditoria_tests {
             fsync: FsyncPolicy::Always,
             audit_queries: true,
             audit_admin: true,
-            access_credentials: vec![AccessCredential {
-                principal: "auditora".into(),
-                token_blake3: blake3::hash(b"s-auditora").to_hex().to_string(),
-                roles: vec![AccessRole::Auditor],
-            }],
+            access_credentials: vec![
+                AccessCredential {
+                    principal: "auditora".into(),
+                    token_blake3: blake3::hash(b"s-auditora").to_hex().to_string(),
+                    roles: vec![AccessRole::Auditor],
+                },
+                AccessCredential {
+                    principal: "chefe".into(),
+                    token_blake3: blake3::hash(b"s-chefe").to_hex().to_string(),
+                    roles: vec![AccessRole::Admin],
+                },
+            ],
             ..Default::default()
         };
         let engine = Arc::new(Engine::open(&cfg).unwrap());
@@ -3331,6 +3403,65 @@ mod meta_auditoria_tests {
                 .iter()
                 .any(|a| a["principal"] == "auditora" && a["ok"] == "true"),
             "a leitura REST tem de ficar registada com a identidade autenticada: {acessos}"
+        );
+    }
+
+    async fn post_admin(addr: std::net::SocketAddr, caminho: &str, corpo: &str) -> u16 {
+        let req = format!(
+            "POST {caminho} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\
+             Authorization: Basic {}\r\n\r\n{corpo}",
+            corpo.len(),
+            b64(b"chefe:s-chefe")
+        );
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(req.as_bytes()).await.unwrap();
+        let mut resposta = Vec::new();
+        sock.read_to_end(&mut resposta).await.unwrap();
+        String::from_utf8_lossy(&resposta)
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Revisão de 2026-10-03: o texto auditado usava o caminho CODIFICADO; o
+    /// relatório de acessos procura o titular descodificado — um id com
+    /// qualquer carácter codificado nunca aparecia.
+    #[tokio::test]
+    async fn titular_com_caracter_codificado_aparece_nos_acessos() {
+        let (addr, engine, _dir) = servir().await;
+        assert_eq!(get(addr, "/titular/ana%20maria").await, 200);
+        let acessos = {
+            let engine = engine.clone();
+            tokio::task::spawn_blocking(move || engine.titular_acessos("ana maria", 10))
+                .await
+                .unwrap()
+        };
+        assert!(
+            !acessos["acessos"].as_array().unwrap().is_empty(),
+            "a leitura de /titular/ana%20maria tem de aparecer: {acessos}"
+        );
+    }
+
+    /// Revisão de 2026-10-03: approve/deny estavam fora do middleware e o
+    /// handler só auditava depois do `execute_admin` — uma tentativa recusada
+    /// ANTES (aprovador trocado, Sentinel indisponível, corpo inválido) não
+    /// deixava rasto.
+    #[tokio::test]
+    async fn aprovacao_recusada_antes_do_protocolo_fica_auditada() {
+        let (addr, engine, _dir) = servir().await;
+        let antes = engine.head();
+        let codigo = post_admin(
+            addr,
+            "/sentinel/incidents/inc-1/approve",
+            r#"{"approval_id":"a","proposal_id":"p","approver":"outra-pessoa"}"#,
+        )
+        .await;
+        assert!(codigo >= 400, "tem de ser recusada: {codigo}");
+        assert!(
+            engine.head() > antes,
+            "a tentativa recusada tem de deixar registo"
         );
     }
 
