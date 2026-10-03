@@ -96,12 +96,82 @@ impl Default for CrlPolicy {
     }
 }
 
-/// CRLs indexadas pelo DER do nome do emissor.
+/// Verificações de assinatura de CRL que deram CERTO.
+///
+/// Conferência de 2026-10-02: o `consultar` re-verificava a assinatura de
+/// TODAS as CRLs do emissor em cada consulta — uma CRL de AC grande tem
+/// dezenas de MB e é a mesma durante dias, e cada certificado da cadeia de
+/// cada carimbo pagava outra vez a verificação RSA/ECDSA completa.
+///
+/// A chave cobre TUDO o que decide o resultado: a chave pública do emissor,
+/// o algoritmo, o `tbsCertList` inteiro e a assinatura. Uma CRL trocada,
+/// adulterada ou apresentada com outro emissor tem outra chave e volta a ser
+/// verificada; só sucessos ficam guardados, portanto uma falha nunca é
+/// "lembrada" como sucesso. O âmbito e a janela temporal continuam a ser
+/// avaliados em cada consulta (dependem do instante, não da assinatura).
+/// Limitado a `MAX` entradas: ao encher, esvazia — perde-se só desempenho.
+#[derive(Debug, Clone, Default)]
+pub struct AssinaturasVerificadas(
+    std::sync::Arc<std::sync::Mutex<std::collections::HashSet<[u8; 32]>>>,
+);
+
+impl AssinaturasVerificadas {
+    const MAX: usize = 4096;
+
+    fn chave(
+        emissor: &x509_cert::Certificate,
+        algoritmo: &x509_cert::spki::AlgorithmIdentifierOwned,
+        tbs: &[u8],
+        assinatura: &[u8],
+    ) -> Option<[u8; 32]> {
+        let spki = emissor
+            .tbs_certificate
+            .subject_public_key_info
+            .to_der()
+            .ok()?;
+        let algoritmo = algoritmo.to_der().ok()?;
+        let mut h = blake3::Hasher::new();
+        h.update(b"heraclitus-crl-assinatura-v1");
+        for parte in [&spki[..], &algoritmo[..], tbs, assinatura] {
+            h.update(&(parte.len() as u64).to_le_bytes());
+            h.update(parte);
+        }
+        Some(*h.finalize().as_bytes())
+    }
+
+    fn contem(&self, chave: &[u8; 32]) -> bool {
+        self.0.lock().map(|s| s.contains(chave)).unwrap_or(false)
+    }
+
+    fn inserir(&self, chave: [u8; 32]) {
+        if let Ok(mut s) = self.0.lock() {
+            if s.len() >= Self::MAX {
+                s.clear();
+            }
+            s.insert(chave);
+        }
+    }
+
+    /// Quantas verificações estão guardadas (para testes e diagnóstico).
+    pub fn len(&self) -> usize {
+        self.0.lock().map(|s| s.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// CRLs indexadas pelo nome do emissor (chave canónica RFC 5280 §7.1).
 #[derive(Debug, Clone, Default)]
 pub struct CrlStore {
+    /// Chave: [`crate::nomes::chave_canonica`] do emissor (não o DER cru).
     por_emissor: BTreeMap<Vec<u8>, Vec<CertificateList>>,
     loaded_from: Option<PathBuf>,
     total: usize,
+    /// Assinaturas de CRL já verificadas com sucesso — ver
+    /// [`AssinaturasVerificadas`].
+    assinaturas_ok: AssinaturasVerificadas,
 }
 
 /// O que aconteceu ao carregar uma pasta — para um operador saber qual ficheiro
@@ -130,10 +200,25 @@ impl CrlStore {
         self.loaded_from.as_deref()
     }
 
+    /// A cache de assinaturas de CRL já verificadas deste store.
+    pub fn assinaturas_verificadas(&self) -> &AssinaturasVerificadas {
+        &self.assinaturas_ok
+    }
+
     /// As CRLs emitidas por este nome.
     pub fn for_issuer(&self, issuer_der: &[u8]) -> &[CertificateList] {
+        let Ok(nome) = x509_cert::name::Name::from_der(issuer_der) else {
+            return &[];
+        };
+        self.for_issuer_name(&nome)
+    }
+
+    /// As CRLs emitidas por este nome, comparado segundo a RFC 5280 §7.1
+    /// (ver [`crate::nomes`]): uma AC que codifica o seu nome com outro tipo
+    /// de string na CRL do que no certificado continua a ser encontrada.
+    pub fn for_issuer_name(&self, nome: &x509_cert::name::Name) -> &[CertificateList] {
         self.por_emissor
-            .get(issuer_der)
+            .get(&crate::nomes::chave_canonica(nome))
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
@@ -205,9 +290,7 @@ impl CrlStore {
     /// Acrescenta uma CRL ja descodificada — usada para as que viajam dentro
     /// do proprio token.
     pub fn acrescentar(&mut self, crl: CertificateList) {
-        let Ok(issuer) = crl.tbs_cert_list.issuer.to_der() else {
-            return;
-        };
+        let issuer = crate::nomes::chave_canonica(&crl.tbs_cert_list.issuer);
         self.por_emissor.entry(issuer).or_default().push(crl);
         self.total += 1;
     }
@@ -226,11 +309,7 @@ impl CrlStore {
             CertificateList::from_der(bytes)
                 .map_err(|e| CompError::Verify(format!("CRL não é um CertificateList: {e}")))?
         };
-        let issuer = crl
-            .tbs_cert_list
-            .issuer
-            .to_der()
-            .map_err(|e| CompError::Verify(format!("emissor da CRL não codifica: {e}")))?;
+        let issuer = crate::nomes::chave_canonica(&crl.tbs_cert_list.issuer);
         self.por_emissor.entry(issuer).or_default().push(crl);
         self.total += 1;
         Ok(())
@@ -421,6 +500,7 @@ fn crls_utilizaveis<'a>(
     policy: &CrlPolicy,
     verificar_assinatura: VerificadorAssinatura<'_>,
     tempo_ms: ConversorTempo<'_>,
+    assinaturas_ok: &AssinaturasVerificadas,
 ) -> Result<Vec<(&'a CertificateList, u64, Option<u64>)>, CompError> {
     // §6.3.3 — quem assina uma CRL tem de o poder fazer. `keyCertSign` não
     // basta: são bits diferentes e a AC pode delegar um sem o outro.
@@ -447,15 +527,23 @@ fn crls_utilizaveis<'a>(
         // A CRL é uma afirmação da AC. Sem verificar a assinatura, qualquer um
         // que escreva na pasta pode declarar um certificado como não revogado —
         // e é essa a resposta que passa despercebida.
-        if let Err(e) = verificar_assinatura(emissor, &crl.signature_algorithm, &tbs, assinatura) {
-            // Distinguir "não sei verificar" de "não confere": a segunda
-            // lê-se como CRL adulterada e a primeira é uma lacuna nossa.
-            motivos.push(if e.to_string().contains("não suportado") {
-                format!("algoritmo da CRL não suportado: {e}")
-            } else {
-                format!("assinatura da CRL não confere: {e}")
-            });
-            continue;
+        let chave = AssinaturasVerificadas::chave(emissor, &crl.signature_algorithm, &tbs, assinatura);
+        if !chave.is_some_and(|k| assinaturas_ok.contem(&k)) {
+            if let Err(e) =
+                verificar_assinatura(emissor, &crl.signature_algorithm, &tbs, assinatura)
+            {
+                // Distinguir "não sei verificar" de "não confere": a segunda
+                // lê-se como CRL adulterada e a primeira é uma lacuna nossa.
+                motivos.push(if e.to_string().contains("não suportado") {
+                    format!("algoritmo da CRL não suportado: {e}")
+                } else {
+                    format!("assinatura da CRL não confere: {e}")
+                });
+                continue;
+            }
+            if let Some(k) = chave {
+                assinaturas_ok.inserir(k);
+            }
         }
         if let Err(e) = verificar_ambito(crl, e_ca) {
             motivos.push(e.to_string());
@@ -541,12 +629,7 @@ pub fn consultar(
     verificar_assinatura: VerificadorAssinatura<'_>,
     tempo_ms: ConversorTempo<'_>,
 ) -> Result<EstadoRevogacao, CompError> {
-    let issuer_der = cert
-        .tbs_certificate
-        .issuer
-        .to_der()
-        .map_err(|e| CompError::Verify(format!("emissor não codifica: {e}")))?;
-    let crls = store.for_issuer(&issuer_der);
+    let crls = store.for_issuer_name(&cert.tbs_certificate.issuer);
     if crls.is_empty() {
         return Err(CompError::Verify(format!(
             "revogação pedida mas não há CRL do emissor `{}` para `{}`",
@@ -561,6 +644,7 @@ pub fn consultar(
         policy,
         verificar_assinatura,
         tempo_ms,
+        &store.assinaturas_ok,
     )
     .map_err(|e| CompError::Verify(format!("emissor `{}`: {e}", cert.tbs_certificate.issuer)))?;
 

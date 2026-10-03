@@ -123,8 +123,11 @@ impl TrustStore {
     /// over and both are valid during the overlap, and the two have the same
     /// subject with different keys.
     pub fn anchors_for_issuer(&self, issuer_der: &[u8]) -> &[TrustAnchor] {
+        let Ok(nome) = x509_cert::name::Name::from_der(issuer_der) else {
+            return &[];
+        };
         self.by_subject
-            .get(issuer_der)
+            .get(&crate::nomes::chave_canonica(&nome))
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
@@ -230,16 +233,14 @@ impl TrustStore {
             .subject
             .to_der()
             .map_err(|e| CompError::Verify(format!("subject não codifica: {e}")))?;
-        let issuer_der = certificate
-            .tbs_certificate
-            .issuer
-            .to_der()
-            .map_err(|e| CompError::Verify(format!("issuer não codifica: {e}")))?;
         // §11 — uma âncora é uma raiz. Aceitar um certificado intermédio como
         // âncora faria o verificador confiar num elo cuja emissão ninguém
         // verificou, e o operador não teria como perceber a diferença ao olhar
         // para a pasta.
-        if subject_der != issuer_der {
+        if !crate::nomes::nomes_equivalentes(
+            &certificate.tbs_certificate.subject,
+            &certificate.tbs_certificate.issuer,
+        ) {
             return Err(CompError::Verify(
                 "âncora tem de ser auto-emitida (subject == issuer); um intermédio não é raiz"
                     .into(),
@@ -256,7 +257,13 @@ impl TrustStore {
             fingerprint,
             certificate,
         };
-        let bucket = self.by_subject.entry(subject_der).or_default();
+        // Chave canónica (RFC 5280 §7.1), não o DER: o `issuer` de um
+        // certificado pode codificar o nome da raiz com outro tipo de string
+        // ou outra capitalização e continuar a ser a mesma raiz.
+        let bucket = self
+            .by_subject
+            .entry(crate::nomes::chave_canonica(&anchor.certificate.tbs_certificate.subject))
+            .or_default();
         // Recarregar a mesma âncora duas vezes não a duplica: o
         // `anchors_for_issuer` seria percorrido duas vezes pelo mesmo
         // certificado e a contagem que o operador vê mentiria.

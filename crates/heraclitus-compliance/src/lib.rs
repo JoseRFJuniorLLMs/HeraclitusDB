@@ -37,6 +37,7 @@ pub mod dashboard;
 pub mod deferred;
 pub mod icp;
 pub mod model_bundle;
+pub mod nomes;
 pub mod privacy;
 pub mod profiles;
 pub mod receipt;

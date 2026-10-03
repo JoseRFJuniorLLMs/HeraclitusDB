@@ -908,12 +908,13 @@ impl IcpBrasilTimestampVerifier {
         }
 
         // Senão, cada intermédio do próprio token que se apresente como emissor.
+        // Nomes comparados segundo a RFC 5280 §7.1 (crate::nomes), não por
+        // DER: o mesmo nome pode vir codificado com outro tipo de string.
+        let issuer_nome = x509_cert::name::Name::from_der(&issuer_der).ok();
         for candidato in pool.iter().filter(|c| {
-            c.tbs_certificate
-                .subject
-                .to_der()
-                .map(|s| s == issuer_der)
-                .unwrap_or(false)
+            issuer_nome
+                .as_ref()
+                .is_some_and(|n| crate::nomes::nomes_equivalentes(&c.tbs_certificate.subject, n))
         }) {
             // Já está no caminho: seguir seria um ciclo.
             if caminho.iter().any(|x| mesmo_certificado(x, candidato)) {
@@ -1057,17 +1058,9 @@ fn encontrar_signatario<'a>(
 ) -> Result<&'a Certificate, CompError> {
     match sid {
         cms::signed_data::SignerIdentifier::IssuerAndSerialNumber(ias) => {
-            let alvo_issuer = ias
-                .issuer
-                .to_der()
-                .map_err(|e| verify_err(format!("issuer do SID não codifica: {e}")))?;
             pool.iter()
                 .find(|c| {
-                    c.tbs_certificate
-                        .issuer
-                        .to_der()
-                        .map(|i| i == alvo_issuer)
-                        .unwrap_or(false)
+                    crate::nomes::nomes_equivalentes(&c.tbs_certificate.issuer, &ias.issuer)
                         && c.tbs_certificate.serial_number == ias.serial_number
                 })
                 .ok_or_else(|| verify_err("certificado do signatário não vem no token".into()))
@@ -1193,7 +1186,7 @@ fn verificar_ess_binding(
         }
         if let Some(issuer) = issuer {
             if issuer.serial_number != signer.tbs_certificate.serial_number || !issuer.issuer.iter().any(|n|
-                matches!(n,x509_cert::ext::pkix::name::GeneralName::DirectoryName(name) if name == &signer.tbs_certificate.issuer)) {
+                matches!(n,x509_cert::ext::pkix::name::GeneralName::DirectoryName(name) if crate::nomes::nomes_equivalentes(name, &signer.tbs_certificate.issuer))) {
                 return Err(verify_err("ESS issuer/serial mismatch".into()));
             }
         }
@@ -1763,6 +1756,74 @@ mod tests {
 
     const CRL_INICIO_S: u64 = AGORA_S - 3_600;
     const CRL_FIM_S: u64 = AGORA_S + 86_400;
+
+    /// Conferência de 2026-10-02: a assinatura de cada CRL era re-verificada
+    /// em CADA consulta. Agora a primeira verificação bem-sucedida fica em
+    /// cache (chave = chave pública do emissor + algoritmo + tbs + assinatura)
+    /// e as seguintes reaproveitam-na.
+    #[test]
+    fn assinatura_da_crl_e_verificada_uma_vez_e_reaproveitada() {
+        let chain = test_pki::chain_de_teste();
+        let crl = crl_da_raiz(&chain, vec![]);
+        let mut store = TrustStore::new();
+        store.add_pem_or_der("raiz", &chain.root_der).unwrap();
+        let mut crls = crate::crl::CrlStore::new();
+        crls.add_pem_or_der(&crl).unwrap();
+        let observador = crls.clone();
+        assert!(observador.assinaturas_verificadas().is_empty());
+        let v = IcpBrasilTimestampVerifier::new(store, TimestampValidationPolicy::default())
+            .with_crls(crls, crate::crl::CrlPolicy::default());
+        v.verify(&token_padrao(&chain), &imprint(), None, AGORA_MS)
+            .unwrap();
+        assert_eq!(observador.assinaturas_verificadas().len(), 1);
+        v.verify(&token_padrao(&chain), &imprint(), None, AGORA_MS)
+            .unwrap();
+        assert_eq!(observador.assinaturas_verificadas().len(), 1);
+    }
+
+    /// RFC 5280 §7.1: uma CRL cujo `issuer` codifica o nome da AC com OUTRO
+    /// tipo de string (UTF8String em vez de PrintableString, ou o inverso) é
+    /// da mesma AC. Por bytes DER não era encontrada ("não há CRL do
+    /// emissor") com a CRL certa na pasta.
+    #[test]
+    fn crl_com_o_nome_do_emissor_noutra_codificacao_e_encontrada() {
+        use der::{Decode, Encode, Tagged};
+        let chain = test_pki::chain_de_teste();
+        let crl_der = crl_da_raiz(&chain, vec![]);
+        let mut crl = x509_cert::crl::CertificateList::from_der(&crl_der).unwrap();
+        // Troca o tipo de string de cada atributo do nome do emissor.
+        for rdn in crl.tbs_cert_list.issuer.0.iter_mut() {
+            let atributos: Vec<_> = rdn
+                .0
+                .iter()
+                .map(|atv| {
+                    let texto = std::str::from_utf8(atv.value.value()).unwrap().to_owned();
+                    let valor = if atv.value.tag() == der::Tag::Utf8String {
+                        der::Any::encode_from(&der::asn1::PrintableStringRef::new(&texto).unwrap())
+                    } else {
+                        der::Any::encode_from(&der::asn1::Utf8StringRef::new(&texto).unwrap())
+                    }
+                    .unwrap();
+                    x509_cert::attr::AttributeTypeAndValue {
+                        oid: atv.oid,
+                        value: valor,
+                    }
+                })
+                .collect();
+            *rdn = x509_cert::name::RelativeDistinguishedName(
+                der::asn1::SetOfVec::try_from(atributos).unwrap(),
+            );
+        }
+        assert_ne!(
+            crl.tbs_cert_list.issuer.to_der().unwrap(),
+            chain.root.tbs_certificate.subject.to_der().unwrap(),
+            "montagem: o DER do emissor tem de ser outro"
+        );
+        let mut crls = crate::crl::CrlStore::new();
+        crls.acrescentar(crl);
+        assert_eq!(crls.for_issuer_name(&chain.root.tbs_certificate.subject).len(), 1);
+        assert_eq!(crls.for_issuer(&chain.root_subject_der).len(), 1);
+    }
 
     fn verificador_com_crl(
         chain: &test_pki::Chain,

@@ -38,7 +38,7 @@
 use std::collections::BTreeSet;
 
 use der::asn1::ObjectIdentifier;
-use der::{Decode, Encode};
+use der::Decode;
 use x509_cert::ext::pkix::constraints::name::{GeneralSubtree, NameConstraints};
 use x509_cert::ext::pkix::name::GeneralName;
 use x509_cert::ext::pkix::{BasicConstraints, KeyUsage, KeyUsages, SubjectAltName};
@@ -390,6 +390,25 @@ fn bate(base: &GeneralName, nome: &GeneralName) -> Result<bool, CompError> {
     }
 }
 
+#[cfg(test)]
+mod testes_dn_rfc5280 {
+    use super::*;
+    use std::str::FromStr;
+
+    /// Conferência de 2026-10-02: com comparação por bytes DER, uma subtree
+    /// EXCLUÍDA codificada em PrintableString não apanhava o mesmo nome em
+    /// UTF8String (ou com outra capitalização) — bastava recodificar o nome
+    /// para escapar à exclusão.
+    #[test]
+    fn subtree_cobre_o_mesmo_nome_com_outra_capitalizacao_e_espacos() {
+        let base = Name::from_str("O=ICP-Brasil,C=BR").unwrap();
+        let nome = Name::from_str("CN=ACT  Teste,O=icp-brasil ,C=br").unwrap();
+        assert!(dn_cobre(&base, &nome).unwrap());
+        let fora = Name::from_str("CN=ACT,O=Outra AC,C=BR").unwrap();
+        assert!(!dn_cobre(&base, &fora).unwrap());
+    }
+}
+
 /// §4.2.1.10 — uma base directoryName cobre um nome se for um **prefixo** da
 /// sequência de RDNs. `C=BR,O=ICP-Brasil` cobre `C=BR,O=ICP-Brasil,CN=ACT`.
 fn dn_cobre(base: &Name, nome: &Name) -> Result<bool, CompError> {
@@ -398,18 +417,16 @@ fn dn_cobre(base: &Name, nome: &Name) -> Result<bool, CompError> {
     if b.len() > n.len() {
         return Ok(false);
     }
-    for (rb, rn) in b.iter().zip(n.iter()) {
-        let db = rb
-            .to_der()
-            .map_err(|e| erro(format!("RDN da subtree não codifica: {e}")))?;
-        let dn = rn
-            .to_der()
-            .map_err(|e| erro(format!("RDN do sujeito não codifica: {e}")))?;
-        if db != dn {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    // RDNs comparados segundo a RFC 5280 §7.1 (`crate::nomes`): a mesma AC
+    // pode codificar o nome da subtree e o do sujeito com tipos de string
+    // diferentes. Por bytes DER, uma subtree permitida podia não cobrir um
+    // nome que é, de facto, seu descendente (falha fechada, mas falha); numa
+    // subtree EXCLUÍDA, a mesma diferença deixava passar o que devia ser
+    // recusado.
+    Ok(b
+        .iter()
+        .zip(n.iter())
+        .all(|(rb, rn)| crate::nomes::rdns_equivalentes(rb, rn)))
 }
 
 /// `example.com` cobre `example.com` e `a.example.com`, mas não `notexample.com`.
