@@ -19,17 +19,70 @@ use arrow_flight::{
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use heraclitus_analytics::vectorized::{episodes_to_batches_sized, BATCH_ROWS};
+use heraclitus_core::{AccessRole, HeraclitusConfig, HeraclitusError};
 use heraclitus_log::EpisodeLog;
 use std::sync::Arc;
 use tonic::{Request, Response, Status, Streaming};
 
+/// Gancho de meta-auditoria do Flight: `(principal, ticket, ok)`.
+///
+/// O servidor liga-o a `Engine::audit_query`; fica como closure para o
+/// serviço não depender do `Engine` (o Flight só precisa do log).
+pub type FlightAudit = Arc<dyn Fn(&str, &str, bool) + Send + Sync>;
+
+/// Política de acesso do Flight: a MESMA autenticação Bearer do gRPC
+/// principal e, opcionalmente, a meta-auditoria.
+///
+/// Auditoria 2026-10-01 (F10) e conferência de 2026-10-02: o DoGet entregava
+/// o log inteiro (todos os agentes, incluindo o diário administrativo) a
+/// qualquer processo local, sem token, sem RBAC e sem rasto — com
+/// `access_credentials` configuradas era o único caminho não autenticado até
+/// aos dados. O loopback limita QUEM chega à porta, não QUEM pode ler.
+#[derive(Clone)]
+pub struct FlightGuard {
+    auth: crate::auth::Authenticator,
+    audit: Option<FlightAudit>,
+}
+
+impl FlightGuard {
+    /// Credenciais tiradas da configuração, exactamente como o gRPC: sem
+    /// credenciais configuradas o acesso continua aberto (loopback-only).
+    pub fn from_config(config: &HeraclitusConfig) -> Result<Self, HeraclitusError> {
+        Ok(Self {
+            auth: crate::auth::Authenticator::from_config(config)?,
+            audit: None,
+        })
+    }
+
+    pub fn with_audit(mut self, audit: FlightAudit) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+}
+
 pub struct HeraclitusFlight {
     log: Arc<dyn EpisodeLog>,
+    audit: Option<FlightAudit>,
 }
 
 impl HeraclitusFlight {
-    pub fn new<L: EpisodeLog + 'static>(log: Arc<L>) -> Self {
-        Self { log }
+    /// O serviço sozinho NÃO autentica: a identidade chega pela extensão
+    /// `Principal` que o interceptor de [`FlightGuard`] instala. Por isso o
+    /// construtor não é público — servir `HeraclitusFlight` sem o interceptor
+    /// faria cada pedido falhar com `principal ausente` (fail-closed), mas a
+    /// única via suportada é [`serve_flight`].
+    fn new<L: EpisodeLog + 'static>(log: Arc<L>, audit: Option<FlightAudit>) -> Self {
+        Self { log, audit }
+    }
+
+    /// A auditoria é um append ao log (com fsync em `Always`): bloqueante,
+    /// portanto vai para a pool bloqueante em vez de parar um worker do
+    /// reactor. É aguardada para o registo preceder a resposta.
+    async fn audit(&self, principal: &str, ticket: &str, ok: bool) {
+        if let Some(audit) = self.audit.clone() {
+            let (principal, ticket) = (principal.to_owned(), ticket.to_owned());
+            let _ = tokio::task::spawn_blocking(move || audit(&principal, &ticket, ok)).await;
+        }
     }
 
     fn parse_ticket(t: &Ticket) -> Result<Option<u64>, Status> {
@@ -61,7 +114,21 @@ impl FlightService for HeraclitusFlight {
     type DoExchangeStream = S<FlightData>;
 
     async fn do_get(&self, req: Request<Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
-        let as_of = Self::parse_ticket(req.get_ref())?;
+        let principal = crate::auth::require(&req, AccessRole::Reader)?;
+        let ticket = String::from_utf8_lossy(&req.get_ref().ticket)
+            .chars()
+            .take(200)
+            .collect::<String>();
+        let as_of = match Self::parse_ticket(req.get_ref()) {
+            Ok(as_of) => as_of,
+            Err(status) => {
+                self.audit(&principal.name, &format!("FLIGHT DoGet {ticket}"), false)
+                    .await;
+                return Err(status);
+            }
+        };
+        self.audit(&principal.name, &format!("FLIGHT DoGet {ticket}"), true)
+            .await;
         let log = self.log.clone();
         static ADMISSION: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
             std::sync::OnceLock::new();
@@ -86,12 +153,14 @@ impl FlightService for HeraclitusFlight {
                     }
                     for row in rows {
                         cursor = row.0.saturating_add(1);
+                        // `size` mede a RAM retida em `pending` (o Episode
+                        // inteiro, com conteúdo), não a linha Arrow: o schema
+                        // só exporta lsn/agent_id/kind/ts/content_len. Um
+                        // evento grande sai sozinho no seu lote. Antes havia
+                        // aqui um aborto acima de 16 MiB — um único append
+                        // grande partia para sempre a exportação de qualquer
+                        // intervalo que o incluísse, por uma linha de ~100 B.
                         let size = row.1.resident_bytes();
-                        if size > 16 << 20 {
-                            return Err(arrow_flight::error::FlightError::ProtocolError(
-                                "Flight row exceeds 16MiB".into(),
-                            ));
-                        }
                         if !pending.is_empty()
                             && (pending.len() == BATCH_ROWS || bytes + size > 16 << 20)
                         {
@@ -141,8 +210,9 @@ impl FlightService for HeraclitusFlight {
 
     async fn get_schema(
         &self,
-        _req: Request<FlightDescriptor>,
+        req: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
+        crate::auth::require(&req, AccessRole::Reader)?;
         // Schema da tabela `events` (o mesmo dos batches do DoGet).
         let schema = heraclitus_analytics::vectorized::batch_schema();
         let opts = Default::default();
@@ -210,17 +280,35 @@ impl FlightService for HeraclitusFlight {
 pub async fn serve_flight<L: EpisodeLog + 'static>(
     log: Arc<L>,
     addr: &str,
+    guard: FlightGuard,
 ) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), String> {
-    let listener = tokio::net::TcpListener::bind(addr)
+    // Loopback verificado ANTES do bind: verificar só depois deixava a porta
+    // pública aberta (e a aceitar ligações no backlog do SO) entre o bind e o
+    // erro. Sem TLS no Flight, o Bearer viajaria em claro numa interface
+    // pública — o loopback continua obrigatório mesmo com autenticação.
+    let resolvidos: Vec<std::net::SocketAddr> = tokio::net::lookup_host(addr)
+        .await
+        .map_err(|e| format!("flight addr {addr}: {e}"))?
+        .collect();
+    if resolvidos.is_empty() || resolvidos.iter().any(|a| !a.ip().is_loopback()) {
+        return Err(
+            "Flight has no TLS transport; only loopback listeners are supported".into(),
+        );
+    }
+    let listener = tokio::net::TcpListener::bind(resolvidos.as_slice())
         .await
         .map_err(|e| format!("flight bind {addr}: {e}"))?;
     let local = listener.local_addr().map_err(|e| e.to_string())?;
     if !local.ip().is_loopback() {
         return Err(
-            "Flight has no authenticated transport; only loopback listeners are supported".into(),
+            "Flight has no TLS transport; only loopback listeners are supported".into(),
         );
     }
-    let svc = FlightServiceServer::new(HeraclitusFlight::new(log));
+    let FlightGuard { auth, audit } = guard;
+    let svc = FlightServiceServer::with_interceptor(
+        HeraclitusFlight::new(log, audit),
+        move |req| auth.authenticate(req),
+    );
     let handle = tokio::spawn(async move {
         let incoming = tonic::transport::server::TcpIncoming::from(listener);
         let _ = tonic::transport::Server::builder()

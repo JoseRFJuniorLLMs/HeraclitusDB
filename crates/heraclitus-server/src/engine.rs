@@ -581,8 +581,15 @@ impl Engine {
                     // Build PAGINADO: o log é varrido em janelas (não materializa os
                     // milhões de episódios de uma vez — limita a RAM do arranque).
                     let head = log.head();
-                    let mut cur = if idx.is_empty() { 0 } else { idx.watermark() };
-                    let mut built = false;
+                    // A cauda começa DEPOIS do watermark: o watermark é o
+                    // último LSN já aplicado (inclusivo). Começar nele fazia o
+                    // primeiro lote nunca vir vazio, e o índice inteiro era
+                    // regravado em cada arranque mesmo sem nada novo.
+                    let mut cur = if idx.has_applied() || !idx.is_empty() {
+                        idx.watermark().saturating_add(1)
+                    } else {
+                        0
+                    };
                     while cur <= head {
                         let batch = log.scan_capped(cur, head, 256)?;
                         if batch.is_empty() {
@@ -595,10 +602,9 @@ impl Engine {
                             }
                             idx.apply(*lsn, ep);
                         }
-                        built = true;
                         cur = last + 1;
                     }
-                    if built {
+                    if idx.is_dirty() {
                         idx.save(&attr_dir)?;
                     }
                 }
@@ -840,6 +846,11 @@ impl Engine {
         let voo = self.index_gate.write().unwrap();
         let idx = self.attr.read().unwrap();
         drop(voo);
+        if !idx.is_dirty() {
+            // Nada aplicado desde o último save: o ficheiro em disco já
+            // descreve exactamente este estado.
+            return Ok(());
+        }
         idx.save(&self.attr_dir)
     }
 

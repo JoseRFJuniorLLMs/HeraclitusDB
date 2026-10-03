@@ -967,19 +967,25 @@ async fn serve_inner(
     // Opt-in via flight_addr; só existe com a feature `analytics`.
     #[cfg(feature = "analytics")]
     let flight_task = if let Some(addr) = config.flight_addr.clone() {
-        // O Flight serve o LOG INTEIRO via DoGet e (ainda) não tem qualquer
-        // autenticação — a única postura segura é loopback-only, como nas
-        // outras superfícies sem auth.
+        // O Flight serve o LOG INTEIRO via DoGet. Autentica com as MESMAS
+        // credenciais Bearer do gRPC (papel Reader) e meta-audita cada DoGet,
+        // mas não tem TLS: fora do loopback o token viajaria em claro.
         let flight_sock: std::net::SocketAddr = addr
             .parse()
             .map_err(|e| HeraclitusError::Config(format!("flight_addr: {e}")))?;
         if !flight_sock.ip().is_loopback() {
             return Err(HeraclitusError::Config(format!(
-                "flight_addr {flight_sock} não é loopback mas o Flight não tem autenticação — \
-                 o log inteiro ficaria legível. Use 127.0.0.1."
+                "flight_addr {flight_sock} não é loopback mas o Flight não tem TLS — \
+                 o token Bearer e o log viajariam em claro. Use 127.0.0.1."
             )));
         }
-        match flight_grpc::serve_flight(engine.log.clone(), &addr).await {
+        let audit_engine = engine.clone();
+        let guard = flight_grpc::FlightGuard::from_config(&config)?.with_audit(Arc::new(
+            move |principal: &str, ticket: &str, ok: bool| {
+                audit_engine.audit_query(ticket, ok, principal)
+            },
+        ));
+        match flight_grpc::serve_flight(engine.log.clone(), &addr, guard).await {
             Ok((local, handle)) => {
                 boot.ok_line("Arrow Flight (gRPC)", &format!("grpc://{local}"));
                 Some(handle)

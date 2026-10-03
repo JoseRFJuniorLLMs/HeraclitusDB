@@ -856,6 +856,14 @@ pub enum AberturaCheckpoint {
 #[derive(Default)]
 pub struct AttrIndex {
     inner: ResidentSnapshot,
+    /// Há mutações que o último `save` (ou o checkpoint carregado) não cobre.
+    ///
+    /// Sem isto o arranque e o checkpoint periódico regravavam o índice
+    /// INTEIRO mesmo sem um único evento novo — escrita completa e um
+    /// `sync_all` por nada a cada boot e a cada intervalo. Só `apply`/`reset`
+    /// mudam o estado (ambos com `&mut self`), e `save` corre com `&self` sob o
+    /// lock de leitura, portanto nenhuma mutação se cruza com ele.
+    dirty: std::sync::atomic::AtomicBool,
 }
 
 impl AttrIndex {
@@ -934,7 +942,13 @@ impl AttrIndex {
                         .and_then(|(snapshot, _)| ResidentSnapshot::from_legacy(snapshot))
                 };
                 match snap {
-                    Some(inner) => (AttrIndex { inner }, AberturaCheckpoint::Carregado),
+                    Some(inner) => (
+                        AttrIndex {
+                            inner,
+                            dirty: Default::default(),
+                        },
+                        AberturaCheckpoint::Carregado,
+                    ),
                     // Corrompido / formato desconhecido -> rebuild por replay.
                     None => (AttrIndex::new(), AberturaCheckpoint::Ilegivel),
                 }
@@ -1214,6 +1228,18 @@ impl AttrIndex {
         self.inner.exact.is_empty()
     }
 
+    /// `true` se houve `apply`/`reset` desde o último `save` bem-sucedido.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// `true` se o índice já consumiu algum LSN — incluindo eventos que não
+    /// geram postings, como `AgentEvidence`. Distingue "watermark 0 porque o
+    /// LSN 0 foi aplicado" de "nada aplicado".
+    pub fn has_applied(&self) -> bool {
+        self.inner.applied
+    }
+
     /// Tamanho que o checkpoint teria **sem** compressão de postings — o
     /// baseline v1 (bincode cru do snapshot).
     ///
@@ -1257,6 +1283,8 @@ impl AttrIndex {
             file.sync_all()?;
         }
         std::fs::rename(&tmp, &dst)?;
+        self.dirty
+            .store(false, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 }
@@ -1267,6 +1295,7 @@ impl View for AttrIndex {
     }
 
     fn apply(&mut self, lsn: Lsn, event: &Episode) {
+        *self.dirty.get_mut() = true;
         // SPEC-0085: AgentEvidence is already durably indexed by its dedicated
         // evidence plane. Duplicating its high-cardinality envelope into the
         // generic AttrIndex lets a denied-action flood allocate RAM without
@@ -1372,6 +1401,7 @@ impl View for AttrIndex {
 
     fn reset(&mut self) {
         self.inner = ResidentSnapshot::default();
+        *self.dirty.get_mut() = true;
     }
 }
 
