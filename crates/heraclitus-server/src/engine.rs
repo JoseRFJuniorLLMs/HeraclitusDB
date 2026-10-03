@@ -49,6 +49,12 @@ pub const MAX_TOP_K: usize = 10_000;
 pub const IDEMPOTENCY_KEY_ATTR: &str = heraclitus_index_attr::IDEMPOTENCY_KEY_FIELD;
 pub const IDEMPOTENCY_HASH_ATTR: &str = "__heraclitus_idempotency_hash";
 
+/// Recusa do append idempotente quando o índice de atributos não descreve o
+/// log inteiro (auditoria recursiva 2026-10-03, iteração 1).
+const IDEMPOTENCIA_SEM_INDICE: &str = "Append idempotente não é permitido com o índice de \
+     atributos não materializado (HERACLITUS_SKIP_VIEW_REPLAY): a deduplicação não veria \
+     as chaves gravadas no intervalo não replayado; repita depois de um arranque normal";
+
 const SENTINEL_DERIVED_KINDS: &[&str] = &[
     "SecurityEvent",
     "SecuritySignal",
@@ -762,6 +768,23 @@ impl Engine {
         if self.vai_para_a_memtable(lsn, &episode) {
             self.memtable.apply(lsn, episode);
         }
+    }
+
+    /// O índice de atributos NÃO descreve o log inteiro: ou o arranque saltou
+    /// o replay da cauda (`attr_nao_materializado`, buraco entre o watermark do
+    /// checkpoint e o head do arranque), ou estamos em LOG_ONLY e as escritas
+    /// desta sessão nunca lá chegam (`vai_para_a_memtable`).
+    ///
+    /// Auditoria recursiva 2026-10-03, iteração 1: a bandeira só travava o
+    /// `checkpoint_attr`. Idempotência, `kind_lookup_lsns`, `attr_lookup_lsns`,
+    /// `attr_range_lookup_lsns` e `titular` tratavam o índice parcial como
+    /// completo — duplicados permanentes no log imutável e linhas largadas sem
+    /// aviso. Quem responde a partir do índice tem de perguntar isto primeiro.
+    fn attr_incompleto(&self) -> bool {
+        self.log_only
+            || self
+                .attr_nao_materializado
+                .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Publica nas views e no índice de atributos; `true` se o episódio deve
@@ -2084,9 +2107,12 @@ impl Engine {
                 // so se pergunta se ainda la esta.
                 .map(|ks| ks.get(agent_id).is_some())
                 .unwrap_or(false),
-            // `false` = este índice não conhece o campo do titular; a contagem
-            // acima não é de confiança e um `rebuild` resolve.
-            "indexado": agentes_indexados > 0,
+            // `false` = este índice não conhece o campo do titular, ou não
+            // descreve o log inteiro (replay saltado / LOG_ONLY — auditoria
+            // recursiva 2026-10-03, iteração 1: antes saía `true` com uma
+            // contagem por baixo). A contagem acima não é de confiança; um
+            // arranque normal resolve.
+            "indexado": agentes_indexados > 0 && !self.attr_incompleto(),
             "agentes_indexados": agentes_indexados,
             "amostra": amostra,
         })
@@ -2468,6 +2494,11 @@ impl Engine {
                     "Append idempotente não é permitido em HERACLITUS_LOG_ONLY".into(),
                 ));
             }
+            // Auditoria recursiva 2026-10-03, iteração 1: a mesma razão do
+            // LOG_ONLY — ver `append_idempotent_validated`.
+            if self.attr_incompleto() {
+                return Err(HeraclitusError::Config(IDEMPOTENCIA_SEM_INDICE.into()));
+            }
             if key.len() > 80
                 || !key
                     .bytes()
@@ -2602,6 +2633,18 @@ impl Engine {
             return Err(HeraclitusError::Config(
                 "Append idempotente não é permitido em HERACLITUS_LOG_ONLY".into(),
             ));
+        }
+        // Auditoria recursiva 2026-10-03, iteração 1: a deduplicação decide SÓ
+        // pelo índice de atributos. Com o replay saltado no arranque
+        // (HERACLITUS_SKIP_VIEW_REPLAY) uma chave gravada no buraco
+        // (watermark do checkpoint, head do arranque] não está lá: o retry
+        // byte-igual era gravado OUTRA vez e um payload diferente não dava
+        // `IdempotencyConflict` — e o log é imutável, o duplicado fica para
+        // sempre. Varrer o buraco a cada pedido não escala no modo que existe
+        // precisamente para bases grandes demais; recusar é a resposta honesta
+        // (o cliente repete depois de um arranque normal).
+        if self.attr_incompleto() {
+            return Err(HeraclitusError::Config(IDEMPOTENCIA_SEM_INDICE.into()));
         }
         if key.len() > 80
             || !key
@@ -3255,6 +3298,12 @@ impl QueryBackend for Engine {
         if !heraclitus_index_attr::valor_indexavel(label) {
             return Ok(None);
         }
+        // Auditoria recursiva 2026-10-03, iteração 1: com o índice parcial o
+        // `Some` seria tomado pelo planner como o conjunto COMPLETO de
+        // candidatos e os matches do buraco desapareciam sem aviso.
+        if self.attr_incompleto() {
+            return Ok(None);
+        }
         let idx = self.attr.read().unwrap();
         if !idx.conhece_campo("_kind") {
             return Ok(None);
@@ -3357,6 +3406,11 @@ impl QueryBackend for Engine {
         if !heraclitus_index_attr::valor_indexavel(value) {
             return Ok(None);
         }
+        // Auditoria recursiva 2026-10-03, iteração 1: "não conheço" pelo lado
+        // da COMPLETUDE — um índice com buraco não pode dar resposta final.
+        if self.attr_incompleto() {
+            return Ok(None);
+        }
         // Só os LSNs: a hidratação fica no planner, que a pára ao encher o
         // LIMIT (auditoria 2026-09-05 — antes lia-se TODO o posting, até
         // QUERY_SCAN_CAP episódios, para devolver 10).
@@ -3435,6 +3489,10 @@ impl QueryBackend for Engine {
             acima && abaixo
         };
         if [0.0f64, -1.0].iter().any(|x| inclui(*x)) {
+            return Ok(None);
+        }
+        // Auditoria recursiva 2026-10-03, iteração 1: idem `attr_lookup_lsns`.
+        if self.attr_incompleto() {
             return Ok(None);
         }
         let mut lsns: Vec<Lsn> = {
