@@ -398,6 +398,23 @@ impl<C: TsaClient> TsaClient for GuardedTsaClient<C> {
             .map_err(|error| CompError::Tsa(error.to_string()))?;
         self.inner.stamp(imprint)
     }
+
+    // Auditoria recursiva 2026-10-03, iteração 2: a guarda reencaminha o
+    // `validation_state` do cliente interno, por isso TEM de reencaminhar
+    // também o `genTime` e a política verificados. Sem isto aplicavam-se os
+    // defaults (`None`) do trait e, com `https` + soberania `controlled` (o
+    // único perfil de produção aceite), o `anchor()` via um estado
+    // `ExternalTokenVerified` sem hora nem política e recusava sempre o
+    // recibo — depois de já ter gravado a decisão de egress e chamado a ACT,
+    // em cada tick, para sempre. Estes métodos não fazem egress (só leem um
+    // token já obtido através de `stamp`), logo não pedem nova autorização.
+    fn verified_gen_unix_ms(&self, token: &[u8], imprint: &[u8; 32]) -> Option<u64> {
+        self.inner.verified_gen_unix_ms(token, imprint)
+    }
+
+    fn verified_policy_oid(&self, token: &[u8], imprint: &[u8; 32]) -> Option<String> {
+        self.inner.verified_policy_oid(token, imprint)
+    }
 }
 
 pub trait SovereignModelBackend: Send + Sync {
@@ -541,6 +558,79 @@ mod tests {
         let audit = SovereigntyAuditState::replay(log.as_ref()).unwrap();
         assert_eq!(audit.egress.len(), 1);
         assert_eq!(audit.egress[0].1.verdict, SovereigntyVerdict::Deny);
+    }
+
+    /// Cliente que declara ter verificado o token (como o `SecureTsaClient`
+    /// com verificador instalado) e devolve hora e política verificadas.
+    struct VerifiedTsa(Arc<AtomicUsize>);
+
+    impl TsaClient for VerifiedTsa {
+        fn policy_name(&self) -> &str {
+            "verified-tsa"
+        }
+
+        fn validation_state(&self) -> TimestampValidationState {
+            TimestampValidationState::ExternalTokenVerified
+        }
+
+        fn stamp(&self, _imprint: &[u8; 32]) -> Result<Vec<u8>, CompError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![0x30, 0])
+        }
+
+        fn verified_gen_unix_ms(&self, _token: &[u8], _imprint: &[u8; 32]) -> Option<u64> {
+            Some(1_700_000_000_000)
+        }
+
+        fn verified_policy_oid(&self, _token: &[u8], _imprint: &[u8; 32]) -> Option<String> {
+            Some("2.16.76.1.7.1.1".into())
+        }
+    }
+
+    // Auditoria recursiva 2026-10-03, iteração 2: com soberania `controlled`
+    // o cliente verificado chega ao worker embrulhado na guarda. Se a guarda
+    // não reencaminhar `genTime`/política, o `anchor()` falha sempre e nenhum
+    // recibo é escrito.
+    #[test]
+    fn guarded_verified_client_forwards_gen_time_and_policy_so_anchor_succeeds() {
+        let (_temp, log) = log();
+        let allowed = endpoint();
+        let policy = SovereigntyPolicy {
+            policy_id: "controlled".into(),
+            version: "v1".into(),
+            mode: SovereigntyMode::ControlledEgress,
+            allowed_endpoints: [allowed.clone()].into_iter().collect(),
+            allow_local_network_models: false,
+            allow_external_models: false,
+        };
+        let runtime = SovereigntyRuntime::new(policy, log.clone()).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = GuardedTsaClient::new(
+            VerifiedTsa(calls.clone()),
+            runtime,
+            allowed,
+            "anchor-worker",
+        )
+        .unwrap();
+        assert_eq!(
+            client.verified_gen_unix_ms(&[0x30, 0], &[7; 32]),
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(
+            client.verified_policy_oid(&[0x30, 0], &[7; 32]).as_deref(),
+            Some("2.16.76.1.7.1.1")
+        );
+
+        let receipts = tempfile::tempdir().unwrap();
+        let receipt = crate::anchor(log.as_ref(), &client, receipts.path(), None)
+            .expect("anchor via guarda com cliente verificado tem de escrever recibo");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            receipt.validation_state,
+            TimestampValidationState::ExternalTokenVerified
+        );
+        assert_eq!(receipt.authority_gen_unix_ms, Some(1_700_000_000_000));
+        assert_eq!(receipt.tsa_policy_oid.as_deref(), Some("2.16.76.1.7.1.1"));
     }
 
     #[test]
