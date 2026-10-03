@@ -26,8 +26,14 @@ use heraclitus_agent::policy::DeterministicAgentPolicyEngine;
 use heraclitus_agent::store::{EvidenceLog, StoredEvidence};
 use heraclitus_core::{HeraclitusError, Lsn};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+
+struct DedupeState {
+    index: DedupeIndex,
+    in_flight: HashMap<String, String>,
+}
 
 /// Estado de uma policy no seu ciclo de vida (§22 da 0075).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -105,7 +111,7 @@ pub struct AgentRuntime {
     pub config: AgentBlackBoxConfig,
     pub gateway: AgentGatewayConfig,
     log: Arc<dyn EvidenceLog>,
-    dedupe: Mutex<DedupeIndex>,
+    dedupe: (Mutex<DedupeState>, Condvar),
     pub approvals: ApprovalStore,
     policy: RwLock<ActivePolicy>,
     pub counters: Mutex<IngestCounters>,
@@ -161,7 +167,13 @@ impl AgentRuntime {
             .with_limits(config.limits.clone())
             .with_redaction(config.redaction_profile());
         Self {
-            dedupe: Mutex::new(DedupeIndex::new(config.limits.max_queue_depth.max(1024))),
+            dedupe: (
+                Mutex::new(DedupeState {
+                    index: DedupeIndex::new(config.limits.max_queue_depth.max(1024)),
+                    in_flight: HashMap::new(),
+                }),
+                Condvar::new(),
+            ),
             normalizer,
             config,
             gateway,
@@ -333,30 +345,84 @@ impl AgentRuntime {
     /// Como [`AgentRuntime::append`], mas dizendo QUAL das três coisas
     /// aconteceu em vez de colapsar duas delas num erro.
     pub fn append_outcome(&self, e: &AgentEvidenceV1) -> AppendOutcome {
-        let verdict = {
-            let mut idx = self.dedupe.lock().unwrap();
-            idx.admit(e)
+        let key = if e.dedupe_key.is_empty() {
+            heraclitus_agent::dedupe::dedupe_key(e)
+        } else {
+            e.dedupe_key.clone()
         };
-        match verdict {
-            DedupeVerdict::Duplicate => {
-                self.counters.lock().unwrap().duplicates += 1;
-                AppendOutcome::Duplicada
-            }
-            DedupeVerdict::Conflict { existing_hash } => {
-                self.counters.lock().unwrap().conflicts += 1;
-                AppendOutcome::Conflito { existing_hash }
-            }
-            DedupeVerdict::Novel => match self.log.append_evidence(e) {
-                Ok(lsn) => {
-                    let mut c = self.counters.lock().unwrap();
-                    c.events += 1;
-                    if e.privacy.redaction_applied {
-                        c.redactions += 1;
+        let hash = heraclitus_agent::canonical::hex32(
+            &heraclitus_agent::canonical::canonical_evidence_hash(e),
+        );
+
+        let (state, cvar) = (&self.dedupe.0, &self.dedupe.1);
+        let mut guard = state.lock().unwrap();
+        loop {
+            if let Some(verdict) = guard.index.check(&key, &hash) {
+                match verdict {
+                    DedupeVerdict::Duplicate => {
+                        self.counters.lock().unwrap().duplicates += 1;
+                        return AppendOutcome::Duplicada;
                     }
-                    AppendOutcome::Gravada(lsn)
+                    DedupeVerdict::Conflict { existing_hash } => {
+                        self.counters.lock().unwrap().conflicts += 1;
+                        return AppendOutcome::Conflito { existing_hash };
+                    }
+                    DedupeVerdict::Novel => unreachable!(),
                 }
-                Err(err) => AppendOutcome::Falhou(err),
-            },
+            }
+            if let Some(in_flight_hash) = guard.in_flight.get(&key) {
+                if in_flight_hash != &hash {
+                    let existing_hash = in_flight_hash.clone();
+                    self.counters.lock().unwrap().conflicts += 1;
+                    return AppendOutcome::Conflito { existing_hash };
+                }
+                guard = cvar.wait(guard).unwrap();
+                continue;
+            }
+            guard.in_flight.insert(key.clone(), hash.clone());
+            break;
+        }
+        drop(guard);
+
+        struct InFlightGuard<'a> {
+            state: &'a Mutex<DedupeState>,
+            cvar: &'a Condvar,
+            key: &'a str,
+            committed: bool,
+        }
+        impl<'a> Drop for InFlightGuard<'a> {
+            fn drop(&mut self) {
+                if !self.committed {
+                    let mut g = self.state.lock().unwrap();
+                    g.in_flight.remove(self.key);
+                    self.cvar.notify_all();
+                }
+            }
+        }
+        let mut inflight_guard = InFlightGuard {
+            state,
+            cvar,
+            key: &key,
+            committed: false,
+        };
+
+        match self.log.append_evidence(e) {
+            Ok(lsn) => {
+                {
+                    let mut g = state.lock().unwrap();
+                    g.in_flight.remove(&key);
+                    g.index.insert_committed(key.clone(), hash);
+                    cvar.notify_all();
+                    inflight_guard.committed = true;
+                }
+                let mut c = self.counters.lock().unwrap();
+                c.events += 1;
+                if e.privacy.redaction_applied {
+                    c.redactions += 1;
+                }
+                AppendOutcome::Gravada(lsn)
+            }
+            Err(err) => AppendOutcome::Falhou(err),
         }
     }
 
@@ -366,43 +432,99 @@ impl AgentRuntime {
     /// erro quando a chave colidiu com conteúdo diferente — que é o caso que a
     /// SPEC-0074 §14 manda falhar explicitamente.
     pub fn append(&self, e: &AgentEvidenceV1) -> Result<Option<Lsn>, HeraclitusError> {
-        let verdict = {
-            let mut idx = self.dedupe.lock().unwrap();
-            idx.admit(e)
+        let key = if e.dedupe_key.is_empty() {
+            heraclitus_agent::dedupe::dedupe_key(e)
+        } else {
+            e.dedupe_key.clone()
         };
-        let mut counters = self.counters.lock().unwrap();
-        match verdict {
-            DedupeVerdict::Duplicate => {
-                counters.duplicates += 1;
-                Ok(None)
-            }
-            DedupeVerdict::Conflict { existing_hash } => {
-                counters.conflicts += 1;
-                Err(HeraclitusError::Config(format!(
-                    "a chave de deduplicação {} já existe com conteúdo diferente \
-                     (gravado {existing_hash}). Recusado: aceitar seria deixar reescrever \
-                     evidência já registada (SPEC-0074 §14).",
-                    e.dedupe_key
-                )))
-            }
-            DedupeVerdict::Novel => {
-                drop(counters);
-                let lsn = self.log.append_evidence(e)?;
+        let hash = heraclitus_agent::canonical::hex32(
+            &heraclitus_agent::canonical::canonical_evidence_hash(e),
+        );
+
+        let (state, cvar) = (&self.dedupe.0, &self.dedupe.1);
+        let mut guard = state.lock().unwrap();
+        loop {
+            if let Some(verdict) = guard.index.check(&key, &hash) {
                 let mut counters = self.counters.lock().unwrap();
-                counters.events += 1;
-                if e.privacy.redaction_applied {
-                    counters.redactions += 1;
+                return match verdict {
+                    DedupeVerdict::Duplicate => {
+                        counters.duplicates += 1;
+                        Ok(None)
+                    }
+                    DedupeVerdict::Conflict { existing_hash } => {
+                        counters.conflicts += 1;
+                        Err(HeraclitusError::Config(format!(
+                            "a chave de deduplicação {} já existe com conteúdo diferente \
+                             (gravado {existing_hash}). Recusado: aceitar seria deixar reescrever \
+                             evidência já registada (SPEC-0074 §14).",
+                            e.dedupe_key
+                        )))
+                    }
+                    DedupeVerdict::Novel => unreachable!(),
+                };
+            }
+            if let Some(in_flight_hash) = guard.in_flight.get(&key) {
+                if in_flight_hash != &hash {
+                    let existing_hash = in_flight_hash.clone();
+                    self.counters.lock().unwrap().conflicts += 1;
+                    return Err(HeraclitusError::Config(format!(
+                        "a chave de deduplicação {} já está em gravação com conteúdo diferente \
+                         (conflito {existing_hash}). Recusado: aceitar seria deixar reescrever \
+                         evidência já registada (SPEC-0074 §14).",
+                        e.dedupe_key
+                    )));
                 }
-                Ok(Some(lsn))
+                guard = cvar.wait(guard).unwrap();
+                continue;
+            }
+            guard.in_flight.insert(key.clone(), hash.clone());
+            break;
+        }
+        drop(guard);
+
+        struct InFlightGuard<'a> {
+            state: &'a Mutex<DedupeState>,
+            cvar: &'a Condvar,
+            key: &'a str,
+            committed: bool,
+        }
+        impl<'a> Drop for InFlightGuard<'a> {
+            fn drop(&mut self) {
+                if !self.committed {
+                    let mut g = self.state.lock().unwrap();
+                    g.in_flight.remove(self.key);
+                    self.cvar.notify_all();
+                }
             }
         }
+        let mut inflight_guard = InFlightGuard {
+            state,
+            cvar,
+            key: &key,
+            committed: false,
+        };
+
+        let lsn = self.log.append_evidence(e)?;
+        {
+            let mut g = state.lock().unwrap();
+            g.in_flight.remove(&key);
+            g.index.insert_committed(key.clone(), hash);
+            cvar.notify_all();
+            inflight_guard.committed = true;
+        }
+        let mut counters = self.counters.lock().unwrap();
+        counters.events += 1;
+        if e.privacy.redaction_applied {
+            counters.redactions += 1;
+        }
+        Ok(Some(lsn))
     }
 
     /// Reconstrói o índice de deduplicação a partir do log (arranque).
     pub fn warm(&self) -> Result<usize, HeraclitusError> {
         let rows = self.scan()?;
-        let mut idx = self.dedupe.lock().unwrap();
-        idx.warm_from(rows.iter().map(|r| &r.evidence));
+        let mut guard = self.dedupe.0.lock().unwrap();
+        guard.index.warm_from(rows.iter().map(|r| &r.evidence));
         self.approvals.warm(Vec::new());
         self.approvals.warm_consumed(rows.iter().filter_map(|row| {
             let e = &row.evidence;
@@ -447,4 +569,117 @@ pub fn now_unix_nanos() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use heraclitus_agent::evidence::AgentEvidenceKindV1;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    struct MockLog {
+        should_fail: AtomicBool,
+        head_count: AtomicU64,
+        entries: Mutex<Vec<AgentEvidenceV1>>,
+    }
+
+    impl MockLog {
+        fn new() -> Self {
+            Self {
+                should_fail: AtomicBool::new(false),
+                head_count: AtomicU64::new(0),
+                entries: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl EvidenceLog for MockLog {
+        fn append_evidence(&self, e: &AgentEvidenceV1) -> Result<Lsn, HeraclitusError> {
+            if self.should_fail.load(Ordering::SeqCst) {
+                return Err(HeraclitusError::Storage(std::io::Error::other(
+                    "simulated write error",
+                )));
+            }
+            let mut list = self.entries.lock().unwrap();
+            let lsn = self.head_count.fetch_add(1, Ordering::SeqCst);
+            list.push(e.clone());
+            Ok(lsn)
+        }
+
+        fn head(&self) -> Lsn {
+            self.head_count.load(Ordering::SeqCst)
+        }
+
+        fn scan_evidence(
+            &self,
+            from: Lsn,
+            limit: u64,
+        ) -> Result<Vec<StoredEvidence>, HeraclitusError> {
+            let list = self.entries.lock().unwrap();
+            let mut res = Vec::new();
+            for (idx, e) in list.iter().enumerate() {
+                let lsn = idx as u64;
+                if lsn >= from && (res.len() as u64) < limit {
+                    res.push(StoredEvidence {
+                        lsn,
+                        evidence: e.clone(),
+                    });
+                }
+            }
+            Ok(res)
+        }
+
+        fn read_evidence(&self, lsn: Lsn) -> Result<Option<StoredEvidence>, HeraclitusError> {
+            let list = self.entries.lock().unwrap();
+            Ok(list.get(lsn as usize).map(|e| StoredEvidence {
+                lsn,
+                evidence: e.clone(),
+            }))
+        }
+
+        fn flush(&self) -> Result<(), HeraclitusError> {
+            Ok(())
+        }
+
+        fn prove(
+            &self,
+            _lsn: Lsn,
+        ) -> Result<heraclitus_agent::store::ProofAvailability, HeraclitusError> {
+            Ok(heraclitus_agent::store::ProofAvailability::PendingSeal)
+        }
+    }
+
+    fn sample_evidence() -> AgentEvidenceV1 {
+        let mut e = AgentEvidenceV1::new("t", AgentEvidenceKindV1::ToolRequested, 1);
+        e.evidence_id = "ev-1".into();
+        e.dedupe_key = "key-test-1".into();
+        e
+    }
+
+    #[test]
+    fn failed_append_does_not_poison_dedupe_index() {
+        let mock_log = Arc::new(MockLog::new());
+        let runtime = AgentRuntime::new(
+            AgentBlackBoxConfig::default(),
+            AgentGatewayConfig::default(),
+            mock_log.clone(),
+        );
+        let ev = sample_evidence();
+
+        // 1. Falha na escrita: não pode marcar a chave como vista
+        mock_log.should_fail.store(true, Ordering::SeqCst);
+        assert!(runtime.append(&ev).is_err());
+        assert_eq!(mock_log.head(), 0);
+
+        // 2. Retry com log recuperado: deve conseguir gravar e não ser descartado como duplicado
+        mock_log.should_fail.store(false, Ordering::SeqCst);
+        let res = runtime.append(&ev);
+        assert_eq!(res.unwrap(), Some(0));
+        assert_eq!(mock_log.head(), 1);
+
+        // 3. Próximo envio com a mesma chave: agora sim é duplicado
+        let res_dup = runtime.append(&ev);
+        assert_eq!(res_dup.unwrap(), None);
+        assert_eq!(mock_log.head(), 1);
+    }
 }

@@ -126,6 +126,29 @@ impl DedupeIndex {
         }
     }
 
+    /// Consulta se uma chave já é conhecida e como classifica.
+    /// Retorna `Some(DedupeVerdict::Duplicate)` ou `Some(DedupeVerdict::Conflict)`
+    /// se já tiver sido admitida, ou `None` se for nova (ainda não committed).
+    pub fn check(&self, key: &str, hash: &str) -> Option<DedupeVerdict> {
+        match self.seen.get(key) {
+            Some((existing, _)) if *existing == hash => Some(DedupeVerdict::Duplicate),
+            Some((existing, _)) => Some(DedupeVerdict::Conflict {
+                existing_hash: existing.clone(),
+            }),
+            None => None,
+        }
+    }
+
+    /// Regista uma chave como persistida no índice de deduplicação.
+    pub fn insert_committed(&mut self, key: String, hash: String) {
+        self.insert(key, hash);
+    }
+
+    /// Remove uma chave do índice (usado em cancelamento/compensação).
+    pub fn forget(&mut self, key: &str) {
+        self.seen.remove(key);
+    }
+
     /// Classifica uma evidência e, se for nova, regista-a.
     pub fn admit(&mut self, e: &AgentEvidenceV1) -> DedupeVerdict {
         let key = if e.dedupe_key.is_empty() {
@@ -134,15 +157,11 @@ impl DedupeIndex {
             e.dedupe_key.clone()
         };
         let hash = hex32(&canonical_evidence_hash(e));
-        match self.seen.get(&key) {
-            Some((existing, _)) if *existing == hash => DedupeVerdict::Duplicate,
-            Some((existing, _)) => DedupeVerdict::Conflict {
-                existing_hash: existing.clone(),
-            },
-            None => {
-                self.insert(key, hash);
-                DedupeVerdict::Novel
-            }
+        if let Some(verdict) = self.check(&key, &hash) {
+            verdict
+        } else {
+            self.insert(key, hash);
+            DedupeVerdict::Novel
         }
     }
 
@@ -259,5 +278,20 @@ mod tests {
         let mut idx = DedupeIndex::new(64);
         idx.warm_from(std::iter::once(&a));
         assert_eq!(idx.admit(&a), DedupeVerdict::Duplicate);
+    }
+
+    #[test]
+    fn check_insert_committed_and_forget() {
+        let a = ev(Some(1));
+        let mut idx = DedupeIndex::new(64);
+        let hash = hex32(&canonical_evidence_hash(&a));
+        assert_eq!(idx.check(&a.dedupe_key, &hash), None);
+        idx.insert_committed(a.dedupe_key.clone(), hash.clone());
+        assert_eq!(
+            idx.check(&a.dedupe_key, &hash),
+            Some(DedupeVerdict::Duplicate)
+        );
+        idx.forget(&a.dedupe_key);
+        assert_eq!(idx.check(&a.dedupe_key, &hash), None);
     }
 }
