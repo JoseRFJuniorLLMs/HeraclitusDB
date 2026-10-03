@@ -989,21 +989,19 @@ async fn sentinel_actions(
         return sentinel_unavailable();
     };
     let limit = query.limit.unwrap_or(100).min(10_000);
+    // Auditoria recursiva 2026-10-03, iteração 1 — antes pedia-se a
+    // `l4_events(None, ..)` as `limit` linhas L4 mais antigas de QUALQUER tipo
+    // e só depois se filtravam as acções: o `limit` era gasto por
+    // investigações e decisões e as acções recentes nunca apareciam.
+    // `action_events` filtra o tipo antes do corte e devolve as mais recentes.
     let result = tokio::task::spawn_blocking(move || {
-        runtime.l4_events(None, query.incident_id.as_deref(), query.as_of_lsn, limit)
+        runtime.action_events(query.incident_id.as_deref(), query.as_of_lsn, limit)
     })
     .await;
     match result {
         Ok(Ok(rows)) => {
             let actions: Vec<_> = rows
                 .into_iter()
-                .filter(|(_, episode)| {
-                    matches!(
-                        &episode.kind,
-                        heraclitus_core::EventKind::Custom(kind)
-                            if kind == "SecurityActionProposal" || kind == "SecurityActionResult"
-                    )
-                })
                 .map(|(lsn, episode)| l4_json(lsn, &episode))
                 .collect();
             Json(serde_json::json!({ "actions": actions, "count": actions.len() })).into_response()
@@ -1028,18 +1026,11 @@ async fn sentinel_action(
     let Some(runtime) = runtime else {
         return sentinel_unavailable();
     };
-    let result = tokio::task::spawn_blocking(move || {
-        let rows = runtime.l4_events(None, None, None, 10_000)?;
-        Ok::<_, heraclitus_sentinel::SentinelError>(rows.into_iter().find(|(_, episode)| {
-            episode
-                .attrs
-                .get("sentinel.action_proposal_id")
-                .map(String::as_str)
-                == Some(id.as_str())
-                || episode.attrs.get("sentinel.action_id").map(String::as_str) == Some(id.as_str())
-        }))
-    })
-    .await;
+    // Auditoria recursiva 2026-10-03, iteração 1 — a procura via
+    // `l4_events(None, None, None, 10_000)` + `find` só via as primeiras
+    // 10 000 linhas L4 e dava 404 para acções gravadas depois delas;
+    // `find_action` percorre o log inteiro em lotes.
+    let result = tokio::task::spawn_blocking(move || runtime.find_action(&id)).await;
     match result {
         Ok(Ok(Some((lsn, episode)))) => Json(l4_json(lsn, &episode)).into_response(),
         Ok(Ok(None)) => (
@@ -3695,6 +3686,130 @@ mod dashboard_tests {
                 .unwrap();
         }
         assert_eq!(pending_do_dashboard(&runtime).await, 0);
+        runtime.shutdown();
+    }
+
+    fn episodio_l4(kind: &str, attrs: &[(&str, String)]) -> heraclitus_core::Episode {
+        let mut episode = heraclitus_core::Episode::new(
+            "sentinel",
+            heraclitus_core::EventKind::Custom(kind.into()),
+            b"{}".to_vec(),
+        );
+        episode
+            .attrs
+            .insert("sentinel.generated".into(), "true".into());
+        episode
+            .attrs
+            .insert("sentinel.incident_id".into(), "inc-1".into());
+        for (chave, valor) in attrs {
+            episode.attrs.insert((*chave).into(), valor.clone());
+        }
+        episode
+    }
+
+    async fn corpo_json(resposta: Response) -> (StatusCode, serde_json::Value) {
+        let estado = resposta.status();
+        let corpo = axum::body::to_bytes(resposta.into_body(), 1 << 24)
+            .await
+            .unwrap();
+        (estado, serde_json::from_slice(&corpo).unwrap())
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 1 — `/sentinel/actions`
+    /// cortava `limit` sobre as linhas L4 mais antigas de QUALQUER tipo antes
+    /// de filtrar as acções (aqui dava `count: 0`), e `/sentinel/actions/:id`
+    /// só procurava nas primeiras 10 000 linhas L4 (aqui dava 404 para uma
+    /// acção que existe).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sentinel_actions_ve_as_accoes_recentes_depois_de_muito_l4() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                64 << 20,
+                FsyncPolicy::GroupCommit { interval_ms: 1_000 },
+            )
+            .unwrap(),
+        );
+        let runtime = Arc::new(
+            SentinelRuntime::start(
+                log.clone(),
+                SentinelConfig {
+                    enabled: true,
+                    mode: SentinelMode::Assist,
+                    queue_capacity: 8,
+                    worker_threads: 1,
+                    pipeline_version: 1,
+                    catch_up_batch: 32,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .unwrap(),
+        );
+        for _ in 0..10_001 {
+            log.append(episodio_l4("SecurityInvestigation", &[]))
+                .unwrap();
+        }
+        for n in 0..3 {
+            log.append(episodio_l4(
+                "SecurityActionProposal",
+                &[("sentinel.action_proposal_id", format!("p-{n}"))],
+            ))
+            .unwrap();
+        }
+
+        let ids = |json: &serde_json::Value| -> Vec<String> {
+            json["actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| {
+                    a["attrs"]["sentinel.action_proposal_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect()
+        };
+        let (estado, json) = corpo_json(
+            sentinel_actions(
+                Extension(Some(runtime.clone())),
+                Query(SentinelIncidentQuery::default()),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(estado, StatusCode::OK);
+        assert_eq!(json["count"], 3, "{json}");
+        assert_eq!(ids(&json), ["p-0", "p-1", "p-2"]);
+
+        let (estado, json) = corpo_json(
+            sentinel_actions(
+                Extension(Some(runtime.clone())),
+                Query(SentinelIncidentQuery {
+                    limit: Some(2),
+                    ..Default::default()
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(estado, StatusCode::OK);
+        assert_eq!(ids(&json), ["p-1", "p-2"], "têm de vir as mais recentes");
+
+        let (estado, json) =
+            corpo_json(sentinel_action(Extension(Some(runtime.clone())), Path("p-2".into())).await)
+                .await;
+        assert_eq!(estado, StatusCode::OK, "{json}");
+        assert_eq!(json["attrs"]["sentinel.action_proposal_id"], "p-2");
+
+        let (estado, _) = corpo_json(
+            sentinel_action(Extension(Some(runtime.clone())), Path("nao-existe".into())).await,
+        )
+        .await;
+        assert_eq!(estado, StatusCode::NOT_FOUND);
         runtime.shutdown();
     }
 }

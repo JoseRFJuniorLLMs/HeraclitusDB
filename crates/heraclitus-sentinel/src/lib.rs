@@ -2022,19 +2022,7 @@ impl SentinelRuntime {
                 let EventKind::Custom(event_kind) = &episode.kind else {
                     continue;
                 };
-                if !matches!(
-                    event_kind.as_str(),
-                    "SecurityInvestigation"
-                        | "SecurityAiInvocation"
-                        | "SecurityActionProposal"
-                        | "SecurityPolicyDecision"
-                        | "SecurityApproval"
-                        | "SecurityActionResult"
-                        | "SecurityModelUpdate"
-                        | "SecurityRulesetUpdate"
-                        | "SecurityFeedback"
-                ) || !episode_is_generated(&episode)
-                {
+                if !e_tipo_l4(event_kind) || !episode_is_generated(&episode) {
                     continue;
                 }
                 if kind.is_some_and(|wanted| wanted != event_kind) {
@@ -2057,6 +2045,140 @@ impl SentinelRuntime {
             cursor = cursor_apos_lote(cursor, ultimo)?;
         }
         Ok(rows)
+    }
+
+    /// As `limit` acções (`SecurityActionProposal` / `SecurityActionResult`)
+    /// MAIS RECENTES até `as_of_lsn`, devolvidas por LSN crescente.
+    ///
+    /// Auditoria recursiva 2026-10-03, iteração 1 — o `GET /sentinel/actions`
+    /// pedia a `l4_events` as `limit` linhas L4 mais ANTIGAS de qualquer dos
+    /// nove tipos e só depois ficava com as acções: investigações, invocações
+    /// de IA e decisões de política gastavam o `limit`, a resposta trazia
+    /// poucas ou nenhumas acções e as recentes nunca apareciam (subir o
+    /// `limit` continuava a começar no LSN 0). Aqui o filtro de tipo vem ANTES
+    /// do corte, e o corte guarda a cauda: com `as_of_lsn` o chamador recua no
+    /// tempo, o que dá uma paginação coerente para trás.
+    ///
+    /// Percorre o log inteiro em lotes (a mesma janela de `l4_events`); a
+    /// memória fica O(janela + limit), nunca O(log).
+    pub fn action_events(
+        &self,
+        incident_id: Option<&str>,
+        as_of_lsn: Option<Lsn>,
+        limit: usize,
+    ) -> Result<Vec<(Lsn, Episode)>, SentinelError> {
+        const JANELA: usize = 20_000;
+        self.action_events_com_janela(incident_id, as_of_lsn, limit, JANELA)
+    }
+
+    /// Corpo de `action_events` com a janela injectável, para o teste poder
+    /// atravessar fronteiras de lote com um log pequeno.
+    fn action_events_com_janela(
+        &self,
+        incident_id: Option<&str>,
+        as_of_lsn: Option<Lsn>,
+        limit: usize,
+        janela: usize,
+    ) -> Result<Vec<(Lsn, Episode)>, SentinelError> {
+        if limit == 0 || limit > 10_000 {
+            return Err(SentinelError::Config(
+                "l4 event limit deve estar entre 1 e 10000".into(),
+            ));
+        }
+        let janela = janela.max(1);
+        let upper = as_of_lsn
+            .map(|lsn| self.inner.log.head().min(lsn.saturating_add(1)))
+            .unwrap_or_else(|| self.inner.log.head());
+        self.inner
+            .metrics
+            .l4_scans_total
+            .fetch_add(1, Ordering::Relaxed);
+        let mut cauda: VecDeque<(Lsn, Episode)> = VecDeque::with_capacity(limit.min(1_024));
+        let mut cursor: Lsn = 0;
+        while cursor < upper {
+            let lote = self.inner.log.scan_capped(cursor, upper, janela)?;
+            let Some(&(ultimo, _)) = lote.last() else {
+                break;
+            };
+            for (lsn, episode) in lote {
+                let EventKind::Custom(event_kind) = &episode.kind else {
+                    continue;
+                };
+                if !matches!(
+                    event_kind.as_str(),
+                    "SecurityActionProposal" | "SecurityActionResult"
+                ) || !episode_is_generated(&episode)
+                {
+                    continue;
+                }
+                if incident_id.is_some_and(|wanted| {
+                    episode
+                        .attrs
+                        .get("sentinel.incident_id")
+                        .map(String::as_str)
+                        != Some(wanted)
+                }) {
+                    continue;
+                }
+                if cauda.len() == limit {
+                    cauda.pop_front();
+                }
+                cauda.push_back((lsn, episode));
+            }
+            cursor = cursor_apos_lote(cursor, ultimo)?;
+        }
+        Ok(cauda.into())
+    }
+
+    /// O primeiro registo L4 (por LSN crescente) cujo
+    /// `sentinel.action_proposal_id` ou `sentinel.action_id` é `id`.
+    ///
+    /// Auditoria recursiva 2026-10-03, iteração 1 — o `GET
+    /// /sentinel/actions/:id` procurava só nas primeiras 10 000 linhas L4
+    /// (`l4_events(None, None, None, 10_000)` + `find`), pelo que qualquer
+    /// acção gravada depois da 10 000.ª linha L4 dava 404 `action_not_found`
+    /// apesar de existir. O predicado é o mesmo (qualquer dos nove tipos L4,
+    /// primeira ocorrência); o que desaparece é o tecto de linhas. Pára no
+    /// primeiro acerto e a memória fica O(janela).
+    pub fn find_action(&self, id: &str) -> Result<Option<(Lsn, Episode)>, SentinelError> {
+        const JANELA: usize = 20_000;
+        self.find_action_com_janela(id, JANELA)
+    }
+
+    /// Corpo de `find_action` com a janela injectável (ver
+    /// `action_events_com_janela`).
+    fn find_action_com_janela(
+        &self,
+        id: &str,
+        janela: usize,
+    ) -> Result<Option<(Lsn, Episode)>, SentinelError> {
+        let janela = janela.max(1);
+        let upper = self.inner.log.head();
+        self.inner
+            .metrics
+            .l4_scans_total
+            .fetch_add(1, Ordering::Relaxed);
+        let mut cursor: Lsn = 0;
+        while cursor < upper {
+            let lote = self.inner.log.scan_capped(cursor, upper, janela)?;
+            let Some(&(ultimo, _)) = lote.last() else {
+                break;
+            };
+            for (lsn, episode) in lote {
+                let EventKind::Custom(event_kind) = &episode.kind else {
+                    continue;
+                };
+                if !e_tipo_l4(event_kind) || !episode_is_generated(&episode) {
+                    continue;
+                }
+                let acerta = |chave: &str| episode.attrs.get(chave).map(String::as_str) == Some(id);
+                if acerta("sentinel.action_proposal_id") || acerta("sentinel.action_id") {
+                    return Ok(Some((lsn, episode)));
+                }
+            }
+            cursor = cursor_apos_lote(cursor, ultimo)?;
+        }
+        Ok(None)
     }
 
     fn incident_revisions_as_of(
@@ -2499,6 +2621,24 @@ fn talvez_publicar_snapshot(inner: &RuntimeInner, processados: u64) {
         tracing::warn!(erro = %erro, "falha ao publicar o snapshot periódico do Sentinel");
     }
     drop(guarda);
+}
+
+/// Os nove tipos de registo L4 que `l4_events` e `find_action` expõem. Uma só
+/// lista para os dois (auditoria recursiva 2026-10-03, iteração 1), para não
+/// poderem divergir.
+fn e_tipo_l4(event_kind: &str) -> bool {
+    matches!(
+        event_kind,
+        "SecurityInvestigation"
+            | "SecurityAiInvocation"
+            | "SecurityActionProposal"
+            | "SecurityPolicyDecision"
+            | "SecurityApproval"
+            | "SecurityActionResult"
+            | "SecurityModelUpdate"
+            | "SecurityRulesetUpdate"
+            | "SecurityFeedback"
+    )
 }
 
 /// Avanço do cursor de uma varredura janelada, com PROGRESSO ESTRITO.
@@ -5962,6 +6102,135 @@ detection:
                     }
                 }
             }
+        }
+        runtime.shutdown();
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 1 — `action_events` tem de
+    /// filtrar o tipo ANTES do corte e guardar as acções MAIS RECENTES; o
+    /// caminho antigo (`l4_events(None, ..)` + filtro) gastava o `limit` nas
+    /// investigações mais antigas. `find_action` tem de achar a acção em
+    /// qualquer ponto do log. Ambos são exercitados contra um oráculo com a
+    /// janela a cair antes, em cima e depois de cada fronteira de lote.
+    #[test]
+    fn action_events_devolve_as_accoes_mais_recentes_e_find_action_ve_o_log_inteiro() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                heraclitus_core::StorageFormat::Legacy,
+                temp.path().join("log"),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let runtime = SentinelRuntime::start(log.clone(), l3_config())
+            .unwrap()
+            .unwrap();
+        let mut lsn_de: std::collections::HashMap<String, Lsn> = Default::default();
+        for i in 0..60u32 {
+            let incidente = if i % 2 == 0 { "inc-1" } else { "inc-2" };
+            let episode = match i % 6 {
+                5 => {
+                    let mut e = episodio_l4("SecurityActionProposal", incidente, b"{}".to_vec());
+                    e.attrs
+                        .insert("sentinel.action_proposal_id".into(), format!("p-{i}"));
+                    e
+                }
+                2 => {
+                    let mut e = episodio_l4("SecurityActionResult", incidente, b"{}".to_vec());
+                    e.attrs
+                        .insert("sentinel.action_id".into(), format!("a-{i}"));
+                    e
+                }
+                _ => episodio_l4("SecurityInvestigation", incidente, b"{}".to_vec()),
+            };
+            let id = episode
+                .attrs
+                .get("sentinel.action_proposal_id")
+                .or_else(|| episode.attrs.get("sentinel.action_id"))
+                .cloned();
+            let lsn = log.append(episode).unwrap();
+            if let Some(id) = id {
+                lsn_de.insert(id, lsn);
+            }
+        }
+        wait_for_catch_up(&runtime, &log);
+        let head = log.head();
+        let e_accao = |e: &Episode| {
+            matches!(&e.kind, EventKind::Custom(k)
+                if k == "SecurityActionProposal" || k == "SecurityActionResult")
+        };
+
+        // O caso que falhava: com `limit = 3` o caminho antigo só via as três
+        // linhas L4 mais antigas (duas investigações e um resultado).
+        let antigo: Vec<Lsn> = runtime
+            .l4_events(None, None, None, 3)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, e)| e_accao(e))
+            .map(|(lsn, _)| lsn)
+            .collect();
+        assert_eq!(antigo.len(), 1, "o caminho antigo perdia acções");
+        let todas: Vec<Lsn> = runtime
+            .l4_events(None, None, None, 10_000)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, e)| e_accao(e))
+            .map(|(lsn, _)| lsn)
+            .collect();
+        assert_eq!(todas.len(), 20);
+        let novo: Vec<Lsn> = runtime
+            .action_events(None, None, 3)
+            .unwrap()
+            .into_iter()
+            .map(|(lsn, _)| lsn)
+            .collect();
+        assert_eq!(novo, todas[todas.len() - 3..].to_vec());
+
+        for incidente in [None, Some("inc-1"), Some("inc-2")] {
+            for limite in [1usize, 3, 10_000] {
+                for as_of in [None, Some(0), Some(head / 2), Some(head)] {
+                    let mut oraculo: Vec<Lsn> = runtime
+                        .l4_events_com_janela(None, incidente, as_of, 10_000, usize::MAX)
+                        .unwrap()
+                        .into_iter()
+                        .filter(|(_, e)| e_accao(e))
+                        .map(|(lsn, _)| lsn)
+                        .collect();
+                    let corte = oraculo.len().saturating_sub(limite);
+                    oraculo.drain(..corte);
+                    for janela in [1usize, 2, 3, 7, 59, 60, 61, 20_000] {
+                        let obtido: Vec<Lsn> = runtime
+                            .action_events_com_janela(incidente, as_of, limite, janela)
+                            .unwrap()
+                            .into_iter()
+                            .map(|(lsn, _)| lsn)
+                            .collect();
+                        assert_eq!(
+                            obtido, oraculo,
+                            "janela={janela} inc={incidente:?} limite={limite} as_of={as_of:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(runtime.action_events(None, None, 0).is_err());
+        assert!(runtime.action_events(None, None, 10_001).is_err());
+
+        for janela in [1usize, 2, 7, 59, 60, 61, 20_000] {
+            for id in ["p-5", "p-59", "a-56", "a-2"] {
+                let lsn_esperado = lsn_de[id];
+                let (lsn, _) = runtime
+                    .find_action_com_janela(id, janela)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{id} não encontrado com janela={janela}"));
+                assert_eq!(lsn, lsn_esperado, "id={id} janela={janela}");
+            }
+            assert!(runtime
+                .find_action_com_janela("nao-existe", janela)
+                .unwrap()
+                .is_none());
         }
         runtime.shutdown();
     }
