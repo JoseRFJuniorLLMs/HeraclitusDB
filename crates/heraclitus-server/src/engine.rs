@@ -257,6 +257,12 @@ pub struct Engine {
     /// dois nós; fechar esse caso exige um CAS sobre a revisão observada no
     /// aplicador do raft, que não está feito.
     case_locks: Vec<Mutex<()>>,
+    /// Serializa os comandos do Content Hub (reconstruir → validar → apender).
+    /// Um só lock, não shards: o estado do hub é UM agregado global
+    /// (`reconstruir` dobra todos os envelopes em conjunto), não há chave por
+    /// onde repartir. Mesma LIMITAÇÃO declarada de `case_locks` com
+    /// replicação activa (auditoria recursiva 2026-10-03, iteração 1).
+    content_lock: Mutex<()>,
     /// Estado regulatório dobrado uma vez e estendido pela cauda desde então.
     /// Vive aqui porque o `RegulatoryPolicyEngine` nasce e morre em cada RPC.
     pub regulatory_cache: Arc<heraclitus_compliance::RegulatoryStateCache>,
@@ -715,6 +721,7 @@ impl Engine {
             index_gate: std::sync::RwLock::new(()),
             idempotency_locks: (0..IDEMPOTENCY_SHARDS).map(|_| Mutex::new(())).collect(),
             case_locks: (0..IDEMPOTENCY_SHARDS).map(|_| Mutex::new(())).collect(),
+            content_lock: Mutex::new(()),
             regulatory_cache: Arc::new(heraclitus_compliance::RegulatoryStateCache::default()),
             trusted_admin: Arc::new(crate::trusted_admin::TrustedAdminProtocol::new()),
             cold_range_reads: std::sync::atomic::AtomicU64::new(0),
@@ -7436,6 +7443,16 @@ impl Engine {
         envelope
             .validar()
             .map_err(|e| HeraclitusError::Config(e.to_string()))?;
+        // Auditoria recursiva 2026-10-03, iteração 1 — a mesma corrida que
+        // A02 fechou em `case_command`. A validação abaixo só vale se o par
+        // (reconstruir → apender) for atómico: sem o guard, dois comandos
+        // concorrentes validavam contra o MESMO estado, ambos recebiam
+        // `Ok(lsn)`, e `reconstruir` ignorava depois o perdedor (p.ex. um
+        // rollout que chega atrás de uma revogação) — o cliente ouvia
+        // "aplicado" sobre um comando que nunca tem efeito. O guard vive até
+        // depois do `append`; é o único lock tomado aqui e o `append` não é
+        // o idempotente, logo sem aninhamento nem risco de deadlock.
+        let _guarda = self.content_lock.lock().unwrap();
         let mut estado = self.content_state(None)?;
         estado
             .aplicar(envelope)
@@ -7469,5 +7486,123 @@ impl Engine {
             cursor = ultimo.saturating_add(1);
         }
         Ok(heraclitus_content::reconstruir(&envelopes))
+    }
+}
+
+#[cfg(test)]
+mod testes_content_spec0071 {
+    use super::*;
+    use heraclitus_content::{ContentEnvelope, ContentEvent, ContentRef, TenantRollout};
+
+    fn motor() -> (tempfile::TempDir, Engine) {
+        let temp = tempfile::tempdir().unwrap();
+        let config = HeraclitusConfig {
+            data_dir: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        (temp, Engine::open(&config).unwrap())
+    }
+
+    fn artefacto(id: &str) -> ContentRef {
+        ContentRef {
+            content_id: id.into(),
+            version: "1.0.0".into(),
+            digest: "ab".repeat(32),
+        }
+    }
+
+    /// SUCESSO FALSO (auditoria recursiva 2026-10-03, iteração 1).
+    ///
+    /// `content_command` reconstruía o estado, validava e apendia sem secção
+    /// crítica nenhuma — a mesma corrida que A02 fechou nos casos. Um Revoked
+    /// e um RolloutChanged concorrentes viam ambos o artefacto Publicado,
+    /// ambos validavam e ambos entravam no log (Revoke primeiro). O cliente
+    /// do rollout recebia `Ok(lsn)`, mas `reconstruir` descarta o seu comando
+    /// em silêncio (`Revogado`), e o estado AS OF o próprio LSN devolvido
+    /// não mostra o rollout que lhe foi confirmado.
+    ///
+    /// O invariante medido: um comando confirmado com `Ok(lsn)` tem efeito
+    /// no estado AS OF esse LSN. Com os dois serializados, ou o rollout entra
+    /// antes da revogação (e é visível no seu LSN), ou é recusado.
+    #[test]
+    fn rollout_concorrente_com_revogacao_nao_e_confirmado_sem_efeito() {
+        let (_t, engine) = motor();
+
+        // Lastro no log: alarga a janela entre a reconstrução (que varre o
+        // log todo) e o append, para a corrida ser apanhada de forma fiável
+        // no código antigo.
+        for i in 0..2_000 {
+            engine
+                .append(Episode::new(
+                    "lastro",
+                    EventKind::Custom("Lastro".into()),
+                    format!("e{i}").into_bytes(),
+                ))
+                .unwrap();
+        }
+
+        for ronda in 0..25 {
+            let x = artefacto(&format!("conector-{ronda}"));
+            engine
+                .content_command(&ContentEnvelope::novo(
+                    format!("pub-{ronda}"),
+                    "publisher",
+                    "publicar",
+                    ContentEvent::Published {
+                        artefacto: x.clone(),
+                        publisher: "forge".into(),
+                        signing_key: "ed25519:k".into(),
+                    },
+                ))
+                .unwrap();
+
+            let revogar = ContentEnvelope::novo(
+                format!("rev-{ronda}"),
+                "operador-a",
+                "comprometido",
+                ContentEvent::Revoked {
+                    artefacto: x.clone(),
+                    reason: "chave comprometida".into(),
+                },
+            );
+            let activar = ContentEnvelope::novo(
+                format!("roll-{ronda}"),
+                "operador-b",
+                "activar",
+                ContentEvent::RolloutChanged {
+                    artefacto: x.clone(),
+                    tenant_id: "tenant-t".into(),
+                    rollout: TenantRollout::Active,
+                    datasources: Vec::new(),
+                },
+            );
+
+            let porta = std::sync::Barrier::new(2);
+            let (r_rev, r_roll) = std::thread::scope(|s| {
+                let ta = s.spawn(|| {
+                    porta.wait();
+                    engine.content_command(&revogar)
+                });
+                let tb = s.spawn(|| {
+                    porta.wait();
+                    engine.content_command(&activar)
+                });
+                (ta.join().unwrap(), tb.join().unwrap())
+            });
+
+            r_rev.unwrap_or_else(|e| panic!("ronda {ronda}: a revogação nunca falha: {e}"));
+            if let Ok(lsn) = r_roll {
+                let estado = engine.content_state(Some(lsn + 1)).unwrap();
+                assert!(
+                    estado.esta_activo(&x, "tenant-t"),
+                    "ronda {ronda}: rollout confirmado em {lsn} mas sem efeito AS OF esse LSN"
+                );
+            }
+            // Em qualquer ordem, a revogação ganha no fim.
+            assert!(!engine
+                .content_state(None)
+                .unwrap()
+                .esta_activo(&x, "tenant-t"));
+        }
     }
 }
