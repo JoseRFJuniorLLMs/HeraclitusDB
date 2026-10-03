@@ -42,7 +42,9 @@ use arrow_schema::{DataType, Field, Schema};
 use heraclitus_core::{Episode, EventKind, HeraclitusError, Lsn, SegmentId};
 use heraclitus_log::format::{Decoded, SegmentHeader, HEADER_LEN};
 use heraclitus_log::{decode_episode_payload, merkle_root, Log};
-use object_store::{local::LocalFileSystem, path::Path as ObjPath, ObjectStore, ObjectStoreExt};
+use object_store::{
+    local::LocalFileSystem, path::Path as ObjPath, ObjectStore, ObjectStoreExt, PutMode, PutOptions,
+};
 use parquet::arrow::ArrowWriter;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -207,20 +209,16 @@ impl ColdTier {
         let (count, root) = scan_and_root(&bytes)?;
 
         let obj_path = ObjPath::from(format!("cold/{segment_id:020}.hrkl"));
-        self.store
-            .put(&obj_path, bytes.clone().into())
-            .await
-            .map_err(|e| HeraclitusError::Storage(std::io::Error::other(e)))?;
+        self.put_immutable_segment(&obj_path, bytes.clone(), &hex(&root))
+            .await?;
 
         // C2.4 (dual-write): espelho Parquet colunar do segmento — analytics
         // SQL diretas (DataFusion/DuckDB) sem descodificar bincode. O .hrkl
         // continua a ser a verdade (Merkle); o Parquet é derivado e re-gerável.
         let parquet_path = ObjPath::from(format!("cold/{segment_id:020}.parquet"));
         let parquet_bytes = segment_to_parquet(&bytes)?;
-        self.store
-            .put(&parquet_path, parquet_bytes.into())
-            .await
-            .map_err(|e| HeraclitusError::Storage(std::io::Error::other(e)))?;
+        self.put_immutable_parquet(&parquet_path, parquet_bytes)
+            .await?;
 
         Ok(DemotionReceipt {
             segment_id,
@@ -366,10 +364,8 @@ impl ColdTier {
             "cold/{:020}-c{generation}.hrkl",
             receipt.segment_id
         ));
-        self.store
-            .put(&new_path, out.clone().into())
-            .await
-            .map_err(|e| HeraclitusError::Storage(std::io::Error::other(e)))?;
+        self.put_immutable_segment(&new_path, out.clone(), &hex(&root))
+            .await?;
 
         // Espelho Parquet do segmento compactado (mesma regra do demote).
         let parquet_path = ObjPath::from(format!(
@@ -377,10 +373,8 @@ impl ColdTier {
             receipt.segment_id
         ));
         let parquet_bytes = segment_to_parquet(&out)?;
-        self.store
-            .put(&parquet_path, parquet_bytes.into())
-            .await
-            .map_err(|e| HeraclitusError::Storage(std::io::Error::other(e)))?;
+        self.put_immutable_parquet(&parquet_path, parquet_bytes)
+            .await?;
 
         Ok(DemotionReceipt {
             segment_id: receipt.segment_id,
@@ -393,6 +387,78 @@ impl ColdTier {
             compacted_from: Some(receipt.object_path.clone()),
             dropped,
         })
+    }
+
+    async fn put_immutable_segment(
+        &self,
+        path: &ObjPath,
+        bytes: Vec<u8>,
+        expected_root: &str,
+    ) -> Result<(), HeraclitusError> {
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        };
+        match self.store.put_opts(path, bytes.into(), opts).await {
+            Ok(_) => Ok(()),
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let existing = self
+                    .store
+                    .get(path)
+                    .await
+                    .map_err(|e| HeraclitusError::Storage(std::io::Error::other(e)))?
+                    .bytes()
+                    .await
+                    .map_err(|e| HeraclitusError::Storage(std::io::Error::other(e)))?;
+                let (_, root) = scan_and_root(&existing)?;
+                if hex(&root) == expected_root {
+                    Ok(())
+                } else {
+                    Err(HeraclitusError::Corruption {
+                        context: "tier compact_cold".into(),
+                        detail: format!(
+                            "`{path}` já existe com bytes/raiz Merkle diferentes; uma geração compactada não pode ser sobrescrita"
+                        ),
+                    })
+                }
+            }
+            Err(e) => Err(HeraclitusError::Storage(std::io::Error::other(e))),
+        }
+    }
+
+    async fn put_immutable_parquet(
+        &self,
+        path: &ObjPath,
+        bytes: Vec<u8>,
+    ) -> Result<(), HeraclitusError> {
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        };
+        match self.store.put_opts(path, bytes.clone().into(), opts).await {
+            Ok(_) => Ok(()),
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let existing = self
+                    .store
+                    .get(path)
+                    .await
+                    .map_err(|e| HeraclitusError::Storage(std::io::Error::other(e)))?
+                    .bytes()
+                    .await
+                    .map_err(|e| HeraclitusError::Storage(std::io::Error::other(e)))?;
+                if existing.as_ref() == bytes.as_slice() {
+                    Ok(())
+                } else {
+                    Err(HeraclitusError::Corruption {
+                        context: "tier compact_cold parquet".into(),
+                        detail: format!(
+                            "`{path}` já existe com bytes diferentes; um espelho Parquet não pode ser sobrescrito com conteúdo divergente"
+                        ),
+                    })
+                }
+            }
+            Err(e) => Err(HeraclitusError::Storage(std::io::Error::other(e))),
+        }
     }
 
     /// Recall-on-demand (`INCLUDE COLD`): fetch and decode a cold segment's
@@ -961,5 +1027,35 @@ mod tests {
             !tier.verify_receipt(&receipt).await.unwrap(),
             "tampering must be detected by the Merkle proof"
         );
+    }
+
+    #[tokio::test]
+    async fn compact_cold_refuses_to_overwrite_divergent_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = seeded_log(&dir.path().join("log"));
+        let cold_root = dir.path().join("cold");
+        let tier = ColdTier::open_local(&cold_root).unwrap();
+        let seg = log.sealed_segments()[0].clone();
+        let (receipt, _) = tier.demote(&log, seg.id).await.unwrap();
+
+        // 1. Primeira compactação remove eventos pares
+        let (r1, _) = tier
+            .compact_cold(&log, &receipt, |lsn, _| lsn % 2 == 0)
+            .await
+            .unwrap();
+        assert!(tier.verify_receipt(&r1).await.unwrap());
+
+        // 2. Segunda compactação sobre o mesmo recibo de origem, mas com predicado diferente
+        // Tentaria escrever no mesmo ficheiro com bytes e raiz distintos.
+        let r2 = tier
+            .compact_cold(&log, &receipt, |lsn, _| lsn % 2 != 0)
+            .await;
+        assert!(
+            r2.is_err(),
+            "deve recusar sobrescrever a geração compactada existente com dados divergentes"
+        );
+
+        // 3. O recibo anterior r1 continua intacto e válido
+        assert!(tier.verify_receipt(&r1).await.unwrap());
     }
 }
