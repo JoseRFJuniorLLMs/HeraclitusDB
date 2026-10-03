@@ -903,6 +903,35 @@ impl Log {
                 execute_physical_repair(&path, scan.valid_len)?;
             }
 
+            // Contiguidade de LSN ENTRE segmentos (auditoria recursiva
+            // 2026-10-03, iteração 1). O primeiro LSN de cada segmento com
+            // registos tem de ser exactamente o seguinte ao último recuperado
+            // (ou 0 no primeiro): o escritor é único, o `roll_segment` passa
+            // `next_base_lsn` ao segmento seguinte e o `append_replicated`
+            // recusa `lsn > head` — uma lacuna NUNCA é estado legítimo, é
+            // sempre perda de dados. Sem esta verificação, um segmento do meio
+            // que faltasse (restauro ou cópia incompleta) era aceite em
+            // silêncio: o `scan` passava por cima do buraco LSN a LSN e
+            // devolvia `Ok`, o `read` de um LSN abaixo do head devolvia
+            // `Ok(None)` e as views eram reconstruídas sem esses eventos —
+            // precisamente o histórico com buraco que a guarda de bit rot
+            // acima recusa. Segmentos vazios (`min_lsn == None`) não carregam
+            // LSN e por isso não são verificados.
+            let esperado = max_recovered_lsn.map(|l| l + 1).unwrap_or(0);
+            if let Some(primeiro) = scan.min_lsn {
+                if primeiro != esperado {
+                    return Err(HeraclitusError::Corruption {
+                        context: format!("segmento {id} ({})", path.display()),
+                        detail: format!(
+                            "lacuna de LSN entre segmentos: o segmento começa no LSN {primeiro} \
+                             mas o seguinte esperado era {esperado} — falta (ou foi trocado) \
+                             um segmento anterior. Recuso abrir um histórico com buraco. \
+                             Restaure os segmentos em falta de backup ou de uma réplica."
+                        ),
+                    });
+                }
+            }
+
             let mut entries = Vec::with_capacity(scan.locs.len());
             for &(l, off, meta) in &scan.locs {
                 entries.push(LsnEntry {
