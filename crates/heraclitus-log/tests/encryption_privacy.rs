@@ -335,3 +335,107 @@ fn residuos_zmap_orfao_e_tmp_sao_apagados_num_log_cifrado() {
     );
     varrer_log_dir_sem_pii(&log_dir);
 }
+
+/// Auditoria recursiva 2026-10-03, iteração 1: depois de um crypto-shred, um
+/// append posterior do MESMO `agent_id` (titular que regressa — o pseudónimo
+/// HMAC é determinista — ou retry tardio do produtor) cria uma chave nova. O
+/// leitor via então "chave presente que não abre" nos registos antigos e
+/// devolvia `Crypto("Assinatura inválida…")` em vez do tombstone; como o scan
+/// propaga o erro com `?`, todo o replay do log inteiro (views, catch-up,
+/// shred de OUTRO titular) deixava de funcionar. Exercita os dois motores,
+/// que partilham `decrypt_storage_episode_in_place`.
+macro_rules! shred_seguido_de_append_do_mesmo_agente {
+    ($abrir:expr) => {{
+        const TITULAR: &str = "titular:hmac-sha256:regressa";
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("log");
+        let keys_dir = dir.path().join("keys");
+        let keys = KeyStore::open(&keys_dir).unwrap();
+        let abrir = $abrir;
+        let log = abrir(&log_dir, keys.clone());
+
+        let episodio = |texto: &str| {
+            let mut ep = Episode::new(
+                TITULAR,
+                EventKind::Custom("OperationalFact".into()),
+                texto.as_bytes().to_vec(),
+            );
+            ep.attrs.insert("actor_name".into(), "Carlos Silva".into());
+            ep
+        };
+        let antigos: Vec<_> = (0..3)
+            .map(|i| log.append(episodio(&format!("antigo {i}"))).unwrap())
+            .collect();
+        let outro = log
+            .append(Episode::new(
+                "titular:hmac-sha256:outro",
+                EventKind::Custom("OperationalFact".into()),
+                b"de outro titular".to_vec(),
+            ))
+            .unwrap();
+
+        assert!(keys.shred(TITULAR).unwrap());
+        // O titular regressa: a chave nova é criada em silêncio pelo writer.
+        let novo = log.append(episodio("novo depois do shred")).unwrap();
+
+        for &lsn in &antigos {
+            let (_, ep) = log
+                .read(lsn)
+                .expect("registo selado com a chave destruída não é adulteração")
+                .unwrap();
+            assert_eq!(ep.content, SHREDDED);
+            assert_eq!(
+                ep.attrs.get("__heraclitus_shredded").map(String::as_str),
+                Some("true")
+            );
+            assert!(!ep.attrs.contains_key("actor_name"));
+        }
+        let (_, ep_novo) = log.read(novo).unwrap().unwrap();
+        assert_eq!(ep_novo.content, b"novo depois do shred");
+        assert_eq!(ep_novo.attrs["actor_name"], "Carlos Silva");
+
+        // O scan do log inteiro — base de views.rebuild, catch-up e do shred
+        // de outros titulares — tem de atravessar os registos antigos.
+        let todos = log
+            .scan(0, u64::MAX)
+            .expect("o scan do log inteiro não pode abortar nos registos shredded");
+        assert_eq!(todos.len(), 5);
+        let conteudo = |lsn| {
+            todos
+                .iter()
+                .find(|(l, _)| *l == lsn)
+                .map(|(_, e)| e.content.clone())
+                .unwrap()
+        };
+        assert_eq!(conteudo(antigos[0]), SHREDDED);
+        assert_eq!(conteudo(outro), b"de outro titular");
+        assert_eq!(conteudo(novo), b"novo depois do shred");
+
+        // E o mesmo depois de reiniciar (cache do keystore vazia).
+        drop(log);
+        let reaberto = abrir(&log_dir, KeyStore::open(&keys_dir).unwrap());
+        let (_, ep) = reaberto.read(antigos[1]).unwrap().unwrap();
+        assert_eq!(ep.content, SHREDDED);
+        let (_, ep_novo) = reaberto.read(novo).unwrap().unwrap();
+        assert_eq!(ep_novo.content, b"novo depois do shred");
+        assert_eq!(reaberto.scan(0, u64::MAX).unwrap().len(), 5);
+    }};
+}
+
+#[test]
+fn append_do_mesmo_agente_depois_do_shred_nao_torna_os_antigos_em_adulteracao() {
+    shred_seguido_de_append_do_mesmo_agente!(
+        |dir: &std::path::Path, keys: std::sync::Arc<KeyStore>| {
+            Log::open_with_keystore(dir, 1 << 20, FsyncPolicy::Always, Some(keys)).unwrap()
+        }
+    );
+}
+
+#[test]
+fn append_do_mesmo_agente_depois_do_shred_nao_torna_os_antigos_em_adulteracao_v6() {
+    shred_seguido_de_append_do_mesmo_agente!(
+        |dir: &std::path::Path, keys: std::sync::Arc<KeyStore>| {
+            Log::open_v6_with_keystore(dir, 1 << 20, FsyncPolicy::Always, Some(keys)).unwrap()
+        }
+    );
+}

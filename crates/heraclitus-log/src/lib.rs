@@ -533,6 +533,16 @@ pub fn encode_storage_payload_for_version(
     }
 }
 
+/// Substitui o episódio pelo tombstone de crypto-shredding: conteúdo
+/// [`heraclitus_crypto::SHREDDED`], sem embedding, só os atributos técnicos
+/// públicos e a marca [`SHREDDED_ATTR`].
+fn apply_shredded_tombstone(ep: &mut Episode) {
+    ep.content = heraclitus_crypto::SHREDDED.to_vec();
+    ep.embedding = None;
+    ep.attrs.retain(|k, _| is_public_technical_attr(k));
+    ep.attrs.insert(SHREDDED_ATTR.into(), "true".into());
+}
+
 /// Reverte a cifra de um `Episode` já reconstruído do payload persistido.
 /// Mantida fora de [`Log`] para que o reader v6 siga exactamente a mesma
 /// semântica de crypto-shredding do reader legado.
@@ -551,22 +561,33 @@ pub(crate) fn decrypt_storage_episode_in_place(
 
     let Some(key) = ks.get(&ep.agent_id) else {
         // Ausência é a semântica normal de crypto-shredding, não corrupção.
-        ep.content = heraclitus_crypto::SHREDDED.to_vec();
-        ep.embedding = None;
-        ep.attrs.retain(|k, _| is_public_technical_attr(k));
-        ep.attrs.insert(SHREDDED_ATTR.into(), "true".into());
+        apply_shredded_tombstone(ep);
         return Ok(());
     };
 
+    // Auditoria recursiva 2026-10-03, iteração 1: depois de um shred, um
+    // append posterior do mesmo `agent_id` cria uma chave nova, e o blob
+    // selado não identifica a chave que o selou. Uma falha AEAD com a chave
+    // presente só é adulteração se o agente NUNCA foi shredded; se foi, o
+    // registo foi selado com a chave destruída e o resultado correcto é o
+    // tombstone — sem isto, todo o scan do log inteiro abortava em `Crypto`.
+    // Custo aceite: para um agente já shredded, um registo da geração nova
+    // adulterado também sai como tombstone (fica ilegível na mesma, e a
+    // integridade física continua guardada pelos checksums dos frames).
     if encrypted_content {
-        let opened = heraclitus_crypto::open(&key, &ep.content, ep.agent_id.as_bytes())
-            .ok_or_else(|| {
-                HeraclitusError::Crypto(format!(
+        match heraclitus_crypto::open(&key, &ep.content, ep.agent_id.as_bytes()) {
+            Some(opened) => ep.content = opened,
+            None if ks.was_shredded(&ep.agent_id) => {
+                apply_shredded_tombstone(ep);
+                return Ok(());
+            }
+            None => {
+                return Err(HeraclitusError::Crypto(format!(
                     "Assinatura inválida detectada na cifra do agente: {}",
                     ep.agent_id
-                ))
-            })?;
-        ep.content = opened;
+                )))
+            }
+        }
     }
 
     if let Some(encoded_hex) = encrypted_fields {
@@ -576,13 +597,19 @@ pub(crate) fn decrypt_storage_episode_in_place(
                 ep.agent_id
             ))
         })?;
-        let opened =
-            heraclitus_crypto::open(&key, &sealed, &fields_aad(&ep.agent_id)).ok_or_else(|| {
-                HeraclitusError::Crypto(format!(
+        let opened = match heraclitus_crypto::open(&key, &sealed, &fields_aad(&ep.agent_id)) {
+            Some(opened) => opened,
+            None if ks.was_shredded(&ep.agent_id) => {
+                apply_shredded_tombstone(ep);
+                return Ok(());
+            }
+            None => {
+                return Err(HeraclitusError::Crypto(format!(
                     "Assinatura inválida no envelope de atributos do agente: {}",
                     ep.agent_id
-                ))
-            })?;
+                )))
+            }
+        };
         let (sensitive, _): (SensitiveFields, usize) =
             bincode::serde::decode_from_slice(&opened, BINCODE_CFG)
                 .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;

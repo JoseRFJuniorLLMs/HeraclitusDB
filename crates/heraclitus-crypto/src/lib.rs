@@ -172,6 +172,30 @@ impl KeyStore {
         self.dir.join(format!("{hex}.key"))
     }
 
+    /// Marca persistente de "este agente já foi crypto-shredded".
+    ///
+    /// Extensão diferente de `.key` de propósito: o `agent_count` conta só
+    /// chaves vivas e a marca nunca pode ser lida como chave.
+    fn shred_marker_path(&self, agent_id: &str) -> PathBuf {
+        let hex: String = agent_id.bytes().map(|b| format!("{b:02x}")).collect();
+        self.dir.join(format!("{hex}.shredded"))
+    }
+
+    /// `true` se alguma chave deste agente já foi destruída por [`Self::shred`].
+    ///
+    /// Auditoria recursiva 2026-10-03, iteração 1: depois de um shred, o
+    /// append seguinte do MESMO `agent_id` (titular que regressa — o
+    /// pseudónimo HMAC é determinista —, ou um retry tardio do produtor) cria
+    /// uma chave nova K2 via [`Self::get_or_create`]. O blob selado não leva
+    /// identificador de chave, portanto o leitor deixava de ver "sem chave"
+    /// (= shredded) e passava a ver "chave presente que não abre" (= violação
+    /// de integridade): os registos antigos, legitimamente apagados, viravam
+    /// erro `Crypto` e qualquer scan do log inteiro abortava. Esta marca
+    /// sobrevive à chave nova e deixa o leitor distinguir os dois casos.
+    pub fn was_shredded(&self, agent_id: &str) -> bool {
+        self.shred_marker_path(agent_id).exists()
+    }
+
     fn read_key(path: &Path) -> Option<[u8; 32]> {
         let bytes = std::fs::read(path).ok()?;
         if bytes.len() != 32 {
@@ -326,6 +350,19 @@ impl KeyStore {
         if !path.exists() {
             return Ok(false);
         }
+        // Marca persistente ANTES de destruir a chave (ver `was_shredded`).
+        // Por esta ordem, um crash a meio deixa "marca + chave ainda viva" —
+        // inofensivo: os dados continuam a abrir com a chave real e o shred
+        // pode ser repetido — e nunca "chave destruída sem marca", que era o
+        // estado que fazia uma chave nova posterior parecer adulteração.
+        // Falhar aqui aborta o shred sem tocar na chave.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.shred_marker_path(agent_id))?
+            .sync_all()?;
+        sync_dir(&self.dir)?;
         // Sobrescrever antes de remover, para os bytes da chave não ficarem no
         // disco. O `sync_all` a seguir não é zelo: sem ele os zeros ficam em
         // buffers e o bloco original pode sobreviver à falha.
@@ -531,6 +568,33 @@ mod testes_shred {
         let nova = ks.get_or_create("ana").unwrap();
         assert_ne!(nova, antiga, "a chave nova nao pode ser a apagada");
         assert!(nova.iter().any(|&b| b != 0));
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 1: o shred deixa uma marca
+    /// persistente que sobrevive à chave nova do mesmo agente e à reabertura
+    /// do keystore — é o que deixa o leitor do log devolver o tombstone em vez
+    /// de reportar adulteração nos registos selados com a chave destruída.
+    #[test]
+    fn shred_deixa_marca_persistente_que_sobrevive_a_chave_nova() {
+        let (d, ks) = loja();
+        ks.get_or_create("ana").unwrap();
+        ks.get_or_create("rui").unwrap();
+        assert!(!ks.was_shredded("ana"), "sem shred nao ha marca");
+        assert!(ks.shred("ana").unwrap());
+        assert!(ks.was_shredded("ana"));
+        assert!(!ks.was_shredded("rui"), "a marca e por agente");
+        // Chave nova do mesmo agente: a marca NAO desaparece.
+        ks.get_or_create("ana").unwrap();
+        assert!(ks.was_shredded("ana"));
+        // A marca nao conta como chave viva.
+        assert_eq!(ks.agent_count(), 2);
+        // E e persistente: outra instancia sobre o mesmo directorio ve-a.
+        let reaberto = KeyStore::open(d.path()).unwrap();
+        assert!(reaberto.was_shredded("ana"));
+        assert!(!reaberto.was_shredded("rui"));
+        // Shred de um agente sem chave nao inventa marca.
+        assert!(!ks.shred("ninguem").unwrap());
+        assert!(!ks.was_shredded("ninguem"));
     }
 
     /// Stress: leitores concorrentes durante um shred nunca veem zeros nem a
