@@ -128,15 +128,23 @@ impl RaftNetworkFactory<TypeConfig> for GrpcNetworkFactory {
             target,
             addr: node.addr.clone(),
             tls: self.tls.clone(),
+            canal: None,
         }
     }
 }
 
-/// Uma ligação lógica a um nó; liga por pedido (openraft chama em série).
+/// Uma ligação lógica a um nó (openraft chama em série, `&mut self`).
+///
+/// falta_fazer.md:92, conferido em 2026-10-02: o canal era construído de raiz
+/// em CADA RPC — `Endpoint` novo, ligação TCP nova e, com mTLS, handshake TLS
+/// novo por cada heartbeat e cada lote de append. O canal tonic já gere
+/// reconexão por si; fica em cache e só é largado depois de um erro, para o
+/// RPC seguinte voltar a resolver e ligar.
 pub struct GrpcConnection {
     target: NodeId,
     addr: String,
     tls: Option<GrpcTlsConfig>,
+    canal: Option<RaftTransportClient<tonic::transport::Channel>>,
 }
 
 /// Snapshots/lotes de raft podem exceder o default de 4MB do tonic; o transporte
@@ -145,7 +153,12 @@ pub struct GrpcConnection {
 const MAX_RAFT_MSG: usize = 256 * 1024 * 1024;
 
 impl GrpcConnection {
-    async fn client(&self) -> Result<RaftTransportClient<tonic::transport::Channel>, Unreachable> {
+    async fn client(
+        &mut self,
+    ) -> Result<RaftTransportClient<tonic::transport::Channel>, Unreachable> {
+        if let Some(canal) = &self.canal {
+            return Ok(canal.clone());
+        }
         let scheme = if self.tls.is_some() { "https" } else { "http" };
         let mut endpoint =
             tonic::transport::Endpoint::from_shared(format!("{scheme}://{}", self.addr))
@@ -170,9 +183,40 @@ impl GrpcConnection {
                 .map_err(|e| Unreachable::new(&e))?;
         }
         let channel = endpoint.connect().await.map_err(|e| Unreachable::new(&e))?;
-        let c = RaftTransportClient::new(channel);
-        Ok(c.max_decoding_message_size(MAX_RAFT_MSG)
-            .max_encoding_message_size(MAX_RAFT_MSG))
+        let c = RaftTransportClient::new(channel)
+            .max_decoding_message_size(MAX_RAFT_MSG)
+            .max_encoding_message_size(MAX_RAFT_MSG);
+        self.canal = Some(c.clone());
+        Ok(c)
+    }
+
+    /// Um RPC com prazo `ttl` (o `hard_ttl` do openraft), cobrindo também a
+    /// ligação. falta_fazer.md:314: o `RPCOption` era ignorado e não havia
+    /// timeout nenhum — um par que aceita a ligação e deixa de responder
+    /// prendia o replicador desse par para sempre. Expira como `Unreachable`,
+    /// para o openraft recuar e tentar de novo.
+    async fn rpc<F, Fut>(&mut self, ttl: std::time::Duration, chamada: F) -> Result<Vec<u8>, Unreachable>
+    where
+        F: FnOnce(RaftTransportClient<tonic::transport::Channel>) -> Fut,
+        Fut: std::future::Future<Output = Result<tonic::Response<RaftEnvelope>, tonic::Status>>,
+    {
+        let resultado = tokio::time::timeout(ttl, async {
+            let client = self.client().await?;
+            chamada(client)
+                .await
+                .map(|r| r.into_inner().payload)
+                .map_err(|s| Unreachable::new(&s))
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(Unreachable::new(&std::io::Error::other(format!(
+                "raft RPC sem resposta em {ttl:?}"
+            ))))
+        });
+        if resultado.is_err() {
+            self.canal = None;
+        }
+        resultado
     }
 }
 
@@ -180,54 +224,55 @@ impl RaftNetwork<TypeConfig> for GrpcConnection {
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
         let payload = encode(&rpc).map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
-        let mut client = self.client().await.map_err(RPCError::Unreachable)?;
-        let env = client
-            .append_entries(Request::new(RaftEnvelope { payload }))
+        let env = self
+            .rpc(option.hard_ttl(), move |mut c| async move {
+                c.append_entries(Request::new(RaftEnvelope { payload })).await
+            })
             .await
-            .map_err(|s| RPCError::Unreachable(Unreachable::new(&s)))?
-            .into_inner();
+            .map_err(RPCError::Unreachable)?;
         let resp: Result<AppendEntriesResponse<NodeId>, RaftError<NodeId>> =
-            decode(&env.payload).map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
+            decode(&env).map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
         resp.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
     }
 
     async fn vote(
         &mut self,
         rpc: VoteRequest<NodeId>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
         let payload = encode(&rpc).map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
-        let mut client = self.client().await.map_err(RPCError::Unreachable)?;
-        let env = client
-            .vote(Request::new(RaftEnvelope { payload }))
+        let env = self
+            .rpc(option.hard_ttl(), move |mut c| async move {
+                c.vote(Request::new(RaftEnvelope { payload })).await
+            })
             .await
-            .map_err(|s| RPCError::Unreachable(Unreachable::new(&s)))?
-            .into_inner();
+            .map_err(RPCError::Unreachable)?;
         let resp: Result<VoteResponse<NodeId>, RaftError<NodeId>> =
-            decode(&env.payload).map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
+            decode(&env).map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
         resp.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
     }
 
     async fn install_snapshot(
         &mut self,
         rpc: InstallSnapshotRequest<TypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
     > {
         let payload = encode(&rpc).map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
-        let mut client = self.client().await.map_err(RPCError::Unreachable)?;
-        let env = client
-            .install_snapshot(Request::new(RaftEnvelope { payload }))
+        let env = self
+            .rpc(option.hard_ttl(), move |mut c| async move {
+                c.install_snapshot(Request::new(RaftEnvelope { payload }))
+                    .await
+            })
             .await
-            .map_err(|s| RPCError::Unreachable(Unreachable::new(&s)))?
-            .into_inner();
+            .map_err(RPCError::Unreachable)?;
         let resp: Result<InstallSnapshotResponse<NodeId>, RaftError<NodeId, InstallSnapshotError>> =
-            decode(&env.payload).map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
+            decode(&env).map_err(|e| RPCError::Unreachable(Unreachable::new(&e)))?;
         resp.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
     }
 }

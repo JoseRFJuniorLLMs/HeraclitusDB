@@ -182,7 +182,26 @@ pub struct TcpConnection {
 }
 
 impl TcpConnection {
-    async fn call(&self, rpc: RaftRpc) -> Result<RaftRpcResp, Unreachable> {
+    /// Um RPC com o prazo `ttl` (o `hard_ttl` que o openraft calcula a partir
+    /// do heartbeat/eleição).
+    ///
+    /// falta_fazer.md:314, conferido em 2026-10-02: o `RPCOption` era ignorado
+    /// e não havia timeout NENHUM de ligação nem de leitura. Um par que aceita
+    /// a ligação e deixa de responder (processo parado, partição a meio)
+    /// prendia o replicador desse par para sempre — o openraft só reage a um
+    /// erro, e nunca chegava nenhum. Expirar como `Unreachable` faz o openraft
+    /// recuar e tentar de novo, que é o tratamento certo para um par mudo.
+    async fn call(
+        &self,
+        rpc: RaftRpc,
+        ttl: std::time::Duration,
+    ) -> Result<RaftRpcResp, Unreachable> {
+        tokio::time::timeout(ttl, self.call_sem_prazo(rpc))
+            .await
+            .map_err(|_| Unreachable::new(&io_err(format!("raft RPC sem resposta em {ttl:?}"))))?
+    }
+
+    async fn call_sem_prazo(&self, rpc: RaftRpc) -> Result<RaftRpcResp, Unreachable> {
         let mut sock = TcpStream::connect(&self.addr)
             .await
             .map_err(|e| Unreachable::new(&e))?;
@@ -209,10 +228,10 @@ impl RaftNetwork<TypeConfig> for TcpConnection {
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<TypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
         match self
-            .call(RaftRpc::AppendEntries(rpc))
+            .call(RaftRpc::AppendEntries(rpc), option.hard_ttl())
             .await
             .map_err(RPCError::Unreachable)?
         {
@@ -229,10 +248,10 @@ impl RaftNetwork<TypeConfig> for TcpConnection {
     async fn vote(
         &mut self,
         rpc: VoteRequest<NodeId>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
         match self
-            .call(RaftRpc::Vote(rpc))
+            .call(RaftRpc::Vote(rpc), option.hard_ttl())
             .await
             .map_err(RPCError::Unreachable)?
         {
@@ -249,13 +268,13 @@ impl RaftNetwork<TypeConfig> for TcpConnection {
     async fn install_snapshot(
         &mut self,
         rpc: InstallSnapshotRequest<TypeConfig>,
-        _option: RPCOption,
+        option: RPCOption,
     ) -> Result<
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
     > {
         match self
-            .call(RaftRpc::InstallSnapshot(rpc))
+            .call(RaftRpc::InstallSnapshot(rpc), option.hard_ttl())
             .await
             .map_err(RPCError::Unreachable)?
         {
@@ -345,6 +364,36 @@ mod tests {
             EventKind::Observation,
             format!("net-{i}").into_bytes(),
         )
+    }
+
+    /// falta_fazer.md:314: o `RPCOption` era ignorado e não havia timeout
+    /// nenhum. Um par que aceita a ligação e nunca responde prendia o RPC para
+    /// sempre (e com ele o replicador desse par). Agora expira no `hard_ttl`
+    /// como `Unreachable`.
+    #[tokio::test]
+    async fn rpc_a_um_par_mudo_expira_no_hard_ttl() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let mudo = tokio::spawn(async move {
+            // Aceita e segura a ligação sem ler nem escrever nada.
+            let (_sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let mut conn = TcpConnection { target: 2, addr };
+        let pedido = VoteRequest::new(openraft::Vote::new(1, 1), None);
+        let inicio = std::time::Instant::now();
+        let resultado = tokio::time::timeout(
+            Duration::from_secs(10),
+            conn.vote(pedido, RPCOption::new(Duration::from_millis(200))),
+        )
+        .await
+        .expect("o RPC tem de expirar sozinho, não ficar pendurado");
+        assert!(
+            matches!(resultado, Err(RPCError::Unreachable(_))),
+            "{resultado:?}"
+        );
+        assert!(inicio.elapsed() < Duration::from_secs(5));
+        mudo.abort();
     }
 
     /// O teto de frame protege contra um comprimento gigante vindo do fio: em vez

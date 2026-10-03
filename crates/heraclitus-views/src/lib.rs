@@ -20,10 +20,51 @@ use std::path::{Path, PathBuf};
 /// checkpoint a view reconstrói-se do LSN 0; com ele, o boot replaya só a
 /// cauda `(watermark, head]` em vez do log inteiro (a lição operacional da
 /// carga massiva de 2026-07-02: replay total não escala).
+///
+/// # Formato (v1, conferência de 2026-10-02)
+///
+/// `MAGIC (4) | versão u16 LE | CRC-32 u32 LE | comprimento do corpo u64 LE |
+/// corpo bincode`.
+///
+/// Até aqui o ficheiro era bincode cru: sem magic, sem versão, sem CRC, e lido
+/// com `fs::read` inteiro antes de descodificar. Duas consequências:
+/// - um bit trocado dentro de uma posting continuava a descodificar e a view
+///   servia resultados errados com aspecto válido (o índice de atributos já
+///   tinha CRC desde a R89; as outras views não);
+/// - o ficheiro inteiro e o estado descodificado coexistiam em RAM no
+///   arranque — o pico duplicava (o `text.ckpt` chegou a 4,4 GB).
+///
+/// Agora o CRC é verificado numa passagem em streaming ANTES de descodificar
+/// (um corpo corrompido podia trazer um comprimento de `Vec` absurdo e abortar
+/// o processo na alocação), e a descodificação também é em streaming. Ficheiros
+/// do formato antigo (sem magic) continuam a ler-se, em streaming, e são
+/// regravados no formato novo no checkpoint seguinte.
 pub mod ckpt {
     use super::HeraclitusError;
-    use std::io::Write as _;
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::Path;
+
+    const MAGIC: &[u8; 4] = b"HRKV";
+    const VERSAO: u16 = 1;
+    const CABECALHO: usize = 4 + 2 + 4 + 8;
+
+    struct Contador<W> {
+        inner: W,
+        crc: crc32fast::Hasher,
+        bytes: u64,
+    }
+
+    impl<W: Write> Write for Contador<W> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let n = self.inner.write(buf)?;
+            self.crc.update(&buf[..n]);
+            self.bytes += n as u64;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
 
     pub fn save<T: serde::Serialize>(
         dir: &Path,
@@ -32,32 +73,123 @@ pub mod ckpt {
     ) -> Result<(), HeraclitusError> {
         let tmp = dir.join(format!("{name}.ckpt.tmp"));
         {
-            let mut f = std::io::BufWriter::with_capacity(64 << 10, std::fs::File::create(&tmp)?);
-            bincode::serde::encode_into_std_write(value, &mut f, bincode::config::standard())
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&[0u8; CABECALHO])?;
+            let mut w = Contador {
+                inner: std::io::BufWriter::with_capacity(64 << 10, f),
+                crc: crc32fast::Hasher::new(),
+                bytes: 0,
+            };
+            bincode::serde::encode_into_std_write(value, &mut w, bincode::config::standard())
                 .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
-            f.flush()?;
-            f.get_ref().sync_all()?;
+            w.flush()?;
+            let (crc, bytes) = (w.crc.finalize(), w.bytes);
+            let mut f = w
+                .inner
+                .into_inner()
+                .map_err(|e| HeraclitusError::from(e.into_error()))?;
+            let mut cabeca = [0u8; CABECALHO];
+            cabeca[..4].copy_from_slice(MAGIC);
+            cabeca[4..6].copy_from_slice(&VERSAO.to_le_bytes());
+            cabeca[6..10].copy_from_slice(&crc.to_le_bytes());
+            cabeca[10..18].copy_from_slice(&bytes.to_le_bytes());
+            f.seek(SeekFrom::Start(0))?;
+            f.write_all(&cabeca)?;
+            f.sync_all()?;
         }
         std::fs::rename(&tmp, dir.join(format!("{name}.ckpt")))?;
+        // O rename só é durável depois do fsync do directório (POSIX). No
+        // Windows não há fsync de directório: o NTFS regista o rename no seu
+        // próprio journal de metadados.
+        #[cfg(unix)]
+        std::fs::File::open(dir)?.sync_all()?;
         Ok(())
     }
 
-    /// `Ok(None)` = sem checkpoint OU checkpoint ilegível (formato antigo /
-    /// corrompido) — a view nasce vazia e o registry força replay desde 0.
-    /// Um snapshot ilegível NUNCA pode impedir o boot: o estado é derivado e
-    /// o log é a verdade; degradar para rebuild é correto por construção.
+    /// `Ok(None)` = sem checkpoint OU checkpoint ilegível (formato
+    /// desconhecido / corrompido / CRC errado) — a view nasce vazia e o
+    /// registry força replay desde 0. Um snapshot ilegível NUNCA pode impedir o
+    /// boot: o estado é derivado e o log é a verdade; degradar para rebuild é
+    /// correto por construção. Um ficheiro que EXISTE e é recusado deixa um
+    /// aviso — trocar um arranque de cauda por um rebuild integral não pode
+    /// ser silencioso.
     pub fn load<T: serde::de::DeserializeOwned>(
         dir: &Path,
         name: &str,
     ) -> Result<Option<T>, HeraclitusError> {
-        let bytes = match std::fs::read(dir.join(format!("{name}.ckpt"))) {
-            Ok(b) => b,
-            Err(_) => return Ok(None),
+        let path = dir.join(format!("{name}.ckpt"));
+        let mut f = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), erro = %e,
+                    "checkpoint existe mas não se abriu; a view será reconstruída desde o LSN 0");
+                return Ok(None);
+            }
         };
-        match bincode::serde::decode_from_slice::<T, _>(&bytes, bincode::config::standard()) {
-            Ok((value, _)) => Ok(Some(value)),
-            Err(_) => Ok(None),
+        match ler(&mut f) {
+            Ok(v) => Ok(Some(v)),
+            Err(motivo) => {
+                tracing::warn!(path = %path.display(), motivo = %motivo,
+                    "checkpoint RECUSADO; a view será reconstruída desde o LSN 0 \
+                     (arranque mais lento, sem perda de dados)");
+                Ok(None)
+            }
         }
+    }
+
+    fn ler<T: serde::de::DeserializeOwned>(f: &mut std::fs::File) -> Result<T, String> {
+        let tamanho = f.metadata().map_err(|e| e.to_string())?.len();
+        let mut cabeca = [0u8; CABECALHO];
+        let tem_cabeca = tamanho >= CABECALHO as u64
+            && f.read_exact(&mut cabeca).is_ok()
+            && &cabeca[..4] == MAGIC;
+        if !tem_cabeca {
+            // Formato antigo: bincode cru desde o byte 0.
+            f.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+            let mut r = std::io::BufReader::with_capacity(1 << 20, &mut *f);
+            return bincode::serde::decode_from_std_read(&mut r, bincode::config::standard())
+                .map_err(|e| format!("formato antigo ilegível: {e}"));
+        }
+        let versao = u16::from_le_bytes([cabeca[4], cabeca[5]]);
+        if versao != VERSAO {
+            return Err(format!("versão {versao} desconhecida"));
+        }
+        let crc = u32::from_le_bytes([cabeca[6], cabeca[7], cabeca[8], cabeca[9]]);
+        let mut comprimento = [0u8; 8];
+        comprimento.copy_from_slice(&cabeca[10..18]);
+        let corpo = u64::from_le_bytes(comprimento);
+        if tamanho != CABECALHO as u64 + corpo {
+            return Err(format!(
+                "comprimento {tamanho} não bate com o cabeçalho ({CABECALHO} + {corpo})"
+            ));
+        }
+        // 1.ª passagem: CRC em streaming, antes de qualquer descodificação.
+        let mut hasher = crc32fast::Hasher::new();
+        let mut buf = vec![0u8; 1 << 20];
+        let mut r = (&mut *f).take(corpo);
+        loop {
+            let n = r.read(&mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+        }
+        drop(buf);
+        if hasher.finalize() != crc {
+            return Err("CRC do corpo não confere".into());
+        }
+        // 2.ª passagem: descodifica em streaming e exige consumir o corpo todo.
+        f.seek(SeekFrom::Start(CABECALHO as u64))
+            .map_err(|e| e.to_string())?;
+        let mut r = std::io::BufReader::with_capacity(1 << 20, (&mut *f).take(corpo));
+        let valor = bincode::serde::decode_from_std_read(&mut r, bincode::config::standard())
+            .map_err(|e| format!("corpo não descodifica: {e}"))?;
+        let mut resto = [0u8; 1];
+        if r.read(&mut resto).map_err(|e| e.to_string())? != 0 {
+            return Err("bytes a mais depois do corpo".into());
+        }
+        Ok(valor)
     }
 }
 

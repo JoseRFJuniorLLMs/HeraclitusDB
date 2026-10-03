@@ -688,14 +688,13 @@ impl VectorIndex {
     /// view fica vazia e o registry força replay desde 0. Um checkpoint
     /// ilegível NUNCA pode impedir o boot: o estado é derivado, o log é a verdade.
     pub fn load_checkpoint(&mut self, dir: &Path) -> Result<bool, HeraclitusError> {
-        let bytes = match std::fs::read(dir.join(VECTOR_CKPT_FILE)) {
-            Ok(b) => b,
-            Err(_) => return Ok(false),
-        };
-        let Ok((snap, _)) = bincode::serde::decode_from_slice::<VectorSnapshot, _>(
-            &bytes,
-            bincode::config::standard(),
-        ) else {
+        // O mesmo leitor das outras views (cabeçalho + CRC verificado antes de
+        // descodificar, descodificação em streaming, compatível com o formato
+        // antigo). Antes era `fs::read` do ficheiro inteiro + decode: o ficheiro
+        // e o índice coexistiam em RAM no arranque, e sem CRC um bit trocado
+        // descodificava em silêncio.
+        debug_assert_eq!(VECTOR_CKPT_FILE, "vector.ckpt");
+        let Some(snap) = heraclitus_views::ckpt::load::<VectorSnapshot>(dir, "vector")? else {
             return Ok(false);
         };
         // Invariante estrutural do HNSW: todo nó tem `level + 1` camadas de
@@ -809,6 +808,19 @@ impl View for VectorIndex {
 
     fn reset(&mut self) {
         *self = VectorIndex::new(self.metric.clone());
+    }
+}
+
+/// Corpo bincode de um `vector.ckpt`, sem o cabeçalho de `heraclitus_views::ckpt`
+/// (magic `HRKV` + versão + CRC + comprimento = 18 bytes). Os testes de formato
+/// raciocinam sobre o stream bincode; o cabeçalho é testado em heraclitus-views.
+#[cfg(test)]
+fn corpo_do_checkpoint(path: &Path) -> Vec<u8> {
+    let bytes = std::fs::read(path).unwrap();
+    if bytes.starts_with(b"HRKV") {
+        bytes[18..].to_vec()
+    } else {
+        bytes
     }
 }
 
@@ -1148,7 +1160,7 @@ mod tests {
         }
         idx.save_checkpoint(dir.path()).unwrap();
         let path = dir.path().join(VECTOR_CKPT_FILE);
-        let bytes = std::fs::read(&path).unwrap();
+        let bytes = corpo_do_checkpoint(&path);
 
         // Um leitor antigo continua a descodificar exactamente todo o ficheiro:
         // `prepared` nao foi acrescentado ao stream bincode.
@@ -1672,7 +1684,7 @@ mod testes_prepared_query {
         idx.save_checkpoint(dir.path()).unwrap();
 
         // Decodificar, envenenar um id de vizinho, re-escrever.
-        let bytes = std::fs::read(dir.path().join(VECTOR_CKPT_FILE)).unwrap();
+        let bytes = corpo_do_checkpoint(&dir.path().join(VECTOR_CKPT_FILE));
         let (mut snap, _): (VectorSnapshot, _) =
             bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
         // Um vizinho que aponta muito para lá do fim.
@@ -1721,12 +1733,14 @@ mod testes_coerencia_do_checkpoint {
         dir: &Path,
         envenenar: impl FnOnce(&mut VectorSnapshot),
     ) -> bool {
-        let bytes = std::fs::read(dir.join(VECTOR_CKPT_FILE)).unwrap();
-        let (mut snap, _): (VectorSnapshot, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        // Envenena o CONTEÚDO com um CRC válido (regravando pelo mesmo
+        // `ckpt::save`): o que se testa aqui é a validação estrutural depois de
+        // descodificar, não o CRC — esse é testado em heraclitus-views.
+        let mut snap = heraclitus_views::ckpt::load::<VectorSnapshot>(dir, "vector")
+            .unwrap()
+            .unwrap();
         envenenar(&mut snap);
-        let envenenado = bincode::serde::encode_to_vec(&snap, bincode::config::standard()).unwrap();
-        std::fs::write(dir.join(VECTOR_CKPT_FILE), &envenenado).unwrap();
+        heraclitus_views::ckpt::save(dir, "vector", &snap).unwrap();
         let mut fresco = VectorIndex::new(ProductMetric::default());
         fresco.restore(dir).unwrap()
     }
