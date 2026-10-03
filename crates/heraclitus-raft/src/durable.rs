@@ -202,32 +202,38 @@ impl FileRaftLog {
             let covered_by_purge = last_purged
                 .is_some_and(|purged| purged.index > committed.index || purged == committed);
             if !covered_by_purge {
-                let start = last_purged.map_or_else(
-                    || {
-                        entries
-                            .first_key_value()
-                            .map_or(committed.index, |(&index, _)| index)
-                    },
-                    |purged| purged.index.saturating_add(1),
-                );
-                let mut expected = start;
-                let mut contiguous = start <= committed.index;
-                if contiguous {
-                    for (&index, _) in entries.range(start..=committed.index) {
-                        if index != expected {
-                            contiguous = false;
-                            break;
+                if committed.index == 0 && entries.is_empty() && last_purged.is_none() {
+                    // Estado inicial antes do primeiro append.
+                } else {
+                    let start = match last_purged {
+                        Some(purged) => purged.index.saturating_add(1),
+                        None => {
+                            if entries.contains_key(&0) {
+                                0
+                            } else {
+                                1
+                            }
                         }
-                        expected = expected.saturating_add(1);
+                    };
+                    let mut expected = start;
+                    let mut contiguous = start <= committed.index;
+                    if contiguous {
+                        for (&index, _) in entries.range(start..=committed.index) {
+                            if index != expected {
+                                contiguous = false;
+                                break;
+                            }
+                            expected = expected.saturating_add(1);
+                        }
                     }
-                }
-                if !contiguous
-                    || entries.get(&committed.index).map(|e| e.log_id) != Some(committed)
-                    || expected != committed.index.saturating_add(1)
-                {
-                    return Err(StorageError::from(StorageIOError::read_logs(io_err(
-                        "WAL raft does not cover durable committed frontier; refusing to truncate",
-                    ))));
+                    if !contiguous
+                        || entries.get(&committed.index).map(|e| e.log_id) != Some(committed)
+                        || expected != committed.index.saturating_add(1)
+                    {
+                        return Err(StorageError::from(StorageIOError::read_logs(io_err(
+                            "WAL raft does not cover durable committed frontier; refusing to truncate",
+                        ))));
+                    }
                 }
             }
         }
@@ -716,6 +722,35 @@ mod tests {
             log.purge(entry(2, 1, "b").log_id).await.unwrap();
         }
         assert!(FileRaftLog::open(dir.path()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn unpurged_missing_prefix_fails_validation_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut log = FileRaftLog::open(dir.path()).unwrap();
+            append(
+                &mut log,
+                vec![entry(1, 1, "a"), entry(2, 1, "b"), entry(3, 1, "c")],
+            )
+            .await;
+            log.save_committed(Some(entry(3, 1, "c").log_id))
+                .await
+                .unwrap();
+        }
+        // Simula perda de prefixo sem ter havido purge: reescreve o WAL apenas com os registos 2 e 3
+        let wal_path = dir.path().join("entries.wal");
+        let mut truncated_wal = std::fs::File::create(&wal_path).unwrap();
+        use std::io::Write;
+        for entry in [entry(2, 1, "b"), entry(3, 1, "c")] {
+            let framed = Inner::encode_record(&LogRecord::Insert(entry)).unwrap();
+            truncated_wal.write_all(&framed).unwrap();
+        }
+        truncated_wal.flush().unwrap();
+        drop(truncated_wal);
+
+        // A abertura deve falhar porque a entrada comprometida 3 existe mas a entrada 1 sumiu sem registo de purge
+        assert!(FileRaftLog::open(dir.path()).is_err());
     }
 
     #[tokio::test]

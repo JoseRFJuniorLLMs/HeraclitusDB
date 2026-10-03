@@ -952,9 +952,13 @@ fn append(runtime: &Arc<AgentRuntime>, e: AgentEvidenceV1) -> Gravacao {
         // dedupe identities. A conflict here is no longer an expected approval
         // retry; it is an evidence-integrity failure and ENFORCE must fail closed.
         AppendOutcome::Conflito { existing_hash } => {
+            let key = if e.dedupe_key.is_empty() {
+                heraclitus_agent::dedupe::dedupe_key(&e)
+            } else {
+                e.dedupe_key.clone()
+            };
             let motivo = format!(
-                "conflito de deduplicação no gateway: chave {} já gravada como {}",
-                e.dedupe_key, existing_hash
+                "conflito de deduplicação no gateway: chave {key} já gravada como {existing_hash}"
             );
             tracing::error!(motivo = %motivo, "evidência de agente NÃO foi gravada");
             GatewayCounters::bump(&runtime.gateway_counters.evidence_errors);

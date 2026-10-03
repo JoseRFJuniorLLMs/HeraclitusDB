@@ -393,7 +393,7 @@ impl AgentRuntime {
         impl<'a> Drop for InFlightGuard<'a> {
             fn drop(&mut self) {
                 if !self.committed {
-                    let mut g = self.state.lock().unwrap();
+                    let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     g.in_flight.remove(self.key);
                     self.cvar.notify_all();
                 }
@@ -454,10 +454,9 @@ impl AgentRuntime {
                     DedupeVerdict::Conflict { existing_hash } => {
                         counters.conflicts += 1;
                         Err(HeraclitusError::Config(format!(
-                            "a chave de deduplicação {} já existe com conteúdo diferente \
+                            "a chave de deduplicação {key} já existe com conteúdo diferente \
                              (gravado {existing_hash}). Recusado: aceitar seria deixar reescrever \
-                             evidência já registada (SPEC-0074 §14).",
-                            e.dedupe_key
+                             evidência já registada (SPEC-0074 §14)."
                         )))
                     }
                     DedupeVerdict::Novel => unreachable!(),
@@ -468,10 +467,9 @@ impl AgentRuntime {
                     let existing_hash = in_flight_hash.clone();
                     self.counters.lock().unwrap().conflicts += 1;
                     return Err(HeraclitusError::Config(format!(
-                        "a chave de deduplicação {} já está em gravação com conteúdo diferente \
+                        "a chave de deduplicação {key} já está em gravação com conteúdo diferente \
                          (conflito {existing_hash}). Recusado: aceitar seria deixar reescrever \
-                         evidência já registada (SPEC-0074 §14).",
-                        e.dedupe_key
+                         evidência já registada (SPEC-0074 §14)."
                     )));
                 }
                 guard = cvar.wait(guard).unwrap();
@@ -491,7 +489,7 @@ impl AgentRuntime {
         impl<'a> Drop for InFlightGuard<'a> {
             fn drop(&mut self) {
                 if !self.committed {
-                    let mut g = self.state.lock().unwrap();
+                    let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
                     g.in_flight.remove(self.key);
                     self.cvar.notify_all();
                 }
@@ -681,5 +679,36 @@ mod tests {
         let res_dup = runtime.append(&ev);
         assert_eq!(res_dup.unwrap(), None);
         assert_eq!(mock_log.head(), 1);
+    }
+
+    #[test]
+    fn unstamped_dedupe_key_conflict_error_contains_computed_key() {
+        let mock_log = Arc::new(MockLog::new());
+        let runtime = AgentRuntime::new(
+            AgentBlackBoxConfig::default(),
+            AgentGatewayConfig::default(),
+            mock_log.clone(),
+        );
+
+        let mut ev1 = AgentEvidenceV1::new("t", AgentEvidenceKindV1::ToolRequested, 1);
+        ev1.evidence_id = "ev-1".into();
+        ev1.dedupe_key = "".into(); // não estampada
+        let computed_key = heraclitus_agent::dedupe::dedupe_key(&ev1);
+        assert!(!computed_key.is_empty());
+
+        assert_eq!(runtime.append(&ev1).unwrap(), Some(0));
+
+        // Evidência diferente que resulta na mesma chave (ou mesma chave com conteúdo modificado)
+        let mut ev2 = ev1.clone();
+        ev2.subject.tool_name = Some("tool_diferente".into());
+        // Força a mesma chave para simular colisão de idempotência
+        ev2.dedupe_key = computed_key.clone();
+
+        let err = runtime.append(&ev2).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&computed_key),
+            "mensagem de erro deve conter a chave calculada: {msg}"
+        );
     }
 }

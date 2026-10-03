@@ -318,7 +318,14 @@ struct LimpezaDir(PathBuf);
 
 impl Drop for LimpezaDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if std::fs::remove_dir_all(&self.0).is_err() {
+            if let Ok(entries) = std::fs::read_dir(&self.0) {
+                for entry in entries.flatten() {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+            let _ = std::fs::remove_dir(&self.0);
+        }
     }
 }
 
