@@ -1549,17 +1549,62 @@ impl Engine {
         let next_cursor = episodes.last().map(|(l, _)| l + 1).unwrap_or(head);
 
         let distiller = heraclitus_distill::Distiller::new(self.metric.clone(), cfg.clone());
-        let mut facts = distiller.distill_episodes(&episodes, head)?;
+        let facts = distiller.distill_episodes(&episodes, head)?;
 
         // SPEC-0046: classificação acompanha a proveniência real do distill.
         // Preparar TODOS os Facts antes de appendar evita uma emissão parcial se
         // uma fonte estiver sem rótulo ou a política não puder ser validada.
+        //
+        // Auditoria recursiva 2026-10-03, iteração 2: um Fact cuja classificação
+        // falha (cluster que mistura fontes com e sem rótulo, rótulo que a
+        // política desconhece, política ausente, inválida ou ainda não vigente)
+        // é DESCARTADO com aviso, em vez de abortar o tick inteiro. Abortar
+        // deixava o cursor parado: o tick seguinte voltava a ver a mesma janela
+        // envenenada e falhava outra vez, para sempre. Como `classification.*`
+        // é escrevível por qualquer Writer, bastava um Writer para parar a
+        // consolidação de todos. O fail-closed mantém-se por Fact — nenhum
+        // FactDerived sai sem classificação válida — mas a liveness do pipeline
+        // deixa de depender de cada cluster. As fontes continuam no log; só o
+        // Fact derivado daquele cluster não é emitido.
         let sources_by_id: StdHashMap<_, _> = episodes
             .iter()
             .map(|(_, episode)| (episode.id, episode))
             .collect();
-        let mut classification_policy: Option<ClassificationPolicy> = None;
-        for fact in &mut facts {
+        // A política é lida no máximo uma vez por tick; um erro de leitura fica
+        // guardado para descartar os restantes Facts classificados sem reler.
+        let mut classification_policy: Option<Result<ClassificationPolicy, String>> = None;
+        let load_policy = || -> Result<ClassificationPolicy, String> {
+            let data_dir = self.attr_dir.parent().unwrap_or(self.attr_dir.as_path());
+            let path = data_dir
+                .join("compliance")
+                .join("classification-policy.json");
+            let raw = std::fs::read(&path).map_err(|error| {
+                format!(
+                    "fontes classificadas exigem política em {}: {error}",
+                    path.display()
+                )
+            })?;
+            let policy: ClassificationPolicy = serde_json::from_slice(&raw).map_err(|error| {
+                format!(
+                    "política de classificação inválida em {}: {error}",
+                    path.display()
+                )
+            })?;
+            policy.validate().map_err(|error| {
+                format!(
+                    "política de classificação inválida em {}: {error}",
+                    path.display()
+                )
+            })?;
+            if policy.identity.effective_from > head {
+                return Err(format!(
+                    "política de classificação {} só vigora a partir do LSN {} (head atual: {head})",
+                    policy.identity.policy_id, policy.identity.effective_from
+                ));
+            }
+            Ok(policy)
+        };
+        let mut classify = |fact: &mut Episode| -> Result<(), String> {
             let classified_parent_count = fact
                 .parents
                 .iter()
@@ -1567,88 +1612,58 @@ impl Engine {
                 .filter(|source| source.attrs.contains_key("classification.label"))
                 .count();
             if classified_parent_count == 0 {
-                continue;
+                return Ok(());
             }
             if classified_parent_count != fact.parents.len() {
-                return Err(HeraclitusError::Config(
+                return Err(
                     "distill recusado: cluster mistura fontes classificadas e sem classificação"
                         .into(),
-                ));
+                );
             }
-
-            if classification_policy.is_none() {
-                let data_dir = self.attr_dir.parent().unwrap_or(self.attr_dir.as_path());
-                let path = data_dir
-                    .join("compliance")
-                    .join("classification-policy.json");
-                let raw = std::fs::read(&path).map_err(|error| {
-                    HeraclitusError::Config(format!(
-                        "fontes classificadas exigem política em {}: {error}",
-                        path.display()
-                    ))
-                })?;
-                let policy: ClassificationPolicy =
-                    serde_json::from_slice(&raw).map_err(|error| {
-                        HeraclitusError::Config(format!(
-                            "política de classificação inválida em {}: {error}",
-                            path.display()
-                        ))
-                    })?;
-                policy.validate().map_err(|error| {
-                    HeraclitusError::Config(format!(
-                        "política de classificação inválida em {}: {error}",
-                        path.display()
-                    ))
-                })?;
-                if policy.identity.effective_from > head {
-                    return Err(HeraclitusError::Config(format!(
-                        "política de classificação {} só vigora a partir do LSN {} (head atual: {head})",
-                        policy.identity.policy_id, policy.identity.effective_from
-                    )));
-                }
-                classification_policy = Some(policy);
-            }
+            let policy = classification_policy
+                .get_or_insert_with(load_policy)
+                .as_ref()
+                .map_err(Clone::clone)?;
 
             let sources: Vec<SourceClassification> = fact
                 .parents
                 .iter()
                 .map(|id| {
                     let source = sources_by_id.get(id).ok_or_else(|| {
-                        HeraclitusError::Config(format!(
-                            "distill perdeu a fonte classificada {id} da janela corrente"
-                        ))
+                        format!("distill perdeu a fonte classificada {id} da janela corrente")
                     })?;
                     let label = source
                         .attrs
                         .get("classification.label")
                         .cloned()
-                        .ok_or_else(|| {
-                            HeraclitusError::Config(format!(
-                                "fonte {id} não possui classification.label"
-                            ))
-                        })?;
+                        .ok_or_else(|| format!("fonte {id} não possui classification.label"))?;
                     Ok(SourceClassification {
                         event_id: *id,
                         label,
                     })
                 })
-                .collect::<Result<_, HeraclitusError>>()?;
-            classify_derived_episode(
-                fact,
-                &sources,
-                None,
-                None,
-                classification_policy
-                    .as_ref()
-                    .expect("policy was loaded for classified sources"),
-            )
-            .map_err(|error| {
-                HeraclitusError::Config(format!(
+                .collect::<Result<_, String>>()?;
+            classify_derived_episode(fact, &sources, None, None, policy).map_err(|error| {
+                format!(
                     "não foi possível classificar FactDerived {}: {error}",
                     fact.id
-                ))
+                )
             })?;
+            Ok(())
+        };
+        let mut prepared = Vec::with_capacity(facts.len());
+        for mut fact in facts {
+            match classify(&mut fact) {
+                Ok(()) => prepared.push(fact),
+                Err(error) => tracing::warn!(
+                    fact_id = %fact.id,
+                    parents = fact.parents.len(),
+                    %error,
+                    "distill: Fact descartado por classificação inválida; o tick continua"
+                ),
+            }
         }
+        let facts = prepared;
         let mut out = Vec::with_capacity(facts.len());
         for ev in facts {
             out.push(self.append(ev)?); // §2.6
@@ -5222,6 +5237,92 @@ mod tests {
             "classification-main"
         );
         assert_eq!(derived.parents.len(), 4);
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 2: um cluster cuja
+    /// classificação falha (mistura fontes com e sem rótulo, ou rótulo sem
+    /// política) não pode parar o distill para sempre. Antes, o tick devolvia
+    /// `Err` sem avançar o cursor e todos os ticks seguintes reencontravam a
+    /// mesma janela envenenada. Agora só o Fact desse cluster é descartado.
+    #[cfg(feature = "distill")]
+    #[test]
+    fn distill_tick_drops_unclassifiable_cluster_without_halting() {
+        use heraclitus_core::ProductPoint;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            ..Default::default()
+        };
+        let obs = |text: &str, x: f32, label: Option<&str>| {
+            let mut e = Episode::new("writer", EventKind::Observation, text.as_bytes().to_vec());
+            e.embedding = Some(ProductPoint {
+                hyp: vec![x, 0.0],
+                sph: vec![],
+                euc: vec![],
+            });
+            if let Some(label) = label {
+                e.attrs.insert("classification.label".into(), label.into());
+            }
+            e
+        };
+        let dcfg = heraclitus_distill::DistillConfig::default();
+        let engine = Engine::open(&cfg).unwrap();
+
+        // Tick 1: cluster misto (1 rotulado + 3 sem rótulo) e um cluster limpo.
+        engine.append(obs("gato 0", 0.60, Some("public"))).unwrap();
+        for i in 1..4 {
+            engine
+                .append(obs(&format!("gato {i}"), 0.60 + i as f32 * 0.01, None))
+                .unwrap();
+        }
+        for i in 0..3 {
+            engine
+                .append(obs(&format!("chuva {i}"), -0.2 + i as f32 * 0.01, None))
+                .unwrap();
+        }
+        let facts = engine
+            .distill_tick(&dcfg)
+            .expect("cluster misto não pode abortar o tick");
+        assert_eq!(facts.len(), 1, "só o cluster limpo vira Fact");
+        let (_, ev) = engine.log.read(facts[0]).unwrap().unwrap();
+        assert_eq!(ev.kind, EventKind::FactDerived);
+        assert_eq!(ev.parents.len(), 3);
+        assert!(!ev.attrs.contains_key("classification.label"));
+        assert!(
+            engine.distill_tick(&dcfg).unwrap().is_empty(),
+            "o cursor avançou para lá da janela envenenada"
+        );
+
+        // Tick 2: rótulo sem política de classificação (fail-closed por Fact).
+        for i in 0..3 {
+            engine
+                .append(obs(
+                    &format!("sol {i}"),
+                    0.60 + i as f32 * 0.01,
+                    Some("public"),
+                ))
+                .unwrap();
+        }
+        assert!(
+            engine
+                .distill_tick(&dcfg)
+                .expect("política ausente não pode abortar o tick")
+                .is_empty(),
+            "sem política, o Fact classificado não é emitido"
+        );
+
+        // Tick 3: a consolidação continua viva para os episódios seguintes.
+        for i in 0..3 {
+            engine
+                .append(obs(&format!("vento {i}"), -0.2 + i as f32 * 0.01, None))
+                .unwrap();
+        }
+        assert_eq!(
+            engine.distill_tick(&dcfg).unwrap().len(),
+            1,
+            "distill continua a produzir Facts depois de clusters inválidos"
+        );
     }
 
     #[test]
