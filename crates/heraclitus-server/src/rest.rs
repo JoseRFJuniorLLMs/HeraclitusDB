@@ -554,6 +554,10 @@ struct SecurityEventQuery {
     min_severity: Option<u8>,
     as_of_lsn: Option<u64>,
     limit: Option<usize>,
+    /// Cursor de paginação (inclusive): o `next_from_lsn` da página anterior.
+    /// Auditoria recursiva 2026-10-03, iteração 1 — sem ele a varredura
+    /// começava sempre no LSN 0 e os eventos recentes ficavam inalcançáveis.
+    from_lsn: Option<u64>,
 }
 
 fn parse_incident_state(value: &str) -> Option<IncidentState> {
@@ -2943,6 +2947,7 @@ async fn security_events(
     // de uma resposta HTTP. 1000 é generoso para um painel e finito para o
     // servidor.
     let limite = query.limit.unwrap_or(200).min(1_000);
+    let desde = query.from_lsn.unwrap_or(0);
     let filtro = heraclitus_telemetry_health::SecurityEventFilter {
         tenant_id: query.tenant_id,
         datasource_id: query.datasource_id,
@@ -2953,19 +2958,32 @@ async fn security_events(
     // `spawn_blocking`: a projecção varre o log em janelas. Ver o comentário do
     // `/sentinel/checkpoint` — uma varredura no reactor bloqueia uma thread que
     // o tokio tem em número fixo.
+    //
+    // Auditoria recursiva 2026-10-03, iteração 1: pede-se UM evento a mais do
+    // que o limite para saber, sem adivinhar, se a página foi cortada. Antes a
+    // resposta não o dizia e não havia como passar dos primeiros 1000 — agora
+    // `truncated` sinaliza o corte e `next_from_lsn` (o LSN do primeiro evento
+    // que ficou de fora) é o `from_lsn` da página seguinte.
     match tokio::task::spawn_blocking(move || {
-        engine.security_events(&filtro, Some(as_of_lsn), limite)
+        engine.security_events_desde(&filtro, desde, Some(as_of_lsn), limite.saturating_add(1))
     })
     .await
     {
-        Ok(Ok(eventos)) => Json(serde_json::json!({
-            "schema": heraclitus_telemetry_health::SECURITY_EVENT_SCHEMA,
-            "as_of_lsn": as_of_lsn,
-            "count": eventos.len(),
-            "limit": limite,
-            "events": eventos,
-        }))
-        .into_response(),
+        Ok(Ok(mut eventos)) => {
+            let next_from_lsn = eventos.get(limite).map(|v| v.lsn);
+            eventos.truncate(limite);
+            Json(serde_json::json!({
+                "schema": heraclitus_telemetry_health::SECURITY_EVENT_SCHEMA,
+                "as_of_lsn": as_of_lsn,
+                "from_lsn": desde,
+                "count": eventos.len(),
+                "limit": limite,
+                "truncated": next_from_lsn.is_some(),
+                "next_from_lsn": next_from_lsn,
+                "events": eventos,
+            }))
+            .into_response()
+        }
         Ok(Err(erro)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": erro.to_string() })),
@@ -3811,5 +3829,107 @@ mod dashboard_tests {
         .await;
         assert_eq!(estado, StatusCode::NOT_FOUND);
         runtime.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod security_events_tests {
+    use super::*;
+    use heraclitus_core::{Episode, EventKind, FsyncPolicy, HeraclitusConfig};
+
+    fn facto_de_seguranca() -> Episode {
+        let mut e = Episode::new("forge-bridge", EventKind::Observation, b"{}".to_vec());
+        for (k, v) in [
+            (
+                "security_schema",
+                heraclitus_telemetry_health::SECURITY_EVENT_SCHEMA,
+            ),
+            ("security_category", "authentication"),
+            ("security_event_type", "login"),
+            ("security_outcome", "failure"),
+            ("security_severity", "7"),
+            ("security_tenant_id", "tenant-a"),
+        ] {
+            e.attrs.insert(k.to_string(), v.to_string());
+        }
+        e
+    }
+
+    fn consulta(limit: usize, from_lsn: Option<u64>) -> SecurityEventQuery {
+        SecurityEventQuery {
+            tenant_id: None,
+            datasource_id: None,
+            category: Some("authentication".into()),
+            outcome: Some("failure".into()),
+            min_severity: None,
+            as_of_lsn: None,
+            limit: Some(limit),
+            from_lsn,
+        }
+    }
+
+    async fn pagina(engine: &Arc<Engine>, q: SecurityEventQuery) -> serde_json::Value {
+        let resposta = security_events(State(engine.clone()), Query(q)).await;
+        assert_eq!(resposta.status(), StatusCode::OK);
+        let corpo = axum::body::to_bytes(resposta.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        serde_json::from_slice(&corpo).unwrap()
+    }
+
+    fn lsns(pagina: &serde_json::Value) -> Vec<u64> {
+        pagina["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["lsn"].as_u64().unwrap())
+            .collect()
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 1 — com mais eventos a bater
+    /// no filtro do que o limite, a resposta devolvia sempre os MAIS ANTIGOS,
+    /// sem dizer que tinha cortado e sem cursor: o evento mais recente nunca
+    /// era alcançável. Agora o corte é sinalizado e `next_from_lsn` pagina até
+    /// ao fim.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_paginacao_sinaliza_o_corte_e_alcanca_o_evento_mais_recente() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            ..Default::default()
+        };
+        let engine = Arc::new(Engine::open(&cfg).unwrap());
+        let mut escritos = Vec::new();
+        for _ in 0..5 {
+            escritos.push(engine.append(facto_de_seguranca()).unwrap());
+        }
+
+        let primeira = pagina(&engine, consulta(2, None)).await;
+        assert_eq!(lsns(&primeira), escritos[..2].to_vec());
+        assert_eq!(primeira["truncated"], true, "{primeira}");
+        assert_eq!(primeira["next_from_lsn"], escritos[2]);
+
+        // Seguir o cursor até ao fim tem de devolver todos, sem repetir nenhum,
+        // e a última página não pode dizer que foi cortada.
+        let mut vistos = lsns(&primeira);
+        let mut cursor = primeira["next_from_lsn"].as_u64();
+        let mut ultima = primeira;
+        while let Some(c) = cursor {
+            ultima = pagina(&engine, consulta(2, Some(c))).await;
+            vistos.extend(lsns(&ultima));
+            cursor = ultima["next_from_lsn"].as_u64();
+        }
+        assert_eq!(
+            vistos, escritos,
+            "o evento mais recente tem de ser alcançável"
+        );
+        assert_eq!(ultima["truncated"], false, "{ultima}");
+        assert!(ultima["next_from_lsn"].is_null());
+
+        // Página exacta: o limite igual ao que existe não é um corte.
+        let exacta = pagina(&engine, consulta(5, None)).await;
+        assert_eq!(exacta["count"], 5);
+        assert_eq!(exacta["truncated"], false, "{exacta}");
     }
 }

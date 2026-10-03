@@ -1961,11 +1961,30 @@ impl Engine {
         as_of_lsn: Option<Lsn>,
         limite: usize,
     ) -> Result<Vec<heraclitus_telemetry_health::SecurityEventView>, HeraclitusError> {
+        self.security_events_desde(filtro, 0, as_of_lsn, limite)
+    }
+
+    /// Como [`Engine::security_events`], mas a varredura começa em `desde`
+    /// (inclusive) em vez de no LSN 0.
+    ///
+    /// Auditoria recursiva 2026-10-03, iteração 1: a varredura começava SEMPRE
+    /// no LSN 0 e parava nos primeiros `limite` resultados, pelo que, com mais
+    /// eventos a bater no filtro do que o tecto do REST (1000), os mais
+    /// recentes eram inalcançáveis — o `as_of_lsn` só baixa o limite superior.
+    /// O limite inferior é o cursor que deixa o cliente paginar até ao fim,
+    /// mantendo a ordem crescente de LSN.
+    pub fn security_events_desde(
+        &self,
+        filtro: &heraclitus_telemetry_health::SecurityEventFilter,
+        desde: Lsn,
+        as_of_lsn: Option<Lsn>,
+        limite: usize,
+    ) -> Result<Vec<heraclitus_telemetry_health::SecurityEventView>, HeraclitusError> {
         use heraclitus_telemetry_health::SecurityEventView;
         const JANELA: usize = 20_000;
         let ate = as_of_lsn.unwrap_or_else(|| self.log.head());
         let mut encontrados = Vec::new();
-        let mut cursor = 0u64;
+        let mut cursor = desde;
         while cursor < ate && encontrados.len() < limite {
             let linhas = self.log.scan_capped(cursor, ate, JANELA)?;
             if linhas.is_empty() {
@@ -7031,6 +7050,36 @@ mod testes_security_events_spec0071 {
             .security_events(&SecurityEventFilter::default(), None, 3)
             .unwrap();
         assert_eq!(poucos.len(), 3);
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 1 — com mais eventos do que o
+    /// limite, os mais recentes têm de continuar alcançáveis: a varredura a
+    /// partir de `desde` devolve o que vem depois, e não outra vez os primeiros.
+    #[test]
+    fn a_varredura_a_partir_de_um_lsn_alcanca_os_eventos_recentes() {
+        let (_t, engine) = motor();
+        let mut lsns = Vec::new();
+        for _ in 0..10 {
+            lsns.push(
+                engine
+                    .append(facto_de_seguranca("authentication", "failure", 7))
+                    .unwrap(),
+            );
+        }
+        let filtro = SecurityEventFilter::default();
+        let primeiros = engine.security_events(&filtro, None, 3).unwrap();
+        assert_eq!(
+            primeiros.iter().map(|v| v.lsn).collect::<Vec<_>>(),
+            lsns[..3].to_vec()
+        );
+        let ultimos = engine
+            .security_events_desde(&filtro, lsns[7], None, 100)
+            .unwrap();
+        assert_eq!(
+            ultimos.iter().map(|v| v.lsn).collect::<Vec<_>>(),
+            lsns[7..].to_vec(),
+            "o evento mais recente tem de ser alcançável"
+        );
     }
 }
 
