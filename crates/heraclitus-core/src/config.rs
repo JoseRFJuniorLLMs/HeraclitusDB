@@ -1353,6 +1353,21 @@ impl HeraclitusConfig {
         }
 
         if let Some(rep) = &self.replication {
+            // falta_fazer.md:197-202, conferido em 2026-10-02: a máquina de
+            // estados do raft grava o `sm_meta` (com fsync) logo a seguir a
+            // aplicar os episódios, ASSUMINDO que estes já estão em disco
+            // (heraclitus-raft consensus.rs, `apply`). Sob GroupCommit — o
+            // default — um crash na janela deixa o meta à frente do log e o nó
+            // recusa arrancar ("state-machine à frente do log"). Era uma
+            // configuração aceite que só falhava no pior momento.
+            if !matches!(self.fsync, FsyncPolicy::Always) {
+                return Err(invalid(
+                    "replicação (raft) exige fsync = always: a máquina de estados grava o \
+                     meta assumindo os episódios já em disco; com group_commit um crash \
+                     deixa o nó sem arrancar"
+                        .into(),
+                ));
+            }
             let tls_parts = usize::from(rep.tls_cert_path.is_some())
                 + usize::from(rep.tls_key_path.is_some())
                 + usize::from(rep.tls_ca_path.is_some());
@@ -1724,6 +1739,23 @@ max_graph_hops = 6
             .unwrap_err()
             .to_string()
             .contains("loopback"));
+    }
+
+    #[test]
+    fn replication_requires_fsync_always() {
+        let mut cfg = HeraclitusConfig {
+            replication: Some(ReplicationConfig {
+                raft_addr: "127.0.0.1:8474".into(),
+                ..Default::default()
+            }),
+            fsync: FsyncPolicy::GroupCommit { interval_ms: 5 },
+            ..Default::default()
+        };
+        let erro = cfg.validate_security().unwrap_err().to_string();
+        assert!(erro.contains("fsync = always"), "{erro}");
+
+        cfg.fsync = FsyncPolicy::Always;
+        cfg.validate_security().unwrap();
     }
 
     #[test]

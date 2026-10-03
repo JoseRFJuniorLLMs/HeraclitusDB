@@ -381,13 +381,21 @@ async fn serve_inner(
     // de um lado e com um cliente a assumir outro. Declarar o mesmo tecto dos
     // dois lados torna o contrato explícito em vez de implícito, e impede que
     // uma mensagem enorme seja aceite antes de alguém decidir se cabe.
+    //
+    // Conferência de 2026-10-02 (auditoria 2026-10-01 F09/F10): os PEDIDOS
+    // descem para 64 MiB. Uma mensagem de 256 MiB é descodificada, clonada para
+    // o Episode, cifrada e indexada — vários múltiplos do tamanho em RAM por
+    // pedido, antes de qualquer decisão. O Raft tem o seu próprio servidor e
+    // tecto (heraclitus-raft), portanto isto só toca nos clientes. As RESPOSTAS
+    // mantêm 256 MiB: um resultado de query grande é limitado pelos tectos do
+    // planner, não por este número.
     const MAX_MSG: usize = 256 * 1024 * 1024;
     let svc = tonic::service::interceptor::InterceptedService::new(
         HeraclitusServer::new(grpc::Service::new_with_sentinel(
             engine.clone(),
             sentinel_runtime.clone(),
         ))
-        .max_decoding_message_size(MAX_MSG)
+        .max_decoding_message_size(grpc::MAX_REQUEST_BYTES)
         .max_encoding_message_size(MAX_MSG),
         auth,
     );

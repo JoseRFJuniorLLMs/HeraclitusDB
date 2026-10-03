@@ -37,6 +37,12 @@ use std::sync::{Arc, Mutex, RwLock};
 /// esperar umas pelas outras; o lock único fazia-o na mesma.
 const IDEMPOTENCY_SHARDS: usize = 64;
 
+/// Tecto de `k` em NEAREST/RECALL (GQL e gRPC). O `k` chegava sem limite
+/// (u32 do GQL): um único pedido fazia o HNSW explorar com `ef = k` e
+/// hidratar do log o índice inteiro. Um top-k desta ordem já não é uma
+/// pesquisa de vizinhos — é uma exportação, e para isso há o Flight.
+pub const MAX_TOP_K: usize = 10_000;
+
 pub const IDEMPOTENCY_KEY_ATTR: &str = "__heraclitus_idempotency_key";
 pub const IDEMPOTENCY_HASH_ATTR: &str = "__heraclitus_idempotency_hash";
 
@@ -3024,7 +3030,7 @@ impl Engine {
     /// 2026-09-05, A56). Aqui não muda nada: mesmos bytes de saída.
     pub fn recall(&self, text: &str, k: usize) -> Result<serde_json::Value, HeraclitusError> {
         let rows: Vec<serde_json::Value> = self
-            .recall_hidratado(text, k)?
+            .recall_hidratado(text, k.min(MAX_TOP_K))?
             .into_iter()
             .map(|(id, lsn, episodio, score)| match episodio {
                 Some(ep) => serde_json::json!({
@@ -3269,34 +3275,47 @@ impl QueryBackend for Engine {
         // Audit #10: AS OF is honored by post-filtering on LSN (the indexes
         // are head-versioned in v0; a versioned-index time travel is the
         // planned upgrade). Over-fetch to compensate for filtered rows.
-        let fetch = if as_of.is_some() { k * 4 } else { k };
-        // Auditoria 2026-09-05, A56: usa-se o `Episode` que a hidratação já
-        // trouxe, em vez de reler o mesmo LSN do log. Nada mais muda — mesmo
-        // ranking, mesmos scores, mesma resolução de `lsn == 0` pelo índice de
-        // grafo, mesmo filtro de id, mesmo `fetch = k*4` com AS OF, mesmo
-        // pós-filtro e mesmo `truncate(k)`.
-        let mut out = Vec::new();
-        for (_id, lsn, episodio, score) in self.recall_hidratado(text, fetch)? {
-            if let Some(bound) = as_of {
-                if lsn >= bound {
-                    continue;
+        //
+        // Conferência de 2026-10-02 (falta_fazer.md:101): o over-fetch era
+        // FIXO (k*4). Com mais de 3/4 dos candidatos depois do AS OF a
+        // resposta saía com menos de `k` linhas sem aviso, embora houvesse
+        // candidatos válidos mais abaixo no ranking. Agora o fetch cresce até
+        // haver `k` sobreviventes ou a fonte deixar de devolver mais.
+        let k = k.min(MAX_TOP_K);
+        let mut fetch = if as_of.is_some() { k.saturating_mul(4) } else { k };
+        loop {
+            // Auditoria 2026-09-05, A56: usa-se o `Episode` que a hidratação
+            // já trouxe, em vez de reler o mesmo LSN do log — mesmo ranking,
+            // mesmos scores, mesma resolução de `lsn == 0` pelo índice de
+            // grafo e mesmo filtro de id.
+            let candidatos = self.recall_hidratado(text, fetch)?;
+            let devolvidos = candidatos.len();
+            let mut out = Vec::new();
+            for (_id, lsn, episodio, score) in candidatos {
+                if let Some(bound) = as_of {
+                    if lsn >= bound {
+                        continue;
+                    }
                 }
-            }
-            match episodio {
-                Some(ep) => out.push((lsn, ep, score)),
-                // Ramo de fallback preservado tal e qual, incluindo a leitura
-                // SEM filtro de id: aqui o `lsn` é o `cand.lsn` cru, que pode
-                // ser 0 e devolver outro episódio. É o comportamento de hoje;
-                // mudá-lo seria outra correcção, com outro achado.
-                None => {
-                    if let Some((l, e)) = self.log.read(lsn)? {
-                        out.push((l, e, score));
+                match episodio {
+                    Some(ep) => out.push((lsn, ep, score)),
+                    // Ramo de fallback preservado tal e qual, incluindo a
+                    // leitura SEM filtro de id: aqui o `lsn` é o `cand.lsn`
+                    // cru, que pode ser 0 e devolver outro episódio.
+                    None => {
+                        if let Some((l, e)) = self.log.read(lsn)? {
+                            out.push((l, e, score));
+                        }
                     }
                 }
             }
+            let esgotado = devolvidos < fetch || fetch >= MAX_TOP_K.saturating_mul(4);
+            if as_of.is_none() || out.len() >= k || esgotado {
+                out.truncate(k);
+                return Ok(out);
+            }
+            fetch = fetch.saturating_mul(4).min(MAX_TOP_K.saturating_mul(4));
         }
-        out.truncate(k);
-        Ok(out)
     }
 
     fn nearest(
@@ -3316,26 +3335,57 @@ impl QueryBackend for Engine {
             }
         };
         // Audit #10: honor AS OF via LSN post-filter (over-fetch first).
-        let fetch = if as_of.is_some() { k * 4 } else { k };
+        //
+        // Conferência de 2026-10-02:
+        // - `k` vinha do GQL sem tecto (u32): `NEAREST k=4000000000` pedia ao
+        //   HNSW um `ef` desse tamanho e hidratava o índice inteiro do log;
+        // - o over-fetch fixo (k*4) devolvia menos de `k` linhas em silêncio
+        //   quando o AS OF filtrava mais de 3/4 dos candidatos — agora cresce
+        //   até haver `k` sobreviventes ou o índice se esgotar;
+        // - cada sobrevivente era lido do log ANTES do corte em `k`: com o
+        //   fetch alargado isso seriam até 4k leituras para devolver k. Agora
+        //   ordena-se e corta-se pelos LSN/distâncias e só os `k` finais são
+        //   hidratados. A deduplicação com a memtable passa a ser por LSN (o
+        //   mesmo evento tem o mesmo LSN nas duas fontes), sem ler nada.
+        let k = k.min(MAX_TOP_K);
+        if k == 0 {
+            return Ok(Vec::new());
+        }
         let in_snapshot = |lsn: Lsn| as_of.map(|b| lsn < b).unwrap_or(true);
-        let hits = self.vector.read().unwrap().search(&dims, fetch, 128, None);
-        let mut out = Vec::new();
-        for h in hits.into_iter().filter(|h| in_snapshot(h.lsn)) {
-            if let Some((l, e)) = self.log.read(h.lsn)? {
-                out.push((l, e, h.dist));
+        let indexados = self.vector.read().unwrap().len();
+        let mut fetch = if as_of.is_some() { k.saturating_mul(4) } else { k };
+        let mut candidatos: Vec<(Lsn, f32)>;
+        loop {
+            let hits = self.vector.read().unwrap().search(&dims, fetch, 128, None);
+            let devolvidos = hits.len();
+            candidatos = hits
+                .into_iter()
+                .filter(|h| in_snapshot(h.lsn))
+                .map(|h| (h.lsn, h.dist))
+                .collect();
+            let esgotado = devolvidos < fetch || fetch >= indexados;
+            if as_of.is_none() || candidatos.len() >= k || esgotado {
+                break;
             }
+            fetch = fetch.saturating_mul(4).min(indexados.max(k));
         }
         // Merge the memtable tail (exact) for read-your-own-writes.
         let mem = self.memtable.knn(&self.metric, &dims, fetch);
         for m in mem.into_iter().filter(|m| in_snapshot(m.lsn)) {
-            if !out.iter().any(|(_, e, _)| e.id == m.id) {
-                if let Some((l, e)) = self.log.read(m.lsn)? {
-                    out.push((l, e, m.score));
-                }
+            if !candidatos.iter().any(|(lsn, _)| *lsn == m.lsn) {
+                candidatos.push((m.lsn, m.score));
             }
         }
-        out.sort_by(|a, b| a.2.total_cmp(&b.2));
-        out.truncate(k);
+        candidatos.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let mut out = Vec::with_capacity(k.min(candidatos.len()));
+        for (lsn, dist) in candidatos {
+            if out.len() == k {
+                break;
+            }
+            if let Some((l, e)) = self.log.read(lsn)? {
+                out.push((l, e, dist));
+            }
+        }
         Ok(out)
     }
 

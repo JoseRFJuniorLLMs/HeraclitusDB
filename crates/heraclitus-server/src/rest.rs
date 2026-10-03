@@ -170,11 +170,15 @@ pub fn router_with_sentinel(
         .route("/tier/receipts", get(tier_receipts))
         .route("/tier/fetch/:segment", get(tier_fetch));
     let routes = routes
-        .with_state(engine)
+        .with_state(engine.clone())
         .layer(Extension(sentinel))
         .layer(Extension(ErasureAllowed(allow_erasure)));
 
-    let protegido = aplicar_auth(routes, PoliticaRest::nova(basic_auth, autenticador));
+    // A meta-auditoria fica DENTRO da autenticação (camada aplicada antes =
+    // mais interior): só corre para pedidos autenticados e já vê o
+    // `Principal` que a auth resolveu.
+    let auditado = aplicar_meta_auditoria(routes, engine);
+    let protegido = aplicar_auth(auditado, PoliticaRest::nova(basic_auth, autenticador));
     // O CORS fica por FORA da autenticação: o browser envia o preflight
     // `OPTIONS` sem credenciais nenhumas, portanto se a auth o apanhasse
     // primeiro devolveria 401 e o pedido real nem chegava a ser feito.
@@ -357,6 +361,67 @@ impl PoliticaRest {
             roles: Arc::new(vec![AccessRole::Admin]),
         })
     }
+}
+
+/// Como uma rota é meta-auditada: `None` = não audita, `Some(true)` =
+/// `audit_admin`, `Some(false)` = `audit_query`.
+///
+/// Conferência de 2026-10-02: o `production_mode` exige `audit_queries` e
+/// `audit_admin`, mas o REST não chamava nenhum dos dois — `/titular/:id`,
+/// `/security/events`, `/flight/events`, as leituras do Sentinel e as
+/// escritas pelo REST não deixavam rasto, e `/titular/:id/acessos` (LGPD art.
+/// 18) omitia todos os acessos feitos por esta porta.
+///
+/// Ficam de fora só as sondas operacionais sem dados pessoais, que os painéis
+/// consultam a cada poucos segundos: auditá-las encheria o log de ruído sem
+/// responder a nenhuma pergunta de "quem leu o quê". O `/sql` audita-se no
+/// próprio handler, com o texto da consulta.
+fn classe_auditoria(metodo: &Method, caminho: &str) -> Option<bool> {
+    let papel = papel_exigido(metodo, caminho)?;
+    let segmentos: Vec<&str> = caminho.split('/').filter(|s| !s.is_empty()).collect();
+    match segmentos.as_slice() {
+        ["metrics"] | ["stats"] | ["state"] | ["telemetry", "health"] => None,
+        ["compliance", "status"] | ["sentinel", "status"] | ["sentinel", "dashboard"] => None,
+        ["verify", ..] | ["sql"] => None,
+        // Auditadas no handler com o nome da operação do gRPC
+        // (`sentinel-approve`/`sentinel-deny`), dentro do `execute_admin`.
+        ["sentinel", "incidents", _, "approve"] | ["sentinel", "incidents", _, "deny"] => None,
+        _ => Some(papel == AccessRole::Admin),
+    }
+}
+
+fn aplicar_meta_auditoria(routes: Router, engine: Arc<Engine>) -> Router {
+    routes.layer(middleware::from_fn(move |req: Request, next: Next| {
+        let engine = engine.clone();
+        async move {
+            let classe = classe_auditoria(req.method(), req.uri().path());
+            let Some(admin) = classe else {
+                return next.run(req).await;
+            };
+            let texto: String = format!("REST {} {}", req.method(), req.uri().path())
+                .chars()
+                .take(500)
+                .collect();
+            let principal = req
+                .extensions()
+                .get::<Principal>()
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| "anonimo".into());
+            let resposta = next.run(req).await;
+            let ok = resposta.status().is_success();
+            // Append bloqueante (fsync em Always): fora do reactor, e aguardado
+            // para o registo existir antes de a resposta sair.
+            let _ = tokio::task::spawn_blocking(move || {
+                if admin {
+                    engine.audit_admin(&texto, ok, &principal);
+                } else {
+                    engine.audit_query(&texto, ok, &principal);
+                }
+            })
+            .await;
+            resposta
+        }
+    }))
 }
 
 fn aplicar_auth(routes: Router, politica: PoliticaRest) -> Router {
@@ -700,33 +765,50 @@ struct SentinelApprovalBody {
     approver: Option<String>,
     #[serde(default)]
     reason: String,
+    /// Chave de idempotência do protocolo administrativo (SPEC-0089). Sem
+    /// ela usa-se o `request_id` do contexto — um retry deixa de ser
+    /// reconhecido como o mesmo pedido, mas nunca é aplicado em duplicado
+    /// sem rasto.
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 async fn sentinel_approve(
+    State(engine): State<Arc<Engine>>,
     Extension(runtime): Extension<Option<Arc<SentinelRuntime>>>,
-    Extension(identidade): Extension<IdentidadeRest>,
+    Extension(principal): Extension<Principal>,
     Path(incident_id): Path<String>,
     Json(body): Json<SentinelApprovalBody>,
 ) -> Response {
-    sentinel_approval(runtime, identidade, incident_id, body, true).await
+    sentinel_approval(engine, runtime, principal, incident_id, body, true).await
 }
 
 async fn sentinel_deny(
+    State(engine): State<Arc<Engine>>,
     Extension(runtime): Extension<Option<Arc<SentinelRuntime>>>,
-    Extension(identidade): Extension<IdentidadeRest>,
+    Extension(principal): Extension<Principal>,
     Path(incident_id): Path<String>,
     Json(body): Json<SentinelApprovalBody>,
 ) -> Response {
-    sentinel_approval(runtime, identidade, incident_id, body, false).await
+    sentinel_approval(engine, runtime, principal, incident_id, body, false).await
 }
 
+/// Aprovação/recusa humana pelo REST.
+///
+/// Conferência de 2026-10-02 (SPEC-0089 §2/§6): o gRPC equivalente
+/// (`Admin op="sentinel-approve"`) já passava pelo `execute_admin` — intenção
+/// durável antes do efeito, idempotência, resultado no log — e pelo
+/// `audit_admin`. O REST gravava a aprovação directamente, sem nenhum dos
+/// dois: a mesma decisão humana tinha garantias diferentes consoante a porta.
 async fn sentinel_approval(
+    engine: Arc<Engine>,
     runtime: Option<Arc<SentinelRuntime>>,
-    identidade: IdentidadeRest,
+    principal: Principal,
     incident_id: String,
     body: SentinelApprovalBody,
     approved: bool,
 ) -> Response {
+    let identidade = IdentidadeRest(principal.name.clone());
     // O `approver` vinha do CORPO: qualquer chamador registava uma aprovacao
     // humana em nome de quem quisesse, e um registo de aprovacao existe
     // precisamente para atribuir responsabilidade. Agora o registado e sempre a
@@ -748,15 +830,60 @@ async fn sentinel_approval(
     let Some(runtime) = runtime else {
         return sentinel_unavailable();
     };
+    let operation = if approved {
+        "sentinel-approve"
+    } else {
+        "sentinel-deny"
+    };
+    let ctx = crate::trusted_admin::AdminContext::new(
+        principal.name.clone(),
+        "local",
+        principal
+            .roles
+            .iter()
+            .map(|role| format!("{role:?}").to_lowercase())
+            .collect(),
+    );
+    // Os mesmos campos que o gRPC recebe em `arg`, para o digest dos
+    // parâmetros descrever o pedido inteiro e não só o nome da operação.
+    let details = serde_json::json!({
+        "incident_id": incident_id,
+        "proposal_id": body.proposal_id,
+        "approval_id": body.approval_id,
+        "approver": approver,
+        "reason": body.reason,
+    })
+    .to_string();
+    let key = body
+        .idempotency_key
+        .clone()
+        .filter(|k| !k.is_empty())
+        .unwrap_or_else(|| ctx.request_id.clone());
+    let mut op = crate::trusted_admin::AdminOperation::new(
+        key.clone(),
+        key,
+        crate::trusted_admin::AdminOperationKind::Custom {
+            name: operation.into(),
+            details: details.clone(),
+        },
+        "authenticated REST sentinel approval",
+    );
+    op.parameters_digest = blake3::hash(details.as_bytes()).to_hex().to_string();
     let result = tokio::task::spawn_blocking(move || {
-        runtime.persist_human_approval_for(
-            &incident_id,
-            &body.proposal_id,
-            &body.approval_id,
-            &approver,
-            approved,
-            &body.reason,
-        )
+        let result = engine.execute_admin(&ctx, &op, |_token| {
+            runtime
+                .persist_human_approval_for(
+                    &incident_id,
+                    &body.proposal_id,
+                    &body.approval_id,
+                    &approver,
+                    approved,
+                    &body.reason,
+                )
+                .map_err(|error| heraclitus_core::HeraclitusError::Config(error.to_string()))
+        });
+        engine.audit_admin(operation, result.is_ok(), &principal.name);
+        result
     })
     .await;
     match result {
@@ -1453,13 +1580,42 @@ async fn flight_events(
 /// Caveat: `LogAnalytics::from_log` materializa o log até ao head (ou `as_of`)
 /// por chamada — usar `as_of` e `LIMIT`/`WHERE` para consultas grandes.
 #[cfg(feature = "analytics")]
-async fn sql(State(engine): State<Arc<Engine>>, Json(body): Json<serde_json::Value>) -> Response {
+async fn sql(
+    State(engine): State<Arc<Engine>>,
+    Extension(principal): Extension<Principal>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
     use axum::response::IntoResponse;
     let Some(query) = body.get("sql").and_then(|v| v.as_str()).map(str::to_owned) else {
         return (StatusCode::BAD_REQUEST, "corpo requer o campo string `sql`").into_response();
     };
     let as_of = body.get("as_of").and_then(|v| v.as_u64());
-    match run_sql(&engine, query, as_of).await {
+    // Admissão: cada `/sql` materializa até SQL_MAX_BYTES do log FORA do pool
+    // do DataFusion. Sem tecto de concorrência, N pedidos simultâneos
+    // multiplicavam esse pico por N (o Flight já tinha o seu semáforo; o SQL
+    // não). Recusa imediata em vez de fila: uma fila esconderia a pressão e
+    // manteria os pedidos à espera com o corpo já em memória.
+    static ADMISSAO: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    let Ok(_vaga) = ADMISSAO
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(SQL_MAX_CONCURRENT)))
+        .clone()
+        .try_acquire_owned()
+    else {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            format!("SQL ocupado: {SQL_MAX_CONCURRENT} consultas em curso; tente de novo"),
+        )
+            .into_response();
+    };
+    let texto = format!("SQL {query}");
+    let resultado = run_sql(&engine, query, as_of).await;
+    // Meta-auditoria com o TEXTO da consulta (o middleware genérico só vê o
+    // caminho): é o SQL que diz que dados foram lidos.
+    let ok = resultado.is_ok();
+    let auditor = engine.clone();
+    let quem = principal.name.clone();
+    let _ = tokio::task::spawn_blocking(move || auditor.audit_query(&texto, ok, &quem)).await;
+    match resultado {
         Ok(rows) => Json(serde_json::Value::Array(rows)).into_response(),
         Err((code, msg)) => (code, msg).into_response(),
     }
@@ -1475,8 +1631,15 @@ async fn sql(State(engine): State<Arc<Engine>>, Json(body): Json<serde_json::Val
 /// terminar sozinho; daí o orçamento explícito em vez do timeout na construção.
 #[cfg(feature = "analytics")]
 const SQL_MAX_ROWS: usize = 2_000_000;
+/// O mesmo tecto que o `heraclitus_analytics::DEFAULT_MAX_BYTES` documentado
+/// (128 MiB). Estava a 256 MiB: com duas sessões admitidas eram ~512 MiB de
+/// entrada fora do pool do DataFusion, o dobro do que a matriz de correções
+/// declarava.
 #[cfg(feature = "analytics")]
-const SQL_MAX_BYTES: usize = 256 * 1024 * 1024;
+const SQL_MAX_BYTES: usize = heraclitus_analytics::DEFAULT_MAX_BYTES;
+/// Consultas `/sql` simultâneas admitidas.
+#[cfg(feature = "analytics")]
+const SQL_MAX_CONCURRENT: usize = 2;
 
 /// Núcleo testável de `POST /sql`: materializa o log em `spawn_blocking` (nunca
 /// no executor async) e corre o SQL no DataFusion. Erro de SQL do utilizador =
@@ -3091,5 +3254,94 @@ mod rbac_tests {
         assert!(b64_decode("!!!!").is_none(), "fora do alfabeto");
         assert!(b64_decode("QQ").is_none(), "comprimento nao multiplo de 4");
         assert!(b64_decode("=QQQ").is_none(), "padding em posicao ilegal");
+    }
+}
+
+#[cfg(test)]
+mod meta_auditoria_tests {
+    use super::*;
+    use heraclitus_core::{AccessCredential, FsyncPolicy, HeraclitusConfig};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn servir() -> (std::net::SocketAddr, Arc<Engine>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            fsync: FsyncPolicy::Always,
+            audit_queries: true,
+            audit_admin: true,
+            access_credentials: vec![AccessCredential {
+                principal: "auditora".into(),
+                token_blake3: blake3::hash(b"s-auditora").to_hex().to_string(),
+                roles: vec![AccessRole::Auditor],
+            }],
+            ..Default::default()
+        };
+        let engine = Arc::new(Engine::open(&cfg).unwrap());
+        let autenticador = Arc::new(crate::auth::Authenticator::from_config(&cfg).unwrap());
+        let app = router_with_sentinel(
+            engine.clone(),
+            None,
+            None,
+            Vec::new(),
+            false,
+            Some(autenticador),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (addr, engine, dir)
+    }
+
+    async fn get(addr: std::net::SocketAddr, caminho: &str) -> u16 {
+        let req = format!(
+            "GET {caminho} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\
+             Authorization: Basic {}\r\n\r\n",
+            b64(b"auditora:s-auditora")
+        );
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(req.as_bytes()).await.unwrap();
+        let mut resposta = Vec::new();
+        sock.read_to_end(&mut resposta).await.unwrap();
+        String::from_utf8_lossy(&resposta)
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Conferência de 2026-10-02: o `production_mode` exige `audit_queries`,
+    /// mas o REST não auditava nada — e `/titular/:id/acessos` (LGPD art.
+    /// 18) omitia todas as leituras feitas por esta porta.
+    #[tokio::test]
+    async fn leitura_rest_de_um_titular_aparece_nos_acessos_do_titular() {
+        let (addr, engine, _dir) = servir().await;
+        assert_eq!(get(addr, "/titular/mariana-ribeiro").await, 200);
+        let acessos = {
+            let engine = engine.clone();
+            tokio::task::spawn_blocking(move || engine.titular_acessos("mariana-ribeiro", 10))
+                .await
+                .unwrap()
+        };
+        let lista = acessos["acessos"].as_array().unwrap();
+        assert!(
+            lista.iter().any(|a| a["principal"] == "auditora" && a["ok"] == "true"),
+            "a leitura REST tem de ficar registada com a identidade autenticada: {acessos}"
+        );
+    }
+
+    /// As sondas operacionais (sem dados pessoais, consultadas a cada poucos
+    /// segundos pelos painéis) não enchem o log de registos de auditoria.
+    #[tokio::test]
+    async fn sondas_operacionais_nao_sao_meta_auditadas() {
+        let (addr, engine, _dir) = servir().await;
+        let antes = engine.head();
+        for caminho in ["/metrics", "/stats", "/state", "/healthz"] {
+            let codigo = get(addr, caminho).await;
+            assert!(codigo == 200, "{caminho}: {codigo}");
+        }
+        assert_eq!(engine.head(), antes, "sondas não podem escrever no log");
     }
 }

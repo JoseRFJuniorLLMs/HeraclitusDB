@@ -33,6 +33,30 @@ fn internal(e: impl std::fmt::Display) -> Status {
     Status::internal(e.to_string())
 }
 
+/// Tecto de um PEDIDO gRPC (descodificação). Ver o comentário em
+/// `lib.rs::serve`.
+pub const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+/// Tectos por campo, verificados antes de qualquer trabalho caro.
+///
+/// Um único tecto de mensagem para todos os métodos tratava igual um `append`
+/// com um documento e um texto de GQL ou um `arg` administrativo — campos que
+/// nunca precisam de megabytes e que alimentam um parser, um digest e o log
+/// de auditoria (que trunca a 500 caracteres, mas só depois de tudo o resto).
+pub const MAX_GQL_BYTES: usize = 1024 * 1024;
+pub const MAX_ADMIN_ARG_BYTES: usize = 1024 * 1024;
+pub const MAX_ATTRS: usize = 1024;
+pub const MAX_ATTRS_BYTES: usize = 1024 * 1024;
+
+#[allow(clippy::result_large_err)]
+fn limitar(campo: &str, tamanho: usize, tecto: usize) -> Result<(), Status> {
+    if tamanho > tecto {
+        return Err(Status::invalid_argument(format!(
+            "{campo} com {tamanho} bytes excede o tecto de {tecto} bytes"
+        )));
+    }
+    Ok(())
+}
+
 fn episode_json(lsn: u64, e: &Episode) -> String {
     let kind = match &e.kind {
         EventKind::Custom(value) => value.clone(),
@@ -103,6 +127,17 @@ impl pb::heraclitus_server::Heraclitus for Service {
                 euc: r.euc,
             });
         }
+        if r.attrs.len() > MAX_ATTRS {
+            return Err(Status::invalid_argument(format!(
+                "{} atributos excedem o tecto de {MAX_ATTRS}",
+                r.attrs.len()
+            )));
+        }
+        limitar(
+            "attrs",
+            r.attrs.iter().map(|(k, v)| k.len() + v.len()).sum(),
+            MAX_ATTRS_BYTES,
+        )?;
         if r.attrs.keys().any(|key| key.starts_with("__heraclitus_")) {
             return Err(Status::invalid_argument(
                 "atributos com prefixo __heraclitus_ são reservados",
@@ -148,6 +183,7 @@ impl pb::heraclitus_server::Heraclitus for Service {
         &self,
         req: Request<pb::QueryRequest>,
     ) -> Result<Response<pb::QueryResponse>, Status> {
+        limitar("gql", req.get_ref().gql.len(), MAX_GQL_BYTES)?;
         let required = match heraclitus_query::required_access(&req.get_ref().gql)
             .map_err(|e| Status::invalid_argument(e.to_string()))?
         {
@@ -231,8 +267,18 @@ impl pb::heraclitus_server::Heraclitus for Service {
                             let _ = tx.send(Err(Status::internal(e.to_string()))).await;
                             return;
                         }
-                        // Task bloqueante abortada (shutdown): encerra o stream.
-                        Err(_) => return,
+                        // Task bloqueante cancelada (shutdown do runtime):
+                        // encerra o stream. Pânico no scan é OUTRA coisa: um
+                        // EOF limpo dizia ao consumidor que o histórico tinha
+                        // acabado, quando ficou por entregar — tem de chegar
+                        // como erro, como o `Ok(Err(_))` acima.
+                        Err(e) if e.is_cancelled() => return,
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(Status::internal(format!("scan do catch-up: {e}"))))
+                                .await;
+                            return;
+                        }
                     };
                     if batch.is_empty() {
                         break;
@@ -292,6 +338,8 @@ impl pb::heraclitus_server::Heraclitus for Service {
         &self,
         req: Request<pb::AdminRequest>,
     ) -> Result<Response<pb::AdminResponse>, Status> {
+        limitar("admin arg", req.get_ref().arg.len(), MAX_ADMIN_ARG_BYTES)?;
+        limitar("admin op", req.get_ref().op.len(), 256)?;
         let required = match req.get_ref().op.as_str() {
             // `legal-holds` e leitura: saber quem esta retido nao muda nada.
             // Colocar e levantar um hold ficam no ramo Admin abaixo.

@@ -327,9 +327,13 @@ impl LogAnalytics {
         if bytes.is_empty() {
             return Ok(Vec::new());
         }
-        let value: serde_json::Value =
+        // Descodifica directamente para o Vec (sem `Value` intermédio clonado):
+        // a saída deixava de estar em memória três vezes (bytes, `Value`,
+        // clone do array) para estar duas, e os bytes caem logo a seguir.
+        let rows: Vec<serde_json::Value> =
             serde_json::from_slice(&bytes).map_err(|e| AnalyticsError::Arrow(e.to_string()))?;
-        Ok(value.as_array().cloned().unwrap_or_default())
+        drop(bytes);
+        Ok(rows)
     }
 }
 
