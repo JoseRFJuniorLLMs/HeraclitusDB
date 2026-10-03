@@ -330,14 +330,28 @@ impl pb::heraclitus_server::Heraclitus for Service {
         &self,
         req: Request<pb::RecallRequest>,
     ) -> Result<Response<pb::QueryResponse>, Status> {
-        crate::auth::require(&req, AccessRole::Reader)?;
+        let principal = crate::auth::require(&req, AccessRole::Reader)?;
         let r = req.into_inner();
         // R11: hidratação lê do disco (log.read por hit) — fora do reactor.
         let engine = self.engine.clone();
-        let v = tokio::task::spawn_blocking(move || engine.recall(&r.text, r.k.max(1) as usize))
-            .await
-            .map_err(internal)?
-            .map_err(internal)?;
+        let v = tokio::task::spawn_blocking(move || {
+            let k = r.k.max(1) as usize;
+            let result = engine.recall(&r.text, k);
+            // Auditoria recursiva 2026-10-03, iteração 2: o Recall devolve o
+            // conteúdo hidratado e não deixava rasto, enquanto o MESMO `RECALL`
+            // pelo Query (GQL), o Flight e o REST ficam auditados — e o
+            // `production_mode` exige `audit_queries`. O texto vai no registo
+            // para o relatório LGPD art. 18 (`titular_acessos`) o encontrar.
+            engine.audit_query(
+                &format!("gRPC Recall k={k} {}", r.text),
+                result.is_ok(),
+                &principal.name,
+            );
+            result
+        })
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
         Ok(Response::new(pb::QueryResponse {
             json: v.to_string(),
         }))
@@ -349,10 +363,26 @@ impl pb::heraclitus_server::Heraclitus for Service {
         &self,
         req: Request<pb::SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
-        crate::auth::require(&req, AccessRole::Reader)?;
+        let principal = crate::auth::require(&req, AccessRole::Reader)?;
         let from = req.into_inner().from_lsn;
-        let (tx, rx) = tokio::sync::mpsc::channel(256);
         let engine = self.engine.clone();
+        // Auditoria recursiva 2026-10-03, iteração 2: o Subscribe entrega
+        // conteúdo e attrs de todos os episódios desde `from_lsn` (o log
+        // inteiro com `from_lsn: 0`) e não deixava rasto — o mesmo buraco já
+        // fechado no Flight DoGet e no REST. Regista-se ANTES de abrir o
+        // stream (o append é bloqueante, daí a pool bloqueante) para o
+        // registo preceder a entrega.
+        let audit_engine = engine.clone();
+        tokio::task::spawn_blocking(move || {
+            audit_engine.audit_query(
+                &format!("gRPC Subscribe from_lsn={from}"),
+                true,
+                &principal.name,
+            )
+        })
+        .await
+        .map_err(internal)?;
+        let (tx, rx) = tokio::sync::mpsc::channel(256);
         let mut live = engine.log.tail_subscribe();
         tokio::spawn(async move {
             // History first, then bridge the live tail. Audit #6: when the
@@ -1494,6 +1524,66 @@ mod testes_dimensao_do_embedding {
             engine.trusted_admin().operation_state(&ctx, "K-2"),
             Some(crate::trusted_admin::AdminState::Reconciled)
         );
+    }
+
+    /// Auditoria recursiva 2026-10-03, iteração 2: com `audit_queries`
+    /// ligado (obrigatório em `production_mode`), o Recall e o Subscribe
+    /// devolviam conteúdo a um Reader sem escrever nenhum AuditQuery.
+    #[tokio::test]
+    async fn recall_e_subscribe_ficam_na_meta_auditoria() {
+        use tokio_stream::StreamExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = HeraclitusConfig {
+            data_dir: dir.path().to_path_buf(),
+            audit_queries: true,
+            ..HeraclitusConfig::default()
+        };
+        let engine = Arc::new(Engine::open(&cfg).unwrap());
+        let svc = Service::new(engine.clone());
+        svc.append(pedido(vec![], vec![], vec![])).await.unwrap();
+        let leitor = Principal {
+            name: "leitor".into(),
+            roles: Arc::new(vec![AccessRole::Reader]),
+        };
+
+        let mut req = Request::new(pb::RecallRequest {
+            text: "maria".into(),
+            k: 10,
+        });
+        req.extensions_mut().insert(leitor.clone());
+        svc.recall(req).await.unwrap();
+
+        let mut req = Request::new(pb::SubscribeRequest { from_lsn: 0 });
+        req.extensions_mut().insert(leitor);
+        let mut stream = svc.subscribe(req).await.unwrap().into_inner();
+        // Consome o primeiro episódio para garantir que o stream entregou dados.
+        assert!(stream.next().await.unwrap().is_ok());
+        drop(stream);
+
+        let auditorias: Vec<String> = engine
+            .log
+            .scan(0, u64::MAX)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, e)| {
+                e.attrs.get("audit").map(String::as_str) == Some("query")
+                    && e.attrs.get("principal").map(String::as_str) == Some("leitor")
+            })
+            .map(|(_, e)| String::from_utf8_lossy(&e.content).into_owned())
+            .collect();
+        assert!(
+            auditorias
+                .iter()
+                .any(|t| t.starts_with("gRPC Recall") && t.contains("maria")),
+            "{auditorias:?}"
+        );
+        assert!(
+            auditorias.iter().any(|t| t == "gRPC Subscribe from_lsn=0"),
+            "{auditorias:?}"
+        );
+        // O relatório de acessos do titular passa a ver o Recall.
+        let r = engine.titular_acessos("maria", 100);
+        assert_eq!(r["total"], 1, "{r}");
     }
 
     /// Segunda ronda: num índice vazio o `embedding_layout()` era None para
