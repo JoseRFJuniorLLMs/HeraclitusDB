@@ -80,6 +80,8 @@ impl EvidencePackageBuilder {
             }
             self.manifest.merkle.root_blake3 = hasher.finalize().to_hex().to_string();
             self.manifest.merkle.leaves_count = self.manifest.objects.len() as u64;
+        } else if self.manifest.merkle.leaves_count == 0 {
+            self.manifest.merkle.leaves_count = self.manifest.objects.len() as u64;
         }
 
         let mut sha = Sha256::new();

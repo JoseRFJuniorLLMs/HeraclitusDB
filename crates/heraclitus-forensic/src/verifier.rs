@@ -325,6 +325,9 @@ impl EvidenceVerifier {
                 next_step += 1;
                 previous_hash = entry.entry_hash;
             }
+            if next_step == 0 {
+                return Err(VerifierError::BrokenCustodyChain { step: 0 });
+            }
         }
 
         // Verify Merkle
@@ -353,6 +356,10 @@ impl EvidenceVerifier {
             return Err(VerifierError::Invalid(
                 "SHA256 object commitment mismatch".into(),
             ));
+        }
+        let proof_path = self.package_dir.join("proofs").join("merkle.json");
+        if !proof_path.exists() {
+            return Err(VerifierError::MissingFile("proofs/merkle.json".to_string()));
         }
         let proof: serde_json::Value = serde_json::from_slice(&crate::safe_fs::read(
             &self.package_dir,

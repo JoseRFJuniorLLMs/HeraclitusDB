@@ -277,6 +277,108 @@ mod tests {
             Err(VerifierError::CustodyDigestMismatch { .. })
         ));
     }
+
+    #[test]
+    fn missing_merkle_proof_returns_missing_file_error() {
+        let dir = tempdir().unwrap();
+        let target_dir = dir.path().join("evidence_pkg");
+        let manifest = create_test_manifest();
+        let mut builder = EvidencePackageBuilder::new(manifest);
+        builder.build(&target_dir).expect("Failed to build package");
+
+        // Remove o proofs/merkle.json
+        fs::remove_file(target_dir.join("proofs/merkle.json")).unwrap();
+
+        let verifier = EvidenceVerifier::new(&target_dir);
+        let result = verifier.verify();
+        assert!(
+            matches!(result, Err(VerifierError::MissingFile(ref f)) if f == "proofs/merkle.json"),
+            "deve retornar MissingFile para proofs/merkle.json: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn empty_whitespace_custody_file_fails_with_broken_custody_chain() {
+        let dir = tempdir().unwrap();
+        let target_dir = dir.path().join("evidence_pkg");
+        let manifest = create_test_manifest();
+        let mut builder = EvidencePackageBuilder::new(manifest);
+        let mut entry = CustodyEntry {
+            step_index: 0,
+            timestamp_secs: 1600000001,
+            action: CustodyAction::Reconhecimento,
+            operator_principal: "op-1".to_string(),
+            terminal_or_node: "node-1".to_string(),
+            previous_entry_hash: "".to_string(),
+            entry_hash: "".to_string(),
+        };
+        entry.entry_hash = entry.compute_hash();
+        builder.add_custody_entry(entry);
+        builder.build(&target_dir).expect("Failed to build package");
+
+        // Substitui custody.jsonl por espaços em branco e atualiza custody_digest no manifest
+        let empty_content = b"\n   \n\t\n";
+        fs::write(target_dir.join("provenance/custody.jsonl"), empty_content).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(empty_content);
+        let empty_digest = hex::encode(hasher.finalize());
+
+        let manifest_file = target_dir.join("manifest.json");
+        let mut m: EvidenceManifest =
+            serde_json::from_slice(&fs::read(&manifest_file).unwrap()).unwrap();
+        m.custody_digest = empty_digest;
+        let m_bytes = serde_json::to_vec_pretty(&m).unwrap();
+        fs::write(&manifest_file, &m_bytes).unwrap();
+        let mut m_hasher = Sha256::new();
+        m_hasher.update(&m_bytes);
+        fs::write(
+            target_dir.join("manifest.sha256"),
+            format!("{}  manifest.json\n", hex::encode(m_hasher.finalize())),
+        )
+        .unwrap();
+
+        let verifier = EvidenceVerifier::new(&target_dir);
+        let result = verifier.verify();
+        assert!(
+            matches!(result, Err(VerifierError::BrokenCustodyChain { step: 0 })),
+            "cadeia vazia deve falhar como BrokenCustodyChain no step 0: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn builder_populates_leaves_count_when_root_blake3_is_manually_set() {
+        let dir = tempdir().unwrap();
+        let target_dir = dir.path().join("evidence_pkg");
+        let mut manifest = create_test_manifest();
+        let data = b"test object content";
+        let sha256_hex = hex::encode(Sha256::digest(data));
+        let blake3_hex = blake3::hash(data).to_hex().to_string();
+        let obj = EvidenceObject {
+            object_id: "obj-manual".to_string(),
+            relative_path: "evidence/manual.txt".to_string(),
+            size_bytes: data.len() as u64,
+            sha256_hex,
+            blake3_hex: blake3_hex.clone(),
+            content_type: "text/plain".to_string(),
+            source_lsn: Some(1),
+        };
+        manifest.objects.push(obj.clone());
+        // A raiz é o hash de blake3_hex
+        let mut h = blake3::Hasher::new();
+        h.update(blake3_hex.as_bytes());
+        manifest.merkle.root_blake3 = h.finalize().to_hex().to_string();
+        manifest.merkle.leaves_count = 0; // omitido pelo chamador
+
+        let mut builder = EvidencePackageBuilder::new(manifest);
+        builder.add_object_data(obj, data.to_vec());
+        builder.build(&target_dir).expect("Failed to build package");
+
+        let verifier = EvidenceVerifier::new(&target_dir);
+        let verified = verifier.verify().expect("deve verificar com sucesso");
+        assert_eq!(verified.merkle.leaves_count, 1);
+    }
 }
 
 #[cfg(test)]
