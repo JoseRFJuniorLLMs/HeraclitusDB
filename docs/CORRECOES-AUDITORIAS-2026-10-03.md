@@ -7,7 +7,7 @@ Documento complementar a [`CORRECOES-AUDITORIAS-2026-10-02.md`](CORRECOES-AUDITO
 
 ## 1. Método e Auditoria Recursiva
 
-Após as rondas 1 e 2 de auditoria e estabilização de produção, foi executado um ciclo de **auditoria recursiva multi-agente** com verificação adversarial independente em 5 rondas consecutivas (Rondas 3 a 7). Cada achado potencial foi submetido a três critérios de refutação antes de qualquer correção de código:
+Após as rondas 1 e 2 de auditoria e estabilização de produção, foi executado um ciclo de **auditoria recursiva multi-agente** com verificação adversarial independente em 10 rondas consecutivas (Rondas 3 a 12). Cada achado potencial foi submetido a três critérios de refutação antes de qualquer correção de código:
 1. **Correção:** O comportamento observado viola uma invariante contratual formal (SPEC, RFC ou garantia do banco)?
 2. **Reprodução:** Existe prova de conceito determinística ou teste que falhe no estado atual?
 3. **Impacto:** O problema afeta produção ou caminhos públicos suportados, sem falsos positivos ou suposições inválidas?
@@ -16,7 +16,7 @@ Todas as correções implementadas foram acompanhadas de testes unitários ou de
 
 ---
 
-## 2. Matriz de Correções (Rondas 3 a 7)
+## 2. Matriz de Correções (Rondas 3 a 12)
 
 | Ronda | Commit | Crate | Defeito Confirmado | Correção Implementada | Teste de Regressão |
 |---|---|---|---|---|---|
@@ -32,6 +32,11 @@ Todas as correções implementadas foram acompanhadas de testes unitários ou de
 | **5** | `5a12c5c` | `heraclitus-tier` | No Windows NTFS, `remove_dir_all` de diretórios de scratch temporários podia falhar com violação de compartilhamento. | Fallback para remoção arquivo por arquivo antes da exclusão do diretório em `LimpezaDir::drop`. | Testes de ciclo de vida de compilação e teste no Windows |
 | **6** | `9b0d679` | `heraclitus-crypto` | Arquivo de chave com tamanho > 32 bytes causava spin-wait desnecessário de 100ms em `get_or_create` e reportava erro de "artefacto de crash". | Detecção imediata de arquivos maiores que 32 bytes com retorno rápido (`fail-fast`) do erro original de `InvalidData: expected 32`. | `get_or_create_fails_fast_on_oversized_key_file` |
 | **7** | `7b53db9` | `heraclitus-views` | Condição de laço `while cur <= head` no replay de views executava varredura vazia de I/O (`scan_capped(head, head, 256)`) na fronteira final ou em logs vazios. | Alinhamento da condição para limite superior exclusivo `while cur < head`, idêntico ao `rebuild` e à semântica canônica de `head()`. | `wipe_and_replay_is_deterministic`, `empty_view_replays_from_zero_despite_persisted_watermark` |
+| **8** | `1f91d1c` | `heraclitus-forensic` | Falta de checagem explícita de existência de `proofs/merkle.json` no verificador (retornava `Io` genérico); cadeia de custódia vazia/whitespace aceita como válida; dessincronização de contagem de folhas quando raiz Merkle é injetada manualmente. | Validação prévia retornando `VerifierError::MissingFile("proofs/merkle.json")`; recusa de custódia vazia com `BrokenCustodyChain { step: 0 }`; sincronização automática de `leaves_count = objects.len()`. | `missing_merkle_proof_returns_missing_file_error`, `empty_whitespace_custody_file_fails_with_broken_custody_chain`, `builder_populates_leaves_count_when_root_blake3_is_manually_set` |
+| **9** | `0217756` | `heraclitus-telemetry-health` | Em `TelemetryHealthGraph::restore`, quando o mapa `latest` do snapshot estava vazio ou podado, `highest_retained_lsn` permanecia 0 ignorando eventos retidos. | Cálculo do LSN máximo combinando `events.last_key_value()` e `snapshot.latest.values()`. | `checkpoint_restore_with_retained_events_populates_highest_retained_lsn` |
+| **10** | `c0998be` | `heraclitus-activation` | Em `ActivationStore::spread`, spreading activation de ACT-R com múltiplos nós de contexto sobrescrevia os pesos em nós compartilhados em vez de acumular; duplicava IDs na saída. | Agregação somatória dos pesos (`base + spread_weight`) em `BTreeMap` e desduplicação determinística na saída. | `spread_deduplicates_and_sums_weights_from_multiple_context_sources` |
+| **11** | `48035c8` | `heraclitus-case` | Admissão de segundo `CaseEvent::CaseOpened` em caso já ativo (`revision > 0`) sobrescrevia SLA e proveniência original (`SPEC-0071 §8.4`), mantendo morto o erro `CaseError::JaAberto`. | Rejeição explícita de `CaseOpened` com `CaseError::JaAberto` quando `self.revision > 0`, preservando a imutabilidade do caso. | `segundo_case_opened_em_caso_existente_falha_com_ja_aberto` |
+| **12** | `2d68eb0` | `heraclitus-memtable` | No laço de evicção de `Memtable::apply`, ausência de `else { break; }` quando `entries.pop_front()` retornava `None` sob estouro de contabilidade de bytes causava loop infinito segurando o lock de escrita `entries.write()` (DoS). `fetch_sub` suscetível a underflow. | Saída defensiva imediata (`break`) e reset de `bytes` para 0 ao esvaziar entradas; uso de `subtract_bytes` com `saturating_sub`. | `eviction_breaks_safely_when_entries_empty_and_bytes_saturate` |
 
 ---
 
@@ -45,8 +50,13 @@ Todas as suítes de testes dos crates afetados foram executadas e validadas:
 - **`heraclitus-tier`**: 100/100 testes aprovados (82 testes unitários + 5 de repack + 6 de object storage + 7 de lakehouse).
 - **`heraclitus-views`**: 20/20 testes aprovados (incluindo `catch_up_com_extra`, `ckpt_integridade`, `fast_boot`, `rebuild_nao_salta_buraco`, `skip_replay`).
 - **`heraclitus-compliance`**: 178/178 testes aprovados.
+- **`heraclitus-forensic`**: 15/15 testes aprovados.
+- **`heraclitus-telemetry-health`**: 28/28 testes aprovados.
+- **`heraclitus-activation`**: 12/12 testes aprovados.
+- **`heraclitus-case`**: 17/17 testes aprovados.
+- **`heraclitus-memtable`**: 5/5 testes aprovados.
 
-Total: **362 testes aprovados** sem falhas ou regressões.
+Total: **439 testes aprovados** sem falhas ou regressões.
 
 ---
 
@@ -56,13 +66,22 @@ Total: **362 testes aprovados** sem falhas ou regressões.
   - Garantida imutabilidade dupla na publicação de segmentos e metadados Parquet (`put_immutable_segment`, `put_immutable_parquet`).
   - Repacks isolados em diretórios temporários atômicos por execução, eliminando interferência concorrente de arquivos scratch.
   - Recusa formal de sobrescrita de gerações compactadas legadas quando a raiz Merkle calculada diverge da raiz registrada.
+- **SPEC-0071 (Case Lifecycle & Immutable Deadlines):**
+  - Imutabilidade da inicialização do caso: segundo evento `CaseOpened` é estritamente recusado com `CaseError::JaAberto`, resguardando metas de SLA e auditoria forense.
 - **SPEC-0074 & SPEC-0085 (Agent Evidence Gateway & In-Flight Flood):**
   - Deduplicação atômica em voo (`InFlightGuard`): evidências concorrentes com mesma chave aguardam resolução sem corromper o índice.
   - Gravação garantida: a evidência só se torna durável na memória de deduplicação após confirmação de escrita pelo `EvidenceLog`.
   - Mensagens de erro de conflito exibem a chave canônica calculada, assegurando auditabilidade forense.
+- **SPEC-0087 (Forensic Package & Verifier Contracts):**
+  - Exigência explícita de `proofs/merkle.json` com retorno uniforme de `VerifierError::MissingFile`.
+  - Rejeição de cadeias de custódia vazias ou compostas puramente por whitespace com `BrokenCustodyChain { step: 0 }`.
+  - Sincronização automática e garantida do número de folhas no manifesto quando a raiz Merkle for gerada ou sobrescrita.
 - **Raft Durabilidade e Recuperação:**
   - Validação estrita da cobertura da fronteira comprometida antes de qualquer mutação ou truncamento do WAL.
   - Detecção imediata de registros ausentes ou corrompidos sem registro de purga.
+- **Memtable & Tail Invariants:**
+  - Garantia de terminação do laço de evicção mesmo sob anomalias de contadores de memória em runtime.
+  - Subtração saturada de bytes prevenindo underflow atômico e deadlocks em cascata sob write locks.
 - **Views e Checkpoints:**
   - Limite de varredura exclusivo alinhado (`cur < head`), evitando overhead de I/O em logs vazios ou completamente consumidos.
   - Checkpoint v1 com cabeçalho, CRC32 e integridade de formato preservada.
