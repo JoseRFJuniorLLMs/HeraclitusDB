@@ -382,6 +382,9 @@ impl CaseState {
         if self.applied_commands.contains(&envelope.command_id) {
             return Ok(false);
         }
+        if matches!(envelope.event, CaseEvent::CaseOpened { .. }) && self.revision > 0 {
+            return Err(CaseError::JaAberto(self.case_id.clone()));
+        }
         if envelope.expected_revision != self.revision {
             return Err(CaseError::Conflito {
                 case_id: self.case_id.clone(),
@@ -767,6 +770,37 @@ mod tests {
             &gravado,
             "mudar a prioridade nao pode mexer nos prazos ja fixados"
         );
+    }
+
+    #[test]
+    fn segundo_case_opened_em_caso_existente_falha_com_ja_aberto() {
+        let mut estado = CaseState::novo("case-1");
+        estado.aplicar(&abrir(0, "c1")).unwrap();
+
+        // Tenta enviar um segundo CaseOpened com a revisão corrente (1)
+        let segundo_abrir = CaseEnvelope::novo(
+            "case-1",
+            "c2-abrir",
+            1,
+            "analista-b",
+            "tentativa indevida de reabrir do zero",
+            CaseEvent::CaseOpened {
+                title: "Novo título forjado".into(),
+                priority: CasePriority::Low,
+                opened_by: "analista-b".into(),
+                sla: SlaDeadlines {
+                    policy_version: "sla-v2-relaxado".into(),
+                    triage_due_micros: Some(999_999),
+                    investigation_due_micros: None,
+                    containment_due_micros: None,
+                    review_due_micros: None,
+                    regulatory_due_micros: None,
+                },
+            },
+        );
+
+        let err = estado.aplicar(&segundo_abrir).unwrap_err();
+        assert_eq!(err, CaseError::JaAberto("case-1".to_string()));
     }
 
     /// §8.5 — os tipos de evidencia sao distintos e nao se confundem.
