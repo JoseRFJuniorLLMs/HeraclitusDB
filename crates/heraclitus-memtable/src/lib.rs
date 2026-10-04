@@ -62,11 +62,11 @@ impl Memtable {
         // senão perde-se read-your-own-writes.
         while entries.len() > self.cap || self.resident_bytes() > self.byte_cap {
             if let Some((_, evicted)) = entries.pop_front() {
-                self.bytes.fetch_sub(
-                    evicted.resident_bytes(),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                self.subtract_bytes(evicted.resident_bytes());
                 self.forget_adjacency(&evicted);
+            } else {
+                self.bytes.store(0, std::sync::atomic::Ordering::Relaxed);
+                break;
             }
         }
     }
@@ -76,13 +76,23 @@ impl Memtable {
         let mut entries = self.entries.write().unwrap();
         while matches!(entries.front(), Some((l, _)) if *l <= watermark) {
             if let Some((_, evicted)) = entries.pop_front() {
-                self.bytes.fetch_sub(
-                    evicted.resident_bytes(),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                self.subtract_bytes(evicted.resident_bytes());
                 self.forget_adjacency(&evicted);
+            } else {
+                break;
             }
         }
+        if entries.is_empty() {
+            self.bytes.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn subtract_bytes(&self, amount: usize) {
+        let _ = self.bytes.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |curr| Some(curr.saturating_sub(amount)),
+        );
     }
 
     /// Audit #12: evicted episodes must take their adjacency rows with them,
@@ -316,5 +326,24 @@ mod byte_budget_regression {
         );
         mem.clear();
         assert_eq!(mem.resident_bytes(), 0);
+    }
+
+    #[test]
+    fn eviction_breaks_safely_when_entries_empty_and_bytes_saturate() {
+        let mem = Memtable::with_byte_budget(10, 100);
+        for lsn in 0..5 {
+            mem.apply(
+                lsn,
+                Episode::new(
+                    "agent",
+                    heraclitus_core::EventKind::Observation,
+                    vec![0; 200],
+                ),
+            );
+        }
+        assert!(mem.len() <= 1);
+        mem.clear();
+        assert_eq!(mem.resident_bytes(), 0);
+        assert_eq!(mem.len(), 0);
     }
 }
