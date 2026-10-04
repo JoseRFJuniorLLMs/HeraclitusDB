@@ -211,7 +211,8 @@ impl ActivationStore {
         now_secs: u64,
         weight: f64,
     ) -> Vec<ActivationHit> {
-        let mut out = Vec::new();
+        let mut map: std::collections::BTreeMap<EventId, (f64, f64)> =
+            std::collections::BTreeMap::new();
         for c in context {
             for (i, n) in neighbors(c).into_iter().enumerate() {
                 if i >= 64 {
@@ -219,14 +220,19 @@ impl ActivationStore {
                 }
                 let base = self.score(&n, now_secs).unwrap_or(f64::NEG_INFINITY);
                 if base.is_finite() {
-                    out.push(ActivationHit {
-                        id: n,
-                        score: (base + weight) as f32,
-                    });
+                    let entry = map.entry(n).or_insert((base, 0.0));
+                    entry.1 += weight;
                 }
             }
         }
-        out.sort_by(|a, b| b.score.total_cmp(&a.score));
+        let mut out: Vec<ActivationHit> = map
+            .into_iter()
+            .map(|(id, (base, spread_w))| ActivationHit {
+                id,
+                score: (base + spread_w) as f32,
+            })
+            .collect();
+        out.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
         out
     }
 
@@ -606,5 +612,46 @@ mod testes_otimizacao {
             (antes - depois).abs() < 1e-9,
             "o score nao pode mudar ao atravessar o checkpoint: {antes} vs {depois}"
         );
+    }
+
+    #[test]
+    fn spread_deduplicates_and_sums_weights_from_multiple_context_sources() {
+        let store = ActivationStore::new(0.5);
+        let c1 = EventId::new();
+        let c2 = EventId::new();
+        let shared_neighbor = EventId::new();
+        let unique_neighbor = EventId::new();
+
+        store.touch(shared_neighbor, 1_000);
+        store.touch(unique_neighbor, 1_000);
+
+        let now = 2_000;
+        let base_shared = store.score(&shared_neighbor, now).unwrap();
+        let base_unique = store.score(&unique_neighbor, now).unwrap();
+        let weight = 1.5f64;
+
+        let neighbors_fn = |node: &EventId| {
+            if *node == c1 {
+                vec![shared_neighbor, unique_neighbor]
+            } else if *node == c2 {
+                vec![shared_neighbor]
+            } else {
+                vec![]
+            }
+        };
+
+        let hits = store.spread(&[c1, c2], neighbors_fn, now, weight);
+
+        // shared_neighbor deve aparecer apenas uma vez
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, shared_neighbor);
+        assert_eq!(hits[1].id, unique_neighbor);
+
+        // shared_neighbor recebe 2 * weight
+        let expected_shared = (base_shared + 2.0 * weight) as f32;
+        let expected_unique = (base_unique + 1.0 * weight) as f32;
+
+        assert!((hits[0].score - expected_shared).abs() < 1e-5);
+        assert!((hits[1].score - expected_unique).abs() < 1e-5);
     }
 }
