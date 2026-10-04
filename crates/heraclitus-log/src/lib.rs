@@ -88,10 +88,32 @@ fn hex_decode(text: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+/// AAD **v1 legada** do envelope de atributos. Só serve para abrir blobs
+/// `HRKLENC1` já persistidos; a escrita usa [`fields_ctx`].
 fn fields_aad(agent_id: &str) -> Vec<u8> {
     let mut aad = agent_id.as_bytes().to_vec();
     aad.extend_from_slice(b"\0fields-v1");
     aad
+}
+
+/// Contexto AEAD v2 do `content` cifrado: liga o blob ao `event_id`, para
+/// que o ciphertext de um evento não decifre colado noutro (cut-and-paste).
+fn content_ctx(episode: &Episode) -> heraclitus_crypto::RecordContext<'_> {
+    heraclitus_crypto::RecordContext {
+        agent_id: &episode.agent_id,
+        event_id: episode.id.0.to_bytes(),
+        purpose: b"content",
+    }
+}
+
+/// Contexto AEAD v2 do envelope de atributos/embedding. A finalidade difere
+/// da do `content`, pelo que os dois blobs do mesmo evento não são trocáveis.
+fn fields_ctx(episode: &Episode) -> heraclitus_crypto::RecordContext<'_> {
+    heraclitus_crypto::RecordContext {
+        agent_id: &episode.agent_id,
+        event_id: episode.id.0.to_bytes(),
+        purpose: b"fields",
+    }
 }
 
 fn segment_path(dir: &Path, id: SegmentId) -> PathBuf {
@@ -403,7 +425,7 @@ pub(crate) fn encode_storage_payload_v6(
                 .get_or_create(&episode.agent_id)
                 .map_err(|e| HeraclitusError::Crypto(format!("Keystore Isolation Fault: {e:?}")))?;
             let stored_content =
-                heraclitus_crypto::seal(&key, &episode.content, episode.agent_id.as_bytes());
+                heraclitus_crypto::seal_record(&key, &episode.content, &content_ctx(episode));
             let public_attrs = episode
                 .attrs
                 .iter()
@@ -422,7 +444,7 @@ pub(crate) fn encode_storage_payload_v6(
             let encoded = bincode::serde::encode_to_vec(&sensitive, BINCODE_CFG)
                 .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
             let sealed_fields =
-                heraclitus_crypto::seal(&key, &encoded, &fields_aad(&episode.agent_id));
+                heraclitus_crypto::seal_record(&key, &encoded, &fields_ctx(episode));
             let mut attrs = public_attrs;
             attrs.insert(ENCRYPTED_FIELDS_ATTR.into(), hex_encode(&sealed_fields));
             (stored_content, attrs, None)
@@ -579,8 +601,18 @@ pub(crate) fn decrypt_storage_episode_in_place(
     // Custo aceite: para um agente já shredded, um registo da geração nova
     // adulterado também sai como tombstone (fica ilegível na mesma, e a
     // integridade física continua guardada pelos checksums dos frames).
+    //
+    // O magic do blob decide a AAD: `HRKLENC2` autentica o `event_id` deste
+    // episódio (um blob colado de outro evento falha a tag e cai no ramo de
+    // adulteração); `HRKLENC1` é um registo legado e abre com a AAD antiga.
     if encrypted_content {
-        match heraclitus_crypto::open(&key, &ep.content, ep.agent_id.as_bytes()) {
+        let opened = heraclitus_crypto::open_record(
+            &key,
+            &ep.content,
+            &content_ctx(ep),
+            ep.agent_id.as_bytes(),
+        );
+        match opened {
             Some(opened) => ep.content = opened,
             None if ks.was_shredded(&ep.agent_id) => {
                 apply_shredded_tombstone(ep);
@@ -602,7 +634,13 @@ pub(crate) fn decrypt_storage_episode_in_place(
                 ep.agent_id
             ))
         })?;
-        let opened = match heraclitus_crypto::open(&key, &sealed, &fields_aad(&ep.agent_id)) {
+        let opened = heraclitus_crypto::open_record(
+            &key,
+            &sealed,
+            &fields_ctx(ep),
+            &fields_aad(&ep.agent_id),
+        );
+        let opened = match opened {
             Some(opened) => opened,
             None if ks.was_shredded(&ep.agent_id) => {
                 apply_shredded_tombstone(ep);
@@ -640,6 +678,156 @@ impl StoragePayload {
             parents: self.parents,
             valid_from: self.valid_from,
             valid_to: self.valid_to,
+        }
+    }
+}
+
+/// AAD v2 do AEAD (item `aead-aad`): o blob cifrado fica ligado ao
+/// `event_id` e à finalidade; blobs v1 legados continuam a abrir.
+#[cfg(test)]
+mod testes_aad_v2 {
+    use super::*;
+
+    const AGENTE: &str = "titular:hmac-sha256:abc";
+
+    fn episodio(conteudo: &[u8], actor: &str) -> Episode {
+        let mut ep = Episode::new(
+            AGENTE,
+            EventKind::Custom("OperationalFact".into()),
+            conteudo.to_vec(),
+        );
+        ep.attrs.insert("actor_name".into(), actor.into());
+        ep.attrs.insert(
+            "__heraclitus_idempotency_key".into(),
+            "0123456789abcdef".into(),
+        );
+        ep.embedding = Some(ProductPoint {
+            hyp: vec![0.25, 0.5],
+            sph: vec![],
+            euc: vec![42.0],
+        });
+        ep
+    }
+
+    /// O episódio exactamente como fica persistido (cifrado), relido do payload.
+    fn persistido(ep: &Episode, ks: &KeyStore) -> Episode {
+        let payload = encode_storage_payload_v6([0; 16], ep, Some(ks)).unwrap();
+        decode_episode_payload_with_meta(format::FORMAT_VERSION, &payload)
+            .unwrap()
+            .episode
+    }
+
+    fn envelope_de_atributos(ep: &Episode) -> Vec<u8> {
+        hex_decode(&ep.attrs[ENCRYPTED_FIELDS_ATTR]).unwrap()
+    }
+
+    #[test]
+    fn a_escrita_sela_conteudo_e_atributos_no_envelope_v2() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = KeyStore::open(dir.path()).unwrap();
+        let guardado = persistido(&episodio(b"segredo", "Carlos"), &ks);
+        assert_eq!(
+            heraclitus_crypto::sealed_version(&guardado.content),
+            Some(heraclitus_crypto::SealVersion::V2)
+        );
+        assert_eq!(
+            heraclitus_crypto::sealed_version(&envelope_de_atributos(&guardado)),
+            Some(heraclitus_crypto::SealVersion::V2)
+        );
+    }
+
+    /// Cut-and-paste: dois eventos do mesmo agente partilham a chave. Colar
+    /// o `content` (ou o envelope de atributos) de B no registo de A tinha de
+    /// ser detectado — com a AAD v1 (só o agente) decifrava sem erro e A
+    /// passava a mostrar os dados de B.
+    #[test]
+    fn trocar_ciphertexts_entre_eventos_falha_a_decifragem() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = KeyStore::open(dir.path()).unwrap();
+        let a = persistido(&episodio(b"evento A", "Ana"), &ks);
+        let b = persistido(&episodio(b"evento B", "Bruno"), &ks);
+
+        let mut conteudo_trocado = a.clone();
+        conteudo_trocado.content = b.content.clone();
+        let erro = decrypt_storage_episode_in_place(&mut conteudo_trocado, Some(&ks));
+        assert!(
+            matches!(erro, Err(HeraclitusError::Crypto(_))),
+            "content de outro evento decifrou: {erro:?} / {:?}",
+            String::from_utf8_lossy(&conteudo_trocado.content)
+        );
+
+        let mut atributos_trocados = a.clone();
+        atributos_trocados.attrs.insert(
+            ENCRYPTED_FIELDS_ATTR.into(),
+            b.attrs[ENCRYPTED_FIELDS_ATTR].clone(),
+        );
+        let erro = decrypt_storage_episode_in_place(&mut atributos_trocados, Some(&ks));
+        assert!(
+            matches!(erro, Err(HeraclitusError::Crypto(_))),
+            "envelope de atributos de outro evento decifrou: {erro:?}"
+        );
+
+        // No mesmo evento, o envelope de atributos não serve de `content`.
+        let mut finalidade_trocada = a.clone();
+        finalidade_trocada.content = envelope_de_atributos(&a);
+        assert!(matches!(
+            decrypt_storage_episode_in_place(&mut finalidade_trocada, Some(&ks)),
+            Err(HeraclitusError::Crypto(_))
+        ));
+
+        // O registo intacto continua a abrir.
+        let mut intacto = a.clone();
+        decrypt_storage_episode_in_place(&mut intacto, Some(&ks)).unwrap();
+        assert_eq!(intacto.content, b"evento A");
+        assert_eq!(intacto.attrs["actor_name"], "Ana");
+        assert!(intacto.embedding.is_some());
+    }
+
+    /// Um registo v1 tal como a geração anterior o escrevia: `content` selado
+    /// com AAD = `agent_id` e atributos selados com `fields_aad`.
+    fn registo_v1(ks: &KeyStore, conteudo: &[u8], actor: &str) -> Episode {
+        let key = ks.get_or_create(AGENTE).unwrap();
+        let mut ep = Episode::new(
+            AGENTE,
+            EventKind::Custom("OperationalFact".into()),
+            heraclitus_crypto::seal_v1(&key, conteudo, AGENTE.as_bytes()),
+        );
+        let sensiveis = SensitiveFields {
+            attrs: [("actor_name".to_string(), actor.to_string())].into(),
+            embedding: Some(ProductPoint {
+                hyp: vec![0.5],
+                sph: vec![],
+                euc: vec![],
+            }),
+        };
+        let codificado = bincode::serde::encode_to_vec(&sensiveis, BINCODE_CFG).unwrap();
+        let selado = heraclitus_crypto::seal_v1(&key, &codificado, &fields_aad(AGENTE));
+        ep.attrs
+            .insert(ENCRYPTED_FIELDS_ATTR.into(), hex_encode(&selado));
+        ep
+    }
+
+    #[test]
+    fn registos_v1_continuam_a_decifrar_e_o_shred_apaga_as_duas_versoes() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = KeyStore::open(dir.path()).unwrap();
+        let legado = registo_v1(&ks, b"dados de 2025", "Carlos");
+        let novo = persistido(&episodio(b"dados novos", "Ana"), &ks);
+
+        let mut lido = legado.clone();
+        decrypt_storage_episode_in_place(&mut lido, Some(&ks)).unwrap();
+        assert_eq!(lido.content, b"dados de 2025");
+        assert_eq!(lido.attrs["actor_name"], "Carlos");
+        assert!(lido.embedding.is_some());
+        assert!(!lido.attrs.contains_key(ENCRYPTED_FIELDS_ATTR));
+
+        assert!(ks.shred(AGENTE).unwrap());
+        for (nome, mut ep) in [("v1", legado), ("v2", novo)] {
+            decrypt_storage_episode_in_place(&mut ep, Some(&ks)).unwrap();
+            assert_eq!(ep.content, heraclitus_crypto::SHREDDED, "{nome}");
+            assert!(!ep.attrs.contains_key("actor_name"), "{nome}");
+            assert!(ep.embedding.is_none(), "{nome}");
+            assert_eq!(ep.attrs[SHREDDED_ATTR], "true", "{nome}");
         }
     }
 }
@@ -1186,10 +1374,10 @@ impl Log {
                                         Some(ks) => match ks.get_or_create(&episode.agent_id) {
                                             Ok(key) => {
                                                 crypto_scratch.clear();
-                                                crypto_scratch = heraclitus_crypto::seal(
+                                                crypto_scratch = heraclitus_crypto::seal_record(
                                                     &key,
                                                     &episode.content,
-                                                    episode.agent_id.as_bytes(),
+                                                    &content_ctx(episode),
                                                 );
 
                                                 let public_attrs = episode
@@ -1223,10 +1411,10 @@ impl Log {
                                                         continue;
                                                     }
                                                 };
-                                                let sealed_fields = heraclitus_crypto::seal(
+                                                let sealed_fields = heraclitus_crypto::seal_record(
                                                     &key,
                                                     &encoded,
-                                                    &fields_aad(&episode.agent_id),
+                                                    &fields_ctx(episode),
                                                 );
                                                 let mut attrs = public_attrs;
                                                 attrs.insert(

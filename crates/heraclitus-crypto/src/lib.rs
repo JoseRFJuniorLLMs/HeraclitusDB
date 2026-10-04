@@ -2,10 +2,32 @@
 //!
 //! Each `agent_id` owns a 32-byte key, persisted as a file **outside the
 //! immutable log**. Episode content plus the sensitive attribute/embedding
-//! envelope are sealed at rest with ChaCha20-Poly1305 (AEAD), with `agent_id`
-//! bound as associated data. "Erasure" (LGPD/GDPR)
+//! envelope are sealed at rest with ChaCha20-Poly1305 (AEAD). "Erasure" (LGPD/GDPR)
 //! is **crypto-shredding**: destroy the key file and that agent's ciphertext
 //! becomes permanently unreadable — the append-only log is never mutated.
+//!
+//! # Versões do envelope selado
+//!
+//! O envelope é `MAGIC(8) || nonce(12) || ciphertext+tag`, e o magic decide,
+//! sem ambiguidade, que AAD foi autenticada:
+//!
+//! - **v1 (`HRKLENC1`, legado)** — a AAD é só o contexto do agente
+//!   (`agent_id`, ou `agent_id\0fields-v1` no envelope de atributos). Não liga
+//!   o registo concreto: o ciphertext de um evento podia ser colado no lugar
+//!   de outro evento do mesmo agente (cut-and-paste/replay) e decifrava sem
+//!   erro. Continua legível — os dados já persistidos ficam intactos — mas
+//!   já não é escrito.
+//! - **v2 (`HRKLENC2`)** — a AAD é o [`RecordContext`] canónico: agente,
+//!   `event_id` e finalidade do blob (conteúdo vs. atributos), codificados
+//!   com prefixos de comprimento. Trocar ciphertexts entre eventos, ou entre
+//!   o conteúdo e o envelope de atributos do mesmo evento, falha a tag.
+//!
+//! Trocar o magic de um blob v2 para v1 (downgrade) também falha: a tag foi
+//! calculada sobre a AAD v2 e o leitor v1 autentica outra AAD. O que a
+//! compatibilidade não pode fechar: um blob v1 *antigo* continua a poder ser
+//! colado no lugar de outro blob v1 do mesmo agente — a AAD v1 nunca ligou o
+//! evento. Para tirar dados antigos dessa classe, reescrevê-los com
+//! `heraclitus migrate-encrypt` (relê e volta a selar em v2).
 //!
 //! Backward compatibility: sealed blobs carry an 8-byte magic prefix. Legacy
 //! plaintext content never starts with it, so a mixed log (old plaintext +
@@ -22,61 +44,169 @@ use std::sync::{Arc, RwLock};
 pub mod provider;
 pub use provider::*;
 
-/// Magic prefix marking a sealed (encrypted) content blob.
+/// Magic prefix do envelope v1 (legado, só leitura): AAD = contexto do agente.
 pub const ENC_MAGIC: &[u8; 8] = b"HRKLENC1";
+/// Magic prefix do envelope v2: AAD = [`RecordContext`] (agente + `event_id`
+/// + finalidade). É o único formato que [`seal_record`] escreve.
+pub const ENC_MAGIC_V2: &[u8; 8] = b"HRKLENC2";
 const NONCE_LEN: usize = 12;
+
+/// Separação de domínio da AAD v2: nenhuma AAD v1 (um `agent_id` cru, com ou
+/// sem o sufixo `\0fields-v1`) coincide com uma AAD v2 por acaso de bytes.
+const RECORD_AAD_V2_DOMAIN: &[u8] = b"heraclitus-record-aad-v2\0";
 
 /// Tombstone substituted for content whose key was crypto-shredded.
 pub const SHREDDED: &[u8] = b"[shredded]";
 
-/// True if `blob` looks like a sealed content blob.
+/// Versão do envelope selado, decidida pelo magic prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SealVersion {
+    /// `HRKLENC1`: AAD só com o contexto do agente (legado).
+    V1,
+    /// `HRKLENC2`: AAD com o [`RecordContext`] do evento.
+    V2,
+}
+
+/// Identidade do registo a que um blob v2 fica autenticado.
+///
+/// O log não tem tenant nem colecção: o âmbito da chave é o `agent_id` (um
+/// `KeyStore` por data dir) e o `event_id` (ULID) é globalmente único, por
+/// isso `agent_id + event_id + purpose` identifica univocamente o blob. Os
+/// restantes metadados do evento (HLC, kind, sessão) ficam de fora: a sua
+/// integridade é guardada pelos checksums/raiz BLAKE3 dos segmentos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordContext<'a> {
+    /// Agente dono da chave.
+    pub agent_id: &'a str,
+    /// `event_id` do evento (os 16 bytes do ULID).
+    pub event_id: [u8; 16],
+    /// Finalidade do blob dentro do evento (p.ex. `b"content"`, `b"fields"`),
+    /// para o envelope de atributos não poder ocupar o lugar do conteúdo.
+    pub purpose: &'a [u8],
+}
+
+impl RecordContext<'_> {
+    /// AAD canónica v2. Os campos de tamanho variável levam prefixo de
+    /// comprimento (u64 LE), pelo que a codificação é injectiva: contextos
+    /// diferentes nunca produzem os mesmos bytes. **Formato persistido** — o
+    /// vector dourado `envelope_v2_vector_dourado` prende-o.
+    pub fn aad(&self) -> Vec<u8> {
+        let agent = self.agent_id.as_bytes();
+        let mut aad = Vec::with_capacity(
+            RECORD_AAD_V2_DOMAIN.len() + 8 + agent.len() + 16 + 8 + self.purpose.len(),
+        );
+        aad.extend_from_slice(RECORD_AAD_V2_DOMAIN);
+        aad.extend_from_slice(&(agent.len() as u64).to_le_bytes());
+        aad.extend_from_slice(agent);
+        aad.extend_from_slice(&self.event_id);
+        aad.extend_from_slice(&(self.purpose.len() as u64).to_le_bytes());
+        aad.extend_from_slice(self.purpose);
+        aad
+    }
+}
+
+/// Versão do envelope selado, ou `None` se `blob` não for um envelope.
 ///
 /// # Limitação conhecida
 ///
 /// Detecção por prefixo mágico: um payload em claro que comece literalmente
-/// com `HRKLENC1` (8 bytes) seguido de >= 12 bytes adicionais será
+/// com `HRKLENC1`/`HRKLENC2` (8 bytes) seguido de >= 12 bytes adicionais será
 /// incorrectamente classificado como cifrado, causando erro de decifra
 /// (falha explícita, não corrupção silenciosa). Na prática a probabilidade
 /// é negligenciável para conteúdo textual/bincode, mas o desenho ideal
 /// usaria metadado de envelope em vez de heurística de conteúdo.
-pub fn is_encrypted(blob: &[u8]) -> bool {
-    blob.len() >= ENC_MAGIC.len() + NONCE_LEN && blob[..ENC_MAGIC.len()] == ENC_MAGIC[..]
+pub fn sealed_version(blob: &[u8]) -> Option<SealVersion> {
+    if blob.len() < ENC_MAGIC.len() + NONCE_LEN {
+        return None;
+    }
+    let magic = &blob[..ENC_MAGIC.len()];
+    if magic == &ENC_MAGIC[..] {
+        Some(SealVersion::V1)
+    } else if magic == &ENC_MAGIC_V2[..] {
+        Some(SealVersion::V2)
+    } else {
+        None
+    }
 }
 
-/// Seal `plaintext`: `MAGIC || nonce(12) || ciphertext+tag`. `aad` (the
-/// agent_id) is authenticated but not encrypted.
-pub fn seal(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
+/// True if `blob` looks like a sealed content blob (de qualquer versão; ver
+/// a limitação documentada em [`sealed_version`]).
+pub fn is_encrypted(blob: &[u8]) -> bool {
+    sealed_version(blob).is_some()
+}
+
+fn seal_with_nonce(
+    key: &[u8; 32],
+    magic: &[u8; 8],
+    nonce: &[u8; NONCE_LEN],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Vec<u8> {
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-    let mut nonce = [0u8; NONCE_LEN];
-    rand::thread_rng().fill_bytes(&mut nonce);
     let ct = cipher
         .encrypt(
-            Nonce::from_slice(&nonce),
+            Nonce::from_slice(nonce),
             Payload {
                 msg: plaintext,
                 aad,
             },
         )
         .expect("chacha20poly1305 encrypt never fails for valid key/nonce");
-    let mut out = Vec::with_capacity(ENC_MAGIC.len() + NONCE_LEN + ct.len());
-    out.extend_from_slice(&ENC_MAGIC[..]);
-    out.extend_from_slice(&nonce);
+    let mut out = Vec::with_capacity(magic.len() + NONCE_LEN + ct.len());
+    out.extend_from_slice(&magic[..]);
+    out.extend_from_slice(nonce);
     out.extend_from_slice(&ct);
     out
 }
 
-/// Open a sealed blob. Returns `None` if the blob is not sealed, the key is
-/// wrong, or the tag fails (tamper / corruption).
-pub fn open(key: &[u8; 32], blob: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
-    if !is_encrypted(blob) {
-        return None;
-    }
+fn seal_with_magic(key: &[u8; 32], magic: &[u8; 8], plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
+    let mut nonce = [0u8; NONCE_LEN];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    seal_with_nonce(key, magic, &nonce, plaintext, aad)
+}
+
+/// Decifra o corpo `nonce || ciphertext+tag` de um envelope cujo magic o
+/// chamador já validou.
+fn open_body(key: &[u8; 32], blob: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
     let nonce = &blob[ENC_MAGIC.len()..ENC_MAGIC.len() + NONCE_LEN];
     let ct = &blob[ENC_MAGIC.len() + NONCE_LEN..];
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     cipher
         .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad })
         .ok()
+}
+
+/// Sela `plaintext` no envelope **v2** (`HRKLENC2 || nonce(12) ||
+/// ciphertext+tag`), autenticando o [`RecordContext`] do evento. É o selador
+/// dos dados novos.
+pub fn seal_record(key: &[u8; 32], plaintext: &[u8], ctx: &RecordContext<'_>) -> Vec<u8> {
+    seal_with_magic(key, ENC_MAGIC_V2, plaintext, &ctx.aad())
+}
+
+/// Abre um envelope de qualquer versão, escolhendo a AAD pelo magic: v2
+/// autentica `ctx`; v1 (legado) autentica `legacy_aad`, a AAD com que a
+/// geração antiga selava aquele blob. Devolve `None` se o blob não for um
+/// envelope, a chave estiver errada, ou a tag falhar (adulteração, corrupção,
+/// ou blob v2 de outro evento/finalidade).
+pub fn open_record(
+    key: &[u8; 32],
+    blob: &[u8],
+    ctx: &RecordContext<'_>,
+    legacy_aad: &[u8],
+) -> Option<Vec<u8>> {
+    match sealed_version(blob)? {
+        SealVersion::V1 => open_body(key, blob, legacy_aad),
+        SealVersion::V2 => open_body(key, blob, &ctx.aad()),
+    }
+}
+
+/// Sela no envelope **v1 legado** (`HRKLENC1`) com a AAD crua dada.
+///
+/// Não liga o evento — não serve para dados novos (ver [`seal_record`]).
+/// Fica para quem precisa de reproduzir bytes da geração antiga, p.ex. os
+/// testes que provam que logs v1 já persistidos continuam legíveis.
+pub fn seal_v1(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
+    seal_with_magic(key, ENC_MAGIC, plaintext, aad)
 }
 
 /// Per-agent key store. One key file per agent so a single agent can be
@@ -492,22 +622,168 @@ impl KeyStore {
 mod tests {
     use super::*;
 
+    fn ctx<'a>(agent_id: &'a str, event: u8, purpose: &'a [u8]) -> RecordContext<'a> {
+        RecordContext {
+            agent_id,
+            event_id: [event; 16],
+            purpose,
+        }
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn unhex(text: &str) -> Vec<u8> {
+        (0..text.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
     #[test]
     fn seal_open_roundtrip() {
         let key = [7u8; 32];
-        let blob = seal(&key, b"segredo do agente", b"eva");
+        let c = ctx("eva", 1, b"content");
+        let blob = seal_record(&key, b"segredo do agente", &c);
         assert!(is_encrypted(&blob));
-        assert_eq!(open(&key, &blob, b"eva").unwrap(), b"segredo do agente");
-        // wrong aad (agent) fails
-        assert!(open(&key, &blob, b"outro").is_none());
+        assert_eq!(sealed_version(&blob), Some(SealVersion::V2));
+        assert_eq!(&blob[..8], &ENC_MAGIC_V2[..]);
+        assert_eq!(
+            open_record(&key, &blob, &c, b"eva").unwrap(),
+            b"segredo do agente"
+        );
+        // wrong agent fails
+        assert!(open_record(&key, &blob, &ctx("outro", 1, b"content"), b"outro").is_none());
         // wrong key fails
-        assert!(open(&[9u8; 32], &blob, b"eva").is_none());
+        assert!(open_record(&[9u8; 32], &blob, &c, b"eva").is_none());
     }
+
+    /// O ataque que a v2 fecha: dois eventos do MESMO agente (mesma chave);
+    /// o blob de um colado no lugar do outro tem de falhar a tag. Com a AAD
+    /// v1 (só o agente) os dois blobs eram permutáveis.
+    #[test]
+    fn trocar_ciphertexts_entre_eventos_falha_a_decifragem() {
+        let key = [7u8; 32];
+        let (a, b) = (ctx("eva", 0xA1, b"content"), ctx("eva", 0xB2, b"content"));
+        let blob_a = seal_record(&key, b"evento A", &a);
+        let blob_b = seal_record(&key, b"evento B", &b);
+        assert!(open_record(&key, &blob_a, &b, b"eva").is_none());
+        assert!(open_record(&key, &blob_b, &a, b"eva").is_none());
+        assert_eq!(open_record(&key, &blob_a, &a, b"eva").unwrap(), b"evento A");
+
+        // Dentro do mesmo evento, o envelope de atributos não ocupa o lugar
+        // do conteúdo.
+        let fields = seal_record(&key, b"attrs", &ctx("eva", 0xA1, b"fields"));
+        assert!(open_record(&key, &fields, &a, b"eva").is_none());
+
+        // Contraprova do defeito antigo: em v1 a troca passava.
+        let v1_a = seal_v1(&key, b"evento A", b"eva");
+        assert_eq!(open_record(&key, &v1_a, &b, b"eva").unwrap(), b"evento A");
+    }
+
+    /// Reescrever o magic `HRKLENC2` -> `HRKLENC1` não abre a porta da AAD
+    /// fraca: a tag foi calculada sobre a AAD v2.
+    #[test]
+    fn downgrade_de_v2_para_v1_falha() {
+        let key = [7u8; 32];
+        let c = ctx("eva", 3, b"content");
+        let mut blob = seal_record(&key, b"segredo", &c);
+        blob[..8].copy_from_slice(&ENC_MAGIC[..]);
+        assert_eq!(sealed_version(&blob), Some(SealVersion::V1));
+        assert!(open_record(&key, &blob, &c, b"eva").is_none());
+    }
+
+    /// A AAD v2 é injectiva: deslocar bytes entre `agent_id` e `purpose` não
+    /// produz a mesma AAD (os prefixos de comprimento separam os campos).
+    #[test]
+    fn aad_v2_e_injectiva_e_separada_da_v1() {
+        let a = RecordContext {
+            agent_id: "ab",
+            event_id: [0; 16],
+            purpose: b"c",
+        };
+        let b = RecordContext {
+            agent_id: "a",
+            event_id: [0; 16],
+            purpose: b"bc",
+        };
+        assert_ne!(a.aad(), b.aad());
+        assert!(a.aad().starts_with(RECORD_AAD_V2_DOMAIN));
+        assert_ne!(ctx("eva", 1, b"x").aad(), ctx("eva", 2, b"x").aad());
+    }
+
+    /// Bytes v1 persistidos por builds anteriores (nonce fixo, chave e AAD
+    /// conhecidas): têm de continuar a decifrar para sempre. Se este vector
+    /// falhar, logs cifrados já existentes deixaram de ser legíveis.
+    #[test]
+    fn envelope_v1_vector_dourado_continua_legivel() {
+        let key = [0x42u8; 32];
+        let blob = unhex(V1_DOURADO);
+        assert_eq!(sealed_version(&blob), Some(SealVersion::V1));
+        // O contexto v2 é irrelevante para um blob v1; só a AAD legada conta.
+        let c = ctx("eva", 0xEE, b"content");
+        assert_eq!(
+            open_record(&key, &blob, &c, b"eva").unwrap(),
+            b"dados legados v1"
+        );
+        assert!(open_record(&key, &blob, &c, b"outro").is_none());
+        // O vector é exactamente o que a geração v1 escrevia.
+        assert_eq!(
+            hex(&seal_with_nonce(
+                &key,
+                ENC_MAGIC,
+                &[0x24; NONCE_LEN],
+                b"dados legados v1",
+                b"eva"
+            )),
+            V1_DOURADO
+        );
+    }
+
+    /// Prende o formato v2 (magic + layout da AAD) a bytes concretos: uma
+    /// mudança acidental em `RecordContext::aad` tornaria ilegíveis os dados
+    /// v2 já escritos, e este teste falha antes disso chegar a disco.
+    #[test]
+    fn envelope_v2_vector_dourado() {
+        let key = [0x42u8; 32];
+        let c = RecordContext {
+            agent_id: "eva",
+            event_id: *b"0123456789abcdef",
+            purpose: b"content",
+        };
+        let blob = unhex(V2_DOURADO);
+        assert_eq!(sealed_version(&blob), Some(SealVersion::V2));
+        assert_eq!(
+            open_record(&key, &blob, &c, b"eva").unwrap(),
+            b"dados novos v2"
+        );
+        assert_eq!(
+            hex(&seal_with_nonce(
+                &key,
+                ENC_MAGIC_V2,
+                &[0x24; NONCE_LEN],
+                b"dados novos v2",
+                &c.aad()
+            )),
+            V2_DOURADO
+        );
+    }
+
+    // Confirmado contra o `open` da geração v1 (antes desta versão): estes
+    // bytes são exactamente o que um log cifrado antigo tem em disco.
+    const V1_DOURADO: &str = "48524b4c454e43312424242424242424242424248066e16198fe34cde2\
+                              0aece497376ba93225fd944335b51eb6f4aebe6c4d4ffd";
+    const V2_DOURADO: &str = "48524b4c454e43322424242424242424242424248066e16198fe36c7f3\
+                              04fbab92259ec22cb759745836f9afc685956358ea";
 
     #[test]
     fn plaintext_is_not_encrypted() {
         assert!(!is_encrypted(b"empresa X trocou de socio"));
         assert!(!is_encrypted(b""));
+        // Um magic sem nonce completo não é envelope de nenhuma versão.
+        assert_eq!(sealed_version(b"HRKLENC2curto"), None);
+        assert_eq!(sealed_version(b"HRKLENC9............"), None);
     }
 
     #[test]
@@ -521,13 +797,16 @@ mod tests {
         assert_eq!(ks.agent_count(), 1);
 
         // seal with the agent key, then shred -> key gone -> cannot open
-        let blob = seal(&k1, b"dados pessoais", b"eva");
+        let c = ctx("eva", 1, b"content");
+        let blob = seal_record(&k1, b"dados pessoais", &c);
+        let legado = seal_v1(&k1, b"dados pessoais", b"eva");
         assert!(ks.shred("eva").unwrap());
         assert!(ks.get("eva").is_none());
         assert!(!ks.shred("eva").unwrap()); // idempotent
                                             // a fresh key for the same agent cannot decrypt the old blob
         let k2 = ks.get_or_create("eva").unwrap();
-        assert!(open(&k2, &blob, b"eva").is_none());
+        assert!(open_record(&k2, &blob, &c, b"eva").is_none());
+        assert!(open_record(&k2, &legado, &c, b"eva").is_none());
     }
 
     // No Unix (VM/produção Linux), a chave em claro no disco fica owner-only.
