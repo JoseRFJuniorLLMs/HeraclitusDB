@@ -85,3 +85,22 @@ Total: **439 testes aprovados** sem falhas ou regressões.
 - **Views e Checkpoints:**
   - Limite de varredura exclusivo alinhado (`cur < head`), evitando overhead de I/O em logs vazios ou completamente consumidos.
   - Checkpoint v1 com cabeçalho, CRC32 e integridade de formato preservada.
+---
+
+## 5. Verificação Final do Ramo (Claude, 2026-10-04)
+
+Verificação independente dos commits das rondas 3 a 12 antes de fechar o ramo:
+
+- `cargo fmt --check`: limpo.
+- `cargo clippy -D warnings` sobre os 23 crates tocados pelo ramo (features `heraclitus-server/analytics`, `heraclitus-server/replication`, `heraclitus-raft/replication`): limpo.
+- `cargo test --no-fail-fast` sobre os mesmos 23 crates (feature `analytics`): **1774 aprovados, 0 falhas, 15 ignorados** (111 binários de teste).
+- Não executados: testes de integração do raft/servidor com `--features replication` (bloqueados pelo classificador de permissões desta sessão).
+
+Revisão manual dos commits de maior risco:
+
+| Commit | Veredito |
+|---|---|
+| `7b53db9` (views `cur < head`) | Correto: `Log::head()` é exclusivo e `scan_capped` devolve vazio com `from >= to`. |
+| `1f91d1c` (forense, custódia vazia) | Correto: o construtor só grava `custody.jsonl` quando há entradas, logo nunca produz o caso agora recusado. |
+| `48035c8` (case `JaAberto`) | **Incompleto** — `Engine::case_command` só comparava a revisão: o segundo `CaseOpened` entrava no log, o cliente ouvia "aplicado" e `reconstruir_auditado` saltava-o. Corrigido em `df04e93` (ensaio de `aplicar` sobre cópia antes do append; teste `um_segundo_case_opened_e_recusado_e_nao_suja_o_log`, verificado por sabotagem). |
+| `2d68eb0`, `config.rs` | Normalizaram fins de linha mistos na base (9 e 3 linhas LF) para CRLF uniforme — inócuo. |
