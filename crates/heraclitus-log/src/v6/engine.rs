@@ -619,12 +619,25 @@ impl V6Log {
     /// Como [`V6Log::append`], devolvendo também o episódio exacto que foi
     /// persistido. O carimbo acontece sob o mesmo mutex que atribui o LSN:
     /// appends concorrentes não conseguem inverter a ordem HLC/LSN.
-    pub fn append_stamped(&self, mut episode: Episode) -> Result<(Lsn, Episode), HeraclitusError> {
+    ///
+    /// A cópia só acontece se um subscritor do `tail_subscribe` ainda segurar
+    /// o mesmo `Arc`; o caminho quente usa [`V6Log::append_shared`].
+    pub fn append_stamped(&self, episode: Episode) -> Result<(Lsn, Episode), HeraclitusError> {
+        let (lsn, partilhado) = self.append_shared(episode)?;
+        Ok((lsn, Arc::unwrap_or_clone(partilhado)))
+    }
+
+    /// Como [`V6Log::append_stamped`], devolvendo o episódio carimbado como o
+    /// MESMO `Arc` que é publicado no `tail_subscribe`. Antes clonava-se o
+    /// episódio inteiro sob o mutex de estado só para o devolver ao chamador,
+    /// e o broadcast embrulhava o original num `Arc` à parte.
+    pub fn append_shared(
+        &self,
+        mut episode: Episode,
+    ) -> Result<(Lsn, Arc<Episode>), HeraclitusError> {
         let mut state = self.lock_state()?;
         episode.ts_hlc = self.hlc.now();
-        let stamped = episode.clone();
-        let lsn = self.append_inner_locked(&mut state, episode, None)?;
-        Ok((lsn, stamped))
+        self.append_inner_locked(&mut state, episode, None)
     }
 
     /// Apêndice replicado: preserva LSN e HLC do líder. Repetir o mesmo evento
@@ -641,7 +654,7 @@ impl V6Log {
                 }),
             };
         }
-        self.append_inner(episode, Some(lsn))
+        self.append_inner(episode, Some(lsn)).map(|(lsn, _)| lsn)
     }
 
     /// Força a barreira física do segmento activo.
@@ -2400,17 +2413,19 @@ impl V6Log {
         &self,
         episode: Episode,
         expected_lsn: Option<Lsn>,
-    ) -> Result<Lsn, HeraclitusError> {
+    ) -> Result<(Lsn, Arc<Episode>), HeraclitusError> {
         let mut state = self.lock_state()?;
         self.append_inner_locked(&mut state, episode, expected_lsn)
     }
 
+    /// Grava e publica o episódio; devolve o LSN e o `Arc` entregue ao
+    /// broadcast, para o chamador partilhar a mesma alocação.
     fn append_inner_locked(
         &self,
         state: &mut V6State,
         episode: Episode,
         expected_lsn: Option<Lsn>,
-    ) -> Result<Lsn, HeraclitusError> {
+    ) -> Result<(Lsn, Arc<Episode>), HeraclitusError> {
         let opaque_meta = episode.id.0.to_bytes();
         let payload =
             crate::encode_storage_payload_v6(opaque_meta, &episode, self.keystore.as_deref())?;
@@ -2486,8 +2501,9 @@ impl V6Log {
         self.metrics
             .append_bytes
             .fetch_add(record_len, Ordering::Relaxed);
-        let _ = self.tail_tx.send((lsn, Arc::new(episode)));
-        Ok(lsn)
+        let episode = Arc::new(episode);
+        let _ = self.tail_tx.send((lsn, Arc::clone(&episode)));
+        Ok((lsn, episode))
     }
 
     fn seal_active_locked(&self, state: &mut V6State) -> Result<(), HeraclitusError> {

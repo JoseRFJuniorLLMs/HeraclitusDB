@@ -58,6 +58,16 @@ pub trait EpisodeLog: Send + Sync {
 
     fn append_stamped(&self, episode: Episode) -> Result<(Lsn, Episode), HeraclitusError>;
 
+    /// Como `append_stamped`, mas devolve o episódio carimbado partilhado em
+    /// `Arc` — nos motores do crate, o MESMO `Arc` que o `tail_subscribe`
+    /// entrega, sem cópia profunda no caminho quente. A implementação por
+    /// defeito existe para não partir implementadores de fora: embrulha o
+    /// resultado de `append_stamped`, sem garantir a partilha com o broadcast.
+    fn append_shared(&self, episode: Episode) -> Result<(Lsn, Arc<Episode>), HeraclitusError> {
+        self.append_stamped(episode)
+            .map(|(lsn, episode)| (lsn, Arc::new(episode)))
+    }
+
     fn append_replicated(&self, lsn: Lsn, episode: Episode) -> Result<Lsn, HeraclitusError>;
 
     fn flush(&self) -> Result<(), HeraclitusError>;
@@ -114,6 +124,10 @@ impl EpisodeLog for Log {
         Log::append_stamped(self, episode)
     }
 
+    fn append_shared(&self, episode: Episode) -> Result<(Lsn, Arc<Episode>), HeraclitusError> {
+        Log::append_shared(self, episode)
+    }
+
     fn append_replicated(&self, lsn: Lsn, episode: Episode) -> Result<Lsn, HeraclitusError> {
         Log::append_replicated(self, lsn, episode)
     }
@@ -163,6 +177,10 @@ impl EpisodeLog for V6Log {
 
     fn append_stamped(&self, episode: Episode) -> Result<(Lsn, Episode), HeraclitusError> {
         V6Log::append_stamped(self, episode)
+    }
+
+    fn append_shared(&self, episode: Episode) -> Result<(Lsn, Arc<Episode>), HeraclitusError> {
+        V6Log::append_shared(self, episode)
     }
 
     fn append_replicated(&self, lsn: Lsn, episode: Episode) -> Result<Lsn, HeraclitusError> {
@@ -223,6 +241,10 @@ impl<T: EpisodeLog + ?Sized> EpisodeLog for Arc<T> {
 
     fn append_stamped(&self, episode: Episode) -> Result<(Lsn, Episode), HeraclitusError> {
         (**self).append_stamped(episode)
+    }
+
+    fn append_shared(&self, episode: Episode) -> Result<(Lsn, Arc<Episode>), HeraclitusError> {
+        (**self).append_shared(episode)
     }
 
     fn append_replicated(&self, lsn: Lsn, episode: Episode) -> Result<Lsn, HeraclitusError> {
@@ -385,6 +407,10 @@ impl AnyLog {
         EpisodeLog::append_stamped(self, episode)
     }
 
+    pub fn append_shared(&self, episode: Episode) -> Result<(Lsn, Arc<Episode>), HeraclitusError> {
+        EpisodeLog::append_shared(self, episode)
+    }
+
     pub fn append_replicated(&self, lsn: Lsn, episode: Episode) -> Result<Lsn, HeraclitusError> {
         EpisodeLog::append_replicated(self, lsn, episode)
     }
@@ -439,6 +465,13 @@ impl EpisodeLog for AnyLog {
         match self {
             Self::Legacy(log) => log.append_stamped(episode),
             Self::V6(log) => log.append_stamped(episode),
+        }
+    }
+
+    fn append_shared(&self, episode: Episode) -> Result<(Lsn, Arc<Episode>), HeraclitusError> {
+        match self {
+            Self::Legacy(log) => log.append_shared(episode),
+            Self::V6(log) => log.append_shared(episode),
         }
     }
 

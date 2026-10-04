@@ -2333,11 +2333,25 @@ impl Log {
     /// valor real, e a view reconstruída do LSN 0 (que lê o log) fica DIFERENTE
     /// da view viva — quebra do invariante I6. A `activation`, por exemplo, usa
     /// `ts_hlc >> 16` como instante de acesso.
+    ///
+    /// Devolve um `Episode` por valor para os chamadores que o querem mutar; o
+    /// caminho quente usa [`Log::append_shared`], que não copia nada. Aqui a
+    /// cópia só acontece se um subscritor do `tail_subscribe` ainda segurar o
+    /// mesmo `Arc` quando a resposta chega.
     pub fn append_stamped(&self, episode: Episode) -> Result<(Lsn, Episode), HeraclitusError> {
-        let mut copia = episode.clone();
-        let (lsn, ts) = self.enqueue_append_inner(episode, None, "append", true)?;
-        copia.ts_hlc = ts; // o carimbo real, feito dentro da secção crítica
-        Ok((lsn, copia))
+        let (lsn, partilhado) = self.append_shared(episode)?;
+        Ok((lsn, Arc::unwrap_or_clone(partilhado)))
+    }
+
+    /// Como [`Log::append_stamped`], mas devolve o episódio carimbado como o
+    /// MESMO `Arc` que o worker publica no `tail_subscribe` — sem cópia
+    /// profunda. Antes, o `append_stamped` clonava o episódio inteiro
+    /// (conteúdo, attrs, embedding) antes de o enfileirar, só para poder
+    /// devolver ao chamador uma cópia com o `ts_hlc` acertado; o worker já
+    /// trabalhava com `Arc`. Quem indexa (memtable, views) partilha agora a
+    /// mesma alocação que o broadcast entrega aos subscritores.
+    pub fn append_shared(&self, episode: Episode) -> Result<(Lsn, Arc<Episode>), HeraclitusError> {
+        self.enqueue_append_inner(episode, None, "append", true)
     }
 
     /// Aplicação replicada (follower): grava a entrada do líder na posição exata
@@ -2376,8 +2390,10 @@ impl Log {
             .map(|(lsn, _)| lsn)
     }
 
-    /// Devolve `(lsn, ts_hlc)`. Com `stamp = true` o carimbo HLC é feito AQUI,
-    /// dentro da secção crítica que também enfileira o comando.
+    /// Devolve o LSN e o episódio tal como foi enfileirado — o mesmo `Arc` que
+    /// o worker grava e publica no `tail_subscribe`, já com o `ts_hlc` final.
+    /// Com `stamp = true` o carimbo HLC é feito AQUI, dentro da secção crítica
+    /// que também enfileira o comando.
     ///
     /// Porquê: o `ts` era carimbado no chamador e só DEPOIS a mensagem entrava no
     /// canal, mas é o worker (FIFO) que atribui o LSN. Dois appends concorrentes
@@ -2395,7 +2411,7 @@ impl Log {
         expected_lsn: Option<Lsn>,
         ctx: &str,
         stamp: bool,
-    ) -> Result<(Lsn, u64), HeraclitusError> {
+    ) -> Result<(Lsn, Arc<Episode>), HeraclitusError> {
         self.check_poison()?;
         let (tx, rx) = crossbeam_channel::bounded(1);
         let opaque_meta = episode.id.0.to_bytes();
@@ -2415,9 +2431,15 @@ impl Log {
         // o que está certo, porque também volta a enfileirar mais tarde. A
         // ordem dos carimbos bem-sucedidos continua igual à ordem de entrada na
         // fila, que é o invariante que interessa.
-        let ts;
+        //
+        // O episódio viaja num `Arc` desde aqui: o worker grava-o e publica-o
+        // no broadcast, e o chamador recebe a MESMA alocação. A cópia que se
+        // devolve só é tirada depois do carimbo, e numa fila cheia é largada
+        // antes de se voltar a tentar — por isso o `Arc` é exclusivo quando
+        // se volta a carimbar e o `make_mut` não copia.
+        let devolver;
         let prazo = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut pendente = Some((episode, tx));
+        let mut pendente = Some((Arc::new(episode), tx));
         loop {
             let Some((mut ep, resp_tx)) = pendente.take() else {
                 unreachable!("o par só é retirado para ser reposto ou consumido");
@@ -2425,20 +2447,23 @@ impl Log {
             let devolvido = {
                 let _ordem = self.stamp_lock.lock().unwrap_or_else(|e| e.into_inner());
                 if stamp {
-                    ep.ts_hlc = self.hlc.now();
+                    Arc::make_mut(&mut ep).ts_hlc = self.hlc.now();
                 }
-                let carimbo = ep.ts_hlc;
+                let partilhado = Arc::clone(&ep);
                 match self.cmd_tx.try_send(LogCommand::Append {
                     opaque_meta,
-                    episode: Arc::new(ep),
+                    episode: ep,
                     expected_lsn,
                     resp_tx,
                 }) {
                     Ok(()) => {
-                        ts = carimbo;
+                        devolver = partilhado;
                         break;
                     }
-                    Err(crossbeam_channel::TrySendError::Full(cmd)) => cmd,
+                    Err(crossbeam_channel::TrySendError::Full(cmd)) => {
+                        drop(partilhado);
+                        cmd
+                    }
                     Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
                         return Err(HeraclitusError::StorageEngine(format!(
                             "Worker do log encerrado ({ctx})"
@@ -2455,19 +2480,18 @@ impl Log {
             else {
                 unreachable!("o comando devolvido é o mesmo que foi enviado");
             };
-            let ep = Arc::try_unwrap(arc).unwrap_or_else(|partilhado| (*partilhado).clone());
             if std::time::Instant::now() >= prazo {
                 return Err(HeraclitusError::StorageEngine(format!(
                     "Timeout de canal: pipeline saturado ({ctx})"
                 )));
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
-            pendente = Some((ep, resp_tx));
+            pendente = Some((arc, resp_tx));
         }
         let lsn = rx.recv().map_err(|_| {
             HeraclitusError::StorageEngine(format!("Worker interrompido no {ctx}"))
         })??;
-        Ok((lsn, ts))
+        Ok((lsn, devolver))
     }
 
     pub fn sealed_segments(&self) -> Vec<SegmentMeta> {

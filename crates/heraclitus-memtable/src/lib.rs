@@ -9,13 +9,15 @@ use dashmap::DashMap;
 use heraclitus_core::{Episode, EventId, Lsn, ProductPoint};
 use heraclitus_manifold::ProductMetric;
 use std::collections::VecDeque;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 pub struct Memtable {
     cap: usize,
     byte_cap: usize,
     bytes: std::sync::atomic::AtomicUsize,
-    entries: RwLock<VecDeque<(Lsn, Episode)>>,
+    /// `Arc` para partilhar a alocação que o log publica no `tail_subscribe`:
+    /// a cauda em RAM não precisa de uma cópia própria de cada episódio.
+    entries: RwLock<VecDeque<(Lsn, Arc<Episode>)>>,
     adjacency: DashMap<EventId, Vec<EventId>>,
 }
 
@@ -43,6 +45,13 @@ impl Memtable {
 
     /// Apply a tail event. O(1) amortized.
     pub fn apply(&self, lsn: Lsn, episode: Episode) {
+        self.apply_shared(lsn, Arc::new(episode));
+    }
+
+    /// Como [`Memtable::apply`], guardando o `Arc` recebido tal como está —
+    /// sem cópia profunda. É o que o engine usa com o episódio devolvido por
+    /// `append_shared`, que é o mesmo que o broadcast do log entrega.
+    pub fn apply_shared(&self, lsn: Lsn, episode: Arc<Episode>) {
         // Audit #12: hold the write lock for the whole publication so the
         // adjacency overlay never exposes an edge to a half-published event.
         let mut entries = self.entries.write().unwrap();
@@ -179,13 +188,20 @@ impl Memtable {
     }
 
     pub fn get(&self, id: &EventId) -> Option<(Lsn, Episode)> {
+        self.get_shared(id)
+            .map(|(lsn, episode)| (lsn, Arc::unwrap_or_clone(episode)))
+    }
+
+    /// Como [`Memtable::get`], sem copiar o episódio: devolve o `Arc` que a
+    /// memtable guarda.
+    pub fn get_shared(&self, id: &EventId) -> Option<(Lsn, Arc<Episode>)> {
         self.entries
             .read()
             .unwrap()
             .iter()
             .rev()
             .find(|(_, e)| e.id == *id)
-            .cloned()
+            .map(|(lsn, episode)| (*lsn, Arc::clone(episode)))
     }
 }
 
@@ -232,7 +248,7 @@ mod tests {
     use super::*;
     use heraclitus_core::EventKind;
 
-    fn ep_with_emb(content: &str, hyp: Vec<f32>) -> Episode {
+    pub(super) fn ep_with_emb(content: &str, hyp: Vec<f32>) -> Episode {
         let mut e = Episode::new("a", EventKind::Observation, content.into());
         e.embedding = Some(ProductPoint {
             hyp,
@@ -345,5 +361,31 @@ mod byte_budget_regression {
         mem.clear();
         assert_eq!(mem.resident_bytes(), 0);
         assert_eq!(mem.len(), 0);
+    }
+
+    #[test]
+    fn apply_shared_guarda_o_mesmo_arc_e_larga_o_na_eviccao() {
+        let mem = Memtable::new(1);
+        let partilhado = Arc::new(super::tests::ep_with_emb("partilhado", vec![0.1, 0.2]));
+        let bytes = partilhado.resident_bytes();
+        mem.apply_shared(3, Arc::clone(&partilhado));
+
+        // A memtable segura a MESMA alocação, não uma cópia.
+        assert_eq!(Arc::strong_count(&partilhado), 2);
+        let (lsn, guardado) = mem.get_shared(&partilhado.id).unwrap();
+        assert_eq!(lsn, 3);
+        assert!(Arc::ptr_eq(&guardado, &partilhado));
+        drop(guardado);
+        assert_eq!(mem.resident_bytes(), bytes);
+        // `get` continua a devolver um episódio por valor, igual ao guardado.
+        let (_, copia) = mem.get(&partilhado.id).unwrap();
+        assert_eq!(copia.content, partilhado.content);
+        assert_eq!(Arc::strong_count(&partilhado), 2);
+
+        // A evicção por contagem larga a referência da memtable.
+        mem.apply(4, super::tests::ep_with_emb("seguinte", vec![0.3, 0.4]));
+        assert_eq!(mem.len(), 1);
+        assert!(mem.get_shared(&partilhado.id).is_none());
+        assert_eq!(Arc::strong_count(&partilhado), 1);
     }
 }

@@ -775,7 +775,7 @@ impl Engine {
     /// É o núcleo partilhado por `append` e pelo hook de apply do consenso — ao
     /// replicar, cada nó indexa localmente o que aplica (read-your-writes).
     /// Marca um append como EM VOO até o guard cair. O `append_internal`
-    /// segura-o entre `append_stamped` e `index_applied`; o checkpoint pede o
+    /// segura-o entre `append_shared` e `index_applied_shared`; o checkpoint pede o
     /// lado exclusivo do mesmo `RwLock` e espera por todos os que estiverem em
     /// voo antes de tirar o snapshot (auditoria 2026-09-05, A07).
     ///
@@ -792,14 +792,16 @@ impl Engine {
         }
     }
 
-    /// Como [`index_applied`](Self::index_applied), consumindo o Episode: o
-    /// último consumidor (a memtable) recebe-o por move em vez de por clone.
-    /// otimizacao-20m §3.7 (conferido em 2026-10-02): cada append fazia uma
-    /// cópia profunda do episódio — conteúdo, attrs e embedding — só para a
-    /// memtable, logo a seguir a o log já o ter clonado.
-    fn index_applied_owned(&self, lsn: Lsn, episode: Episode) {
+    /// Como [`index_applied`](Self::index_applied), com o episódio partilhado:
+    /// as views e o índice de atributos lêem-no por referência e a memtable
+    /// guarda o próprio `Arc`. otimizacao-20m §3.7 (conferido em 2026-10-02):
+    /// cada append fazia uma cópia profunda do episódio — conteúdo, attrs e
+    /// embedding — só para a memtable, e o log já o tinha clonado no
+    /// `append_stamped`. Com `append_shared` não há cópia nenhuma: a memtable,
+    /// as views e o `tail_subscribe` vêem a mesma alocação.
+    fn index_applied_shared(&self, lsn: Lsn, episode: Arc<Episode>) {
         if self.vai_para_a_memtable(lsn, &episode) {
-            self.memtable.apply(lsn, episode);
+            self.memtable.apply_shared(lsn, episode);
         }
     }
 
@@ -3031,8 +3033,8 @@ impl Engine {
         // à frente de um LSN por aplicar (auditoria 2026-09-05, A07). Read
         // lock: dois appends nunca esperam um pelo outro.
         let _voo = self.begin_indexing();
-        let (lsn, stamped) = self.log.append_stamped(episode)?;
-        self.index_applied_owned(lsn, stamped);
+        let (lsn, stamped) = self.log.append_shared(episode)?;
+        self.index_applied_shared(lsn, stamped);
         Ok(lsn)
     }
 
@@ -6356,6 +6358,37 @@ mod tests {
             1,
             "o episodio em voo ficou fora do indice de atributos para sempre: {v}"
         );
+    }
+
+    #[test]
+    fn append_partilha_o_mesmo_episodio_entre_log_broadcast_e_memtable() {
+        // O caminho de append não faz cópias profundas do episódio: o que o
+        // `tail_subscribe` entrega e o que a memtable guarda são a MESMA
+        // alocação, carimbada pelo log e igual ao que ficou persistido.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine_in(dir.path());
+        let mut tail = engine.log.tail_subscribe();
+
+        let mut ep = Episode::new("ag", EventKind::Observation, b"partilhado".to_vec());
+        ep.attrs.insert("chave".into(), "valor".into());
+        let id = ep.id;
+        let lsn = engine.append(ep).unwrap();
+
+        let (lsn_tail, entregue) = tail.try_recv().unwrap();
+        assert_eq!(lsn_tail, lsn);
+        assert_eq!(entregue.id, id);
+        assert_ne!(entregue.ts_hlc, 0, "o log carimba o HLC antes de publicar");
+        let (lsn_mem, guardado) = engine.memtable.get_shared(&id).unwrap();
+        assert_eq!(lsn_mem, lsn);
+        assert!(
+            Arc::ptr_eq(&entregue, &guardado),
+            "a memtable guardou uma cópia em vez do Arc publicado pelo log"
+        );
+
+        let (_, persistido) = engine.log.read(lsn).unwrap().unwrap();
+        assert_eq!(persistido.ts_hlc, guardado.ts_hlc);
+        assert_eq!(persistido.content, guardado.content);
+        assert_eq!(persistido.attrs, guardado.attrs);
     }
 
     /// O `view rebuild` aplicava DUAS vezes um append em voo (auditoria
