@@ -1191,7 +1191,12 @@ impl View for TelemetryHealthGraph {
             };
         *self = Self {
             cache_valid: true,
-            highest_retained_lsn: snapshot.latest.iter().map(|(_, l)| *l).max(),
+            highest_retained_lsn: events
+                .last_key_value()
+                .map(|(l, _)| *l)
+                .into_iter()
+                .chain(snapshot.latest.iter().map(|(_, l)| *l))
+                .max(),
             event_sizes: events
                 .iter()
                 .map(|(l, e)| (*l, serde_json::to_vec(e).map_or(0, |b| b.len())))
@@ -1638,6 +1643,21 @@ mod tests {
             restored.snapshot_as_of(&id(), 2),
             graph.snapshot_as_of(&id(), 2)
         );
+        assert_eq!(restored.highest_retained_lsn, Some(1));
+    }
+
+    #[test]
+    fn checkpoint_restore_with_retained_events_populates_highest_retained_lsn() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut graph = TelemetryHealthGraph::new();
+        graph
+            .apply_envelope(42, envelope(10, expectation(Some(0))))
+            .unwrap();
+        graph.checkpoint(dir.path()).unwrap();
+
+        let mut restored = TelemetryHealthGraph::new();
+        assert!(restored.restore(dir.path()).unwrap());
+        assert_eq!(restored.highest_retained_lsn, Some(42));
     }
 
     #[test]
