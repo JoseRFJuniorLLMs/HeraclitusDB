@@ -7694,6 +7694,15 @@ impl Engine {
                         .to_string(),
                     ));
                 }
+                // Revisão do commit 48035c8 — `CaseState::aplicar` passou a
+                // recusar um segundo `CaseOpened` (JaAberto), mas aqui só se
+                // comparava a revisão: o comando entrava no log, o cliente
+                // ouvia "aplicado" e `reconstruir` saltava-o em silêncio. O
+                // ensaio sobre uma cópia aplica na fronteira do comando as
+                // MESMAS regras que a reconstrução vai aplicar ao ler.
+                e.clone()
+                    .aplicar(envelope)
+                    .map_err(|erro| HeraclitusError::Config(erro.to_string()))?;
             }
             None => {
                 if !matches!(
@@ -7891,6 +7900,37 @@ mod testes_case_spec0071 {
             head_antes,
             "o comando em conflito nao entrou"
         );
+    }
+
+    /// Revisão do commit 48035c8 — um segundo `CaseOpened` com a revisão
+    /// CERTA passava a comparação de revisão, entrava no log e o cliente
+    /// ouvia "aplicado"; a reconstrução saltava-o depois (JaAberto). Tem de
+    /// ser recusado ANTES de apender, sem tocar no SLA original.
+    #[test]
+    fn um_segundo_case_opened_e_recusado_e_nao_suja_o_log() {
+        let (_t, engine) = motor();
+        engine.case_command(&abrir("c1")).unwrap();
+        let head_antes = engine.head();
+
+        let reabrir = CaseEnvelope::novo(
+            "case-1",
+            "c2",
+            1, // revisão corrente: só o JaAberto o pode travar
+            "analista-b",
+            "reabrir do zero",
+            CaseEvent::CaseOpened {
+                title: "Titulo forjado".into(),
+                priority: CasePriority::Low,
+                opened_by: "analista-b".into(),
+                sla: sla(),
+            },
+        );
+        let erro = engine.case_command(&reabrir).unwrap_err();
+        assert!(erro.to_string().contains("já foi aberto"), "{erro}");
+        assert_eq!(engine.head(), head_antes, "o segundo CaseOpened nao entrou");
+        let estado = engine.case_state("case-1", None).unwrap().unwrap();
+        assert_eq!(estado.title, "Acessos falhados");
+        assert_eq!(estado.revision, 1);
     }
 
     #[test]
