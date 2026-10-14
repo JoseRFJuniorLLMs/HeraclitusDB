@@ -107,7 +107,7 @@ jobs:
           else
             exit "${soak_status:-1}"
           fi
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: nightly-qualification-reports
@@ -145,7 +145,7 @@ jobs:
         run: cargo +nightly-2026-02-17 fuzz run rfc3161_decode -- -max_total_time=300
       - name: preserve any crash as regression corpus (SPEC-0049)
         if: failure()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-deep-crash-artifacts
           if-no-files-found: ignore

@@ -34,7 +34,7 @@ jobs:
           rustc --version > offline-kit/RUSTC_VERSION
           cargo --version > offline-kit/CARGO_VERSION
       - name: Upload offline kit
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: heraclitus-sandbox-offline-kit
           path: offline-kit

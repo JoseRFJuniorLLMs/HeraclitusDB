@@ -29,7 +29,7 @@ jobs:
           cp -r labs/Agent-Atack-Heraclitus/. sandbox-artifact/Agent-Atack-Heraclitus/
           git rev-parse HEAD > sandbox-artifact/COMMIT
           sha256sum sandbox-artifact/heraclitus-server > sandbox-artifact/SHA256SUMS
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: heraclitus-sandbox-corrected
           path: sandbox-artifact/
