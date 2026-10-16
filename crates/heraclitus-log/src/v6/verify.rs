@@ -21,7 +21,7 @@ use super::header::PhysicalLayout;
 use super::merkle::{build_inclusion_proof, InclusionProof, MerkleAccumulatorV1};
 use super::packed::{open_packed, BlockSource, PackedSegmentReader, ScanCounters};
 use super::packer::CanonicalHasher;
-use super::raw::{footer_no_eof_alem_do_rasgo, scan_raw_segment, RawScan};
+use super::raw::{parece_selado, rasgo_corrompido, scan_raw_segment, RawScan};
 use super::receipts::{attestation_for, AttestationEnvelopeV1};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -99,34 +99,37 @@ fn verify_raw(
     const CTX: &str = "hrkl v6 verify raw";
     // O scan já valida o CRC-32C de cada registo: no RAW, físico e estrutural
     // são o mesmo percurso.
-    let RawScan {
-        header,
-        records,
-        footer,
-        torn_at,
-    } = scan_raw_segment(path)?;
-    let mut notes = Vec::new();
+    let scan = scan_raw_segment(path)?;
     // Auditoria recursiva 2026-10-03, iteração 1: um bit rodado no registo k
     // de um RAW SELADO faz a varredura parar em k (`torn_at`) sem nunca chegar
     // ao footer que continua válido no EOF. Sem esta verificação o relatório
     // chamava-lhe "cauda activa" e devolvia `physical_ok = true` — o
     // `heraclitus verify` (nível Physical) dava "passed" e saía com 0 num
     // segmento adulterado cujos registos depois de k nunca foram lidos. É o
-    // mesmo predicado que `repair_active_tail` usa para recusar truncar.
-    let selado_com_registo_corrompido = match torn_at {
-        Some(at) => footer_no_eof_alem_do_rasgo(path, at)?,
-        None => false,
-    };
+    // mesmo predicado que `repair_active_tail` usa para recusar truncar — e,
+    // desde a auditoria 2026-10-16 (B1), apanha também o registo corrompido a
+    // meio de uma cauda activa SEM footer, que antes passava por "torn tail".
+    let corrupcao = rasgo_corrompido(path, &scan)?;
+    let RawScan {
+        header,
+        records,
+        footer,
+        torn_at,
+    } = scan;
+    let mut notes = Vec::new();
     let footer = match footer {
         Some(f) => f,
         None => {
-            if selado_com_registo_corrompido {
-                notes.push(format!(
-                    "sealed segment has a corrupt record at offset {};                      the records after it and the footer were not verified",
-                    torn_at.unwrap_or(0)
-                ));
-            } else {
-                notes.push("segment is not sealed (active tail)".into());
+            match (&corrupcao, torn_at) {
+                (Some(motivo), Some(at)) if parece_selado(path)? => notes.push(format!(
+                    "sealed segment has a corrupt record at offset {at}; the records after \
+                     it and the footer were not verified ({motivo})"
+                )),
+                (Some(motivo), Some(at)) => notes.push(format!(
+                    "unsealed segment has a corrupt record at offset {at}, not a torn tail; \
+                     the records after it were not verified ({motivo})"
+                )),
+                _ => notes.push("segment is not sealed (active tail)".into()),
             }
             FooterV6 {
                 record_count: records.len() as u64,
@@ -142,7 +145,7 @@ fn verify_raw(
             }
         }
     };
-    if let (Some(at), false) = (torn_at, selado_com_registo_corrompido) {
+    if let (Some(at), None) = (torn_at, &corrupcao) {
         notes.push(format!("torn tail at offset {at}"));
     }
 
@@ -156,7 +159,7 @@ fn verify_raw(
         block_count: 0,
         declared_root: footer.logical_root,
         recomputed_root: None,
-        physical_ok: !selado_com_registo_corrompido,
+        physical_ok: corrupcao.is_none(),
         logical_ok: None,
         counters: ScanCounters::default(),
         notes,

@@ -44,7 +44,7 @@ use super::packed::{open_packed, PackOptions, ScanCounters};
 use super::packer::{pack_segment, PackOutcome};
 use super::raw::{
     find_raw_record, percorrer_raw_segmento, read_footer, read_sealing_footer, repair_active_tail,
-    scan_raw_segment, ControloVarredura, RawSegmentWriter, SegmentInit,
+    scan_raw_segment, ControloVarredura, FimPercurso, RawSegmentWriter, SegmentInit,
 };
 use super::receipts::{persist_pack_receipt, physical_digest_of_file};
 use super::verify::{verify_segment as verify_segment_file, IntegrityLevel, VerifyReport};
@@ -876,9 +876,10 @@ impl V6Log {
     }
 
     fn tentar_ler(&self, lsn: Lsn) -> Result<Option<(Lsn, Episode)>, TentativaFalhou> {
-        let source = {
+        let (source, head) = {
             let state = self.lock_state()?;
-            if lsn >= state.next_lsn {
+            let head = state.next_lsn;
+            if lsn >= head {
                 return Ok(None);
             }
             // Sem segmento activo (seal falhado, à espera de o repor) os LSNs
@@ -889,7 +890,7 @@ impl V6Log {
                 .active
                 .as_ref()
                 .filter(|active| lsn >= active.writer.header().first_lsn);
-            if let Some(active) = activo {
+            let source = if let Some(active) = activo {
                 ReadSource::Active(active.path.clone(), active.writer.offset_of(lsn))
             } else {
                 let desc = state.manifest.find_segment_for_lsn(lsn).ok_or_else(|| {
@@ -906,9 +907,17 @@ impl V6Log {
                     resolve_location(&self.root, &generation.location)?,
                     generation.layout,
                 )
-            }
+            };
+            (source, head)
         };
 
+        // Auditoria 2026-10-16, B2: daqui para baixo `lsn < head`, isto é, o
+        // registo foi confirmado e escrito antes de o `head` avançar. Se o
+        // segmento que o contém não o entrega, é corrupção — nunca `Ok(None)`,
+        // que para quem chama significa "não existe" (era o que acontecia com
+        // um bit trocado antes dele num RAW selado: 13 LSN confirmados davam
+        // `Ok(None)`).
+        //
         // Auditoria 2026-09-05, A04: os dois ramos RAW faziam
         // `scan_raw_segment(..).records.into_iter().find(|r| r.lsn == lsn)` —
         // ou seja, liam o ficheiro TODO e alocavam um `Vec<u8>` por registo
@@ -919,36 +928,58 @@ impl V6Log {
         // em streaming pára no registo alvo e copia só esse payload; o ramo
         // PACKED ao lado já fazia o equivalente (descomprime um bloco, não o
         // segmento).
-        let found = match source {
+        let (found_lsn, payload) = match source {
             ReadSource::Active(path, offset) => match offset
                 .map(|o| super::raw::read_raw_record_at(&path, o, lsn))
                 .transpose()
                 .map(Option::flatten)
                 .and_then(|directo| match directo {
-                    Some(r) => Ok(Some(r)),
+                    Some(r) => Ok(Ok(r)),
                     // Sem offset, ou o offset não confere: o percurso
                     // completo, que é a definição.
-                    None => find_raw_record(&path, lsn).map(|a| a.record),
+                    None => find_raw_record(&path, lsn).map(|a| a.record.ok_or(a.percurso)),
                 }) {
-                Ok(achado) => achado.map(|r| (r.lsn, r.payload)),
+                Ok(Ok(r)) => (r.lsn, r.payload),
+                Ok(Err(percurso)) => {
+                    return Err(TentativaFalhou::Erro(lsn_em_falta(
+                        lsn,
+                        head,
+                        &path,
+                        &percurso.descrever(),
+                    )))
+                }
                 // O ficheiro deixou de existir: alguem selou o segmento entre a
                 // resolucao do caminho e a abertura. Nao e erro — e a corrida.
                 Err(_) if !path.exists() => return Err(TentativaFalhou::Rolou),
                 Err(e) => return Err(TentativaFalhou::Erro(e)),
             },
-            ReadSource::Sealed(path, PhysicalLayout::Raw) => find_raw_record(&path, lsn)?
-                .record
-                .map(|r| (r.lsn, r.payload)),
+            ReadSource::Sealed(path, PhysicalLayout::Raw) => {
+                let achado = find_raw_record(&path, lsn)?;
+                match achado.record {
+                    Some(r) => (r.lsn, r.payload),
+                    None => {
+                        return Err(
+                            lsn_em_falta(lsn, head, &path, &achado.percurso.descrever()).into()
+                        )
+                    }
+                }
+            }
             ReadSource::Sealed(path, PhysicalLayout::Packed) => {
                 let reader = open_packed(&path, HARD_MAX_BLOCK_BYTES)?;
                 let mut counters = ScanCounters::default();
-                reader
-                    .get(lsn, &mut counters)?
-                    .map(|(_, payload)| (lsn, payload))
+                match reader.get(lsn, &mut counters)? {
+                    Some((_, payload)) => (lsn, payload),
+                    None => {
+                        return Err(lsn_em_falta(
+                            lsn,
+                            head,
+                            &path,
+                            "the PACKED generation has no such record",
+                        )
+                        .into())
+                    }
+                }
             }
-        };
-        let Some((found_lsn, payload)) = found else {
-            return Ok(None);
         };
         let mut episode =
             crate::decode_episode_payload_with_meta(crate::format::FORMAT_VERSION, &payload)?
@@ -1111,6 +1142,7 @@ impl V6Log {
         }
         let mut out = Vec::with_capacity(max.min(1024));
         let mut counters = ScanCounters::default();
+        let mut pista_cauda = None;
 
         for desc in &instantaneo.candidatos {
             if out.len() >= max {
@@ -1138,15 +1170,19 @@ impl V6Log {
                     // O que A13 não escreveu, e a revisão de A55 obrigou a
                     // escrever: com esta troca a VARREDURA passa também a perder
                     // a validação incidental do footer que `scan_raw_segment`
-                    // fazia de passagem. Um segmento selado com footer completo
-                    // mas malformado termina o percurso em silêncio em vez de
-                    // dar `Corruption`. Não se perde nenhuma linha (o footer vem
-                    // depois de todos os registos), mas a garantia deixou de ser
-                    // um efeito secundário da leitura e passou a ser exclusiva de
-                    // `verify_sealed`/`verify_active_tail` e do boot — a mesma
-                    // troca que A04 declarou para as leituras pontuais, agora
-                    // válida também aqui.
-                    let percorrido = percorrer_raw_segmento(path, |lsn, _hlc, payload| {
+                    // fazia de passagem (`validate_raw_footer`), que fica
+                    // exclusiva de `verify_sealed`/`verify_active_tail` e do
+                    // boot — a mesma troca que A04 declarou para as leituras
+                    // pontuais.
+                    //
+                    // O que A13/A55 afirmavam a seguir — "não se perde nenhuma
+                    // linha" — era falso (auditoria 2026-10-16, B2): o percurso
+                    // parava no primeiro CRC falhado sem o distinguir do fim, e
+                    // a varredura devolvia `Ok` sem todas as linhas a partir
+                    // dele (187 de 200). Agora o percurso diz porque parou, e um
+                    // RAW selado que não chega ao footer com `record_count`
+                    // registos é corrupção.
+                    let percurso = percorrer_raw_segmento(path, |lsn, _hlc, payload| {
                         if lsn < seg_from || lsn >= seg_to {
                             return Ok(ControloVarredura::Continuar);
                         }
@@ -1166,7 +1202,8 @@ impl V6Log {
                             ControloVarredura::Continuar
                         })
                     })?;
-                    counters.bytes_physical_read += percorrido;
+                    counters.bytes_physical_read += percurso.bytes;
+                    percurso.exigir_selado_completo(path)?;
                 }
                 PhysicalLayout::Packed => {
                     let reader = open_packed(path, HARD_MAX_BLOCK_BYTES)?;
@@ -1213,7 +1250,7 @@ impl V6Log {
                     // mais varrido de todos (é sempre RAW e é onde o replay
                     // acaba sempre por bater) e era relida por inteiro a cada
                     // janela. Mesmo percurso em streaming dos selados.
-                    let percorrido = match percorrer_raw_segmento(path, |lsn, _hlc, payload| {
+                    let percurso = match percorrer_raw_segmento(path, |lsn, _hlc, payload| {
                         if lsn < seg_from || lsn >= end {
                             return Ok(ControloVarredura::Continuar);
                         }
@@ -1237,7 +1274,7 @@ impl V6Log {
                             ControloVarredura::Continuar
                         })
                     }) {
-                        Ok(percorrido) => percorrido,
+                        Ok(percurso) => percurso,
                         // O ficheiro deixou de existir: alguém selou a cauda
                         // depois do instantâneo. Repetir com estado fresco — o
                         // segmento está agora no catálogo, e é lá que os
@@ -1245,11 +1282,32 @@ impl V6Log {
                         Err(_) if !path.exists() => return Err(TentativaFalhou::Rolou),
                         Err(e) => return Err(TentativaFalhou::Erro(e)),
                     };
-                    counters.bytes_physical_read += percorrido;
+                    counters.bytes_physical_read += percurso.bytes;
+                    // Na cauda um `Rasgo` no fim é normal — pode ser o registo
+                    // que outro append está a escrever agora, acima do `head`
+                    // deste instantâneo. O que não pode faltar é nenhum LSN
+                    // abaixo dele: isso confere-se a seguir, para a janela
+                    // inteira, e esta pista diz onde a cauda parou.
+                    if percurso.fim == FimPercurso::Rasgo {
+                        pista_cauda = Some(format!(
+                            "active tail {}: {}",
+                            path.display(),
+                            percurso.descrever()
+                        ));
+                    }
                 }
             }
         }
 
+        exigir_janela_completa(
+            "hrkl v6 scan",
+            out.iter().map(|(lsn, _)| *lsn),
+            from,
+            end,
+            instantaneo.head,
+            max,
+            pista_cauda.as_deref(),
+        )?;
         Ok((out, counters))
     }
 
@@ -1366,6 +1424,25 @@ impl V6Log {
             match layout {
                 PhysicalLayout::Raw => {
                     let scan = scan_raw_segment(path)?;
+                    // Auditoria 2026-10-16, B2: sem footer, a varredura parou num
+                    // registo ilegível de um segmento selado, e os registos
+                    // depois dele não entravam nos candidatos — o diário
+                    // administrativo (`trusted_admin::recover`) era recuperado
+                    // sem eles. Com footer, `scan_raw_bytes` já conferiu a
+                    // contagem contra os registos lidos.
+                    if scan.footer.is_none() {
+                        return Err(corrupt(
+                            "hrkl v6 pruned scan",
+                            format!(
+                                "{}: sealed RAW stops at offset {} after {} records without \
+                                 reaching its footer",
+                                path.display(),
+                                scan.torn_at.unwrap_or(0),
+                                scan.records.len()
+                            ),
+                        )
+                        .into());
+                    }
                     stats.segments_read += 1;
                     stats.blocks_candidate += 1;
                     stats.blocks_read += 1;
@@ -1478,6 +1555,27 @@ impl V6Log {
                     stats.bytes_candidate += active_bytes;
                     stats.bytes_physical_read += active_bytes;
                     let scan = scan_raw_segment(&active.path)?;
+                    // Auditoria 2026-10-16, B2: lida sob o mutex do writer, a
+                    // cauda tem de chegar ao `head` — não há append a meio.
+                    let alcancado = first.saturating_add(scan.records.len() as u64);
+                    if alcancado < state.next_lsn
+                        || scan
+                            .records
+                            .iter()
+                            .enumerate()
+                            .any(|(i, r)| r.lsn != first.saturating_add(i as u64))
+                    {
+                        return Err(corrupt(
+                            "hrkl v6 pruned scan",
+                            format!(
+                                "active tail {} stops at LSN {alcancado} (offset {}) below head {}",
+                                active.path.display(),
+                                scan.torn_at.unwrap_or(0),
+                                state.next_lsn
+                            ),
+                        )
+                        .into());
+                    }
                     self.collect_builtin_matches(
                         scan.records.iter().map(|r| (r.lsn, r.payload.as_slice())),
                         &criterio,
@@ -1756,6 +1854,17 @@ impl V6Log {
     /// O mutex `state` é mantido apenas para fotografar um job e para publicar
     /// a nova geração no HRKM. Compressão, hashes e fsync acontecem sem ele;
     /// portanto appends continuam enquanto o PACKED é produzido.
+    ///
+    /// Auditoria 2026-10-16, B6: a falha de um segmento já não aborta a fila.
+    /// Um único RAW selado corrompido (um CRC a meio) devolvia `Err` no `?` do
+    /// `pack_segment` e nenhum segmento a seguir voltava a ser empacotado — nem,
+    /// por arrasto, ganhava HRKI, Parquet ou GC das gerações; o disco crescia e
+    /// o único sintoma era um `warn` a cada 30 s. Agora cada falha é registada
+    /// com o seu segmento e a fila continua; os que deram certo ficam
+    /// publicados no HRKM e o segmento mau fica na fila (é a única cópia dos
+    /// seus registos — não há geração para onde o quarentenar). No fim, se
+    /// algum falhou, devolve-se o erro do primeiro: a corrupção nunca é engolida
+    /// por uma resposta `Ok`.
     pub fn pack_pending(
         &self,
         profile: PackingProfile,
@@ -1766,8 +1875,25 @@ impl V6Log {
             .map_err(|_| HeraclitusError::StorageEngine("v6 packing lock poisoned".into()))?;
         let queue = self.lock_state()?.manifest.packing_queue();
         let mut outcomes = Vec::with_capacity(queue.len());
+        let mut falhas = FalhasDaFila::new("hrkl v6 pack");
         for id in queue {
-            let (desc, source_location, source_generation) = {
+            match self.empacotar_da_fila(id, profile) {
+                Ok(outcome) => outcomes.push(outcome),
+                Err(err) => falhas.registar(id, err),
+            }
+        }
+        falhas.concluir(outcomes)
+    }
+
+    /// Um job de [`Self::pack_pending`]: empacota o segmento `id` e publica a
+    /// geração PACKED no HRKM.
+    fn empacotar_da_fila(
+        &self,
+        id: SegmentId,
+        profile: PackingProfile,
+    ) -> Result<PackOutcome, HeraclitusError> {
+        let (desc, source_location, source_generation) =
+            {
                 let state = self.lock_state()?;
                 let desc = state.manifest.segment(id).cloned().ok_or_else(|| {
                     HeraclitusError::Corruption {
@@ -1785,76 +1911,73 @@ impl V6Log {
                     })?;
                 (desc.clone(), source.location.clone(), source.generation)
             };
-            let source_path = resolve_location(&self.root, &source_location)?;
-            let target_generation = next_physical_generation(&self.segments_dir, &desc)?;
-            let target_path = packed_path(&self.segments_dir, id, target_generation);
-            let options = PackOptions {
-                profile,
-                ..PackOptions::default()
-            };
-            // Deliberadamente SEM `state`: esta é a parte cara.
-            let pack_started = Instant::now();
-            let outcome = pack_segment(
-                &source_path,
-                &target_path,
-                options,
-                source_generation,
-                target_generation,
-                &persisted_hasher,
-            )?;
-            self.metrics
-                .pack_nanos
-                .fetch_add(saturating_nanos(pack_started.elapsed()), Ordering::Relaxed);
-            self.metrics
-                .pack_source_bytes
-                .fetch_add(outcome.receipt.source_physical_size, Ordering::Relaxed);
-            self.metrics
-                .pack_target_bytes
-                .fetch_add(outcome.receipt.target_physical_size, Ordering::Relaxed);
+        let source_path = resolve_location(&self.root, &source_location)?;
+        let target_generation = next_physical_generation(&self.segments_dir, &desc)?;
+        let target_path = packed_path(&self.segments_dir, id, target_generation);
+        let options = PackOptions {
+            profile,
+            ..PackOptions::default()
+        };
+        // Deliberadamente SEM `state`: esta é a parte cara.
+        let pack_started = Instant::now();
+        let outcome = pack_segment(
+            &source_path,
+            &target_path,
+            options,
+            source_generation,
+            target_generation,
+            &persisted_hasher,
+        )?;
+        self.metrics
+            .pack_nanos
+            .fetch_add(saturating_nanos(pack_started.elapsed()), Ordering::Relaxed);
+        self.metrics
+            .pack_source_bytes
+            .fetch_add(outcome.receipt.source_physical_size, Ordering::Relaxed);
+        self.metrics
+            .pack_target_bytes
+            .fetch_add(outcome.receipt.target_physical_size, Ordering::Relaxed);
 
-            // §88 passo 12: a evidência imutável e fsyncada existe antes de o
-            // HRKM tornar a geração PACKED ativa. Crash aqui deixa somente
-            // PACKED+recibo órfãos; o RAW committed segue como autoridade.
-            persist_pack_receipt(&self.root.join("receipts"), &outcome.receipt)?;
+        // §88 passo 12: a evidência imutável e fsyncada existe antes de o
+        // HRKM tornar a geração PACKED ativa. Crash aqui deixa somente
+        // PACKED+recibo órfãos; o RAW committed segue como autoridade.
+        persist_pack_receipt(&self.root.join("receipts"), &outcome.receipt)?;
 
-            let mut state = self.lock_state()?;
-            let current =
-                state
-                    .manifest
-                    .segment(id)
-                    .ok_or_else(|| HeraclitusError::Corruption {
-                        context: "hrkl v6 pack".into(),
-                        detail: format!("segmento {id} desapareceu antes do publish"),
-                    })?;
-            if current.logical_root != desc.logical_root
-                || current.record_count != desc.record_count
-                || current.generation(source_generation).is_none()
-            {
-                return Err(corrupt(
-                    "hrkl v6 pack",
-                    format!("segmento {id} mudou enquanto era empacotado"),
-                ));
-            }
-            let before = state.manifest.clone();
-            let location = packed_location(id, target_generation);
-            if let Err(err) = record_pack(
-                &mut state.manifest,
-                &outcome.receipt,
-                &location,
-                self.hlc.now(),
-            ) {
-                state.manifest = before;
-                return Err(err);
-            }
-            if let Err(err) = self.manifest_store.commit(&mut state.manifest) {
-                // O PACKED publicado fica deliberadamente órfão e legível; o
-                // retry escolhe outra geração física em vez de sobrescrevê-lo.
-                state.manifest = before;
-                return Err(err);
-            }
-            outcomes.push(outcome);
+        let mut state = self.lock_state()?;
+        let current = state
+            .manifest
+            .segment(id)
+            .ok_or_else(|| HeraclitusError::Corruption {
+                context: "hrkl v6 pack".into(),
+                detail: format!("segmento {id} desapareceu antes do publish"),
+            })?;
+        if current.logical_root != desc.logical_root
+            || current.record_count != desc.record_count
+            || current.generation(source_generation).is_none()
+        {
+            return Err(corrupt(
+                "hrkl v6 pack",
+                format!("segmento {id} mudou enquanto era empacotado"),
+            ));
         }
-        Ok(outcomes)
+        let before = state.manifest.clone();
+        let location = packed_location(id, target_generation);
+        if let Err(err) = record_pack(
+            &mut state.manifest,
+            &outcome.receipt,
+            &location,
+            self.hlc.now(),
+        ) {
+            state.manifest = before;
+            return Err(err);
+        }
+        if let Err(err) = self.manifest_store.commit(&mut state.manifest) {
+            // O PACKED publicado fica deliberadamente órfão e legível; o
+            // retry escolhe outra geração física em vez de sobrescrevê-lo.
+            state.manifest = before;
+            return Err(err);
+        }
+        Ok(outcome)
     }
 
     /// Variante assíncrona para workers Tokio. O I/O/CPU síncrono é sempre
@@ -1902,7 +2025,12 @@ impl V6Log {
             if active.layout != PhysicalLayout::Packed {
                 continue;
             }
-            let packed = resolve_location(&self.root, &active.location)?;
+            // B6: uma localização que não resolve é problema DESTE segmento —
+            // entra na fila, onde a falha é registada sem parar os outros.
+            let Ok(packed) = resolve_location(&self.root, &active.location) else {
+                queue.insert(desc.segment_id);
+                continue;
+            };
             let sidecar_path = caminho_sidecar(&packed);
             let valid = desc.hrki.as_ref().is_some_and(|artifact| {
                 let Ok(catalog_path) = resolve_location(&self.root, &artifact.location) else {
@@ -1918,92 +2046,112 @@ impl V6Log {
                 queue.insert(desc.segment_id);
             }
         }
+        // Auditoria 2026-10-16, B6: como em `pack_pending`, um segmento que
+        // falha (PACKED ilegível, sidecar que não se escreve) é registado e a
+        // fila continua; o erro do primeiro sobe no fim.
         let mut outcomes = Vec::with_capacity(queue.len());
+        let mut falhas = FalhasDaFila::new("hrkl v6 hrki build");
         for id in queue {
-            let (logical_root, generation, location) = {
-                let state = self.lock_state()?;
-                let Some(desc) = state.manifest.segment(id) else {
-                    continue;
-                };
-                let Some(active) = desc.active() else {
-                    return Err(corrupt(
-                        "hrkl v6 hrki build",
-                        format!("segmento {id} sem geração ativa"),
-                    ));
-                };
-                if active.layout != PhysicalLayout::Packed {
-                    // Depois de uma quarentena pode existir PACKED histórico
-                    // enquanto o reader voltou ao RAW. As fronteiras de bloco
-                    // do sidecar têm de pertencer ao layout activo.
-                    continue;
-                }
-                (
-                    desc.logical_root,
-                    active.generation,
-                    active.location.clone(),
-                )
-            };
-            let packed = resolve_location(&self.root, &location)?;
-            let decode = |payload: &[u8]| {
-                let mut episode =
-                    crate::decode_episode_payload(crate::format::FORMAT_VERSION, payload).ok()?;
-                crate::decrypt_storage_episode_in_place(&mut episode, self.keystore.as_deref())
-                    .ok()?;
-                Some(episode)
-            };
-            construir_para_packed(
-                &packed,
-                policy,
-                index_key,
-                fpr,
-                HARD_MAX_BLOCK_BYTES,
-                &decode,
-            )?;
-            let path = caminho_sidecar(&packed);
-            let size = std::fs::metadata(&path)?.len();
-            let digest = physical_digest_of_file(&path)?;
-            let created_hlc = self.hlc.now();
-
-            let mut state = self.lock_state()?;
-            let current = state.manifest.segment(id).ok_or_else(|| {
-                corrupt("hrkl v6 hrki publish", format!("segmento {id} desapareceu"))
-            })?;
-            if current.logical_root != logical_root
-                || current.active_generation != generation
-                || current
-                    .active()
-                    .is_none_or(|g| g.layout != PhysicalLayout::Packed)
-            {
-                // O ficheiro fica órfão e reconstruível; nunca se liga
-                // metadata calculada para outra geração física.
-                continue;
+            match self.construir_hrki_da_fila(id, policy, index_key, fpr) {
+                Ok(Some(outcome)) => outcomes.push(outcome),
+                Ok(None) => {}
+                Err(err) => falhas.registar(id, err),
             }
-            let before = state.manifest.clone();
-            let artifact = DerivedArtifactRef {
-                location: format!("segments/{id:020}.g{generation:04}.packed.hrki"),
-                size,
-                digest,
-                logical_root,
-                created_hlc,
-            };
-            if let Err(err) = attach_sidecar(&mut state.manifest, id, artifact) {
-                state.manifest = before;
-                return Err(err);
-            }
-            if let Err(err) = self.manifest_store.commit(&mut state.manifest) {
-                state.manifest = before;
-                return Err(err);
-            }
-            outcomes.push(HrkiBuildOutcome {
-                segment_id: id,
-                generation,
-                path,
-                size,
-                digest,
-            });
-            self.metrics.hrki_rebuilds.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(outcomes)
+        falhas.concluir(outcomes)
+    }
+
+    /// Um job de [`Self::build_pending_hrki`]. `Ok(None)` quando o segmento
+    /// deixou de precisar de sidecar entre a fotografia da fila e o publish.
+    fn construir_hrki_da_fila(
+        &self,
+        id: SegmentId,
+        policy: &IndexPolicySet,
+        index_key: Option<[u8; 32]>,
+        fpr: f64,
+    ) -> Result<Option<HrkiBuildOutcome>, HeraclitusError> {
+        let (logical_root, generation, location) = {
+            let state = self.lock_state()?;
+            let Some(desc) = state.manifest.segment(id) else {
+                return Ok(None);
+            };
+            let Some(active) = desc.active() else {
+                return Err(corrupt(
+                    "hrkl v6 hrki build",
+                    format!("segmento {id} sem geração ativa"),
+                ));
+            };
+            if active.layout != PhysicalLayout::Packed {
+                // Depois de uma quarentena pode existir PACKED histórico
+                // enquanto o reader voltou ao RAW. As fronteiras de bloco
+                // do sidecar têm de pertencer ao layout activo.
+                return Ok(None);
+            }
+            (
+                desc.logical_root,
+                active.generation,
+                active.location.clone(),
+            )
+        };
+        let packed = resolve_location(&self.root, &location)?;
+        let decode = |payload: &[u8]| {
+            let mut episode =
+                crate::decode_episode_payload(crate::format::FORMAT_VERSION, payload).ok()?;
+            crate::decrypt_storage_episode_in_place(&mut episode, self.keystore.as_deref()).ok()?;
+            Some(episode)
+        };
+        construir_para_packed(
+            &packed,
+            policy,
+            index_key,
+            fpr,
+            HARD_MAX_BLOCK_BYTES,
+            &decode,
+        )?;
+        let path = caminho_sidecar(&packed);
+        let size = std::fs::metadata(&path)?.len();
+        let digest = physical_digest_of_file(&path)?;
+        let created_hlc = self.hlc.now();
+
+        let mut state = self.lock_state()?;
+        let current = state
+            .manifest
+            .segment(id)
+            .ok_or_else(|| corrupt("hrkl v6 hrki publish", format!("segmento {id} desapareceu")))?;
+        if current.logical_root != logical_root
+            || current.active_generation != generation
+            || current
+                .active()
+                .is_none_or(|g| g.layout != PhysicalLayout::Packed)
+        {
+            // O ficheiro fica órfão e reconstruível; nunca se liga
+            // metadata calculada para outra geração física.
+            return Ok(None);
+        }
+        let before = state.manifest.clone();
+        let artifact = DerivedArtifactRef {
+            location: format!("segments/{id:020}.g{generation:04}.packed.hrki"),
+            size,
+            digest,
+            logical_root,
+            created_hlc,
+        };
+        if let Err(err) = attach_sidecar(&mut state.manifest, id, artifact) {
+            state.manifest = before;
+            return Err(err);
+        }
+        if let Err(err) = self.manifest_store.commit(&mut state.manifest) {
+            state.manifest = before;
+            return Err(err);
+        }
+        self.metrics.hrki_rebuilds.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(HrkiBuildOutcome {
+            segment_id: id,
+            generation,
+            path,
+            size,
+            digest,
+        }))
     }
 
     pub async fn build_pending_hrki_async(
@@ -2729,6 +2877,119 @@ impl Drop for V6Log {
 /// certa sem mais nenhuma alteração aqui.
 fn janela_toca_a_cauda(cauda_first_lsn: Option<Lsn>, end: Lsn) -> bool {
     cauda_first_lsn.is_none_or(|primeiro| end > primeiro)
+}
+
+/// Auditoria 2026-10-16, B6: as falhas de uma fila de trabalho de fundo
+/// (packing, HRKI), segmento a segmento.
+///
+/// Cada falha é registada com o seu segmento no momento em que acontece e a
+/// fila continua. No fim, se alguma falhou, devolve-se o erro da primeira — com
+/// o segmento no contexto e a lista das outras no detalhe —, para que quem
+/// chama continue a ver a corrupção em vez de um `Ok` parcial.
+struct FalhasDaFila {
+    contexto: &'static str,
+    segmentos: Vec<SegmentId>,
+    primeira: Option<HeraclitusError>,
+}
+
+impl FalhasDaFila {
+    fn new(contexto: &'static str) -> Self {
+        Self {
+            contexto,
+            segmentos: Vec::new(),
+            primeira: None,
+        }
+    }
+
+    fn registar(&mut self, segmento: SegmentId, err: HeraclitusError) {
+        tracing::error!(
+            segmento,
+            error = %err,
+            "{}: o segmento falhou; a fila continua com os restantes",
+            self.contexto
+        );
+        self.segmentos.push(segmento);
+        if self.primeira.is_none() {
+            self.primeira = Some(match err {
+                HeraclitusError::Corruption { context, detail } => HeraclitusError::Corruption {
+                    context: format!("{context} (segmento {segmento})"),
+                    detail,
+                },
+                outro => outro,
+            });
+        }
+    }
+
+    fn concluir<T>(self, feitos: Vec<T>) -> Result<Vec<T>, HeraclitusError> {
+        let Some(primeira) = self.primeira else {
+            return Ok(feitos);
+        };
+        Err(match primeira {
+            HeraclitusError::Corruption { context, detail } => HeraclitusError::Corruption {
+                context,
+                detail: format!(
+                    "{detail} [{}: segmento(s) {:?} falharam; {} concluído(s) nesta passagem]",
+                    self.contexto,
+                    self.segmentos,
+                    feitos.len()
+                ),
+            },
+            outro => outro,
+        })
+    }
+}
+
+/// Auditoria 2026-10-16, B2: o erro de um LSN confirmado (`< head`) que o
+/// segmento que o contém não entregou.
+fn lsn_em_falta(lsn: Lsn, head: Lsn, path: &Path, porque: &str) -> HeraclitusError {
+    HeraclitusError::Corruption {
+        context: "hrkl v6 read".into(),
+        detail: format!(
+            "LSN {lsn} is below head {head} (confirmed) but {} does not yield it: {porque}",
+            path.display()
+        ),
+    }
+}
+
+/// Auditoria 2026-10-16, B2: `[from, end)` é contíguo por construção — o
+/// manifesto cobre `0..` sem buracos (`validate_manifest_ranges`), a cauda
+/// começa onde o catálogo acaba, e todo LSN abaixo do `head` do instantâneo foi
+/// escrito antes de o `head` avançar. Uma linha que falte é portanto um registo
+/// que nenhum ramo conseguiu ler, e a resposta não pode ser `Ok`: `catch_up`,
+/// `rebuild`, o índice de atributos, o `Subscribe`, o snapshot Raft e o relatório
+/// do titular avançam o cursor por linha e nunca mais voltariam a ela.
+///
+/// `limite` é o `max` da varredura: uma resposta cortada por ele só tem de ser
+/// contígua até onde chegou.
+fn exigir_janela_completa(
+    contexto: &'static str,
+    lsns: impl Iterator<Item = Lsn>,
+    from: Lsn,
+    end: Lsn,
+    head: Lsn,
+    limite: usize,
+    pista: Option<&str>,
+) -> Result<(), HeraclitusError> {
+    let mut esperado = from;
+    let mut linhas = 0usize;
+    for lsn in lsns {
+        if lsn != esperado {
+            break;
+        }
+        esperado += 1;
+        linhas += 1;
+    }
+    if esperado == end || linhas >= limite {
+        return Ok(());
+    }
+    Err(HeraclitusError::Corruption {
+        context: contexto.into(),
+        detail: format!(
+            "window [{from}, {end}) below head {head}: confirmed LSN {esperado} was not \
+             yielded by any segment{}",
+            pista.map(|p| format!(" ({p})")).unwrap_or_default()
+        ),
+    })
 }
 
 /// Porque e que uma tentativa de leitura nao produziu o registo.
