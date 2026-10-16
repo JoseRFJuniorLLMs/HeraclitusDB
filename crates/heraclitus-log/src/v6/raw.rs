@@ -1074,17 +1074,10 @@ pub(super) fn rasgo_corrompido(path: &Path, scan: &RawScan) -> V6Result<Option<S
         RawDecoded::Record { lsn, .. } => Some(lsn),
         _ => None,
     };
-    let footer_declara = |b: &[u8]| {
-        FooterV6::decode(b)
-            .ok()
-            .filter(|f| f.record_count > 0)
-            .map(|f| (f.min_lsn, f.max_lsn))
-    };
     let formato = crate::rasgo::Formato {
         footer_magic: FOOTER_MAGIC,
         footer_len: FOOTER_LEN,
         registo_integro: &registo_integro,
-        footer_declara: &footer_declara,
     };
     Ok(
         match crate::rasgo::classificar(&resto, esperado, &formato) {
@@ -1503,9 +1496,46 @@ mod tests {
         assert_eq!(percurso.registos, 5);
         // O fim tem de dizer que parou num rasgo, não que o ficheiro acabou.
         assert_eq!(percurso.fim, FimPercurso::Rasgo);
+        assert!(percurso.exigir_selado_completo(&path).is_err());
         assert!(find_raw_record(&path, 5).unwrap().record.is_none());
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn percurso_selado_exige_footer_e_contagem_mesmo_com_todos_os_payloads_legiveis() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contagem.raw.hrkl");
+        let init = SegmentInit {
+            segment_id: 16,
+            created_hlc: 1,
+            first_lsn: 0,
+            writer_epoch: 1,
+            storage_namespace_id: [0u8; 16],
+        };
+        let mut w = RawSegmentWriter::create(&path, init).unwrap();
+        w.append(0, 1, b"primeiro", &h(1)).unwrap();
+        w.append(1, 2, b"segundo", &h(2)).unwrap();
+        let mut footer = w.seal().unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let footer_at = bytes.len() - FOOTER_LEN;
+        let percorrer =
+            || percorrer_raw_segmento(&path, |_, _, _| Ok(ControloVarredura::Continuar)).unwrap();
+        assert!(percorrer().exigir_selado_completo(&path).is_ok());
+
+        // EOF numa fronteira de registo continua a ser corrupção num selado.
+        std::fs::write(&path, &bytes[..footer_at]).unwrap();
+        let sem_footer = percorrer();
+        assert_eq!(sem_footer.fim, FimPercurso::Eof);
+        assert!(sem_footer.exigir_selado_completo(&path).is_err());
+
+        // Footer íntegro, mas com contagem divergente dos registos percorridos.
+        footer.record_count = 1;
+        bytes[footer_at..].copy_from_slice(&footer.encode());
+        std::fs::write(&path, bytes).unwrap();
+        let divergente = percorrer();
+        assert_eq!(divergente.fim, FimPercurso::Footer { record_count: 1 });
+        assert!(divergente.exigir_selado_completo(&path).is_err());
     }
 
     #[test]
@@ -1791,14 +1821,11 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().len(), bytes.len() as u64);
     }
 
-    /// Auditoria 2026-10-16, B1/B5: o comprimento do ÚLTIMO registo de um
-    /// segmento selado (um `.active` que caiu entre o seal e o rename),
-    /// estragado para lá do EOF, parece uma escrita interrompida — não há
-    /// registo nenhum depois dele. Mas o footer íntegro no EOF declara esse
-    /// LSN: o registo estava completo quando o segmento foi selado, e cortá-lo
-    /// apagaria um registo confirmado e o footer que o prova.
+    /// B5: só a fronteira alcançada pode selar. O footer em EOF-128,
+    /// dentro de um frame cujo comprimento passa do EOF, não é prova de seal,
+    /// mesmo que declare o LSN esperado.
     #[test]
-    fn comprimento_estragado_no_ultimo_registo_de_um_selado_nao_e_truncado() {
+    fn footer_que_declara_o_lsn_dentro_do_rasgo_nao_sela() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("13.active.hrkl");
         let init = SegmentInit {
@@ -1821,9 +1848,8 @@ mod tests {
             scan_raw_segment(&path).unwrap().torn_at,
             Some(segundo as u64)
         );
-        let erro = repair_active_tail(&path).unwrap_err().to_string();
-        assert!(erro.contains("valid footer at EOF"), "{erro}");
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), bytes.len() as u64);
+        assert_eq!(repair_active_tail(&path).unwrap(), Some(segundo as u64));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), segundo as u64);
     }
 
     /// Auditoria 2026-10-16, B1: o bit trocado no `payload_len` de um registo
@@ -1862,12 +1888,10 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().len(), bytes.len() as u64);
     }
 
-    /// A excepção da regra: zeros do rasgo até ao EOF não são um registo (o
-    /// CRC-32C de zeros não é zero) nem o rasto de um bit trocado — são a
-    /// extensão do ficheiro cujo conteúdo não chegou ao disco antes de uma
-    /// falha de energia. Truncá-los não apaga nada que alguém escreveu.
+    /// Uma região zerada pode resultar de corrupção. O comprimento declarado
+    /// é zero e o frame cabe no ficheiro: preservar a evidência, sem truncar.
     #[test]
-    fn zeros_depois_do_ultimo_registo_sao_cauda_rasgada() {
+    fn zeros_depois_do_ultimo_registo_sao_corrupcao_sem_truncar() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("14.active.hrkl");
         let init = SegmentInit {
@@ -1882,7 +1906,6 @@ mod tests {
             w.append(i, i, b"abcdefgh", &h(i as u8 + 1)).unwrap();
         }
         w.sync().unwrap();
-        let bom = std::fs::metadata(&path).unwrap().len();
         drop(w);
         {
             use std::io::Write as _;
@@ -1893,7 +1916,8 @@ mod tests {
                 .write_all(&[0u8; 300])
                 .unwrap();
         }
-        assert_eq!(repair_active_tail(&path).unwrap(), Some(bom));
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), bom);
+        let antes = std::fs::read(&path).unwrap();
+        assert!(repair_active_tail(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), antes);
     }
 }

@@ -1558,7 +1558,13 @@ impl V6Log {
                     // Auditoria 2026-10-16, B2: lida sob o mutex do writer, a
                     // cauda tem de chegar ao `head` — não há append a meio.
                     let alcancado = first.saturating_add(scan.records.len() as u64);
-                    if alcancado < state.next_lsn {
+                    if alcancado < state.next_lsn
+                        || scan
+                            .records
+                            .iter()
+                            .enumerate()
+                            .any(|(i, r)| r.lsn != first.saturating_add(i as u64))
+                    {
                         return Err(corrupt(
                             "hrkl v6 pruned scan",
                             format!(

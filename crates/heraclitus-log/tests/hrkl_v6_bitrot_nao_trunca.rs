@@ -133,13 +133,8 @@ fn bitrot_no_meio_da_cauda_activa_nao_trunca_confirmados() {
         a = activo(dir.path());
         alvo = std::fs::metadata(&a).unwrap().len() / 3;
         inverter_byte(&a, alvo);
-        // Com o log aberto, a cauda tem de acusar o buraco (B2, ramo da cauda).
-        assert!(
-            log.scan(0, 100).is_err(),
-            "scan da cauda devolveu Ok com o registo corrompido"
-        );
     }
-    let antes = std::fs::metadata(&a).unwrap().len();
+    let antes = std::fs::read(&a).unwrap();
 
     match V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always) {
         Ok(log) => panic!(
@@ -152,9 +147,9 @@ fn bitrot_no_meio_da_cauda_activa_nao_trunca_confirmados() {
         Err(e) => panic!("esperava Corruption, veio {e}"),
     }
     assert_eq!(
-        std::fs::metadata(&a).unwrap().len(),
+        std::fs::read(&a).unwrap(),
         antes,
-        "a cauda foi truncada — a evidência tinha de ficar intacta"
+        "a cauda foi alterada — a evidência tinha de ficar intacta"
     );
 
     // Nada foi destruído: desfeita a corrupção, os 100 registos voltam todos.
@@ -164,6 +159,76 @@ fn bitrot_no_meio_da_cauda_activa_nao_trunca_confirmados() {
     assert_eq!(log.scan(0, 100).unwrap().len(), 100);
 }
 
+/// B2 na cauda: leitura sequencial, pontual e filtrada têm de denunciar um
+/// registo confirmado que deixou de ser legível, com o writer ainda aberto.
+#[test]
+fn bitrot_na_cauda_falha_no_scan_no_read_e_no_scan_filtrado() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
+    encher(&log, 100, &"y".repeat(40));
+    let path = activo(dir.path());
+    let alvo = std::fs::metadata(&path).unwrap().len() / 3;
+    inverter_byte(&path, alvo);
+    assert!(matches!(
+        log.scan(0, 100),
+        Err(HeraclitusError::Corruption { .. })
+    ));
+    let mut erros = 0;
+    for lsn in 0..log.head() {
+        match log.read(lsn) {
+            Ok(Some((encontrado, _))) => assert_eq!(encontrado, lsn),
+            Err(HeraclitusError::Corruption { .. }) => erros += 1,
+            outro => panic!("read({lsn}) abaixo do head: {outro:?}"),
+        }
+    }
+    assert!(erros > 0);
+    assert!(matches!(
+        log.scan_builtin_eq_capped("agent_id", "a", 0, 100, usize::MAX),
+        Err(HeraclitusError::Corruption { .. })
+    ));
+    assert!(log.read(100).unwrap().is_none());
+    assert!(log.read(u64::MAX).unwrap().is_none());
+}
+
+/// B2: a contagem sozinha não prova cobertura. Um frame com CRC íntegro que
+/// repete outro LSN deixa um confirmado em falta, inclusive no scan filtrado.
+#[test]
+fn lsn_duplicado_com_crc_integro_na_cauda_nao_esconde_um_confirmado() {
+    use heraclitus_log::v6::header::FILE_HEADER_LEN;
+    use heraclitus_log::v6::raw::{encode_raw_record, scan_raw_segment};
+
+    let dir = tempfile::tempdir().unwrap();
+    let log = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
+    encher(&log, 10, "conteudo");
+    let path = activo(dir.path());
+    let scan = scan_raw_segment(&path).unwrap();
+    let mut bytes = std::fs::read(&path).unwrap()[..FILE_HEADER_LEN].to_vec();
+    for r in scan.records {
+        bytes.extend(encode_raw_record(
+            if r.lsn == 1 { 2 } else { r.lsn },
+            r.hlc,
+            &r.payload,
+        ));
+    }
+    // Mantém dez frames válidos, mas o LSN 1 não aparece e o 2 se repete.
+    let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    file.write_all(&bytes).unwrap();
+    file.sync_all().unwrap();
+    assert_eq!(scan_raw_segment(&path).unwrap().records.len(), 10);
+    assert!(matches!(
+        log.scan(0, 10),
+        Err(HeraclitusError::Corruption { .. })
+    ));
+    assert!(matches!(
+        log.read(1),
+        Err(HeraclitusError::Corruption { .. })
+    ));
+    assert!(matches!(
+        log.scan_builtin_eq_capped("agent_id", "a", 0, 10, usize::MAX),
+        Err(HeraclitusError::Corruption { .. })
+    ));
+}
+
 /// B5 — escrita interrompida (SIGKILL a meio de um `write` grande, que o Linux
 /// corta em fronteira de página) de um registo cujo payload — conteúdo do
 /// cliente — traz uma imagem de footer válida mesmo antes do corte. O CRC do
@@ -171,11 +236,17 @@ fn bitrot_no_meio_da_cauda_activa_nao_trunca_confirmados() {
 /// abrir para sempre ("refusing to truncate a sealed segment").
 #[test]
 fn cauda_rasgada_com_imagem_de_footer_no_payload_recupera() {
+    for record_count in [0, 2] {
+        recuperar_imagem_de_footer(record_count);
+    }
+}
+
+fn recuperar_imagem_de_footer(record_count: u64) {
     let dir = tempfile::tempdir().unwrap();
     let imagem = FooterV6 {
-        record_count: 0,
+        record_count,
         min_lsn: 0,
-        max_lsn: 0,
+        max_lsn: record_count.saturating_sub(1),
         min_hlc: 0,
         max_hlc: 0,
         block_count: 0,
@@ -185,6 +256,7 @@ fn cauda_rasgada_com_imagem_de_footer_no_payload_recupera() {
         logical_root: [0u8; 32],
     }
     .encode();
+    assert!(FooterV6::decode(&imagem).is_ok(), "setup: footer íntegro");
     {
         let log = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
         log.append(Episode::new(

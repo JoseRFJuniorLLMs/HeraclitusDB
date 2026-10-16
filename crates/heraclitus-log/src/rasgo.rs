@@ -22,18 +22,9 @@
 //! 2. depois do rasgo não pode existir nenhum registo íntegro com o LSN que
 //!    viria a seguir (`esperado + k`) — se existir, o comprimento do frame
 //!    rasgado é que se estragou e há história confirmada depois dele;
-//! 3. um footer íntegro no EOF que declara o LSN `esperado` também é história
-//!    depois do rasgo (um segmento que chegou a ser selado).
 //!
 //! Tudo o resto é corrupção: preservar o ficheiro e recusar arrancar, a mesma
 //! política dos segmentos não-últimos do legado e do WAL do Raft.
-//!
-//! A excepção são bytes **todos a zero** desde o rasgo até ao EOF. Nenhum
-//! registo escrito pelo motor é só zeros (o CRC-32C de zeros não é zero), um
-//! bit trocado nunca produz uma região inteira de zeros, e é exactamente o que
-//! um sistema de ficheiros mostra numa extensão cujo conteúdo não chegou ao
-//! disco antes de uma falha de energia. Truncá-los não apaga nada que alguém
-//! tenha escrito.
 //!
 //! Nota sobre o footer: ele **nunca sela** a partir daqui. Só sela um footer
 //! que a varredura alcança numa fronteira de registo (isto é, que começa no
@@ -52,9 +43,6 @@ pub(crate) struct Formato<'a> {
     pub footer_len: usize,
     /// `Some(lsn)` se `buf` começa por um registo completo cujo CRC confere.
     pub registo_integro: &'a dyn Fn(&[u8]) -> Option<Lsn>,
-    /// `Some((min_lsn, max_lsn))` se `buf` (exactamente `footer_len` bytes) é
-    /// um footer íntegro que declara pelo menos um registo.
-    pub footer_declara: &'a dyn Fn(&[u8]) -> Option<(Lsn, Lsn)>,
 }
 
 /// Veredicto sobre os bytes que vão do rasgo até ao EOF.
@@ -70,10 +58,6 @@ pub(crate) enum Rasgo {
 /// varredura parou — sabendo que o registo nesse offset devia ter o LSN
 /// `esperado`.
 pub(crate) fn classificar(resto: &[u8], esperado: Lsn, fmt: &Formato<'_>) -> Rasgo {
-    if resto.iter().all(|&b| b == 0) {
-        return Rasgo::Cauda;
-    }
-
     let alem_do_eof = if resto.starts_with(&fmt.footer_magic) {
         resto.len() < fmt.footer_len
     } else if resto.len() < CABECALHO_REGISTO {
@@ -97,7 +81,7 @@ pub(crate) fn classificar(resto: &[u8], esperado: Lsn, fmt: &Formato<'_>) -> Ras
     let teto = (resto.len() / CABECALHO_REGISTO) as u64;
     for p in 1..=resto.len().saturating_sub(CABECALHO_REGISTO) {
         let lsn = u64::from_le_bytes(resto[p + 8..p + 16].try_into().unwrap());
-        if !lsn.checked_sub(esperado).is_some_and(|k| k <= teto) {
+        if lsn.checked_sub(esperado).is_none_or(|k| k > teto) {
             continue;
         }
         if (fmt.registo_integro)(&resto[p..]) == Some(lsn) {
@@ -108,17 +92,6 @@ pub(crate) fn classificar(resto: &[u8], esperado: Lsn, fmt: &Formato<'_>) -> Ras
         }
     }
 
-    if resto.len() > fmt.footer_len {
-        let fim = &resto[resto.len() - fmt.footer_len..];
-        if let Some((min, max)) = (fmt.footer_declara)(fim) {
-            if min <= esperado && esperado <= max {
-                return Rasgo::Corrupcao(format!(
-                    "a valid footer at EOF declares LSNs {min}..={max}, so LSN \
-                     {esperado} was complete when the segment was sealed"
-                ));
-            }
-        }
-    }
     Rasgo::Cauda
 }
 
@@ -137,19 +110,10 @@ mod tests {
             (b.len() >= CABECALHO_REGISTO + len && b[4] == 0xC0)
                 .then(|| u64::from_le_bytes(b[8..16].try_into().unwrap()))
         };
-        let footer = |b: &[u8]| -> Option<(Lsn, Lsn)> {
-            (b[..4] == *b"FFFF").then(|| {
-                (
-                    u16::from_le_bytes([b[4], b[5]]) as u64,
-                    u16::from_le_bytes([b[6], b[7]]) as u64,
-                )
-            })
-        };
         f(&Formato {
             footer_magic: *b"FFFF",
             footer_len: 8,
             registo_integro: &registo,
-            footer_declara: &footer,
         })
     }
 
@@ -169,7 +133,10 @@ mod tests {
             assert_eq!(classificar(&f[..60], 5, fmt), Rasgo::Cauda);
             assert_eq!(classificar(&f[..10], 5, fmt), Rasgo::Cauda);
             assert_eq!(classificar(b"FFFF\x01", 5, fmt), Rasgo::Cauda); // footer a meio
-            assert_eq!(classificar(&[0u8; 300], 5, fmt), Rasgo::Cauda);
+            assert!(matches!(
+                classificar(&[0u8; 300], 5, fmt),
+                Rasgo::Corrupcao(_)
+            ));
         });
     }
 
@@ -204,16 +171,13 @@ mod tests {
     }
 
     #[test]
-    fn footer_no_eof_so_conta_se_declarar_o_lsn_esperado() {
+    fn footer_dentro_do_frame_rasgado_nao_sela_mesmo_declarando_o_lsn() {
         com_formato(|fmt| {
             let mut v = frame(5, &[b'x'; 40], true);
             v[..4].copy_from_slice(&10_000u32.to_le_bytes());
             let mut que_cobre = v.clone();
             que_cobre.extend_from_slice(b"FFFF\x00\x00\x05\x00");
-            assert!(matches!(
-                classificar(&que_cobre, 5, fmt),
-                Rasgo::Corrupcao(_)
-            ));
+            assert_eq!(classificar(&que_cobre, 5, fmt), Rasgo::Cauda);
             let mut imagem_vazia = v;
             imagem_vazia.extend_from_slice(b"FFFF\x00\x00\x00\x00");
             assert_eq!(classificar(&imagem_vazia, 5, fmt), Rasgo::Cauda);
