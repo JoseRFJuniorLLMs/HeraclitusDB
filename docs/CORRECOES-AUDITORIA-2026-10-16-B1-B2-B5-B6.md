@@ -2,8 +2,14 @@
 
 Base: `79c9fa5`. Trabalho no ramo `fix/auditoria-2026-10-16-b1-b2-b5-b6`,
 em `D:\tmp\heraclitus-b1b2b5b6`. O WIP do diretório principal não foi incorporado
-nem editado. O commit inicial desta correção é `917732c`; esta continuação
-ajusta dois desvios de sua regra de recuperação e conclui a validação.
+nem editado. A correção tem três commits:
+
+1. `917732c` — a correção inicial;
+2. `f758a81` — continuação que retirou duas proteções de `917732c` (a exceção
+   dos bytes zerados e o veto do footer no EOF) e concluiu a validação;
+3. o commit que repõe o **veto do footer no EOF**, por decisão do responsável
+   (perda silenciosa de um registro confirmado é P0; recusa de arranque sem
+   perda é P2). A exceção dos bytes zerados continua retirada.
 
 ## Comportamento
 
@@ -13,9 +19,22 @@ ajusta dois desvios de sua regra de recuperação e conclui a validação.
   não encontra registros íntegros posteriores com LSN esperado + k.
   Cabeçalhos ou footers parcialmente escritos continuam recuperáveis.
 - **Fronteira do footer:** só um footer alcançado pelo percurso dos registros
-  pode selar. Uma imagem no payload de um frame interrompido não sela, mesmo
-  com CRC íntegro e um intervalo que declara o LSN esperado. Removido o veto
-  adicional que `917732c` impunha neste último caso.
+  pode selar. Uma imagem no payload de um frame interrompido nunca sela.
+- **Veto do footer no EOF (reposto):** se, depois do rasgo, um footer íntegro
+  fecha o arquivo e declara o LSN que o frame rasgado devia ter, há história
+  confirmada depois do rasgo: é um `.active` que caiu entre o seal e o rename,
+  com o `payload_len` do último registro estragado para lá do EOF. O arranque
+  recusa com `Corruption` (`a valid footer at EOF declares LSNs …`), sem
+  truncar. Sem o veto, o último registro confirmado e o footer que o prova eram
+  cortados em silêncio e o LSN voltava a ser atribuído. Vale no V6 e no legado.
+  A imagem da sonda B5 (`record_count = 0`) não declara LSN nenhum e continua
+  sendo cauda: recupera.
+- **Preço do veto, aceito de propósito:** o CRC do footer não tem chave, e um
+  cliente pode pôr no payload uma imagem que declare o LSN do próprio registro.
+  Se um crash cortar essa escrita exatamente depois da imagem, o arranque recusa
+  em vez de truncar — falha fechada, sem alterar bytes. O operador corta o
+  arquivo no offset do rasgo indicado no erro e o arranque volta (coberto por
+  teste).
 - **Bytes zerados:** removida a exceção de `917732c`. Um frame zerado que cabe
   no arquivo não declara extensão além do EOF e é preservado como corrupção.
 - **B2:** o percurso RAW informa por que terminou; um selado precisa alcançar
@@ -38,6 +57,19 @@ O cenário B1 de reabertura está separado do cenário B2 de leitura da cauda,
 para que uma asserção não impeça a execução da outra prova. Há cobertura
 adicional para a fila HRKI, recuperação do legado, ressincronização por LSN,
 footer sem fronteira, bytes zerados e término/contagem de um percurso selado.
+
+O veto do footer tem quatro regressões:
+
+| Teste | O que prova |
+|---|---|
+| `rasgo::tests::footer_no_eof_so_veta_se_declarar_o_lsn_esperado` | A regra veta só quando o footer declara o LSN esperado; um footer que acaba antes dele, ou vazio, não veta. |
+| `v6::raw::tests::comprimento_estragado_no_ultimo_registo_de_um_selado_nao_e_truncado` | V6: `.active` selado com o comprimento do último registro estragado recusa, não sela e fica intacto. |
+| `bitrot_nao_trunca::comprimento_estragado_no_ultimo_registo_de_um_selado_recusa_abrir` | Legado: o último segmento selado no mesmo caso recusa abrir e fica intacto (com contraprova de que abre sem a corrupção). |
+| `hrkl_v6_bitrot_nao_trunca::imagem_de_footer_que_declara_o_lsn_cortado_recusa_sem_perda` | O preço: a imagem forjada que declara o LSN recusa sem alterar bytes, e cortar no rasgo devolve o arranque. |
+
+`cauda_rasgada_com_imagem_de_footer_no_payload_recupera` voltou a ser só a
+sonda B5 original (`record_count = 0`), que recupera; o caso `record_count = 2`
+que `f758a81` lhe tinha juntado é o teste do preço acima.
 
 ## Validação
 
@@ -100,6 +132,24 @@ S12 e S14 reproduzem a fila residual `[1, 2, 3, 4, 5, 6]`, em vez de `[1]`.
 S1 e S2 reproduzem o head 33 em vez de 100. S8 reproduz `read(87) = Ok(None)`
 abaixo do head 200. A restauração do código é seguida pela suíte completa.
 
+### Sabotagem do veto do footer
+
+Mesmo método, sobre o código com o veto reposto, correndo `--lib` e os testes
+`hrkl_v6_bitrot_nao_trunca`, `bitrot_nao_trunca` e `hrkl_v6_crash`. Todas
+compilaram e saíram com 101:
+
+| # | Sabotagem | Regressões que falharam |
+|---|---|---|
+| V1 | A regra deixa de consultar o footer no EOF | as quatro regressões do veto |
+| V2 | V6: `footer_declara` nunca declara | `comprimento_estragado_no_ultimo_registo_de_um_selado_nao_e_truncado`, `imagem_de_footer_que_declara_o_lsn_cortado_recusa_sem_perda` |
+| V3 | Legado: `footer_declara` nunca declara | `comprimento_estragado_no_ultimo_registo_de_um_selado_recusa_abrir` |
+| V4 | Veto sem limite superior (`min <= esperado`) | `footer_no_eof_so_veta_se_declarar_o_lsn_esperado` |
+| V5 | V4 + V6 sem o filtro `record_count > 0` | `cauda_rasgada_com_imagem_de_footer_no_payload_recupera` (o veto engoliria a sonda B5) |
+
+Na V4 sozinha a sonda B5 continua recuperando porque a imagem também é
+excluída pelo filtro `record_count > 0`: são duas condições independentes, e
+a V5 mostra que o teste B5 parte quando ambas faltam.
+
 ### Verificações finais
 
 | Verificação | Resultado |
@@ -109,6 +159,15 @@ abaixo do head 200. A restauração do código é seguida pela suíte completa.
 | `cargo clippy -p heraclitus-log --all-targets --offline -- -D warnings` | Saída 0, sem avisos. |
 | `git -c core.whitespace=trailing-space,space-before-tab,cr-at-eol diff --check` | Saída 0; respeita os CRLF já existentes em `raw.rs`. |
 | `graphify update .` | Atualização AST concluída conforme instrução do repositório. |
+
+Depois do commit do veto, sobre o mesmo ambiente:
+
+| Verificação | Resultado |
+|---|---|
+| `cargo test -p heraclitus-log --offline` | Saída 0: **373 aprovados, 0 reprovados**. |
+| `cargo fmt --check` | Saída 0. |
+| `cargo clippy -p heraclitus-log --all-targets --offline -- -D warnings` | Saída 0. O campo `footer_declara` passou a usar o alias `FooterDeclara` (`type_complexity`). |
+| `git -c core.whitespace=trailing-space,space-before-tab,cr-at-eol diff --check` | Saída 0. |
 
 O SHA-256 do `engine.rs` do diretório principal foi conferido no início e ao
 fim: `9D854AE669294B65654DE90ECFEF31D514674EB7370B5E1DFB9C4C89C0DD3251`.
@@ -130,3 +189,7 @@ bundle incremental `D:\tmp\heraclitus-b1b2b5b6-conclusao.bundle` contém esse
 commit e exige `917732c` como base. Não duplica o checkout nem inclui o WIP do
 diretório principal. Sua importação no repositório original exige um shell
 com permissão de escrita nos metadados desse repositório.
+
+Importado depois: o ramo avançou de `917732c` para `f758a81` (avanço simples;
+a árvore do commit do bundle é idêntica ao diretório de trabalho). O commit do
+veto vem por cima de `f758a81`. Sem push.

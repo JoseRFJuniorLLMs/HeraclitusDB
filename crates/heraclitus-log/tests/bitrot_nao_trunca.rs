@@ -159,3 +159,77 @@ fn bitrot_no_meio_do_segmento_ativo_recusa_abrir_em_vez_de_truncar() {
     let log = Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
     assert_eq!(log.head(), 100);
 }
+
+/// Auditoria 2026-10-16, B1/B5 — o veto do footer, no legado. Quando o último
+/// segmento está selado (aqui: o ativo vazio a seguir a ele desapareceu), um
+/// bit trocado no comprimento do seu ÚLTIMO registo faz o frame "passar do
+/// EOF" como uma escrita interrompida, sem registo nenhum depois. O rodapé no
+/// EOF declara esse LSN: o registo estava completo quando o segmento foi
+/// selado, e a abertura tem de recusar em vez de o cortar com o rodapé.
+#[test]
+fn comprimento_estragado_no_ultimo_registo_de_um_selado_recusa_abrir() {
+    const HEADER_LEN: usize = 22;
+    const RECORD_HEADER_LEN: usize = 24;
+    const FOOTER_LEN: usize = 60;
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let log = Log::open(dir.path(), 4096, FsyncPolicy::Always).unwrap();
+        for i in 0..120 {
+            log.append(Episode::new(
+                "a",
+                EventKind::Observation,
+                format!("evento {i} {}", "x".repeat(60)).into_bytes(),
+            ))
+            .unwrap();
+        }
+    }
+    let mut segs: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "hrkl").unwrap_or(false))
+        .collect();
+    segs.sort();
+    assert!(segs.len() >= 2, "o teste precisa de um segmento selado");
+    std::fs::remove_file(segs.pop().unwrap()).unwrap();
+    let selado = segs.pop().unwrap();
+
+    // Contraprova: sem a corrupção, um último segmento selado abre.
+    let head_selado = Log::open(dir.path(), 4096, FsyncPolicy::Always)
+        .expect("ultimo segmento selado tem de abrir")
+        .head();
+    let segs_depois: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "hrkl").unwrap_or(false) && *p > selado)
+        .collect();
+    for p in segs_depois {
+        std::fs::remove_file(p).unwrap(); // o ativo novo, vazio, que a abertura criou
+    }
+
+    let mut bytes = std::fs::read(&selado).unwrap();
+    let fim_dos_registos = bytes.len() - FOOTER_LEN;
+    let (mut pos, mut ultimo) = (HEADER_LEN, HEADER_LEN);
+    while pos < fim_dos_registos {
+        ultimo = pos;
+        let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += RECORD_HEADER_LEN + len;
+    }
+    assert_eq!(pos, fim_dos_registos, "setup: percurso dos registos");
+    bytes[ultimo + 3] ^= 0x10; // byte alto do comprimento: ~256 MiB, além do EOF
+    std::fs::write(&selado, &bytes).unwrap();
+
+    match Log::open(dir.path(), 4096, FsyncPolicy::Always) {
+        Ok(log) => panic!(
+            "abriu com head {} (antes {head_selado}): cortou o ultimo registo e o rodape",
+            log.head()
+        ),
+        Err(e) => assert!(e.to_string().contains("valid footer at EOF"), "{e}"),
+    }
+    assert_eq!(
+        std::fs::read(&selado).unwrap(),
+        bytes,
+        "o segmento foi alterado — a evidência tem de ficar intacta"
+    );
+}

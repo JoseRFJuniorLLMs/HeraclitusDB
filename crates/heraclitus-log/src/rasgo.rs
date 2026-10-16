@@ -22,6 +22,10 @@
 //! 2. depois do rasgo não pode existir nenhum registo íntegro com o LSN que
 //!    viria a seguir (`esperado + k`) — se existir, o comprimento do frame
 //!    rasgado é que se estragou e há história confirmada depois dele;
+//! 3. um footer íntegro no EOF que declara o LSN `esperado` também é história
+//!    depois do rasgo: o segmento chegou a ser selado com esse registo
+//!    completo (um `.active` que caiu entre o seal e o rename, com o
+//!    `payload_len` do último registo estragado para lá do EOF).
 //!
 //! Tudo o resto é corrupção: preservar o ficheiro e recusar arrancar, a mesma
 //! política dos segmentos não-últimos do legado e do WAL do Raft.
@@ -29,7 +33,17 @@
 //! Nota sobre o footer: ele **nunca sela** a partir daqui. Só sela um footer
 //! que a varredura alcança numa fronteira de registo (isto é, que começa no
 //! próprio rasgo), e esse caso já não chega a este módulo — a varredura
-//! devolveu-o como footer, ou recusou-o como footer completo malformado.
+//! devolveu-o como footer, ou recusou-o como footer completo malformado. O
+//! ponto 3 não sela: só **veta** o truncamento.
+//!
+//! O preço do ponto 3, aceite de propósito: um cliente pode pôr no payload uma
+//! imagem de footer com CRC certo (não tem chave) que declare o LSN do seu
+//! próprio registo; se um crash cortar essa escrita exactamente a seguir à
+//! imagem, o arranque recusa em vez de truncar. É uma recusa sem perda (P2,
+//! falha fechada, o operador corta a cauda à mão), contra a alternativa de
+//! apagar em silêncio um registo confirmado e reutilizar o seu LSN (P0). A
+//! imagem da sonda B5 (`record_count = 0`) não declara LSN nenhum e continua a
+//! ser cauda.
 
 use heraclitus_core::Lsn;
 
@@ -43,7 +57,13 @@ pub(crate) struct Formato<'a> {
     pub footer_len: usize,
     /// `Some(lsn)` se `buf` começa por um registo completo cujo CRC confere.
     pub registo_integro: &'a dyn Fn(&[u8]) -> Option<Lsn>,
+    /// `Some((min_lsn, max_lsn))` se `buf` (exactamente `footer_len` bytes) é
+    /// um footer íntegro que declara pelo menos um registo.
+    pub footer_declara: &'a FooterDeclara,
 }
+
+/// Ver [`Formato::footer_declara`].
+pub(crate) type FooterDeclara = dyn Fn(&[u8]) -> Option<(Lsn, Lsn)>;
 
 /// Veredicto sobre os bytes que vão do rasgo até ao EOF.
 #[derive(Debug, PartialEq, Eq)]
@@ -92,6 +112,19 @@ pub(crate) fn classificar(resto: &[u8], esperado: Lsn, fmt: &Formato<'_>) -> Ras
         }
     }
 
+    // O veto do footer (ponto 3 da regra): estritamente depois do rasgo, a
+    // fechar o ficheiro, e a declarar o LSN que o frame rasgado devia ter.
+    if resto.len() > fmt.footer_len {
+        let fim = &resto[resto.len() - fmt.footer_len..];
+        if let Some((min, max)) = (fmt.footer_declara)(fim) {
+            if min <= esperado && esperado <= max {
+                return Rasgo::Corrupcao(format!(
+                    "a valid footer at EOF declares LSNs {min}..={max}, so LSN \
+                     {esperado} was complete when the segment was sealed"
+                ));
+            }
+        }
+    }
     Rasgo::Cauda
 }
 
@@ -110,10 +143,19 @@ mod tests {
             (b.len() >= CABECALHO_REGISTO + len && b[4] == 0xC0)
                 .then(|| u64::from_le_bytes(b[8..16].try_into().unwrap()))
         };
+        let footer = |b: &[u8]| -> Option<(Lsn, Lsn)> {
+            (b[..4] == *b"FFFF").then(|| {
+                (
+                    u16::from_le_bytes([b[4], b[5]]) as u64,
+                    u16::from_le_bytes([b[6], b[7]]) as u64,
+                )
+            })
+        };
         f(&Formato {
             footer_magic: *b"FFFF",
             footer_len: 8,
             registo_integro: &registo,
+            footer_declara: &footer,
         })
     }
 
@@ -170,14 +212,22 @@ mod tests {
         });
     }
 
+    /// O ponto 3: um footer no EOF veta o truncamento só quando declara o LSN
+    /// do frame rasgado; uma imagem que não o declara (a da sonda B5) não veta.
     #[test]
-    fn footer_dentro_do_frame_rasgado_nao_sela_mesmo_declarando_o_lsn() {
+    fn footer_no_eof_so_veta_se_declarar_o_lsn_esperado() {
         com_formato(|fmt| {
             let mut v = frame(5, &[b'x'; 40], true);
             v[..4].copy_from_slice(&10_000u32.to_le_bytes());
             let mut que_cobre = v.clone();
             que_cobre.extend_from_slice(b"FFFF\x00\x00\x05\x00");
-            assert_eq!(classificar(&que_cobre, 5, fmt), Rasgo::Cauda);
+            assert!(matches!(
+                classificar(&que_cobre, 5, fmt),
+                Rasgo::Corrupcao(m) if m.contains("valid footer at EOF")
+            ));
+            let mut antes_do_lsn = v.clone();
+            antes_do_lsn.extend_from_slice(b"FFFF\x00\x00\x04\x00");
+            assert_eq!(classificar(&antes_do_lsn, 5, fmt), Rasgo::Cauda);
             let mut imagem_vazia = v;
             imagem_vazia.extend_from_slice(b"FFFF\x00\x00\x00\x00");
             assert_eq!(classificar(&imagem_vazia, 5, fmt), Rasgo::Cauda);

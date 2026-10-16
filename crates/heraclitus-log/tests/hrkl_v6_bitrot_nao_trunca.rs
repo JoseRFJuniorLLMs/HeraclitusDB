@@ -236,12 +236,60 @@ fn lsn_duplicado_com_crc_integro_na_cauda_nao_esconde_um_confirmado() {
 /// abrir para sempre ("refusing to truncate a sealed segment").
 #[test]
 fn cauda_rasgada_com_imagem_de_footer_no_payload_recupera() {
-    for record_count in [0, 2] {
-        recuperar_imagem_de_footer(record_count);
-    }
+    let (dir, _) = cortar_depois_de_imagem_de_footer(0);
+    let log = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always)
+        .expect("a cauda rasgada tem de ser recuperada, não recusada para sempre");
+    assert_eq!(log.head(), 1, "só o registo completo sobrevive ao corte");
+    let linhas = log.scan(0, 1).unwrap();
+    assert_eq!(linhas[0].1.content, b"primeiro");
+    let novo = log
+        .append(Episode::new(
+            "a",
+            EventKind::Observation,
+            b"depois".to_vec(),
+        ))
+        .unwrap();
+    assert_eq!(novo, 1, "o LSN do registo cortado é o próximo a atribuir");
+    drop(log);
+    let log = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
+    assert_eq!(log.head(), 2);
 }
 
-fn recuperar_imagem_de_footer(record_count: u64) {
+/// O preço do veto do footer, aceite de propósito: se a imagem forjada no
+/// payload DECLARA o LSN do próprio registo cortado, é indistinguível do footer
+/// verdadeiro de um segmento selado cujo último `payload_len` se estragou — e
+/// aí truncar apagaria um registo confirmado. O arranque recusa, sem tocar em
+/// nada (falha fechada); o operador corta a cauda no offset indicado.
+#[test]
+fn imagem_de_footer_que_declara_o_lsn_cortado_recusa_sem_perda() {
+    use heraclitus_log::v6::raw::scan_raw_segment;
+
+    let (dir, a) = cortar_depois_de_imagem_de_footer(2);
+    let antes = std::fs::read(&a).unwrap();
+    match V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always) {
+        Ok(log) => panic!("truncou com head {}", log.head()),
+        Err(HeraclitusError::Corruption { detail, .. }) => {
+            assert!(detail.contains("valid footer at EOF"), "{detail}")
+        }
+        Err(e) => panic!("esperava Corruption, veio {e}"),
+    }
+    assert_eq!(std::fs::read(&a).unwrap(), antes, "nada pode ser alterado");
+
+    // A intervenção do operador: cortar no rasgo devolve o arranque.
+    let rasgo = scan_raw_segment(&a).unwrap().torn_at.expect("rasgo");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&a)
+        .unwrap()
+        .set_len(rasgo)
+        .unwrap();
+    let log = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
+    assert_eq!(log.head(), 1);
+}
+
+/// Dois appends — `"primeiro"` e um payload com a imagem de um footer que
+/// declara `record_count` registos — e o corte do 2.º logo a seguir à imagem.
+fn cortar_depois_de_imagem_de_footer(record_count: u64) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let imagem = FooterV6 {
         record_count,
@@ -281,23 +329,7 @@ fn recuperar_imagem_de_footer(record_count: u64) {
     let f = std::fs::OpenOptions::new().write(true).open(&a).unwrap();
     f.set_len((pos + imagem.len()) as u64).unwrap();
     drop(f);
-
-    let log = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always)
-        .expect("a cauda rasgada tem de ser recuperada, não recusada para sempre");
-    assert_eq!(log.head(), 1, "só o registo completo sobrevive ao corte");
-    let linhas = log.scan(0, 1).unwrap();
-    assert_eq!(linhas[0].1.content, b"primeiro");
-    let novo = log
-        .append(Episode::new(
-            "a",
-            EventKind::Observation,
-            b"depois".to_vec(),
-        ))
-        .unwrap();
-    assert_eq!(novo, 1, "o LSN do registo cortado é o próximo a atribuir");
-    drop(log);
-    let log = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
-    assert_eq!(log.head(), 2);
+    (dir, a)
 }
 
 /// B6 — um único RAW selado corrompido travava o packing de todos os

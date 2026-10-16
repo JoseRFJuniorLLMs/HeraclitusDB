@@ -1074,10 +1074,17 @@ pub(super) fn rasgo_corrompido(path: &Path, scan: &RawScan) -> V6Result<Option<S
         RawDecoded::Record { lsn, .. } => Some(lsn),
         _ => None,
     };
+    let footer_declara = |b: &[u8]| {
+        FooterV6::decode(b)
+            .ok()
+            .filter(|f| f.record_count > 0)
+            .map(|f| (f.min_lsn, f.max_lsn))
+    };
     let formato = crate::rasgo::Formato {
         footer_magic: FOOTER_MAGIC,
         footer_len: FOOTER_LEN,
         registo_integro: &registo_integro,
+        footer_declara: &footer_declara,
     };
     Ok(
         match crate::rasgo::classificar(&resto, esperado, &formato) {
@@ -1821,11 +1828,15 @@ mod tests {
         assert_eq!(std::fs::metadata(&path).unwrap().len(), bytes.len() as u64);
     }
 
-    /// B5: só a fronteira alcançada pode selar. O footer em EOF-128,
-    /// dentro de um frame cujo comprimento passa do EOF, não é prova de seal,
-    /// mesmo que declare o LSN esperado.
+    /// Auditoria 2026-10-16, B1/B5: o comprimento do ÚLTIMO registo de um
+    /// segmento selado (um `.active` que caiu entre o seal e o rename),
+    /// estragado para lá do EOF, parece uma escrita interrompida — não há
+    /// registo nenhum depois dele. Mas o footer íntegro no EOF declara esse
+    /// LSN: o registo estava completo quando o segmento foi selado. O footer
+    /// não sela (não começa no rasgo), mas veta o truncamento, que apagaria um
+    /// registo confirmado e o footer que o prova.
     #[test]
-    fn footer_que_declara_o_lsn_dentro_do_rasgo_nao_sela() {
+    fn comprimento_estragado_no_ultimo_registo_de_um_selado_nao_e_truncado() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("13.active.hrkl");
         let init = SegmentInit {
@@ -1848,8 +1859,10 @@ mod tests {
             scan_raw_segment(&path).unwrap().torn_at,
             Some(segundo as u64)
         );
-        assert_eq!(repair_active_tail(&path).unwrap(), Some(segundo as u64));
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), segundo as u64);
+        assert!(read_sealing_footer(&path).unwrap().is_none(), "não sela");
+        let erro = repair_active_tail(&path).unwrap_err().to_string();
+        assert!(erro.contains("valid footer at EOF"), "{erro}");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "nada truncado");
     }
 
     /// Auditoria 2026-10-16, B1: o bit trocado no `payload_len` de um registo

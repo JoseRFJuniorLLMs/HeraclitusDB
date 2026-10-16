@@ -3105,10 +3105,16 @@ fn rasgo_legado_corrompido(
         Decoded::Record(lsn, ..) => Some(lsn),
         _ => None,
     };
+    let footer_declara = |b: &[u8]| {
+        SegmentFooter::decode(b)
+            .filter(|f| f.record_count > 0)
+            .map(|f| (f.min_lsn, f.max_lsn))
+    };
     let formato = rasgo::Formato {
         footer_magic: format::FOOTER_MAGIC,
         footer_len: format::FOOTER_LEN,
         registo_integro: &registo_integro,
+        footer_declara: &footer_declara,
     };
     Ok(match rasgo::classificar(&resto, esperado, &formato) {
         rasgo::Rasgo::Cauda => None,
