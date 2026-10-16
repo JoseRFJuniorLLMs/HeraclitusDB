@@ -610,6 +610,82 @@ pub enum ControloVarredura {
 /// por omissão; 256 KiB dão poucas syscalls sem prender memória por leitor.
 const BUFFER_PERCURSO: usize = 256 * 1024;
 
+/// Como terminou um [`percorrer_raw_segmento`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FimPercurso {
+    /// Quem visita mandou parar; o resto do ficheiro não foi lido.
+    Parado,
+    /// O ficheiro acabou exactamente numa fronteira de registo, sem footer: o
+    /// fim normal de uma cauda activa.
+    Eof,
+    /// Um footer íntegro, alcançado numa fronteira de registo, fecha o ficheiro.
+    Footer { record_count: u64 },
+    /// O percurso parou antes do fim: CRC falhado, comprimento impossível,
+    /// leitura curta, ou um footer malformado ou fora do sítio. Na cauda activa
+    /// pode ser o registo que está a ser escrito agora mesmo; num RAW selado é
+    /// sempre corrupção.
+    Rasgo,
+}
+
+/// O que um [`percorrer_raw_segmento`] fez.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Percurso {
+    /// Bytes do ficheiro percorridos até parar — o offset onde o percurso
+    /// acabou. A medida honesta do trabalho feito, e o que os testes usam para
+    /// provar a paragem antecipada.
+    pub bytes: u64,
+    /// Registos íntegros entregues a quem visita.
+    pub registos: u64,
+    pub fim: FimPercurso,
+}
+
+impl Percurso {
+    /// Auditoria 2026-10-16, B2. Um RAW **selado** é imutável: um percurso que
+    /// quem visita não mandou parar tem de chegar ao footer depois de
+    /// exactamente `record_count` registos. Qualquer outro fim é um registo
+    /// ilegível a meio do segmento, e os registos depois dele ficariam de fora
+    /// de uma resposta `Ok` — era isso que `scan` e `read` faziam.
+    pub fn exigir_selado_completo(&self, path: &Path) -> V6Result<()> {
+        const CTX: &str = "hrkl v6 sealed raw";
+        match self.fim {
+            FimPercurso::Parado => Ok(()),
+            FimPercurso::Footer { record_count } if record_count == self.registos => Ok(()),
+            FimPercurso::Footer { record_count } => Err(corrupt(
+                CTX,
+                format!(
+                    "{}: footer declares {record_count} records, the walk read {}",
+                    path.display(),
+                    self.registos
+                ),
+            )),
+            FimPercurso::Eof | FimPercurso::Rasgo => Err(corrupt(
+                CTX,
+                format!("{}: {}", path.display(), self.descrever()),
+            )),
+        }
+    }
+
+    /// Porque é que o percurso acabou onde acabou, para mensagens de erro.
+    pub fn descrever(&self) -> String {
+        match self.fim {
+            FimPercurso::Parado => format!("walk stopped by the caller at offset {}", self.bytes),
+            FimPercurso::Eof => format!(
+                "file ends at offset {} after {} records, without a footer",
+                self.bytes, self.registos
+            ),
+            FimPercurso::Footer { record_count } => format!(
+                "footer reached at offset {} after {} records (it declares {record_count})",
+                self.bytes, self.registos
+            ),
+            FimPercurso::Rasgo => format!(
+                "unreadable record at offset {} (CRC, length or short read) after {} intact \
+                 records",
+                self.bytes, self.registos
+            ),
+        }
+    }
+}
+
 /// Percorre os registos de um segmento RAW **em streaming**, entregando cada
 /// payload por referência e parando onde quem visita mandar.
 ///
@@ -621,29 +697,27 @@ const BUFFER_PERCURSO: usize = 256 * 1024;
 /// alocações imediatamente descartadas. Aqui não há alocação por registo: o
 /// buffer é reutilizado e quem visita decide se copia.
 ///
-/// Devolve os **bytes do ficheiro percorridos** até parar — a medida honesta do
-/// trabalho feito, e o que os testes usam para provar a paragem antecipada.
+/// Devolve um [`Percurso`]: os **bytes do ficheiro percorridos** até parar, os
+/// registos entregues e **porque** parou.
 ///
 /// A máquina de estados é a de [`scan_raw_bytes`] e a descodificação é
 /// literalmente [`decode_raw_record`], para não haver duas noções de registo
 /// válido: mesmo CRC, mesmo tratamento de cauda rasgada, mesmo tecto de
 /// `HARD_MAX_RECORD_BYTES`. A diferença deliberada é o que **não** acontece:
-/// não corre `validate_raw_footer` nem a recusa de bytes depois do footer. Isso
-/// é agora exclusivo de quem tem de o fazer — `verify_sealed`/
-/// `verify_active_tail` e o boot, que confronta o tamanho do ficheiro com o
-/// manifesto — exactamente como o ramo PACKED já vivia.
+/// não corre `validate_raw_footer` (só se confere que o footer descodifica e
+/// fecha o ficheiro) nem decide se um rasgo é cauda ou corrupção. Isso é
+/// exclusivo de quem tem de o fazer — `verify_sealed`/`verify_active_tail` e o
+/// boot, que confronta o tamanho do ficheiro com o manifesto — exactamente como
+/// o ramo PACKED já vivia.
 ///
-/// Correcção honesta ao que A04/A13 escreveram (revisão de A55): a troca **não**
-/// se limita ao percurso parcial nem às leituras pontuais. Ao ver `FOOTER_MAGIC`
-/// este laço devolve `Ok(pos)` sem olhar para o resto do footer, portanto mesmo
-/// um percurso COMPLETO deixa de recusar um segmento selado cujo footer esteja
-/// completo mas malformado — o `Corruption("complete footer is malformed or
-/// corrupt")` que `scan_raw_bytes` dava ali deixa de acontecer. E, desde A13, o
-/// que perde essa validação incidental são também os dois ramos RAW de
-/// `scan_capped` (selados e cauda), não só o `read` pontual de A04. Nenhuma
-/// linha se perde por isto — o footer vem depois de todos os registos — mas
-/// quem quiser a garantia tem de pedir `verify_sealed`.
-pub fn percorrer_raw_segmento<F>(path: &Path, mut visitar: F) -> V6Result<u64>
+/// Auditoria 2026-10-16, B2. A versão anterior devolvia só `Ok(pos)`, igual
+/// para "acabaram os registos" e para "parei num CRC falhado a meio do
+/// ficheiro". O doc-comment dizia que "nenhuma linha se perde por isto"; era
+/// falso para um registo corrompido a meio: `scan` devolvia `Ok` sem todas as
+/// linhas a partir dele e `read` devolvia `Ok(None)` para LSN confirmados. Agora
+/// o fim vem tipado ([`FimPercurso`]) e quem chama tem de decidir — num RAW
+/// selado, com [`Percurso::exigir_selado_completo`].
+pub fn percorrer_raw_segmento<F>(path: &Path, mut visitar: F) -> V6Result<Percurso>
 where
     F: FnMut(Lsn, u64, &[u8]) -> V6Result<ControloVarredura>,
 {
@@ -662,15 +736,46 @@ where
     }
 
     let mut pos = FILE_HEADER_LEN as u64;
+    let mut registos = 0u64;
+    let acabar = |bytes, registos, fim| {
+        Ok(Percurso {
+            bytes,
+            registos,
+            fim,
+        })
+    };
     let mut buf: Vec<u8> = Vec::with_capacity(RAW_RECORD_HEADER_LEN);
     loop {
         buf.clear();
         buf.resize(RAW_RECORD_HEADER_LEN, 0);
-        if ler_ate_encher(&mut leitor, &mut buf)? < RAW_RECORD_HEADER_LEN {
-            return Ok(pos); // fim do ficheiro ou cauda rasgada
+        match ler_ate_encher(&mut leitor, &mut buf)? {
+            0 => return acabar(pos, registos, FimPercurso::Eof),
+            n if n < RAW_RECORD_HEADER_LEN => {
+                return acabar(pos, registos, FimPercurso::Rasgo);
+            }
+            _ => {}
         }
         if buf[..4] == FOOTER_MAGIC {
-            return Ok(pos); // acabaram os registos
+            // Acabaram os registos. O footer só conta se estiver inteiro,
+            // descodificar e fechar o ficheiro — os mesmos três testes que
+            // `scan_raw_bytes` faz antes de o aceitar.
+            buf.resize(FOOTER_LEN, 0);
+            let resto = FOOTER_LEN - RAW_RECORD_HEADER_LEN;
+            if ler_ate_encher(&mut leitor, &mut buf[RAW_RECORD_HEADER_LEN..])? < resto
+                || pos + FOOTER_LEN as u64 != tamanho
+            {
+                return acabar(pos, registos, FimPercurso::Rasgo);
+            }
+            return match FooterV6::decode(&buf) {
+                Ok(f) => acabar(
+                    pos,
+                    registos,
+                    FimPercurso::Footer {
+                        record_count: f.record_count,
+                    },
+                ),
+                Err(_) => acabar(pos, registos, FimPercurso::Rasgo),
+            };
         }
         let len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
         // SPEC-0050 §140: um comprimento vindo do disco não pode chegar a um
@@ -679,11 +784,11 @@ where
         // como ainda não lemos os bytes, o tecto tem de ser explícito.
         let restante = tamanho.saturating_sub(pos + RAW_RECORD_HEADER_LEN as u64);
         if len > HARD_MAX_RECORD_BYTES || len as u64 > restante {
-            return Ok(pos); // cauda rasgada
+            return acabar(pos, registos, FimPercurso::Rasgo);
         }
         buf.resize(RAW_RECORD_HEADER_LEN + len, 0);
         if ler_ate_encher(&mut leitor, &mut buf[RAW_RECORD_HEADER_LEN..])? < len {
-            return Ok(pos);
+            return acabar(pos, registos, FimPercurso::Rasgo);
         }
         match decode_raw_record(&buf) {
             RawDecoded::Record {
@@ -695,13 +800,16 @@ where
                 let avanco = pos + total as u64;
                 let controlo = visitar(lsn, hlc, payload)?;
                 pos = avanco;
+                registos += 1;
                 if controlo == ControloVarredura::Parar {
-                    return Ok(pos);
+                    return acabar(pos, registos, FimPercurso::Parado);
                 }
             }
-            // CRC falhado (ou um footer que não estava onde devia): é o mesmo
-            // fim de percurso que `scan_raw_bytes` trata como cauda.
-            RawDecoded::Footer(_) | RawDecoded::Torn => return Ok(pos),
+            // CRC falhado: o mesmo ponto em que `scan_raw_bytes` devolve
+            // `torn_at`. (Um footer não chega aqui: o magic foi visto acima.)
+            RawDecoded::Footer(_) | RawDecoded::Torn => {
+                return acabar(pos, registos, FimPercurso::Rasgo);
+            }
         }
     }
 }
@@ -725,8 +833,10 @@ fn ler_ate_encher(leitor: &mut impl Read, destino: &mut [u8]) -> V6Result<usize>
 #[derive(Debug)]
 pub struct RawLookup {
     pub record: Option<RawRecord>,
-    /// Bytes do ficheiro percorridos até parar.
-    pub bytes_percorridos: u64,
+    /// Bytes percorridos até parar, e porque parou: com `record == None` é o
+    /// que distingue "o LSN não está neste segmento" (footer ou EOF alcançados)
+    /// de "há um registo ilegível antes dele" (auditoria 2026-10-16, B2).
+    pub percurso: Percurso,
 }
 
 /// Procura um LSN num segmento RAW, parando **no registo alvo**.
@@ -780,7 +890,7 @@ pub fn read_raw_record_at(path: &Path, offset: u64, alvo: Lsn) -> V6Result<Optio
 
 pub fn find_raw_record(path: &Path, alvo: Lsn) -> V6Result<RawLookup> {
     let mut encontrado = None;
-    let bytes_percorridos = percorrer_raw_segmento(path, |lsn, hlc, payload| {
+    let percurso = percorrer_raw_segmento(path, |lsn, hlc, payload| {
         if lsn != alvo {
             return Ok(ControloVarredura::Continuar);
         }
@@ -793,7 +903,7 @@ pub fn find_raw_record(path: &Path, alvo: Lsn) -> V6Result<RawLookup> {
     })?;
     Ok(RawLookup {
         record: encontrado,
-        bytes_percorridos,
+        percurso,
     })
 }
 
@@ -892,25 +1002,14 @@ pub fn is_crash_stub(path: &Path) -> V6Result<bool> {
 /// Trunca a cauda rasgada de um segmento **activo** (§123).
 ///
 /// Recusa-se a tocar num segmento selado: corrupção interna num ficheiro que já
-/// tem footer é falha dura, não é "truncar e fingir que nada aconteceu".
+/// tem footer é falha dura, não é "truncar e fingir que nada aconteceu". E
+/// recusa-se a truncar o que não é uma escrita interrompida — ver
+/// [`rasgo_corrompido`].
 ///
 /// Pressupõe um segmento com header. Um toco de crash (ver [`is_crash_stub`])
 /// não é reparável — não há prefixo válido para preservar — e o chamador deve
 /// filtrá-lo antes, como o motor faz no arranque.
 pub fn repair_active_tail(path: &Path) -> V6Result<Option<u64>> {
-    // Não basta confiar no resultado da varredura abaixo. Se um bit rodado em
-    // um registo anterior fizer `scan_raw_segment` parar antes do fim, ela não
-    // chega a observar o footer que continua válido no EOF. Nesse caso o
-    // ficheiro já está selado e truncá-lo em `torn_at` apagaria história.
-    //
-    // Mas os últimos 128 bytes do ficheiro só PODEM ser um footer se
-    // começarem numa fronteira de registo a que a varredura não chegou
-    // (`>= torn_at`). Auditoria recursiva 2026-10-03, iteração 1: a versão
-    // anterior olhava para o EOF ANTES de varrer e sem esta condição. Numa
-    // cauda activa sem footer, esses bytes são o fim do payload do último
-    // registo — conteúdo do cliente. Um evento com `"HFTR"` em EOF-128 fazia
-    // o arranque recusar para sempre ("refusing to truncate a sealed
-    // segment") uma cauda que a varredura lia limpa até ao EOF.
     let scan = scan_raw_segment(path)?;
     if scan.footer.is_some() {
         return Err(corrupt(
@@ -924,18 +1023,13 @@ pub fn repair_active_tail(path: &Path) -> V6Result<Option<u64>> {
     let Some(at) = scan.torn_at else {
         return Ok(None);
     };
-    // A presença de um footer válido no fim é a definição de segmento selado
-    // (§24), independentemente de a passagem pelos registos conseguir chegar
-    // até ele. Um footer verdadeiro começa sempre em `>= torn_at` (todos os
-    // registos antes de `torn_at` são íntegros e o footer vem depois deles);
-    // um "footer" que comece antes está dentro de um registo válido e não sela
-    // nada. Checá-lo distingue uma cauda de footer parcial (não selada,
-    // portanto recuperável) de corrupção interna num segmento selado (falha
-    // dura).
-    if footer_no_eof_alem_do_rasgo(path, at)? {
+    if let Some(motivo) = rasgo_corrompido(path, &scan)? {
         return Err(corrupt(
             "hrkl v6 raw recovery",
-            "refusing to truncate a sealed segment; this is hard corruption",
+            format!(
+                "refusing to truncate at offset {at}: {motivo}; the file is preserved, \
+                 restore the segment from a backup or a replica"
+            ),
         ));
     }
     let file = OpenOptions::new().write(true).open(path)?;
@@ -944,19 +1038,67 @@ pub fn repair_active_tail(path: &Path) -> V6Result<Option<u64>> {
     Ok(Some(at))
 }
 
-/// `true` se o EOF de um RAW cuja varredura rasgou em `at` mostra um footer
-/// (válido, ou com magic e CRC partido) que começa em `>= at` — ou seja, se o
-/// ficheiro está selado e o "rasgo" é corrupção interna, não cauda activa.
+/// `Some(motivo)` se a varredura `scan` de `path` parou num ponto que **não** é
+/// uma cauda rasgada; `None` se não parou, ou se o rasgo é uma escrita
+/// interrompida que pode ser truncada.
+///
+/// Auditoria 2026-10-16, B1 e B5 — a regra está em [`crate::rasgo`]. As duas
+/// versões anteriores decidiam pelo EOF: primeiro "há um footer em EOF-128?"
+/// antes de varrer, depois "há um footer em EOF-128 que começa em `>=
+/// torn_at`?". Nenhuma olhava para o frame no rasgo, e ambas erravam nos dois
+/// sentidos: um bit trocado a meio de uma cauda activa sem footer era cortado
+/// como cauda rasgada (B1: 100 → 33 registos confirmados, LSN reutilizados), e
+/// uma escrita realmente cortada cujo payload trazia uma imagem de footer
+/// depois do rasgo recusava o arranque para sempre (B5). Um footer só sela
+/// quando a varredura o alcança numa fronteira de registo — e esse já não chega
+/// aqui, porque a varredura o devolve como footer (ou recusa-o como footer
+/// completo malformado).
 ///
 /// Partilhado por [`repair_active_tail`] e pelo `verify` (auditoria recursiva
-/// 2026-10-03, iteração 1): o `verify` tratava este caso como cauda activa e
-/// reportava `physical_ok` num segmento selado com um registo corrompido.
-pub(super) fn footer_no_eof_alem_do_rasgo(path: &Path, at: u64) -> V6Result<bool> {
-    let len = std::fs::metadata(path)?.len();
-    let footer_cabe_depois_do_rasgo = len
-        .checked_sub(FOOTER_LEN as u64)
-        .is_some_and(|inicio| inicio >= at);
-    Ok(footer_cabe_depois_do_rasgo && (read_footer(path)?.is_some() || footer_magic_at_eof(path)?))
+/// 2026-10-03, iteração 1): o `verify` não pode chamar "cauda activa" àquilo que
+/// o arranque se recusa a truncar.
+pub(super) fn rasgo_corrompido(path: &Path, scan: &RawScan) -> V6Result<Option<String>> {
+    let Some(at) = scan.torn_at else {
+        return Ok(None);
+    };
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(at))?;
+    let mut resto = Vec::new();
+    file.read_to_end(&mut resto)?;
+    let esperado = scan
+        .records
+        .last()
+        .map(|r| r.lsn.saturating_add(1))
+        .unwrap_or(scan.header.first_lsn);
+    let registo_integro = |b: &[u8]| match decode_raw_record(b) {
+        RawDecoded::Record { lsn, .. } => Some(lsn),
+        _ => None,
+    };
+    let footer_declara = |b: &[u8]| {
+        FooterV6::decode(b)
+            .ok()
+            .filter(|f| f.record_count > 0)
+            .map(|f| (f.min_lsn, f.max_lsn))
+    };
+    let formato = crate::rasgo::Formato {
+        footer_magic: FOOTER_MAGIC,
+        footer_len: FOOTER_LEN,
+        registo_integro: &registo_integro,
+        footer_declara: &footer_declara,
+    };
+    Ok(
+        match crate::rasgo::classificar(&resto, esperado, &formato) {
+            crate::rasgo::Rasgo::Cauda => None,
+            crate::rasgo::Rasgo::Corrupcao(motivo) => Some(motivo),
+        },
+    )
+}
+
+/// `true` se os últimos 128 bytes de `path` parecem um footer (válido, ou com
+/// magic e CRC partido). É só um palpite sobre o EOF, e por isso serve apenas
+/// para escolher a mensagem do `verify`; quem decide é [`rasgo_corrompido`].
+pub(super) fn parece_selado(path: &Path) -> V6Result<bool> {
+    Ok(read_footer(path)?.is_some() || footer_magic_at_eof(path)?)
 }
 
 /// O footer que **sela** de facto um segmento RAW: válido no EOF *e* alcançado
@@ -1287,9 +1429,9 @@ mod tests {
         assert_eq!(achado.record.as_ref().unwrap().hlc, 1009);
         assert_eq!(achado.record.as_ref().unwrap().payload, vec![b'p'; 512]);
         assert!(
-            achado.bytes_percorridos < tamanho / 4,
+            achado.percurso.bytes < tamanho / 4,
             "percorreu {} de {tamanho} bytes para o 10.º registo",
-            achado.bytes_percorridos
+            achado.percurso.bytes
         );
 
         std::fs::remove_file(&path).ok();
@@ -1312,7 +1454,10 @@ mod tests {
         }
         // Acima do máximo e (por construção) inexistente: o percurso chega ao
         // footer e devolve `None`, não um erro.
-        assert!(find_raw_record(&path, 120).unwrap().record.is_none());
+        let fora = find_raw_record(&path, 120).unwrap();
+        assert!(fora.record.is_none());
+        assert_eq!(fora.percurso.fim, FimPercurso::Footer { record_count: 120 });
+        assert!(fora.percurso.exigir_selado_completo(&path).is_ok());
         assert!(find_raw_record(&path, u64::MAX).unwrap().record.is_none());
 
         std::fs::remove_file(&path).ok();
@@ -1348,13 +1493,16 @@ mod tests {
         }
 
         let mut vistos = Vec::new();
-        let percorridos = percorrer_raw_segmento(&path, |lsn, _, _| {
+        let percurso = percorrer_raw_segmento(&path, |lsn, _, _| {
             vistos.push(lsn);
             Ok(ControloVarredura::Continuar)
         })
         .unwrap();
         assert_eq!(vistos, vec![0, 1, 2, 3, 4]);
-        assert_eq!(percorridos, bom);
+        assert_eq!(percurso.bytes, bom);
+        assert_eq!(percurso.registos, 5);
+        // O fim tem de dizer que parou num rasgo, não que o ficheiro acabou.
+        assert_eq!(percurso.fim, FimPercurso::Rasgo);
         assert!(find_raw_record(&path, 5).unwrap().record.is_none());
 
         std::fs::remove_file(&path).ok();
@@ -1641,5 +1789,111 @@ mod tests {
         assert!(read_sealing_footer(&path).unwrap().is_none());
         assert!(repair_active_tail(&path).is_err());
         assert_eq!(std::fs::metadata(&path).unwrap().len(), bytes.len() as u64);
+    }
+
+    /// Auditoria 2026-10-16, B1/B5: o comprimento do ÚLTIMO registo de um
+    /// segmento selado (um `.active` que caiu entre o seal e o rename),
+    /// estragado para lá do EOF, parece uma escrita interrompida — não há
+    /// registo nenhum depois dele. Mas o footer íntegro no EOF declara esse
+    /// LSN: o registo estava completo quando o segmento foi selado, e cortá-lo
+    /// apagaria um registo confirmado e o footer que o prova.
+    #[test]
+    fn comprimento_estragado_no_ultimo_registo_de_um_selado_nao_e_truncado() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("13.active.hrkl");
+        let init = SegmentInit {
+            segment_id: 13,
+            created_hlc: 1,
+            first_lsn: 0,
+            writer_epoch: 1,
+            storage_namespace_id: [8u8; 16],
+        };
+        let mut w = RawSegmentWriter::create(&path, init).unwrap();
+        w.append(0, 1, b"primeiro registo", &h(1)).unwrap();
+        w.append(1, 2, b"segundo registo", &h(2)).unwrap();
+        w.seal().unwrap();
+        let segundo = FILE_HEADER_LEN + RAW_RECORD_HEADER_LEN + b"primeiro registo".len();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[segundo + 3] ^= 0x10; // byte alto do `payload_len`: ~256 MiB
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(
+            scan_raw_segment(&path).unwrap().torn_at,
+            Some(segundo as u64)
+        );
+        let erro = repair_active_tail(&path).unwrap_err().to_string();
+        assert!(erro.contains("valid footer at EOF"), "{erro}");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), bytes.len() as u64);
+    }
+
+    /// Auditoria 2026-10-16, B1: o bit trocado no `payload_len` de um registo
+    /// a meio da cauda faz o frame "estender-se" para lá do EOF, como uma
+    /// escrita interrompida. A ressincronização encontra o registo seguinte,
+    /// íntegro e com o LSN esperado, e isso prova que há história depois do
+    /// rasgo.
+    #[test]
+    fn comprimento_estragado_a_meio_da_cauda_nao_e_truncado() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("15.active.hrkl");
+        let init = SegmentInit {
+            segment_id: 15,
+            created_hlc: 1,
+            first_lsn: 40,
+            writer_epoch: 1,
+            storage_namespace_id: [5u8; 16],
+        };
+        let mut w = RawSegmentWriter::create(&path, init).unwrap();
+        for i in 0..10u64 {
+            w.append(40 + i, i, b"abcdefgh", &h(i as u8 + 1)).unwrap();
+        }
+        w.sync().unwrap();
+        drop(w);
+        let quarto = FILE_HEADER_LEN + 3 * (RAW_RECORD_HEADER_LEN + 8);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[quarto + 3] ^= 0x10;
+        std::fs::write(&path, &bytes).unwrap();
+
+        assert_eq!(
+            scan_raw_segment(&path).unwrap().torn_at,
+            Some(quarto as u64)
+        );
+        let erro = repair_active_tail(&path).unwrap_err().to_string();
+        assert!(erro.contains("intact record with LSN 44"), "{erro}");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), bytes.len() as u64);
+    }
+
+    /// A excepção da regra: zeros do rasgo até ao EOF não são um registo (o
+    /// CRC-32C de zeros não é zero) nem o rasto de um bit trocado — são a
+    /// extensão do ficheiro cujo conteúdo não chegou ao disco antes de uma
+    /// falha de energia. Truncá-los não apaga nada que alguém escreveu.
+    #[test]
+    fn zeros_depois_do_ultimo_registo_sao_cauda_rasgada() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("14.active.hrkl");
+        let init = SegmentInit {
+            segment_id: 14,
+            created_hlc: 1,
+            first_lsn: 0,
+            writer_epoch: 1,
+            storage_namespace_id: [9u8; 16],
+        };
+        let mut w = RawSegmentWriter::create(&path, init).unwrap();
+        for i in 0..3u64 {
+            w.append(i, i, b"abcdefgh", &h(i as u8 + 1)).unwrap();
+        }
+        w.sync().unwrap();
+        let bom = std::fs::metadata(&path).unwrap().len();
+        drop(w);
+        {
+            use std::io::Write as _;
+            OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(&[0u8; 300])
+                .unwrap();
+        }
+        assert_eq!(repair_active_tail(&path).unwrap(), Some(bom));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), bom);
     }
 }

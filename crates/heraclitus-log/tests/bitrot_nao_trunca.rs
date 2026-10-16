@@ -106,3 +106,56 @@ fn cauda_torn_no_segmento_ativo_continua_a_recuperar() {
         .expect("cauda torn no segmento ativo tem de ser recuperada");
     assert_eq!(log.head(), 10, "os 10 registos bons têm de sobreviver");
 }
+
+/// Auditoria 2026-10-16, B1 (o mesmo padrão do HRKL v6): o segmento ATIVO
+/// também não pode ser truncado por bit rot. Um bit trocado a 1/3 do único
+/// segmento, com os 100 registos confirmados com `fsync = Always`, fazia a
+/// abertura cortar tudo a partir do registo estragado e reatribuir os LSN —
+/// a guarda acima só valia para os segmentos não-últimos.
+#[test]
+fn bitrot_no_meio_do_segmento_ativo_recusa_abrir_em_vez_de_truncar() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let log = Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
+        for i in 0..100 {
+            log.append(Episode::new(
+                "a",
+                EventKind::Observation,
+                format!("evento {i} {}", "y".repeat(40)).into_bytes(),
+            ))
+            .unwrap();
+        }
+    }
+    let seg = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().map(|x| x == "hrkl").unwrap_or(false))
+        .unwrap();
+    let antes = std::fs::metadata(&seg).unwrap().len();
+    let inverter = || {
+        let mut bytes = std::fs::read(&seg).unwrap();
+        let alvo = bytes.len() / 3;
+        bytes[alvo] ^= 0x01;
+        std::fs::write(&seg, &bytes).unwrap();
+    };
+    inverter();
+
+    match Log::open(dir.path(), 1 << 20, FsyncPolicy::Always) {
+        Ok(log) => panic!(
+            "abriu com head {} (antes 100): truncou registos confirmados",
+            log.head()
+        ),
+        Err(e) => assert!(e.to_string().contains("Recuso truncar"), "{e}"),
+    }
+    assert_eq!(
+        std::fs::metadata(&seg).unwrap().len(),
+        antes,
+        "o segmento ativo foi truncado — a evidência tem de ser preservada"
+    );
+
+    // Nada se perdeu: desfeita a corrupção, os 100 registos estão lá.
+    inverter();
+    let log = Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
+    assert_eq!(log.head(), 100);
+}

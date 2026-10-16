@@ -21,6 +21,7 @@ pub mod io_backend; // SPEC-0073 §7: contrato de I/O do log (PortableFileIo def
 #[cfg(all(target_os = "linux", feature = "linux-io-uring"))]
 pub mod io_uring_backend; // SPEC-0073 §8/§9: backend io_uring experimental
 pub mod mmap;
+mod rasgo; // auditoria 2026-10-16, B1/B5: a regra única de cauda rasgada
 pub mod skip_scan; // SPEC-010: segment-level skip-I/O scan wired on zone maps
 pub mod store; // SPEC-0050: fachada explícita e neutra entre HRKL legado/v6
 pub mod subscribe; // SPEC-022: StreamSubscriber ligado ao tail do log
@@ -1087,6 +1088,32 @@ impl Log {
                             scan.valid_len
                         ),
                     });
+                }
+                // Auditoria 2026-10-16, B1: mesmo no segmento ATIVO, "ilegível"
+                // não quer dizer "rasgado". Um bit trocado a meio da cauda —
+                // registos já confirmados, com fsync — era cortado como se fosse
+                // a escrita interrompida de um crash: os registos seguintes
+                // desapareciam e os seus LSN voltavam a ser atribuídos aos
+                // próximos appends. Só se trunca o que `rasgo::classificar`
+                // reconhece como escrita interrompida (o último frame, cortado
+                // além do EOF, sem nada íntegro depois dele).
+                if scan.valid_len < scan.file_len {
+                    let esperado = scan
+                        .max_lsn
+                        .or(max_recovered_lsn)
+                        .map_or(0, |l| l.saturating_add(1));
+                    if let Some(motivo) = rasgo_legado_corrompido(&path, &scan, esperado)? {
+                        return Err(HeraclitusError::Corruption {
+                            context: format!("segmento {id} ({})", path.display()),
+                            detail: format!(
+                                "registo ilegível no offset {} do segmento ativo que não é uma \
+                                 escrita interrompida ({motivo}). Recuso truncar: apagaria \
+                                 registos confirmados e reutilizaria os seus LSN. Restaure este \
+                                 segmento de backup ou de uma réplica.",
+                                scan.valid_len
+                            ),
+                        });
+                    }
                 }
                 execute_physical_repair(&path, scan.valid_len)?;
             }
@@ -3058,6 +3085,40 @@ fn scan_segment_file(
         version,
         corruption_detected: corruption,
         max_hlc,
+    })
+}
+
+/// `Some(motivo)` se os bytes do segmento ativo a partir de `scan.valid_len`
+/// não são uma escrita interrompida — ver [`rasgo`]. `esperado` é o LSN que o
+/// registo nesse offset devia ter.
+fn rasgo_legado_corrompido(
+    path: &Path,
+    scan: &SegmentScan,
+    esperado: Lsn,
+) -> Result<Option<String>, HeraclitusError> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(scan.valid_len))?;
+    let mut resto = Vec::new();
+    file.read_to_end(&mut resto)?;
+    let version = scan.version;
+    let registo_integro = |b: &[u8]| match format::decode_record(version, b) {
+        Decoded::Record(lsn, ..) => Some(lsn),
+        _ => None,
+    };
+    let footer_declara = |b: &[u8]| {
+        SegmentFooter::decode(b)
+            .filter(|f| f.record_count > 0)
+            .map(|f| (f.min_lsn, f.max_lsn))
+    };
+    let formato = rasgo::Formato {
+        footer_magic: format::FOOTER_MAGIC,
+        footer_len: format::FOOTER_LEN,
+        registo_integro: &registo_integro,
+        footer_declara: &footer_declara,
+    };
+    Ok(match rasgo::classificar(&resto, esperado, &formato) {
+        rasgo::Rasgo::Cauda => None,
+        rasgo::Rasgo::Corrupcao(motivo) => Some(motivo),
     })
 }
 

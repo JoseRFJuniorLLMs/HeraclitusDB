@@ -289,8 +289,15 @@ fn reparacao_recusa_segmento_selado() {
 
 /// Bit rot num registo COMPLETO (o CRC falha, o comprimento não) tem de dar
 /// `torn_at` nesse registo — e não ser lido como bom.
+///
+/// Auditoria 2026-10-16, B1: e também NÃO pode ser truncado como cauda. Este
+/// teste afirmava o contrário (`repair_active_tail` devolvia
+/// `Some(inicio_do_quarto)` e cortava o ficheiro), e era exactamente o
+/// mecanismo do B1: um registo que cabe inteiro no ficheiro foi escrito por
+/// inteiro — confirmado, com `fsync = Always` — e estragou-se depois. Uma
+/// escrita interrompida deixa um frame que se estende além do EOF.
 #[test]
-fn bit_rot_num_registo_completo_e_tratado_como_cauda() {
+fn bit_rot_num_registo_completo_nao_e_tratado_como_cauda() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rot.hrkl");
 
@@ -349,8 +356,17 @@ fn bit_rot_num_registo_completo_e_tratado_como_cauda() {
         Some(inicio_do_quarto),
         "torn_at tem de apontar para o inicio do registo corrompido"
     );
-    assert_eq!(repair_active_tail(&path).unwrap(), Some(inicio_do_quarto));
-    assert_eq!(std::fs::metadata(&path).unwrap().len(), tamanho_bom);
+    let antes = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        repair_active_tail(&path).is_err(),
+        "um registo completo com CRC errado e corrupcao, nao cauda rasgada"
+    );
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        antes,
+        "o registo corrompido tem de ficar no ficheiro para pericia"
+    );
+    assert!(antes > tamanho_bom);
 }
 
 /// Um footer escrito só até meio (kill durante o `seal`) não pode ser aceite

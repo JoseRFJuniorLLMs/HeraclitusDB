@@ -114,7 +114,26 @@ pub fn pack_segment_with_observer(
     }
     let Some(source_footer) = scan.footer else {
         // §22: só se packa depois do seal. Um segmento activo ainda cresce.
-        return Err(corrupt(CTX, "refusing to pack an unsealed segment"));
+        let Some(at) = scan.torn_at else {
+            return Err(corrupt(CTX, "refusing to pack an unsealed segment"));
+        };
+        // Auditoria 2026-10-16, B6: um RAW selado com um CRC falhado a meio
+        // também chega aqui sem footer — a varredura pára no registo estragado
+        // e nunca o vê —, e a mensagem acima mandava o operador procurar um
+        // segmento por selar quando o problema é corrupção num selado.
+        let motivo = match super::raw::rasgo_corrompido(source, &scan)? {
+            Some(motivo) => motivo,
+            None => "a torn write, as in an active tail that was never sealed".into(),
+        };
+        return Err(corrupt(
+            CTX,
+            format!(
+                "{}: the footer was never reached; the records stop at offset {at} after {} \
+                 intact records: {motivo}",
+                source.display(),
+                scan.records.len()
+            ),
+        ));
     };
     if scan.torn_at.is_some() {
         return Err(corrupt(
