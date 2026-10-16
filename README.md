@@ -20,6 +20,16 @@
   <img src="https://img.shields.io/badge/deployment-On--Prem%20%7C%20Air--Gap-071D41" alt="deployment targets" />
 </p>
 
+<p align="center">
+  <img src="img/heraclitusdb-casa-do-codigo.png" alt="Capa: HeraclitusDB, Guerra entre irmãos. Um banco de dados onde nada é sobrescrito." width="420" />
+  <img src="img/morte-postgres.png" alt="Capa: HeraclitusDB, Tudo flui, tudo muda. Um banco de dados de fluxo que nunca é o mesmo." width="420" />
+</p>
+
+<p align="center">
+  <em>Guerra entre irmãos</em> — o rio contra o abismo. Registre e prove.<br />
+  <em>Tudo flui, tudo muda</em> — o devir do dado. O banco que é rio, não lago.
+</p>
+
 > **Posicionamento institucional.** O HeraclitusDB é um projeto independente. Foi concebido para requisitos típicos do setor público, infraestrutura crítica e ambientes regulados, mas não é produto oficial, homologado, certificado ou endossado pelo Governo Federal brasileiro. Mapeamentos normativos e mecanismos técnicos não equivalem, por si só, a conformidade institucional, fé pública, certificação ou admissibilidade jurídica.
 
 ---
