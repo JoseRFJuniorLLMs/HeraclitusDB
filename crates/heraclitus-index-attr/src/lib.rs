@@ -1178,9 +1178,18 @@ impl AttrIndex {
         use std::io::{Read, Seek, SeekFrom};
         let mut f = std::fs::File::open(path)?;
         let mut cabeca = [0u8; CABECALHO_V6];
-        if f.read_exact(&mut cabeca).is_err()
-            || &cabeca[..4] != MAGIC_V2
-            || u16::from_le_bytes([cabeca[4], cabeca[5]]) != FORMAT_CURRENT
+        match f.read_exact(&mut cabeca) {
+            Ok(()) => {}
+            // Mais curto do que o cabeçalho: não é um checkpoint deste formato.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            // Tudo o resto é I/O a sério e tem de chegar ao chamador como tal
+            // (`ErroIo`, não `Ilegivel`): no Linux um `File::open` de um
+            // directório abre, e é a leitura que falha com EISDIR — no
+            // Windows já falhava no `open`. Antes de v7 este erro chegava ao
+            // `fs::read` do caminho de compatibilidade; sem ele, era engolido.
+            Err(e) => return Err(e),
+        }
+        if &cabeca[..4] != MAGIC_V2 || u16::from_le_bytes([cabeca[4], cabeca[5]]) != FORMAT_CURRENT
         {
             return Ok(None);
         }
