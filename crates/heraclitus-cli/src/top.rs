@@ -13,6 +13,13 @@
 //!   TCP probe of gRPC :7474   (5 s, reachability only)
 //!   GET /state                (10 s; deliberately slower because it is heavier)
 //!   GET /compliance/status    (30 s; deliberately slower because it replays state)
+//!
+//! Every request goes to `--url` with the credential given on the command
+//! line (`--user` plus `--pass` or `--pass-file`). There is no retry against
+//! another host and no retry with another credential.
+//!
+//! The formal-proof table takes its status from the CI report passed in
+//! `--proof-status`; without it every proof shows NOT_VERIFIED.
 
 use crossterm::{
     cursor::Show,
@@ -38,7 +45,7 @@ use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const HISTORY_SAMPLES: usize = 120;
@@ -101,29 +108,31 @@ impl ActiveTab {
     }
 }
 
+// Campo que o servidor não enviou fica `None` e aparece como N/D. Um 0
+// inventado pintaria de verde as falhas de CRC e de verificação canónica.
 #[derive(Debug, Default, Clone)]
 struct StorageSnapshot {
     available: bool,
-    append_bytes_total: u64,
-    raw_bytes: u64,
-    packed_bytes: u64,
-    compression_ratio: f64,
-    pack_queue_depth: u64,
-    pack_seconds: f64,
-    pack_throughput_bytes_sec: f64,
-    blocks_total: u64,
-    blocks_read: u64,
-    blocks_pruned: u64,
-    bytes_pruned: u64,
-    decompressed_bytes: u64,
-    hrki_hits: u64,
-    hrki_misses: u64,
-    hrki_rebuilds: u64,
-    cold_range_reads: u64,
-    cold_bytes_downloaded: u64,
-    parquet_export_lag_lsn: u64,
-    canonical_verify_failures: u64,
-    physical_crc_failures: u64,
+    append_bytes_total: Option<u64>,
+    raw_bytes: Option<u64>,
+    packed_bytes: Option<u64>,
+    compression_ratio: Option<f64>,
+    pack_queue_depth: Option<u64>,
+    pack_seconds: Option<f64>,
+    pack_throughput_bytes_sec: Option<f64>,
+    blocks_total: Option<u64>,
+    blocks_read: Option<u64>,
+    blocks_pruned: Option<u64>,
+    bytes_pruned: Option<u64>,
+    decompressed_bytes: Option<u64>,
+    hrki_hits: Option<u64>,
+    hrki_misses: Option<u64>,
+    hrki_rebuilds: Option<u64>,
+    cold_range_reads: Option<u64>,
+    cold_bytes_downloaded: Option<u64>,
+    parquet_export_lag_lsn: Option<u64>,
+    canonical_verify_failures: Option<u64>,
+    physical_crc_failures: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -154,21 +163,22 @@ struct SentinelSnapshot {
     lag_state: String,
     queue_depth: u64,
     queue_capacity: u64,
-    queue_overflow_total: u64,
+    // Os contadores de falha são `Option`, como no storage: ausente é N/D.
+    queue_overflow_total: Option<u64>,
     events_seen_total: u64,
     events_processed_total: u64,
     events_normalized_total: u64,
     signals_emitted_total: u64,
     threat_matches_total: u64,
     incidents_created_total: u64,
-    incident_capacity_drops_total: u64,
-    normalization_errors_total: u64,
+    incident_capacity_drops_total: Option<u64>,
+    normalization_errors_total: Option<u64>,
     l0_latency_us: u64,
     l1_latency_ms: u64,
     l2_latency_ms: u64,
     l3_latency_ms: u64,
     ai_requests_total: u64,
-    ai_failures_total: u64,
+    ai_failures_total: Option<u64>,
     ai_latency_ms: u64,
     ai_tokens_total: u64,
     ai_investigations_persisted_total: u64,
@@ -177,7 +187,7 @@ struct SentinelSnapshot {
     actions_approved_total: u64,
     actions_denied_total: u64,
     actions_executed_total: u64,
-    action_failures_total: u64,
+    action_failures_total: Option<u64>,
     boot_outcome: String,
     boot_total_ms: u64,
     boot_tail_events: u64,
@@ -413,11 +423,20 @@ struct AppState {
     redteam: RedTeamSnapshot,
     agent_status: AgentStatusSnapshot,
 
+    proof_status_path: Option<PathBuf>,
+    proofs: ProofSource,
+
     selected_task_index: usize,
 }
 
 impl AppState {
-    fn new(target_url: String, auth: String, interval_sec: f64) -> Self {
+    fn new(
+        target_url: String,
+        auth: String,
+        interval_sec: f64,
+        proof_status_path: Option<PathBuf>,
+    ) -> Self {
+        let proofs = load_proof_source(proof_status_path.as_deref());
         let agent_url =
             env::var("HERACLITUS_AGENT_URL").unwrap_or_else(|_| derive_agent_url(&target_url));
 
@@ -471,6 +490,9 @@ impl AppState {
 
             agent_url,
 
+            proof_status_path,
+            proofs,
+
             selected_task_index: 0,
         }
     }
@@ -480,14 +502,13 @@ impl AppState {
 
         // /healthz is intentionally cheap and does not take the heavyweight
         // locks used by /stats and /state.
-        if let Ok(response) = fetch_with_fallback(&mut self.target_url, &mut self.auth, "/healthz")
-        {
+        if let Ok(response) = fetch_http(&self.target_url, &self.auth, "/healthz") {
             if response.is_success() {
                 self.health_text = response.body_text().trim().to_string();
             }
         }
 
-        match fetch_json_with_fallback(&mut self.target_url, &mut self.auth, "/stats") {
+        match fetch_json(&self.target_url, &self.auth, "/stats") {
             Ok((stats, latency_ms)) => {
                 self.online = true;
                 self.consecutive_failures = 0;
@@ -501,6 +522,8 @@ impl AppState {
                 self.online = false;
                 self.consecutive_failures = self.consecutive_failures.saturating_add(1);
                 self.last_error = Some(error);
+                // Sem resposta válida não há medição: N/D, não o último verde.
+                self.storage = StorageSnapshot::default();
                 if let Some(last) = self.last_success_at {
                     self.last_success_elapsed = Some(now.saturating_duration_since(last));
                 }
@@ -552,6 +575,7 @@ impl AppState {
         self.last_grpc_probe = None;
         self.last_redteam_poll = None;
         self.last_agent_status_poll = None;
+        self.proofs = load_proof_source(self.proof_status_path.as_deref());
         self.update_fast();
     }
 
@@ -598,9 +622,10 @@ impl AppState {
             activation_tracked: u64_at(&stats, "activation_tracked").unwrap_or(0),
         };
 
-        if let Some(storage) = stats.get("storage_metrics") {
-            self.storage = parse_storage(storage);
-        }
+        self.storage = stats
+            .get("storage_metrics")
+            .map(parse_storage)
+            .unwrap_or_default();
 
         // Forward compatible: when the server eventually exposes a raft object
         // in /stats, the same CLI starts rendering it without inventing data on
@@ -613,22 +638,20 @@ impl AppState {
     }
 
     fn poll_state(&mut self) {
-        if let Ok((state, _)) =
-            fetch_json_with_fallback(&mut self.target_url, &mut self.auth, "/state")
-        {
+        if let Ok((state, _)) = fetch_json(&self.target_url, &self.auth, "/state") {
             self.view_watermarks = extract_watermarks(&state);
         }
     }
 
     fn poll_sentinel(&mut self) {
-        match fetch_json_with_fallback(&mut self.target_url, &mut self.auth, "/sentinel/status") {
+        match fetch_json(&self.target_url, &self.auth, "/sentinel/status") {
             Ok((value, _)) => self.sentinel = parse_sentinel(&value),
             Err(_) => self.sentinel.available = false,
         }
     }
 
     fn poll_compliance(&mut self) {
-        match fetch_json_with_fallback(&mut self.target_url, &mut self.auth, "/compliance/status") {
+        match fetch_json(&self.target_url, &self.auth, "/compliance/status") {
             Ok((value, _)) => self.compliance = parse_compliance(&value),
             Err(_) => self.compliance.available = false,
         }
@@ -647,42 +670,25 @@ impl AppState {
         }
     }
 
+    // O agente pode correr sem autenticação; a segunda tentativa vai sem
+    // credencial nenhuma, nunca com uma mais forte.
     fn poll_redteam(&mut self) {
-        let mut target = self.agent_url.clone();
-        let mut auth = self.auth.clone();
-        match fetch_json_with_fallback(
-            &mut target,
-            &mut auth,
-            "/api/v1/agent/red-team/events?limit=50",
-        ) {
+        const PATH: &str = "/api/v1/agent/red-team/events?limit=50";
+        match fetch_json(&self.agent_url, &self.auth, PATH)
+            .or_else(|_| fetch_json(&self.agent_url, "", PATH))
+        {
             Ok((value, _)) => self.redteam = parse_redteam(&value),
-            Err(_) => {
-                let mut empty_auth = String::new();
-                match fetch_json_with_fallback(
-                    &mut target,
-                    &mut empty_auth,
-                    "/api/v1/agent/red-team/events?limit=50",
-                ) {
-                    Ok((value, _)) => self.redteam = parse_redteam(&value),
-                    Err(_) => self.redteam.available = false,
-                }
-            }
+            Err(_) => self.redteam.available = false,
         }
     }
 
     fn poll_agent_status(&mut self) {
-        let mut target = self.agent_url.clone();
-        let mut auth = self.auth.clone();
-        match fetch_json_with_fallback(&mut target, &mut auth, "/api/v1/agent/status") {
+        const PATH: &str = "/api/v1/agent/status";
+        match fetch_json(&self.agent_url, &self.auth, PATH)
+            .or_else(|_| fetch_json(&self.agent_url, "", PATH))
+        {
             Ok((value, _)) => self.agent_status = parse_agent_status(&value),
-            Err(_) => {
-                let mut empty_auth = String::new();
-                match fetch_json_with_fallback(&mut target, &mut empty_auth, "/api/v1/agent/status")
-                {
-                    Ok((value, _)) => self.agent_status = parse_agent_status(&value),
-                    Err(_) => self.agent_status.available = false,
-                }
-            }
+            Err(_) => self.agent_status.available = false,
         }
     }
 
@@ -709,23 +715,23 @@ impl AppState {
             });
         }
 
-        if self.storage.physical_crc_failures > 0 {
+        if let Some(failures) = self.storage.physical_crc_failures.filter(|n| *n > 0) {
             alarms.push(Alarm {
                 source: "STORAGE",
                 code: "ALM-CRC-001",
                 severity: AlarmSeverity::Critical,
                 message: "HRKL physical block CRC verification failure".into(),
-                value: format!("{} crc err", self.storage.physical_crc_failures),
+                value: format!("{failures} crc err"),
             });
         }
 
-        if self.storage.canonical_verify_failures > 0 {
+        if let Some(failures) = self.storage.canonical_verify_failures.filter(|n| *n > 0) {
             alarms.push(Alarm {
                 source: "STORAGE",
                 code: "ALM-CAN-001",
                 severity: AlarmSeverity::Critical,
                 message: "Canonical serialization / hash verification failure".into(),
-                value: format!("{} verify err", self.storage.canonical_verify_failures),
+                value: format!("{failures} verify err"),
             });
         }
 
@@ -777,13 +783,13 @@ impl AppState {
         }
 
         if self.sentinel.available {
-            if self.sentinel.queue_overflow_total > 0 {
+            if let Some(drops) = self.sentinel.queue_overflow_total.filter(|n| *n > 0) {
                 alarms.push(Alarm {
                     source: "SENTINEL",
                     code: "ALM-SNT-001",
                     severity: AlarmSeverity::Critical,
                     message: "Sentinel queue overflow dropped telemetry events".into(),
-                    value: format!("{} drops", self.sentinel.queue_overflow_total),
+                    value: format!("{drops} drops"),
                 });
             }
             if self.sentinel.lag_state.eq_ignore_ascii_case("CRITICAL") {
@@ -821,13 +827,17 @@ impl AppState {
             }
         }
 
-        if self.storage.available && self.storage.parquet_export_lag_lsn > 100_000 {
+        if let Some(lag) = self
+            .storage
+            .parquet_export_lag_lsn
+            .filter(|lag| self.storage.available && *lag > 100_000)
+        {
             alarms.push(Alarm {
                 source: "LAKEHOUSE",
                 code: "ALM-LAK-001",
                 severity: AlarmSeverity::Warning,
                 message: "Parquet Lakehouse export lag exceeds 100k LSN".into(),
-                value: format!("lag={}", format_number(self.storage.parquet_export_lag_lsn)),
+                value: format!("lag={}", format_number(lag)),
             });
         }
 
@@ -851,115 +861,95 @@ impl AppState {
         let mut tasks = Vec::new();
 
         if self.storage.available {
+            let (state, severity) = match self.storage.pack_queue_depth {
+                None => ("UNKNOWN", Severity::Neutral),
+                Some(0) => ("IDLE", Severity::Good),
+                Some(_) => ("RUNNING", Severity::Neutral),
+            };
             tasks.push(BackgroundTask {
                 id: "HRKL".into(),
                 kind: "PACKING".into(),
-                state: if self.storage.pack_queue_depth > 0 {
-                    "RUNNING"
-                } else {
-                    "IDLE"
-                }
-                .into(),
+                state: state.into(),
                 progress: "N/D".into(),
-                throughput: format_rate_bytes(self.storage.pack_throughput_bytes_sec),
-                detail: format!("queue={} blocos", self.storage.pack_queue_depth),
-                severity: if self.storage.pack_queue_depth > 0 {
-                    Severity::Neutral
-                } else {
-                    Severity::Good
-                },
+                throughput: self
+                    .storage
+                    .pack_throughput_bytes_sec
+                    .map(format_rate_bytes)
+                    .unwrap_or_else(|| "N/D".into()),
+                detail: format!(
+                    "queue={} blocos",
+                    option_number(self.storage.pack_queue_depth)
+                ),
+                severity,
             });
 
+            let (state, severity) = match self.storage.parquet_export_lag_lsn {
+                None => ("UNKNOWN", Severity::Neutral),
+                Some(0) => ("SYNCED", Severity::Good),
+                Some(_) => ("LAGGING", Severity::Warning),
+            };
             tasks.push(BackgroundTask {
                 id: "LAKE".into(),
                 kind: "PARQUET EXPORT".into(),
-                state: if self.storage.parquet_export_lag_lsn > 0 {
-                    "LAGGING"
-                } else {
-                    "SYNCED"
-                }
-                .into(),
+                state: state.into(),
                 progress: "N/D".into(),
                 throughput: "N/D".into(),
                 detail: format!(
                     "lag={} LSN",
-                    format_number(self.storage.parquet_export_lag_lsn)
+                    option_number(self.storage.parquet_export_lag_lsn)
                 ),
-                severity: if self.storage.parquet_export_lag_lsn > 0 {
-                    Severity::Warning
-                } else {
-                    Severity::Good
-                },
+                severity,
             });
 
-            let index_total = self
-                .storage
-                .hrki_hits
-                .saturating_add(self.storage.hrki_misses);
-            let hit_rate = if index_total > 0 {
-                100.0 * self.storage.hrki_hits as f64 / index_total as f64
-            } else {
-                0.0
+            let hit_rate = match (self.storage.hrki_hits, self.storage.hrki_misses) {
+                (Some(hits), Some(misses)) if hits.saturating_add(misses) > 0 => {
+                    Some(100.0 * hits as f64 / hits.saturating_add(misses) as f64)
+                }
+                _ => None,
+            };
+            let (state, severity) = match self.storage.hrki_rebuilds {
+                None => ("UNKNOWN", Severity::Neutral),
+                Some(0) => ("HEALTHY", Severity::Good),
+                Some(_) => ("OBSERVE", Severity::Warning),
             };
             tasks.push(BackgroundTask {
                 id: "HRKI".into(),
                 kind: "INDEX SIDECAR".into(),
-                state: if self.storage.hrki_rebuilds == 0 {
-                    "HEALTHY"
-                } else {
-                    "OBSERVE"
-                }
-                .into(),
+                state: state.into(),
                 progress: "N/D".into(),
-                throughput: if index_total > 0 {
-                    format!("{hit_rate:.1}% hit")
-                } else {
-                    "N/D".into()
-                },
-                detail: format!("rebuilds={}", self.storage.hrki_rebuilds),
-                severity: if self.storage.hrki_rebuilds == 0 {
-                    Severity::Good
-                } else {
-                    Severity::Warning
-                },
+                throughput: hit_rate
+                    .map(|rate| format!("{rate:.1}% hit"))
+                    .unwrap_or_else(|| "N/D".into()),
+                detail: format!("rebuilds={}", option_number(self.storage.hrki_rebuilds)),
+                severity,
             });
 
+            let (state, severity) = integrity_state(self.storage.physical_crc_failures);
             tasks.push(BackgroundTask {
                 id: "CRC".into(),
                 kind: "PHYSICAL INTEGRITY".into(),
-                state: if self.storage.physical_crc_failures == 0 {
-                    "HEALTHY"
-                } else {
-                    "FAILED"
-                }
-                .into(),
+                state: state.into(),
                 progress: "N/D".into(),
                 throughput: "N/D".into(),
-                detail: format!("crc_failures={}", self.storage.physical_crc_failures),
-                severity: if self.storage.physical_crc_failures == 0 {
-                    Severity::Good
-                } else {
-                    Severity::Critical
-                },
+                detail: format!(
+                    "crc_failures={}",
+                    option_number(self.storage.physical_crc_failures)
+                ),
+                severity,
             });
 
+            let (state, severity) = integrity_state(self.storage.canonical_verify_failures);
             tasks.push(BackgroundTask {
                 id: "CAN".into(),
                 kind: "CANONICAL VERIFY".into(),
-                state: if self.storage.canonical_verify_failures == 0 {
-                    "HEALTHY"
-                } else {
-                    "FAILED"
-                }
-                .into(),
+                state: state.into(),
                 progress: "N/D".into(),
                 throughput: "N/D".into(),
-                detail: format!("verify_failures={}", self.storage.canonical_verify_failures),
-                severity: if self.storage.canonical_verify_failures == 0 {
-                    Severity::Good
-                } else {
-                    Severity::Critical
-                },
+                detail: format!(
+                    "verify_failures={}",
+                    option_number(self.storage.canonical_verify_failures)
+                ),
+                severity,
             });
         }
 
@@ -1102,7 +1092,13 @@ impl AppState {
     }
 }
 
-pub fn run_top(url_str: &str, user: &str, pass: &str, interval_sec: f64) -> Result<String, String> {
+pub fn run_top(
+    url_str: &str,
+    user: &str,
+    pass: &str,
+    interval_sec: f64,
+    proof_status: Option<&Path>,
+) -> Result<String, String> {
     enable_raw_mode().map_err(|error| format!("erro ao ativar raw mode: {error}"))?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)
@@ -1122,7 +1118,12 @@ pub fn run_top(url_str: &str, user: &str, pass: &str, interval_sec: f64) -> Resu
         format!("{user}:{pass}")
     };
 
-    let mut app = AppState::new(url_str.to_owned(), auth, interval_sec);
+    let mut app = AppState::new(
+        url_str.to_owned(),
+        auth,
+        interval_sec,
+        proof_status.map(Path::to_path_buf),
+    );
     app.force_refresh();
     let mut last_tick = Instant::now();
 
@@ -1400,23 +1401,8 @@ fn render_banner(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
         Span::styled(" 0 WARN ", Style::default().fg(Color::DarkGray))
     };
 
-    let crc_span = if app.storage.physical_crc_failures == 0 {
-        Span::styled("CRC: OK", Style::default().fg(Color::Green))
-    } else {
-        Span::styled(
-            format!("CRC: {} FAIL", app.storage.physical_crc_failures),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        )
-    };
-
-    let can_span = if app.storage.canonical_verify_failures == 0 {
-        Span::styled("CAN: OK", Style::default().fg(Color::Green))
-    } else {
-        Span::styled(
-            format!("CAN: {} FAIL", app.storage.canonical_verify_failures),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        )
-    };
+    let crc_span = integrity_span("CRC", app.storage.physical_crc_failures);
+    let can_span = integrity_span("CAN", app.storage.canonical_verify_failures);
 
     let evd_span = if !app.agent_status.available {
         Span::styled("Evidence: N/D", Style::default().fg(Color::DarkGray))
@@ -1429,7 +1415,9 @@ fn render_banner(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
         )
     };
 
-    let leak_span = if app.redteam.reached_upstream > 0 {
+    let leak_span = if !app.redteam.available {
+        Span::styled("Boundary: N/D", Style::default().fg(Color::DarkGray))
+    } else if app.redteam.reached_upstream > 0 {
         Span::styled(
             format!("Boundary: +{} LEAK", app.redteam.reached_upstream),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -1626,28 +1614,27 @@ fn render_overview(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
     );
     frame.render_widget(system, top[1]);
 
-    let savings = storage_savings_factor(&app.storage);
     let storage = Paragraph::new(vec![
-        kv_line("RAW", format_bytes(app.storage.raw_bytes), Color::Yellow),
+        kv_line("RAW", option_bytes(app.storage.raw_bytes), Color::Yellow),
         kv_line(
             "PACKED",
-            format_bytes(app.storage.packed_bytes),
+            option_bytes(app.storage.packed_bytes),
             Color::Green,
         ),
         kv_line(
             "Packed/RAW",
-            format!("{:.1}%", app.storage.compression_ratio * 100.0),
+            option_percent(app.storage.compression_ratio, 1),
             Color::Magenta,
         ),
-        kv_line("Economia", format!("{savings:.2}x"), Color::Cyan),
+        kv_line(
+            "Economia",
+            option_factor(storage_savings_factor(&app.storage)),
+            Color::Cyan,
+        ),
         kv_line(
             "Pack queue",
-            app.storage.pack_queue_depth.to_string(),
-            if app.storage.pack_queue_depth == 0 {
-                Color::Green
-            } else {
-                Color::Yellow
-            },
+            option_number(app.storage.pack_queue_depth),
+            counter_color(app.storage.pack_queue_depth, Color::Yellow),
         ),
     ])
     .block(
@@ -1665,10 +1652,10 @@ fn render_overview(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
     render_ingest_chart(frame, app, middle[0]);
     render_overview_right(frame, app, middle[1]);
 
-    render_verified_invariants(frame, vertical[2]);
+    render_verified_invariants(frame, &app.proofs, vertical[2]);
 }
 
-fn render_verified_invariants(frame: &mut ratatui::Frame<'_>, area: Rect) {
+fn render_verified_invariants(frame: &mut ratatui::Frame<'_>, proofs: &ProofSource, area: Rect) {
     let header = Row::new([
         "SPEC",
         "SUBSYSTEM",
@@ -1684,80 +1671,39 @@ fn render_verified_invariants(frame: &mut ratatui::Frame<'_>, area: Rect) {
     )
     .bottom_margin(0);
 
-    let rows = vec![
-        Row::new([
-            "SPEC-0010",
-            "heraclitus-storage",
-            "ProofAppendOnly",
-            "Monotonic LSN progression & physical block immutability",
-            "Lean 4 (v4.8)",
-            "PROVED",
-        ])
-        .style(Style::default().fg(Color::Green)),
-        Row::new([
-            "SPEC-0015",
-            "heraclitus-merkle",
-            "ProofMerkleTree",
-            "Cryptographic state inclusion & collision resistance",
-            "Lean 4 (v4.8)",
-            "PROVED",
-        ])
-        .style(Style::default().fg(Color::Green)),
-        Row::new([
-            "SPEC-0022",
-            "heraclitus-state",
-            "ProofDeterministicReplay",
-            "Strict state isomorphism under identical event history",
-            "Lean 4 (v4.8)",
-            "PROVED",
-        ])
-        .style(Style::default().fg(Color::Green)),
-        Row::new([
-            "SPEC-0034",
-            "heraclitus-core",
-            "ProofDenseMap",
-            "Hazard pointers memory safety & lock-free progression",
-            "Lean 4 (v4.8)",
-            "PROVED",
-        ])
-        .style(Style::default().fg(Color::Green)),
-        Row::new([
-            "SPEC-0041",
-            "heraclitus-hlc",
-            "ProofHLC",
-            "Strict causality & wall-clock forward monotonicity",
-            "Lean 4 (v4.8)",
-            "PROVED",
-        ])
-        .style(Style::default().fg(Color::Green)),
-        Row::new([
-            "SPEC-0081",
-            "heraclitus-agent",
-            "ProofApprovalIdempotence",
-            "Zero double-execution & replay safety under burst",
-            "Lean 4 (v4.8)",
-            "PROVED",
-        ])
-        .style(Style::default().fg(Color::Green)),
-        Row::new([
-            "SPEC-0085",
-            "heraclitus-agent-gateway",
-            "ProofToolCallIsolation",
-            "Zero leak past denial barrier (upstream_delta == 0)",
-            "Lean 4 (v4.8)",
-            "PROVED",
-        ])
-        .style(Style::default().fg(Color::Green)),
-        Row::new([
-            "SPEC-0078",
-            "heraclitus-blackbox",
-            "ProofRFC3161Seal",
-            "Tamper-evident evidence chain non-repudiation",
-            "Kani / Proptest",
-            "TESTED",
-        ])
-        .style(Style::default().fg(Color::Cyan)),
-    ];
+    let rows = proof_rows(proofs)
+        .into_iter()
+        .map(|(claim, status)| {
+            Row::new([
+                claim.spec,
+                claim.subsystem,
+                claim.name,
+                claim.property,
+                claim.engine,
+                status.label(),
+            ])
+            .style(Style::default().fg(status.color()))
+        })
+        .collect::<Vec<_>>();
+
+    let (title, title_color) = match proofs {
+        ProofSource::NotProvided => (
+            " FORMAL PROOFS: NOT_VERIFIED (sem relatório do CI; use --proof-status) ".to_string(),
+            Color::Yellow,
+        ),
+        ProofSource::Loaded(report) => (
+            format!(
+                " FORMAL PROOFS: relatório {} @ {} ",
+                report.source,
+                value_or_nd(&report.commit)
+            ),
+            Color::White,
+        ),
+        ProofSource::Invalid { source, error } => (
+            format!(" FORMAL PROOFS: relatório {source} inválido ({error}) "),
+            Color::Red,
+        ),
+    };
 
     let table = Table::new(
         rows,
@@ -1774,10 +1720,219 @@ fn render_verified_invariants(frame: &mut ratatui::Frame<'_>, area: Rect) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" FORMAL SPEC & VERIFIED INVARIANTS (LEAN 4 / FORMAL PROOFS) "),
+            .title(Span::styled(title, Style::default().fg(title_color))),
     );
 
     frame.render_widget(table, area);
+}
+
+/// Esquema do relatório aceite por `--proof-status`.
+///
+/// ```json
+/// { "schema": "heraclitus.proof-status.v1", "commit": "79c9fa5",
+///   "proofs": { "ProofHLC": { "status": "SORRY" } } }
+/// ```
+///
+/// `status` é PROVED, TESTED, SORRY, FAILED ou MISSING. Quem gera o relatório
+/// (o CI, depois de `lake build` e de verificar `sorry` e axiomas) responde
+/// pelo PROVED. O `top` só o mostra.
+const PROOF_STATUS_SCHEMA: &str = "heraclitus.proof-status.v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProofStatus {
+    Proved,
+    Tested,
+    Sorry,
+    Failed,
+    Missing,
+    NotVerified,
+}
+
+impl ProofStatus {
+    /// Um valor desconhecido nunca sobe a PROVED: fica NOT_VERIFIED.
+    fn parse(text: &str) -> Self {
+        match text.trim().to_ascii_uppercase().as_str() {
+            "PROVED" => Self::Proved,
+            "TESTED" => Self::Tested,
+            "SORRY" => Self::Sorry,
+            "FAILED" => Self::Failed,
+            "MISSING" => Self::Missing,
+            _ => Self::NotVerified,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Proved => "PROVED",
+            Self::Tested => "TESTED",
+            Self::Sorry => "SORRY",
+            Self::Failed => "FAILED",
+            Self::Missing => "MISSING",
+            Self::NotVerified => "NOT_VERIFIED",
+        }
+    }
+
+    fn color(self) -> Color {
+        match self {
+            Self::Proved => Color::Green,
+            Self::Tested => Color::Cyan,
+            Self::Sorry => Color::Yellow,
+            Self::Failed | Self::Missing => Color::Red,
+            Self::NotVerified => Color::DarkGray,
+        }
+    }
+}
+
+/// Uma prova que o painel afirma existir. O estado não vive aqui.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProofClaim {
+    spec: &'static str,
+    subsystem: &'static str,
+    name: &'static str,
+    property: &'static str,
+    engine: &'static str,
+}
+
+const PROOF_CLAIMS: &[ProofClaim] = &[
+    ProofClaim {
+        spec: "SPEC-0010",
+        subsystem: "heraclitus-storage",
+        name: "ProofAppendOnly",
+        property: "Monotonic LSN progression & physical block immutability",
+        engine: "Lean 4",
+    },
+    ProofClaim {
+        spec: "SPEC-0015",
+        subsystem: "heraclitus-merkle",
+        name: "ProofMerkleTree",
+        property: "Cryptographic state inclusion & collision resistance",
+        engine: "Lean 4",
+    },
+    ProofClaim {
+        spec: "SPEC-0022",
+        subsystem: "heraclitus-state",
+        name: "ProofDeterministicReplay",
+        property: "Strict state isomorphism under identical event history",
+        engine: "Lean 4",
+    },
+    ProofClaim {
+        spec: "SPEC-0034",
+        subsystem: "heraclitus-core",
+        name: "ProofDenseMap",
+        property: "ULID <-> dense index bijection (DenseEntityMap)",
+        engine: "Lean 4",
+    },
+    ProofClaim {
+        spec: "SPEC-0041",
+        subsystem: "heraclitus-hlc",
+        name: "ProofHLC",
+        property: "Strict causality & wall-clock forward monotonicity",
+        engine: "Lean 4",
+    },
+    ProofClaim {
+        spec: "SPEC-0081",
+        subsystem: "heraclitus-agent",
+        name: "ProofApprovalIdempotence",
+        property: "Zero double-execution & replay safety under burst",
+        engine: "Lean 4",
+    },
+    ProofClaim {
+        spec: "SPEC-0085",
+        subsystem: "heraclitus-agent-gateway",
+        name: "ProofToolCallIsolation",
+        property: "Zero leak past denial barrier (upstream_delta == 0)",
+        engine: "Lean 4",
+    },
+    ProofClaim {
+        spec: "SPEC-0078",
+        subsystem: "heraclitus-blackbox",
+        name: "ProofRFC3161Seal",
+        property: "Tamper-evident evidence chain non-repudiation",
+        engine: "Kani / Proptest",
+    },
+];
+
+#[derive(Debug, Clone, Default)]
+struct ProofReport {
+    source: String,
+    commit: String,
+    statuses: Vec<(String, ProofStatus)>,
+}
+
+#[derive(Debug, Clone)]
+enum ProofSource {
+    NotProvided,
+    Loaded(ProofReport),
+    Invalid { source: String, error: String },
+}
+
+fn load_proof_source(path: Option<&Path>) -> ProofSource {
+    let Some(path) = path else {
+        return ProofSource::NotProvided;
+    };
+    let source = path.display().to_string();
+    let parsed = fs::read(path)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| {
+            serde_json::from_slice::<Value>(&bytes)
+                .map_err(|error| format!("JSON inválido: {error}"))
+        })
+        .and_then(|value| parse_proof_report(&source, &value));
+    match parsed {
+        Ok(report) => ProofSource::Loaded(report),
+        Err(error) => ProofSource::Invalid { source, error },
+    }
+}
+
+fn parse_proof_report(source: &str, value: &Value) -> Result<ProofReport, String> {
+    let schema = value.get("schema").and_then(Value::as_str);
+    if schema != Some(PROOF_STATUS_SCHEMA) {
+        return Err(format!(
+            "schema {} em vez de {PROOF_STATUS_SCHEMA}",
+            schema.unwrap_or("ausente")
+        ));
+    }
+    let proofs = value
+        .get("proofs")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "sem objeto proofs".to_string())?;
+    let statuses = proofs
+        .iter()
+        .map(|(name, entry)| {
+            let status = entry
+                .get("status")
+                .and_then(Value::as_str)
+                .map(ProofStatus::parse)
+                .unwrap_or(ProofStatus::NotVerified);
+            (name.clone(), status)
+        })
+        .collect();
+    Ok(ProofReport {
+        source: source.to_owned(),
+        commit: string_at(value, "commit").unwrap_or_default(),
+        statuses,
+    })
+}
+
+/// Cada prova afirmada com o estado que o relatório lhe dá. Sem relatório
+/// válido tudo fica NOT_VERIFIED; com relatório, a prova que ele não cita
+/// fica MISSING.
+fn proof_rows(source: &ProofSource) -> Vec<(ProofClaim, ProofStatus)> {
+    PROOF_CLAIMS
+        .iter()
+        .map(|claim| {
+            let status = match source {
+                ProofSource::Loaded(report) => report
+                    .statuses
+                    .iter()
+                    .find(|(name, _)| name == claim.name)
+                    .map(|(_, status)| *status)
+                    .unwrap_or(ProofStatus::Missing),
+                ProofSource::NotProvided | ProofSource::Invalid { .. } => ProofStatus::NotVerified,
+            };
+            (*claim, status)
+        })
+        .collect()
 }
 
 fn render_ingest_chart(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
@@ -2017,62 +2172,68 @@ fn render_storage(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
         ),
         kv_line(
             "RAW bytes",
-            format_bytes(app.storage.raw_bytes),
+            option_bytes(app.storage.raw_bytes),
             Color::Yellow,
         ),
         kv_line(
             "PACKED bytes",
-            format_bytes(app.storage.packed_bytes),
+            option_bytes(app.storage.packed_bytes),
             Color::Green,
         ),
         kv_line(
             "Compression ratio",
-            format!("{:.2}%", app.storage.compression_ratio * 100.0),
+            option_percent(app.storage.compression_ratio, 2),
             Color::Cyan,
         ),
         kv_line(
             "Economia",
-            format!("{:.2}x", storage_savings_factor(&app.storage)),
+            option_factor(storage_savings_factor(&app.storage)),
             Color::Cyan,
         ),
         kv_line(
             "Append bytes total",
-            format_bytes(app.storage.append_bytes_total),
+            option_bytes(app.storage.append_bytes_total),
             Color::Gray,
         ),
         kv_line(
             "Pack queue",
-            app.storage.pack_queue_depth.to_string(),
+            option_number(app.storage.pack_queue_depth),
             Color::Yellow,
         ),
         kv_line(
             "Pack seconds",
-            format!("{:.3}s", app.storage.pack_seconds),
+            app.storage
+                .pack_seconds
+                .map(|seconds| format!("{seconds:.3}s"))
+                .unwrap_or_else(|| "N/D".into()),
             Color::Gray,
         ),
         kv_line(
             "Pack throughput",
-            format_rate_bytes(app.storage.pack_throughput_bytes_sec),
+            app.storage
+                .pack_throughput_bytes_sec
+                .map(format_rate_bytes)
+                .unwrap_or_else(|| "N/D".into()),
             Color::Green,
         ),
         kv_line(
             "Blocks total",
-            format_number(app.storage.blocks_total),
+            option_number(app.storage.blocks_total),
             Color::Gray,
         ),
         kv_line(
             "Blocks read",
-            format_number(app.storage.blocks_read),
+            option_number(app.storage.blocks_read),
             Color::Gray,
         ),
         kv_line(
             "Blocks pruned",
-            format_number(app.storage.blocks_pruned),
+            option_number(app.storage.blocks_pruned),
             Color::Gray,
         ),
         kv_line(
             "Bytes pruned",
-            format_bytes(app.storage.bytes_pruned),
+            option_bytes(app.storage.bytes_pruned),
             Color::Gray,
         ),
     ])
@@ -2084,51 +2245,37 @@ fn render_storage(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
     .wrap(Wrap { trim: false });
     frame.render_widget(left, columns[0]);
 
-    let crc_color = if app.storage.physical_crc_failures == 0 {
-        Color::Green
-    } else {
-        Color::Red
-    };
-    let canonical_color = if app.storage.canonical_verify_failures == 0 {
-        Color::Green
-    } else {
-        Color::Red
-    };
     let right =
         Paragraph::new(vec![
         title_line("INDEX / COLD TIER / INTEGRITY"),
         Line::from(""),
-        kv_line("HRKI hits", format_number(app.storage.hrki_hits), Color::Green),
-        kv_line("HRKI misses", format_number(app.storage.hrki_misses), Color::Yellow),
-        kv_line("HRKI rebuilds", format_number(app.storage.hrki_rebuilds), Color::Yellow),
-        kv_line("Cold range reads", format_number(app.storage.cold_range_reads), Color::Gray),
+        kv_line("HRKI hits", option_number(app.storage.hrki_hits), Color::Green),
+        kv_line("HRKI misses", option_number(app.storage.hrki_misses), Color::Yellow),
+        kv_line("HRKI rebuilds", option_number(app.storage.hrki_rebuilds), Color::Yellow),
+        kv_line("Cold range reads", option_number(app.storage.cold_range_reads), Color::Gray),
         kv_line(
             "Cold bytes downloaded",
-            format_bytes(app.storage.cold_bytes_downloaded),
+            option_bytes(app.storage.cold_bytes_downloaded),
             Color::Gray,
         ),
         kv_line(
             "Parquet export lag",
-            format!("{} LSN", format_number(app.storage.parquet_export_lag_lsn)),
-            if app.storage.parquet_export_lag_lsn == 0 {
-                Color::Green
-            } else {
-                Color::Yellow
-            },
+            format!("{} LSN", option_number(app.storage.parquet_export_lag_lsn)),
+            counter_color(app.storage.parquet_export_lag_lsn, Color::Yellow),
         ),
         kv_line(
             "Canonical verify failures",
-            format_number(app.storage.canonical_verify_failures),
-            canonical_color,
+            option_number(app.storage.canonical_verify_failures),
+            counter_color(app.storage.canonical_verify_failures, Color::Red),
         ),
         kv_line(
             "Physical CRC failures",
-            format_number(app.storage.physical_crc_failures),
-            crc_color,
+            option_number(app.storage.physical_crc_failures),
+            counter_color(app.storage.physical_crc_failures, Color::Red),
         ),
         kv_line(
             "Decompressed bytes",
-            format_bytes(app.storage.decompressed_bytes),
+            option_bytes(app.storage.decompressed_bytes),
             Color::Gray,
         ),
         Line::from(""),
@@ -2340,11 +2487,7 @@ fn render_security(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
                     "{}/{}",
                     app.sentinel.queue_depth, app.sentinel.queue_capacity
                 ),
-                if app.sentinel.queue_overflow_total == 0 {
-                    Color::Green
-                } else {
-                    Color::Red
-                },
+                counter_color(app.sentinel.queue_overflow_total, Color::Red),
             ),
             kv_line(
                 "Processed",
@@ -2414,30 +2557,18 @@ fn render_security(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
             ),
             kv_line(
                 "Queue Overflows",
-                format_number(app.sentinel.queue_overflow_total),
-                if app.sentinel.queue_overflow_total == 0 {
-                    Color::Green
-                } else {
-                    Color::Red
-                },
+                option_number(app.sentinel.queue_overflow_total),
+                counter_color(app.sentinel.queue_overflow_total, Color::Red),
             ),
             kv_line(
                 "Norm. Errors",
-                format_number(app.sentinel.normalization_errors_total),
-                if app.sentinel.normalization_errors_total == 0 {
-                    Color::Green
-                } else {
-                    Color::Yellow
-                },
+                option_number(app.sentinel.normalization_errors_total),
+                counter_color(app.sentinel.normalization_errors_total, Color::Yellow),
             ),
             kv_line(
                 "Capacity Drops",
-                format_number(app.sentinel.incident_capacity_drops_total),
-                if app.sentinel.incident_capacity_drops_total == 0 {
-                    Color::Green
-                } else {
-                    Color::Red
-                },
+                option_number(app.sentinel.incident_capacity_drops_total),
+                counter_color(app.sentinel.incident_capacity_drops_total, Color::Red),
             ),
             kv_line(
                 "Actions Proposed",
@@ -2461,12 +2592,8 @@ fn render_security(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
             ),
             kv_line(
                 "Action Failures",
-                format_number(app.sentinel.action_failures_total),
-                if app.sentinel.action_failures_total == 0 {
-                    Color::Green
-                } else {
-                    Color::Red
-                },
+                option_number(app.sentinel.action_failures_total),
+                counter_color(app.sentinel.action_failures_total, Color::Red),
             ),
         ])
         .block(
@@ -2497,12 +2624,8 @@ fn render_security(frame: &mut ratatui::Frame<'_>, app: &AppState, area: Rect) {
             ),
             kv_line(
                 "AI Failures",
-                format_number(app.sentinel.ai_failures_total),
-                if app.sentinel.ai_failures_total == 0 {
-                    Color::Green
-                } else {
-                    Color::Red
-                },
+                option_number(app.sentinel.ai_failures_total),
+                counter_color(app.sentinel.ai_failures_total, Color::Red),
             ),
             kv_line(
                 "AI Latency",
@@ -3402,6 +3525,10 @@ fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
             "Métricas inexistentes no servidor aparecem como N/D. Humanos já inventam métricas suficientes sem ajuda do terminal.",
             Style::default().fg(Color::DarkGray),
         )),
+        Line::from(Span::styled(
+            "Provas formais: o estado vem do relatório do CI em --proof-status; sem ele, NOT_VERIFIED.",
+            Style::default().fg(Color::DarkGray),
+        )),
     ])
     .block(
         Block::default()
@@ -3430,15 +3557,22 @@ impl HttpResponse {
     }
 }
 
-fn fetch_json_with_fallback(
-    target: &mut String,
-    auth: &mut String,
-    path: &str,
-) -> Result<(Value, f64), String> {
+/// Um pedido JSON ao endereço e com a credencial que o operador indicou.
+///
+/// Não há segunda tentativa. Um erro de ligação não muda o destino: antes ia
+/// para o `nameserver` de `/etc/resolv.conf`, que fora do WSL é o DNS da rede.
+/// Um 401 também não troca a credencial por outra achada no disco ou no
+/// ambiente. Os dois casos chegam ao painel como erro.
+fn fetch_json(target: &str, auth: &str, path: &str) -> Result<(Value, f64), String> {
     let started = Instant::now();
-    let response = fetch_with_fallback(target, auth, path)?;
+    let response = fetch_http(target, auth, path)?;
     let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
 
+    if response.status == 401 {
+        return Err(format!(
+            "HTTP 401 em {path}: credencial recusada (indique --user com --pass ou --pass-file)"
+        ));
+    }
     if !response.is_success() {
         return Err(format!("HTTP {} em {}", response.status, path));
     }
@@ -3446,58 +3580,6 @@ fn fetch_json_with_fallback(
     let value = serde_json::from_slice::<Value>(&response.body)
         .map_err(|error| format!("JSON inválido em {path}: {error}"))?;
     Ok((value, elapsed_ms))
-}
-
-fn fetch_with_fallback(
-    target: &mut String,
-    auth: &mut String,
-    path: &str,
-) -> Result<HttpResponse, String> {
-    match fetch_http(target, auth, path) {
-        Ok(response) if response.status != 401 => Ok(response),
-        Ok(response) if response.status == 401 => {
-            if let Some(token) = find_secret_token() {
-                let replacement = format!("security-admin:{token}");
-                match fetch_http(target, &replacement, path) {
-                    Ok(retry) if retry.status != 401 => {
-                        *auth = replacement;
-                        Ok(retry)
-                    }
-                    Ok(retry) => Ok(retry),
-                    Err(error) => Err(error),
-                }
-            } else {
-                Ok(response)
-            }
-        }
-        Ok(response) => Ok(response),
-        Err(original_error) => {
-            if !looks_like_connection_error(&original_error) {
-                return Err(original_error);
-            }
-
-            if let Some(host_ip) = get_wsl_host_ip() {
-                let fallback = format!("http://{host_ip}:7475");
-                if let Ok(response) = fetch_http(&fallback, auth, path) {
-                    if response.status != 401 {
-                        *target = fallback;
-                        return Ok(response);
-                    }
-                }
-
-                if let Some(token) = find_secret_token() {
-                    let fallback_auth = format!("security-admin:{token}");
-                    if let Ok(response) = fetch_http(&fallback, &fallback_auth, path) {
-                        *target = fallback;
-                        *auth = fallback_auth;
-                        return Ok(response);
-                    }
-                }
-            }
-
-            Err(original_error)
-        }
-    }
 }
 
 fn fetch_http(
@@ -3639,60 +3721,19 @@ fn decode_chunked(input: &[u8]) -> Result<Vec<u8>, String> {
     Ok(output)
 }
 
-fn find_secret_token() -> Option<String> {
-    for variable in ["HERACLITUS_ADMIN_TOKEN", "HERACLITUS_TOKEN"] {
-        if let Ok(value) = env::var(variable) {
-            let token = value.trim();
-            if !token.is_empty() {
-                return Some(token.to_owned());
-            }
-        }
+/// Lê a senha do ficheiro que o operador passou em `--pass-file`.
+///
+/// É a única fonte de credencial em ficheiro: o `top` não procura tokens em
+/// caminhos conhecidos nem em variáveis de ambiente. Assim a senha não fica
+/// na linha de comando, visível em `ps`.
+pub fn read_pass_file(path: &Path) -> Result<String, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("não foi possível ler {}: {error}", path.display()))?;
+    let secret = content.trim();
+    if secret.is_empty() {
+        return Err(format!("{} está vazio", path.display()));
     }
-
-    let mut candidates = Vec::<PathBuf>::new();
-    if let Ok(path) = env::var("HERACLITUS_TOKEN_FILE") {
-        candidates.push(PathBuf::from(path));
-    }
-    if let Some(home) = env::var_os("HOME") {
-        candidates.push(PathBuf::from(home).join(".config/heraclitus/admin.token"));
-    }
-    if let Some(profile) = env::var_os("USERPROFILE") {
-        candidates.push(PathBuf::from(profile).join(".heraclitus/admin.token"));
-    }
-
-    // Compatibility with the current development layout. Environment/config
-    // paths above take precedence, so the CLI no longer depends on these.
-    candidates.extend([
-        PathBuf::from(r"D:\HeraclitusDB\secrets-v1\admin.token"),
-        PathBuf::from(r"D:\HeraclitusDB\secrets-v1\writer.token"),
-        PathBuf::from("/mnt/d/HeraclitusDB/secrets-v1/admin.token"),
-    ]);
-
-    candidates.into_iter().find_map(read_non_empty_file)
-}
-
-fn read_non_empty_file(path: PathBuf) -> Option<String> {
-    if !path.is_file() {
-        return None;
-    }
-    let content = fs::read_to_string(path).ok()?;
-    let content = content.trim();
-    if content.is_empty() {
-        None
-    } else {
-        Some(content.to_owned())
-    }
-}
-
-fn get_wsl_host_ip() -> Option<String> {
-    let content = fs::read_to_string("/etc/resolv.conf").ok()?;
-    content.lines().find_map(|line| {
-        let mut parts = line.split_whitespace();
-        match (parts.next(), parts.next()) {
-            (Some("nameserver"), Some(ip)) => Some(ip.to_owned()),
-            _ => None,
-        }
-    })
+    Ok(secret.to_owned())
 }
 
 fn probe_grpc_port(target_url: &str) -> Result<f64, String> {
@@ -3758,55 +3799,37 @@ fn resolve_first(authority: &str) -> Result<std::net::SocketAddr, String> {
         .ok_or_else(|| format!("nenhum endereço resolvido para {authority}"))
 }
 
-fn looks_like_connection_error(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    [
-        "refused",
-        "recusada",
-        "111",
-        "10061",
-        "timed out",
-        "timeout",
-        "conectar",
-        "resolve",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
 fn parse_storage(value: &Value) -> StorageSnapshot {
+    let raw_bytes = u64_at(value, "hrkl_raw_bytes");
+    let packed_bytes = u64_at(value, "hrkl_packed_bytes");
     StorageSnapshot {
-        available: value
-            .get("available")
-            .and_then(Value::as_bool)
-            .unwrap_or(true),
-        append_bytes_total: u64_at(value, "hrkl_append_bytes_total").unwrap_or(0),
-        raw_bytes: u64_at(value, "hrkl_raw_bytes").unwrap_or(0),
-        packed_bytes: u64_at(value, "hrkl_packed_bytes").unwrap_or(0),
-        compression_ratio: f64_at(value, "hrkl_compression_ratio").unwrap_or_else(|| {
-            if u64_at(value, "hrkl_raw_bytes").unwrap_or(0) > 0 {
-                u64_at(value, "hrkl_packed_bytes").unwrap_or(0) as f64
-                    / u64_at(value, "hrkl_raw_bytes").unwrap_or(1) as f64
-            } else {
-                1.0
-            }
-        }),
-        pack_queue_depth: u64_at(value, "hrkl_pack_queue_depth").unwrap_or(0),
-        pack_seconds: f64_at(value, "hrkl_pack_seconds").unwrap_or(0.0),
-        pack_throughput_bytes_sec: f64_at(value, "hrkl_pack_throughput_bytes_sec").unwrap_or(0.0),
-        blocks_total: u64_at(value, "hrkl_blocks_total").unwrap_or(0),
-        blocks_read: u64_at(value, "hrkl_blocks_read").unwrap_or(0),
-        blocks_pruned: u64_at(value, "hrkl_blocks_pruned").unwrap_or(0),
-        bytes_pruned: u64_at(value, "hrkl_bytes_pruned").unwrap_or(0),
-        decompressed_bytes: u64_at(value, "hrkl_decompressed_bytes").unwrap_or(0),
-        hrki_hits: u64_at(value, "hrki_hits").unwrap_or(0),
-        hrki_misses: u64_at(value, "hrki_misses").unwrap_or(0),
-        hrki_rebuilds: u64_at(value, "hrki_rebuilds").unwrap_or(0),
-        cold_range_reads: u64_at(value, "cold_range_reads").unwrap_or(0),
-        cold_bytes_downloaded: u64_at(value, "cold_bytes_downloaded").unwrap_or(0),
-        parquet_export_lag_lsn: u64_at(value, "parquet_export_lag_lsn").unwrap_or(0),
-        canonical_verify_failures: u64_at(value, "canonical_verify_failures").unwrap_or(0),
-        physical_crc_failures: u64_at(value, "physical_crc_failures").unwrap_or(0),
+        // O servidor declara sempre `available`; sem ele não há garantia.
+        available: value.get("available").and_then(Value::as_bool) == Some(true),
+        append_bytes_total: u64_at(value, "hrkl_append_bytes_total"),
+        raw_bytes,
+        packed_bytes,
+        compression_ratio: f64_at(value, "hrkl_compression_ratio").or(
+            match (raw_bytes, packed_bytes) {
+                (Some(raw), Some(packed)) if raw > 0 => Some(packed as f64 / raw as f64),
+                _ => None,
+            },
+        ),
+        pack_queue_depth: u64_at(value, "hrkl_pack_queue_depth"),
+        pack_seconds: f64_at(value, "hrkl_pack_seconds"),
+        pack_throughput_bytes_sec: f64_at(value, "hrkl_pack_throughput_bytes_sec"),
+        blocks_total: u64_at(value, "hrkl_blocks_total"),
+        blocks_read: u64_at(value, "hrkl_blocks_read"),
+        blocks_pruned: u64_at(value, "hrkl_blocks_pruned"),
+        bytes_pruned: u64_at(value, "hrkl_bytes_pruned"),
+        decompressed_bytes: u64_at(value, "hrkl_decompressed_bytes"),
+        hrki_hits: u64_at(value, "hrki_hits"),
+        hrki_misses: u64_at(value, "hrki_misses"),
+        hrki_rebuilds: u64_at(value, "hrki_rebuilds"),
+        cold_range_reads: u64_at(value, "cold_range_reads"),
+        cold_bytes_downloaded: u64_at(value, "cold_bytes_downloaded"),
+        parquet_export_lag_lsn: u64_at(value, "parquet_export_lag_lsn"),
+        canonical_verify_failures: u64_at(value, "canonical_verify_failures"),
+        physical_crc_failures: u64_at(value, "physical_crc_failures"),
     }
 }
 
@@ -3827,21 +3850,21 @@ fn parse_sentinel(value: &Value) -> SentinelSnapshot {
         lag_state: value_string(value.get("lag_state")),
         queue_depth: u64_at(value, "queue_depth").unwrap_or(0),
         queue_capacity: u64_at(value, "queue_capacity").unwrap_or(0),
-        queue_overflow_total: u64_at(value, "queue_overflow_total").unwrap_or(0),
+        queue_overflow_total: u64_at(value, "queue_overflow_total"),
         events_seen_total: u64_at(value, "events_seen_total").unwrap_or(0),
         events_processed_total: u64_at(value, "events_processed_total").unwrap_or(0),
         events_normalized_total: u64_at(value, "events_normalized_total").unwrap_or(0),
         signals_emitted_total: u64_at(value, "signals_emitted_total").unwrap_or(0),
         threat_matches_total: u64_at(value, "threat_matches_total").unwrap_or(0),
         incidents_created_total: u64_at(value, "incidents_created_total").unwrap_or(0),
-        incident_capacity_drops_total: u64_at(value, "incident_capacity_drops_total").unwrap_or(0),
-        normalization_errors_total: u64_at(value, "normalization_errors_total").unwrap_or(0),
+        incident_capacity_drops_total: u64_at(value, "incident_capacity_drops_total"),
+        normalization_errors_total: u64_at(value, "normalization_errors_total"),
         l0_latency_us: u64_at(value, "l0_latency_us").unwrap_or(0),
         l1_latency_ms: u64_at(value, "l1_latency_ms").unwrap_or(0),
         l2_latency_ms: u64_at(value, "l2_latency_ms").unwrap_or(0),
         l3_latency_ms: u64_at(value, "l3_latency_ms").unwrap_or(0),
         ai_requests_total: u64_at(value, "ai_requests_total").unwrap_or(0),
-        ai_failures_total: u64_at(value, "ai_failures_total").unwrap_or(0),
+        ai_failures_total: u64_at(value, "ai_failures_total"),
         ai_latency_ms: u64_at(value, "ai_latency_ms").unwrap_or(0),
         ai_tokens_total: u64_at(value, "ai_tokens_total").unwrap_or(0),
         ai_investigations_persisted_total: u64_at(value, "ai_investigations_persisted_total")
@@ -3851,7 +3874,7 @@ fn parse_sentinel(value: &Value) -> SentinelSnapshot {
         actions_approved_total: u64_at(value, "actions_approved_total").unwrap_or(0),
         actions_denied_total: u64_at(value, "actions_denied_total").unwrap_or(0),
         actions_executed_total: u64_at(value, "actions_executed_total").unwrap_or(0),
-        action_failures_total: u64_at(value, "action_failures_total").unwrap_or(0),
+        action_failures_total: u64_at(value, "action_failures_total"),
         boot_outcome: value_string(boot.get("outcome")),
         boot_total_ms: u64_at(boot, "total_boot_ms").unwrap_or(0),
         boot_tail_events: u64_at(boot, "tail_events").unwrap_or(0),
@@ -4251,6 +4274,53 @@ fn option_number(value: Option<u64>) -> String {
     value.map(format_number).unwrap_or_else(|| "N/D".into())
 }
 
+fn option_bytes(value: Option<u64>) -> String {
+    value.map(format_bytes).unwrap_or_else(|| "N/D".into())
+}
+
+fn option_percent(ratio: Option<f64>, decimals: usize) -> String {
+    ratio
+        .map(|ratio| format!("{:.*}%", decimals, ratio * 100.0))
+        .unwrap_or_else(|| "N/D".into())
+}
+
+fn option_factor(factor: Option<f64>) -> String {
+    factor
+        .map(|factor| format!("{factor:.2}x"))
+        .unwrap_or_else(|| "N/D".into())
+}
+
+/// Cor de um contador em que 0 é o estado bom. Só um 0 medido é verde.
+fn counter_color(value: Option<u64>, nonzero: Color) -> Color {
+    match value {
+        None => Color::DarkGray,
+        Some(0) => Color::Green,
+        Some(_) => nonzero,
+    }
+}
+
+fn integrity_state(failures: Option<u64>) -> (&'static str, Severity) {
+    match failures {
+        None => ("UNKNOWN", Severity::Neutral),
+        Some(0) => ("HEALTHY", Severity::Good),
+        Some(_) => ("FAILED", Severity::Critical),
+    }
+}
+
+fn integrity_span(label: &str, failures: Option<u64>) -> Span<'static> {
+    match failures {
+        None => Span::styled(
+            format!("{label}: N/D"),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Some(0) => Span::styled(format!("{label}: OK"), Style::default().fg(Color::Green)),
+        Some(count) => Span::styled(
+            format!("{label}: {count} FAIL"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+    }
+}
+
 fn queue_progress(depth: u64, capacity: u64) -> String {
     if capacity == 0 {
         "N/D".into()
@@ -4259,11 +4329,10 @@ fn queue_progress(depth: u64, capacity: u64) -> String {
     }
 }
 
-fn storage_savings_factor(storage: &StorageSnapshot) -> f64 {
-    if storage.packed_bytes > 0 {
-        storage.raw_bytes as f64 / storage.packed_bytes as f64
-    } else {
-        1.0
+fn storage_savings_factor(storage: &StorageSnapshot) -> Option<f64> {
+    match (storage.raw_bytes, storage.packed_bytes) {
+        (Some(raw), Some(packed)) if packed > 0 => Some(raw as f64 / packed as f64),
+        _ => None,
     }
 }
 
@@ -4432,5 +4501,243 @@ mod tests {
     fn formats_number_pt_br_style() {
         assert_eq!(format_number(575809), "575.809");
         assert_eq!(format_number(8_600_000), "8.600.000");
+    }
+
+    /// Servidor HTTP de teste: regista cada pedido e responde sempre com
+    /// `status`. Para ao receber `GET /__fim`, e devolve os pedidos vistos.
+    fn servidor_espiao(status: &'static str) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut pedidos = Vec::new();
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut lido = Vec::new();
+                let mut bloco = [0u8; 1024];
+                while find_bytes(&lido, b"\r\n\r\n").is_none() {
+                    let n = stream.read(&mut bloco).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    lido.extend_from_slice(&bloco[..n]);
+                }
+                let pedido = String::from_utf8_lossy(&lido).into_owned();
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                )
+                .unwrap();
+                if pedido.starts_with("GET /__fim ") {
+                    break;
+                }
+                pedidos.push(pedido);
+            }
+            pedidos
+        });
+        (url, handle)
+    }
+
+    // B9: um 401 chega ao painel como erro, sem segunda tentativa com outra
+    // credencial (antes repetia como security-admin com um token do disco).
+    #[test]
+    fn um_401_nao_troca_de_credencial() {
+        let (url, servidor) = servidor_espiao("401 Unauthorized");
+
+        let erro = fetch_json(&url, "leitor:segredo", "/stats").unwrap_err();
+        assert!(erro.contains("401"), "{erro}");
+
+        fetch_http(&url, "", "/__fim").unwrap();
+        let pedidos = servidor.join().unwrap();
+        assert_eq!(pedidos.len(), 1, "houve nova tentativa: {pedidos:?}");
+        let esperado = format!(
+            "Authorization: Basic {}\r\n",
+            base64_encode(b"leitor:segredo")
+        );
+        assert!(pedidos[0].contains(&esperado), "{}", pedidos[0]);
+    }
+
+    // B9: o agente sem auth é tentado sem credencial, nunca com uma mais forte.
+    #[test]
+    fn agente_recusado_so_tenta_sem_credencial() {
+        let (url, servidor) = servidor_espiao("401 Unauthorized");
+        let mut app = AppState::new(url.clone(), "leitor:segredo".into(), 1.0, None);
+        app.agent_url = url.clone();
+
+        app.poll_agent_status();
+        assert!(!app.agent_status.available);
+        assert_eq!(app.auth, "leitor:segredo");
+
+        fetch_http(&url, "", "/__fim").unwrap();
+        let pedidos = servidor.join().unwrap();
+        assert_eq!(pedidos.len(), 2, "{pedidos:?}");
+        assert!(pedidos[0].contains("Authorization: Basic "));
+        assert!(!pedidos[1].contains("Authorization:"), "{}", pedidos[1]);
+    }
+
+    // B4: um erro de ligação devolve o erro do destino pedido. O fetch recebe
+    // destino e credencial por referência imutável: não há para onde fugir.
+    #[test]
+    fn erro_de_ligacao_nao_muda_de_destino() {
+        let porta = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let url = format!("http://127.0.0.1:{porta}");
+
+        let erro = fetch_json(&url, "leitor:segredo", "/stats").unwrap_err();
+        assert!(erro.contains(&format!("127.0.0.1:{porta}")), "{erro}");
+    }
+
+    // B4/B9: guarda contra o regresso do fallback DNS e dos segredos fixos.
+    // Os padrões estão partidos para este teste não se encontrar a si próprio.
+    #[test]
+    fn fonte_sem_fallback_dns_nem_segredos_fixos() {
+        let fonte = include_str!("top.rs");
+        for proibido in [
+            concat!("\"/etc/", "resolv.conf\""),
+            concat!("secrets", "-v1"),
+            concat!("format!(\"security", "-admin:"),
+            concat!("\"HERACLITUS_", "ADMIN_TOKEN\""),
+            concat!("\"HERACLITUS_", "TOKEN_FILE\""),
+        ] {
+            assert!(
+                !fonte.contains(proibido),
+                "top.rs voltou a conter {proibido}"
+            );
+        }
+    }
+
+    #[test]
+    fn pass_file_e_lido_aparado_e_vazio_e_recusado() {
+        let pasta = tempfile::tempdir().unwrap();
+        let com_senha = pasta.path().join("leitor.pass");
+        fs::write(&com_senha, "segredo\r\n").unwrap();
+        assert_eq!(read_pass_file(&com_senha).unwrap(), "segredo");
+
+        let vazio = pasta.path().join("vazio.pass");
+        fs::write(&vazio, " \n").unwrap();
+        assert!(read_pass_file(&vazio).is_err());
+        assert!(read_pass_file(&pasta.path().join("nao-existe")).is_err());
+    }
+
+    // R1: sem relatório do CI nenhuma prova aparece como PROVED.
+    #[test]
+    fn sem_relatorio_nenhuma_prova_e_proved() {
+        let invalido = load_proof_source(Some(Path::new("nao-existe/proof-status.json")));
+        assert!(matches!(invalido, ProofSource::Invalid { .. }));
+
+        for fonte in [ProofSource::NotProvided, invalido] {
+            let linhas = proof_rows(&fonte);
+            assert_eq!(linhas.len(), PROOF_CLAIMS.len());
+            assert!(linhas
+                .iter()
+                .all(|(_, estado)| *estado == ProofStatus::NotVerified));
+        }
+    }
+
+    // R1: o estado vem do relatório; o que ele não cita fica MISSING e um
+    // estado desconhecido não sobe a PROVED.
+    #[test]
+    fn relatorio_do_ci_define_o_estado_das_provas() {
+        let pasta = tempfile::tempdir().unwrap();
+        let caminho = pasta.path().join("proof-status.json");
+        let relatorio = serde_json::json!({
+            "schema": PROOF_STATUS_SCHEMA,
+            "commit": "79c9fa5",
+            "proofs": {
+                "ProofAppendOnly": { "status": "SORRY" },
+                "ProofMerkleTree": { "status": "FAILED" },
+                "ProofHLC": { "status": "PROVED" },
+                "ProofDenseMap": { "status": "quase" },
+            }
+        });
+        fs::write(&caminho, relatorio.to_string()).unwrap();
+
+        let fonte = load_proof_source(Some(&caminho));
+        let ProofSource::Loaded(lido) = &fonte else {
+            panic!("relatório não carregou: {fonte:?}");
+        };
+        assert_eq!(lido.commit, "79c9fa5");
+
+        let estado = |nome: &str| {
+            proof_rows(&fonte)
+                .into_iter()
+                .find(|(claim, _)| claim.name == nome)
+                .map(|(_, estado)| estado)
+                .unwrap()
+        };
+        assert_eq!(estado("ProofAppendOnly"), ProofStatus::Sorry);
+        assert_eq!(estado("ProofMerkleTree"), ProofStatus::Failed);
+        assert_eq!(estado("ProofHLC"), ProofStatus::Proved);
+        assert_eq!(estado("ProofDenseMap"), ProofStatus::NotVerified);
+        assert_eq!(estado("ProofApprovalIdempotence"), ProofStatus::Missing);
+        assert_eq!(estado("ProofToolCallIsolation"), ProofStatus::Missing);
+    }
+
+    #[test]
+    fn relatorio_sem_schema_e_recusado() {
+        let sem_schema = serde_json::json!({ "proofs": { "ProofHLC": { "status": "PROVED" } } });
+        assert!(parse_proof_report("x", &sem_schema).is_err());
+    }
+
+    // Falso-verde: campo ausente é N/D e estado UNKNOWN, nunca 0 e HEALTHY.
+    #[test]
+    fn contadores_de_integridade_ausentes_ficam_nd() {
+        let sem_contadores = parse_storage(&serde_json::json!({ "available": true }));
+        assert!(sem_contadores.available);
+        assert_eq!(sem_contadores.physical_crc_failures, None);
+        assert_eq!(sem_contadores.canonical_verify_failures, None);
+        assert_eq!(option_number(sem_contadores.physical_crc_failures), "N/D");
+        assert_eq!(
+            counter_color(sem_contadores.physical_crc_failures, Color::Red),
+            Color::DarkGray
+        );
+        assert_eq!(integrity_state(None).0, "UNKNOWN");
+        assert_eq!(storage_savings_factor(&sem_contadores), None);
+
+        assert!(!parse_storage(&serde_json::json!({})).available);
+
+        let medido = parse_storage(&serde_json::json!({
+            "available": true,
+            "physical_crc_failures": 0,
+            "canonical_verify_failures": 2,
+        }));
+        assert_eq!(integrity_state(medido.physical_crc_failures).0, "HEALTHY");
+        assert_eq!(
+            integrity_state(medido.canonical_verify_failures).0,
+            "FAILED"
+        );
+
+        let sentinel = parse_sentinel(&serde_json::json!({}));
+        assert_eq!(sentinel.queue_overflow_total, None);
+        assert_eq!(sentinel.action_failures_total, None);
+    }
+
+    #[test]
+    fn painel_nao_mostra_crc_saudavel_sem_medicao() {
+        let mut app = AppState::new("http://127.0.0.1:1".into(), String::new(), 1.0, None);
+        app.apply_stats(
+            serde_json::json!({ "head": 1, "storage_metrics": { "available": true } }),
+            Instant::now(),
+        );
+
+        let tarefas = app.background_tasks();
+        for id in ["CRC", "CAN"] {
+            let tarefa = tarefas.iter().find(|tarefa| tarefa.id == id).unwrap();
+            assert_eq!(tarefa.state, "UNKNOWN", "{id}");
+            assert_ne!(tarefa.severity, Severity::Good, "{id}");
+        }
+        assert!(app
+            .evaluate_alarms()
+            .iter()
+            .all(|alarme| alarme.source != "STORAGE"));
+
+        // /stats sem storage_metrics: nada de storage, nem o snapshot anterior.
+        app.apply_stats(serde_json::json!({ "head": 2 }), Instant::now());
+        assert!(!app.storage.available);
+        assert!(!app
+            .background_tasks()
+            .iter()
+            .any(|tarefa| tarefa.id == "CRC"));
     }
 }
