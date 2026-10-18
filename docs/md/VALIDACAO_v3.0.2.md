@@ -46,10 +46,19 @@ Sabotagem:
   `ts_hlc_replicado_carimbado_monotono_e_igual_nos_tres_nos` falha com
   `ts_hlc a 0: [0, 0, 0, 0, 0]`, o defeito da auditoria.
 
-Uma regressão encontrada e corrigida na integração:
-`heraclitus-query::tests::edge_match_ordena_antes_do_limit` fixava a ordem
-lexicográfica dos ids de relação no formato antigo; com os ids `e2` do G1 o
-maior id é outro. O teste passou a conferir a ordem contra os próprios ids.
+Regressões encontradas e corrigidas na integração:
+
+- `heraclitus-query::tests::edge_match_ordena_antes_do_limit` fixava a ordem
+  lexicográfica dos ids de relação no formato antigo; com os ids `e2` do G1 o
+  maior id é outro. O teste passou a conferir a ordem contra os próprios ids.
+- `heraclitus-index-attr` (só em Linux, apanhado pelo CI): ao retirar o caminho
+  de compatibilidade, o G6 fez qualquer falha de leitura do cabeçalho do
+  checkpoint passar a `Ilegivel`. No Linux um `File::open` de um directório
+  abre e a leitura falha com `EISDIR`, que deve ser `ErroIo`. Corrigido para
+  só um ficheiro curto contar como "não é deste formato"; confirmado no WSL
+  (falha com o código anterior, passa com a correção).
+- Como o `cargo test --workspace` do CI pára no primeiro crate que falha, a
+  suíte completa (`--all-features --no-fail-fast`) foi também corrida no WSL.
 
 ## Não coberto localmente
 
