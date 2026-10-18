@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-3.0.1-1351B4" alt="version 3.0.1" />
+  <img src="https://img.shields.io/badge/version-3.0.2-1351B4" alt="version 3.0.2" />
   <img src="https://img.shields.io/badge/core-Rust%202021-071D41" alt="Rust 2021" />
   <img src="https://img.shields.io/badge/license-GPL--2.0--only-168821" alt="GPL-2.0-only" />
   <img src="https://img.shields.io/badge/history-append--only-0C326F" alt="append only" />
@@ -456,7 +456,7 @@ Ferramentas como Power BI, DBeaver, Superset, Trino e plataformas analíticas de
 
 # Arquitetura do workspace
 
-O workspace Rust 3.0.1 é dividido em crates especializados.
+O workspace Rust 3.0.2 é dividido em crates especializados.
 
 ~~~text
 heraclitus-core              tipos, runtime e tempo lógico

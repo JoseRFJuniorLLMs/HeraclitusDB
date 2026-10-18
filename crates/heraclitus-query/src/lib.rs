@@ -793,10 +793,26 @@ mod tests {
             ids("MATCH (a)-[r:socio_de]->(b) RETURN b.id ORDER BY r.belief ASC"),
             vec!["Zeta", "Maria", "Beto"]
         );
-        // Por string: lexicográfica, nos dois sentidos.
+        // Por string: lexicográfica, nos dois sentidos. Desde o G1 (auditoria
+        // GPT 2026-10-16) o id é `e2:{len}:{origem}{len}:{destino}{len}:{tipo}`
+        // e o comprimento entra na ordem: o maior id é o da "Maria" (`5:`), não
+        // o da "Zeta" (`4:`). Confere-se a ordem contra os próprios ids, para o
+        // teste não voltar a depender do formato.
+        let ids_desc: Vec<String> =
+            execute("MATCH (a)-[r]->(b) RETURN r.id ORDER BY r.id DESC", &be)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["r.id"].as_str().unwrap().to_string())
+                .collect();
+        let mut esperado = ids_desc.clone();
+        esperado.sort_by(|a, b| b.cmp(a));
+        assert_eq!(ids_desc.len(), 3);
+        assert_eq!(ids_desc, esperado, "ORDER BY r.id DESC não é lexicográfico");
         assert_eq!(
             ids("MATCH (a)-[r]->(b) RETURN b.id ORDER BY r.id DESC LIMIT 1"),
-            vec!["Zeta"]
+            vec!["Maria"]
         );
         assert_eq!(
             ids("MATCH (a)-[r]->(b) RETURN b.id ORDER BY r.to ASC"),

@@ -41,6 +41,11 @@ class HeraclitusStub(object):
                 request_serializer=heraclitus__pb2.AppendRequest.SerializeToString,
                 response_deserializer=heraclitus__pb2.AppendResponse.FromString,
                 _registered_method=True)
+        self.AppendBatch = channel.unary_unary(
+                '/heraclitus.v1.Heraclitus/AppendBatch',
+                request_serializer=heraclitus__pb2.AppendBatchRequest.SerializeToString,
+                response_deserializer=heraclitus__pb2.AppendBatchResponse.FromString,
+                _registered_method=True)
         self.Query = channel.unary_unary(
                 '/heraclitus.v1.Heraclitus/Query',
                 request_serializer=heraclitus__pb2.QueryRequest.SerializeToString,
@@ -75,6 +80,16 @@ class HeraclitusServicer(object):
 
     def Append(self, request, context):
         """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AppendBatch(self, request, context):
+        """Batch of appends in ONE round trip (otimizacao-20m §3.6). NOT atomic:
+        items are applied in order and the first failure stops the batch; the
+        error says how many items were appended before it. Use a per-item
+        idempotency_key to make a retry of the whole batch safe.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -116,6 +131,11 @@ def add_HeraclitusServicer_to_server(servicer, server):
                     servicer.Append,
                     request_deserializer=heraclitus__pb2.AppendRequest.FromString,
                     response_serializer=heraclitus__pb2.AppendResponse.SerializeToString,
+            ),
+            'AppendBatch': grpc.unary_unary_rpc_method_handler(
+                    servicer.AppendBatch,
+                    request_deserializer=heraclitus__pb2.AppendBatchRequest.FromString,
+                    response_serializer=heraclitus__pb2.AppendBatchResponse.SerializeToString,
             ),
             'Query': grpc.unary_unary_rpc_method_handler(
                     servicer.Query,
@@ -172,6 +192,33 @@ class Heraclitus(object):
             '/heraclitus.v1.Heraclitus/Append',
             heraclitus__pb2.AppendRequest.SerializeToString,
             heraclitus__pb2.AppendResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AppendBatch(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/heraclitus.v1.Heraclitus/AppendBatch',
+            heraclitus__pb2.AppendBatchRequest.SerializeToString,
+            heraclitus__pb2.AppendBatchResponse.FromString,
             options,
             channel_credentials,
             insecure,

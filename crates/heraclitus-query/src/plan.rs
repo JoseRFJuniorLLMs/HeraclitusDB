@@ -560,6 +560,7 @@ fn eval_operand(op: &Operand, lsn: Lsn, e: &Episode) -> Option<Json> {
         Operand::Prop(_, field) => field_of(lsn, e, field),
         Operand::Ident(field) => field_of(lsn, e, field),
         Operand::Num(n) => Some(json!(n)),
+        Operand::Int(n) => Some(json!(n)),
         Operand::Str(s) => Some(json!(s)),
         Operand::Dist(kind, v) => eval_dist(*kind, v, e).map(|d| json!(d)),
     }
@@ -607,6 +608,96 @@ fn eval_dist(kind: DistKind, q: &[f32], e: &Episode) -> Option<f64> {
     })
 }
 
+#[derive(Clone, Copy)]
+enum Numeric {
+    Int(i128),
+    Float(f64),
+}
+
+fn numeric(j: &Json) -> Option<Numeric> {
+    if let Some(n) = j.as_i64() {
+        return Some(Numeric::Int(i128::from(n)));
+    }
+    if let Some(n) = j.as_u64() {
+        return Some(Numeric::Int(i128::from(n)));
+    }
+    if let Some(n) = j.as_f64() {
+        return Some(Numeric::Float(n));
+    }
+    let s = j.as_str()?.trim();
+    s.parse::<i128>()
+        .ok()
+        .map(Numeric::Int)
+        .or_else(|| s.parse::<f64>().ok().map(Numeric::Float))
+}
+
+/// Compara inteiro e float sem arredondar o inteiro. O cast do float é feito
+/// somente após testar seus limites; a parte fracionária desempata a truncagem.
+fn cmp_int_float(i: i128, f: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if f.is_nan() {
+        return None;
+    }
+    if f >= -(i128::MIN as f64) {
+        return Some(Ordering::Less);
+    }
+    if f < i128::MIN as f64 {
+        return Some(Ordering::Greater);
+    }
+    Some(i.cmp(&(f as i128)).then_with(|| {
+        if f.fract() > 0.0 {
+            Ordering::Less
+        } else if f.fract() < 0.0 {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        }
+    }))
+}
+
+fn cmp_numeric(a: Numeric, b: Numeric) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Numeric::Int(x), Numeric::Int(y)) => Some(x.cmp(&y)),
+        (Numeric::Float(x), Numeric::Float(y)) => x.partial_cmp(&y),
+        (Numeric::Int(x), Numeric::Float(y)) => cmp_int_float(x, y),
+        (Numeric::Float(x), Numeric::Int(y)) => cmp_int_float(y, x).map(|o| o.reverse()),
+    }
+}
+
+#[cfg(test)]
+mod numeric_regressions_g4 {
+    use super::*;
+
+    #[test]
+    fn mixed_integer_float_comparisons_keep_the_integer_bits() {
+        use std::cmp::Ordering::*;
+        let cases = [
+            (i128::from(u64::MAX), u64::MAX as f64, Less),
+            (i128::from(i64::MIN), i64::MIN as f64, Equal),
+            ((1i128 << 53) + 1, (1u64 << 53) as f64, Greater),
+            (-(1i128 << 53) - 1, -((1u64 << 53) as f64), Less),
+            (0, -0.0, Equal),
+            (2, 2.5, Less),
+            (-2, -2.5, Greater),
+            (i128::MAX, -(i128::MIN as f64), Less),
+            (i128::MIN, i128::MIN as f64, Equal),
+        ];
+        for (integer, float, expected) in cases {
+            assert_eq!(
+                cmp_numeric(Numeric::Int(integer), Numeric::Float(float)),
+                Some(expected)
+            );
+            assert_eq!(
+                cmp_numeric(Numeric::Float(float), Numeric::Int(integer)),
+                Some(expected.reverse())
+            );
+        }
+        assert!(cmp_json(&json!(u64::MAX), &json!(u64::MAX - 1), Cmp::Gt));
+        // Duas strings continuam lexicográficas (identificadores com zeros).
+        assert!(!cmp_json(&json!("001"), &json!("1"), Cmp::Eq));
+    }
+}
+
 fn cmp_json(a: &Json, b: &Json, cmp: Cmp) -> bool {
     // Coerção numérica: attrs vivem como STRINGS no Episode; se um dos lados é
     // um número genuíno e o outro é uma string numérica, compara-se como
@@ -614,17 +705,12 @@ fn cmp_json(a: &Json, b: &Json, cmp: Cmp) -> bool {
     // caía no caminho de strings e devolvia None). Strings puras dos dois
     // lados continuam a comparar lexicograficamente (CPFs com zeros à esquerda
     // não mudam de semântica).
-    let coerce = |j: &Json| {
-        j.as_f64()
-            .or_else(|| j.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
-    };
-    let ord = match (a.as_f64(), b.as_f64()) {
-        (Some(x), Some(y)) => x.partial_cmp(&y),
-        (Some(_), None) | (None, Some(_)) => match (coerce(a), coerce(b)) {
-            (Some(x), Some(y)) => x.partial_cmp(&y),
-            _ => None,
-        },
-        _ => a.as_str().and_then(|x| b.as_str().map(|y| x.cmp(y))),
+    let ord = if a.is_number() || b.is_number() {
+        numeric(a)
+            .zip(numeric(b))
+            .and_then(|(x, y)| cmp_numeric(x, y))
+    } else {
+        a.as_str().and_then(|x| b.as_str().map(|y| x.cmp(y)))
     };
     match (ord, cmp) {
         (Some(o), Cmp::Eq) => o.is_eq(),
@@ -732,6 +818,7 @@ fn eval_edge_operand(
 ) -> Option<Json> {
     match op {
         Operand::Num(n) => Some(json!(n)),
+        Operand::Int(n) => Some(json!(n)),
         Operand::Str(s) => Some(json!(s)),
         Operand::Dist(..) => None, // sem embedding num contexto de aresta
         Operand::Ident(v) => {
@@ -812,12 +899,14 @@ fn edge_matches(
 /// o resto compara lexicograficamente. Antes tudo era comparado como string
 /// JSON — `ORDER BY n.lsn ASC` dava [0,1,10,11,2,...].
 fn cmp_order(a: &Json, b: &Json) -> std::cmp::Ordering {
-    let coerce = |j: &Json| {
-        j.as_f64()
-            .or_else(|| j.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
-    };
-    match (coerce(a), coerce(b)) {
-        (Some(x), Some(y)) => x.total_cmp(&y),
+    match (numeric(a), numeric(b)) {
+        (Some(x), Some(y)) => cmp_numeric(x, y).unwrap_or_else(|| {
+            let float = |v| match v {
+                Numeric::Int(n) => n as f64,
+                Numeric::Float(n) => n,
+            };
+            float(x).total_cmp(&float(y))
+        }),
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => a.to_string().cmp(&b.to_string()),
@@ -1028,6 +1117,11 @@ fn attr_range_hint(conditions: &[(BoolOp, Condition)]) -> Option<(String, NumBou
             (Operand::Num(n), Operand::Prop(_, f)) => (f, flip_cmp(c.cmp), *n),
             _ => continue,
         };
+        // O índice de ranges usa f64. Nesta faixa ele não é uma fonte completa
+        // para o comparador exato (um inteiro adjacente pode arredondar ao bound).
+        if n.abs() >= (1u64 << 53) as f64 {
+            return None;
+        }
         if is_builtin_field(f) {
             continue;
         }

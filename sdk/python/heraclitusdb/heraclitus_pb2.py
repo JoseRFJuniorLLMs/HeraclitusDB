@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x10heraclitus.proto\x12\rheraclitus.v1\"\x8b\x02\n\rAppendRequest\x12\x10\n\x08\x61gent_id\x18\x01 \x01(\t\x12\x12\n\nsession_id\x18\x02 \x01(\t\x12\x0c\n\x04kind\x18\x03 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x04 \x01(\x0c\x12\x0b\n\x03hyp\x18\x05 \x03(\x02\x12\x0b\n\x03sph\x18\x06 \x03(\x02\x12\x0b\n\x03\x65uc\x18\x07 \x03(\x02\x12\x36\n\x05\x61ttrs\x18\x08 \x03(\x0b\x32\'.heraclitus.v1.AppendRequest.AttrsEntry\x12\x0f\n\x07parents\x18\t \x03(\t\x12\x17\n\x0fidempotency_key\x18\n \x01(\t\x1a,\n\nAttrsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"E\n\x0e\x41ppendResponse\x12\x0b\n\x03lsn\x18\x01 \x01(\x04\x12\x14\n\x0c\x64\x65\x64uplicated\x18\x02 \x01(\x08\x12\x10\n\x08\x65vent_id\x18\x03 \x01(\t\"\x1b\n\x0cQueryRequest\x12\x0b\n\x03gql\x18\x01 \x01(\t\"\x1d\n\rQueryResponse\x12\x0c\n\x04json\x18\x01 \x01(\t\"(\n\rRecallRequest\x12\x0c\n\x04text\x18\x01 \x01(\t\x12\t\n\x01k\x18\x02 \x01(\r\"$\n\x10SubscribeRequest\x12\x10\n\x08\x66rom_lsn\x18\x01 \x01(\x04\"1\n\x0c\x45ventMessage\x12\x0b\n\x03lsn\x18\x01 \x01(\x04\x12\x14\n\x0c\x65pisode_json\x18\x02 \x01(\t\"\x11\n\x0fSnapshotRequest\"\x1f\n\x10SnapshotResponse\x12\x0b\n\x03lsn\x18\x01 \x01(\x04\"\'\n\x0c\x41\x64minRequest\x12\n\n\x02op\x18\x01 \x01(\t\x12\x0b\n\x03\x61rg\x18\x02 \x01(\t\",\n\rAdminResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t2\xbb\x03\n\nHeraclitus\x12\x45\n\x06\x41ppend\x12\x1c.heraclitus.v1.AppendRequest\x1a\x1d.heraclitus.v1.AppendResponse\x12\x42\n\x05Query\x12\x1b.heraclitus.v1.QueryRequest\x1a\x1c.heraclitus.v1.QueryResponse\x12\x44\n\x06Recall\x12\x1c.heraclitus.v1.RecallRequest\x1a\x1c.heraclitus.v1.QueryResponse\x12K\n\tSubscribe\x12\x1f.heraclitus.v1.SubscribeRequest\x1a\x1b.heraclitus.v1.EventMessage0\x01\x12K\n\x08Snapshot\x12\x1e.heraclitus.v1.SnapshotRequest\x1a\x1f.heraclitus.v1.SnapshotResponse\x12\x42\n\x05\x41\x64min\x12\x1b.heraclitus.v1.AdminRequest\x1a\x1c.heraclitus.v1.AdminResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x10heraclitus.proto\x12\rheraclitus.v1\"\x8b\x02\n\rAppendRequest\x12\x10\n\x08\x61gent_id\x18\x01 \x01(\t\x12\x12\n\nsession_id\x18\x02 \x01(\t\x12\x0c\n\x04kind\x18\x03 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x04 \x01(\x0c\x12\x0b\n\x03hyp\x18\x05 \x03(\x02\x12\x0b\n\x03sph\x18\x06 \x03(\x02\x12\x0b\n\x03\x65uc\x18\x07 \x03(\x02\x12\x36\n\x05\x61ttrs\x18\x08 \x03(\x0b\x32\'.heraclitus.v1.AppendRequest.AttrsEntry\x12\x0f\n\x07parents\x18\t \x03(\t\x12\x17\n\x0fidempotency_key\x18\n \x01(\t\x1a,\n\nAttrsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"E\n\x0e\x41ppendResponse\x12\x0b\n\x03lsn\x18\x01 \x01(\x04\x12\x14\n\x0c\x64\x65\x64uplicated\x18\x02 \x01(\x08\x12\x10\n\x08\x65vent_id\x18\x03 \x01(\t\"A\n\x12\x41ppendBatchRequest\x12+\n\x05items\x18\x01 \x03(\x0b\x32\x1c.heraclitus.v1.AppendRequest\"E\n\x13\x41ppendBatchResponse\x12.\n\x07results\x18\x01 \x03(\x0b\x32\x1d.heraclitus.v1.AppendResponse\"\x1b\n\x0cQueryRequest\x12\x0b\n\x03gql\x18\x01 \x01(\t\"\x1d\n\rQueryResponse\x12\x0c\n\x04json\x18\x01 \x01(\t\"(\n\rRecallRequest\x12\x0c\n\x04text\x18\x01 \x01(\t\x12\t\n\x01k\x18\x02 \x01(\r\"$\n\x10SubscribeRequest\x12\x10\n\x08\x66rom_lsn\x18\x01 \x01(\x04\"1\n\x0c\x45ventMessage\x12\x0b\n\x03lsn\x18\x01 \x01(\x04\x12\x14\n\x0c\x65pisode_json\x18\x02 \x01(\t\"\x11\n\x0fSnapshotRequest\"\x1f\n\x10SnapshotResponse\x12\x0b\n\x03lsn\x18\x01 \x01(\x04\"\'\n\x0c\x41\x64minRequest\x12\n\n\x02op\x18\x01 \x01(\t\x12\x0b\n\x03\x61rg\x18\x02 \x01(\t\",\n\rAdminResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t2\x91\x04\n\nHeraclitus\x12\x45\n\x06\x41ppend\x12\x1c.heraclitus.v1.AppendRequest\x1a\x1d.heraclitus.v1.AppendResponse\x12T\n\x0b\x41ppendBatch\x12!.heraclitus.v1.AppendBatchRequest\x1a\".heraclitus.v1.AppendBatchResponse\x12\x42\n\x05Query\x12\x1b.heraclitus.v1.QueryRequest\x1a\x1c.heraclitus.v1.QueryResponse\x12\x44\n\x06Recall\x12\x1c.heraclitus.v1.RecallRequest\x1a\x1c.heraclitus.v1.QueryResponse\x12K\n\tSubscribe\x12\x1f.heraclitus.v1.SubscribeRequest\x1a\x1b.heraclitus.v1.EventMessage0\x01\x12K\n\x08Snapshot\x12\x1e.heraclitus.v1.SnapshotRequest\x1a\x1f.heraclitus.v1.SnapshotResponse\x12\x42\n\x05\x41\x64min\x12\x1b.heraclitus.v1.AdminRequest\x1a\x1c.heraclitus.v1.AdminResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -39,24 +39,28 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_APPENDREQUEST_ATTRSENTRY']._serialized_end=303
   _globals['_APPENDRESPONSE']._serialized_start=305
   _globals['_APPENDRESPONSE']._serialized_end=374
-  _globals['_QUERYREQUEST']._serialized_start=376
-  _globals['_QUERYREQUEST']._serialized_end=403
-  _globals['_QUERYRESPONSE']._serialized_start=405
-  _globals['_QUERYRESPONSE']._serialized_end=434
-  _globals['_RECALLREQUEST']._serialized_start=436
-  _globals['_RECALLREQUEST']._serialized_end=476
-  _globals['_SUBSCRIBEREQUEST']._serialized_start=478
-  _globals['_SUBSCRIBEREQUEST']._serialized_end=514
-  _globals['_EVENTMESSAGE']._serialized_start=516
-  _globals['_EVENTMESSAGE']._serialized_end=565
-  _globals['_SNAPSHOTREQUEST']._serialized_start=567
-  _globals['_SNAPSHOTREQUEST']._serialized_end=584
-  _globals['_SNAPSHOTRESPONSE']._serialized_start=586
-  _globals['_SNAPSHOTRESPONSE']._serialized_end=617
-  _globals['_ADMINREQUEST']._serialized_start=619
-  _globals['_ADMINREQUEST']._serialized_end=658
-  _globals['_ADMINRESPONSE']._serialized_start=660
-  _globals['_ADMINRESPONSE']._serialized_end=704
-  _globals['_HERACLITUS']._serialized_start=707
-  _globals['_HERACLITUS']._serialized_end=1150
+  _globals['_APPENDBATCHREQUEST']._serialized_start=376
+  _globals['_APPENDBATCHREQUEST']._serialized_end=441
+  _globals['_APPENDBATCHRESPONSE']._serialized_start=443
+  _globals['_APPENDBATCHRESPONSE']._serialized_end=512
+  _globals['_QUERYREQUEST']._serialized_start=514
+  _globals['_QUERYREQUEST']._serialized_end=541
+  _globals['_QUERYRESPONSE']._serialized_start=543
+  _globals['_QUERYRESPONSE']._serialized_end=572
+  _globals['_RECALLREQUEST']._serialized_start=574
+  _globals['_RECALLREQUEST']._serialized_end=614
+  _globals['_SUBSCRIBEREQUEST']._serialized_start=616
+  _globals['_SUBSCRIBEREQUEST']._serialized_end=652
+  _globals['_EVENTMESSAGE']._serialized_start=654
+  _globals['_EVENTMESSAGE']._serialized_end=703
+  _globals['_SNAPSHOTREQUEST']._serialized_start=705
+  _globals['_SNAPSHOTREQUEST']._serialized_end=722
+  _globals['_SNAPSHOTRESPONSE']._serialized_start=724
+  _globals['_SNAPSHOTRESPONSE']._serialized_end=755
+  _globals['_ADMINREQUEST']._serialized_start=757
+  _globals['_ADMINREQUEST']._serialized_end=796
+  _globals['_ADMINRESPONSE']._serialized_start=798
+  _globals['_ADMINRESPONSE']._serialized_end=842
+  _globals['_HERACLITUS']._serialized_start=845
+  _globals['_HERACLITUS']._serialized_end=1374
 # @@protoc_insertion_point(module_scope)

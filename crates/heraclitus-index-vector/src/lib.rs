@@ -15,7 +15,7 @@ use rand::{Rng, SeedableRng};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::path::Path;
 
 const DEFAULT_M: usize = 16;
@@ -174,6 +174,7 @@ pub struct VectorIndex {
     /// para preservar a conectividade do HNSW. Nada é apagado do log: um
     /// tombstone é ele próprio um evento (`attrs.tombstone_of = <event_id>`).
     tombstones: RoaringBitmap,
+    retired_at: BTreeMap<u32, Lsn>,
 }
 
 #[derive(Debug, Clone)]
@@ -197,6 +198,8 @@ struct VectorSnapshot {
     watermark: Lsn,
     sig: Signature,
     tombstones: Vec<u32>,
+    retired_at: BTreeMap<u32, Lsn>,
+    visibility_version: u32,
 }
 
 #[derive(Serialize)]
@@ -210,6 +213,8 @@ struct VectorSnapshotRef<'a> {
     watermark: Lsn,
     sig: &'a Signature,
     tombstones: Vec<u32>,
+    retired_at: &'a BTreeMap<u32, Lsn>,
+    visibility_version: u32,
 }
 
 const VECTOR_CKPT_FILE: &str = "vector.ckpt";
@@ -230,15 +235,24 @@ impl VectorIndex {
             // level sequence is then a pure function of insertion order.
             rng: StdRng::seed_from_u64(0x48524B4C),
             tombstones: RoaringBitmap::new(),
+            retired_at: BTreeMap::new(),
         }
     }
 
     /// Marca o vetor de `event` como retirado (tombstone semântico). Devolve
     /// `true` se o evento estava indexado. Idempotente.
     pub fn tombstone_event(&mut self, event: &EventId) -> bool {
+        self.tombstone_event_at(event, 0)
+    }
+
+    pub fn tombstone_event_at(&mut self, event: &EventId, lsn: Lsn) -> bool {
         match self.by_event.get(event) {
             Some(&id) => {
                 self.tombstones.insert(id);
+                self.retired_at
+                    .entry(id)
+                    .and_modify(|at| *at = (*at).min(lsn))
+                    .or_insert(lsn);
                 true
             }
             None => false,
@@ -247,6 +261,21 @@ impl VectorIndex {
 
     pub fn is_tombstoned(&self, internal: u32) -> bool {
         self.tombstones.contains(internal)
+    }
+
+    fn visible_at(&self, internal: u32, as_of: Option<Lsn>) -> bool {
+        as_of.is_none_or(|bound| self.lsns[internal as usize] < bound)
+            && self
+                .retired_at
+                .get(&internal)
+                .is_none_or(|at| as_of.is_some_and(|bound| *at >= bound))
+    }
+
+    /// A mesma máscara para candidatos vindos da cauda quente ou de outro canal.
+    pub fn event_visible_at(&self, event: &EventId, as_of: Option<Lsn>) -> bool {
+        self.by_event
+            .get(event)
+            .is_none_or(|&id| self.visible_at(id, as_of))
     }
 
     /// Nº de vetores retirados — alimenta o trigger de compaction (delta ratio).
@@ -301,14 +330,25 @@ impl VectorIndex {
         ef: usize,
         filter: Option<&RoaringBitmap>,
     ) -> Vec<Candidate> {
+        self.search_layer_at(query, entry, level, ef, filter, None)
+    }
+
+    fn search_layer_at(
+        &self,
+        query: &PreparedQuery,
+        entry: u32,
+        level: usize,
+        ef: usize,
+        filter: Option<&RoaringBitmap>,
+        as_of: Option<Lsn>,
+    ) -> Vec<Candidate> {
         #[cfg(test)]
         SEARCH_LAYER_CALLS.with(|calls| calls.set(calls.get() + 1));
         // Tombstones nunca entram nos RESULTADOS mas continuam a ser
         // atravessados (visited/candidates) — remover nós do grafo partiria a
         // conectividade; excluí-los só da seleção preserva o recall.
-        let passes = |id: u32| {
-            !self.tombstones.contains(id) && filter.map(|f| f.contains(id)).unwrap_or(true)
-        };
+        let passes =
+            |id: u32| self.visible_at(id, as_of) && filter.map(|f| f.contains(id)).unwrap_or(true);
         let d0 = self.dist2(entry, query);
         // `candidates` drives traversal over every reachable node; `results`
         // keeps only filter-passing nodes (the ones we may return).
@@ -535,6 +575,17 @@ impl VectorIndex {
         ef: usize,
         filter: Option<&RoaringBitmap>,
     ) -> Vec<VectorHit> {
+        self.search_as_of(query, k, ef, filter, None)
+    }
+
+    pub fn search_as_of(
+        &self,
+        query: &ProductPoint,
+        k: usize,
+        ef: usize,
+        filter: Option<&RoaringBitmap>,
+        as_of: Option<Lsn>,
+    ) -> Vec<VectorHit> {
         let Some(mut ep) = self.entry else {
             return Vec::new();
         };
@@ -547,8 +598,14 @@ impl VectorIndex {
             ep = self.search_layer_greedy(&pq, ep, l).id;
         }
         let ef = ef.max(k);
-        let candidates =
-            self.search_layer(&pq, ep, 0, ef.max(self.ef_construction.min(64)), filter);
+        let candidates = self.search_layer_at(
+            &pq,
+            ep,
+            0,
+            ef.max(self.ef_construction.min(64)),
+            filter,
+            as_of,
+        );
         candidates
             .into_iter()
             .take(k)
@@ -613,6 +670,19 @@ impl VectorIndex {
         self.rescore(query, cands.iter().map(|c| c.index as usize), k)
     }
 
+    /// Snapshots históricos exigem a máscara temporal também no caminho exato.
+    pub fn search_exact_as_of(
+        &self,
+        query: &ProductPoint,
+        k: usize,
+        as_of: Option<Lsn>,
+    ) -> Vec<VectorHit> {
+        if as_of.is_none() {
+            return self.search_exact_gpu(query, k);
+        }
+        self.rescore_at(query, 0..self.nodes.len(), k, as_of)
+    }
+
     /// Rescore candidate internal ids with the exact f64 metric, take Top-k.
     /// Tombstones ficam fora do rescore (mesma semântica do search HNSW).
     fn rescore(
@@ -621,8 +691,18 @@ impl VectorIndex {
         cand: impl Iterator<Item = usize>,
         k: usize,
     ) -> Vec<VectorHit> {
+        self.rescore_at(query, cand, k, None)
+    }
+
+    fn rescore_at(
+        &self,
+        query: &ProductPoint,
+        cand: impl Iterator<Item = usize>,
+        k: usize,
+        as_of: Option<Lsn>,
+    ) -> Vec<VectorHit> {
         let mut scored: Vec<(f64, usize)> = cand
-            .filter(|i| !self.tombstones.contains(*i as u32))
+            .filter(|i| self.visible_at(*i as u32, as_of))
             .map(|i| (self.metric.dist(query, &self.nodes[i].point), i))
             .collect();
         scored.sort_by(|x, y| x.0.total_cmp(&y.0));
@@ -679,6 +759,8 @@ impl VectorIndex {
             watermark: self.watermark,
             sig: &self.metric.sig,
             tombstones: self.tombstones.iter().collect(),
+            retired_at: &self.retired_at,
+            visibility_version: 2,
         };
         heraclitus_views::ckpt::save(dir, "vector", &snap)
     }
@@ -717,6 +799,9 @@ impl VectorIndex {
             // DEFAULT_EF_CONSTRUCTION = 200), portanto isto só recusa ficheiros
             // que já eram venenosos.
             (M_MIN..=M_MAX).contains(&snap.m)
+            && snap.visibility_version == 2
+            && snap.retired_at.keys().copied().eq(snap.tombstones.iter().copied())
+            && snap.tombstones.iter().all(|id| (*id as usize) < n_nodes && snap.retired_at.contains_key(id))
             && (EF_CONSTRUCTION_MIN..=EF_CONSTRUCTION_MAX).contains(&snap.ef_construction)
             && n_nodes == snap.ids.len()
             && n_nodes == snap.lsns.len()
@@ -768,6 +853,7 @@ impl VectorIndex {
         self.watermark = snap.watermark;
         self.metric = metric;
         self.tombstones = snap.tombstones.into_iter().collect();
+        self.retired_at = snap.retired_at;
         Ok(true)
     }
 }
@@ -786,7 +872,7 @@ impl View for VectorIndex {
         // resultados. Replay-determinístico como qualquer outra derivação.
         if let Some(target) = event.attrs.get("tombstone_of") {
             if let Ok(id) = target.parse::<EventId>() {
-                self.tombstone_event(&id);
+                self.tombstone_event_at(&id, lsn);
             }
         }
         // Avanço-só (ver activation/text/attr): entrega fora de ordem não pode
@@ -1091,6 +1177,52 @@ mod tests {
     }
 
     #[test]
+    fn tombstones_respeitam_snapshot_em_ann_exato_e_checkpoint() {
+        let mut idx = VectorIndex::new(ProductMetric::default());
+        let query = pt(vec![0.1, 0.2]);
+        let mut a = Episode::new("audit", heraclitus_core::EventKind::Observation, vec![]);
+        a.embedding = Some(query.clone());
+        idx.apply(0, &a);
+        let mut removal = Episode::new("audit", heraclitus_core::EventKind::Observation, vec![]);
+        removal
+            .attrs
+            .insert("tombstone_of".into(), a.id.to_string());
+        idx.apply(1, &removal);
+        idx.apply(3, &removal); // retry não move a primeira retirada para o futuro
+        let mut b = Episode::new("audit", heraclitus_core::EventKind::Observation, vec![]);
+        b.embedding = Some(pt(vec![0.11, 0.2]));
+        idx.apply(4, &b);
+        let verify = |index: &VectorIndex| {
+            for bound in [None, Some(0), Some(1), Some(2), Some(4), Some(5)] {
+                let expected = match bound {
+                    Some(0) | Some(2) | Some(4) => vec![],
+                    Some(1) => vec![a.id],
+                    _ => vec![b.id],
+                };
+                let ann: Vec<_> = index
+                    .search_as_of(&query, 1, 128, None, bound)
+                    .iter()
+                    .map(|h| h.id)
+                    .collect();
+                let exact: Vec<_> = index
+                    .search_exact_as_of(&query, 1, bound)
+                    .iter()
+                    .map(|h| h.id)
+                    .collect();
+                assert_eq!(ann, expected, "ANN snapshot {bound:?}");
+                assert_eq!(exact, expected, "exact snapshot {bound:?}");
+                assert_eq!(index.event_visible_at(&a.id, bound), bound == Some(1));
+            }
+        };
+        verify(&idx);
+        let dir = tempfile::tempdir().unwrap();
+        idx.save_checkpoint(dir.path()).unwrap();
+        let mut restored = VectorIndex::new(ProductMetric::default());
+        assert!(restored.load_checkpoint(dir.path()).unwrap());
+        verify(&restored);
+    }
+
+    #[test]
     fn unreadable_checkpoint_degrades_to_rebuild() {
         // Um snapshot de formato antigo/corrompido NUNCA impede o boot: o
         // restore devolve false e o registry replaya desde 0.
@@ -1162,25 +1294,23 @@ mod tests {
         let path = dir.path().join(VECTOR_CKPT_FILE);
         let bytes = corpo_do_checkpoint(&path);
 
-        // Um leitor antigo continua a descodificar exactamente todo o ficheiro:
-        // `prepared` nao foi acrescentado ao stream bincode.
+        // O cache PreparedPoint continua fora do wire format. A extensão
+        // temporal v2 vem DEPOIS dos campos históricos, com versão explícita.
         let (legacy, consumed) = bincode::serde::decode_from_slice::<LegacyVectorSnapshot, _>(
             &bytes,
             bincode::config::standard(),
         )
-        .expect("checkpoint novo deve manter o formato antigo");
-        assert_eq!(consumed, bytes.len());
+        .unwrap();
+        assert!(consumed < bytes.len());
         assert_eq!(legacy.nodes.len(), idx.nodes.len());
-
-        // E o sentido inverso: bytes emitidos pelo schema antigo entram no
-        // loader novo, que recalcula o cache derivado sob a Signature gravada.
-        let legacy_bytes =
-            bincode::serde::encode_to_vec(&legacy, bincode::config::standard()).unwrap();
-        assert_eq!(legacy_bytes, bytes, "o wire format deve ser identico");
-        std::fs::write(&path, legacy_bytes).unwrap();
 
         let mut restored = VectorIndex::new(ProductMetric::default());
         assert!(restored.load_checkpoint(dir.path()).unwrap());
+        // O schema anterior não sabe quando tombstones aconteceram. Mesmo
+        // sendo decodável e íntegro, não pode responder a snapshots históricos.
+        heraclitus_views::ckpt::save(dir.path(), "vector", &legacy).unwrap();
+        let mut old = VectorIndex::new(ProductMetric::default());
+        assert!(!old.load_checkpoint(dir.path()).unwrap());
         assert_eq!(restored.nodes.len(), idx.nodes.len());
         for node in &restored.nodes {
             assert_eq!(

@@ -224,9 +224,17 @@ enum Cmd {
         /// Password for Basic Auth.
         #[arg(long, default_value = "debian23")]
         pass: String,
+        /// Read the Basic Auth password from this file instead of --pass
+        /// (keeps it out of the process list).
+        #[arg(long, conflicts_with = "pass")]
+        pass_file: Option<PathBuf>,
         /// Refresh interval in seconds.
         #[arg(long, default_value_t = 1.0)]
         interval: f64,
+        /// CI report with the formal-proof status (schema
+        /// heraclitus.proof-status.v1). Without it no proof shows as PROVED.
+        #[arg(long)]
+        proof_status: Option<PathBuf>,
     },
 }
 
@@ -502,8 +510,18 @@ fn main() {
             url,
             user,
             pass,
+            pass_file,
             interval,
-        } => heraclitus_cli::top::run_top(&url, &user, &pass, interval),
+            proof_status,
+        } => {
+            let pass = match pass_file {
+                Some(path) => heraclitus_cli::top::read_pass_file(&path),
+                None => Ok(pass),
+            };
+            pass.and_then(|pass| {
+                heraclitus_cli::top::run_top(&url, &user, &pass, interval, proof_status.as_deref())
+            })
+        }
         // Tratado acima, com códigos de saída próprios (§18).
         Cmd::Agent { .. } => unreachable!("`agent` sai antes deste mapa"),
     };

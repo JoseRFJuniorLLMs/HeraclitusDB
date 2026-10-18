@@ -1,0 +1,18 @@
+    /// SONDA AUDITORIA 2026-10-16: ts_hlc dos episodios replicados.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sonda_ts_hlc_replicado() {
+        let (nodes, _router, _dirs) = three_nodes().await;
+        wait_leader(&nodes).await;
+        let mut last = 0;
+        for i in 0..5 {
+            let (_d, idx) = write_to_leader(&nodes, episode_bytes(&ep(i))).await;
+            last = idx;
+        }
+        wait_all_applied(&nodes, last).await;
+        for n in &nodes {
+            let ts: Vec<u64> = n.log.scan(0, u64::MAX).unwrap().iter().map(|(_, e)| e.ts_hlc).collect();
+            eprintln!("SONDA no {} ts_hlc = {:?}", n.id, ts);
+        }
+        let ts0: Vec<u64> = nodes[0].log.scan(0, u64::MAX).unwrap().iter().map(|(_, e)| e.ts_hlc).collect();
+        assert!(ts0.iter().all(|t| *t == 0), "nao reproduziu: ts_hlc carimbado");
+    }
