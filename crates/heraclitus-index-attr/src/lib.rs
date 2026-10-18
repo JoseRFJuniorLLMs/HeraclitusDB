@@ -160,11 +160,13 @@ const MAGIC_V2: &[u8; 4] = b"HATR";
 /// Subir a versão faz o `open` recusar o checkpoint antigo e reconstruir por
 /// replay desde o LSN 0. Custa um replay no primeiro arranque; num log de 10M
 /// isso são minutos, uma vez.
+#[cfg(test)]
 const FORMAT_LEGACY_COMPRESSED: u16 = 4;
 /// v5 troca apenas o checkpoint DERIVADO para IDs densos. O log canónico não
 /// muda; checkpoints v4 e v1 continuam legíveis e são internados ao abrir.
 ///
 /// Continua aceite em leitura por decisão explícita — ver [`FORMAT_CURRENT`].
+#[cfg(test)]
 const FORMAT_V5_SEM_CRC: u16 = 5;
 /// **v6**: o cabeçalho passa a trazer um CRC-32 do resto do ficheiro.
 ///
@@ -190,18 +192,48 @@ const FORMAT_V5_SEM_CRC: u16 = 5;
 /// MAC — quem adultera o corpo de propósito recalcula o CRC. Defesa contra
 /// adulteração deliberada fica fora deste fix.
 ///
-/// **Porque é que v5/v4/v1 continuam a ser aceites** (e isto não contradiz a
-/// doutrina "subir versão = rejeitar" das v3/v4 acima):
-/// (a) esses ficheiros foram escritos por uma versão que nunca calculou CRC —
-///     recusá-los não detecta corrupção nenhuma, só força um replay total no
-///     primeiro arranque após a actualização, que é precisamente o custo que
-///     o comentário do `open` diz que se quis evitar;
-/// (b) a janela de exposição é de UM arranque: o `checkpoint()` seguinte
-///     reescreve o ficheiro em v6, já com CRC;
-/// (c) as subidas v3/v4 existiam para CORRIGIR conteúdo em falta (`_agent`,
-///     `_kind`) e por isso TINHAM de rejeitar. Aqui o conteúdo da v5 é
-///     semanticamente correcto; só lhe falta a prova.
-const FORMAT_CURRENT: u16 = 6;
+/// **v7**: separa os pseudo-campos do envelope dos atributos do cliente.
+/// Todos os formatos anteriores são recusados e reconstruídos do log.
+/// O log canônico permanece inalterado; há um replay no primeiro arranque.
+const FORMAT_CURRENT: u16 = 7;
+
+#[cfg(test)]
+mod regressions_g6 {
+    use super::*;
+
+    #[test]
+    fn replay_nao_indexa_pseudocampos_do_cliente() {
+        let mut idx = AttrIndex::new();
+        let mut event = Episode::new("ana", EventKind::Observation, vec![]);
+        event.attrs.insert("_agent".into(), "bia".into());
+        event.attrs.insert("_kind".into(), "Forjado".into());
+        idx.apply(0, &event);
+        assert_eq!(idx.lookup("_agent", "ana"), &[0]);
+        assert!(idx.lookup("_agent", "bia").is_empty());
+        assert!(idx.lookup("_kind", "Forjado").is_empty());
+        assert_eq!(idx.lookup("_kind", "Observation"), &[0]);
+        assert_eq!(idx.field_entries("_agent"), 1);
+    }
+
+    #[test]
+    fn checkpoint_v6_contaminado_exige_replay_mesmo_com_crc_correto() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut idx = AttrIndex::new();
+        idx.apply(0, &Episode::new("ana", EventKind::Observation, vec![]));
+        idx.inner.upsert_exact("_agent", "bia", 0);
+        idx.save(dir.path()).unwrap();
+        let path = dir.path().join(SNAPSHOT_FILE);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[4..6].copy_from_slice(&6u16.to_le_bytes());
+        let crc = crc32_ieee(&[&bytes[4..6], &bytes[CABECALHO_V6..]]);
+        bytes[6..10].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(path, bytes).unwrap();
+        let (fresh, status) = AttrIndex::open_reportando(dir.path());
+        assert_eq!(status, AberturaCheckpoint::Ilegivel);
+        assert!(!fresh.has_applied());
+        assert!(fresh.lookup("_agent", "bia").is_empty());
+    }
+}
 
 /// Tabela do CRC-32 **IEEE 802.3** (polinómio reflectido `0xEDB88320`) — o
 /// mesmo do `crc32fast`/zip/gzip. NÃO é CRC-32**C** (Castagnoli, `0x82F63B78`),
@@ -680,6 +712,7 @@ struct LegacySnapshot {
     numeric: HashMap<String, BTreeMap<u64, Vec<Lsn>>>,
 }
 
+#[cfg(test)]
 #[derive(Serialize, Deserialize)]
 struct LegacyCompressedSnapshot {
     watermark: Lsn,
@@ -690,6 +723,7 @@ struct LegacyCompressedSnapshot {
     numeric_packed: HashMap<String, BTreeMap<u64, Vec<u8>>>,
 }
 
+#[cfg(test)]
 impl From<&LegacySnapshot> for LegacyCompressedSnapshot {
     fn from(s: &LegacySnapshot) -> Self {
         let mut exact_plain = HashMap::new();
@@ -735,40 +769,6 @@ impl From<&LegacySnapshot> for LegacyCompressedSnapshot {
     }
 }
 
-impl LegacyCompressedSnapshot {
-    fn expand(self) -> Option<LegacySnapshot> {
-        use hume_kernel::compression::column;
-        let mut exact = self.exact_plain;
-        for (key, blob) in self.exact_packed {
-            exact.insert(key, column::decode(&blob)?);
-        }
-        let mut numeric = self.numeric_plain;
-        for (field, by_value) in self.numeric_packed {
-            let target = numeric.entry(field).or_default();
-            for (value, blob) in by_value {
-                target.insert(value, column::decode(&blob)?);
-            }
-        }
-        if exact
-            .values()
-            .any(|postings| !postings_estritamente_crescentes(postings))
-            || numeric.values().any(|by_value| {
-                by_value
-                    .values()
-                    .any(|postings| !postings_estritamente_crescentes(postings))
-            })
-        {
-            return None;
-        }
-        Some(LegacySnapshot {
-            watermark: self.watermark,
-            applied: self.applied,
-            exact,
-            numeric,
-        })
-    }
-}
-
 fn legacy_key(field: &str, value: &str) -> String {
     let mut key = String::with_capacity(field.len() + value.len() + 1);
     key.push_str(field);
@@ -778,43 +778,6 @@ fn legacy_key(field: &str, value: &str) -> String {
 }
 
 impl ResidentSnapshot {
-    fn from_legacy(snapshot: LegacySnapshot) -> Option<Self> {
-        let mut resident = Self {
-            watermark: snapshot.watermark,
-            applied: snapshot.applied,
-            ..Self::default()
-        };
-        // HashMap iteration is randomized. Sorting gives stable IDs after every
-        // restore, which keeps EXPLAIN/checkpoint materialization deterministic.
-        let mut exact: Vec<_> = snapshot.exact.into_iter().collect();
-        exact.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        for (composite, postings) in exact {
-            if !postings_estritamente_crescentes(&postings) {
-                return None;
-            }
-            let (field, value) = composite.split_once(SEP)?;
-            let key = resident.dictionary.intern(field, value);
-            if resident.exact.insert(key, postings).is_some() {
-                return None;
-            }
-        }
-        let mut numeric: Vec<_> = snapshot.numeric.into_iter().collect();
-        numeric.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-        for (field, postings) in numeric {
-            if postings
-                .values()
-                .any(|values| !postings_estritamente_crescentes(values))
-            {
-                return None;
-            }
-            let field_id = resident.dictionary.fields.intern(&field);
-            if resident.numeric.insert(field_id, postings).is_some() {
-                return None;
-            }
-        }
-        Some(resident)
-    }
-
     fn to_legacy(&self) -> LegacySnapshot {
         let exact = self
             .exact
@@ -919,103 +882,19 @@ impl AttrIndex {
     /// Auditoria 2026-09-05, vaga 2 (R90).
     pub fn open_reportando(dir: impl AsRef<Path>) -> (Self, AberturaCheckpoint) {
         let path = dir.as_ref().join(SNAPSHOT_FILE);
-        // Formato corrente: CRC e descodificação em streaming, sem ler o
-        // ficheiro inteiro para memória (boot.md "streaming restore",
-        // conferido em 2026-10-02 — o ficheiro e o índice descodificado
-        // coexistiam em RAM no arranque). `None` = não é o formato corrente:
-        // cai no caminho de compatibilidade abaixo, que só corre uma vez.
+        // v7 exige replay dos formatos anteriores: estes podem conter
+        // postings de _agent/_kind forjados por atributos do cliente.
+        // CRC e descodificação continuam em streaming.
         match Self::abrir_corrente_em_streaming(&path) {
-            Ok(Some(Some(inner))) => {
-                return (
-                    AttrIndex {
-                        inner,
-                        dirty: Default::default(),
-                    },
-                    AberturaCheckpoint::Carregado,
-                )
-            }
-            Ok(Some(None)) => return (AttrIndex::new(), AberturaCheckpoint::Ilegivel),
-            Ok(None) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return (AttrIndex::new(), AberturaCheckpoint::Ausente)
-            }
-            Err(e) => return (AttrIndex::new(), AberturaCheckpoint::ErroIo(e.to_string())),
-        }
-        match std::fs::read(&path) {
-            Ok(bytes) => {
-                // v2 (comprimido) traz magic; v1 (bincode cru) não. Ler os dois
-                // não é cortesia: sem isto, o primeiro arranque depois desta
-                // mudança deitava fora um checkpoint válido e reconstruía o
-                // índice inteiro por replay — correto, mas caro e silencioso.
-                let snap = if bytes.starts_with(MAGIC_V2) {
-                    match bytes.get(4..6).map(|v| u16::from_le_bytes([v[0], v[1]])) {
-                        Some(FORMAT_CURRENT) => {
-                            // R89: o CRC é verificado ANTES de descodificar. Um
-                            // corpo corrompido descodifica-se sem erro e serve
-                            // postings errados (ver `FORMAT_CURRENT`); verificar
-                            // depois seria verificar tarde de mais. Tudo por
-                            // `get(..)` — o ficheiro pode ter < 10 bytes.
-                            let crc_lido = bytes
-                                .get(6..CABECALHO_V6)
-                                .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]));
-                            let corpo = bytes.get(CABECALHO_V6..);
-                            match (crc_lido, corpo) {
-                                (Some(crc_lido), Some(corpo))
-                                    if crc_lido == crc32_ieee(&[&bytes[4..6], corpo]) =>
-                                {
-                                    bincode::serde::decode_from_slice::<CompressedSnapshot, _>(
-                                        corpo,
-                                        BINCODE_CFG,
-                                    )
-                                    .ok()
-                                    .and_then(|(snapshot, _)| snapshot.expand())
-                                }
-                                // CRC não bate (ou cabeçalho truncado): cai no
-                                // `None` -> índice vazio -> rebuild por replay.
-                                _ => None,
-                            }
-                        }
-                        // v5: escrita por uma versão que nunca calculou CRC.
-                        // Aceite de propósito — ver `FORMAT_CURRENT`, ponto (a).
-                        Some(FORMAT_V5_SEM_CRC) => {
-                            bincode::serde::decode_from_slice::<CompressedSnapshot, _>(
-                                &bytes[6..],
-                                BINCODE_CFG,
-                            )
-                            .ok()
-                            .and_then(|(snapshot, _)| snapshot.expand())
-                        }
-                        Some(FORMAT_LEGACY_COMPRESSED) => {
-                            bincode::serde::decode_from_slice::<LegacyCompressedSnapshot, _>(
-                                &bytes[6..],
-                                BINCODE_CFG,
-                            )
-                            .ok()
-                            .and_then(|(snapshot, _)| snapshot.expand())
-                            .and_then(ResidentSnapshot::from_legacy)
-                        }
-                        _ => None,
-                    }
-                } else {
-                    bincode::serde::decode_from_slice::<LegacySnapshot, _>(&bytes, BINCODE_CFG)
-                        .ok()
-                        .and_then(|(snapshot, _)| ResidentSnapshot::from_legacy(snapshot))
-                };
-                match snap {
-                    Some(inner) => (
-                        AttrIndex {
-                            inner,
-                            dirty: Default::default(),
-                        },
-                        AberturaCheckpoint::Carregado,
-                    ),
-                    // Corrompido / formato desconhecido -> rebuild por replay.
-                    None => (AttrIndex::new(), AberturaCheckpoint::Ilegivel),
-                }
-            }
-            // "Não existe" é o primeiro arranque e NÃO é um aviso. Qualquer
-            // outro erro (permissão negada, EIO) é sintoma de disco a morrer e
-            // não pode ser confundido com um log virgem.
+            Ok(Some(Some(inner))) => (
+                AttrIndex {
+                    inner,
+                    dirty: Default::default(),
+                },
+                AberturaCheckpoint::Carregado,
+            ),
+            Ok(Some(None)) => (AttrIndex::new(), AberturaCheckpoint::Ilegivel),
+            Ok(None) => (AttrIndex::new(), AberturaCheckpoint::Ilegivel),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 (AttrIndex::new(), AberturaCheckpoint::Ausente)
             }
@@ -1471,6 +1350,10 @@ impl View for AttrIndex {
         }
 
         for (field, value) in &event.attrs {
+            // Também no replay: logs anteriores podem ter atributos forjados.
+            if matches!(field.as_str(), "_agent" | "_kind") {
+                continue;
+            }
             let v = value.trim();
             // A MESMA decisão que `valor_indexavel` — e agora é literalmente
             // ela, para o índice e a consulta nunca divergirem sobre o que está
@@ -1987,7 +1870,7 @@ mod compressao_tests {
     }
 
     #[test]
-    fn save_grava_v6_com_crc_verificavel() {
+    fn save_grava_v7_com_crc_verificavel() {
         let dir = tempfile::tempdir().unwrap();
         indice_com(10).save(dir.path()).unwrap();
         let bytes = std::fs::read(dir.path().join(SNAPSHOT_FILE)).unwrap();
@@ -2010,11 +1893,9 @@ mod compressao_tests {
         assert_ne!(crc_gravado, 0, "CRC de um corpo real nao e zero");
     }
 
-    /// Protege a decisão de compatibilidade do R89: v5 (sem CRC) continua a
-    /// ser lida. Sem este teste, uma "limpeza" futura que exija CRC a todas as
-    /// versões passa despercebida e custa um replay total a toda a gente.
+    /// Checkpoints sem o isolamento de pseudo-campos exigem replay.
     #[test]
-    fn checkpoint_v5_sem_crc_continua_a_ser_lido() {
+    fn checkpoint_v5_sem_crc_exige_replay() {
         let dir = tempfile::tempdir().unwrap();
         let original = indice_com(1_000);
         let corpo =
@@ -2026,37 +1907,31 @@ mod compressao_tests {
         bytes.extend_from_slice(&corpo);
         std::fs::write(dir.path().join(SNAPSHOT_FILE), bytes).unwrap();
 
-        let lido = AttrIndex::open(dir.path());
-        assert_eq!(
-            lido.lookup("campo", "valor"),
-            original.lookup("campo", "valor"),
-            "v5 sem CRC tem de continuar legivel"
-        );
-        assert_eq!(lido.watermark(), original.watermark());
-        assert_eq!(lido.fields(), original.fields());
+        let (lido, status) = AttrIndex::open_reportando(dir.path());
+        assert_eq!(status, AberturaCheckpoint::Ilegivel);
+        assert!(!lido.has_applied());
+        assert!(lido.fields().is_empty());
     }
 
     /// Sem isto, o primeiro arranque depois desta mudanca deitava fora um
     /// checkpoint valido e reconstruia o indice inteiro por replay -- correto,
     /// mas caro e silencioso.
     #[test]
-    fn checkpoint_v1_legado_continua_a_ser_lido() {
+    fn checkpoint_v1_legado_exige_replay() {
         let dir = tempfile::tempdir().unwrap();
         let ix = indice_com(200);
         // Grava no formato ANTIGO: bincode cru, sem magic.
         let cru = bincode::serde::encode_to_vec(ix.inner.to_legacy(), BINCODE_CFG).unwrap();
         std::fs::write(dir.path().join(SNAPSHOT_FILE), &cru).unwrap();
 
-        let lido = AttrIndex::open(dir.path());
-        assert_eq!(
-            lido.lookup("campo", "valor").len(),
-            200,
-            "v1 tem de continuar legivel"
-        );
+        let (lido, status) = AttrIndex::open_reportando(dir.path());
+        assert_eq!(status, AberturaCheckpoint::Ilegivel);
+        assert!(!lido.has_applied());
+        assert!(lido.fields().is_empty());
     }
 
     #[test]
-    fn checkpoint_v4_comprimido_continua_a_ser_lido() {
+    fn checkpoint_v4_comprimido_exige_replay() {
         let dir = tempfile::tempdir().unwrap();
         let original = indice_com(5_000);
         let legacy = original.inner.to_legacy();
@@ -2068,14 +1943,10 @@ mod compressao_tests {
         bytes.extend_from_slice(&body);
         std::fs::write(dir.path().join(SNAPSHOT_FILE), bytes).unwrap();
 
-        let restored = AttrIndex::open(dir.path());
-        assert_eq!(restored.watermark(), original.watermark());
-        assert_eq!(
-            restored.lookup("campo", "valor"),
-            original.lookup("campo", "valor")
-        );
-        assert_eq!(restored.fields(), original.fields());
-        assert_eq!(restored.field_values("seq"), original.field_values("seq"));
+        let (restored, status) = AttrIndex::open_reportando(dir.path());
+        assert_eq!(status, AberturaCheckpoint::Ilegivel);
+        assert!(!restored.has_applied());
+        assert!(restored.fields().is_empty());
     }
 
     #[test]

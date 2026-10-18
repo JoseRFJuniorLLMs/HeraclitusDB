@@ -106,16 +106,36 @@ pub struct Edge {
     /// bincode antigos do tgraph — o restore degrada para replay (correto por
     /// construção, estado derivado).
     #[serde(default)]
-    pub closed_intervals: Vec<(Lsn, Lsn)>,
+    pub closed_intervals: Vec<EdgeInterval>,
+}
+
+/// Uma vida da aresta: transaction time e valid time pertencem à mesma versão.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct EdgeInterval {
+    pub from_lsn: Lsn,
+    pub to_lsn: Option<Lsn>,
+    pub world_valid_from: Option<u64>,
+    pub world_valid_to: Option<u64>,
 }
 
 impl Edge {
     pub fn alive_at(&self, at: Lsn) -> bool {
-        (self.valid_from_lsn <= at && self.valid_to_lsn.is_none_or(|to| at < to))
-            || self
-                .closed_intervals
-                .iter()
-                .any(|(from, to)| *from <= at && at < *to)
+        self.interval_at(at).is_some()
+    }
+
+    pub fn interval_at(&self, at: Lsn) -> Option<EdgeInterval> {
+        if self.valid_from_lsn <= at && self.valid_to_lsn.is_none_or(|to| at < to) {
+            return Some(EdgeInterval {
+                from_lsn: self.valid_from_lsn,
+                to_lsn: self.valid_to_lsn,
+                world_valid_from: self.world_valid_from,
+                world_valid_to: self.world_valid_to,
+            });
+        }
+        self.closed_intervals
+            .iter()
+            .copied()
+            .find(|v| v.from_lsn <= at && v.to_lsn.is_none_or(|to| at < to))
     }
 
     /// O facto que a aresta representa é válido NO MUNDO em `t`?
@@ -372,16 +392,19 @@ impl TemporalGraph {
         entry.sort_by(|a, b| a.hypothesis_id.cmp(&b.hypothesis_id));
 
         // A topologia (adjacência + Edge) regista-se uma única vez; o `edge_id`
-        // é determinístico (from→to#etype), logo estável entre replays.
+        // codifica a tupla com comprimentos, logo estável entre replays.
         // R12: um assert sobre uma aresta FECHADA reabre-a num novo intervalo,
         // arquivando o anterior em `closed_intervals` — antes era no-op
         // silencioso e a relação ficava morta para sempre. Idempotente: um
         // assert sobre aresta ABERTA continua a ser no-op topológico.
         if let Some(existing) = self.edges.get_mut(&edge.id) {
             if let Some(closed_at) = existing.valid_to_lsn {
-                existing
-                    .closed_intervals
-                    .push((existing.valid_from_lsn, closed_at));
+                existing.closed_intervals.push(EdgeInterval {
+                    from_lsn: existing.valid_from_lsn,
+                    to_lsn: Some(closed_at),
+                    world_valid_from: existing.world_valid_from,
+                    world_valid_to: existing.world_valid_to,
+                });
                 existing.valid_from_lsn = edge.valid_from_lsn;
                 existing.valid_to_lsn = None;
                 existing.world_valid_from = edge.world_valid_from;
@@ -455,9 +478,9 @@ impl TemporalGraph {
                         Some(e) => e,
                         None => continue,
                     };
-                    if !edge.alive_at(as_of) {
+                    let Some(interval) = edge.interval_at(as_of) else {
                         continue;
-                    }
+                    };
                     let belief = self.belief_at(eid, as_of);
                     if belief < min_confidence {
                         continue;
@@ -467,8 +490,8 @@ impl TemporalGraph {
                         to: edge.to.clone(),
                         etype: t.clone(),
                         belief,
-                        weight: belief * decay(lambda, edge.valid_from_lsn, as_of),
-                        lsn: edge.valid_from_lsn,
+                        weight: belief * decay(lambda, interval.from_lsn, as_of),
+                        lsn: interval.from_lsn,
                     });
                 }
             }
@@ -540,9 +563,9 @@ impl TemporalGraph {
         let mut consider = |edge: &Edge| {
             #[cfg(test)]
             ARESTAS_TOCADAS.with(|c| c.set(c.get() + 1));
-            if !edge.alive_at(as_of) {
+            let Some(interval) = edge.interval_at(as_of) else {
                 return;
-            }
+            };
             if let Some(want) = etype {
                 if *want != edge.etype {
                     return;
@@ -563,8 +586,8 @@ impl TemporalGraph {
                 to: edge.to.clone(),
                 etype: edge.etype.clone(),
                 belief,
-                world_valid_from: edge.world_valid_from,
-                world_valid_to: edge.world_valid_to,
+                world_valid_from: interval.world_valid_from,
+                world_valid_to: interval.world_valid_to,
             });
         };
         // Origem fixa → adjacência de saída; senão destino fixo → adjacência de
@@ -982,7 +1005,15 @@ impl TemporalGraph {
     /// `edge_id` determinístico de uma aresta `from -[etype]-> to`. Estável entre
     /// replays e plataformas (alimenta o `state_hash`).
     pub fn edge_id(from: &str, to: &str, etype: &EdgeType) -> EdgeId {
-        format!("{from}->{to}#{}", etype.key())
+        let kind = etype.key();
+        // v2: tamanhos em bytes tornam a tupla injetiva mesmo com delimitadores
+        // ou Unicode nos campos. Checkpoints v1 são reconstruídos do log.
+        format!(
+            "e2:{}:{from}{}:{to}{}:{kind}",
+            from.len(),
+            to.len(),
+            kind.len()
+        )
     }
 
     /// Fecha a aresta (M9: mutação temporal). Define `valid_to_lsn` se ainda
@@ -1137,31 +1168,83 @@ impl TemporalGraph {
     /// inserção. Não usa `Debug` (formato não-contratual) — usa `etype.key()`.
     pub fn state_hash(&self) -> [u8; 32] {
         let mut h = blake3::Hasher::new();
-        for (id, e) in &self.edges {
-            h.update(id.as_bytes());
-            h.update(e.from.as_bytes());
-            h.update(e.to.as_bytes());
-            h.update(e.etype.key().as_bytes());
-            h.update(&e.valid_from_lsn.to_le_bytes());
-            h.update(&e.valid_to_lsn.unwrap_or(u64::MAX).to_le_bytes());
-            // R12: os intervalos fechados fazem parte do estado determinístico.
-            for (from, to) in &e.closed_intervals {
-                h.update(&from.to_le_bytes());
-                h.update(&to.to_le_bytes());
-            }
+        h.update(b"heraclitus-temporal-state-v2");
+        fn text(h: &mut blake3::Hasher, s: &str) {
+            h.update(&(s.len() as u64).to_le_bytes());
+            h.update(s.as_bytes());
         }
-        for (id, vs) in &self.versions {
-            h.update(id.as_bytes());
-            for v in vs {
-                h.update(v.hypothesis_id.as_bytes());
-                h.update(&v.confidence.to_le_bytes());
-                h.update(v.source.as_bytes());
-                h.update(&v.polarity.to_le_bytes());
-                h.update(&v.valid_from_lsn.to_le_bytes());
-                for prov in &v.provenance {
-                    h.update(prov.as_bytes());
+        fn optional(h: &mut blake3::Hasher, value: Option<u64>) {
+            match value {
+                None => {
+                    h.update(&[0]);
+                }
+                Some(v) => {
+                    h.update(&[1]);
+                    h.update(&v.to_le_bytes());
                 }
             }
+        }
+        h.update(&self.policy.version.to_le_bytes());
+        h.update(&self.policy.eps.to_le_bytes());
+        h.update(&(self.edges.len() as u64).to_le_bytes());
+        for (id, e) in &self.edges {
+            text(&mut h, id);
+            text(&mut h, &e.id);
+            text(&mut h, &e.from);
+            text(&mut h, &e.to);
+            text(&mut h, &e.etype.key());
+            h.update(&e.valid_from_lsn.to_le_bytes());
+            optional(&mut h, e.valid_to_lsn);
+            optional(&mut h, e.world_valid_from);
+            optional(&mut h, e.world_valid_to);
+            h.update(&(e.closed_intervals.len() as u64).to_le_bytes());
+            for v in &e.closed_intervals {
+                h.update(&v.from_lsn.to_le_bytes());
+                optional(&mut h, v.to_lsn);
+                optional(&mut h, v.world_valid_from);
+                optional(&mut h, v.world_valid_to);
+            }
+        }
+        h.update(&(self.versions.len() as u64).to_le_bytes());
+        for (id, vs) in &self.versions {
+            text(&mut h, id);
+            h.update(&(vs.len() as u64).to_le_bytes());
+            for v in vs {
+                text(&mut h, &v.hypothesis_id);
+                h.update(&v.confidence.to_le_bytes());
+                text(&mut h, &v.source);
+                h.update(&v.polarity.to_le_bytes());
+                h.update(&v.valid_from_lsn.to_le_bytes());
+                h.update(&(v.provenance.len() as u64).to_le_bytes());
+                for prov in &v.provenance {
+                    text(&mut h, prov);
+                }
+            }
+        }
+        // Mapas e métricas também alteram respostas públicas do grafo.
+        h.update(&(self.entity_map.len() as u64).to_le_bytes());
+        for (id, mappings) in &self.entity_map {
+            text(&mut h, id);
+            h.update(&(mappings.len() as u64).to_le_bytes());
+            for m in mappings {
+                text(&mut h, &m.entity_id);
+                h.update(&m.confidence.to_le_bytes());
+                text(&mut h, &m.source);
+                h.update(&(m.provenance.len() as u64).to_le_bytes());
+                for p in &m.provenance {
+                    text(&mut h, p);
+                }
+                h.update(&m.valid_from_lsn.to_le_bytes());
+                optional(&mut h, m.valid_to_lsn);
+            }
+        }
+        h.update(&(self.metrics.len() as u64).to_le_bytes());
+        for (id, m) in &self.metrics {
+            text(&mut h, id);
+            h.update(&m.degree.to_le_bytes());
+            h.update(&m.centrality.to_le_bytes());
+            h.update(&m.anomaly_score.to_le_bytes());
+            h.update(&m.computed_at_lsn.to_le_bytes());
         }
         *h.finalize().as_bytes()
     }
@@ -1183,16 +1266,16 @@ impl heraclitus_views::View for TemporalGraph {
     }
 
     fn checkpoint(&self, dir: &std::path::Path) -> Result<(), heraclitus_core::HeraclitusError> {
-        heraclitus_views::ckpt::save(dir, "tgraph", self)
+        heraclitus_views::ckpt::save(dir, "tgraph", &(*b"HTGR0002", self))
     }
 
     fn restore(&mut self, dir: &std::path::Path) -> Result<bool, heraclitus_core::HeraclitusError> {
-        match heraclitus_views::ckpt::load::<TemporalGraph>(dir, "tgraph")? {
-            Some(g) => {
+        match heraclitus_views::ckpt::load::<([u8; 8], TemporalGraph)>(dir, "tgraph")? {
+            Some((version, g)) if version == *b"HTGR0002" => {
                 *self = g;
                 Ok(true)
             }
-            None => Ok(false),
+            _ => Ok(false),
         }
     }
 
@@ -2169,8 +2252,8 @@ mod testes_match_por_destino {
                 e.to.clone(),
                 e.etype.clone(),
                 belief.to_bits(),
-                e.world_valid_from,
-                e.world_valid_to,
+                e.interval_at(as_of).unwrap().world_valid_from,
+                e.interval_at(as_of).unwrap().world_valid_to,
             ));
         }
         out

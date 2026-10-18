@@ -1828,6 +1828,7 @@ impl QueryBackend for LogBackend {
             let s = match v {
                 Value::Str(s) => s.clone(),
                 Value::Num(n) => n.to_string(),
+                Value::Int(n) => n.to_string(),
             };
             e.attrs.insert(k.clone(), s);
         }

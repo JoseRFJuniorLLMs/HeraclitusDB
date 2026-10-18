@@ -9,6 +9,21 @@ use heraclitus_core::{
 };
 use heraclitus_crypto::KeyStore;
 use heraclitus_index_attr::{AberturaCheckpoint, AttrIndex};
+
+fn validar_namespace_do_indice(
+    episode: &heraclitus_core::Episode,
+) -> Result<(), heraclitus_core::HeraclitusError> {
+    if episode
+        .attrs
+        .keys()
+        .any(|k| matches!(k.as_str(), "_agent" | "_kind"))
+    {
+        return Err(heraclitus_core::HeraclitusError::Query(
+            "atributos _agent e _kind são reservados ao envelope do índice".into(),
+        ));
+    }
+    Ok(())
+}
 use heraclitus_index_graph::entity::EntityResolver;
 use heraclitus_index_graph::temporal::TemporalGraph;
 use heraclitus_index_graph::GraphIndex;
@@ -1901,8 +1916,24 @@ impl Engine {
     /// frames H-VM, sem `AgentEvidence`) para as duas vias contarem o mesmo.
     fn lsns_do_agente(&self, agent_id: &str) -> Result<(Vec<Lsn>, bool), HeraclitusError> {
         if heraclitus_index_attr::agente_indexavel(agent_id) {
-            let attr = self.attr.read().unwrap();
-            return Ok((attr.lookup("_agent", agent_id).to_vec(), false));
+            let candidates = self
+                .attr
+                .read()
+                .unwrap()
+                .lookup("_agent", agent_id)
+                .to_vec();
+            let mut lsns = Vec::with_capacity(candidates.len());
+            for lsn in candidates {
+                if let Some((_, ep)) = self.log.read(lsn)? {
+                    if ep.agent_id == agent_id
+                        && !matches!(&ep.kind, EventKind::Custom(k) if k == "AgentEvidence")
+                        && !vm_bridge::is_hvm(&ep)
+                    {
+                        lsns.push(lsn);
+                    }
+                }
+            }
+            return Ok((lsns, false));
         }
         let head = self.log.head();
         let mut lsns = Vec::new();
@@ -2708,6 +2739,7 @@ impl Engine {
     /// dentro do append, e um item reservado falhava depois de os anteriores
     /// já estarem gravados, com o mesmo código de erro de uma recusa à entrada.
     pub fn validar_append(&self, episode: &Episode, key: &str) -> Result<(), HeraclitusError> {
+        validar_namespace_do_indice(episode)?;
         if episode.agent_id == "heraclitus-admin"
             || matches!(&episode.kind, EventKind::Custom(k) if k == "AdminIntent" || k == "AdminResult")
         {
@@ -2768,6 +2800,7 @@ impl Engine {
     }
 
     pub fn append(&self, episode: Episode) -> Result<Lsn, HeraclitusError> {
+        validar_namespace_do_indice(&episode)?;
         if episode.agent_id == "heraclitus-admin"
             || matches!(&episode.kind, EventKind::Custom(k) if k == "AdminIntent" || k == "AdminResult")
         {
@@ -2824,6 +2857,7 @@ impl Engine {
         episode: Episode,
         key: &str,
     ) -> Result<(Lsn, bool, String), HeraclitusError> {
+        validar_namespace_do_indice(&episode)?;
         if episode.agent_id == "heraclitus-admin"
             || matches!(&episode.kind, EventKind::Custom(k) if k == "AdminIntent" || k == "AdminResult")
         {
@@ -3714,7 +3748,7 @@ impl QueryBackend for Engine {
         // como resposta final, devolvendo zero linhas sobre dados existentes.
         // Recuar para o varrimento é a resposta certa; o pós-filtro do planner
         // faz o resto.
-        if !heraclitus_index_attr::valor_indexavel(value) {
+        if value != value.trim() || !heraclitus_index_attr::valor_indexavel(value) {
             return Ok(None);
         }
         // Auditoria recursiva 2026-10-03, iteração 1: `WHERE n.kind =
@@ -3936,7 +3970,11 @@ impl QueryBackend for Engine {
         };
         let mut candidatos: Vec<(Lsn, f32)>;
         loop {
-            let hits = self.vector.read().unwrap().search(&dims, fetch, 128, None);
+            let hits = self
+                .vector
+                .read()
+                .unwrap()
+                .search_as_of(&dims, fetch, 128, None, as_of);
             let devolvidos = hits.len();
             candidatos = hits
                 .into_iter()
@@ -3951,11 +3989,16 @@ impl QueryBackend for Engine {
         }
         // Merge the memtable tail (exact) for read-your-own-writes.
         let mem = self.memtable.knn(&self.metric, &dims, fetch);
-        for m in mem.into_iter().filter(|m| in_snapshot(m.lsn)) {
+        let visibility = self.vector.read().unwrap();
+        for m in mem
+            .into_iter()
+            .filter(|m| in_snapshot(m.lsn) && visibility.event_visible_at(&m.id, as_of))
+        {
             if !candidatos.iter().any(|(lsn, _)| *lsn == m.lsn) {
                 candidatos.push((m.lsn, m.score));
             }
         }
+        drop(visibility);
         candidatos.sort_by(|a, b| a.1.total_cmp(&b.1));
         let mut out = Vec::with_capacity(k.min(candidatos.len()));
         for (lsn, dist) in candidatos {
@@ -4131,6 +4174,7 @@ impl QueryBackend for Engine {
             let s = match v {
                 GqlValue::Str(s) => s.clone(),
                 GqlValue::Num(n) => n.to_string(),
+                GqlValue::Int(n) => n.to_string(),
             };
             attrs.insert(k.clone(), s);
         }

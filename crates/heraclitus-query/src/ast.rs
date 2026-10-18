@@ -152,6 +152,8 @@ pub enum Operand {
     Prop(String, String),
     Ident(String),
     Num(f64),
+    /// Inteiros fora da faixa exata de f64 conservam os bits do literal.
+    Int(serde_json::Number),
     Str(String),
     /// Distância do embedding do nó ao vetor literal (Variedade Produto).
     Dist(DistKind, Vec<f32>),
@@ -199,11 +201,21 @@ pub enum RetItem {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Num(f64),
+    Int(serde_json::Number),
     Str(String),
 }
 
 fn perr(msg: impl Into<String>) -> HeraclitusError {
     HeraclitusError::Query(msg.into())
+}
+
+fn large_integer_literal(s: &str) -> Option<serde_json::Number> {
+    let integer = s.parse::<i128>().ok()?;
+    if integer > -(1i128 << 53) && integer < (1i128 << 53) {
+        return None;
+    }
+    let number = s.parse::<serde_json::Number>().ok()?;
+    (!number.is_f64()).then_some(number)
 }
 
 fn unquote(s: &str) -> String {
@@ -720,7 +732,12 @@ fn build_create(pair: Pair<Rule>) -> Result<CreateStmt, HeraclitusError> {
                         let val = it.next().ok_or_else(|| perr("bad pair"))?;
                         let value = match val.as_rule() {
                             Rule::string => Value::Str(unquote(val.as_str())),
-                            _ => Value::Num(val.as_str().parse().map_err(|_| perr("bad number"))?),
+                            _ => match large_integer_literal(val.as_str()) {
+                                Some(n) => Value::Int(n),
+                                None => Value::Num(
+                                    val.as_str().parse().map_err(|_| perr("bad number"))?,
+                                ),
+                            },
                         };
                         c.props.push((key, value));
                     }
@@ -758,7 +775,10 @@ fn build_operand(pair: Pair<Rule>) -> Result<Operand, HeraclitusError> {
             let (a, b) = split_prop(inner.as_str())?;
             Operand::Prop(a, b)
         }
-        Rule::number => Operand::Num(inner.as_str().parse().map_err(|_| perr("bad number"))?),
+        Rule::number => match large_integer_literal(inner.as_str()) {
+            Some(n) => Operand::Int(n),
+            None => Operand::Num(inner.as_str().parse().map_err(|_| perr("bad number"))?),
+        },
         Rule::string => Operand::Str(unquote(inner.as_str())),
         Rule::dist_fn => {
             let (kind, vector) = build_dist_fn(inner)?;
