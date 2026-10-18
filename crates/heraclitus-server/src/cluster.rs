@@ -675,6 +675,147 @@ mod tests {
         }
     }
 
+    /// GATE B3 (auditoria 2026-10-16): `AS OF TIMESTAMP` num cluster de 3
+    /// servidores responde como num nó autónomo.
+    ///
+    /// Antes, o caminho replicado gravava `ts_hlc = 0` em todos os episódios, e
+    /// o `lsn_for_timestamp` devolvia sempre o head: um corte entre dois lotes
+    /// via os dois lotes. Agora a máquina de estados carimba no apply, e o
+    /// corte vê só o primeiro lote em todos os nós, como no autónomo.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn as_of_timestamp_no_cluster_igual_ao_no_autonomo() {
+        fn agora_ms() -> u64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+        }
+        fn linhas_as_of(e: &Engine, ts_ms: u64) -> usize {
+            heraclitus_query::execute(&format!("MATCH (n) AS OF TIMESTAMP {ts_ms} RETURN n"), e)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len()
+        }
+        let pausa = || tokio::time::sleep(Duration::from_millis(30));
+
+        let addrs: Vec<String> = (0..3).map(|_| free_addr()).collect();
+        let peers: BTreeMap<u64, String> = (0..3).map(|i| (i as u64, addrs[i].clone())).collect();
+        let mut engines: Vec<Arc<Engine>> = Vec::new();
+        let mut tasks: Vec<ClusterTasks> = Vec::new();
+        let mut dirs = Vec::new();
+        for id in 0..3u64 {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = HeraclitusConfig {
+                data_dir: dir.path().to_path_buf(),
+                fsync: FsyncPolicy::Always,
+                replication: Some(ReplicationConfig {
+                    node_id: id,
+                    raft_addr: addrs[id as usize].clone(),
+                    peers: peers.clone(),
+                    bootstrap: id == 0,
+                    raft_dir: dir.path().join("raft"),
+                    sm_dir: dir.path().join("raft-sm"),
+                    transport: RaftTransport::Tcp,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let engine = Arc::new(Engine::open(&cfg).unwrap());
+            let (handle, t) = spawn(&engine, cfg.replication.as_ref().unwrap(), &cfg.data_dir)
+                .await
+                .unwrap();
+            engine.set_replication(handle);
+            engines.push(engine);
+            tasks.push(t);
+            dirs.push(dir);
+        }
+        let dir_autonomo = tempfile::tempdir().unwrap();
+        let autonomo = Arc::new(
+            Engine::open(&HeraclitusConfig {
+                data_dir: dir_autonomo.path().to_path_buf(),
+                fsync: FsyncPolicy::Always,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+
+        // Primeira escrita só para haver líder: o relógio de antes fica a
+        // seguir, sem a eleição pelo meio.
+        write_via_cluster(&engines, obs("alice", "aquecimento")).await;
+        autonomo.append(obs("alice", "aquecimento")).unwrap();
+        pausa().await;
+        let antes_ms = agora_ms();
+        pausa().await;
+        for i in 0..3 {
+            write_via_cluster(&engines, obs("alice", &format!("lote A {i}"))).await;
+            autonomo
+                .append(obs("alice", &format!("lote A {i}")))
+                .unwrap();
+        }
+        pausa().await;
+        let corte_ms = agora_ms();
+        pausa().await;
+        for i in 0..3 {
+            write_via_cluster(&engines, obs("alice", &format!("lote B {i}"))).await;
+            autonomo
+                .append(obs("alice", &format!("lote B {i}")))
+                .unwrap();
+        }
+        for _ in 0..50 {
+            if engines.iter().all(|e| e.log.head() == 7) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let ts_de = |e: &Engine| -> Vec<u64> {
+            e.log
+                .scan(0, u64::MAX)
+                .unwrap()
+                .iter()
+                .map(|(_, ep)| ep.ts_hlc)
+                .collect()
+        };
+        let ts0 = ts_de(&engines[0]);
+        assert_eq!(ts0.len(), 7, "nó 0 não replicou tudo");
+        assert!(ts0.iter().all(|t| *t > 0), "ts_hlc a 0 no cluster: {ts0:?}");
+        assert!(
+            ts0.windows(2).all(|w| w[0] < w[1]),
+            "ts não monótono: {ts0:?}"
+        );
+        for (i, e) in engines.iter().enumerate() {
+            assert_eq!(ts_de(e), ts0, "nó {i} carimbou diferente do nó 0");
+        }
+
+        // As mesmas três perguntas, a cada nó do cluster e ao autónomo: antes
+        // do lote A (só o aquecimento), no corte entre os lotes (aquecimento +
+        // A), e muito depois (tudo).
+        let longe_ms = agora_ms() + 1_000_000;
+        let esperado = [1usize, 4, 7];
+        let autonomo_viu = [
+            linhas_as_of(&autonomo, antes_ms),
+            linhas_as_of(&autonomo, corte_ms),
+            linhas_as_of(&autonomo, longe_ms),
+        ];
+        assert_eq!(autonomo_viu, esperado, "o próprio autónomo");
+        for (i, e) in engines.iter().enumerate() {
+            let viu = [
+                linhas_as_of(e, antes_ms),
+                linhas_as_of(e, corte_ms),
+                linhas_as_of(e, longe_ms),
+            ];
+            assert_eq!(
+                viu, autonomo_viu,
+                "nó {i}: AS OF TIMESTAMP difere do autónomo"
+            );
+        }
+
+        for t in tasks {
+            t.abort();
+        }
+    }
+
     /// Como o milestone acima, mas com **transporte gRPC** (`RaftTransport::Grpc`):
     /// 3 servidores formam o cluster pela superfície gRPC, replicam o log e
     /// indexam (query GQL devolve os dados em TODOS) — prova o wiring do toggle

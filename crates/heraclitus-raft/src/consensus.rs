@@ -9,8 +9,11 @@
 //! no fundo deste ficheiro. A tese do SPEC-015 é preservada por construção:
 //!
 //! - **Só bytes de episódios viajam** (`AppData = Vec<u8>` — o bincode do
-//!   `Episode`, exatamente o que o log grava em disco). Nenhuma view, matriz
-//!   ou índice atravessa a rede.
+//!   `Episode`, exatamente o que o log grava em disco, dentro de um envelope
+//!   que só acrescenta o relógio do líder; ver [`episode_bytes`]). Nenhuma
+//!   view, matriz ou índice atravessa a rede.
+//! - **O `ts_hlc` é carimbado no apply, igual em todos os nós**:
+//!   `max(ts_anterior + 1, relógio_da_entrada)`. Ver [`carimbo_deterministico`].
 //! - **Cada nó aplica ao seu próprio `heraclitus_log::Log`** via
 //!   `append_replicated` (LSN denso local) e hidrata as suas views localmente
 //!   — soberania local absoluta.
@@ -52,9 +55,10 @@ use std::sync::{Arc, Mutex};
 const BINCODE_CFG: bincode::config::Configuration = bincode::config::standard();
 
 openraft::declare_raft_types!(
-    /// Config de tipos do cluster Heraclitus: a app data é o bincode cru do
-    /// `Episode` (os mesmos bytes do log em disco) e a resposta é o LSN denso
-    /// que o nó atribuiu ao aplicar.
+    /// Config de tipos do cluster Heraclitus: a app data é o bincode do
+    /// `Episode` (os mesmos bytes do log em disco) no envelope de
+    /// [`episode_bytes`], e a resposta é o LSN denso que o nó atribuiu ao
+    /// aplicar.
     pub TypeConfig:
         D = Vec<u8>,
         R = u64,
@@ -185,6 +189,11 @@ struct SmState {
     normals: u64,
     /// Transiente: quantos re-appends de Normal saltar por já estarem em disco.
     skip_normals: u64,
+    /// Transiente: o `ts_hlc` do último episódio do log, o "anterior" do
+    /// [`carimbo_deterministico`]. `None` = por ler: relê-se da cauda do log
+    /// no apply seguinte (arranque, `install_snapshot`, `skip_normals`). Não
+    /// vai para o `sm_meta`: o log é a verdade, e é igual em todos os nós.
+    ultimo_ts: Option<u64>,
     current_snapshot: Option<(SnapshotMeta<NodeId, BasicNode>, Vec<u8>)>,
 }
 
@@ -198,9 +207,10 @@ struct SmMeta {
 }
 
 /// A máquina de estados do consenso É o log de episódios local: aplicar uma
-/// entrada Normal = decodificar o `Episode` e fazer `append_replicated` com o
-/// próximo LSN denso. Entradas Blank/Membership não produzem episódios — por
-/// isso os LSNs dos episódios ficam densos mesmo com ruído de eleição no meio.
+/// entrada Normal = decodificar o `Episode`, carimbar-lhe o `ts_hlc`
+/// ([`carimbo_deterministico`]) e fazer `append_replicated` com o próximo LSN
+/// denso. Entradas Blank/Membership não produzem episódios — por isso os LSNs
+/// dos episódios ficam densos mesmo com ruído de eleição no meio.
 ///
 /// Com `sm_dir = Some(_)` a máquina é DURÁVEL: grava `(applied, membership,
 /// normals)` num sidecar a cada batch de apply e recupera-o no restart. O log de
@@ -301,6 +311,7 @@ impl EpisodeStateMachine {
                 snapshot_idx: meta.snapshot_idx,
                 normals: meta.normals,
                 skip_normals,
+                ultimo_ts: None,
                 current_snapshot: None,
             })),
             sm_dir: Some(sm_dir),
@@ -355,6 +366,24 @@ impl EpisodeStateMachine {
         // `FileRaftLog`: sem isto um crash pode reverter o `applied` recuperado.
         crate::durable::fsync_dir(dir);
         Ok(())
+    }
+
+    /// O `ts_hlc` do último episódio do log (0 num log vazio): o "anterior"
+    /// do carimbo quando a máquina ainda não o tem em memória. Todos os
+    /// episódios do log vieram do raft (`open_durable` recusa um log com
+    /// escritas locais), logo esta cauda é a mesma em todos os nós.
+    fn ts_da_cauda(&self, head: heraclitus_core::Lsn) -> Result<u64, String> {
+        if head == 0 {
+            return Ok(0);
+        }
+        match self.log.read(head - 1) {
+            Ok(Some((_, ep))) => Ok(ep.ts_hlc),
+            Ok(None) => Err(format!(
+                "cauda do log ilegível: o LSN {} (head {head}) não existe",
+                head - 1
+            )),
+            Err(e) => Err(format!("cauda do log ilegível: {e}")),
+        }
     }
 
     fn io_err(e: impl std::fmt::Display) -> openraft::AnyError {
@@ -456,34 +485,39 @@ impl RaftStateMachine<TypeConfig> for EpisodeStateMachine {
                         // (aplicado num crash antes de o meta ser gravado). Salta
                         // o append — idempotência que evita duplicar episódios.
                         st.skip_normals -= 1;
+                        // O episódio saltado já tem o seu carimbo em disco; o
+                        // anterior do próximo carimbo relê-se da cauda.
+                        st.ultimo_ts = None;
                         st.normals - 1 // o LSN denso que este episódio já tem
                     } else {
-                        let (ep, _): (Episode, usize) =
-                            bincode::serde::decode_from_slice(bytes, BINCODE_CFG).map_err(|e| {
-                                StorageError::from(StorageIOError::apply(
-                                    entry.log_id,
-                                    Self::io_err(e),
-                                ))
-                            })?;
+                        let falha = |e: String| {
+                            StorageError::from(StorageIOError::apply(entry.log_id, Self::io_err(e)))
+                        };
+                        let (mut ep, relogio) = decode_entrada(bytes).map_err(falha)?;
                         let lsn = self.log.head();
+                        let anterior = match st.ultimo_ts {
+                            Some(ts) => ts,
+                            None => self.ts_da_cauda(lsn).map_err(falha)?,
+                        };
+                        // Uma entrada antiga (sem envelope) não traz relógio:
+                        // conta o `ts_hlc` que o episódio trouxer, tipicamente 0.
+                        ep.ts_hlc = carimbo_deterministico(anterior, relogio.unwrap_or(ep.ts_hlc));
+                        let ts = ep.ts_hlc;
                         // Só clonamos quando há hook (o host quer indexar). O
-                        // hook corre síncrono com o apply ⇒ read-your-writes.
+                        // hook corre síncrono com o apply ⇒ read-your-writes,
+                        // e recebe o episódio JÁ carimbado (a activation usa
+                        // `ts_hlc >> 16` como instante de acesso).
                         if let Some(hook) = &self.on_apply {
-                            self.log.append_replicated(lsn, ep.clone()).map_err(|e| {
-                                StorageError::from(StorageIOError::apply(
-                                    entry.log_id,
-                                    Self::io_err(e),
-                                ))
-                            })?;
+                            self.log
+                                .append_replicated(lsn, ep.clone())
+                                .map_err(|e| falha(e.to_string()))?;
                             hook(lsn, &ep);
                         } else {
-                            self.log.append_replicated(lsn, ep).map_err(|e| {
-                                StorageError::from(StorageIOError::apply(
-                                    entry.log_id,
-                                    Self::io_err(e),
-                                ))
-                            })?;
+                            self.log
+                                .append_replicated(lsn, ep)
+                                .map_err(|e| falha(e.to_string()))?;
                         }
+                        st.ultimo_ts = Some(ts);
                         lsn
                     }
                 }
@@ -520,6 +554,10 @@ impl RaftStateMachine<TypeConfig> for EpisodeStateMachine {
                 .map_err(|e| StorageError::from(StorageIOError::read(Self::io_err(e))))?;
         // O log local é append-only: instalar = acrescentar apenas os episódios
         // que ainda faltam (o prefixo já presente é, por determinismo, igual).
+        // Os episódios do snapshot vêm do log do líder JÁ carimbados pelo
+        // apply dele, que é o carimbo que este nó teria calculado: grava-se tal
+        // como vem, sem re-carimbar e sem envelope (o snapshot leva episódios
+        // do log, não entradas do raft).
         for (i, ep_bytes) in payload.iter().enumerate() {
             let lsn = i as u64;
             if lsn < self.log.head() {
@@ -547,6 +585,8 @@ impl RaftStateMachine<TypeConfig> for EpisodeStateMachine {
         // um snapshot recém-instalado não deixa nada por saltar.
         st.normals = self.log.head();
         st.skip_normals = 0;
+        // A cauda mudou por fora do apply: o anterior do próximo carimbo relê-se.
+        st.ultimo_ts = None;
         st.current_snapshot = Some((meta.clone(), bytes));
         self.persist_sm_meta(&st)?;
         Ok(())
@@ -771,10 +811,104 @@ pub async fn spawn_node_durable(
     spawn_node_with(id, log, router, config, store, sm).await
 }
 
-/// Serializa um episódio para o formato que viaja no consenso (o mesmo bincode
-/// do disco — a rede transporta apenas bytes do log, SPEC-015).
+// ─────────────────────────────────────────────────────────────────────────
+// Entrada Normal: envelope com o relógio do líder + carimbo no apply
+// ─────────────────────────────────────────────────────────────────────────
+//
+// Auditoria 2026-10-16, B3: o caminho replicado nunca carimbava o HLC. O
+// `append_replicated` preserva o `ts_hlc` recebido, e o que chegava era o
+// `Episode::new` cru, com 0. Resultado: `ts_hlc = 0` em todos os nós, `AS OF
+// TIMESTAMP` a devolver sempre o head, a activation a registar tudo no
+// instante 0, `min/max_hlc` dos segmentos a 0.
+//
+// Carimbar no líder antes de propor não chega: propostas concorrentes entram
+// no raft-log por uma ordem que não é a dos carimbos, e o `ts` deixava de ser
+// monótono por índice raft (logo por LSN). Por isso o líder só põe o relógio
+// físico na entrada, e é a máquina de estados que carimba, no apply, em ordem
+// de índice e com a mesma regra em todos os nós.
+
+/// Abertura do envelope v1 de uma entrada Normal.
+///
+/// O primeiro byte é `0xFF`, que nunca abre o bincode de um `Episode`: o
+/// primeiro campo (`id`, um ULID) começa com um varint, e no formato
+/// `standard()` do bincode um varint começa em `0..=250` ou num dos marcadores
+/// `251..=254`; o `255` não é usado. Uma entrada antiga, o bincode cru do
+/// episódio como viajava até aqui, distingue-se assim sem ambiguidade e
+/// continua a aplicar (ver [`decode_entrada`]).
+const ENVELOPE_MAGIC: [u8; 4] = [0xFF, b'H', b'T', b'S'];
+const ENVELOPE_V1: u8 = 1;
+/// magic (4) + versão (1) + relógio do líder, u64 little-endian (8).
+const ENVELOPE_HEADER: usize = 13;
+
+/// O relógio físico deste nó no layout do HLC (`ms << 16`, contador a 0).
+fn relogio_fisico_hlc() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.as_millis() as u64) << 16)
+        .unwrap_or(0)
+}
+
+/// Serializa um episódio para o formato que viaja no consenso: o bincode do
+/// disco (a rede transporta apenas bytes do log, SPEC-015) num envelope que
+/// lhe junta o relógio físico de quem propõe. Só o líder consegue propor (um
+/// seguidor recebe `ForwardToLeader` e a entrada não existe), logo o relógio
+/// que fica no raft-log é o do líder.
+///
+/// O `ts_hlc` do episódio não conta, tal como no `append` autónomo: quem o
+/// carimba é a máquina de estados, no apply ([`carimbo_deterministico`]).
 pub fn episode_bytes(ep: &Episode) -> Vec<u8> {
-    bincode::serde::encode_to_vec(ep, BINCODE_CFG).expect("Episode é sempre serializável")
+    episode_bytes_com_relogio(ep, relogio_fisico_hlc())
+}
+
+/// Como [`episode_bytes`], com o relógio dado (layout do HLC, `ms << 16`).
+pub fn episode_bytes_com_relogio(ep: &Episode, relogio_hlc: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ENVELOPE_HEADER + 64 + ep.content.len());
+    out.extend_from_slice(&ENVELOPE_MAGIC);
+    out.push(ENVELOPE_V1);
+    out.extend_from_slice(&relogio_hlc.to_le_bytes());
+    bincode::serde::encode_into_std_write(ep, &mut out, BINCODE_CFG)
+        .expect("Episode é sempre serializável");
+    out
+}
+
+/// Decodifica uma entrada Normal em `(episódio, relógio do líder)`. Uma
+/// entrada antiga, sem envelope, não traz relógio (`None`).
+///
+/// Um envelope de versão desconhecida é erro, e não um fallback: aplicar uma
+/// entrada que este nó não entende divergiria dos nós que a entendem.
+fn decode_entrada(bytes: &[u8]) -> Result<(Episode, Option<u64>), String> {
+    let decode = |b: &[u8]| {
+        bincode::serde::decode_from_slice::<Episode, _>(b, BINCODE_CFG)
+            .map(|(ep, _)| ep)
+            .map_err(|e| e.to_string())
+    };
+    if bytes.first() != Some(&ENVELOPE_MAGIC[0]) {
+        return Ok((decode(bytes)?, None));
+    }
+    if bytes.len() < ENVELOPE_HEADER || bytes[..ENVELOPE_MAGIC.len()] != ENVELOPE_MAGIC {
+        return Err("entrada raft com envelope truncado ou magic inválido".into());
+    }
+    if bytes[4] != ENVELOPE_V1 {
+        return Err(format!(
+            "entrada raft com envelope v{} (este nó só conhece o v{ENVELOPE_V1})",
+            bytes[4]
+        ));
+    }
+    let relogio = u64::from_le_bytes(bytes[5..ENVELOPE_HEADER].try_into().expect("8 bytes"));
+    Ok((decode(&bytes[ENVELOPE_HEADER..])?, Some(relogio)))
+}
+
+/// O carimbo do apply: `max(ts_anterior + 1, relógio_da_entrada)`.
+///
+/// É o `Hlc::now` com o relógio físico local trocado pelo da entrada. Depende
+/// só do estado replicado (o `ts_hlc` do episódio anterior no log) e da entrada
+/// (o relógio que o líder lá pôs), logo dá o MESMO valor em todos os nós, e é
+/// estritamente crescente por LSN, o contrato de que `lsn_for_timestamp` (AS OF
+/// TIMESTAMP) depende. Um líder novo com o relógio atrasado não faz o `ts`
+/// recuar: avança o contador lógico até o relógio físico o alcançar. Satura em
+/// `u64::MAX` em vez de dar a volta, como o `Hlc::now`.
+pub fn carimbo_deterministico(anterior: u64, relogio_da_entrada: u64) -> u64 {
+    relogio_da_entrada.max(anterior.saturating_add(1))
 }
 
 // ── API de alto nível para hosts (ex.: heraclitus-server) ────────────────────
@@ -1578,5 +1712,235 @@ mod tests {
             &nodes[follower_id as usize].log
         )
         .unwrap());
+    }
+
+    // ── B3 (auditoria 2026-10-16): carimbo determinístico do ts_hlc ──────────
+
+    fn ts_de(log: &AnyLog) -> Vec<u64> {
+        log.scan(0, u64::MAX)
+            .unwrap()
+            .iter()
+            .map(|(_, e)| e.ts_hlc)
+            .collect()
+    }
+
+    fn log_temporario() -> (tempfile::TempDir, Arc<AnyLog>) {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                crate::formato_de_teste(),
+                dir.path(),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        (dir, log)
+    }
+
+    /// Entrada Normal com índice raft `idx` (termo 1, líder 0).
+    fn normal(idx: u64, bytes: Vec<u8>) -> Entry<TypeConfig> {
+        Entry {
+            log_id: LogId::new(openraft::CommittedLeaderId::new(1, 0), idx),
+            payload: EntryPayload::Normal(bytes),
+        }
+    }
+
+    /// Relógio em ms no layout do HLC.
+    fn ms(m: u64) -> u64 {
+        m << 16
+    }
+
+    /// GATE B3: a sonda `sonda_ts_hlc_replicado` da auditoria com a asserção
+    /// invertida. Antes os 5 episódios tinham `ts_hlc = [0,0,0,0,0]` nos três
+    /// nós. Agora: > 0, estritamente crescentes, iguais nos três, e com o
+    /// relógio físico do momento da escrita.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ts_hlc_replicado_carimbado_monotono_e_igual_nos_tres_nos() {
+        let (nodes, _router, _dirs) = three_nodes().await;
+        wait_leader(&nodes).await;
+        let antes = relogio_fisico_hlc();
+        let mut last = 0;
+        for i in 0..5 {
+            let (_d, idx) = write_to_leader(&nodes, episode_bytes(&ep(i))).await;
+            last = idx;
+        }
+        let depois = relogio_fisico_hlc();
+        wait_all_applied(&nodes, last).await;
+
+        let ts0 = ts_de(&nodes[0].log);
+        assert_eq!(ts0.len(), 5);
+        assert!(ts0.iter().all(|t| *t > 0), "ts_hlc a 0: {ts0:?}");
+        assert!(
+            ts0.windows(2).all(|w| w[0] < w[1]),
+            "ts_hlc não estritamente crescente por LSN: {ts0:?}"
+        );
+        // Nada aqui avança o contador lógico 65536 vezes no mesmo ms, por isso
+        // o campo físico fica dentro da janela das escritas.
+        assert!(
+            ts0.iter()
+                .all(|t| (antes >> 16) <= (t >> 16) && (t >> 16) <= (depois >> 16)),
+            "ts_hlc fora do relógio físico [{antes}, {depois}]: {ts0:?}"
+        );
+        for n in &nodes[1..] {
+            assert_eq!(ts_de(&n.log), ts0, "nó {} carimbou diferente do nó 0", n.id);
+        }
+        assert!(logs_equivalent(&nodes[0].log, &nodes[1].log).unwrap());
+        assert!(logs_equivalent(&nodes[1].log, &nodes[2].log).unwrap());
+    }
+
+    /// A regra `max(anterior + 1, relógio)` aplicada por duas máquinas
+    /// independentes às mesmas entradas dá os mesmos carimbos, e um relógio que
+    /// recua ou repete (líder novo atrasado, ou duas propostas no mesmo ms) não
+    /// faz o ts recuar: avança o contador lógico. O `ts_hlc` que o episódio
+    /// traga dentro do envelope não conta.
+    #[tokio::test]
+    async fn carimbo_deterministico_com_relogio_a_recuar() {
+        let relogios = [ms(1000), ms(900), ms(1000), ms(5000), ms(5000)];
+        // As MESMAS entradas para os dois nós (cada `ep(i)` tem um ULID novo).
+        let entradas: Vec<Entry<TypeConfig>> = relogios
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let mut e = ep(i as u64);
+                e.ts_hlc = u64::MAX / 2; // o proponente não manda no carimbo
+                normal(i as u64 + 1, episode_bytes_com_relogio(&e, *r))
+            })
+            .collect();
+        let esperado = vec![ms(1000), ms(1000) + 1, ms(1000) + 2, ms(5000), ms(5000) + 1];
+
+        let (_da, log_a) = log_temporario();
+        let (_db, log_b) = log_temporario();
+        let mut a = EpisodeStateMachine::new(log_a.clone());
+        let mut b = EpisodeStateMachine::new(log_b.clone());
+        // Lotes diferentes nos dois nós: o carimbo não pode depender de como o
+        // openraft agrupa as entradas.
+        a.apply(entradas.clone()).await.unwrap();
+        b.apply(entradas[..2].to_vec()).await.unwrap();
+        b.apply(entradas[2..].to_vec()).await.unwrap();
+
+        assert_eq!(ts_de(&log_a), esperado);
+        assert_eq!(ts_de(&log_b), esperado);
+        assert!(logs_equivalent(&log_a, &log_b).unwrap());
+    }
+
+    /// Compatibilidade: uma entrada gravada antes do envelope (o bincode cru do
+    /// episódio, num raft-log durável ou em trânsito) continua a aplicar, e é
+    /// carimbada pela mesma regra com o `ts_hlc` que trouxer como relógio. Um
+    /// envelope de versão desconhecida falha alto em vez de aplicar às cegas.
+    #[tokio::test]
+    async fn entrada_antiga_sem_envelope_continua_a_aplicar() {
+        let antiga = |i: u64| bincode::serde::encode_to_vec(ep(i), BINCODE_CFG).unwrap();
+        assert_ne!(
+            antiga(0)[0],
+            ENVELOPE_MAGIC[0],
+            "o bincode de um Episode não pode abrir com o byte do envelope"
+        );
+
+        let (_d, log) = log_temporario();
+        let mut sm = EpisodeStateMachine::new(log.clone());
+        sm.apply(vec![
+            normal(1, antiga(0)),
+            normal(2, episode_bytes_com_relogio(&ep(1), ms(7000))),
+            normal(3, antiga(2)),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(ts_de(&log), vec![1, ms(7000), ms(7000) + 1]);
+        let conteudos: Vec<Vec<u8>> = log
+            .scan(0, u64::MAX)
+            .unwrap()
+            .into_iter()
+            .map(|(_, e)| e.content)
+            .collect();
+        assert_eq!(
+            conteudos,
+            vec![
+                b"acked-0".to_vec(),
+                b"acked-1".to_vec(),
+                b"acked-2".to_vec()
+            ]
+        );
+
+        let mut futuro = episode_bytes_com_relogio(&ep(3), ms(8000));
+        futuro[4] = 2;
+        assert!(
+            sm.apply(vec![normal(4, futuro)]).await.is_err(),
+            "envelope v2 aplicado por um nó que só conhece o v1"
+        );
+        assert_eq!(log.head(), 3, "nada aplicado da entrada recusada");
+    }
+
+    /// Depois de um restart o "anterior" relê-se da cauda do log, incluindo
+    /// quando há re-aplicações a saltar (`skip_normals`: episódios em disco
+    /// cujo meta não chegou a ser gravado). O episódio saltado mantém o
+    /// carimbo que já tinha, e o seguinte continua a sequência a partir dele.
+    #[tokio::test]
+    async fn carimbo_retoma_da_cauda_depois_de_restart_com_skip_normals() {
+        let root = tempfile::tempdir().unwrap();
+        let sm_dir = root.path().join("sm");
+        let (_d, log) = log_temporario();
+
+        let e1 = normal(1, episode_bytes_com_relogio(&ep(0), ms(1000)));
+        let e2 = normal(2, episode_bytes_com_relogio(&ep(1), ms(2000)));
+        let e3 = normal(3, episode_bytes_com_relogio(&ep(2), ms(3000)));
+        let e4 = normal(4, episode_bytes_com_relogio(&ep(3), ms(10)));
+
+        {
+            let mut sm = EpisodeStateMachine::open_durable(log.clone(), &sm_dir).unwrap();
+            sm.apply(vec![e1, e2]).await.unwrap();
+            std::fs::copy(sm_dir.join("sm_meta.bin"), root.path().join("meta-2")).unwrap();
+            sm.apply(vec![e3.clone()]).await.unwrap();
+        }
+        assert_eq!(ts_de(&log), vec![ms(1000), ms(2000), ms(3000)]);
+        // Crash simulado: o episódio 3 ficou em disco, o meta ficou no 2.
+        std::fs::copy(root.path().join("meta-2"), sm_dir.join("sm_meta.bin")).unwrap();
+
+        let mut sm = EpisodeStateMachine::open_durable(log.clone(), &sm_dir).unwrap();
+        // O openraft re-entrega o 3 (saltado) e depois o 4, com um relógio muito
+        // atrasado: tem de ficar logo a seguir ao carimbo do 3, que está no log.
+        let lsns = sm.apply(vec![e3, e4]).await.unwrap();
+        assert_eq!(lsns, vec![2, 3]);
+        assert_eq!(
+            ts_de(&log),
+            vec![ms(1000), ms(2000), ms(3000), ms(3000) + 1]
+        );
+    }
+
+    /// `install_snapshot` grava os episódios com os carimbos do líder, e o
+    /// próximo apply no nó que instalou continua a sequência exatamente como
+    /// no líder: os dois ficam iguais também depois do snapshot. O seguidor já
+    /// tinha aplicado um prefixo antes do snapshot, por isso o "anterior" que
+    /// tinha em memória fica velho com a instalação e tem de ser relido.
+    #[tokio::test]
+    async fn install_snapshot_preserva_carimbos_e_o_seguinte_continua_igual() {
+        let entradas: Vec<Entry<TypeConfig>> = (0..5)
+            .map(|i| normal(i + 1, episode_bytes_com_relogio(&ep(i), ms(100 + i))))
+            .collect();
+        let (_ds, src_log) = log_temporario();
+        let mut src = EpisodeStateMachine::new(src_log.clone());
+        src.apply(entradas.clone()).await.unwrap();
+        let snap = src
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+
+        let (_dd, dst_log) = log_temporario();
+        let mut dst = EpisodeStateMachine::new(dst_log.clone());
+        dst.apply(entradas[..2].to_vec()).await.unwrap();
+        dst.install_snapshot(&snap.meta, snap.snapshot)
+            .await
+            .unwrap();
+        assert_eq!(ts_de(&dst_log), ts_de(&src_log), "snapshot re-carimbou");
+
+        // A entrada seguinte, com relógio atrasado, nos dois nós.
+        let seguinte = normal(6, episode_bytes_com_relogio(&ep(5), ms(1)));
+        src.apply(vec![seguinte.clone()]).await.unwrap();
+        dst.apply(vec![seguinte]).await.unwrap();
+        assert_eq!(*ts_de(&src_log).last().unwrap(), ms(104) + 1);
+        assert_eq!(ts_de(&dst_log), ts_de(&src_log));
+        assert!(logs_equivalent(&src_log, &dst_log).unwrap());
     }
 }
