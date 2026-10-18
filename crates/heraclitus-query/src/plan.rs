@@ -676,13 +676,21 @@ mod numeric_regressions_g4 {
             (i128::from(i64::MIN), i64::MIN as f64, Equal),
             ((1i128 << 53) + 1, (1u64 << 53) as f64, Greater),
             (-(1i128 << 53) - 1, -((1u64 << 53) as f64), Less),
-            (0, -0.0, Equal), (2, 2.5, Less), (-2, -2.5, Greater),
+            (0, -0.0, Equal),
+            (2, 2.5, Less),
+            (-2, -2.5, Greater),
             (i128::MAX, -(i128::MIN as f64), Less),
             (i128::MIN, i128::MIN as f64, Equal),
         ];
         for (integer, float, expected) in cases {
-            assert_eq!(cmp_numeric(Numeric::Int(integer), Numeric::Float(float)), Some(expected));
-            assert_eq!(cmp_numeric(Numeric::Float(float), Numeric::Int(integer)), Some(expected.reverse()));
+            assert_eq!(
+                cmp_numeric(Numeric::Int(integer), Numeric::Float(float)),
+                Some(expected)
+            );
+            assert_eq!(
+                cmp_numeric(Numeric::Float(float), Numeric::Int(integer)),
+                Some(expected.reverse())
+            );
         }
         assert!(cmp_json(&json!(u64::MAX), &json!(u64::MAX - 1), Cmp::Gt));
         // Duas strings continuam lexicográficas (identificadores com zeros).
