@@ -58,7 +58,18 @@ Regressões encontradas e corrigidas na integração:
   só um ficheiro curto contar como "não é deste formato"; confirmado no WSL
   (falha com o código anterior, passa com a correção).
 - Como o `cargo test --workspace` do CI pára no primeiro crate que falha, a
-  suíte completa (`--all-features --no-fail-fast`) foi também corrida no WSL.
+  suíte completa (`--all-features --no-fail-fast`) foi também corrida no WSL
+  (Ubuntu, toolchain 1.96.0): **2239 aprovados, 3 reprovados**, nenhum por
+  regressão desta versão:
+  - `heraclitus-qualifier` (2): o Git do WSL não resolve o `gitdir` de um
+    worktree criado no Windows (`/mnt/d/.../D:/DEV/...`). Ambiente.
+  - `heraclitus-server::agent_plane::um_ficheiro_sem_as_seccoes_da_o_default_desligado`:
+    flake anterior a esta versão. Outro teste do mesmo binário punha
+    `HERACLITUS_AGENT_CAPTURE_MODE=tudo` no ambiente do processo e, em
+    paralelo, este lia-o. Corrigido: `apply_env` passa a ler o ambiente por
+    uma função injetável (`apply_env_com`) e o teste deixou de usar `set_var`.
+  - `heraclitus-client::grpc_roundtrip` ficou bloqueado no WSL e foi
+    interrompido; no CI (Linux) passa em 0,3 s.
 
 ## Não coberto localmente
 

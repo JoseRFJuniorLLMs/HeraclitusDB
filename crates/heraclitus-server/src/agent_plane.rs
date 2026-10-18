@@ -70,15 +70,26 @@ impl AgentPlane {
     }
 
     fn apply_env(&mut self) -> Result<(), HeraclitusError> {
+        self.apply_env_com(|k| std::env::var(k).ok())
+    }
+
+    /// [`Self::apply_env`] com a leitura do ambiente injectada. Os testes usam
+    /// isto em vez de `std::env::set_var`: o ambiente é do PROCESSO, e um teste
+    /// que lá pusesse `HERACLITUS_AGENT_CAPTURE_MODE=tudo` fazia falhar, em
+    /// paralelo, qualquer outro teste que carregasse o plano (`load`, `serve`).
+    fn apply_env_com(
+        &mut self,
+        var: impl Fn(&str) -> Option<String>,
+    ) -> Result<(), HeraclitusError> {
         let truthy =
             |v: &str| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes");
-        if let Ok(v) = std::env::var("HERACLITUS_AGENT_ENABLED") {
+        if let Some(v) = var("HERACLITUS_AGENT_ENABLED") {
             self.black_box.enabled = truthy(&v);
         }
-        if let Ok(v) = std::env::var("HERACLITUS_AGENT_TENANT") {
+        if let Some(v) = var("HERACLITUS_AGENT_TENANT") {
             self.black_box.tenant_id = v;
         }
-        if let Ok(v) = std::env::var("HERACLITUS_AGENT_CAPTURE_MODE") {
+        if let Some(v) = var("HERACLITUS_AGENT_CAPTURE_MODE") {
             if heraclitus_agent::evidence::CaptureModeV1::parse(&v).is_none() {
                 return Err(HeraclitusError::Config(format!(
                     "HERACLITUS_AGENT_CAPTURE_MODE=`{v}` não existe \
@@ -87,37 +98,37 @@ impl AgentPlane {
             }
             self.black_box.capture_mode = v;
         }
-        if let Ok(v) = std::env::var("HERACLITUS_AGENT_OTLP_HTTP_ADDR") {
+        if let Some(v) = var("HERACLITUS_AGENT_OTLP_HTTP_ADDR") {
             self.black_box.otlp.http_addr = v;
         }
-        if let Ok(v) = std::env::var("HERACLITUS_AGENT_OTLP_GRPC_ADDR") {
+        if let Some(v) = var("HERACLITUS_AGENT_OTLP_GRPC_ADDR") {
             self.black_box.otlp.grpc_addr = v;
         }
-        if let Ok(v) = std::env::var("HERACLITUS_AGENT_CONSOLE_ADDR") {
+        if let Some(v) = var("HERACLITUS_AGENT_CONSOLE_ADDR") {
             self.black_box.console.addr = v;
         }
         // A credencial partilhada. Deliberadamente NAO ha default: uma senha
         // por omissao seria uma porta aberta com aparencia de fechada.
-        if let Ok(v) = std::env::var("HERACLITUS_AGENT_CONSOLE_BASIC_AUTH") {
+        if let Some(v) = var("HERACLITUS_AGENT_CONSOLE_BASIC_AUTH") {
             self.black_box.console.basic_auth = v;
         }
-        if let Ok(v) = std::env::var("HERACLITUS_AGENT_OTLP_REQUIRE_AUTH") {
+        if let Some(v) = var("HERACLITUS_AGENT_OTLP_REQUIRE_AUTH") {
             self.black_box.otlp.require_auth = truthy(&v);
         }
-        if let Ok(v) = std::env::var("HERACLITUS_AGENT_GATEWAY_ENABLED") {
+        if let Some(v) = var("HERACLITUS_AGENT_GATEWAY_ENABLED") {
             self.gateway.enabled = truthy(&v);
         }
-        if let Ok(v) = std::env::var("HERACLITUS_AGENT_GATEWAY_MODE") {
+        if let Some(v) = var("HERACLITUS_AGENT_GATEWAY_MODE") {
             self.gateway.mode = GatewayMode::parse(&v).ok_or_else(|| {
                 HeraclitusError::Config(format!(
                     "HERACLITUS_AGENT_GATEWAY_MODE=`{v}` não existe (observe|shadow|enforce)"
                 ))
             })?;
         }
-        if let Ok(v) = std::env::var("HERACLITUS_AGENT_GATEWAY_UPSTREAM") {
+        if let Some(v) = var("HERACLITUS_AGENT_GATEWAY_UPSTREAM") {
             self.gateway.upstream_url = v;
         }
-        if let Ok(v) = std::env::var("HERACLITUS_AGENT_POLICY") {
+        if let Some(v) = var("HERACLITUS_AGENT_POLICY") {
             self.gateway.policy.active = v;
         }
         Ok(())
@@ -312,10 +323,11 @@ upstream_url = "http://mcp:9000"
     #[test]
     fn capture_mode_invalido_no_ambiente_e_recusado() {
         let mut plane = AgentPlane::default();
-        // SAFETY: teste de processo único; a variável é removida a seguir.
-        unsafe { std::env::set_var("HERACLITUS_AGENT_CAPTURE_MODE", "tudo") };
-        let r = plane.apply_env();
-        unsafe { std::env::remove_var("HERACLITUS_AGENT_CAPTURE_MODE") };
+        // Sem `set_var`: os testes correm em paralelo no mesmo processo, e a
+        // variável fazia falhar `um_ficheiro_sem_as_seccoes_da_o_default_desligado`
+        // quando calhava entre o `set_var` e o `remove_var`.
+        let r =
+            plane.apply_env_com(|k| (k == "HERACLITUS_AGENT_CAPTURE_MODE").then(|| "tudo".into()));
         assert!(r.is_err());
     }
 
