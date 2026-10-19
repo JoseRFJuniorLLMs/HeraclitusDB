@@ -1215,7 +1215,7 @@ async fn serve_inner(
     );
     let grpc_listener = tokio::net::TcpListener::bind(grpc_addr).await?;
     let grpc_local = grpc_listener.local_addr()?;
-    let incoming = tonic::transport::server::TcpIncoming::from(grpc_listener);
+    let incoming = incoming_sem_nagle(grpc_listener);
     if let Some(ready) = ready {
         ready()?;
     }
@@ -1404,4 +1404,38 @@ fn instalar_guarda_de_soberania(
     let guarded = GuardedTsaClient::new(cliente, runtime, endpoint, "compliance-anchor-worker")
         .map_err(|e| HeraclitusError::Config(format!("guarda de egresso: {e}")))?;
     Ok(std::sync::Arc::new(guarded))
+}
+
+/// O `incoming` dos servidores gRPC deste crate (o principal e o Flight), com
+/// `TCP_NODELAY` nos sockets aceites.
+///
+/// `Server::tcp_nodelay(true)` só vale para o listener que o próprio tonic abre
+/// em `serve`. Com um listener nosso (`serve_with_incoming*`) a opção tem de ir
+/// no `TcpIncoming`. Sem ela o Nagle voltou a ligar-se nos sockets aceites
+/// (cda5ba5, 2026-10-02) e cada `Query` curta passou a esperar ~40 ms pelo ACK
+/// atrasado do cliente: o crash-loop de qualificação, que faz uma consulta por
+/// append confirmado, foi de ~1,5 para mais de 60 minutos e a v3.0.2 ficou sem
+/// binários.
+pub(crate) fn incoming_sem_nagle(
+    listener: tokio::net::TcpListener,
+) -> tonic::transport::server::TcpIncoming {
+    tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true))
+}
+
+#[cfg(test)]
+mod testes_incoming {
+    use tokio_stream::StreamExt as _;
+
+    #[tokio::test]
+    async fn os_sockets_aceites_pelo_grpc_tem_tcp_nodelay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut incoming = super::incoming_sem_nagle(listener);
+        let _cliente = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let aceite = incoming.next().await.unwrap().unwrap();
+        assert!(
+            aceite.nodelay().unwrap(),
+            "socket aceite com o Nagle ligado: cada resposta gRPC curta espera o ACK atrasado"
+        );
+    }
 }

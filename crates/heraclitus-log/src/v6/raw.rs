@@ -717,7 +717,25 @@ impl Percurso {
 /// linhas a partir dele e `read` devolvia `Ok(None)` para LSN confirmados. Agora
 /// o fim vem tipado ([`FimPercurso`]) e quem chama tem de decidir — num RAW
 /// selado, com [`Percurso::exigir_selado_completo`].
-pub fn percorrer_raw_segmento<F>(path: &Path, mut visitar: F) -> V6Result<Percurso>
+pub fn percorrer_raw_segmento<F>(path: &Path, visitar: F) -> V6Result<Percurso>
+where
+    F: FnMut(Lsn, u64, &[u8]) -> V6Result<ControloVarredura>,
+{
+    percorrer_raw_segmento_desde(path, None, visitar)
+}
+
+/// Como [`percorrer_raw_segmento`], mas a começar no offset `desde` — o início
+/// de um registo, tal como [`RawSegmentWriter::offset_of`] o devolve — em vez
+/// de no primeiro registo. O cabeçalho é lido e validado na mesma. Os registos
+/// antes de `desde` não são lidos nem contados em `registos`.
+///
+/// Um offset que não seja uma fronteira de registo não dá um registo errado:
+/// o CRC falha e o percurso acaba em [`FimPercurso::Rasgo`], como num rasgo.
+pub fn percorrer_raw_segmento_desde<F>(
+    path: &Path,
+    desde: Option<u64>,
+    mut visitar: F,
+) -> V6Result<Percurso>
 where
     F: FnMut(Lsn, u64, &[u8]) -> V6Result<ControloVarredura>,
 {
@@ -744,6 +762,13 @@ where
             fim,
         })
     };
+    if let Some(offset) = desde.filter(|&o| o > pos) {
+        if offset > tamanho {
+            return acabar(offset, registos, FimPercurso::Rasgo);
+        }
+        leitor.seek(SeekFrom::Start(offset))?;
+        pos = offset;
+    }
     let mut buf: Vec<u8> = Vec::with_capacity(RAW_RECORD_HEADER_LEN);
     loop {
         buf.clear();
