@@ -22,17 +22,38 @@ async fn grpc_roundtrip() {
         ..Default::default()
     };
 
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let server = tokio::spawn(heraclitus_server::serve(config, async {
-        let _ = stop_rx.await;
-    }));
+    // The console on an ephemeral port: the default `0.0.0.0:8080` is often
+    // taken on a developer machine, `serve` then fails, and the connect loop
+    // below used to wait forever.
+    let mut plane = heraclitus_server::agent_plane::AgentPlane::default();
+    plane.black_box.console.addr = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("127.0.0.1:{}", l.local_addr().unwrap().port())
+    };
 
-    // Connect with retry while the server boots.
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(heraclitus_server::serve_with_agent_plane(
+        config,
+        plane,
+        async {
+            let _ = stop_rx.await;
+        },
+    ));
+
+    // Connect with retry while the server boots — bounded, and failing with the
+    // reason if the server already gave up.
     let addr = format!("http://127.0.0.1:{grpc_port}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut client = loop {
         match Client::connect(addr.clone()).await {
             Ok(c) => break c,
-            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            Err(e) => {
+                assert!(
+                    !server.is_finished() && std::time::Instant::now() < deadline,
+                    "server never came up: {e}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await
+            }
         }
     };
 
