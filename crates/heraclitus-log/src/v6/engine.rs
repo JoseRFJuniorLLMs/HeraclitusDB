@@ -43,8 +43,9 @@ use super::manifest::{
 use super::packed::{open_packed, PackOptions, ScanCounters};
 use super::packer::{pack_segment, PackOutcome};
 use super::raw::{
-    find_raw_record, percorrer_raw_segmento, read_footer, read_sealing_footer, repair_active_tail,
-    scan_raw_segment, ControloVarredura, FimPercurso, RawSegmentWriter, SegmentInit,
+    find_raw_record, percorrer_raw_segmento, percorrer_raw_segmento_desde, read_footer,
+    read_sealing_footer, repair_active_tail, scan_raw_segment, ControloVarredura, FimPercurso,
+    RawSegmentWriter, SegmentInit,
 };
 use super::receipts::{persist_pack_receipt, physical_digest_of_file};
 use super::verify::{verify_segment as verify_segment_file, IntegrityLevel, VerifyReport};
@@ -313,6 +314,10 @@ struct InstantaneoVarredura {
     candidatos: Vec<CandidatoVarredura>,
     /// Caminho e primeiro LSN da cauda activa, no mesmo instante.
     cauda: Option<(PathBuf, Lsn)>,
+    /// Offset, na cauda activa, do primeiro registo da janela (`from`, ou o
+    /// primeiro LSN da cauda se a janela começar antes dela), se o writer o
+    /// conhecer. O percurso da cauda começa aqui em vez de no cabeçalho.
+    offset_cauda: Option<u64>,
     /// `next_lsn` no mesmo instante — o tecto de qualquer varredura.
     head: Lsn,
     /// Total de segmentos catalogados (estatística de poda).
@@ -1068,9 +1073,22 @@ impl V6Log {
             .active
             .as_ref()
             .map(|active| (active.path.clone(), active.writer.header().first_lsn));
+        // Release v3.0.2: uma janela pequena na cauda (o `MATCH (n) WHERE
+        // n.lsn = X` que o crash-loop do qualifier faz por cada append
+        // confirmado) lia a cauda inteira, desde o cabeçalho até ao EOF — até
+        // 8 MiB por consulta pontual, ~47 ms com 20 000 registos, e o gate de
+        // release a passar de ~1,5 para mais de 60 minutos. O writer sabe o
+        // offset de cada registo que escreveu; tirado aqui, sob o mesmo lock,
+        // o percurso começa no primeiro registo da janela.
+        let offset_cauda = state.active.as_ref().and_then(|active| {
+            active
+                .writer
+                .offset_of(from.max(active.writer.header().first_lsn))
+        });
         Ok(InstantaneoVarredura {
             candidatos,
             cauda,
+            offset_cauda,
             head,
             segmentos_total: state.manifest.segments_v2.len() as u64,
         })
@@ -1163,9 +1181,14 @@ impl V6Log {
                     // seguido de um filtro que deitava fora o que estava fora
                     // da janela. Com streaming só se copia o que entra no
                     // resultado, e o ficheiro deixa de ser lido além da janela.
-                    // Continua a percorrer-se além de `seg_to` (só `max` pára o
-                    // percurso) porque o `RawSegmentWriter` admite segmentos
-                    // esparsos e a filtragem anterior era independente da ordem.
+                    // Release v3.0.2: o percurso pára no primeiro LSN `>= seg_to`.
+                    // Antes continuava até ao fim do ficheiro (só `max` o parava),
+                    // para não depender da ordem dos registos num segmento
+                    // esparso; mas o motor só escreve LSN contíguos e crescentes,
+                    // e um segmento fora de ordem já não passa em silêncio: a
+                    // janela tem de sair contígua (`exigir_janela_completa`), ou
+                    // a varredura falha alto. Cada consulta pontual lia o resto
+                    // do segmento.
                     //
                     // O que A13 não escreveu, e a revisão de A55 obrigou a
                     // escrever: com esta troca a VARREDURA passa também a perder
@@ -1183,7 +1206,10 @@ impl V6Log {
                     // RAW selado que não chega ao footer com `record_count`
                     // registos é corrupção.
                     let percurso = percorrer_raw_segmento(path, |lsn, _hlc, payload| {
-                        if lsn < seg_from || lsn >= seg_to {
+                        if lsn >= seg_to {
+                            return Ok(ControloVarredura::Parar);
+                        }
+                        if lsn < seg_from {
                             return Ok(ControloVarredura::Continuar);
                         }
                         let mut episode = crate::decode_episode_payload_with_meta(
@@ -1250,39 +1276,50 @@ impl V6Log {
                     // mais varrido de todos (é sempre RAW e é onde o replay
                     // acaba sempre por bater) e era relida por inteiro a cada
                     // janela. Mesmo percurso em streaming dos selados.
-                    let percurso = match percorrer_raw_segmento(path, |lsn, _hlc, payload| {
-                        if lsn < seg_from || lsn >= end {
-                            return Ok(ControloVarredura::Continuar);
-                        }
-                        // Evitar duplicados caso já tenha sido incluído por um candidato selado
-                        if out.last().map(|(l, _)| *l >= lsn).unwrap_or(false) {
-                            return Ok(ControloVarredura::Continuar);
-                        }
-                        let mut episode = crate::decode_episode_payload_with_meta(
-                            crate::format::FORMAT_VERSION,
-                            payload,
-                        )?
-                        .episode;
-                        crate::decrypt_storage_episode_in_place(
-                            &mut episode,
-                            self.keystore.as_deref(),
-                        )?;
-                        out.push((lsn, episode));
-                        Ok(if out.len() >= max {
-                            ControloVarredura::Parar
-                        } else {
-                            ControloVarredura::Continuar
-                        })
-                    }) {
-                        Ok(percurso) => percurso,
-                        // O ficheiro deixou de existir: alguém selou a cauda
-                        // depois do instantâneo. Repetir com estado fresco — o
-                        // segmento está agora no catálogo, e é lá que os
-                        // registos aparecem.
-                        Err(_) if !path.exists() => return Err(TentativaFalhou::Rolou),
-                        Err(e) => return Err(TentativaFalhou::Erro(e)),
-                    };
-                    counters.bytes_physical_read += percurso.bytes;
+                    // Começa no offset do primeiro registo da janela (tirado no
+                    // instantâneo) e pára no primeiro LSN `>= end`: uma janela
+                    // pequena custa os seus registos, não a cauda inteira.
+                    let desde = instantaneo.offset_cauda;
+                    let percurso =
+                        match percorrer_raw_segmento_desde(path, desde, |lsn, _hlc, payload| {
+                            if lsn >= end {
+                                return Ok(ControloVarredura::Parar);
+                            }
+                            if lsn < seg_from {
+                                return Ok(ControloVarredura::Continuar);
+                            }
+                            // Evitar duplicados caso já tenha sido incluído por um candidato selado
+                            if out.last().map(|(l, _)| *l >= lsn).unwrap_or(false) {
+                                return Ok(ControloVarredura::Continuar);
+                            }
+                            let mut episode = crate::decode_episode_payload_with_meta(
+                                crate::format::FORMAT_VERSION,
+                                payload,
+                            )?
+                            .episode;
+                            crate::decrypt_storage_episode_in_place(
+                                &mut episode,
+                                self.keystore.as_deref(),
+                            )?;
+                            out.push((lsn, episode));
+                            Ok(if out.len() >= max {
+                                ControloVarredura::Parar
+                            } else {
+                                ControloVarredura::Continuar
+                            })
+                        }) {
+                            Ok(percurso) => percurso,
+                            // O ficheiro deixou de existir: alguém selou a cauda
+                            // depois do instantâneo. Repetir com estado fresco — o
+                            // segmento está agora no catálogo, e é lá que os
+                            // registos aparecem.
+                            Err(_) if !path.exists() => return Err(TentativaFalhou::Rolou),
+                            Err(e) => return Err(TentativaFalhou::Erro(e)),
+                        };
+                    // `percurso.bytes` é o offset onde o percurso acabou; o que
+                    // foi lido de facto começa em `desde`.
+                    counters.bytes_physical_read +=
+                        percurso.bytes.saturating_sub(desde.unwrap_or(0));
                     // Na cauda um `Rasgo` no fim é normal — pode ser o registo
                     // que outro append está a escrever agora, acima do `head`
                     // deste instantâneo. O que não pode faltar é nenhum LSN
@@ -4204,6 +4241,52 @@ mod tests {
         assert!(
             lidos < 4 * bytes_no_disco,
             "o replay em janelas de {JANELA} leu {lidos} bytes para {bytes_no_disco} bytes de segmentos"
+        );
+    }
+
+    /// Release v3.0.2: `MATCH (n) WHERE n.lsn = X` chega aqui como a janela
+    /// `[X, X+1)`, e o crash-loop do qualifier faz uma por cada append
+    /// confirmado. A cauda era lida desde o cabeçalho até ao EOF em cada uma —
+    /// ~47 ms com 20 000 registos, e o gate de release passou de ~1,5 para mais
+    /// de 60 minutos. Uma janela de um registo tem de custar ~um registo na
+    /// cauda (o writer sabe o offset) e, num RAW selado, parar no fim da janela.
+    #[test]
+    fn consulta_pontual_por_lsn_le_um_registo_e_nao_o_segmento() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
+        let n: u64 = 2_000;
+        for i in 0..n {
+            log.append(event(i)).unwrap();
+        }
+        let cauda = std::fs::read_dir(dir.path().join(SEGMENTS_DIR))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.to_string_lossy().ends_with(".active.hrkl"))
+            .unwrap();
+        let tamanho_cauda = std::fs::metadata(&cauda).unwrap().len();
+        for x in [0, 100, 1_000, n - 1] {
+            let (linhas, contadores) = log.varrer_com_contadores(x, x + 1, usize::MAX).unwrap();
+            assert_eq!(linhas.len(), 1);
+            assert_eq!(linhas[0].0, x);
+            assert!(
+                contadores.bytes_physical_read < 4096,
+                "a janela [{x}, {}) leu {} bytes de uma cauda de {tamanho_cauda}",
+                x + 1,
+                contadores.bytes_physical_read
+            );
+        }
+
+        log.seal_active().unwrap();
+        let selado = log.manifest().segments_v2[0].clone();
+        assert_eq!(selado.active().unwrap().layout, PhysicalLayout::Raw);
+        let tamanho_selado = selado.active().unwrap().physical_size;
+        let (linhas, contadores) = log.varrer_com_contadores(5, 6, usize::MAX).unwrap();
+        assert_eq!(linhas.len(), 1);
+        assert!(
+            contadores.bytes_physical_read < tamanho_selado / 20,
+            "a janela [5, 6) leu {} bytes de um RAW selado de {tamanho_selado}",
+            contadores.bytes_physical_read
         );
     }
 
