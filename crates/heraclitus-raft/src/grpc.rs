@@ -337,9 +337,7 @@ where
     // Um erro de `accept()` (ex.: EMFILE por exaustão de FDs sob carga) NÃO deve
     // terminar o serve — senão o nó cairia do cluster até restart, sem sinal. O
     // TCP puro (`net::serve`) já recua e continua; aqui saltamos o erro no stream.
-    use tokio_stream::StreamExt as _;
-    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener)
-        .filter_map(|r| r.ok().map(Ok::<_, std::io::Error>));
+    let incoming = incoming_sem_nagle(listener);
     let mut builder = tonic::transport::Server::builder();
     if let Some(tls) = tls {
         let server_tls = tonic::transport::ServerTlsConfig::new()
@@ -380,6 +378,24 @@ pub async fn spawn_node_grpc(
     spawn_node_grpc_on(id, log, config, bind_addr, MemRaftLog::default(), sm).await
 }
 
+/// Os sockets aceites pelo transporte gRPC do Raft, com `TCP_NODELAY`.
+///
+/// SPEC-0073 §31 — também do lado do servidor: o cliente (`net.rs`) já o liga,
+/// mas as respostas saíam por sockets aceites com o Nagle ligado, porque o
+/// `tcp_nodelay` do builder do tonic não se aplica a um listener nosso. Um erro
+/// de `accept()` é saltado em vez de terminar o serve (ver o chamador).
+fn incoming_sem_nagle(
+    listener: tokio::net::TcpListener,
+) -> impl tokio_stream::Stream<Item = Result<tokio::net::TcpStream, std::io::Error>> {
+    use tokio_stream::StreamExt as _;
+    tokio_stream::wrappers::TcpListenerStream::new(listener).filter_map(|r| {
+        r.ok().map(|s| {
+            let _ = s.set_nodelay(true);
+            Ok(s)
+        })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,6 +404,21 @@ mod tests {
     use heraclitus_core::{Episode, EventKind, FsyncPolicy};
     use std::collections::BTreeMap;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn os_sockets_aceites_pelo_transporte_tem_tcp_nodelay() {
+        use tokio_stream::StreamExt as _;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = incoming_sem_nagle(listener);
+        tokio::pin!(incoming);
+        let _cliente = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let aceite = incoming.next().await.unwrap().unwrap();
+        assert!(
+            aceite.nodelay().unwrap(),
+            "socket aceite pelo transporte Raft com o Nagle ligado"
+        );
+    }
 
     fn cfg() -> Arc<openraft::Config> {
         Arc::new(

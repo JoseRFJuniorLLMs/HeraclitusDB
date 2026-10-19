@@ -111,7 +111,7 @@ pub async fn spawn(
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| HeraclitusError::Config(format!("OTLP/gRPC em {addr}: {e}")))?;
-        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+        let incoming = incoming_sem_nagle(listener);
         let service = grpc::TraceServiceServer::new(grpc::AgentTraceService::new(runtime.clone()))
             .max_decoding_message_size(runtime.config.limits.max_body_bytes.max(1024));
         let sd = shutdown.clone();
@@ -168,4 +168,32 @@ pub async fn spawn(
     }
 
     Ok(AgentServices { handles })
+}
+
+/// Os sockets aceites pelo OTLP/gRPC, com `TCP_NODELAY`.
+///
+/// Um `TcpListenerStream` cru, ou o `tcp_nodelay` do builder do tonic (que só
+/// vale para o listener que o próprio tonic abre), deixa o Nagle ligado nos
+/// sockets aceites, e cada export OTLP curto esperava ~40 ms pelo ACK atrasado
+/// do cliente.
+fn incoming_sem_nagle(listener: tokio::net::TcpListener) -> tonic::transport::server::TcpIncoming {
+    tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true))
+}
+
+#[cfg(test)]
+mod testes_incoming {
+    use tokio_stream::StreamExt as _;
+
+    #[tokio::test]
+    async fn os_sockets_aceites_pelo_otlp_grpc_tem_tcp_nodelay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut incoming = super::incoming_sem_nagle(listener);
+        let _cliente = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let aceite = incoming.next().await.unwrap().unwrap();
+        assert!(
+            aceite.nodelay().unwrap(),
+            "socket aceite pelo OTLP/gRPC com o Nagle ligado"
+        );
+    }
 }

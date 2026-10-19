@@ -310,7 +310,7 @@ pub async fn serve_flight<L: EpisodeLog + 'static>(
             auth.authenticate(req)
         });
     let handle = tokio::spawn(async move {
-        let incoming = tonic::transport::server::TcpIncoming::from(listener);
+        let incoming = crate::incoming_sem_nagle(listener);
         let _ = tonic::transport::Server::builder()
             .add_service(svc)
             .serve_with_incoming(incoming)
