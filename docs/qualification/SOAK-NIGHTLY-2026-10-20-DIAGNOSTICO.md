@@ -4,12 +4,36 @@ Run: https://github.com/JoseRFJuniorLLMs/HeraclitusDB/actions/runs/39393746314
 (perfil `soak-nightly`, 900 s, carga `mixed`, 8 workers, commit da v3.0.3).
 
 **Resultado:** reprovado nos gates de RSS, threads e deriva do p99, com zero
-erros de operação e `verify` íntegro no fim. Pela leitura do código, a
-causa provável do p99 é custo O(n) em três das cinco consultas da carga, e não
-um vazamento. Esta é uma **hipótese apoiada no código e na forma das séries**.
-Ainda não está confirmada por medição por tipo de operação: o relatório de
-20/10 não separava a latência por operação. A partir deste commit o
-qualifier passa a separá-la (ver "O que mudou").
+erros de operação e `verify` íntegro no fim. A causa do p99 é custo O(n) em
+duas consultas da carga (mais uma terceira que cresce menos), e não um
+vazamento. A hipótese saiu da leitura do código e foi **confirmada por medição
+por operação** no nightly da branch do PR #34 (secção seguinte).
+
+## Confirmação: nightly da branch, commit `1ce650d`
+
+Run: https://github.com/JoseRFJuniorLLMs/HeraclitusDB/actions/runs/39508445278
+(mesmo perfil e semente). Crash-loop do binário aprovado: 40 ciclos, 283 747
+appends confirmados, nenhum em falta. Soak reprovado outra vez (p99 13,16×),
+agora com a latência separada por operação:
+
+| Operação | p50 / p99 com 9,6 mil eventos | p50 / p99 com 81,8 mil eventos |
+|---|---|---|
+| `attribute_query` (`agent_id`) | 23 / 67 ms | 557 / 791 ms |
+| `vector_retrieval` (`DIST_HYP`) | 28 / 87 ms | 855 / 1 137 ms |
+| `text_retrieval` (`recall`) | 13 / 39 ms | 136 / 230 ms |
+| `ingest` | 3 / 21 ms | 3 / 149 ms |
+| `as_of_analytics` | 21 / 46 ms | 51 / 80 ms |
+| `graph_traversal` | 0 / 5 ms | 0 / 5 ms |
+
+- `attribute_query` e `vector_retrieval` crescem em linha reta com o `head`:
+  O(n) confirmado.
+- `text_retrieval` cresce cerca de 10× e abranda depois dos 50 mil eventos.
+- O p50 da ingestão fica plano; o p99 sobe até ~150 ms e estabiliza. A
+  explicação provável, não medida, é competição de CPU no runner com as
+  consultas que descodificam o log inteiro.
+- `memory_per_event`: ~5,1 KB de RSS por evento gravado, e ~5,0 KB na segunda
+  metade. A memória é proporcional aos dados, não ao tempo.
+- Threads: 17 → 18 uma única vez, aos ~645 s, de novo na segunda metade.
 
 ## O que as séries mostram
 
@@ -75,7 +99,7 @@ Só diagnóstico; nenhum limite nem veredito foi alterado.
 - `memory_per_event`: inclinação do RSS contra o `head` (bytes por evento
   gravado), na janela estabilizada e na segunda metade.
 
-O próximo nightly confirma ou desmente a atribuição acima por operação.
+O nightly da branch já usou estes campos (secção "Confirmação").
 
 ## Decisões que ficam para o responsável
 
