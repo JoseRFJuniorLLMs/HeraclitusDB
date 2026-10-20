@@ -103,10 +103,15 @@ O nightly da branch já usou estes campos (secção "Confirmação").
 
 ## Decisões que ficam para o responsável
 
-Não alterei nada disto, porque muda o que o gate mede ou o desenho do motor:
+A primeira já foi decidida e implementada; as restantes continuam em aberto:
 
-1. **Pista vetorial do qualifier**: medir o HNSW (`NEAREST`) em vez do top-k
-   exato por scan, ou manter o scan e aceitar que ele é O(n).
+1. **Pista vetorial — decidido:** o responsável escolheu manter o resultado
+   exato e calculá-lo sobre os vetores em memória. `ORDER BY DIST_*(...) ASC
+   LIMIT k` passa a medir os vetores residentes do HNSW
+   (`topk_por_vetores_residentes` em `crates/heraclitus-query/src/plan.rs`),
+   lê do log só os LSNs que faltam no índice e volta ao varrimento se um
+   episódio hidratado não confirmar a distância. A carga do qualifier não
+   mudou.
 2. **`agent_id` sem índice**: índice dedicado para builtins ou `LIMIT`
    empurrado para `scan_builtin_eq`.
 3. **`ActivationStore::top_k`**: estrutura ordenada em vez de varrer tudo.

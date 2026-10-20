@@ -726,6 +726,17 @@ impl VectorIndex {
         self.nodes.len()
     }
 
+    /// Visita o ponto residente de cada vetor com LSN em `[from, to)`, pela
+    /// ordem interna. Os retirados entram: a retirada esconde o vetor das
+    /// pesquisas, mas o episódio continua no log e um varrimento devolve-o.
+    pub fn for_each_point_in(&self, from: Lsn, to: Lsn, mut visit: impl FnMut(Lsn, &ProductPoint)) {
+        for (node, &lsn) in self.nodes.iter().zip(&self.lsns) {
+            if from <= lsn && lsn < to {
+                visit(lsn, &node.point);
+            }
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }

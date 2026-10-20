@@ -581,7 +581,13 @@ fn eval_operand(op: &Operand, lsn: Lsn, e: &Episode) -> Option<Json> {
 /// Igualdade ESTRITA porque a truncagem é simétrica: um `q` mais longo mente
 /// tanto como um mais curto. `DIST_PRODUCT` já rejeitava a mesma entrada.
 fn eval_dist(kind: DistKind, q: &[f32], e: &Episode) -> Option<f64> {
-    let emb = e.embedding.as_ref()?;
+    eval_dist_point(kind, q, e.embedding.as_ref()?)
+}
+
+/// O corpo de [`eval_dist`] sobre um ponto: é a MESMA função que mede o
+/// episódio e o vetor residente no índice, para que as duas medidas sejam
+/// bit a bit iguais quando o ponto é o mesmo.
+fn eval_dist_point(kind: DistKind, q: &[f32], emb: &heraclitus_core::ProductPoint) -> Option<f64> {
     let sig = &heraclitus_manifold::ProductMetric::default().sig;
     Some(match kind {
         DistKind::Hyp => (q.len() == emb.hyp.len())
@@ -959,6 +965,117 @@ fn ordenar_por_chave(
     idx.truncate(k);
     let mut slots: Vec<Option<(Lsn, Episode)>> = rows.into_iter().map(Some).collect();
     idx.into_iter().filter_map(|i| slots[i].take()).collect()
+}
+
+/// Acima disto as lacunas do índice estão tão fragmentadas que lê-las troço a
+/// troço custaria mais do que o varrimento por páginas que o atalho substitui.
+const ATALHO_VETORIAL_MAX_TROCOS: usize = 1024;
+
+/// Top-k exacto de `ORDER BY DIST_*(...) ASC LIMIT k` a partir dos vetores
+/// residentes do backend, sem descodificar a janela inteira do log.
+///
+/// Soak nightly de 20/10/2026: `MATCH (n) RETURN n ORDER BY DIST_HYP([...])
+/// ASC LIMIT 10` lia e descodificava todos os episódios da janela a cada
+/// consulta — p50 de 28 → 855 ms entre 9,6 mil e 81,8 mil eventos. O índice
+/// vetorial já tem em memória o embedding de quase todos eles.
+///
+/// O resultado é o MESMO do varrimento, linha a linha e pela mesma ordem:
+/// - cada LSN de `[lo, hi)` entra com a chave que o varrimento lhe daria. Os
+///   residentes, pela distância ao ponto do índice; os que faltam na lista
+///   (sem embedding, `AgentEvidence`, frames H-VM, `EventId` repetido, escrita
+///   ainda em voo) são lidos do log e medidos no próprio episódio;
+/// - a ordem é (chave, LSN), a do `Acumulador` sobre um varrimento por LSN
+///   crescente, com `+inf` para quem não tem embedding;
+/// - cada linha hidratada é medida de novo no episódio lido. Uma diferença (um
+///   crypto-shred que apagou o embedding, um índice desactualizado) devolve
+///   `None` e o planner varre como antes. Uma linha que não chegou a ser
+///   hidratada não pode esconder uma melhor: o log é imutável, e a única
+///   mudança que o episódio lido pode ter face ao ponto residente é perder o
+///   embedding, o que só o empurra para `+inf`, para o fim.
+///
+/// Só ASC, por causa desse último ponto: em DESC o `+inf` vem primeiro, e um
+/// embedding que deixou de se ler saltaria para a frente sem ser visto.
+///
+/// `None` também quando o atalho não se aplica ou não compensa: janela acima
+/// de QUERY_SCAN_CAP (é o varrimento que decide o erro de materialização),
+/// mais lacunas do que residentes, lacunas muito fragmentadas, ou filtros que
+/// rejeitam tantas linhas que a hidratação uma a uma deixaria de ser barata.
+fn topk_por_vetores_residentes(
+    be: &dyn QueryBackend,
+    kind: DistKind,
+    q: &[f32],
+    k: usize,
+    lo: Lsn,
+    hi: Lsn,
+    aceita: &dyn Fn(Lsn, &Episode) -> bool,
+) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
+    if hi <= lo || hi - lo > QUERY_SCAN_CAP as u64 {
+        return Ok(None);
+    }
+    let Some(mut residentes) = be.resident_vector_keys(lo, hi, &|p| eval_dist_point(kind, q, p))?
+    else {
+        return Ok(None);
+    };
+    residentes.retain(|(l, _)| (lo..hi).contains(l));
+    residentes.sort_unstable_by_key(|(l, _)| *l);
+    if residentes.windows(2).any(|par| par[0].0 == par[1].0) {
+        // Dois vetores para o mesmo LSN: o índice não descreve o log.
+        return Ok(None);
+    }
+    let janela = (hi - lo) as usize;
+    if janela - residentes.len() > janela / 2 {
+        return Ok(None);
+    }
+    let mut trocos = Vec::new();
+    let mut cursor = lo;
+    for &(l, _) in &residentes {
+        if l > cursor {
+            trocos.push((cursor, l));
+        }
+        cursor = l + 1;
+    }
+    if cursor < hi {
+        trocos.push((cursor, hi));
+    }
+    if trocos.len() > ATALHO_VETORIAL_MAX_TROCOS {
+        return Ok(None);
+    }
+
+    let chave = |d: Option<f64>| d.unwrap_or(f64::INFINITY);
+    let mut entradas: Vec<(f64, Lsn)> =
+        residentes.into_iter().map(|(l, d)| (chave(d), l)).collect();
+    for (inicio, fim) in trocos {
+        let mut de = inicio;
+        while de < fim {
+            let ate = de.saturating_add(4096).min(fim);
+            for (l, e) in be.scan_range(de, ate)? {
+                entradas.push((chave(eval_dist(kind, q, &e)), l));
+            }
+            de = ate;
+        }
+    }
+    entradas.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+
+    let orcamento = k.saturating_mul(8).max(4096);
+    let mut linhas = Vec::with_capacity(k.min(entradas.len()));
+    for (lidas, (d, l)) in entradas.into_iter().enumerate() {
+        if linhas.len() >= k {
+            break;
+        }
+        if lidas >= orcamento {
+            return Ok(None);
+        }
+        let Some((lido, e)) = be.read_lsn(l)? else {
+            return Ok(None);
+        };
+        if lido != l || chave(eval_dist(kind, q, &e)).total_cmp(&d) != std::cmp::Ordering::Equal {
+            return Ok(None);
+        }
+        if aceita(l, &e) {
+            linhas.push((l, e));
+        }
+    }
+    Ok(Some(linhas))
 }
 
 /// Acumula as linhas aceites de um MATCH. Em modo top-k guarda no máximo
@@ -1546,6 +1663,20 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                     // Page by LSN ranges, not by returned row count (shredded
                     // records leave holes). Every range has at most 4096 LSNs.
                     let (mut lo, mut hi) = lsn_window(conditions, bound);
+                    // `ORDER BY DIST_*(...) ASC LIMIT k`: o mesmo top-k a partir
+                    // dos vetores residentes, quando o backend os tem (ver
+                    // `topk_por_vetores_residentes`). Se responder, não há
+                    // páginas a varrer.
+                    if let Some((OrderKey::Dist(kind, q), true, k)) = topk {
+                        if let Some(linhas) =
+                            topk_por_vetores_residentes(be, *kind, q, k, lo, hi, &aceita)?
+                        {
+                            for (l, e) in linhas {
+                                acc.push(l, e)?;
+                            }
+                            lo = hi;
+                        }
+                    }
                     'pages: while lo < hi {
                         if tecto.is_some_and(|k| acc.len() >= k) {
                             break;
@@ -2544,5 +2675,351 @@ mod testes_valid_at_precisao {
         e.attrs.insert("valid_from".into(), "1000.5".into());
         assert!(!valid_at_matches(&e, 1000), "1000.5 <= 1000 e falso");
         assert!(valid_at_matches(&e, 1001));
+    }
+}
+
+#[cfg(test)]
+mod testes_topk_vetores_residentes {
+    //! Soak nightly de 20/10/2026: `ORDER BY DIST_*(...) ASC LIMIT k` passa a
+    //! sair dos vetores residentes do backend. O contrato é dar EXACTAMENTE o
+    //! que o varrimento daria. Cada teste corre a mesma consulta duas vezes,
+    //! com e sem vetores residentes, e compara as linhas.
+    use super::*;
+    use crate::backend::*;
+    use heraclitus_core::{Episode, EventKind, ProductPoint};
+    use heraclitus_index_graph::temporal::TemporalGraph;
+    use std::cell::Cell;
+
+    fn ponto(hyp: Vec<f32>) -> ProductPoint {
+        ProductPoint {
+            hyp,
+            sph: vec![],
+            euc: vec![],
+        }
+    }
+
+    /// O log em memória e, ao lado, o que um índice vetorial diria dele.
+    struct Vetores {
+        linhas: Vec<Episode>,
+        residentes: Option<Vec<(Lsn, ProductPoint)>>,
+        lidas: Cell<usize>,
+        varridas: Cell<u64>,
+    }
+
+    impl Vetores {
+        fn novo(linhas: Vec<Episode>, residentes: Option<Vec<(Lsn, ProductPoint)>>) -> Self {
+            Self {
+                linhas,
+                residentes,
+                lidas: Cell::new(0),
+                varridas: Cell::new(0),
+            }
+        }
+
+        /// Um índice fiel: um vetor por episódio com embedding.
+        fn fiel(linhas: &[Episode]) -> Vec<(Lsn, ProductPoint)> {
+            linhas
+                .iter()
+                .enumerate()
+                .filter_map(|(l, e)| e.embedding.clone().map(|p| (l as Lsn, p)))
+                .collect()
+        }
+    }
+
+    impl QueryBackend for Vetores {
+        fn head(&self) -> Result<Lsn, HeraclitusError> {
+            Ok(self.linhas.len() as Lsn)
+        }
+        fn scan(&self, as_of: Option<Lsn>) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
+            self.scan_range(0, as_of.unwrap_or(Lsn::MAX))
+        }
+        fn scan_range(&self, from: Lsn, to: Lsn) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
+            let to = to.min(self.linhas.len() as Lsn);
+            self.varridas
+                .set(self.varridas.get() + to.saturating_sub(from));
+            Ok((from..to)
+                .map(|l| (l, self.linhas[l as usize].clone()))
+                .collect())
+        }
+        fn read_lsn(&self, lsn: Lsn) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
+            self.lidas.set(self.lidas.get() + 1);
+            Ok(self.linhas.get(lsn as usize).cloned().map(|e| (lsn, e)))
+        }
+        fn resident_vector_keys(
+            &self,
+            from: Lsn,
+            to: Lsn,
+            key: &dyn Fn(&ProductPoint) -> Option<f64>,
+        ) -> Result<Option<ResidentVectorKeys>, HeraclitusError> {
+            Ok(self.residentes.as_ref().map(|r| {
+                r.iter()
+                    .filter(|(l, _)| (from..to).contains(l))
+                    .map(|(l, p)| (*l, key(p)))
+                    .collect()
+            }))
+        }
+        fn attr_lookup(
+            &self,
+            _field: &str,
+            _value: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<Vec<(Lsn, Episode)>>, HeraclitusError> {
+            Ok(None)
+        }
+        fn graph(&self) -> Result<TemporalGraph, HeraclitusError> {
+            unimplemented!("graph: fora do ambito deste mock")
+        }
+        fn append(
+            &self,
+            _label: Option<&str>,
+            _props: &[(String, Value)],
+        ) -> Result<Lsn, HeraclitusError> {
+            unimplemented!("append: fora do ambito deste mock")
+        }
+        fn recall(
+            &self,
+            _text: &str,
+            _k: usize,
+            _as_of: Option<Lsn>,
+        ) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError> {
+            unimplemented!("recall: fora do ambito deste mock")
+        }
+        fn nearest(
+            &self,
+            _vector: &[f32],
+            _k: usize,
+            _as_of: Option<Lsn>,
+        ) -> Result<Vec<(Lsn, Episode, f32)>, HeraclitusError> {
+            unimplemented!("nearest: fora do ambito deste mock")
+        }
+        fn provenance(&self, _id: &str) -> Result<Vec<String>, HeraclitusError> {
+            unimplemented!("provenance: fora do ambito deste mock")
+        }
+        fn neighbors(
+            &self,
+            _node: &str,
+            _etype: Option<&str>,
+            _as_of: Option<Lsn>,
+            _min_confidence: f32,
+        ) -> Result<Vec<NeighborRow>, HeraclitusError> {
+            unimplemented!("neighbors: fora do ambito deste mock")
+        }
+        fn traverse(
+            &self,
+            _start: &str,
+            _max_depth: usize,
+            _as_of: Option<Lsn>,
+            _min_confidence: f32,
+        ) -> Result<Vec<(String, usize)>, HeraclitusError> {
+            unimplemented!("traverse: fora do ambito deste mock")
+        }
+        fn match_edges(
+            &self,
+            _src: Option<&str>,
+            _etype: Option<&str>,
+            _dst: Option<&str>,
+            _as_of: Option<Lsn>,
+        ) -> Result<Vec<EdgeRow>, HeraclitusError> {
+            unimplemented!("match_edges: fora do ambito deste mock")
+        }
+        fn community(
+            &self,
+            _node: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<CommunityResult>, HeraclitusError> {
+            unimplemented!("community: fora do ambito deste mock")
+        }
+        fn node_metrics(
+            &self,
+            _node: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<MetricsResult>, HeraclitusError> {
+            unimplemented!("node_metrics: fora do ambito deste mock")
+        }
+        fn edge_hypotheses(
+            &self,
+            _from: &str,
+            _to: &str,
+            _etype: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<EdgeHypotheses>, HeraclitusError> {
+            unimplemented!("edge_hypotheses: fora do ambito deste mock")
+        }
+        fn lsn_for_timestamp(&self, _ts_ms: u64) -> Result<Lsn, HeraclitusError> {
+            unimplemented!("lsn_for_timestamp: fora do ambito deste mock")
+        }
+        fn resolve_entity(
+            &self,
+            _key: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Option<String>, HeraclitusError> {
+            unimplemented!("resolve_entity: fora do ambito deste mock")
+        }
+        fn entity_cluster(
+            &self,
+            _entity_id: &str,
+            _as_of: Option<Lsn>,
+        ) -> Result<Vec<String>, HeraclitusError> {
+            unimplemented!("entity_cluster: fora do ambito deste mock")
+        }
+    }
+
+    /// xorshift64: determinístico, sem depender de `rand` nos testes.
+    struct Sorte(u64);
+
+    impl Sorte {
+        fn proximo(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn ate(&mut self, n: u64) -> u64 {
+            self.proximo() % n
+        }
+    }
+
+    fn episodio(i: usize, embedding: Option<ProductPoint>) -> Episode {
+        let mut e = Episode::new("a", EventKind::Observation, format!("e{i}").into_bytes());
+        e.embedding = embedding;
+        e
+    }
+
+    /// Coordenadas de uma grelha pequena, para haver muitos empates de
+    /// distância; alguns sem embedding e alguns com a dimensão errada.
+    fn log_aleatorio(sorte: &mut Sorte, n: usize) -> Vec<Episode> {
+        (0..n)
+            .map(|i| {
+                let coord = |s: &mut Sorte| s.ate(4) as f32 / 10.0;
+                let embedding = match sorte.ate(20) {
+                    0..=2 => None,
+                    3 => Some(ponto(vec![coord(sorte), coord(sorte), coord(sorte)])),
+                    _ => Some(ponto(vec![coord(sorte), coord(sorte)])),
+                };
+                let mut e = episodio(i, embedding);
+                let cor = if sorte.ate(2) == 0 { "azul" } else { "verde" };
+                e.attrs.insert("cor".into(), cor.into());
+                e
+            })
+            .collect()
+    }
+
+    fn igual_ao_varrimento(
+        gql: &str,
+        linhas: &[Episode],
+        residentes: Vec<(Lsn, ProductPoint)>,
+    ) -> Vetores {
+        let referencia = Vetores::novo(linhas.to_vec(), None);
+        let esperado = crate::execute(gql, &referencia).unwrap();
+        let be = Vetores::novo(linhas.to_vec(), Some(residentes));
+        let obtido = crate::execute(gql, &be).unwrap();
+        assert_eq!(obtido, esperado, "{gql}");
+        be
+    }
+
+    const CONSULTAS: &[&str] = &[
+        "MATCH (n) RETURN n ORDER BY DIST_HYP([0.1, 0.2]) ASC LIMIT 0",
+        "MATCH (n) RETURN n ORDER BY DIST_HYP([0.1, 0.2]) ASC LIMIT 1",
+        "MATCH (n) RETURN n ORDER BY DIST_HYP([0.1, 0.2]) ASC LIMIT 7",
+        "MATCH (n) RETURN n ORDER BY DIST_HYP([0.0, 0.0]) LIMIT 1000",
+        "MATCH (n) RETURN n ORDER BY DIST_PRODUCT([0.3, 0.1]) ASC LIMIT 5",
+        "MATCH (n) RETURN n ORDER BY DIST_HYP([0.1, 0.2, 0.3]) ASC LIMIT 5",
+        "MATCH (n) RETURN n ORDER BY DIST_HYP([0.2, 0.2]) DESC LIMIT 5",
+        "MATCH (n) WHERE n.cor = \"azul\" RETURN n ORDER BY DIST_HYP([0.1, 0.1]) ASC LIMIT 5",
+        "MATCH (n) WHERE n.lsn >= 7 AND n.lsn < 90 RETURN n ORDER BY DIST_HYP([0.2, 0.1]) ASC LIMIT 6",
+        "MATCH (n) AS OF LSN 50 RETURN n ORDER BY DIST_HYP([0.1, 0.0]) ASC LIMIT 4",
+    ];
+
+    #[test]
+    fn indice_fiel_da_o_mesmo_que_o_varrimento() {
+        for semente in 1..=40u64 {
+            let mut sorte = Sorte(semente.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+            let n = 1 + sorte.ate(150) as usize;
+            let linhas = log_aleatorio(&mut sorte, n);
+            for gql in CONSULTAS {
+                igual_ao_varrimento(gql, &linhas, Vetores::fiel(&linhas));
+            }
+        }
+    }
+
+    /// Eventos que nunca chegam ao índice (AgentEvidence, frames H-VM, EventId
+    /// repetido, escrita em voo) faltam na lista e o planner lê-os do log,
+    /// mesmo quando um deles é o mais próximo de todos.
+    #[test]
+    fn lacunas_do_indice_sao_lidas_do_log() {
+        for semente in 1..=40u64 {
+            let mut sorte = Sorte(semente.wrapping_mul(0xD1B5_4A32_D192_ED03));
+            let n = 1 + sorte.ate(150) as usize;
+            let linhas = log_aleatorio(&mut sorte, n);
+            let residentes: Vec<_> = Vetores::fiel(&linhas)
+                .into_iter()
+                .filter(|_| sorte.ate(10) >= 3)
+                .collect();
+            for gql in CONSULTAS {
+                igual_ao_varrimento(gql, &linhas, residentes.clone());
+            }
+        }
+
+        let mut linhas: Vec<Episode> = (0..20)
+            .map(|i| episodio(i, Some(ponto(vec![0.3, 0.3]))))
+            .collect();
+        linhas[13].embedding = Some(ponto(vec![0.1, 0.1]));
+        let residentes = Vetores::fiel(&linhas)
+            .into_iter()
+            .filter(|(l, _)| *l != 13)
+            .collect();
+        let gql = "MATCH (n) RETURN n ORDER BY DIST_HYP([0.1, 0.1]) ASC LIMIT 1";
+        let be = igual_ao_varrimento(gql, &linhas, residentes);
+        assert_eq!(be.varridas.get(), 1, "só a lacuna é varrida");
+        assert_eq!(be.lidas.get(), 1, "só a linha devolvida é hidratada");
+    }
+
+    /// Sem lacunas o atalho não varre nada e hidrata só o LIMIT.
+    #[test]
+    fn indice_completo_hidrata_so_o_limit() {
+        let linhas: Vec<Episode> = (0..5_000)
+            .map(|i| episodio(i, Some(ponto(vec![(i % 97) as f32 / 1000.0, 0.01]))))
+            .collect();
+        let gql = "MATCH (n) RETURN n ORDER BY DIST_HYP([0.05, 0.01]) ASC LIMIT 10";
+        let be = igual_ao_varrimento(gql, &linhas, Vetores::fiel(&linhas));
+        assert_eq!(be.varridas.get(), 0);
+        assert_eq!(be.lidas.get(), 10);
+    }
+
+    /// Um ponto residente que já não descreve o episódio (crypto-shred apagou
+    /// o embedding, índice desactualizado) é detectado quando chega a ser
+    /// hidratado, e o planner varre como antes. Dois vetores no mesmo LSN
+    /// também mandam varrer.
+    #[test]
+    fn indice_desactualizado_ou_repetido_recua_para_o_varrimento() {
+        let mut linhas: Vec<Episode> = (0..30)
+            .map(|i| episodio(i, Some(ponto(vec![0.2, (i % 5) as f32 / 10.0]))))
+            .collect();
+        let gql = "MATCH (n) RETURN n ORDER BY DIST_HYP([0.0, 0.0]) ASC LIMIT 3";
+
+        // O índice ainda tem o ponto mais próximo de todos para um episódio
+        // cujo embedding deixou de se ler.
+        let mut residentes = Vetores::fiel(&linhas);
+        linhas[4].embedding = None;
+        residentes[4].1 = ponto(vec![0.0, 0.0]);
+        let be = igual_ao_varrimento(gql, &linhas, residentes);
+        assert_eq!(be.varridas.get(), 30, "recuou para o varrimento completo");
+
+        // LSN repetido.
+        let mut residentes = Vetores::fiel(&linhas);
+        residentes.push((9, ponto(vec![0.0, 0.0])));
+        let be = igual_ao_varrimento(gql, &linhas, residentes);
+        assert_eq!(be.varridas.get(), 30);
+    }
+
+    /// DESC não usa o atalho: o `+inf` de quem não tem embedding vem primeiro.
+    #[test]
+    fn desc_continua_a_varrer() {
+        let linhas: Vec<Episode> = (0..10)
+            .map(|i| episodio(i, (i != 6).then(|| ponto(vec![0.1, i as f32 / 100.0]))))
+            .collect();
+        let gql = "MATCH (n) RETURN n ORDER BY DIST_HYP([0.1, 0.0]) DESC LIMIT 2";
+        let be = igual_ao_varrimento(gql, &linhas, Vetores::fiel(&linhas));
+        assert_eq!(be.varridas.get(), 10);
     }
 }

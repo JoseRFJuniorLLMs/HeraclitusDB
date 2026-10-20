@@ -3818,6 +3818,26 @@ impl QueryBackend for Engine {
         self.log.read(lsn)
     }
 
+    /// Os vetores do HNSW são o embedding que a view recebeu de cada episódio,
+    /// sem projecção (`VectorIndex::apply`). O que não passa pela view — frames
+    /// H-VM, `AgentEvidence`, um `EventId` repetido, um append ainda entre o
+    /// log e as views — simplesmente falta na lista, e o planner lê-o do log.
+    /// Em LOG_ONLY as views não recebem nada: a lista seria toda buracos.
+    fn resident_vector_keys(
+        &self,
+        from: Lsn,
+        to: Lsn,
+        key: &dyn Fn(&ProductPoint) -> Option<f64>,
+    ) -> Result<Option<heraclitus_query::backend::ResidentVectorKeys>, HeraclitusError> {
+        if self.log_only {
+            return Ok(None);
+        }
+        let idx = self.vector.read().unwrap();
+        let mut out = Vec::with_capacity(idx.len().min(to.saturating_sub(from) as usize));
+        idx.for_each_point_in(from, to, |lsn, ponto| out.push((lsn, key(ponto))));
+        Ok(Some(out))
+    }
+
     /// Range numérico (C1.6): resolvido pelo BTreeMap ordenado do índice de
     /// atributos — `WHERE n.valor > x AND n.valor < y` vira `range()` +
     /// hidratação O(1)/LSN, sem scan do log.
@@ -6669,6 +6689,101 @@ mod tests {
             "RECALL leu {gastas} vezes para {} linhas (era 2x + 1)",
             linhas.len()
         );
+    }
+
+    /// Soak nightly de 20/10/2026: `ORDER BY DIST_HYP(...) ASC LIMIT k` sai dos
+    /// vetores residentes do HNSW em vez de descodificar o log inteiro. Contra
+    /// um oraculo calculado a mao sobre o log, com o mais proximo de todos num
+    /// `AgentEvidence`, que nunca passa pelas views.
+    #[test]
+    fn order_by_dist_hyp_sai_dos_vetores_residentes_e_ve_o_que_falta_no_indice() {
+        for formato in [
+            heraclitus_core::StorageFormat::Legacy,
+            HeraclitusConfig::default().storage_format,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = HeraclitusConfig {
+                data_dir: dir.path().to_path_buf(),
+                fsync: FsyncPolicy::Always,
+                storage_format: formato,
+                ..Default::default()
+            };
+            let engine = Engine::open(&cfg).unwrap();
+            for i in 0..300u32 {
+                let mut e =
+                    Episode::new("ag", EventKind::Observation, format!("e{i}").into_bytes());
+                if i % 11 != 0 {
+                    e.embedding = Some(heraclitus_core::ProductPoint {
+                        hyp: vec![(i % 17) as f32 / 100.0, (i % 5) as f32 / 100.0],
+                        sph: vec![],
+                        euc: vec![],
+                    });
+                }
+                engine.append(e).unwrap();
+            }
+            let mut evidencia = Episode::new(
+                "ag",
+                EventKind::Custom("AgentEvidence".into()),
+                b"evidencia".to_vec(),
+            );
+            evidencia.embedding = Some(heraclitus_core::ProductPoint {
+                hyp: vec![0.05, 0.02],
+                sph: vec![],
+                euc: vec![],
+            });
+            let lsn_evidencia = engine.append(evidencia).unwrap();
+
+            // O indice nao tem o AgentEvidence nem os episodios sem embedding.
+            let residentes = engine
+                .resident_vector_keys(0, engine.head(), &|_| Some(0.0))
+                .unwrap()
+                .unwrap();
+            assert_eq!(residentes.len(), 300 - 28, "{formato:?}");
+            assert!(residentes.iter().all(|(l, _)| *l != lsn_evidencia));
+
+            // ORACULO: a mesma distancia do planner, sobre todos os episodios
+            // do log, ordenada por (distancia, LSN), sem embedding no fim.
+            let q = [0.05f32, 0.02];
+            let k1 = ProductMetric::default().sig.k1;
+            let mut todas: Vec<(f64, Lsn)> = engine
+                .log
+                .scan_capped(0, engine.head(), usize::MAX)
+                .unwrap()
+                .into_iter()
+                .map(|(l, e)| {
+                    let d = e
+                        .embedding
+                        .as_ref()
+                        .filter(|p| p.hyp.len() == q.len())
+                        .map(|p| heraclitus_manifold::dist_hyp(&q, &p.hyp, -k1))
+                        .unwrap_or(f64::INFINITY);
+                    (d, l)
+                })
+                .collect();
+            todas.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            let esperado: Vec<u64> = todas.iter().take(5).map(|(_, l)| *l).collect();
+            assert_eq!(esperado[0], lsn_evidencia, "montagem: o mais proximo");
+
+            let antes = engine.log.leituras_efectuadas();
+            let v = heraclitus_query::execute(
+                "MATCH (n) RETURN n ORDER BY DIST_HYP([0.05, 0.02]) ASC LIMIT 5",
+                &engine,
+            )
+            .unwrap();
+            let obtido: Vec<u64> = v
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["lsn"].as_u64().unwrap())
+                .collect();
+            assert_eq!(obtido, esperado, "{formato:?}");
+
+            // O varrimento antigo nao faz leituras pontuais; o atalho faz
+            // exactamente uma por linha devolvida.
+            if let (Some(antes), Some(depois)) = (antes, engine.log.leituras_efectuadas()) {
+                assert_eq!(depois - antes, 5, "{formato:?}");
+            }
+        }
     }
 
     /// A guarda ao nivel do backend, sem passar pelo planner: um campo que o

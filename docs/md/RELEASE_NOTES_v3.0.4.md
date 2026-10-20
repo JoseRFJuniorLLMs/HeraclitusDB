@@ -25,6 +25,12 @@ com 40 ciclos de crash/restart antes de tornar a release pública.
 
 ## Otimizações e distribuição
 
+- `ORDER BY DIST_*(...) ASC LIMIT k` sem caminho de índice calcula o top-k
+  exato sobre os vetores residentes do HNSW, em vez de descodificar todos os
+  episódios da janela. Os LSNs que faltam no índice (sem embedding,
+  `AgentEvidence`, frames H-VM, escrita em voo) são lidos do log; cada linha
+  devolvida é medida de novo no episódio, e qualquer divergência volta ao
+  varrimento. DESC e janelas acima de `QUERY_SCAN_CAP` continuam a varrer.
 - Scan builtin da cauda sai do mutex do writer e respeita o teto confirmado.
 - Cache limitado a 32 leitores PACKED; cursor de arquivo protegido contra
   interleaving de leituras concorrentes.
