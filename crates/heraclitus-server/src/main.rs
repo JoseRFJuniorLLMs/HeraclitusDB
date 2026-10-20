@@ -22,6 +22,16 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
+        println!(
+            "heraclitus-server {} (git {} {}; source-epoch {})",
+            env!("CARGO_PKG_VERSION"),
+            env!("HERACLITUS_GIT_SHA"),
+            env!("HERACLITUS_GIT_STATE"),
+            env!("HERACLITUS_SOURCE_EPOCH")
+        );
+        return Ok(());
+    }
     // Installer-only utility: secret travels over stdin, never argv or logs.
     if std::env::args().nth(1).as_deref() == Some("--credential-hash-stdin") {
         use std::io::Read;

@@ -134,8 +134,24 @@ impl LakehouseWorker {
     ) -> Result<Vec<ExportOutcome>, HeraclitusError> {
         let pendentes = log.lakehouse_pending()?;
         let mut out = Vec::with_capacity(pendentes.len());
+        let mut failures = Vec::new();
         for pendente in pendentes {
-            out.push(self.export_one(log, pendente).await?);
+            let segment = pendente.segment_id;
+            match self.export_one(log, pendente).await {
+                Ok(done) => out.push(done),
+                Err(err) => failures.push((segment, err)),
+            }
+        }
+        if !failures.is_empty() {
+            return Err(HeraclitusError::StorageEngine(format!(
+                "lakehouse queue: {} completed; failed segments: {}",
+                out.len(),
+                failures
+                    .iter()
+                    .map(|(s, e)| format!("{s}: {e}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )));
         }
         Ok(out)
     }

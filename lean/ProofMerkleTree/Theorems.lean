@@ -12,10 +12,30 @@ theorem mutation_fails_verification (t t' : MerkleTree) :
   rootHash t = rootHash t' →
   t = t'
 := by
-  -- We admit the structural induction proof for now.
-  -- The proof would proceed by induction on `t`, matching against `t'`,
-  -- and repeatedly applying `crypto_hash_injective` at the leaves 
-  -- and `combine_hash_injective` at the nodes.
-  sorry
+  induction t generalizing t' with
+  | leaf h d =>
+    cases t' with
+    | leaf h' d' =>
+      intro v v' eq
+      simp_all [verify, rootHash, crypto_hash, combine_hash]
+    | node h' l' r' =>
+      intro v v' eq
+      simp_all [verify, rootHash, crypto_hash, combine_hash]
+  | node h l r il ir =>
+    cases t' with
+    | leaf h' d' =>
+      intro v v' eq
+      simp_all [verify, rootHash, crypto_hash, combine_hash]
+    | node h' l' r' =>
+      intro v v' eq
+      simp only [verify, Bool.and_eq_true, beq_iff_eq] at v v'
+      rcases v with ⟨⟨vl, vr⟩, vh⟩
+      rcases v' with ⟨⟨vl', vr'⟩, vh'⟩
+      change h = h' at eq
+      have children := combine_hash_injective _ _ _ _ (vh.symm.trans (eq.trans vh'))
+      have left := il l' vl vl' children.1
+      have right := ir r' vr vr' children.2
+      subst h'; subst l'; subst r'
+      simp_all
 
 end ProofMerkleTree

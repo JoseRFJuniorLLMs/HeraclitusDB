@@ -1,12 +1,10 @@
 namespace ProofDenseMap
 
 /-- ULID abstract representation -/
-def ULID := Nat
-deriving Repr, DecidableEq, Inhabited
+abbrev ULID := Nat
 
 /-- Dense Index abstract representation (simulating u32) -/
-def Index := Nat
-deriving Repr, DecidableEq, Inhabited
+abbrev Index := Nat
 
 /-- The Dense Entity Map structure.
     In formal verification, instead of writing an array or hashmap, 

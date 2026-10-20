@@ -1,5 +1,6 @@
 import ProofHLC.Basic
 import ProofHLC.Operations
+import Std.Tactic
 
 namespace ProofHLC
 
@@ -34,7 +35,20 @@ theorem hlc_no_physical_regression (pt : Nat) (prev : HLCTime) :
 theorem hlc_causality_preservation (pt : Nat) (prev : HLCTime) (msg : HLCTime) :
   msg < receive pt prev msg
 := by
-  -- Prova baseada na definição recursiva de limites do HLC.
-  sorry
+  have ge_right (a b : Nat) : b ≤ max a b := by
+    unfold max
+    split <;> omega
+  have bound := ge_right (max pt prev.l) msg.l
+  change hlc_lt msg (receive pt prev msg) = true
+  by_cases eq : max (max pt prev.l) msg.l = msg.l
+  · by_cases same : msg.l = prev.l
+    · have counter : msg.c < max prev.c msg.c + 1 := by
+        have := ge_right prev.c msg.c
+        omega
+      rw [same] at eq
+      simp [hlc_lt, receive, same, eq, counter]
+    · simp [hlc_lt, receive, eq, same]
+  · have lt : msg.l < max (max pt prev.l) msg.l := by omega
+    simp [hlc_lt, receive, lt]
 
 end ProofHLC

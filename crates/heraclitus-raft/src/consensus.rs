@@ -364,7 +364,8 @@ impl EpisodeStateMachine {
             .map_err(|e| StorageError::from(StorageIOError::write(Self::io_err(e))))?;
         // Torna o rename durável (a entrada de diretório) — mesma razão do
         // `FileRaftLog`: sem isto um crash pode reverter o `applied` recuperado.
-        crate::durable::fsync_dir(dir);
+        crate::durable::fsync_dir(dir)
+            .map_err(|e| StorageError::from(StorageIOError::write(Self::io_err(e))))?;
         Ok(())
     }
 

@@ -50,6 +50,7 @@ use crate::receipts_v2::{DemotionReceiptV2, DEMOTION_RECEIPT_V2};
 pub struct ColdTierV6 {
     pub(crate) store: Arc<dyn ObjectStore>,
     pub(crate) max_block_bytes: usize,
+    keystore: Option<Arc<heraclitus_crypto::KeyStore>>,
 }
 
 /// O que uma verificação de geração apurou.
@@ -78,7 +79,13 @@ impl ColdTierV6 {
         Self {
             store,
             max_block_bytes: HARD_MAX_BLOCK_BYTES,
+            keystore: None,
         }
+    }
+
+    pub fn with_keystore(mut self, keystore: Option<Arc<heraclitus_crypto::KeyStore>>) -> Self {
+        self.keystore = keystore;
+        self
     }
 
     pub fn open_local(root: impl AsRef<Path>) -> Result<Self, HeraclitusError> {
@@ -126,6 +133,7 @@ impl ColdTierV6 {
         let compression_codec = codec_label(&codecs);
 
         let bytes = std::fs::read(local_hrkl)?;
+        let physical_size = bytes.len() as u64;
         let digest = physical_digest(&bytes);
         let key = GenerationKey::new(
             reader.header.storage_namespace_id,
@@ -134,7 +142,7 @@ impl ColdTierV6 {
             generation,
         );
 
-        self.put_immutable(&key.segment_path(), bytes.clone(), &digest)
+        self.put_immutable(&key.segment_path(), bytes, &digest)
             .await?;
 
         // O `.hrki` é derivado (§56): se não existir ao lado do segmento, não
@@ -160,7 +168,7 @@ impl ColdTierV6 {
             storage_namespace_id: hex(&reader.header.storage_namespace_id),
             logical_root: hex(&reader.footer.logical_root),
             physical_digest: hex(&digest),
-            physical_size: bytes.len() as u64,
+            physical_size,
             physical_layout: "PACKED".into(),
             compression_codec,
             object_path: key.segment_path().to_string(),
@@ -220,12 +228,22 @@ impl ColdTierV6 {
         &self,
         key: &GenerationKey,
     ) -> Result<ColdSegmentReader, HeraclitusError> {
-        ColdSegmentReader::open(
+        let reader = ColdSegmentReader::open(
             Arc::clone(&self.store),
             key.segment_path(),
             self.max_block_bytes,
         )
-        .await
+        .await?;
+        if reader.header.storage_namespace_id != key.storage_namespace_id
+            || reader.header.segment_id != key.segment_id
+            || reader.logical_root() != key.logical_root
+        {
+            return Err(HeraclitusError::Corruption {
+                context: key.segment_path().to_string(),
+                detail: "cold generation identity does not match its key".into(),
+            });
+        }
+        Ok(reader)
     }
 
     /// Recall de um intervalo de LSN: só os blocos que sobrevivem ao pruning
@@ -240,15 +258,59 @@ impl ColdTierV6 {
         let brutos = reader.scan_lsn_range(lo, hi).await?;
         let mut out = Vec::with_capacity(brutos.len());
         for (lsn, _hlc, payload) in brutos {
-            out.push((
-                lsn,
-                heraclitus_log::decode_episode_payload(
-                    heraclitus_log::format::FORMAT_VERSION,
-                    &payload,
-                )?,
-            ));
+            let mut episode = heraclitus_log::decode_episode_payload(
+                heraclitus_log::format::FORMAT_VERSION,
+                &payload,
+            )?;
+            crate::decrypt_cold_episode(&mut episode, self.keystore.as_deref())?;
+            out.push((lsn, episode));
         }
         Ok((out, reader.stats()))
+    }
+
+    /// Receipt-bound recall. Verify the complete immutable image before
+    /// exposing any row; range-only reads cannot attest a whole-file digest.
+    pub async fn recall_receipt(
+        &self,
+        receipt: &DemotionReceiptV2,
+    ) -> Result<(Vec<(Lsn, Episode)>, ColdReadStats), HeraclitusError> {
+        let (reader, report) = self
+            .read_receipt(
+                receipt,
+                IntegrityLevel::Logical,
+                Some(&heraclitus_log::canonical_hash_storage_payload_v6),
+            )
+            .await?;
+        if !report.is_ok() {
+            return Err(HeraclitusError::Corruption {
+                context: receipt.object_path.clone(),
+                detail: "cold generation does not match its demotion receipt".into(),
+            });
+        }
+        let raw = reader.scan_lsn_range(
+            receipt.first_lsn,
+            receipt.last_lsn,
+            &mut ScanCounters::default(),
+        )?;
+        let mut rows = Vec::with_capacity(raw.len());
+        for (lsn, _, payload) in raw {
+            let mut ep = heraclitus_log::decode_episode_payload(
+                heraclitus_log::format::FORMAT_VERSION,
+                &payload,
+            )?;
+            crate::decrypt_cold_episode(&mut ep, self.keystore.as_deref())?;
+            rows.push((lsn, ep));
+        }
+        Ok((
+            rows,
+            ColdReadStats {
+                requests: 1,
+                bytes_fetched: report.bytes_downloaded,
+                blocks_fetched: reader.block_count() as u64,
+                object_size: report.bytes_downloaded,
+                ..Default::default()
+            },
+        ))
     }
 
     /// Verifica uma geração publicada contra o seu recibo (§84).
@@ -262,7 +324,16 @@ impl ColdTierV6 {
         level: IntegrityLevel,
         hasher: Option<CanonicalHasher<'_>>,
     ) -> Result<ColdVerifyReport, HeraclitusError> {
-        let path_ok = receipt.check_path_consistency().is_ok();
+        Ok(self.read_receipt(receipt, level, hasher).await?.1)
+    }
+
+    async fn read_receipt(
+        &self,
+        receipt: &DemotionReceiptV2,
+        level: IntegrityLevel,
+        hasher: Option<CanonicalHasher<'_>>,
+    ) -> Result<(PackedSegmentReader<MemorySource>, ColdVerifyReport), HeraclitusError> {
+        let mut path_ok = receipt.check_path_consistency().is_ok();
         let path = ObjPath::from(receipt.object_path.clone());
         let bytes = self
             .store
@@ -279,16 +350,26 @@ impl ColdTierV6 {
 
         let reader: PackedSegmentReader<MemorySource> =
             PackedSegmentReader::open(MemorySource(bytes), self.max_block_bytes)?;
+        path_ok &= receipt.receipt_version == DEMOTION_RECEIPT_V2
+            && reader.header.storage_namespace_id == receipt.namespace_bytes()?
+            && reader.header.segment_id == receipt.segment_id
+            && receipt.physical_layout == "PACKED"
+            && receipt.canonical_codec_version == CANONICAL_CODEC_V1 as u16
+            && reader.footer.record_count == receipt.record_count
+            && reader.footer.min_lsn == receipt.first_lsn
+            && reader.footer.max_lsn == receipt.last_lsn
+            && bytes_downloaded == receipt.physical_size;
         let logical_root_ok = reader.footer.logical_root == receipt.logical_root_bytes()?;
         let report = verify_packed_reader(&reader, level, hasher)?;
 
-        Ok(ColdVerifyReport {
+        let report = ColdVerifyReport {
             physical_digest_ok,
             logical_root_ok,
             path_ok,
             bytes_downloaded,
             report,
-        })
+        };
+        Ok((reader, report))
     }
 
     /// A entrada de manifesto de uma geração **já verificada** (§72).

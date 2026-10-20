@@ -247,7 +247,7 @@ pub struct Engine {
     hvm_lock: Mutex<()>,
     /// Estado H-VM dobrado até ao cursor (próximo LSN por ver). Ver
     /// [`Engine::hvm_state`].
-    hvm_cache: Mutex<Option<(Lsn, VmState)>>,
+    hvm_cache: Mutex<Option<(Lsn, Arc<VmState>)>>,
     /// Ponto de consistência para o checkpoint: nenhum append pode estar EM VOO
     /// (já no log, ainda por indexar) quando um snapshot é tirado.
     ///
@@ -1114,12 +1114,25 @@ impl Engine {
     /// se decifrar), rebuild e demote invalidam a cache e o próximo pedido
     /// faz o replay integral, que é a definição.
     pub fn hvm_state(&self) -> Result<VmState, HeraclitusError> {
+        Ok((*self.hvm_state_shared()?).clone())
+    }
+
+    /// Read-only callers share a stable snapshot; unchanged ledgers allocate
+    /// nothing. An update copies only if an older reader still owns the Arc.
+    pub fn hvm_state_shared(&self) -> Result<Arc<VmState>, HeraclitusError> {
         let vm = ConsistencyVirtualMachine::new(VmVersion(1));
         let mut cache = self.hvm_cache.lock().unwrap();
+        if let Some((cursor, state)) = cache.as_ref() {
+            if *cursor == self.log.head() {
+                return Ok(Arc::clone(state));
+            }
+        }
         let (from, state) = cache.take().unwrap_or_default();
         // Um erro deixa a cache vazia: o próximo pedido refaz tudo do zero.
-        let (state, next) = vm_bridge::replay_vm_from(&self.log, &vm, state, from)?;
-        *cache = Some((next, state.clone()));
+        let (state, next) =
+            vm_bridge::replay_vm_from(&self.log, &vm, Arc::unwrap_or_clone(state), from)?;
+        let state = Arc::new(state);
+        *cache = Some((next, Arc::clone(&state)));
         Ok(state)
     }
 
@@ -1222,12 +1235,18 @@ impl Engine {
     /// local (default). As credenciais de nuvem vêm do ambiente.
     #[cfg(feature = "tier")]
     fn open_cold_tier(&self) -> Result<heraclitus_tier::ColdTier, HeraclitusError> {
-        heraclitus_tier::ColdTier::open_location(&self.cold_tier_path.to_string_lossy())
+        Ok(
+            heraclitus_tier::ColdTier::open_location(&self.cold_tier_path.to_string_lossy())?
+                .with_keystore(self.keystore.clone()),
+        )
     }
 
     #[cfg(feature = "tier")]
     fn open_cold_tier_v6(&self) -> Result<heraclitus_tier::ColdTierV6, HeraclitusError> {
-        heraclitus_tier::ColdTierV6::open_location(&self.cold_tier_path.to_string_lossy())
+        Ok(
+            heraclitus_tier::ColdTierV6::open_location(&self.cold_tier_path.to_string_lossy())?
+                .with_keystore(self.keystore.clone()),
+        )
     }
 
     /// Ids dos segmentos selados — candidatos a demote para o cold tier.
@@ -1519,9 +1538,7 @@ impl Engine {
             }
             heraclitus_tier::AnyDemotionReceipt::V2(v2) => {
                 let cold = self.open_cold_tier_v6()?;
-                let (events, stats) = cold
-                    .recall_lsn_range(&v2.key()?, v2.first_lsn, v2.last_lsn)
-                    .await?;
+                let (events, stats) = cold.recall_receipt(&v2).await?;
                 self.cold_range_reads
                     .fetch_add(stats.requests, std::sync::atomic::Ordering::Relaxed);
                 self.cold_bytes_downloaded
@@ -2969,19 +2986,23 @@ impl Engine {
 
         // EventId/ts_hlc são gerados pelo destino e não participam do hash: um
         // retry legítimo cria um Episode novo antes de chegar aqui.
-        let canonical = serde_json::to_vec(&(
-            &episode.agent_id,
-            &episode.session_id,
-            &episode.kind,
-            &episode.content,
-            &episode.embedding,
-            &episode.attrs,
-            &episode.valid_from,
-            &episode.valid_to,
-            &episode.parents,
-        ))
+        let mut canonical = blake3::Hasher::new();
+        serde_json::to_writer(
+            &mut canonical,
+            &(
+                &episode.agent_id,
+                &episode.session_id,
+                &episode.kind,
+                &episode.content,
+                &episode.embedding,
+                &episode.attrs,
+                &episode.valid_from,
+                &episode.valid_to,
+                &episode.parents,
+            ),
+        )
         .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
-        let payload_hash = blake3::hash(&canonical).to_hex().to_string();
+        let payload_hash = canonical.finalize().to_hex().to_string();
 
         let _guard = self.idempotency_shard(key).lock().unwrap();
         // `.read()` e não `.write()`: `lookup` é `&self`. Tomar o lock de
@@ -3002,18 +3023,22 @@ impl Engine {
                     context: "idempotency index".into(),
                     detail: format!("LSN {lsn} ausente para a chave {key}"),
                 })?;
-            let legacy = serde_json::to_vec(&(
-                &episode.agent_id,
-                &episode.session_id,
-                &episode.kind,
-                &episode.content,
-                &episode.embedding,
-                &episode.attrs,
-                &episode.valid_from,
-                &episode.valid_to,
-            ))
+            let mut legacy = blake3::Hasher::new();
+            serde_json::to_writer(
+                &mut legacy,
+                &(
+                    &episode.agent_id,
+                    &episode.session_id,
+                    &episode.kind,
+                    &episode.content,
+                    &episode.embedding,
+                    &episode.attrs,
+                    &episode.valid_from,
+                    &episode.valid_to,
+                ),
+            )
             .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
-            let legacy_hash = blake3::hash(&legacy).to_hex().to_string();
+            let legacy_hash = legacy.finalize().to_hex().to_string();
             if existing.parents == episode.parents
                 && (existing.attrs.get(IDEMPOTENCY_HASH_ATTR) == Some(&payload_hash)
                     || existing.attrs.get(IDEMPOTENCY_HASH_ATTR) == Some(&legacy_hash))

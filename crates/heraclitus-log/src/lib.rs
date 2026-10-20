@@ -47,7 +47,7 @@ use std::time::Instant;
 use tokio::sync::broadcast;
 
 const BINCODE_CFG: bincode::config::Configuration = bincode::config::standard();
-const ENCRYPTED_FIELDS_ATTR: &str = "__heraclitus_encrypted_fields_v1";
+pub const ENCRYPTED_FIELDS_ATTR: &str = "__heraclitus_encrypted_fields_v1";
 const SHREDDED_ATTR: &str = "__heraclitus_shredded";
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -569,7 +569,7 @@ fn apply_shredded_tombstone(ep: &mut Episode) {
 /// Reverte a cifra de um `Episode` já reconstruído do payload persistido.
 /// Mantida fora de [`Log`] para que o reader v6 siga exactamente a mesma
 /// semântica de crypto-shredding do reader legado.
-pub(crate) fn decrypt_storage_episode_in_place(
+pub fn decrypt_storage_episode_in_place(
     ep: &mut Episode,
     keystore: Option<&KeyStore>,
 ) -> Result<(), HeraclitusError> {
@@ -607,12 +607,7 @@ pub(crate) fn decrypt_storage_episode_in_place(
     // episódio (um blob colado de outro evento falha a tag e cai no ramo de
     // adulteração); `HRKLENC1` é um registo legado e abre com a AAD antiga.
     if encrypted_content {
-        let opened = heraclitus_crypto::open_record(
-            &key,
-            &ep.content,
-            &content_ctx(ep),
-            ep.agent_id.as_bytes(),
-        );
+        let opened = ks.open_record(&key, &ep.content, &content_ctx(ep), ep.agent_id.as_bytes());
         match opened {
             Some(opened) => ep.content = opened,
             None if ks.was_shredded(&ep.agent_id) => {
@@ -635,12 +630,7 @@ pub(crate) fn decrypt_storage_episode_in_place(
                 ep.agent_id
             ))
         })?;
-        let opened = heraclitus_crypto::open_record(
-            &key,
-            &sealed,
-            &fields_ctx(ep),
-            &fields_aad(&ep.agent_id),
-        );
+        let opened = ks.open_record(&key, &sealed, &fields_ctx(ep), &fields_aad(&ep.agent_id));
         let opened = match opened {
             Some(opened) => opened,
             None if ks.was_shredded(&ep.agent_id) => {
@@ -661,6 +651,49 @@ pub(crate) fn decrypt_storage_episode_in_place(
         ep.embedding = sensitive.embedding;
     }
     Ok(())
+}
+
+pub(crate) fn initialize_legacy_policy_from_log(
+    ks: Option<&KeyStore>,
+    head: Lsn,
+    mut scan: impl FnMut(Lsn, Lsn) -> Result<Vec<(Lsn, Episode)>, HeraclitusError>,
+) -> Result<(), HeraclitusError> {
+    let Some(ks) = ks.filter(|k| !k.legacy_policy_initialized()) else {
+        return Ok(());
+    };
+    let mut bindings = Vec::new();
+    let mut from = 0;
+    while from < head {
+        let to = from.saturating_add(1024).min(head);
+        for (_, ep) in scan(from, to)? {
+            if let Some(binding) =
+                heraclitus_crypto::legacy_record_binding(&ep.content, &content_ctx(&ep))
+            {
+                bindings.push(binding);
+            }
+            if let Some(encoded) = ep.attrs.get(ENCRYPTED_FIELDS_ATTR) {
+                let blob = hex_decode(encoded).ok_or_else(|| {
+                    HeraclitusError::Crypto("invalid legacy fields envelope".into())
+                })?;
+                if let Some(binding) =
+                    heraclitus_crypto::legacy_record_binding(&blob, &fields_ctx(&ep))
+                {
+                    bindings.push(binding);
+                }
+            }
+        }
+        from = to;
+    }
+    ks.initialize_legacy_policy(bindings)?;
+    Ok(())
+}
+
+pub(crate) fn same_replicated_episode(a: &Episode, b: &Episode) -> Result<bool, HeraclitusError> {
+    let encode = |ep: &Episode| {
+        bincode::serde::encode_to_vec(ep, BINCODE_CFG)
+            .map_err(|e| HeraclitusError::Serialization(e.to_string()))
+    };
+    Ok(encode(a)? == encode(b)?)
 }
 
 impl StoragePayload {
@@ -813,6 +846,16 @@ mod testes_aad_v2 {
         let dir = tempfile::tempdir().unwrap();
         let ks = KeyStore::open(dir.path()).unwrap();
         let legado = registo_v1(&ks, b"dados de 2025", "Carlos");
+        ks.initialize_legacy_policy(vec![
+            heraclitus_crypto::legacy_record_binding(&legado.content, &content_ctx(&legado))
+                .unwrap(),
+            heraclitus_crypto::legacy_record_binding(
+                &envelope_de_atributos(&legado),
+                &fields_ctx(&legado),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
         let novo = persistido(&episodio(b"dados novos", "Ana"), &ks);
 
         let mut lido = legado.clone();
@@ -1706,7 +1749,7 @@ impl Log {
             }));
         });
 
-        Ok(Self {
+        let mut log = Self {
             dir,
             #[cfg(test)]
             synced_batches,
@@ -1716,11 +1759,16 @@ impl Log {
             catalog,
             tail_tx,
             cmd_tx,
-            keystore,
+            keystore: None,
             stamp_lock: std::sync::Mutex::new(()),
             fds: std::sync::Mutex::new(std::collections::HashMap::new()),
             leituras: AtomicU64::new(0),
-        })
+        };
+        initialize_legacy_policy_from_log(keystore.as_deref(), log.head(), |from, to| {
+            log.scan(from, to)
+        })?;
+        log.keystore = keystore;
+        Ok(log)
     }
 
     fn check_poison(&self) -> Result<(), HeraclitusError> {
@@ -2397,7 +2445,7 @@ impl Log {
         let head = self.head();
         if lsn < head {
             return match self.read(lsn)? {
-                Some((_, existing)) if existing.id == episode.id => Ok(lsn),
+                Some((_, existing)) if same_replicated_episode(&existing, &episode)? => Ok(lsn),
                 _ => Err(HeraclitusError::CasConflict {
                     expected: lsn,
                     head,
