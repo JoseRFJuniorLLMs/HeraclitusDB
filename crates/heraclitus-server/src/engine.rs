@@ -6721,13 +6721,15 @@ mod tests {
                 }
                 engine.append(e).unwrap();
             }
+            // Fora da grelha das observacoes (multiplos de 0,01): nenhuma pode
+            // empatar a distancia 0 com a evidencia e ganhar pelo LSN menor.
             let mut evidencia = Episode::new(
                 "ag",
                 EventKind::Custom("AgentEvidence".into()),
                 b"evidencia".to_vec(),
             );
             evidencia.embedding = Some(heraclitus_core::ProductPoint {
-                hyp: vec![0.05, 0.02],
+                hyp: vec![0.055, 0.025],
                 sph: vec![],
                 euc: vec![],
             });
@@ -6743,7 +6745,7 @@ mod tests {
 
             // ORACULO: a mesma distancia do planner, sobre todos os episodios
             // do log, ordenada por (distancia, LSN), sem embedding no fim.
-            let q = [0.05f32, 0.02];
+            let q = [0.055f32, 0.025];
             let k1 = ProductMetric::default().sig.k1;
             let mut todas: Vec<(f64, Lsn)> = engine
                 .log
@@ -6766,7 +6768,7 @@ mod tests {
 
             let antes = engine.log.leituras_efectuadas();
             let v = heraclitus_query::execute(
-                "MATCH (n) RETURN n ORDER BY DIST_HYP([0.05, 0.02]) ASC LIMIT 5",
+                "MATCH (n) RETURN n ORDER BY DIST_HYP([0.055, 0.025]) ASC LIMIT 5",
                 &engine,
             )
             .unwrap();
