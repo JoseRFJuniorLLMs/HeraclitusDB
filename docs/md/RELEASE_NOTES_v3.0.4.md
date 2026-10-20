@@ -1,7 +1,8 @@
 # HeraclitusDB v3.0.4 — Correções das auditorias e pacotes Linux
 
-Data: 2026-10-20. Candidato em validação; os resultados do CI serão registrados
-antes da publicação da release.
+Data: 2026-10-20. Binários e pacotes são compilados no GitHub Actions. O workflow
+de publicação exige dois builds reprodutíveis e qualifica o pacote extraído
+com 40 ciclos de crash/restart antes de tornar a release pública.
 
 ## Correções
 

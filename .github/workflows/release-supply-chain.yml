@@ -9,6 +9,11 @@ on:
         description: Version recorded in the release dossier (3.0.0 or v3.0.0)
         required: true
         type: string
+      publish_release:
+        description: Publish a draft only after every build and qualification gate passes
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -220,3 +225,32 @@ jobs:
           "$RUNNER_TEMP/native-packages/SHA256SUMS"
           "$RUNNER_TEMP/native-packages/linux-packages.sigstore.json"
           --repo "$GITHUB_REPOSITORY"
+
+      - name: Publish the qualified version and native packages
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.payload.outputs.version }}
+          ARCHIVE: ${{ steps.payload.outputs.archive }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION#v}"
+          git fetch --tags origin
+          if git rev-parse --verify "refs/tags/$tag" >/dev/null 2>&1; then
+            test "$(git rev-parse "refs/tags/$tag^{}")" = "$GITHUB_SHA"
+          fi
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists; refusing to overwrite it" >&2
+            exit 1
+          fi
+          # Keep the release invisible until all assets have uploaded. The
+          # GITHUB_TOKEN publication does not recursively trigger this workflow.
+          gh release create "$tag" --draft --target "$GITHUB_SHA" \
+            --title "HeraclitusDB $tag" --notes-file "docs/md/RELEASE_NOTES_$tag.md" \
+            "$ARCHIVE" "$ARCHIVE.sha256" "$ARCHIVE.sigstore.json" \
+            "$RUNNER_TEMP/native-packages/"*.deb "$RUNNER_TEMP/native-packages/"*.rpm \
+            "$RUNNER_TEMP/native-packages/SHA256SUMS" \
+            "$RUNNER_TEMP/native-packages/linux-packages.sigstore.json" \
+            --repo "$GITHUB_REPOSITORY"
+          gh release edit "$tag" --draft=false --latest --repo "$GITHUB_REPOSITORY"
