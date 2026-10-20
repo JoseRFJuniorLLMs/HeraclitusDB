@@ -9,6 +9,7 @@
 //! stabilized remainder, then comparing that slope against a budget the
 //! operator declared in advance.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,7 +21,9 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 
 use crate::evidence::{sha256_file, write_bytes_new, write_json_new};
-use crate::load::{execute_operation, latency_summary, mix, operation, LatencySummary};
+use crate::load::{
+    execute_operation, latency_summary, mix, operation, LatencySummary, OperationKind,
+};
 use crate::manifest::WorkloadProfile;
 use crate::procstat::{self, ProcessSample};
 
@@ -103,6 +106,30 @@ struct GrowthGate {
     within_budget: Option<bool>,
 }
 
+/// One workload lane across the run. Diagnostic only: it never changes the
+/// verdict. The overall p99 says latency drifted; this says which lane did,
+/// and `samples[].head` beside it says whether it tracks the data volume.
+#[derive(Debug, Serialize)]
+struct OperationLatency {
+    first_window: LatencySummary,
+    final_window: LatencySummary,
+    p99_drift_ratio: Option<f64>,
+    /// Aligned with `latency_windows`; a window without this lane has count 0.
+    windows: Vec<LatencySummary>,
+}
+
+/// Memory against the data the soak itself wrote. Diagnostic only. A workload
+/// that keeps appending grows in-memory indexes with every event, so bytes per
+/// hour alone cannot tell "proportional to retained data" from "leaking".
+#[derive(Debug, Serialize)]
+struct MemoryPerEvent {
+    /// Slope of RSS against `head` over the stabilized window.
+    resident_set_bytes_per_appended_event: Option<f64>,
+    /// The same slope over the final half of that window.
+    resident_set_bytes_per_appended_event_second_half: Option<f64>,
+    events_appended_in_window: u64,
+}
+
 #[derive(Debug, Serialize)]
 struct SoakReport {
     schema_version: u32,
@@ -130,7 +157,9 @@ struct SoakReport {
     latency_final_window: LatencySummary,
     latency_drift_ratio: Option<f64>,
     latency_within_budget: Option<bool>,
+    latency_by_operation: BTreeMap<&'static str, OperationLatency>,
     gates: Vec<GrowthGate>,
+    memory_per_event: MemoryPerEvent,
     integrity_ok: bool,
     integrity_message: String,
     samples: Vec<Sample>,
@@ -278,6 +307,102 @@ fn gate(
     }
 }
 
+/// Summarise one drained window per lane.
+fn summarise_by_operation(
+    window: &[(OperationKind, u64)],
+) -> BTreeMap<OperationKind, LatencySummary> {
+    let mut lanes: BTreeMap<OperationKind, Vec<u64>> = BTreeMap::new();
+    for (kind, micros) in window {
+        lanes.entry(*kind).or_default().push(*micros);
+    }
+    lanes
+        .into_iter()
+        .map(|(kind, micros)| (kind, latency_summary(&micros)))
+        .collect()
+}
+
+/// Turn the per-window lane summaries into one aligned series per lane, with
+/// the same first/final-window choice the drift gate makes.
+fn latency_by_operation(
+    windows: &[BTreeMap<OperationKind, LatencySummary>],
+) -> BTreeMap<&'static str, OperationLatency> {
+    let kinds: std::collections::BTreeSet<OperationKind> = windows
+        .iter()
+        .flat_map(|window| window.keys().copied())
+        .collect();
+    kinds
+        .into_iter()
+        .map(|kind| {
+            let series: Vec<LatencySummary> = windows
+                .iter()
+                .map(|window| {
+                    window
+                        .get(&kind)
+                        .cloned()
+                        .unwrap_or_else(|| latency_summary(&[]))
+                })
+                .collect();
+            let empty = || latency_summary(&[]);
+            let first_window = series.first().cloned().unwrap_or_else(empty);
+            let final_window = series.last().cloned().unwrap_or_else(empty);
+            let p99_drift_ratio = (first_window.p99_ms > 0.0 && final_window.count > 0)
+                .then(|| final_window.p99_ms / first_window.p99_ms);
+            (
+                kind.as_str(),
+                OperationLatency {
+                    first_window,
+                    final_window,
+                    p99_drift_ratio,
+                    windows: series,
+                },
+            )
+        })
+        .collect()
+}
+
+/// RSS slope against `head` from `from_seconds` on, in bytes per event.
+fn rss_per_event(samples: &[Sample], from_seconds: f64) -> Option<f64> {
+    let (heads, rss): (Vec<f64>, Vec<f64>) = samples
+        .iter()
+        .filter(|sample| sample.elapsed_seconds >= from_seconds)
+        .filter_map(|sample| {
+            sample
+                .process
+                .rss_bytes
+                .map(|rss| (sample.head as f64, rss as f64))
+        })
+        .unzip();
+    // A flat head has no slope to fit: dividing memory by zero new events
+    // would print infinity where the honest answer is "not measurable".
+    let spread = heads.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+        - heads.iter().copied().fold(f64::INFINITY, f64::min);
+    if spread.is_nan() || spread <= 0.0 {
+        return None;
+    }
+    procstat::slope_per_second(&heads, &rss)
+}
+
+fn memory_per_event(samples: &[Sample], stabilization_seconds: f64) -> MemoryPerEvent {
+    let last_elapsed = samples
+        .last()
+        .map(|sample| sample.elapsed_seconds)
+        .unwrap_or(stabilization_seconds);
+    let midpoint = stabilization_seconds + (last_elapsed - stabilization_seconds) / 2.0;
+    let in_window = samples
+        .iter()
+        .filter(|sample| sample.elapsed_seconds >= stabilization_seconds);
+    let first_head = in_window.clone().map(|sample| sample.head).min();
+    let last_head = in_window.map(|sample| sample.head).max();
+    MemoryPerEvent {
+        resident_set_bytes_per_appended_event: rss_per_event(samples, stabilization_seconds),
+        resident_set_bytes_per_appended_event_second_half: rss_per_event(samples, midpoint),
+        events_appended_in_window: match (first_head, last_head) {
+            (Some(first), Some(last)) => last.saturating_sub(first),
+            _ => 0,
+        },
+    }
+}
+
 /// Counters every soak worker shares. Grouped so the worker signature stays
 /// readable as the set grows.
 #[derive(Clone)]
@@ -285,7 +410,8 @@ struct SoakLedger {
     stop: Arc<AtomicBool>,
     completed: Arc<AtomicU64>,
     errors: Arc<AtomicU64>,
-    latencies: Arc<Mutex<Vec<u64>>>,
+    /// Lane and latency in microseconds, drained once per sample window.
+    latencies: Arc<Mutex<Vec<(OperationKind, u64)>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -313,7 +439,10 @@ async fn worker(mut client: Client, spec: SoakWorkerSpec, ledger: SoakLedger) {
         )
         .await
         .is_ok();
-        local.push(started.elapsed().as_micros().min(u64::MAX as u128) as u64);
+        local.push((
+            kind,
+            started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+        ));
         if outcome {
             ledger.completed.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -392,16 +521,21 @@ async fn run_async(config: &SoakConfig) -> Result<SoakSummary> {
     // Latency is summarised per sample window so drift is measurable; an
     // overall p99 hides a system that got three times slower halfway through.
     let mut window_summaries: Vec<LatencySummary> = Vec::new();
+    let mut window_lanes: Vec<BTreeMap<OperationKind, LatencySummary>> = Vec::new();
     let mut reservoir = LatencyReservoir::new();
+    let mut drain = |window: Vec<(OperationKind, u64)>| {
+        let micros: Vec<u64> = window.iter().map(|(_, micros)| *micros).collect();
+        reservoir.extend(&micros);
+        window_summaries.push(latency_summary(&micros));
+        window_lanes.push(summarise_by_operation(&window));
+    };
     while Instant::now() < deadline {
         tokio::time::sleep(interval).await;
         let head = control.snapshot().await.unwrap_or(0);
-        {
-            // Drain, do not accumulate: the ledger must not grow with the soak.
-            let window = std::mem::take(&mut *latencies.lock().expect("latency ledger poisoned"));
-            reservoir.extend(&window);
-            window_summaries.push(latency_summary(&window));
-        }
+        // Drain, do not accumulate: the ledger must not grow with the soak.
+        drain(std::mem::take(
+            &mut *latencies.lock().expect("latency ledger poisoned"),
+        ));
         samples.push(Sample {
             elapsed_seconds: started.elapsed().as_secs_f64(),
             head,
@@ -421,8 +555,7 @@ async fn run_async(config: &SoakConfig) -> Result<SoakSummary> {
     {
         let tail = std::mem::take(&mut *latencies.lock().expect("latency ledger poisoned"));
         if !tail.is_empty() {
-            reservoir.extend(&tail);
-            window_summaries.push(latency_summary(&tail));
+            drain(tail);
         }
     }
     let final_head = control.snapshot().await.unwrap_or(0);
@@ -569,7 +702,9 @@ async fn run_async(config: &SoakConfig) -> Result<SoakSummary> {
         latency_final_window,
         latency_drift_ratio,
         latency_within_budget,
+        latency_by_operation: latency_by_operation(&window_lanes),
         gates,
+        memory_per_event: memory_per_event(&samples, stabilization),
         integrity_ok,
         integrity_message,
         samples,
@@ -650,6 +785,72 @@ mod tests {
                 handles: Some(32),
             },
         }
+    }
+
+    #[test]
+    fn lane_series_stay_aligned_and_name_the_lane_that_drifted() {
+        use OperationKind::{AttributeQuery, Ingest, VectorRetrieval};
+        // Ingest stays flat; the vector lane gets ten times slower; the
+        // attribute lane is absent from the middle window.
+        let windows = vec![
+            summarise_by_operation(&[
+                (Ingest, 1_000),
+                (VectorRetrieval, 10_000),
+                (AttributeQuery, 2_000),
+            ]),
+            summarise_by_operation(&[(Ingest, 1_000), (VectorRetrieval, 50_000)]),
+            summarise_by_operation(&[
+                (Ingest, 1_000),
+                (VectorRetrieval, 100_000),
+                (AttributeQuery, 2_000),
+            ]),
+        ];
+        let lanes = latency_by_operation(&windows);
+        assert_eq!(
+            lanes.keys().copied().collect::<Vec<_>>(),
+            vec!["attribute_query", "ingest", "vector_retrieval"]
+        );
+        for lane in lanes.values() {
+            assert_eq!(lane.windows.len(), windows.len());
+        }
+        assert_eq!(lanes["attribute_query"].windows[1].count, 0);
+        assert_eq!(lanes["ingest"].p99_drift_ratio, Some(1.0));
+        assert_eq!(lanes["vector_retrieval"].p99_drift_ratio, Some(10.0));
+    }
+
+    #[test]
+    fn a_lane_missing_from_the_final_window_reports_no_drift_ratio() {
+        let windows = vec![
+            summarise_by_operation(&[(OperationKind::TextRetrieval, 5_000)]),
+            summarise_by_operation(&[(OperationKind::Ingest, 1_000)]),
+        ];
+        let lanes = latency_by_operation(&windows);
+        assert_eq!(lanes["text_retrieval"].p99_drift_ratio, None);
+    }
+
+    #[test]
+    fn memory_is_also_reported_per_appended_event() {
+        // 4 KiB per event, at a head that grows by 1 000 events per sample.
+        let samples: Vec<Sample> = (0..8)
+            .map(|i| Sample {
+                head: i * 1_000,
+                ..sample(i as f64 * 60.0, Some(100_000_000 + i * 4_096_000))
+            })
+            .collect();
+        let memory = memory_per_event(&samples, 120.0);
+        let per_event = memory.resident_set_bytes_per_appended_event.unwrap();
+        assert!((per_event - 4_096.0).abs() < 1e-6, "{per_event}");
+        assert!(memory
+            .resident_set_bytes_per_appended_event_second_half
+            .is_some());
+        assert_eq!(memory.events_appended_in_window, 5_000);
+
+        // A head that never moves has no per-event slope, not an infinite one.
+        let flat: Vec<Sample> = (0..4).map(|i| sample(i as f64 * 60.0, Some(1))).collect();
+        assert_eq!(
+            memory_per_event(&flat, 0.0).resident_set_bytes_per_appended_event,
+            None
+        );
     }
 
     #[test]

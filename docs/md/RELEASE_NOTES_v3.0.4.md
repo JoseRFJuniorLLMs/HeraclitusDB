@@ -43,7 +43,13 @@ O modelo Merkle deixa de assumir a falsa injetividade da soma. O CI verifica
 os modelos e gera relatório com commit e escopo. Isso não é uma prova de
 refinamento do código Rust: esse estado continua `NOT_VERIFIED`.
 
-O soak reprovado de 20/10 ainda precisa de nova execução e diagnóstico causal.
+O soak reprovado de 20/10 continua reprovado. O diagnóstico em
+`docs/qualification/SOAK-NIGHTLY-2026-10-20-DIAGNOSTICO.md` atribui a deriva
+do p99 a três consultas da carga que custam O(n) no desenho atual (`agent_id`
+sem índice, `ORDER BY DIST_HYP` por scan, `ActivationStore::top_k`) e o RSS ao
+volume gravado com índices em memória. É uma hipótese apoiada no código. O
+qualifier passa a registar a latência por operação e o RSS por evento para que
+o próximo nightly a confirme ou desminta. Os limites dos gates não mudaram.
 Esta versão não declara encerradas as otimizações arquiteturais O1/O2/O6/O7/O8,
 o teto global dos índices, snapshots Raft em streaming, nem a qualificação
 externa HSM/ACT/WORM e institucional. A política conservadora do footer B5 é

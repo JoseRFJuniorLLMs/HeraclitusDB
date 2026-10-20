@@ -2441,17 +2441,21 @@ impl V6Log {
 
     /// O registo de pins de §92.
     ///
-    /// **Nenhum leitor interno pina hoje**, e vale dizer porquê em vez de
-    /// deixar isso implícito. O que §92 protege é remover uma geração que
-    /// alguém está a ler, e o `commit_gc` já é seguro nos dois sistemas onde
-    /// isto corre: em Unix o `unlink` de um ficheiro aberto deixa o descritor
-    /// válido, e em Windows o `remove_file` falha com sharing violation e a
-    /// geração é reportada como `orphaned` — nunca como removida — para uma
-    /// passagem posterior. O invariante que impede perda de dados é o §91, que
-    /// é verificado por `assert_gc_invariant` e não por pins.
+    /// Desde a v3.0.4 a leitura pontual (`tentar_ler`) e a varredura
+    /// (`instantaneo_varredura`) pinam a geração selada que escolheram, sob o
+    /// mesmo lock em que a escolheram, até acabarem de a ler. A cauda activa
+    /// não é pinada: se rolar a meio, a varredura detecta-o e recomeça.
     ///
-    /// O registo existe e é honrado pelo plano: quem tiver um leitor de longa
-    /// duração (um recall frio, uma exportação) deve pinar por aqui.
+    /// Os pins não substituem o invariante que impede perda de dados, que é o
+    /// §91, verificado por `assert_gc_invariant`. Em Unix o `unlink` de um
+    /// ficheiro aberto deixa o descritor válido; em Windows o `remove_file`
+    /// pode falhar com sharing violation e a geração fica `orphaned` para uma
+    /// passagem posterior. A cache de leitores PACKED (`packed_readers`) guarda
+    /// descritores sem pinar: em Unix, uma geração recolhida pode reter o seu
+    /// espaço até a entrada da cache sair (no máximo 32 leitores).
+    ///
+    /// Quem tiver um leitor de longa duração (um recall frio, uma exportação)
+    /// deve pinar por aqui.
     pub fn pins(&self) -> &super::gc::PinRegistry {
         &self.pins
     }
