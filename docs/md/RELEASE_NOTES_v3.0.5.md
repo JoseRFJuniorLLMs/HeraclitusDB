@@ -44,3 +44,24 @@ Em preparação. Cada PR do ciclo acrescenta aqui a sua entrada.
   longos não o usam.
 - O gate de threads aceita um único degrau pequeno depois da estabilização,
   mesmo na segunda metade da janela, e regista o motivo no relatório.
+
+## Memória
+
+- Medição por índice em `crates/heraclitus-server/tests/memoria_por_indice.rs`
+  (ver `docs/qualification/MEMORIA-INDICES-2026-10-21.md`).
+- O índice de propriedades do grafo deixa de guardar os atributos internos
+  `__heraclitus_*` (únicos por evento): 724 → 149 B por evento. O restore
+  descarta-os de checkpoints antigos.
+- O índice de atributos deixa de indexar o hash de idempotência:
+  446 → 236 B por evento. Formato v9 (um checkpoint v8 ou anterior é
+  reconstruído do log no primeiro arranque; com a v8 do mesmo ciclo, é uma
+  só reconstrução para quem vem da 3.0.4).
+- Teto de memória dos índices: cada índice estima os seus bytes residentes
+  (dentro de ±7% do alocador na carga do soak); o servidor amostra-os a cada
+  `index_memory_sample_secs` (30 s), publica
+  `heraclitus_index_resident_bytes{index=...}` e `index_memory` no `/stats`, e
+  aplica `index_memory_budget_bytes` (sem teto por omissão). Com
+  `index_memory_policy = "reject_writes"`, os appends de clientes recebem
+  `RESOURCE_EXHAUSTED` (repetível) enquanto a memória estiver acima do teto;
+  escritas internas e replicação nunca são recusadas. Variante nova
+  `HeraclitusError::ResourceExhausted`.

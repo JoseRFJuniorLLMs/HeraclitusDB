@@ -17,6 +17,16 @@ pub mod entity; // M11: entity resolution determinística e temporal
 pub mod provenance; // SPEC-014: provenance engine (WHY / minimal causal chain)
 pub mod temporal; // M8: grafo temporal + probabilístico (RFC-004/005/006/007)
 
+/// Atributos do envelope que o motor grava no próprio episódio
+/// (`__heraclitus_idempotency_key`, `__heraclitus_idempotency_hash`,
+/// `__heraclitus_shredded`, ...). São únicos por evento ou internos, e ninguém
+/// filtra por eles no grafo: indexá-los custava ~0,5 KiB por evento ao
+/// `attr_idx` (medido em `tests/memoria_por_indice.rs` do servidor) só para
+/// entrar no checkpoint e no `state_hash`.
+fn atributo_interno(campo: &str) -> bool {
+    campo.starts_with("__heraclitus_")
+}
+
 #[derive(Default)]
 pub struct GraphIndex {
     /// parent -> children
@@ -77,6 +87,29 @@ impl GraphIndex {
             .get(&format!("{key}={value}"))
             .map(|b| b.clone())
             .unwrap_or_default()
+    }
+
+    /// Bytes residentes, estimados pelas capacidades (ver
+    /// `heraclitus_core::memoria`). O(entradas): para amostragem periódica.
+    pub fn resident_bytes(&self) -> u64 {
+        use heraclitus_core::memoria::{de_hashmap, de_vec};
+        let adjacencia = |mapa: &DashMap<EventId, Vec<EventId>>| {
+            de_hashmap::<EventId, Vec<EventId>>(mapa.capacity())
+                + mapa
+                    .iter()
+                    .map(|e| de_vec::<EventId>(e.value().capacity()))
+                    .sum::<u64>()
+        };
+        adjacencia(&self.out)
+            + adjacencia(&self.inn)
+            + de_hashmap::<String, RoaringBitmap>(self.attr_idx.capacity())
+            + self
+                .attr_idx
+                .iter()
+                .map(|e| e.key().capacity() as u64 + e.value().serialized_size() as u64)
+                .sum::<u64>()
+            + self.dense.resident_bytes()
+            + de_hashmap::<EventId, Lsn>(self.lsn_of.capacity())
     }
 
     pub fn internal_id(&self, id: &EventId) -> Option<u32> {
@@ -241,6 +274,14 @@ impl View for GraphIndex {
         // intacto e devolve-se `Ok(false)` (rebuild), sem estado meio-restaurado.
         let mut attr_idx = std::collections::HashMap::new();
         for (k, bytes) in snap.attr {
+            // Checkpoints anteriores indexavam os atributos internos; o
+            // `apply` deixou de o fazer. Descartá-los aqui deixa o estado
+            // restaurado (e o `state_hash`) igual ao de um rebuild do log.
+            if k.split_once('=')
+                .is_some_and(|(campo, _)| atributo_interno(campo))
+            {
+                continue;
+            }
             match RoaringBitmap::deserialize_from(&bytes[..]) {
                 Ok(b) => {
                     attr_idx.insert(k, b);
@@ -276,6 +317,9 @@ impl View for GraphIndex {
         // na primeira vez que o par campo=valor aparece.
         let mut chave = String::new();
         for (k, v) in &event.attrs {
+            if atributo_interno(k) {
+                continue;
+            }
             chave.clear();
             chave.push_str(k);
             chave.push('=');
@@ -319,6 +363,42 @@ mod tests {
         let mut b = GraphIndex::new();
         b.apply(0, &event);
         assert_ne!(a.state_hash(), b.state_hash());
+    }
+
+    /// Atributos internos do envelope ficam fora do `attr_idx`; um checkpoint
+    /// antigo que os tenha volta com o mesmo estado (e `state_hash`) que um
+    /// rebuild a partir do log faria hoje.
+    #[test]
+    fn atributos_internos_ficam_fora_do_indice_de_propriedades() {
+        let mut event = Episode::new("x", EventKind::Observation, vec![]);
+        event.attrs.insert("role".into(), "admin".into());
+        event
+            .attrs
+            .insert("__heraclitus_idempotency_key".into(), "pedido-1".into());
+        event
+            .attrs
+            .insert("__heraclitus_idempotency_hash".into(), "ab".repeat(32));
+        let mut g = GraphIndex::new();
+        g.apply(0, &event);
+        assert_eq!(g.attr_idx.len(), 1);
+        assert_eq!(g.filter_eq("role", "admin").len(), 1);
+        assert!(g
+            .filter_eq("__heraclitus_idempotency_key", "pedido-1")
+            .is_empty());
+
+        // Checkpoint "antigo": o mesmo grafo com os pares internos indexados.
+        let dir = tempfile::tempdir().unwrap();
+        let mut antigo = GraphIndex::new();
+        antigo.apply(0, &event);
+        antigo
+            .attr_idx
+            .entry("__heraclitus_idempotency_key=pedido-1".into())
+            .or_default()
+            .insert(0);
+        antigo.checkpoint(dir.path()).unwrap();
+        let mut restaurado = GraphIndex::new();
+        assert!(restaurado.restore(dir.path()).unwrap());
+        assert_eq!(restaurado.state_hash(), g.state_hash());
     }
 
     #[test]

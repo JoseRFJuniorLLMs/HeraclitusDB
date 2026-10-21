@@ -726,6 +726,29 @@ impl VectorIndex {
         self.nodes.len()
     }
 
+    /// Bytes residentes, estimados pelas capacidades (ver
+    /// `heraclitus_core::memoria`). O(n) nos nós: para amostragem periódica,
+    /// não para o caminho de cada append.
+    pub fn resident_bytes(&self) -> u64 {
+        use heraclitus_core::memoria::{de_btree, de_hashmap, de_vec};
+        let mut total = de_vec::<Node>(self.nodes.capacity())
+            + de_hashmap::<EventId, u32>(self.by_event.capacity())
+            + de_vec::<EventId>(self.ids.capacity())
+            + de_vec::<Lsn>(self.lsns.capacity())
+            + self.tombstones.serialized_size() as u64
+            + de_btree::<u32, Lsn>(self.retired_at.len());
+        for no in &self.nodes {
+            let p = &no.point;
+            total += de_vec::<f32>(p.hyp.capacity() + p.sph.capacity() + p.euc.capacity())
+                + de_vec::<Vec<u32>>(no.neighbors.capacity())
+                + no.neighbors
+                    .iter()
+                    .map(|camada| de_vec::<u32>(camada.capacity()))
+                    .sum::<u64>();
+        }
+        total
+    }
+
     /// Visita o ponto residente de cada vetor com LSN em `[from, to)`, pela
     /// ordem interna. Os retirados entram: a retirada esconde o vetor das
     /// pesquisas, mas o episódio continua no log e um varrimento devolve-o.

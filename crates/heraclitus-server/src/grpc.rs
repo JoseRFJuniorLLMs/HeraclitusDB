@@ -41,6 +41,9 @@ fn status_do_append(e: heraclitus_core::HeraclitusError) -> Status {
             Status::already_exists(e.to_string())
         }
         heraclitus_core::HeraclitusError::Query(_) => Status::invalid_argument(e.to_string()),
+        heraclitus_core::HeraclitusError::ResourceExhausted(_) => {
+            Status::resource_exhausted(e.to_string())
+        }
         _ => internal(e),
     }
 }

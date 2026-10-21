@@ -45,6 +45,10 @@ impl Embedded {
 
     /// Grava um episódio no log (a fonte da verdade) e nas views.
     pub fn append(&self, episode: Episode) -> Result<Lsn, HeraclitusError> {
+        // Sem servidor não há amostragem periódica: quem embarca chama
+        // `engine().amostrar_memoria_dos_indices()` ao seu ritmo para o teto
+        // acompanhar a memória.
+        self.engine.verificar_teto_de_memoria()?;
         self.engine.append(episode)
     }
 

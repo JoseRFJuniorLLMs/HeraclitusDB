@@ -29,6 +29,13 @@ impl DenseEntityMap {
         Self::default()
     }
 
+    /// Bytes residentes, estimados pelas capacidades.
+    pub fn resident_bytes(&self) -> u64 {
+        use heraclitus_core::memoria::{de_hashmap, de_vec};
+        de_hashmap::<EventId, u32>(self.forward.capacity())
+            + de_vec::<EventId>(self.backward.capacity())
+    }
+
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             forward: HashMap::with_capacity(capacity),
