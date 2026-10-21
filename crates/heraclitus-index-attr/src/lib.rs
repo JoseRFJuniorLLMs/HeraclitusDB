@@ -125,6 +125,13 @@ pub fn agente_indexavel(agent_id: &str) -> bool {
 /// nenhum.
 pub const IDEMPOTENCY_KEY_FIELD: &str = "__heraclitus_idempotency_key";
 
+/// O hash canónico do payload que o `Engine` grava ao lado da chave de
+/// idempotência. É lido do PRÓPRIO episódio (depois de a chave dar o LSN) e
+/// nunca procurado por valor, por isso não entra no índice: era um valor único
+/// de 64 hex por evento, com dicionário e posting próprios. Uma consulta por
+/// este campo recua para o varrimento (`conhece_campo` diz que não).
+pub const IDEMPOTENCY_HASH_FIELD: &str = "__heraclitus_idempotency_hash";
+
 /// Pseudo-campo com o `agent_id` dos `AgentEvidence`, que a SPEC-0085 mantém
 /// fora do `_agent` (e de todo o envelope genérico).
 ///
@@ -218,9 +225,12 @@ const FORMAT_V5_SEM_CRC: u16 = 5;
 /// v7 não tem esse posting para as evidências antigas, e o `Engine` toma
 /// `_agent ∪ _agent_ev` como o conjunto COMPLETO de candidatos de
 /// `agent_id = x`; por isso o v7 também é recusado.
+/// **v9**: deixa de indexar `__heraclitus_idempotency_hash` (ver
+/// `IDEMPOTENCY_HASH_FIELD`). Um v8 teria postings desse campo só para os
+/// eventos antigos — uma resposta parcial —, por isso também é recusado.
 /// Todos os formatos anteriores são recusados e reconstruídos do log.
 /// O log canônico permanece inalterado; há um replay no primeiro arranque.
-const FORMAT_CURRENT: u16 = 8;
+const FORMAT_CURRENT: u16 = 9;
 
 #[cfg(test)]
 mod regressions_g6 {
@@ -1409,7 +1419,7 @@ impl View for AttrIndex {
 
         for (field, value) in &event.attrs {
             // Também no replay: logs anteriores podem ter atributos forjados.
-            if PSEUDO_CAMPOS.contains(&field.as_str()) {
+            if PSEUDO_CAMPOS.contains(&field.as_str()) || field == IDEMPOTENCY_HASH_FIELD {
                 continue;
             }
             let v = value.trim();
@@ -1617,6 +1627,26 @@ mod tests {
             .is_empty());
         assert!(idx.lookup("_agent", "hostile-agent").is_empty());
         assert!(idx.lookup("_kind", "AgentEvidence").is_empty());
+    }
+
+    /// O hash de idempotência fica fora do índice (v9); a chave continua, e o
+    /// campo do hash é desconhecido — uma consulta por ele varre o log.
+    #[test]
+    fn hash_de_idempotencia_nao_entra_no_indice() {
+        let mut idx = AttrIndex::new();
+        let mut e = Episode::new("ana", EventKind::Observation, vec![]);
+        e.attrs
+            .insert(IDEMPOTENCY_KEY_FIELD.into(), "pedido-1".into());
+        e.attrs
+            .insert(IDEMPOTENCY_HASH_FIELD.into(), "ab".repeat(32));
+        e.attrs.insert("cor".into(), "azul".into());
+        idx.apply(0, &e);
+        assert_eq!(idx.lookup(IDEMPOTENCY_KEY_FIELD, "pedido-1"), &[0]);
+        assert_eq!(idx.lookup("cor", "azul"), &[0]);
+        assert!(idx
+            .lookup(IDEMPOTENCY_HASH_FIELD, &"ab".repeat(32))
+            .is_empty());
+        assert!(!idx.conhece_campo(IDEMPOTENCY_HASH_FIELD));
     }
 
     /// `lsns_do_agente` junta `_agent` e `_agent_ev`, ordenado e sem

@@ -62,7 +62,7 @@ pub const MAX_TOP_K: usize = 10_000;
 /// mesmo com valores SKIP_VALUES) — uma só fonte para os dois nunca divergirem
 /// (auditoria recursiva 2026-10-03, iteração 1).
 pub const IDEMPOTENCY_KEY_ATTR: &str = heraclitus_index_attr::IDEMPOTENCY_KEY_FIELD;
-pub const IDEMPOTENCY_HASH_ATTR: &str = "__heraclitus_idempotency_hash";
+pub const IDEMPOTENCY_HASH_ATTR: &str = heraclitus_index_attr::IDEMPOTENCY_HASH_FIELD;
 
 /// Recusa do append idempotente quando o índice de atributos não descreve o
 /// log inteiro (auditoria recursiva 2026-10-03, iteração 1).

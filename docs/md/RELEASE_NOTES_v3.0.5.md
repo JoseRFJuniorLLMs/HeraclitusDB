@@ -44,3 +44,15 @@ Em preparação. Cada PR do ciclo acrescenta aqui a sua entrada.
   longos não o usam.
 - O gate de threads aceita um único degrau pequeno depois da estabilização,
   mesmo na segunda metade da janela, e regista o motivo no relatório.
+
+## Memória
+
+- Medição por índice em `crates/heraclitus-server/tests/memoria_por_indice.rs`
+  (ver `docs/qualification/MEMORIA-INDICES-2026-10-21.md`).
+- O índice de propriedades do grafo deixa de guardar os atributos internos
+  `__heraclitus_*` (únicos por evento): 724 → 149 B por evento. O restore
+  descarta-os de checkpoints antigos.
+- O índice de atributos deixa de indexar o hash de idempotência:
+  446 → 236 B por evento. Formato v9 (um checkpoint v8 ou anterior é
+  reconstruído do log no primeiro arranque; com a v8 do mesmo ciclo, é uma
+  só reconstrução para quem vem da 3.0.4).
