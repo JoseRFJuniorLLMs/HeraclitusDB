@@ -48,7 +48,6 @@ use openraft::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
-use std::io::Cursor;
 use std::ops::RangeBounds;
 use std::sync::{Arc, Mutex};
 
@@ -62,6 +61,11 @@ openraft::declare_raft_types!(
     pub TypeConfig:
         D = Vec<u8>,
         R = u64,
+        // Ficheiro e não `Cursor<Vec<u8>>`: o snapshot é o log inteiro, e em
+        // memória chegava a ter três a quatro cópias dele (auditoria
+        // 2026-10-16, O7). Os transportes enviam-no em pedaços pelo
+        // `InstallSnapshotRequest`, lendo e escrevendo este ficheiro.
+        SnapshotData = tokio::fs::File,
 );
 
 pub type NodeId = <TypeConfig as openraft::RaftTypeConfig>::NodeId;
@@ -194,7 +198,13 @@ struct SmState {
     /// no apply seguinte (arranque, `install_snapshot`, `skip_normals`). Não
     /// vai para o `sm_meta`: o log é a verdade, e é igual em todos os nós.
     ultimo_ts: Option<u64>,
-    current_snapshot: Option<(SnapshotMeta<NodeId, BasicNode>, Vec<u8>)>,
+    /// O snapshot corrente: o meta e o ficheiro com os episódios.
+    current_snapshot: Option<(SnapshotMeta<NodeId, BasicNode>, std::path::PathBuf)>,
+    /// O ficheiro aberto pelo último `begin_receiving_snapshot`, que o
+    /// `install_snapshot` adopta como snapshot corrente.
+    recebido: Option<std::path::PathBuf>,
+    /// Contador para nomes únicos dos ficheiros recebidos.
+    recebidos: u64,
 }
 
 /// Snapshot durável do estado da máquina (para recuperação de restart).
@@ -228,6 +238,9 @@ pub struct EpisodeStateMachine {
     state: Arc<Mutex<SmState>>,
     sm_dir: Option<std::path::PathBuf>,
     on_apply: Option<ApplyHook>,
+    /// Directório temporário dos snapshots da máquina em memória (sem
+    /// `sm_dir`), criado no primeiro uso e apagado quando a máquina morre.
+    snapshots_tmp: Arc<Mutex<Option<tempfile::TempDir>>>,
 }
 
 impl EpisodeStateMachine {
@@ -238,6 +251,7 @@ impl EpisodeStateMachine {
             state: Arc::new(Mutex::new(SmState::default())),
             sm_dir: None,
             on_apply: None,
+            snapshots_tmp: Arc::default(),
         }
     }
 
@@ -302,6 +316,9 @@ impl EpisodeStateMachine {
             ))));
         }
         let skip_normals = head - meta.normals;
+        // O snapshot corrente vive só em memória (o openraft reconstrói-o
+        // quando precisa): ficheiros de um processo anterior são lixo.
+        let _ = std::fs::remove_dir_all(sm_dir.join("snapshots"));
         Ok(Self {
             log,
             on_apply: None,
@@ -313,8 +330,11 @@ impl EpisodeStateMachine {
                 skip_normals,
                 ultimo_ts: None,
                 current_snapshot: None,
+                recebido: None,
+                recebidos: 0,
             })),
             sm_dir: Some(sm_dir),
+            snapshots_tmp: Arc::default(),
         })
     }
 
@@ -335,6 +355,22 @@ impl EpisodeStateMachine {
                 }),
             Err(_) => Ok((SmMeta::default(), false)), // primeiro arranque durável
         }
+    }
+
+    /// Onde ficam os ficheiros dos snapshots: `sm_dir/snapshots` numa máquina
+    /// durável, um directório temporário próprio numa máquina em memória.
+    fn dir_snapshots(&self) -> Result<std::path::PathBuf, StorageError<NodeId>> {
+        let erro = |e: std::io::Error| StorageError::from(StorageIOError::write(Self::io_err(e)));
+        if let Some(dir) = &self.sm_dir {
+            let snapshots = dir.join("snapshots");
+            std::fs::create_dir_all(&snapshots).map_err(erro)?;
+            return Ok(snapshots);
+        }
+        let mut tmp = self.snapshots_tmp.lock().unwrap();
+        if tmp.is_none() {
+            *tmp = Some(tempfile::tempdir().map_err(erro)?);
+        }
+        Ok(tmp.as_ref().unwrap().path().to_path_buf())
     }
 
     /// Persiste o meta da máquina de forma atómica (tmp+rename+fsync). Chamado
@@ -406,33 +442,7 @@ impl RaftSnapshotBuilder<TypeConfig> for EpisodeStateMachine {
         // N episódios mas meta a apontar N±1). Nenhum `.await` é retido sob o
         // guard, logo não há await-holding-lock nem deadlock.
         let mut st = self.state.lock().unwrap();
-        // R22: scan JANELADO direto para o vec de payloads — o scan(0, MAX)
-        // antigo materializava o log inteiro num Vec de Episodes ALÉM do vec de
-        // payloads e dos bytes finais (~3× o log em RAM, sob o mutex). O
-        // snapshot continua a ser todos os episódios por design; isto corta o
-        // pico para ~2× sem mudar um byte do formato.
-        let head = self.log.head();
-        let mut payload: Vec<Vec<u8>> = Vec::new();
-        let mut cur = 0u64;
-        while cur < head {
-            let batch = self
-                .log
-                .scan_capped(cur, head, 100_000)
-                .map_err(|e| StorageError::from(StorageIOError::read(Self::io_err(e))))?;
-            let Some(&(last, _)) = batch.last() else {
-                break;
-            };
-            for (_, ep) in &batch {
-                payload.push(
-                    bincode::serde::encode_to_vec(ep, BINCODE_CFG)
-                        .map_err(|e| StorageError::from(StorageIOError::read(Self::io_err(e))))?,
-                );
-            }
-            cur = last + 1;
-        }
-        let bytes = bincode::serde::encode_to_vec(&payload, BINCODE_CFG)
-            .map_err(|e| StorageError::from(StorageIOError::read(Self::io_err(e))))?;
-
+        let dir = self.dir_snapshots()?;
         st.snapshot_idx += 1;
         let meta = SnapshotMeta {
             last_log_id: st.applied,
@@ -443,10 +453,23 @@ impl RaftSnapshotBuilder<TypeConfig> for EpisodeStateMachine {
                 st.snapshot_idx
             ),
         };
-        st.current_snapshot = Some((meta.clone(), bytes.clone()));
+        let caminho = dir.join(format!("snapshot-{}.bin", meta.snapshot_id));
+        // Auditoria 2026-10-16, O7: o snapshot tinha o log inteiro 3–4× em RAM
+        // (payloads, bytes, clone no `current_snapshot`, clone em cada
+        // `get_current_snapshot`). Agora vai para um ficheiro à medida que se
+        // lê o log, num lote de cada vez, com os MESMOS bytes do formato de
+        // sempre — `bincode(Vec<Vec<u8>>)`: o número de episódios e cada
+        // episódio como `Vec<u8>` — para nós de versões diferentes continuarem
+        // a trocar snapshots.
+        escrever_snapshot(&self.log, &caminho)?;
+        if let Some((_, anterior)) = st.current_snapshot.replace((meta.clone(), caminho.clone())) {
+            if anterior != caminho {
+                let _ = std::fs::remove_file(anterior);
+            }
+        }
         Ok(Snapshot {
             meta,
-            snapshot: Box::new(Cursor::new(bytes)),
+            snapshot: Box::new(abrir_snapshot(&caminho)?),
         })
     }
 }
@@ -540,32 +563,52 @@ impl RaftStateMachine<TypeConfig> for EpisodeStateMachine {
 
     async fn begin_receiving_snapshot(
         &mut self,
-    ) -> Result<Box<Cursor<Vec<u8>>>, StorageError<NodeId>> {
-        Ok(Box::new(Cursor::new(Vec::new())))
+    ) -> Result<Box<tokio::fs::File>, StorageError<NodeId>> {
+        let dir = self.dir_snapshots()?;
+        let mut st = self.state.lock().unwrap();
+        st.recebidos += 1;
+        let caminho = dir.join(format!("recebido-{}.bin.tmp", st.recebidos));
+        let ficheiro = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&caminho)
+            .map_err(erro_de_snapshot)?;
+        if let Some(anterior) = st.recebido.replace(caminho) {
+            let _ = std::fs::remove_file(anterior);
+        }
+        Ok(Box::new(tokio::fs::File::from_std(ficheiro)))
     }
 
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta<NodeId, BasicNode>,
-        snapshot: Box<Cursor<Vec<u8>>>,
+        snapshot: Box<tokio::fs::File>,
     ) -> Result<(), StorageError<NodeId>> {
-        let bytes = snapshot.into_inner();
-        let (payload, _): (Vec<Vec<u8>>, usize) =
-            bincode::serde::decode_from_slice(&bytes, BINCODE_CFG)
-                .map_err(|e| StorageError::from(StorageIOError::read(Self::io_err(e))))?;
+        use std::io::{Seek, SeekFrom};
+        // Lido em streaming: um episódio de cada vez, nunca o snapshot inteiro.
+        let mut ficheiro = snapshot.into_std().await;
+        ficheiro
+            .seek(SeekFrom::Start(0))
+            .map_err(erro_de_snapshot)?;
+        let mut entrada = std::io::BufReader::new(ficheiro);
+        let total: u64 = bincode::serde::decode_from_std_read(&mut entrada, BINCODE_CFG)
+            .map_err(erro_de_snapshot)?;
         // O log local é append-only: instalar = acrescentar apenas os episódios
         // que ainda faltam (o prefixo já presente é, por determinismo, igual).
         // Os episódios do snapshot vêm do log do líder JÁ carimbados pelo
         // apply dele, que é o carimbo que este nó teria calculado: grava-se tal
         // como vem, sem re-carimbar e sem envelope (o snapshot leva episódios
         // do log, não entradas do raft).
-        for (i, ep_bytes) in payload.iter().enumerate() {
-            let lsn = i as u64;
+        for lsn in 0..total {
+            let ep_bytes: Vec<u8> = bincode::serde::decode_from_std_read(&mut entrada, BINCODE_CFG)
+                .map_err(erro_de_snapshot)?;
             if lsn < self.log.head() {
                 continue;
             }
             let (ep, _): (Episode, usize) =
-                bincode::serde::decode_from_slice(ep_bytes, BINCODE_CFG)
+                bincode::serde::decode_from_slice(&ep_bytes, BINCODE_CFG)
                     .map_err(|e| StorageError::from(StorageIOError::read(Self::io_err(e))))?;
             self.log
                 .append_replicated(lsn, ep.clone())
@@ -579,6 +622,24 @@ impl RaftStateMachine<TypeConfig> for EpisodeStateMachine {
                 hook(lsn, &ep);
             }
         }
+        // O ficheiro instalado passa a ser o snapshot corrente (é o que este
+        // nó servirá a outros). Copia-se o que foi dado em vez de renomear o
+        // último `recebido`: uma receção abortada antes deixaria o nome
+        // errado.
+        let dir = self.dir_snapshots()?;
+        let caminho = dir.join(format!("snapshot-{}.bin", meta.snapshot_id));
+        let mut ficheiro = entrada.into_inner();
+        ficheiro
+            .seek(SeekFrom::Start(0))
+            .map_err(erro_de_snapshot)?;
+        let tmp = caminho.with_extension("bin.tmp");
+        {
+            let mut destino = std::fs::File::create(&tmp).map_err(erro_de_snapshot)?;
+            std::io::copy(&mut ficheiro, &mut destino).map_err(erro_de_snapshot)?;
+        }
+        drop(ficheiro);
+        std::fs::rename(&tmp, &caminho).map_err(erro_de_snapshot)?;
+
         let mut st = self.state.lock().unwrap();
         st.applied = meta.last_log_id;
         st.membership = meta.last_membership.clone();
@@ -588,7 +649,14 @@ impl RaftStateMachine<TypeConfig> for EpisodeStateMachine {
         st.skip_normals = 0;
         // A cauda mudou por fora do apply: o anterior do próximo carimbo relê-se.
         st.ultimo_ts = None;
-        st.current_snapshot = Some((meta.clone(), bytes));
+        if let Some((_, anterior)) = st.current_snapshot.replace((meta.clone(), caminho.clone())) {
+            if anterior != caminho {
+                let _ = std::fs::remove_file(anterior);
+            }
+        }
+        if let Some(recebido) = st.recebido.take() {
+            let _ = std::fs::remove_file(recebido);
+        }
         self.persist_sm_meta(&st)?;
         Ok(())
     }
@@ -597,11 +665,74 @@ impl RaftStateMachine<TypeConfig> for EpisodeStateMachine {
         &mut self,
     ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
         let st = self.state.lock().unwrap();
-        Ok(st.current_snapshot.as_ref().map(|(meta, bytes)| Snapshot {
-            meta: meta.clone(),
-            snapshot: Box::new(Cursor::new(bytes.clone())),
-        }))
+        st.current_snapshot
+            .as_ref()
+            .map(|(meta, caminho)| {
+                Ok(Snapshot {
+                    meta: meta.clone(),
+                    snapshot: Box::new(abrir_snapshot(caminho)?),
+                })
+            })
+            .transpose()
     }
+}
+
+fn erro_de_snapshot(e: impl std::fmt::Display) -> StorageError<NodeId> {
+    StorageError::from(StorageIOError::read(openraft::AnyError::error(
+        e.to_string(),
+    )))
+}
+
+/// Escreve os episódios `[0, head)` do log em `caminho`, no formato do
+/// snapshot — `bincode(Vec<Vec<u8>>)` —, um lote de cada vez: o número de
+/// episódios e, para cada um, o seu bincode como `Vec<u8>`. A memória é a de um
+/// lote, não a do log. Escreve num `.tmp` e renomeia no fim.
+fn escrever_snapshot(log: &AnyLog, caminho: &std::path::Path) -> Result<(), StorageError<NodeId>> {
+    use std::io::Write;
+    let tmp = caminho.with_extension("bin.tmp");
+    let ficheiro = std::fs::File::create(&tmp).map_err(erro_de_snapshot)?;
+    let mut saida = std::io::BufWriter::new(ficheiro);
+    let head = log.head();
+    bincode::serde::encode_into_std_write(head, &mut saida, BINCODE_CFG)
+        .map_err(erro_de_snapshot)?;
+    let mut esperado = 0u64;
+    let mut episodio = Vec::new();
+    while esperado < head {
+        let lote = log
+            .scan_capped(esperado, head, 4096)
+            .map_err(erro_de_snapshot)?;
+        if lote.is_empty() {
+            return Err(erro_de_snapshot(format!(
+                "snapshot: o log acabou no LSN {esperado}, antes do head {head}"
+            )));
+        }
+        for (lsn, ep) in lote {
+            // O `install_snapshot` atribui o LSN pela posição: um buraco
+            // desalinhava todos os seguintes.
+            if lsn != esperado {
+                return Err(erro_de_snapshot(format!(
+                    "snapshot: o log saltou do LSN {esperado} para {lsn}"
+                )));
+            }
+            episodio.clear();
+            bincode::serde::encode_into_std_write(&ep, &mut episodio, BINCODE_CFG)
+                .map_err(erro_de_snapshot)?;
+            bincode::serde::encode_into_std_write(&episodio, &mut saida, BINCODE_CFG)
+                .map_err(erro_de_snapshot)?;
+            esperado += 1;
+        }
+    }
+    saida.flush().map_err(erro_de_snapshot)?;
+    drop(saida);
+    std::fs::rename(&tmp, caminho).map_err(erro_de_snapshot)
+}
+
+/// Um handle novo, com o seu próprio cursor: o líder pode estar a enviar o
+/// mesmo snapshot a vários seguidores ao mesmo tempo.
+fn abrir_snapshot(caminho: &std::path::Path) -> Result<tokio::fs::File, StorageError<NodeId>> {
+    std::fs::File::open(caminho)
+        .map(tokio::fs::File::from_std)
+        .map_err(erro_de_snapshot)
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1330,6 +1461,61 @@ mod tests {
     /// install_snapshot num nó vazio reconstrói o log byte-a-byte; reinstalar é
     /// idempotente (o skip de prefixo `lsn < head` funciona). Cobre o caminho
     /// que o header afirma que "funciona" e exercita o lock de consistência.
+    /// Auditoria 2026-10-16, O7 (item 7 do backlog): o snapshot vai para um
+    /// ficheiro em streaming, com os MESMOS bytes do formato anterior — o
+    /// `bincode(Vec<Vec<u8>>)` montado em memória —, para nós de versões
+    /// diferentes continuarem a trocar snapshots num upgrade gradual. Cada
+    /// `get_current_snapshot` dá um handle novo, lido desde o início.
+    #[tokio::test]
+    async fn snapshot_em_ficheiro_tem_os_bytes_do_formato_anterior() {
+        use openraft::{CommittedLeaderId, LogId};
+        use tokio::io::AsyncReadExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(
+            AnyLog::open(
+                crate::formato_de_teste(),
+                dir.path(),
+                1 << 20,
+                FsyncPolicy::Always,
+            )
+            .unwrap(),
+        );
+        let mut sm = EpisodeStateMachine::new(log.clone());
+        let entradas: Vec<Entry<TypeConfig>> = (0..300)
+            .map(|i| Entry {
+                log_id: LogId::new(CommittedLeaderId::new(1, 0), i + 1),
+                payload: EntryPayload::Normal(episode_bytes(&ep(i))),
+            })
+            .collect();
+        sm.apply(entradas).await.unwrap();
+
+        // O formato anterior, calculado como era: tudo em memória.
+        let antigos: Vec<Vec<u8>> = log
+            .scan_capped(0, log.head(), usize::MAX)
+            .unwrap()
+            .iter()
+            .map(|(_, e)| bincode::serde::encode_to_vec(e, BINCODE_CFG).unwrap())
+            .collect();
+        let esperado = bincode::serde::encode_to_vec(&antigos, BINCODE_CFG).unwrap();
+
+        let mut construido = sm
+            .get_snapshot_builder()
+            .await
+            .build_snapshot()
+            .await
+            .unwrap();
+        let mut lidos = Vec::new();
+        construido.snapshot.read_to_end(&mut lidos).await.unwrap();
+        assert_eq!(lidos, esperado);
+        for _ in 0..2 {
+            let mut corrente = sm.get_current_snapshot().await.unwrap().unwrap();
+            let mut bytes = Vec::new();
+            corrente.snapshot.read_to_end(&mut bytes).await.unwrap();
+            assert_eq!(bytes, esperado);
+        }
+    }
+
     #[tokio::test]
     async fn snapshot_build_and_install_reconstructs_episode_log() {
         use openraft::{CommittedLeaderId, LogId};
