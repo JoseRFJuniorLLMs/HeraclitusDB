@@ -3182,7 +3182,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "heraclitus-activation"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "arrayvec",
  "heraclitus-core",
@@ -3195,7 +3195,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-agent"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "blake3",
  "crc32fast",
@@ -3217,7 +3217,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-agent-gateway"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "axum 0.7.9",
  "heraclitus-agent",
@@ -3245,7 +3245,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-analytics"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "core_affinity",
  "criterion",
@@ -3260,7 +3260,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-btree"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "blake3",
  "crc32fast",
@@ -3270,7 +3270,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-case"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "heraclitus-core",
  "serde",
@@ -3280,7 +3280,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-cli"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "blake3",
  "clap",
@@ -3305,7 +3305,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-client"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "heraclitus-core",
  "heraclitus-proto",
@@ -3318,7 +3318,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-compliance"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "blake3",
  "cms",
@@ -3346,7 +3346,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-content"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "heraclitus-core",
  "serde",
@@ -3356,7 +3356,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-core"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "heraclitus-platform",
  "serde",
@@ -3369,7 +3369,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-crypto"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "blake3",
  "chacha20poly1305",
@@ -3381,7 +3381,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-distill"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "heraclitus-core",
  "heraclitus-log",
@@ -3392,7 +3392,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-forensic"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "blake3",
  "heraclitus-compliance",
@@ -3410,7 +3410,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-gpu"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "bytemuck",
  "heraclitus-core",
@@ -3421,7 +3421,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-index-attr"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "bincode",
  "heraclitus-core",
@@ -3434,7 +3434,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-index-graph"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "blake3",
  "criterion",
@@ -3449,7 +3449,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-index-text"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "heraclitus-core",
  "heraclitus-memtable",
@@ -3460,7 +3460,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-index-vector"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "bincode",
  "blake3",
@@ -3479,7 +3479,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-ingestor"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -3494,7 +3494,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-log"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "arc-swap",
  "bincode",
@@ -3522,7 +3522,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-manifold"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "criterion",
  "heraclitus-core",
@@ -3533,7 +3533,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-memtable"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "dashmap",
  "heraclitus-core",
@@ -3544,7 +3544,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-platform"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "libc",
  "serde",
@@ -3557,7 +3557,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-proto"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "prost",
  "protox",
@@ -3568,7 +3568,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-qualifier"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -3585,7 +3585,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-query"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "arc-swap",
  "blake3",
@@ -3602,7 +3602,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-raft"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "bincode",
  "crc32fast",
@@ -3621,7 +3621,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-retrieval"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "heraclitus-activation",
  "heraclitus-core",
@@ -3637,7 +3637,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-sentinel"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "blake3",
  "crossbeam-channel",
@@ -3654,7 +3654,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-server"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "arrow-flight",
  "axum 0.7.9",
@@ -3705,7 +3705,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-sim"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "bincode",
  "heraclitus-core",
@@ -3718,7 +3718,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-telemetry-health"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "blake3",
  "heraclitus-core",
@@ -3731,7 +3731,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-tier"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "arrow-array 59.2.0",
  "arrow-schema 59.2.0",
@@ -3752,7 +3752,7 @@ dependencies = [
 
 [[package]]
 name = "heraclitus-views"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "bincode",
  "crc32fast",
@@ -3844,7 +3844,7 @@ checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
 
 [[package]]
 name = "hume-ir"
-version = "3.0.4"
+version = "3.0.5"
 dependencies = [
  "cranelift",
  "cranelift-jit",
@@ -3854,11 +3854,11 @@ dependencies = [
 
 [[package]]
 name = "hume-kernel"
-version = "3.0.4"
+version = "3.0.5"
 
 [[package]]
 name = "hume-sketches"
-version = "3.0.4"
+version = "3.0.5"
 
 [[package]]
 name = "hybrid-array"

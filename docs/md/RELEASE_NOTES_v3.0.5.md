@@ -1,6 +1,20 @@
-# HeraclitusDB v3.0.5 — rascunho
+# HeraclitusDB v3.0.5 — escala das consultas, teto de memória e Raft em streaming
 
-Em preparação. Cada PR do ciclo acrescenta aqui a sua entrada.
+Data: 2026-10-21. Inclui tudo o que estava preparado para a v3.0.4, que não
+chegou a ser publicada: as correções das auditorias de 16/10 (B1–B13, G1–G7),
+o WAL Raft com checksum, a cifra do tier frio e o top-k exato de
+`ORDER BY DIST_*` sobre os vetores residentes — ver
+`docs/md/RELEASE_NOTES_v3.0.4.md`. Binários e pacotes (.deb, .rpm, tarball)
+são compilados no GitHub Actions.
+
+O que acrescenta:
+
+- Medido no soak nightly (carga `mixed`, ~100 mil eventos): pesquisa vetorial
+  855 → 67 ms de p50.
+- Medido por índice com um alocador contador: memória dos índices
+  4 198 → 3 476 B por evento, agora com teto configurável.
+- Coberto por testes, ainda sem medição no soak: consulta por `agent_id` pelo
+  índice e `recall` sem pontuar todos os eventos.
 
 ## Desempenho
 
