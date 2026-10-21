@@ -3185,7 +3185,6 @@ name = "heraclitus-activation"
 version = "3.0.4"
 dependencies = [
  "arrayvec",
- "dashmap",
  "heraclitus-core",
  "heraclitus-views",
  "proptest",

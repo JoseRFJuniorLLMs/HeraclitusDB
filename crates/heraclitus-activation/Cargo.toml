@@ -9,7 +9,6 @@ description = "ACT-R base-level activation store, O(1) incremental approximation
 [dependencies]
 heraclitus-core = { workspace = true }
 heraclitus-views = { workspace = true }
-dashmap = { workspace = true }
 arrayvec = { workspace = true }
 serde = { workspace = true }
 
