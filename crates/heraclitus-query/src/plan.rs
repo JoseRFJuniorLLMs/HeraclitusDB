@@ -470,6 +470,14 @@ pub fn explain_with_backend(plan: &Plan, be: &dyn QueryBackend) -> Result<String
         CaminhoAcesso::BuiltinSkip(chave, valor) => (chave, valor),
     };
     let bound = resolve_as_of(as_of, be)?;
+    // A mesma precedência do executor: índice completo do builtin primeiro.
+    if let Some(lsns) = be.builtin_eq_lsns(&field, &value, bound)? {
+        out.push_str(&format!(
+            "BuiltinIndex\n  key = {field}\n  value = {value}\n  candidates = {}\n",
+            lsns.len()
+        ));
+        return Ok(out);
+    }
     let Some(probe) = be.scan_builtin_eq(&field, &value, bound)? else {
         out.push_str("StoragePruning\n  capability = unavailable (conservative scan)\n");
         return Ok(out);
@@ -1575,9 +1583,18 @@ pub fn execute(plan: &Plan, be: &dyn QueryBackend) -> Result<Json, HeraclitusErr
                 // segmentos selados cujo zone map não contém o valor
                 // (scan_builtin_eq). São builtins (fora do índice de
                 // atributos); o pós-filtro `matches` revalida o exato.
-                CaminhoAcesso::BuiltinSkip(field, value) => be
-                    .scan_builtin_eq(&field, &value, bound)?
-                    .map(|result| Fonte::Linhas(result.rows)),
+                // Antes do skip-scan, um índice completo do builtin, se o
+                // backend o tiver: com o valor em todos os segmentos (4 096
+                // agentes no soak de 20/10/2026) os zone maps não saltam nada
+                // e o skip-scan lia a janela inteira para um `LIMIT 10`.
+                CaminhoAcesso::BuiltinSkip(field, value) => {
+                    match be.builtin_eq_lsns(&field, &value, bound)? {
+                        Some(lsns) => Some(Fonte::Lsns(lsns)),
+                        None => be
+                            .scan_builtin_eq(&field, &value, bound)?
+                            .map(|result| Fonte::Linhas(result.rows)),
+                    }
+                }
                 // O rótulo é resolvido logo a seguir, no mesmo recuo que já
                 // apanha os hints que devolveram `None`.
                 CaminhoAcesso::RotuloKind(_) | CaminhoAcesso::Janela => None,
@@ -2698,22 +2715,36 @@ mod testes_topk_vetores_residentes {
         }
     }
 
-    /// O log em memória e, ao lado, o que um índice vetorial diria dele.
-    struct Vetores {
+    /// O log em memória e, ao lado, o que um índice vetorial — e, se pedido,
+    /// um índice de `agent_id` — diriam dele. Partilhado com
+    /// `testes_indice_de_builtin`.
+    pub(super) struct Vetores {
         linhas: Vec<Episode>,
         residentes: Option<Vec<(Lsn, ProductPoint)>>,
-        lidas: Cell<usize>,
-        varridas: Cell<u64>,
+        por_agente: bool,
+        pub(super) lidas: Cell<usize>,
+        pub(super) varridas: Cell<u64>,
     }
 
     impl Vetores {
-        fn novo(linhas: Vec<Episode>, residentes: Option<Vec<(Lsn, ProductPoint)>>) -> Self {
+        pub(super) fn novo(
+            linhas: Vec<Episode>,
+            residentes: Option<Vec<(Lsn, ProductPoint)>>,
+        ) -> Self {
             Self {
                 linhas,
                 residentes,
+                por_agente: false,
                 lidas: Cell::new(0),
                 varridas: Cell::new(0),
             }
+        }
+
+        /// Um índice de `agent_id` como o do `Engine`: guarda o valor aparado,
+        /// devolve um superconjunto e recusa valores com espaço nas pontas.
+        pub(super) fn com_indice_de_agente(mut self) -> Self {
+            self.por_agente = true;
+            self
         }
 
         /// Um índice fiel: um vetor por episódio com embedding.
@@ -2757,6 +2788,27 @@ mod testes_topk_vetores_residentes {
                     .map(|(l, p)| (*l, key(p)))
                     .collect()
             }))
+        }
+        fn builtin_eq_lsns(
+            &self,
+            field: &str,
+            value: &str,
+            as_of: Option<Lsn>,
+        ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
+            if !self.por_agente || field != "agent_id" || value.is_empty() || value != value.trim()
+            {
+                return Ok(None);
+            }
+            let teto = as_of.unwrap_or(Lsn::MAX);
+            Ok(Some(
+                self.linhas
+                    .iter()
+                    .enumerate()
+                    .map(|(l, e)| (l as Lsn, e))
+                    .filter(|(l, e)| *l < teto && e.agent_id.trim() == value)
+                    .map(|(l, _)| l)
+                    .collect(),
+            ))
         }
         fn attr_lookup(
             &self,
@@ -3021,5 +3073,87 @@ mod testes_topk_vetores_residentes {
         let gql = "MATCH (n) RETURN n ORDER BY DIST_HYP([0.1, 0.0]) DESC LIMIT 2";
         let be = igual_ao_varrimento(gql, &linhas, Vetores::fiel(&linhas));
         assert_eq!(be.varridas.get(), 10);
+    }
+}
+
+#[cfg(test)]
+mod testes_indice_de_builtin {
+    //! Soak nightly de 20/10/2026: `WHERE n.agent_id = "x"` passa a sair de um
+    //! índice completo do builtin (`builtin_eq_lsns`) em vez do skip-scan, que
+    //! não salta nada quando o agente aparece em todos os segmentos. Contrato:
+    //! as MESMAS linhas, pela mesma ordem, que o varrimento.
+    use super::testes_topk_vetores_residentes::Vetores;
+    use heraclitus_core::{Episode, EventKind};
+
+    /// Agentes repetidos, um com espaço nas pontas (que o índice guarda
+    /// aparado e o pós-filtro tem de recusar) e um atributo para filtrar.
+    fn log(n: usize) -> Vec<Episode> {
+        let agentes = ["ana", " ana ", "bia", "eva", "ana"];
+        (0..n)
+            .map(|i| {
+                let mut e = Episode::new(
+                    agentes[i % agentes.len()],
+                    EventKind::Observation,
+                    format!("e{i}").into_bytes(),
+                );
+                let cor = if i % 3 == 0 { "azul" } else { "verde" };
+                e.attrs.insert("cor".into(), cor.into());
+                e
+            })
+            .collect()
+    }
+
+    fn igual_ao_varrimento(gql: &str, linhas: &[Episode]) -> Vetores {
+        let referencia = Vetores::novo(linhas.to_vec(), None);
+        let esperado = crate::execute(gql, &referencia).unwrap();
+        let be = Vetores::novo(linhas.to_vec(), None).com_indice_de_agente();
+        let obtido = crate::execute(gql, &be).unwrap();
+        assert_eq!(obtido, esperado, "{gql}");
+        be
+    }
+
+    #[test]
+    fn indice_de_agente_da_o_mesmo_que_o_varrimento() {
+        let linhas = log(97);
+        for gql in [
+            "MATCH (n) WHERE n.agent_id = \"ana\" RETURN n LIMIT 0",
+            "MATCH (n) WHERE n.agent_id = \"ana\" RETURN n LIMIT 3",
+            "MATCH (n) WHERE n.agent_id = \"ana\" RETURN n",
+            "MATCH (n) WHERE n.agent_id = \" ana \" RETURN n",
+            "MATCH (n) WHERE n.agent_id = \"ninguem\" RETURN n LIMIT 5",
+            "MATCH (n) WHERE n.agent_id = \"bia\" RETURN n ORDER BY n.lsn DESC LIMIT 4",
+            "MATCH (n) WHERE n.agent_id = \"ana\" RETURN n ORDER BY n.content ASC LIMIT 4",
+            "MATCH (n) WHERE n.agent_id = \"eva\" AS OF LSN 40 RETURN n",
+            "MATCH (n) WHERE n.agent_id = \"ana\" AND n.lsn >= 20 RETURN n LIMIT 6",
+            "MATCH (n) WHERE n.agent_id = \"ana\" OR n.agent_id = \"bia\" RETURN n LIMIT 6",
+        ] {
+            igual_ao_varrimento(gql, &linhas);
+        }
+    }
+
+    /// Com o índice, um `LIMIT k` custa `k` leituras e nenhum varrimento.
+    #[test]
+    fn limit_custa_k_leituras_sem_varrimento() {
+        let linhas = log(5_000);
+        let be = igual_ao_varrimento(
+            "MATCH (n) WHERE n.agent_id = \"bia\" RETURN n LIMIT 10",
+            &linhas,
+        );
+        assert_eq!(be.varridas.get(), 0);
+        assert_eq!(be.lidas.get(), 10);
+    }
+
+    /// O EXPLAIN mostra o caminho que a execução toma.
+    #[test]
+    fn explain_mostra_o_indice_do_builtin() {
+        let be = Vetores::novo(log(10), None).com_indice_de_agente();
+        let plano = crate::execute(
+            "EXPLAIN MATCH (n) WHERE n.agent_id = \"ana\" RETURN n LIMIT 3",
+            &be,
+        )
+        .unwrap();
+        let texto = plano.as_str().unwrap();
+        assert!(texto.contains("BuiltinIndex"), "{texto}");
+        assert_eq!(be.varridas.get(), 0, "o EXPLAIN não varre");
     }
 }
