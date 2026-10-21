@@ -16,10 +16,10 @@ fn validar_namespace_do_indice(
     if episode
         .attrs
         .keys()
-        .any(|k| matches!(k.as_str(), "_agent" | "_kind"))
+        .any(|k| heraclitus_index_attr::PSEUDO_CAMPOS.contains(&k.as_str()))
     {
         return Err(heraclitus_core::HeraclitusError::Query(
-            "atributos _agent e _kind são reservados ao envelope do índice".into(),
+            "atributos _agent, _kind e _agent_ev são reservados ao envelope do índice".into(),
         ));
     }
     Ok(())
@@ -1099,7 +1099,7 @@ impl Engine {
         let frame = heraclitus_core::vm::encode(VmVersion(1), instr);
         // : este é o ÚNICO produtor legítimo de frames hvm_isa.
         self.append_internal(Episode::new(
-            "hvm",
+            vm_bridge::HVM_AGENT,
             EventKind::Custom(vm_bridge::HVM_KIND.to_string()),
             frame,
         ))
@@ -3816,6 +3816,28 @@ impl QueryBackend for Engine {
     fn read_lsn(&self, lsn: Lsn) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
         // O(1) via o índice de offset por-LSN do log (seek directo).
         self.log.read(lsn)
+    }
+
+    /// `agent_id = x` pelo índice de atributos (v8): `_agent` cobre todos os
+    /// eventos excepto `AgentEvidence` e frames H-VM; `_agent_ev` cobre os
+    /// `AgentEvidence`. Os frames H-VM são todos do agente `hvm` e não passam
+    /// pelo índice, por isso esse valor varre. Um índice com buraco
+    /// (`attr_incompleto`) também.
+    fn builtin_eq_lsns(
+        &self,
+        field: &str,
+        value: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
+        if field != "agent_id" || value == vm_bridge::HVM_AGENT || self.attr_incompleto() {
+            return Ok(None);
+        }
+        let Some(mut lsns) = self.attr.read().unwrap().lsns_do_agente(value) else {
+            return Ok(None);
+        };
+        let bound = as_of.unwrap_or_else(|| self.log.head());
+        lsns.retain(|l| *l < bound);
+        Ok(Some(lsns))
     }
 
     /// Os vetores do HNSW são o embedding que a view recebeu de cada episódio,
@@ -6785,6 +6807,105 @@ mod tests {
             if let (Some(antes), Some(depois)) = (antes, engine.log.leituras_efectuadas()) {
                 assert_eq!(depois - antes, 5, "{formato:?}");
             }
+        }
+    }
+
+    /// Soak nightly de 20/10/2026: `WHERE n.agent_id = "x"` sai do indice de
+    /// atributos v8 (`_agent` + `_agent_ev`), com as evidencias desse agente
+    /// incluidas e o LIMIT empurrado para a hidratacao.
+    #[test]
+    fn agent_id_sai_do_indice_e_inclui_as_evidencias_do_agente() {
+        for formato in [
+            heraclitus_core::StorageFormat::Legacy,
+            HeraclitusConfig::default().storage_format,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = HeraclitusConfig {
+                data_dir: dir.path().to_path_buf(),
+                fsync: FsyncPolicy::Always,
+                storage_format: formato,
+                ..Default::default()
+            };
+            let engine = Engine::open(&cfg).unwrap();
+            let agentes = ["ana", "bia", "eva"];
+            for i in 0..200usize {
+                let kind = if i % 10 == 0 {
+                    EventKind::Custom("AgentEvidence".into())
+                } else {
+                    EventKind::Observation
+                };
+                engine
+                    .append(Episode::new(
+                        agentes[i % agentes.len()],
+                        kind,
+                        format!("e{i}").into_bytes(),
+                    ))
+                    .unwrap();
+            }
+
+            // ORACULO: o log inteiro, filtrado a mao.
+            let esperado: Vec<(u64, bool)> = engine
+                .log
+                .scan_capped(0, engine.head(), usize::MAX)
+                .unwrap()
+                .into_iter()
+                .filter(|(_, e)| e.agent_id == "ana")
+                .map(|(l, e)| {
+                    (
+                        l,
+                        matches!(&e.kind, EventKind::Custom(k) if k == "AgentEvidence"),
+                    )
+                })
+                .collect();
+            assert!(
+                esperado.iter().any(|(_, evidencia)| *evidencia),
+                "montagem: a ana tem evidencias"
+            );
+
+            let lsns = |gql: &str| -> Vec<u64> {
+                heraclitus_query::execute(gql, &engine)
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r["lsn"].as_u64().unwrap())
+                    .collect()
+            };
+            let todos: Vec<u64> = esperado.iter().map(|(l, _)| *l).collect();
+            assert_eq!(
+                lsns("MATCH (n) WHERE n.agent_id = \"ana\" RETURN n"),
+                todos,
+                "{formato:?}"
+            );
+
+            // O skip-scan nao faz leituras pontuais; o indice faz uma por linha.
+            let antes = engine.log.leituras_efectuadas();
+            assert_eq!(
+                lsns("MATCH (n) WHERE n.agent_id = \"ana\" RETURN n LIMIT 4"),
+                todos[..4].to_vec(),
+                "{formato:?}"
+            );
+            if let (Some(antes), Some(depois)) = (antes, engine.log.leituras_efectuadas()) {
+                assert_eq!(depois - antes, 4, "{formato:?}");
+            }
+
+            // Frames H-VM nao passam pelo indice: esse agente varre.
+            assert!(engine
+                .builtin_eq_lsns("agent_id", vm_bridge::HVM_AGENT, None)
+                .unwrap()
+                .is_none());
+            assert!(engine
+                .builtin_eq_lsns("session_id", "s", None)
+                .unwrap()
+                .is_none());
+
+            // Um cliente nao pode forjar o pseudo-campo das evidencias.
+            let mut forjado = Episode::new("eva", EventKind::Observation, b"f".to_vec());
+            forjado.attrs.insert(
+                heraclitus_index_attr::AGENT_EVIDENCE_FIELD.into(),
+                "ana".into(),
+            );
+            assert!(engine.append(forjado).is_err());
         }
     }
 

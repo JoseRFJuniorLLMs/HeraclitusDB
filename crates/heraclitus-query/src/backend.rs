@@ -618,6 +618,23 @@ pub trait QueryBackend {
     ) -> Result<Option<PrunedScanResult>, HeraclitusError> {
         Ok(None)
     }
+    /// `WHERE <builtin> = "v"` respondido por um índice: os LSNs (ordenados,
+    /// sem hidratar) de um SUPERCONJUNTO COMPLETO dos episódios com esse
+    /// valor, abaixo de `as_of`. O planner hidrata pela ordem, pára no LIMIT e
+    /// revalida a igualdade exacta. Tem precedência sobre o
+    /// [`scan_builtin_eq`](Self::scan_builtin_eq), que lê a janela inteira
+    /// quando o valor aparece em todos os segmentos.
+    ///
+    /// "Completo" é o contrato: um LSN com o valor que falte aqui desaparece
+    /// da resposta. Na dúvida, `Ok(None)` (default) e o planner varre.
+    fn builtin_eq_lsns(
+        &self,
+        _field: &str,
+        _value: &str,
+        _as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
+        Ok(None)
+    }
     /// Chaves de ordenação por distância calculadas sobre os vetores
     /// RESIDENTES num índice em memória: um par `(lsn, key(ponto))` por vetor
     /// indexado com LSN em `[from, to)`. É o que deixa `ORDER BY DIST_*(...)
