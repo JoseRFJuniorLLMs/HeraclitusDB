@@ -67,6 +67,47 @@ const RAW_GENERATION: u32 = 0;
 const BUILTINS_PODADOS_EM_CLARO: [&str; 2] = ["agent_id", "session_id"];
 type SharedPackedReader = Arc<super::packed::PackedSegmentReader<super::packed::FileSource>>;
 
+/// Offsets dos registos de cada RAW selado, guardados no seal até ao pack.
+///
+/// Auditoria 2026-10-16, O8: uma leitura pontual num RAW selado ainda não
+/// empacotado percorria o ficheiro desde o cabeçalho — O(posição) — porque os
+/// offsets só existiam no writer da cauda activa. O writer já os tem no seal;
+/// guardá-los torna a leitura um `seek` até o pack publicar a geração PACKED.
+/// Limitado a [`OFFSETS_RAW_SELADOS_MAX`] segmentos (FIFO): com o packing
+/// atrasado não cresce sem fim, e o que sai cai no percurso completo, que é a
+/// definição. Depois de um restart também: os offsets não são persistidos.
+#[derive(Default)]
+struct OffsetsRawSelados {
+    por_caminho: std::collections::HashMap<PathBuf, (Lsn, Arc<Vec<u64>>)>,
+    ordem: std::collections::VecDeque<PathBuf>,
+}
+
+const OFFSETS_RAW_SELADOS_MAX: usize = 64;
+
+impl OffsetsRawSelados {
+    fn guardar(&mut self, caminho: PathBuf, primeiro: Lsn, offsets: Vec<u64>) {
+        if self
+            .por_caminho
+            .insert(caminho.clone(), (primeiro, Arc::new(offsets)))
+            .is_none()
+        {
+            self.ordem.push_back(caminho);
+        }
+        while self.ordem.len() > OFFSETS_RAW_SELADOS_MAX {
+            if let Some(velho) = self.ordem.pop_front() {
+                self.por_caminho.remove(&velho);
+            }
+        }
+    }
+
+    fn offset(&self, caminho: &Path, lsn: Lsn) -> Option<u64> {
+        let (primeiro, offsets) = self.por_caminho.get(caminho)?;
+        offsets
+            .get(usize::try_from(lsn.checked_sub(*primeiro)?).ok()?)
+            .copied()
+    }
+}
+
 /// Escritor/reader v6 com manifesto `.hrkm` persistente.
 ///
 /// A implementação prioriza a semântica de armazenamento e recuperação. O
@@ -117,6 +158,7 @@ pub struct V6Log {
     /// no manifesto e a sua entrada fica órfã, o que custa bytes e não erros.
     blocos_por_geracao: Mutex<std::collections::HashMap<PathBuf, u64>>,
     packed_readers: Mutex<std::collections::HashMap<PathBuf, SharedPackedReader>>,
+    offsets_raw_selados: Mutex<OffsetsRawSelados>,
     hlc: Arc<Hlc>,
     fsync: FsyncPolicy,
     segment_max_bytes: u64,
@@ -609,6 +651,7 @@ impl V6Log {
             sidecar_lock: Mutex::new(()),
             blocos_por_geracao: Mutex::new(std::collections::HashMap::new()),
             packed_readers: Mutex::new(std::collections::HashMap::new()),
+            offsets_raw_selados: Mutex::new(OffsetsRawSelados::default()),
             hlc,
             fsync,
             segment_max_bytes,
@@ -972,13 +1015,37 @@ impl V6Log {
                 Err(e) => return Err(TentativaFalhou::Erro(e)),
             },
             ReadSource::Sealed(path, PhysicalLayout::Raw) => {
-                let achado = find_raw_record(&path, lsn)?;
-                match achado.record {
+                // O8: com os offsets guardados no seal, um `seek`. O
+                // `read_raw_record_at` confere o LSN no offset; se não conferir,
+                // ou se não houver offsets (restart, cache cheia), o percurso
+                // completo, que é a definição.
+                let offset = self
+                    .offsets_raw_selados
+                    .lock()
+                    .ok()
+                    .and_then(|cache| cache.offset(&path, lsn));
+                let directo = match offset {
+                    Some(o) => super::raw::read_raw_record_at(&path, o, lsn)?,
+                    None => None,
+                };
+                match directo {
                     Some(r) => (r.lsn, r.payload),
                     None => {
-                        return Err(
-                            lsn_em_falta(lsn, head, &path, &achado.percurso.descrever()).into()
-                        )
+                        #[cfg(test)]
+                        PERCURSOS_RAW_SELADO.with(|c| c.set(c.get() + 1));
+                        let achado = find_raw_record(&path, lsn)?;
+                        match achado.record {
+                            Some(r) => (r.lsn, r.payload),
+                            None => {
+                                return Err(lsn_em_falta(
+                                    lsn,
+                                    head,
+                                    &path,
+                                    &achado.percurso.descrever(),
+                                )
+                                .into())
+                            }
+                        }
                     }
                 }
             }
@@ -2828,6 +2895,8 @@ impl V6Log {
         state: &mut V6State,
         active: ActiveSegment,
     ) -> Result<(), HeraclitusError> {
+        // Antes do `seal`, que consome o writer (O8).
+        let offsets = active.writer.offsets_contiguos();
         let footer = active.writer.seal()?;
         // Ja verificado acima, antes de o estado ser tocado; aqui fica so como
         // rede, porque entre as duas verificacoes nada mais cria este nome.
@@ -2866,6 +2935,11 @@ impl V6Log {
         if let Err(err) = self.manifest_store.commit(&mut state.manifest) {
             state.manifest = before;
             return Err(err);
+        }
+        if let Some((primeiro, offsets)) = offsets {
+            if let Ok(mut cache) = self.offsets_raw_selados.lock() {
+                cache.guardar(final_path, primeiro, offsets);
+            }
         }
         Ok(())
     }
@@ -3109,6 +3183,12 @@ enum ReadSource {
     /// Caminho do activo e, se o writer o souber, o offset do registo.
     Active(PathBuf, Option<u64>),
     Sealed(PathBuf, PhysicalLayout),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Leituras pontuais em RAW selado que caíram no percurso completo (O8).
+    static PERCURSOS_RAW_SELADO: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -3867,6 +3947,66 @@ mod tests {
             EventKind::Observation,
             format!("payload-{i}").into_bytes(),
         )
+    }
+
+    /// Auditoria 2026-10-16, O8: entre o seal e o pack, a leitura pontual num
+    /// RAW selado usa os offsets que o writer tinha — nenhum percurso
+    /// completo. Depois de reabrir (os offsets não são persistidos) recua para
+    /// o percurso e devolve o mesmo.
+    #[test]
+    fn leitura_pontual_em_raw_selado_usa_os_offsets_do_seal() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
+        for i in 0..200 {
+            log.append(event(i)).unwrap();
+        }
+        log.seal_active().unwrap();
+        log.append(event(200)).unwrap();
+        let ler = |log: &V6Log, lsn: Lsn| {
+            let (lido, e) = log.read(lsn).unwrap().unwrap();
+            assert_eq!(lido, lsn);
+            assert_eq!(e.content, format!("payload-{lsn}").into_bytes());
+        };
+
+        PERCURSOS_RAW_SELADO.with(|c| c.set(0));
+        for lsn in [0, 1, 99, 198, 199] {
+            ler(&log, lsn);
+        }
+        assert_eq!(PERCURSOS_RAW_SELADO.with(|c| c.get()), 0);
+        drop(log);
+
+        let reaberto = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
+        PERCURSOS_RAW_SELADO.with(|c| c.set(0));
+        ler(&reaberto, 199);
+        assert_eq!(PERCURSOS_RAW_SELADO.with(|c| c.get()), 1);
+    }
+
+    /// Um offset que não confere (cache de outro ficheiro, por exemplo) nunca
+    /// devolve o registo errado: `read_raw_record_at` confere o LSN e a
+    /// leitura recua para o percurso.
+    #[test]
+    fn offset_que_nao_confere_recua_para_o_percurso() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
+        for i in 0..50 {
+            log.append(event(i)).unwrap();
+        }
+        log.seal_active().unwrap();
+        {
+            let mut cache = log.offsets_raw_selados.lock().unwrap();
+            let caminho = cache.ordem.front().unwrap().clone();
+            // Todos os offsets a apontar para o registo do LSN 0.
+            let (primeiro, offsets) = cache.por_caminho.get(&caminho).unwrap().clone();
+            let errados = vec![offsets[0]; offsets.len()];
+            cache
+                .por_caminho
+                .insert(caminho, (primeiro, Arc::new(errados)));
+        }
+        PERCURSOS_RAW_SELADO.with(|c| c.set(0));
+        let (lsn, e) = log.read(37).unwrap().unwrap();
+        assert_eq!(lsn, 37);
+        assert_eq!(e.content, b"payload-37".to_vec());
+        assert_eq!(PERCURSOS_RAW_SELADO.with(|c| c.get()), 1);
     }
 
     #[test]
