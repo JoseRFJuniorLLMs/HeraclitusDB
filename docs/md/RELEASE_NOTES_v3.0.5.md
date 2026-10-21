@@ -14,6 +14,14 @@ Em preparação. Cada PR do ciclo acrescenta aqui a sua entrada.
   índice), valores com espaço nas pontas ou acima de 80 bytes, e o arranque
   com o replay das views saltado.
 - O EXPLAIN mostra `BuiltinIndex` quando a consulta toma esse caminho.
+- O `recall` deixa de pontuar todos os eventos no canal de ativação ACT-R.
+  `ActivationStore::top_k` percorre os registos por limite superior
+  decrescente (`score ≤ ln(n) − d·ln(now − último acesso)`) e pára quando o
+  limite do próximo fica abaixo do k-ésimo score. O resultado é o mesmo da
+  ordenação total, incluindo o desempate por id. Com um acesso por evento,
+  que é o caso de cada episódio novo, pontua só `k` registos. O índice é
+  derivado: o checkpoint da view não muda. Custa uma entrada ordenada por
+  registo (um `u64` e o `EventId`) em memória.
 
 ## Atualização
 
