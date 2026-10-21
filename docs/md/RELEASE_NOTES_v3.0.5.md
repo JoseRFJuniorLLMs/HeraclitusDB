@@ -88,3 +88,9 @@ Em preparação. Cada PR do ciclo acrescenta aqui a sua entrada.
   durável (o openraft recupera-o do líder); aqui serve de defesa extra na
   abertura, que continua válida com um valor ligeiramente mais antigo. As
   entradas reconhecidas continuam com fsync no `append`.
+- Snapshot do Raft em streaming (item 7 do backlog; auditoria 2026-10-16,
+  O7): o snapshot — que é o log de episódios inteiro — deixa de ser montado
+  em memória (chegava a três ou quatro cópias do log) e passa a ser escrito e
+  lido de um ficheiro, um lote de episódios de cada vez. O formato é o mesmo
+  `bincode(Vec<Vec<u8>>)`, byte a byte, para nós de versões diferentes
+  continuarem a trocar snapshots num upgrade gradual.
