@@ -89,6 +89,29 @@ impl GraphIndex {
             .unwrap_or_default()
     }
 
+    /// Bytes residentes, estimados pelas capacidades (ver
+    /// `heraclitus_core::memoria`). O(entradas): para amostragem periódica.
+    pub fn resident_bytes(&self) -> u64 {
+        use heraclitus_core::memoria::{de_hashmap, de_vec};
+        let adjacencia = |mapa: &DashMap<EventId, Vec<EventId>>| {
+            de_hashmap::<EventId, Vec<EventId>>(mapa.capacity())
+                + mapa
+                    .iter()
+                    .map(|e| de_vec::<EventId>(e.value().capacity()))
+                    .sum::<u64>()
+        };
+        adjacencia(&self.out)
+            + adjacencia(&self.inn)
+            + de_hashmap::<String, RoaringBitmap>(self.attr_idx.capacity())
+            + self
+                .attr_idx
+                .iter()
+                .map(|e| e.key().capacity() as u64 + e.value().serialized_size() as u64)
+                .sum::<u64>()
+            + self.dense.resident_bytes()
+            + de_hashmap::<EventId, Lsn>(self.lsn_of.capacity())
+    }
+
     pub fn internal_id(&self, id: &EventId) -> Option<u32> {
         self.dense.lookup_id(id)
     }

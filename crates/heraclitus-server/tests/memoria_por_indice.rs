@@ -12,7 +12,7 @@
 //! -- --ignored --nocapture`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::cell::Cell;
 
 use heraclitus_activation::ActivationStore;
 use heraclitus_core::{Episode, EventKind, ProductPoint};
@@ -29,21 +29,33 @@ use heraclitus_views::View;
 
 struct Contador;
 
-static VIVOS: AtomicIsize = AtomicIsize::new(0);
+thread_local! {
+    /// Bytes vivos pedidos por ESTA thread: os testes do binário correm em
+    /// paralelo, e um contador global misturava as medições.
+    static VIVOS: Cell<isize> = const { Cell::new(0) };
+}
+
+fn somar(delta: isize) {
+    let _ = VIVOS.try_with(|v| v.set(v.get() + delta));
+}
+
+fn vivos() -> isize {
+    VIVOS.with(Cell::get)
+}
 
 unsafe impl GlobalAlloc for Contador {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        VIVOS.fetch_add(l.size() as isize, Ordering::Relaxed);
+        somar(l.size() as isize);
         System.alloc(l)
     }
 
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        VIVOS.fetch_sub(l.size() as isize, Ordering::Relaxed);
+        somar(-(l.size() as isize));
         System.dealloc(p, l);
     }
 
     unsafe fn realloc(&self, p: *mut u8, l: Layout, novo: usize) -> *mut u8 {
-        VIVOS.fetch_add(novo as isize - l.size() as isize, Ordering::Relaxed);
+        somar(novo as isize - l.size() as isize);
         System.realloc(p, l, novo)
     }
 }
@@ -119,12 +131,34 @@ fn mix(mut v: u64) -> u64 {
 }
 
 /// Bytes vivos por evento depois de `n` episódios aplicados à view.
-fn medir(n: u64, view: &mut dyn View, episodios: &[Episode]) -> f64 {
-    let antes = VIVOS.load(Ordering::Relaxed);
+fn medir<V: View>(n: u64, view: &mut V, episodios: &[Episode]) -> f64 {
+    let antes = vivos();
     for (lsn, e) in episodios.iter().enumerate().take(n as usize) {
         view.apply(lsn as u64, e);
     }
-    (VIVOS.load(Ordering::Relaxed) - antes) as f64 / n as f64
+    (vivos() - antes) as f64 / n as f64
+}
+
+/// Uma linha da medição: o que o alocador viu e o que o índice estima.
+struct Linha {
+    nome: &'static str,
+    medido: f64,
+    estimado: Option<f64>,
+}
+
+fn linha<V: View>(
+    nome: &'static str,
+    view: &mut V,
+    episodios: &[Episode],
+    estimar: impl Fn(&V) -> u64,
+) -> Linha {
+    let n = episodios.len() as u64;
+    let medido = medir(n, view, episodios);
+    Linha {
+        nome,
+        medido,
+        estimado: Some(estimar(view) as f64 / n as f64),
+    }
 }
 
 #[test]
@@ -132,41 +166,137 @@ fn medir(n: u64, view: &mut dyn View, episodios: &[Episode]) -> f64 {
 fn memoria_por_evento_de_cada_indice() {
     const N: u64 = 20_000;
     let episodios: Vec<Episode> = (0..N).map(episodio).collect();
-    let mut linhas = Vec::new();
+    let mut linhas = vec![
+        linha(
+            "vector (HNSW)",
+            &mut VectorIndex::new(ProductMetric::default()),
+            &episodios,
+            VectorIndex::resident_bytes,
+        ),
+        linha(
+            "text (BM25)",
+            &mut TextIndex::new(),
+            &episodios,
+            TextIndex::resident_bytes,
+        ),
+        linha(
+            "graph",
+            &mut GraphIndex::new(),
+            &episodios,
+            GraphIndex::resident_bytes,
+        ),
+        linha(
+            "activation",
+            &mut ActivationStore::new(0.5),
+            &episodios,
+            ActivationStore::resident_bytes,
+        ),
+        linha(
+            "attr",
+            &mut AttrIndex::new(),
+            &episodios,
+            AttrIndex::resident_bytes,
+        ),
+    ];
+    for (nome, medido) in [
+        (
+            "temporal graph",
+            medir(N, &mut TemporalGraph::new(), &episodios),
+        ),
+        ("entity", medir(N, &mut EntityResolver::new(), &episodios)),
+        (
+            "telemetry health",
+            medir(N, &mut TelemetryHealthGraph::new(), &episodios),
+        ),
+    ] {
+        linhas.push(Linha {
+            nome,
+            medido,
+            estimado: None,
+        });
+    }
 
-    let mut vetor = VectorIndex::new(ProductMetric::default());
-    linhas.push(("vector (HNSW)", medir(N, &mut vetor, &episodios)));
-    let mut texto = TextIndex::new();
-    linhas.push(("text (BM25)", medir(N, &mut texto, &episodios)));
-    let mut grafo = GraphIndex::new();
-    linhas.push(("graph", medir(N, &mut grafo, &episodios)));
-    let mut temporal = TemporalGraph::new();
-    linhas.push(("temporal graph", medir(N, &mut temporal, &episodios)));
-    let mut entidades = EntityResolver::new();
-    linhas.push(("entity", medir(N, &mut entidades, &episodios)));
-    let mut ativacao = ActivationStore::new(0.5);
-    linhas.push(("activation", medir(N, &mut ativacao, &episodios)));
-    let mut saude = TelemetryHealthGraph::new();
-    linhas.push(("telemetry health", medir(N, &mut saude, &episodios)));
-    let mut atributos = AttrIndex::new();
-    linhas.push(("attr", medir(N, &mut atributos, &episodios)));
-
-    let antes = VIVOS.load(Ordering::Relaxed);
+    let antes = vivos();
     let memtable = Memtable::new(100_000);
     for (lsn, e) in episodios.iter().enumerate() {
         memtable.apply(lsn as u64, e.clone());
     }
-    let memtable_por_evento = (VIVOS.load(Ordering::Relaxed) - antes) as f64 / N as f64;
-    linhas.push(("memtable (até ao cap)", memtable_por_evento));
+    linhas.push(Linha {
+        nome: "memtable (até ao cap)",
+        medido: (vivos() - antes) as f64 / N as f64,
+        estimado: Some(memtable.resident_bytes() as f64 / N as f64),
+    });
 
-    let total: f64 = linhas.iter().map(|(_, b)| b).sum();
-    println!("\n{N} episódios da carga mixed — bytes vivos por evento:");
-    for (nome, bytes) in &linhas {
+    let total: f64 = linhas.iter().map(|l| l.medido).sum();
+    println!("\n{N} episódios da carga mixed — bytes por evento (medido / estimado):");
+    for l in &linhas {
+        let estimado = l
+            .estimado
+            .map(|e| {
+                format!(
+                    "{e:>9.0}  ({:>+5.1}%)",
+                    100.0 * (e - l.medido) / l.medido.max(1.0)
+                )
+            })
+            .unwrap_or_else(|| "        —".into());
         println!(
-            "  {nome:<24} {bytes:>9.0}  ({:>4.1}%)",
-            100.0 * bytes / total
+            "  {:<24} {:>9.0}  {estimado}   ({:>4.1}% do total)",
+            l.nome,
+            l.medido,
+            100.0 * l.medido / total
         );
     }
     println!("  {:<24} {total:>9.0}", "total");
     assert!(total > 0.0);
+}
+
+/// A contabilidade que o teto de memória usa (`resident_bytes` de cada
+/// índice) tem de acompanhar o que o alocador vê. Corre sempre: se alguém mudar
+/// uma estrutura e esquecer a estimativa, isto falha.
+#[test]
+fn estimativas_de_memoria_acompanham_o_alocador() {
+    let episodios: Vec<Episode> = (0..5_000).map(episodio).collect();
+    let linhas = [
+        linha(
+            "vector",
+            &mut VectorIndex::new(ProductMetric::default()),
+            &episodios,
+            VectorIndex::resident_bytes,
+        ),
+        linha(
+            "text",
+            &mut TextIndex::new(),
+            &episodios,
+            TextIndex::resident_bytes,
+        ),
+        linha(
+            "graph",
+            &mut GraphIndex::new(),
+            &episodios,
+            GraphIndex::resident_bytes,
+        ),
+        linha(
+            "activation",
+            &mut ActivationStore::new(0.5),
+            &episodios,
+            ActivationStore::resident_bytes,
+        ),
+        linha(
+            "attr",
+            &mut AttrIndex::new(),
+            &episodios,
+            AttrIndex::resident_bytes,
+        ),
+    ];
+    for l in linhas {
+        let estimado = l.estimado.unwrap();
+        let desvio = (estimado - l.medido).abs() / l.medido;
+        assert!(
+            desvio <= 0.20,
+            "{}: estimado {estimado:.0} B/evento, medido {:.0} ({:+.1}%)",
+            l.nome,
+            l.medido,
+            100.0 * (estimado - l.medido) / l.medido
+        );
+    }
 }

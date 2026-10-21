@@ -37,6 +37,12 @@ pub enum HeraclitusError {
     /// query/storage failure.
     #[error("idempotency conflict for key {key}")]
     IdempotencyConflict { key: String },
+
+    /// A memória dos índices passou do `index_memory_budget_bytes` com a
+    /// política `reject_writes`. Repetível: o append pode ser tentado de novo
+    /// quando a memória voltar abaixo do teto.
+    #[error("resource exhausted: {0}")]
+    ResourceExhausted(String),
 }
 
 pub type Result<T> = std::result::Result<T, HeraclitusError>;

@@ -185,6 +185,59 @@ fn is_audit_reserved(episode: &Episode) -> bool {
 const AUDIT_RESERVADO: &str =
     "os kinds AuditQuery/AuditAdmin e o agente heraclitus-audit são reservados à meta-auditoria";
 
+/// Uma amostra da memória residente dos índices, em bytes (estimativas pelas
+/// capacidades; ver `Engine::amostrar_memoria_dos_indices`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoriaDosIndices {
+    pub vector: u64,
+    pub text: u64,
+    pub graph: u64,
+    pub activation: u64,
+    pub attr: u64,
+    pub memtable: u64,
+    /// O `index_memory_budget_bytes` em vigor quando a amostra foi tirada.
+    pub budget: Option<u64>,
+}
+
+impl MemoriaDosIndices {
+    pub fn total(&self) -> u64 {
+        self.vector + self.text + self.graph + self.activation + self.attr + self.memtable
+    }
+
+    pub fn over_budget(&self) -> bool {
+        self.budget.is_some_and(|teto| self.total() > teto)
+    }
+
+    /// As linhas Prometheus desta amostra.
+    pub fn prometheus(&self) -> String {
+        let mut out = String::new();
+        for (indice, bytes) in [
+            ("vector", self.vector),
+            ("text", self.text),
+            ("graph", self.graph),
+            ("activation", self.activation),
+            ("attr", self.attr),
+            ("memtable", self.memtable),
+        ] {
+            out.push_str(&format!(
+                "heraclitus_index_resident_bytes{{index=\"{indice}\"}} {bytes}\n"
+            ));
+        }
+        out.push_str(&format!(
+            "heraclitus_index_resident_bytes_total {}\n",
+            self.total()
+        ));
+        if let Some(teto) = self.budget {
+            out.push_str(&format!("heraclitus_index_memory_budget_bytes {teto}\n"));
+        }
+        out.push_str(&format!(
+            "heraclitus_index_memory_over_budget {}\n",
+            u8::from(self.over_budget())
+        ));
+        out
+    }
+}
+
 pub struct Engine {
     /// Backend append-only selecionado explicitamente na configuração.
     /// `legacy` continua sendo o default; `v6` nunca é inferido nem migrado.
@@ -231,6 +284,14 @@ pub struct Engine {
     /// atributos é um componente à parte, e `view rebuild` materializa as views
     /// sem lhe tocar — logo baixar uma marca não pode baixar a outra.
     attr_nao_materializado: std::sync::atomic::AtomicBool,
+    /// Teto e política da memória dos índices (`index_memory_budget_bytes`,
+    /// `index_memory_policy`), a última amostra e se ela passou do teto. A
+    /// amostra é periódica (`amostrar_memoria_dos_indices`); as entradas de
+    /// escrita dos clientes só lêem o atómico.
+    memoria_teto: Option<u64>,
+    memoria_politica: heraclitus_core::IndexMemoryPolicy,
+    memoria_amostra: Mutex<Option<MemoriaDosIndices>>,
+    memoria_acima_do_teto: std::sync::atomic::AtomicBool,
     /// Meta-auditoria de acessos (padrão immudb): cada query GQL executada
     /// gera um evento `AuditQuery` no próprio log — quem consultou o quê é,
     /// ele próprio, evidência imutável. Liga por config (audit_queries).
@@ -754,6 +815,10 @@ impl Engine {
             keystore,
             log_only,
             attr_nao_materializado: std::sync::atomic::AtomicBool::new(skip_replay),
+            memoria_teto: config.index_memory_budget_bytes,
+            memoria_politica: config.index_memory_policy,
+            memoria_amostra: Mutex::new(None),
+            memoria_acima_do_teto: std::sync::atomic::AtomicBool::new(false),
             audit_queries: config.audit_queries,
             audit_admin: config.audit_admin,
             replication: std::sync::OnceLock::new(),
@@ -777,7 +842,71 @@ impl Engine {
             std::fs::remove_file(&privacy_rebuild_marker)?;
         }
         engine.trusted_admin.recover(engine.log.as_ref())?;
+        // A primeira amostra sai do arranque: com o teto configurado, um
+        // processo que já arranca acima dele recusa escritas desde o início.
+        engine.amostrar_memoria_dos_indices();
         Ok(engine)
+    }
+
+    /// Mede a memória residente dos índices (estimativas pelas capacidades,
+    /// calibradas em `tests/memoria_por_indice.rs`), guarda a amostra e
+    /// actualiza o estado do teto. Percorre cada índice sob o seu lock de
+    /// leitura: corre em segundo plano, nunca no caminho de um append.
+    ///
+    /// Não contabiliza o grafo temporal, as entidades nem a telemetria de
+    /// saúde, que não crescem por evento na carga medida.
+    pub fn amostrar_memoria_dos_indices(&self) -> MemoriaDosIndices {
+        let amostra = MemoriaDosIndices {
+            vector: self.vector.read().unwrap().resident_bytes(),
+            text: self.text.read().unwrap().resident_bytes(),
+            graph: self.graph.read().unwrap().resident_bytes(),
+            activation: self.activation.read().unwrap().resident_bytes(),
+            attr: self.attr.read().unwrap().resident_bytes(),
+            memtable: self.memtable.resident_bytes() as u64,
+            budget: self.memoria_teto,
+        };
+        let acima = amostra.over_budget();
+        let antes = self
+            .memoria_acima_do_teto
+            .swap(acima, std::sync::atomic::Ordering::Relaxed);
+        if acima && !antes {
+            tracing::warn!(
+                total = amostra.total(),
+                teto = ?self.memoria_teto,
+                politica = ?self.memoria_politica,
+                "memória dos índices acima do teto"
+            );
+        } else if antes && !acima {
+            tracing::info!(
+                total = amostra.total(),
+                "memória dos índices voltou abaixo do teto"
+            );
+        }
+        *self.memoria_amostra.lock().unwrap() = Some(amostra.clone());
+        amostra
+    }
+
+    /// A última amostra da memória dos índices.
+    pub fn memoria_dos_indices(&self) -> Option<MemoriaDosIndices> {
+        self.memoria_amostra.lock().unwrap().clone()
+    }
+
+    /// Chamado pelas entradas de escrita dos CLIENTES (gRPC, GQL `CREATE`,
+    /// API embarcada). Nunca pelas escritas internas nem pelo aplicador do
+    /// consenso: recusar uma entrada já comprometida partiria a replicação.
+    pub fn verificar_teto_de_memoria(&self) -> Result<(), HeraclitusError> {
+        if self.memoria_politica == heraclitus_core::IndexMemoryPolicy::RejectWrites
+            && self
+                .memoria_acima_do_teto
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(HeraclitusError::ResourceExhausted(format!(
+                "memória dos índices acima do teto de {} bytes (index_memory_policy = \
+                 reject_writes); tente de novo quando baixar",
+                self.memoria_teto.unwrap_or_default()
+            )));
+        }
+        Ok(())
     }
 
     /// Ativa a replicação: a partir daqui `append` encaminha pelo consenso.
@@ -2874,6 +3003,7 @@ impl Engine {
         episode: Episode,
         key: &str,
     ) -> Result<(Lsn, bool, String), HeraclitusError> {
+        self.verificar_teto_de_memoria()?;
         validar_namespace_do_indice(&episode)?;
         if episode.agent_id == "heraclitus-admin"
             || matches!(&episode.kind, EventKind::Custom(k) if k == "AdminIntent" || k == "AdminResult")
@@ -3208,6 +3338,7 @@ impl Engine {
             "storage_format": self.log.format().as_str(),
             "memtable": self.memtable.len(),
             "memtable_bytes_estimated": self.memtable.resident_bytes(),
+            "index_memory": self.memoria_dos_indices(),
             // Contagens: leitura pura. Com `.write()` cada uma esperava pelo
             // checkpoint em curso, e era isso que punha o `/stats` a 44 s.
             "vector_indexed": self.vector.read().unwrap().len(),
@@ -3281,7 +3412,7 @@ impl Engine {
         let cold_bytes_downloaded = self
             .cold_bytes_downloaded
             .load(std::sync::atomic::Ordering::Relaxed);
-        Ok(format!(
+        let mut texto = format!(
             concat!(
                 "hrkl_append_bytes_total {}\n",
                 "hrkl_raw_bytes {}\n",
@@ -3330,7 +3461,11 @@ impl Engine {
             m.physical_crc_failures,
             log.hlc_skew_ms(),
             u8::from(log.degradado().is_some()),
-        ))
+        );
+        if let Some(memoria) = self.memoria_dos_indices() {
+            texto.push_str(&memoria.prometheus());
+        }
+        Ok(texto)
     }
 
     pub fn verify(&self) -> Result<serde_json::Value, HeraclitusError> {
@@ -4229,6 +4364,8 @@ impl QueryBackend for Engine {
         label: Option<&str>,
         props: &[(String, GqlValue)],
     ) -> Result<Lsn, HeraclitusError> {
+        // GQL `CREATE` e `DECIDE`: escritas de cliente.
+        self.verificar_teto_de_memoria()?;
         let kind = match label {
             Some(l) if l.eq_ignore_ascii_case("action") => EventKind::Action,
             Some(l) if l.eq_ignore_ascii_case("message") => EventKind::Message,
@@ -6829,6 +6966,56 @@ mod tests {
                 assert_eq!(depois - antes, 5, "{formato:?}");
             }
         }
+    }
+
+    /// Teto de memoria dos indices: com `reject_writes`, as escritas de
+    /// clientes (gRPC via `append_idempotent`, GQL `CREATE`) sao recusadas com
+    /// `ResourceExhausted` enquanto a ultima amostra estiver acima do teto; as
+    /// escritas internas continuam. Com `warn`, so sinaliza.
+    #[test]
+    fn teto_de_memoria_dos_indices_recusa_so_escritas_de_clientes() {
+        let abrir = |politica| {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = HeraclitusConfig {
+                data_dir: dir.path().to_path_buf(),
+                fsync: FsyncPolicy::Always,
+                storage_format: heraclitus_core::StorageFormat::V6,
+                index_memory_budget_bytes: Some(1),
+                index_memory_policy: politica,
+                ..Default::default()
+            };
+            (Engine::open(&cfg).unwrap(), dir)
+        };
+        let episodio =
+            |i: u32| Episode::new("ag", EventKind::Observation, format!("e{i}").into_bytes());
+
+        let (engine, _dir) = abrir(heraclitus_core::IndexMemoryPolicy::RejectWrites);
+        // Escrita interna: nunca passa pelo teto.
+        engine.append(episodio(0)).unwrap();
+        let amostra = engine.amostrar_memoria_dos_indices();
+        assert!(amostra.total() > 1, "{amostra:?}");
+        assert!(amostra.over_budget());
+        assert!(matches!(
+            engine.append_idempotent(episodio(1), "chave-1"),
+            Err(HeraclitusError::ResourceExhausted(_))
+        ));
+        assert!(matches!(
+            heraclitus_query::execute("CREATE (n:Nota {texto: \"x\"})", &engine),
+            Err(HeraclitusError::ResourceExhausted(_))
+        ));
+        engine.append(episodio(2)).unwrap();
+        // Métricas e /stats publicam a amostra.
+        let prometheus = engine.prometheus_metrics().unwrap();
+        assert!(prometheus.contains("heraclitus_index_resident_bytes{index=\"vector\"}"));
+        assert!(prometheus.contains("heraclitus_index_memory_over_budget 1"));
+        assert_eq!(engine.stats()["index_memory"]["budget"], 1);
+
+        let (engine, _dir) = abrir(heraclitus_core::IndexMemoryPolicy::Warn);
+        engine.append(episodio(0)).unwrap();
+        assert!(engine.amostrar_memoria_dos_indices().over_budget());
+        engine.append_idempotent(episodio(1), "chave-1").unwrap();
+        assert!(engine.verificar_teto_de_memoria().is_ok());
+        heraclitus_query::execute("CREATE (n:Nota {texto: \"x\"})", &engine).unwrap();
     }
 
     /// Soak nightly de 20/10/2026: `WHERE n.agent_id = "x"` sai do indice de

@@ -56,3 +56,12 @@ Em preparação. Cada PR do ciclo acrescenta aqui a sua entrada.
   446 → 236 B por evento. Formato v9 (um checkpoint v8 ou anterior é
   reconstruído do log no primeiro arranque; com a v8 do mesmo ciclo, é uma
   só reconstrução para quem vem da 3.0.4).
+- Teto de memória dos índices: cada índice estima os seus bytes residentes
+  (dentro de ±7% do alocador na carga do soak); o servidor amostra-os a cada
+  `index_memory_sample_secs` (30 s), publica
+  `heraclitus_index_resident_bytes{index=...}` e `index_memory` no `/stats`, e
+  aplica `index_memory_budget_bytes` (sem teto por omissão). Com
+  `index_memory_policy = "reject_writes"`, os appends de clientes recebem
+  `RESOURCE_EXHAUSTED` (repetível) enquanto a memória estiver acima do teto;
+  escritas internas e replicação nunca são recusadas. Variante nova
+  `HeraclitusError::ResourceExhausted`.

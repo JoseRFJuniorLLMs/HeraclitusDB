@@ -457,6 +457,20 @@ impl ActivationStore {
         self.ler().mapa.len()
     }
 
+    /// Bytes residentes, estimados pelas capacidades (ver
+    /// `heraclitus_core::memoria`): o mapa e o índice ordenado do `top_k`.
+    pub fn resident_bytes(&self) -> u64 {
+        use heraclitus_core::memoria::{de_btree, de_hashmap, de_vec};
+        let registos = self.ler();
+        de_hashmap::<EventId, ActivationRecord>(registos.mapa.capacity())
+            + de_vec::<BTreeSet<(Reverse<u64>, EventId)>>(registos.faixas.capacity())
+            + registos
+                .faixas
+                .iter()
+                .map(|faixa| de_btree::<(Reverse<u64>, EventId), ()>(faixa.len()))
+                .sum::<u64>()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.ler().mapa.is_empty()
     }

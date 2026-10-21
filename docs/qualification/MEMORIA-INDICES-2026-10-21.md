@@ -43,10 +43,19 @@ Sem a memtable, que é limitada, a parte que cresce com os dados passou de
 
 ## Etapas seguintes do teto de memória
 
-1. **Contabilidade e orçamento global**: cada índice reporta os seus bytes
-   residentes; o `Engine` soma, publica a métrica por índice e aplica um
-   `index_memory_budget_bytes` configurável, com um estado explícito quando é
-   ultrapassado.
+1. **Contabilidade e orçamento global — feito.** Cada índice reporta os
+   seus bytes (`resident_bytes`, pelas capacidades dos contentores; ver
+   `heraclitus_core::memoria`), dentro de ±7% do alocador na carga medida e
+   verificado no CI a ±20% (`estimativas_de_memoria_acompanham_o_alocador`).
+   O `Engine` amostra-os no arranque e a cada `index_memory_sample_secs`
+   (30 s), publica `heraclitus_index_resident_bytes{index=...}` no `/metrics`
+   e `index_memory` no `/stats`, e aplica `index_memory_budget_bytes`:
+   com `index_memory_policy = "reject_writes"` as escritas de clientes (gRPC,
+   GQL `CREATE`/`DECIDE`, API embarcada) recebem `RESOURCE_EXHAUSTED`
+   enquanto a última amostra estiver acima do teto; com `"warn"` só se
+   sinaliza. Escritas internas e o aplicador do consenso nunca são
+   recusados. Não contabilizados: grafo temporal, entidades e telemetria de
+   saúde (0 B/evento na carga medida).
 2. **Memtable por bytes**: além do número de entradas, um teto em bytes.
    Muda o canal da memtable no ranking do `recall` quando o teto corta antes
    do `cap`; precisa de decisão.
