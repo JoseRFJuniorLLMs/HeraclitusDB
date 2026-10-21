@@ -4809,15 +4809,17 @@ mod tests {
         let engine = Engine::open(&cfg).unwrap();
         for i in 0..40 {
             let agent = if i < 20 { "alice" } else { "bob" };
-            engine
-                .append(Episode::new(agent, EventKind::Observation, vec![b'x'; 512]))
-                .unwrap();
+            let mut e = Episode::new(agent, EventKind::Observation, vec![b'x'; 512]);
+            e.session_id = format!("s-{agent}");
+            engine.append(e).unwrap();
         }
         let v6 = engine.log.v6_arc().unwrap();
         v6.seal_active().unwrap();
         v6.pack_pending(PackingProfile::Balanced).unwrap();
         v6.build_pending_hrki(
-            &IndexPolicySet::new().com("agent_id", IndexPolicy::PublicTechnical),
+            &IndexPolicySet::new()
+                .com("agent_id", IndexPolicy::PublicTechnical)
+                .com("session_id", IndexPolicy::PublicTechnical),
             None,
             0.01,
         )
@@ -4836,8 +4838,27 @@ mod tests {
             heraclitus_query::execute("MATCH (n) WHERE n.agent_id = \"alice\" RETURN n", &engine)
                 .unwrap();
         assert_eq!(rows.as_array().unwrap().len(), 20);
+        // `agent_id` passou a sair do índice de atributos (`_agent` +
+        // `_agent_ev`), que tem precedência sobre o skip-scan; o EXPLAIN mostra
+        // o caminho que a execução toma.
         let explain = heraclitus_query::execute(
             "EXPLAIN MATCH (n) WHERE n.agent_id = \"alice\" RETURN n",
+            &engine,
+        )
+        .unwrap();
+        let explain = explain.as_str().unwrap();
+        assert!(explain.contains("BuiltinIndex"), "{explain}");
+        assert!(explain.contains("candidates = 20"), "{explain}");
+        // `session_id` não tem índice: a poda HRKI continua a ser o caminho, e
+        // o EXPLAIN reporta-a.
+        let rows = heraclitus_query::execute(
+            "MATCH (n) WHERE n.session_id = \"s-alice\" RETURN n",
+            &engine,
+        )
+        .unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 20);
+        let explain = heraclitus_query::execute(
+            "EXPLAIN MATCH (n) WHERE n.session_id = \"s-alice\" RETURN n",
             &engine,
         )
         .unwrap();
