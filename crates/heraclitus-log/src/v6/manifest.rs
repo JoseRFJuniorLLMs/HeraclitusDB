@@ -469,13 +469,23 @@ pub struct LoadedManifest {
 /// O directório de manifestos, com o protocolo de commit de §75.
 pub struct ManifestStore {
     dir: PathBuf,
+    /// A próxima geração a escrever, depois do primeiro commit deste
+    /// processo. Auditoria 2026-10-16, O2: o `commit` listava o directório
+    /// (`read_dir`) a cada seal, pack, HRKI e legal hold para descobrir o
+    /// número, e entre passagens do GC os manifestos antigos acumulam-se.
+    /// `None` = ainda não lida, ou o último commit falhou: o próximo lê o
+    /// disco, para que um commit interrompido nunca reutilize um número.
+    proxima: std::sync::Mutex<Option<u64>>,
 }
 
 impl ManifestStore {
     pub fn open(dir: impl AsRef<Path>) -> V6Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
-        Ok(Self { dir })
+        Ok(Self {
+            dir,
+            proxima: std::sync::Mutex::new(None),
+        })
     }
 
     /// Abre um store existente sem criar diretórios nem reparar estado. É o
@@ -488,7 +498,10 @@ impl ManifestStore {
                 format!("manifest directory does not exist: {}", dir.display()),
             ));
         }
-        Ok(Self { dir })
+        Ok(Self {
+            dir,
+            proxima: std::sync::Mutex::new(None),
+        })
     }
 
     pub fn dir(&self) -> &Path {
@@ -627,8 +640,26 @@ impl ManifestStore {
     /// Morrer em qualquer ponto deixa `CURRENT` a apontar para a geração
     /// anterior, que continua completa.
     pub fn commit(&self, manifest: &mut DatabaseManifest) -> V6Result<LoadedManifest> {
+        let resultado = self.commit_na_proxima_geracao(manifest);
+        *self.proxima.lock().unwrap_or_else(|e| e.into_inner()) = match &resultado {
+            Ok(carregado) => Some(carregado.generation + 1),
+            Err(_) => None,
+        };
+        resultado
+    }
+
+    fn commit_na_proxima_geracao(
+        &self,
+        manifest: &mut DatabaseManifest,
+    ) -> V6Result<LoadedManifest> {
         const CTX: &str = "hrkm commit";
-        let generation = self.next_generation()?;
+        let em_memoria = *self.proxima.lock().unwrap_or_else(|e| e.into_inner());
+        let generation = match em_memoria {
+            // Um ficheiro que este processo não escreveu ocupa o número: a
+            // listagem, como antes, escolhe acima do mais alto em disco.
+            Some(g) if !self.path_for(g).exists() => g,
+            _ => self.next_generation()?,
+        };
         manifest.manifest_generation = generation;
         manifest.format_identifier = HRKM_MAGIC;
         let final_path = self.path_for(generation);
@@ -1287,6 +1318,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// Auditoria 2026-10-16, O2: depois do primeiro commit o número vem do
+    /// contador em memória, sem listar o directório. Um ficheiro de geração
+    /// que o processo não escreveu continua a ser saltado, e um store reaberto
+    /// continua acima do mais alto em disco.
+    #[test]
+    fn geracoes_seguidas_sem_reutilizar_numeros() {
+        let d = dir_teste("geracoes");
+        let store = ManifestStore::open(&d).unwrap();
+        let mut m = manifesto();
+        assert_eq!(store.commit(&mut m).unwrap().generation, 1);
+        assert_eq!(store.commit(&mut m).unwrap().generation, 2);
+        std::fs::write(store.path_for(3), b"alheio").unwrap();
+        assert_eq!(store.commit(&mut m).unwrap().generation, 4);
+        assert_eq!(store.commit(&mut m).unwrap().generation, 5);
+        let reaberto = ManifestStore::open(&d).unwrap();
+        assert_eq!(reaberto.commit(&mut m).unwrap().generation, 6);
+        assert_eq!(reaberto.load().unwrap().unwrap().generation, 6);
     }
 
     #[test]

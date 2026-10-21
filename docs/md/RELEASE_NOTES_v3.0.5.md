@@ -73,3 +73,8 @@ Em preparação. Cada PR do ciclo acrescenta aqui a sua entrada.
   guarda os offsets que o writer já tinha, e a leitura faz um `seek`. O LSN
   no offset é sempre conferido; sem offsets (depois de um restart, ou com
   mais de 64 segmentos à espera de pack) recua para o percurso completo.
+- O commit do manifesto HRKM deixa de listar o directório a cada seal, pack,
+  HRKI e legal hold para saber o número da geração (auditoria 2026-10-16,
+  O2, parte): um contador em memória, lido do disco no primeiro commit e
+  esquecido se um commit falhar. Fica por fazer o resto do O2 (o manifesto
+  inteiro ainda é clonado e reescrito a cada commit).
