@@ -33,3 +33,14 @@ Em preparação. Cada PR do ciclo acrescenta aqui a sua entrada.
 - Cada `AgentEvidence` acrescenta um posting (o agente) ao índice de
   atributos, o mesmo custo que a chave de idempotência já tinha. O envelope
   de alta cardinalidade continua fora (SPEC-0085).
+
+## Qualificação
+
+- O gate de memória do soak aceita um segundo orçamento, em bytes de RSS por
+  evento retido (`memory_growth_budget_bytes_per_retained_event`). Com ele,
+  um RSS que sobe acima do orçamento por hora passa se a memória por evento
+  gravado ficar dentro do orçamento nas duas metades da janela; o nightly usa
+  8 KiB. Memória a crescer sem eventos novos continua a falhar. Os perfis
+  longos não o usam.
+- O gate de threads aceita um único degrau pequeno depois da estabilização,
+  mesmo na segunda metade da janela, e regista o motivo no relatório.

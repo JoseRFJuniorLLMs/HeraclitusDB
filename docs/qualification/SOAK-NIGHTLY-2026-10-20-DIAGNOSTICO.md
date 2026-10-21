@@ -115,7 +115,16 @@ A primeira já foi decidida e implementada; as restantes continuam em aberto:
 2. **`agent_id` sem índice**: índice dedicado para builtins ou `LIMIT`
    empurrado para `scan_builtin_eq`.
 3. **`ActivationStore::top_k`**: estrutura ordenada em vez de varrer tudo.
-4. **Gate de memória**: complementar bytes/hora com bytes por evento retido,
-   ou limitar o volume da carga de soak.
-5. **Gate de threads**: exigir mais de um degrau, ou uma janela mais longa no
-   perfil nightly.
+4. **Gate de memória — decidido:** teto de memória dos índices (em curso) e,
+   no perfil nightly, um segundo orçamento por evento retido
+   (`memory_growth_budget_bytes_per_retained_event = 8192`). Um declive de RSS
+   acima do orçamento por hora passa só se o RSS por evento gravado ficar
+   dentro dos 8 KiB na janela inteira e na segunda metade; memória a crescer
+   com o `head` parado continua julgada pelo orçamento por hora. Os 8 KiB
+   cobrem os ~5,0–5,1 KiB medidos nos dois nightlies, com folga de ~60%.
+   Os perfis longos (6 h a 168 h) ficam sem este orçamento: ao longo de dias,
+   a meta é a memória limitada.
+5. **Gate de threads — decidido:** um único novo máximo depois da
+   estabilização, pequeno face ao nível estabilizado (no máximo um quarto, ou
+   2), passa onde quer que caia; dois ou mais continuam julgados pelo declive.
+   O relatório diz sempre porque aceitou (`accepted_because`).

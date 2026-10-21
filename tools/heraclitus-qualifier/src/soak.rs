@@ -46,6 +46,21 @@ pub struct SoakProfile {
     /// §20 budget. Growth beyond this over the stabilized window is
     /// "unbounded", not "expected cache growth".
     pub memory_growth_budget_bytes_per_hour: f64,
+    /// Optional second memory budget: RSS bytes per event the soak itself
+    /// retained (slope of RSS against `head`).
+    ///
+    /// A workload that keeps appending grows the in-memory indexes with every
+    /// event, so bytes per hour alone cannot tell "proportional to retained
+    /// data" from "leaking" — the nightly of 2026-10-20 failed the hourly
+    /// budget at a steady ~5 KiB per event. With this set, an RSS slope over
+    /// the hourly budget still passes when BOTH the whole stabilized window and
+    /// its second half stay within it. Memory that grows with a flat `head`
+    /// has no per-event slope and stays judged by the hourly budget alone.
+    ///
+    /// The long profiles leave it unset on purpose: over days the hourly
+    /// budget is what a bounded-memory design has to meet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_growth_budget_bytes_per_retained_event: Option<f64>,
     pub handle_growth_budget_per_hour: f64,
     pub thread_growth_budget_per_hour: f64,
     /// Ratio of final-window p99 to first-window p99 above which latency has
@@ -104,6 +119,18 @@ struct GrowthGate {
     samples_in_window: usize,
     samples_in_second_half: usize,
     within_budget: Option<bool>,
+    /// Resident set only: the per-retained-event budget, when the profile has
+    /// one (see `SoakProfile::memory_growth_budget_bytes_per_retained_event`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget_bytes_per_retained_event: Option<f64>,
+    /// Threads only: how many times the series set a new maximum after
+    /// stabilization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_maxima_after_stabilization: Option<usize>,
+    /// Why a slope over the hourly budget was accepted, when it was. Never
+    /// silent: the slopes above stay in the report either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accepted_because: Option<&'static str>,
 }
 
 /// One workload lane across the run. Diagnostic only: it never changes the
@@ -304,6 +331,73 @@ fn gate(
         samples_in_window,
         samples_in_second_half,
         within_budget,
+        budget_bytes_per_retained_event: None,
+        new_maxima_after_stabilization: None,
+        accepted_because: None,
+    }
+}
+
+/// The per-retained-event budget for the resident set (see
+/// `SoakProfile::memory_growth_budget_bytes_per_retained_event`). Only ever
+/// turns a failing verdict into a pass, and only with both halves measured.
+fn accept_rss_per_retained_event(
+    gate: &mut GrowthGate,
+    memory: &MemoryPerEvent,
+    budget: Option<f64>,
+) {
+    let Some(budget) = budget else {
+        return;
+    };
+    gate.budget_bytes_per_retained_event = Some(budget);
+    if gate.within_budget != Some(false) {
+        return;
+    }
+    if let (Some(whole), Some(tail)) = (
+        memory.resident_set_bytes_per_appended_event,
+        memory.resident_set_bytes_per_appended_event_second_half,
+    ) {
+        if whole <= budget && tail <= budget {
+            gate.within_budget = Some(true);
+            gate.accepted_because = Some(
+                "resident set grows no faster than the per-retained-event budget in either half",
+            );
+        }
+    }
+}
+
+/// §20 forbids continuous growth. The step rule in [`gate`] already lets a
+/// series that grew once and went flat pass — unless the step lands in the
+/// second half of the window, as the single 16→17 thread step of the
+/// 2026-10-20 nightly did. Counting new maxima tells one step from a trend
+/// wherever it falls. The step must also be small next to the stabilized
+/// level (at most a quarter of it, or 2): a single jump to hundreds of
+/// threads is not a pool settling.
+fn accept_single_small_step(
+    gate: &mut GrowthGate,
+    samples: &[Sample],
+    stabilization_seconds: f64,
+    extract: impl Fn(&ProcessSample) -> Option<u64>,
+) {
+    let mut values = samples
+        .iter()
+        .filter(|sample| sample.elapsed_seconds >= stabilization_seconds)
+        .filter_map(|sample| extract(&sample.process));
+    let Some(baseline) = values.next() else {
+        return;
+    };
+    let mut maximum = baseline;
+    let mut new_maxima = 0usize;
+    for value in values {
+        if value > maximum {
+            maximum = value;
+            new_maxima += 1;
+        }
+    }
+    gate.new_maxima_after_stabilization = Some(new_maxima);
+    let small = maximum - baseline <= (baseline / 4).max(2);
+    if gate.within_budget == Some(false) && new_maxima <= 1 && small {
+        gate.within_budget = Some(true);
+        gate.accepted_because = Some("a single small step after stabilization, then flat");
     }
 }
 
@@ -565,14 +659,31 @@ async fn run_async(config: &SoakConfig) -> Result<SoakSummary> {
     };
 
     let stabilization = config.profile.stabilization_seconds as f64;
+    let memory_per_event = memory_per_event(&samples, stabilization);
+    let mut rss_gate = gate(
+        "resident_set_bytes",
+        &samples,
+        stabilization,
+        config.profile.memory_growth_budget_bytes_per_hour,
+        |process| process.rss_bytes,
+    );
+    accept_rss_per_retained_event(
+        &mut rss_gate,
+        &memory_per_event,
+        config.profile.memory_growth_budget_bytes_per_retained_event,
+    );
+    let mut threads_gate = gate(
+        "threads",
+        &samples,
+        stabilization,
+        config.profile.thread_growth_budget_per_hour,
+        |process| process.threads,
+    );
+    accept_single_small_step(&mut threads_gate, &samples, stabilization, |process| {
+        process.threads
+    });
     let gates = vec![
-        gate(
-            "resident_set_bytes",
-            &samples,
-            stabilization,
-            config.profile.memory_growth_budget_bytes_per_hour,
-            |process| process.rss_bytes,
-        ),
+        rss_gate,
         gate(
             "open_handles",
             &samples,
@@ -580,13 +691,7 @@ async fn run_async(config: &SoakConfig) -> Result<SoakSummary> {
             config.profile.handle_growth_budget_per_hour,
             |process| process.handles,
         ),
-        gate(
-            "threads",
-            &samples,
-            stabilization,
-            config.profile.thread_growth_budget_per_hour,
-            |process| process.threads,
-        ),
+        threads_gate,
     ];
 
     let latency_first_window = window_summaries
@@ -704,7 +809,7 @@ async fn run_async(config: &SoakConfig) -> Result<SoakSummary> {
         latency_within_budget,
         latency_by_operation: latency_by_operation(&window_lanes),
         gates,
-        memory_per_event: memory_per_event(&samples, stabilization),
+        memory_per_event,
         integrity_ok,
         integrity_message,
         samples,
@@ -851,6 +956,139 @@ mod tests {
             memory_per_event(&flat, 0.0).resident_set_bytes_per_appended_event,
             None
         );
+    }
+
+    /// RSS growing at 4 KiB per appended event, far over an hourly budget.
+    fn rss_proportional_to_head() -> Vec<Sample> {
+        (0..8)
+            .map(|i| Sample {
+                head: i * 1_000,
+                ..sample(i as f64 * 60.0, Some(100_000_000 + i * 4_096_000))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rss_proportional_to_retained_events_passes_the_per_event_budget() {
+        let samples = rss_proportional_to_head();
+        let memory = memory_per_event(&samples, 120.0);
+        let hourly = |p: &ProcessSample| p.rss_bytes;
+
+        let mut gate_rss = gate("resident_set_bytes", &samples, 120.0, 1_000_000.0, hourly);
+        assert_eq!(
+            gate_rss.within_budget,
+            Some(false),
+            "montagem: hourly fails"
+        );
+        accept_rss_per_retained_event(&mut gate_rss, &memory, Some(8_192.0));
+        assert_eq!(gate_rss.within_budget, Some(true));
+        assert!(gate_rss.accepted_because.is_some());
+        assert_eq!(gate_rss.budget_bytes_per_retained_event, Some(8_192.0));
+
+        // Tighter than the observed 4 KiB: still a failure.
+        let mut gate_rss = gate("resident_set_bytes", &samples, 120.0, 1_000_000.0, hourly);
+        accept_rss_per_retained_event(&mut gate_rss, &memory, Some(2_048.0));
+        assert_eq!(gate_rss.within_budget, Some(false));
+        assert!(gate_rss.accepted_because.is_none());
+
+        // No per-event budget in the profile: the hourly verdict stands.
+        let mut gate_rss = gate("resident_set_bytes", &samples, 120.0, 1_000_000.0, hourly);
+        accept_rss_per_retained_event(&mut gate_rss, &memory, None);
+        assert_eq!(gate_rss.within_budget, Some(false));
+    }
+
+    /// Memory that grows while nothing is appended is the leak the hourly
+    /// budget exists for; the per-event budget cannot excuse it.
+    #[test]
+    fn rss_growing_with_a_flat_head_is_never_excused_per_event() {
+        let samples: Vec<Sample> = (0..8)
+            .map(|i| Sample {
+                head: 5_000,
+                ..sample(i as f64 * 60.0, Some(100_000_000 + i * 4_096_000))
+            })
+            .collect();
+        let memory = memory_per_event(&samples, 120.0);
+        let mut gate_rss = gate("resident_set_bytes", &samples, 120.0, 1_000_000.0, |p| {
+            p.rss_bytes
+        });
+        accept_rss_per_retained_event(&mut gate_rss, &memory, Some(1e12));
+        assert_eq!(gate_rss.within_budget, Some(false));
+    }
+
+    fn threads_series(values: &[u64]) -> Vec<Sample> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, threads)| Sample {
+                process: ProcessSample {
+                    threads: Some(*threads),
+                    ..sample(0.0, Some(1)).process
+                },
+                ..sample(i as f64 * 60.0, Some(1))
+            })
+            .collect()
+    }
+
+    /// The 2026-10-20 nightly: one 16→17 step right after the midpoint of the
+    /// stabilized window failed the step rule. One small new maximum is a
+    /// pool settling, wherever it lands.
+    #[test]
+    fn a_single_small_thread_step_in_the_second_half_is_not_a_leak() {
+        let samples = threads_series(&[16, 16, 16, 16, 16, 16, 17, 17, 17]);
+        let threads = |p: &ProcessSample| p.threads;
+        let mut gate_threads = gate("threads", &samples, 60.0, 0.5, threads);
+        assert_eq!(gate_threads.within_budget, Some(false), "montagem");
+        accept_single_small_step(&mut gate_threads, &samples, 60.0, threads);
+        assert_eq!(gate_threads.new_maxima_after_stabilization, Some(1));
+        assert_eq!(gate_threads.within_budget, Some(true));
+        assert!(gate_threads.accepted_because.is_some());
+    }
+
+    #[test]
+    fn repeated_or_large_thread_steps_still_fail() {
+        let threads = |p: &ProcessSample| p.threads;
+        // Two new maxima: growing, not settled.
+        let samples = threads_series(&[16, 16, 16, 16, 17, 17, 17, 18, 18]);
+        let mut gate_threads = gate("threads", &samples, 60.0, 0.5, threads);
+        accept_single_small_step(&mut gate_threads, &samples, 60.0, threads);
+        assert_eq!(gate_threads.new_maxima_after_stabilization, Some(2));
+        assert_eq!(gate_threads.within_budget, Some(false));
+
+        // One step, but to far more threads than a pool settling adds.
+        let samples = threads_series(&[16, 16, 16, 16, 16, 16, 200, 200, 200]);
+        let mut gate_threads = gate("threads", &samples, 60.0, 0.5, threads);
+        accept_single_small_step(&mut gate_threads, &samples, 60.0, threads);
+        assert_eq!(gate_threads.within_budget, Some(false));
+    }
+
+    /// The nightly profile with the per-event budget parses; the shipped long
+    /// profiles stay without it (hourly budget only).
+    #[test]
+    fn per_event_budget_is_optional_in_profiles() {
+        let nightly: SoakProfile = serde_json::from_value(serde_json::json!({
+            "schema_version": 1, "id": "soak-nightly", "description": "x",
+            "duration_seconds": 900, "sample_interval_seconds": 15,
+            "stabilization_seconds": 180, "concurrency": 8, "workload_profile": "mixed",
+            "memory_growth_budget_bytes_per_hour": 134217728.0,
+            "memory_growth_budget_bytes_per_retained_event": 8192.0,
+            "handle_growth_budget_per_hour": 60.0, "thread_growth_budget_per_hour": 4.0,
+            "latency_drift_budget_ratio": 3.0, "satisfies_level": "development"
+        }))
+        .unwrap();
+        assert_eq!(
+            nightly.memory_growth_budget_bytes_per_retained_event,
+            Some(8192.0)
+        );
+        for name in ["6h", "24h", "72h", "168h"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../qa/qualification/soak")
+                .join(format!("{name}.json"));
+            let profile = load_profile(&path).unwrap();
+            assert_eq!(
+                profile.memory_growth_budget_bytes_per_retained_event, None,
+                "{name}"
+            );
+        }
     }
 
     #[test]
