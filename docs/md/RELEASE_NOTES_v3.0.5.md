@@ -78,3 +78,13 @@ Em preparação. Cada PR do ciclo acrescenta aqui a sua entrada.
   O2, parte): um contador em memória, lido do disco no primeiro commit e
   esquecido se um commit falhar. Fica por fazer o resto do O2 (o manifesto
   inteiro ainda é clonado e reescrito a cada commit).
+
+## Raft
+
+- O `committed` do Raft deixa de ser gravado com dois fsyncs a cada avanço
+  (auditoria 2026-10-16, O7). Vai para o `meta.bin` no primeiro valor, a
+  cada 1 024 entradas de avanço, depois de 1 s desde a última escrita, quando
+  o voto é gravado e quando o log fecha. O Raft não exige que ele seja
+  durável (o openraft recupera-o do líder); aqui serve de defesa extra na
+  abertura, que continua válida com um valor ligeiramente mais antigo. As
+  entradas reconhecidas continuam com fsync no `append`.

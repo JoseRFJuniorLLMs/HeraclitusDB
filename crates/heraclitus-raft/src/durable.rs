@@ -62,6 +62,38 @@ struct Inner {
     entries: BTreeMap<u64, Entry<TypeConfig>>,
     last_purged: Option<LogId<NodeId>>,
     meta: Meta,
+    /// O `committed` que está no `meta.bin` e quando foi escrito (O7).
+    committed_persistido: Option<LogId<NodeId>>,
+    committed_persistido_em: std::time::Instant,
+}
+
+/// Auditoria 2026-10-16, O7: `save_committed` fazia tmp+fsync+rename+fsync do
+/// directório a cada avanço do commit — dois fsyncs por lote replicado, só
+/// para um valor que o Raft não exige durável (o openraft recupera-o do líder
+/// depois de um restart). Aqui ele serve de defesa extra no `open`: recusar
+/// truncar entradas abaixo da fronteira comprometida. Persistido com atraso, a
+/// fronteira fica um pouco mais antiga e a verificação continua válida, só
+/// menos estrita; as entradas reconhecidas continuam com fsync no `append`.
+///
+/// Grava-se quando: é o primeiro valor do processo, o commit avançou
+/// [`COMMITTED_PERSISTIR_A_CADA`] entradas, passou
+/// [`COMMITTED_PERSISTIR_APOS`] desde a última escrita, ou recuou; e sempre
+/// que o voto é gravado (o `meta.bin` leva os dois) e quando o log fecha.
+const COMMITTED_PERSISTIR_A_CADA: u64 = 1024;
+const COMMITTED_PERSISTIR_APOS: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[cfg(test)]
+thread_local! {
+    /// Escritas do `meta.bin` nesta thread (os testes do O7 contam-nas).
+    static ESCRITAS_META: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if self.committed_persistido != self.meta.committed {
+            let _ = self.write_meta();
+        }
+    }
 }
 
 fn io_err(e: impl std::fmt::Display) -> openraft::AnyError {
@@ -189,6 +221,10 @@ impl Inner {
         // Torna o rename durável — sem isto o voto podia reverter num crash.
         fsync_dir(&self.dir)
             .map_err(|e| StorageError::from(StorageIOError::write_vote(io_err(e))))?;
+        self.committed_persistido = self.meta.committed;
+        self.committed_persistido_em = std::time::Instant::now();
+        #[cfg(test)]
+        ESCRITAS_META.with(|c| c.set(c.get() + 1));
         Ok(())
     }
 
@@ -323,6 +359,8 @@ impl FileRaftLog {
             wal,
             entries,
             last_purged,
+            committed_persistido: meta.committed,
+            committed_persistido_em: std::time::Instant::now(),
             meta,
         };
         // R23: se o replay consumiu Truncate/Purge, o ficheiro tem lixo morto —
@@ -604,7 +642,18 @@ impl RaftLogStorage<TypeConfig> for FileRaftLog {
     ) -> Result<(), StorageError<NodeId>> {
         let mut inner = self.inner.lock().unwrap();
         inner.meta.committed = committed;
-        inner.write_meta()
+        let gravar = match (committed, inner.committed_persistido) {
+            (Some(novo), Some(gravado)) => {
+                novo.index < gravado.index
+                    || novo.index - gravado.index >= COMMITTED_PERSISTIR_A_CADA
+                    || inner.committed_persistido_em.elapsed() >= COMMITTED_PERSISTIR_APOS
+            }
+            (novo, gravado) => novo != gravado,
+        };
+        if gravar {
+            inner.write_meta()?;
+        }
+        Ok(())
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
@@ -693,6 +742,37 @@ mod tests {
     fn directory_sync_errors_are_not_suppressed() {
         let dir = tempfile::tempdir().unwrap();
         assert!(fsync_dir(&dir.path().join("missing")).is_err());
+    }
+
+    /// Auditoria 2026-10-16, O7: avanços pequenos e seguidos do commit não
+    /// reescrevem o `meta.bin` um a um; um salto de
+    /// `COMMITTED_PERSISTIR_A_CADA` entradas grava logo; e o valor mais recente
+    /// chega ao disco quando o log fecha.
+    #[tokio::test]
+    async fn committed_e_persistido_com_atraso_e_ao_fechar() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = |i: u64| entry(i, 1, "x").log_id;
+        let ultimo = 1_200u64;
+        {
+            let mut log = FileRaftLog::open(dir.path()).unwrap();
+            log.append_sync((1..=ultimo).map(|i| entry(i, 1, "x")))
+                .unwrap();
+            ESCRITAS_META.with(|c| c.set(0));
+            for i in 1..=100 {
+                log.save_committed(Some(id(i))).await.unwrap();
+            }
+            let escritas = ESCRITAS_META.with(|c| c.get());
+            assert!(escritas <= 2, "{escritas} escritas para 100 avanços");
+
+            let salto = 100 + COMMITTED_PERSISTIR_A_CADA;
+            log.save_committed(Some(id(salto))).await.unwrap();
+            let meta = FileRaftLog::load_meta(&dir.path().join("meta.bin")).unwrap();
+            assert_eq!(meta.committed, Some(id(salto)));
+
+            log.save_committed(Some(id(ultimo))).await.unwrap();
+        }
+        let mut reaberto = FileRaftLog::open(dir.path()).unwrap();
+        assert_eq!(reaberto.read_committed().await.unwrap(), Some(id(ultimo)));
     }
 
     fn entry(index: u64, term: u64, body: &str) -> Entry<TypeConfig> {
