@@ -65,3 +65,11 @@ Em preparação. Cada PR do ciclo acrescenta aqui a sua entrada.
   `RESOURCE_EXHAUSTED` (repetível) enquanto a memória estiver acima do teto;
   escritas internas e replicação nunca são recusadas. Variante nova
   `HeraclitusError::ResourceExhausted`.
+
+## Leituras
+
+- Leitura pontual num segmento RAW selado e ainda não empacotado deixa de
+  percorrer o ficheiro desde o início (auditoria 2026-10-16, O8): o seal
+  guarda os offsets que o writer já tinha, e a leitura faz um `seek`. O LSN
+  no offset é sempre conferido; sem offsets (depois de um restart, ou com
+  mais de 64 segmentos à espera de pack) recua para o percurso completo.
