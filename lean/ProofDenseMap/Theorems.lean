@@ -12,9 +12,6 @@ def IsValidMap (m : DenseEntityMap) : Prop :=
 theorem empty_is_valid : IsValidMap empty := by
   intro u idx
   simp [empty, IsValidMap]
-  -- In Lean 4, this reduces to showing that `none = some idx ↔ none = some u`, 
-  -- which is vacuously `False ↔ False`.
-  sorry
 
 -- 2. Property (is_injective): No collision.
 -- If the map is valid, no two different ULIDs can point to the same Index.
@@ -45,8 +42,9 @@ theorem bijection_integrity (m : DenseEntityMap) :
   IsValidMap m →
   ∀ u idx, m.forward u = some idx → m.backward (m.forward u).get! = some u
 := by
-  -- Follows from the invariant and Option properties.
-  sorry
+  intro valid u idx h
+  rw [h]
+  exact (valid u idx).mp h
 
 -- 5. Property: Insert maintains integrity.
 -- If we take a valid map and insert a non-existent ULID with a non-existent Index, it remains valid.
@@ -56,7 +54,19 @@ theorem insert_maintains_validity (m : DenseEntityMap) (u : ULID) (idx : Index) 
   m.backward idx = none →
   IsValidMap (insert m u idx)
 := by
-  -- Solved by splitting cases on whether the requested `u` / `idx` is the new one or an old one.
-  sorry
+  intro valid freshU freshI x j
+  have noU (i : Index) : m.backward i ≠ some u := by
+    intro h
+    have := (valid u i).mpr h
+    simp [freshU] at this
+  have noI (a : ULID) : m.forward a ≠ some idx := by
+    intro h
+    have := (valid a idx).mp h
+    simp [freshI] at this
+  by_cases hx : x = u <;> by_cases hj : j = idx
+  all_goals simp_all [insert]
+  · exact Ne.symm hj
+  · exact Ne.symm hx
+  · exact valid x j
 
 end ProofDenseMap

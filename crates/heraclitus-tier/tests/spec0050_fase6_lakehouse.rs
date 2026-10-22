@@ -37,6 +37,22 @@ use object_store::{ObjectStore, ObjectStoreExt};
 const N: u64 = 600;
 const SEGMENT_BYTES: u64 = 96 * 1024;
 
+#[tokio::test]
+async fn failed_first_segment_does_not_block_later_parquet_jobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (log, _) = banco_empacotado(dir.path());
+    let pending = log.lakehouse_pending().unwrap();
+    assert!(pending.len() > 1);
+    std::fs::write(&pending[0].packed, b"corrupt packed image").unwrap();
+    let w = worker(&dir.path().join("lakehouse"), &log);
+    let error = w.export_pending(&log).await.unwrap_err().to_string();
+    assert!(error.contains("failed segments"), "{error}");
+    let left = log.lakehouse_pending().unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].segment_id, pending[0].segment_id);
+    assert_eq!(log.manifest().exported_through_lsn, 0);
+}
+
 fn conteudo(i: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(256);
     let mut j = 0u64;

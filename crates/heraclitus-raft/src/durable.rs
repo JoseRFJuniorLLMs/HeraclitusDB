@@ -8,7 +8,8 @@
 //! durabilidade real, não por memória.
 //!
 //! Layout em disco (um diretório):
-//! - `entries.wal` — registos append-only enquadrados por `u32` de comprimento:
+//! - `entries.v2.wal` — frames HRW2 com comprimento, CRC do cabeçalho e CRC
+//!   do payload; `entries.wal` é a origem legada preservada na migração:
 //!   `Insert(Entry)`, `Truncate(index)`, `Purge(LogId)`. A cauda meia-escrita
 //!   por um crash é truncada no `open` (o último registo incompleto é descartado
 //!   — determinístico, sem corrupção silenciosa).
@@ -34,6 +35,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const BINCODE_CFG: bincode::config::Configuration = bincode::config::standard();
+const WAL_MAGIC: &[u8; 4] = b"HRW2";
+const WAL_NAME: &str = "entries.v2.wal";
+const FRAME_HEADER: usize = 12;
+const MAX_WAL_RECORD_BYTES: usize = 64 << 20;
 
 /// Um registo do WAL do raft-log.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -71,9 +76,17 @@ fn io_err(e: impl std::fmt::Display) -> openraft::AnyError {
 /// diretório e `sync_all` funciona e dá durabilidade total; no **Windows** não
 /// se pode abrir um diretório como `File` (isto vira no-op) e a durabilidade do
 /// rename fica dependente da atomicidade do NTFS + journaling de metadados.
-pub(crate) fn fsync_dir(dir: &Path) {
-    if let Ok(f) = File::open(dir) {
-        let _ = f.sync_all();
+pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        // Production durability is qualified on Unix. std cannot open a
+        // Windows directory for fsync; do not suppress errors on Unix.
+        let _ = dir;
+        Ok(())
     }
 }
 
@@ -82,9 +95,19 @@ impl Inner {
     fn encode_record(rec: &LogRecord) -> Result<Vec<u8>, StorageError<NodeId>> {
         let bytes = bincode::serde::encode_to_vec(rec, BINCODE_CFG)
             .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
-        let mut out = Vec::with_capacity(4 + bytes.len());
-        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        if bytes.len() > MAX_WAL_RECORD_BYTES {
+            return Err(StorageError::from(StorageIOError::write_logs(io_err(
+                "raft WAL record exceeds 64 MiB",
+            ))));
+        }
+        let len = u32::try_from(bytes.len())
+            .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
+        let mut out = Vec::with_capacity(FRAME_HEADER + bytes.len() + 4);
+        out.extend_from_slice(WAL_MAGIC);
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&crc32fast::hash(&out).to_le_bytes());
         out.extend_from_slice(&bytes);
+        out.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
         Ok(out)
     }
 
@@ -117,8 +140,8 @@ impl Inner {
     /// bound num cluster de vida longa). Chamado no `purge` (pós-snapshot, os
     /// vivos são poucos) e no `open` quando o replay consumiu compactações.
     fn rewrite_wal(&mut self) -> Result<(), StorageError<NodeId>> {
-        let wal_path = self.dir.join("entries.wal");
-        let tmp = self.dir.join("entries.wal.tmp");
+        let wal_path = self.dir.join(WAL_NAME);
+        let tmp = self.dir.join("entries.v2.wal.tmp");
         {
             let mut f = File::create(&tmp)
                 .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
@@ -135,7 +158,8 @@ impl Inner {
         }
         std::fs::rename(&tmp, &wal_path)
             .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
-        fsync_dir(&self.dir);
+        fsync_dir(&self.dir)
+            .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
         let mut wal = OpenOptions::new()
             .read(true)
             .write(true)
@@ -163,7 +187,8 @@ impl Inner {
         std::fs::rename(&tmp, &final_path)
             .map_err(|e| StorageError::from(StorageIOError::write_vote(io_err(e))))?;
         // Torna o rename durável — sem isto o voto podia reverter num crash.
-        fsync_dir(&self.dir);
+        fsync_dir(&self.dir)
+            .map_err(|e| StorageError::from(StorageIOError::write_vote(io_err(e))))?;
         Ok(())
     }
 
@@ -191,8 +216,21 @@ impl FileRaftLog {
         std::fs::create_dir_all(&dir)
             .map_err(|e| StorageError::from(StorageIOError::read_logs(io_err(e))))?;
 
-        let wal_path = dir.join("entries.wal");
-        let (entries, last_purged, valid_len, saw_compaction) = Self::replay(&wal_path)?;
+        let wal_path = dir.join(WAL_NAME);
+        // A separate filename is the durable format discriminator. Never
+        // interpret a damaged v2 magic as an empty legacy WAL. Migration
+        // publishes v2 atomically and retains the legacy source for recovery.
+        let migrate = match std::fs::metadata(&wal_path) {
+            Ok(_) => false,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => return Err(StorageError::from(StorageIOError::read_logs(io_err(e)))),
+        };
+        let source = if migrate {
+            dir.join("entries.wal")
+        } else {
+            wal_path.clone()
+        };
+        let (entries, last_purged, valid_len, saw_compaction) = Self::replay(&source, migrate)?;
         // Auditoria recursiva, iteração 3: validar a fronteira comprometida
         // durável ANTES de alterar o WAL. Um prefixo corrompido pode parecer
         // uma escrita final interrompida; a recuperação não pode descartar
@@ -238,6 +276,28 @@ impl FileRaftLog {
             }
         }
 
+        if migrate {
+            // Do not create the authoritative path until the entire migrated
+            // image has reached disk. A crash before rename must retry v1.
+            let tmp = dir.join("entries.v2.wal.tmp");
+            let mut f = File::create(&tmp)
+                .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
+            if let Some(p) = last_purged {
+                f.write_all(&Inner::encode_record(&LogRecord::Purge(p))?)
+                    .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
+            }
+            for entry in entries.values() {
+                f.write_all(&Inner::encode_record(&LogRecord::Insert(entry.clone()))?)
+                    .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
+            }
+            f.sync_all()
+                .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
+            drop(f);
+            std::fs::rename(&tmp, &wal_path)
+                .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
+            fsync_dir(&dir)
+                .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
+        }
         // Trunca a cauda meia-escrita (o último registo incompleto após crash).
         let wal = OpenOptions::new()
             .create(true)
@@ -246,13 +306,17 @@ impl FileRaftLog {
             .truncate(false) // preserva o conteúdo existente; truncamos a cauda torn à mão
             .open(&wal_path)
             .map_err(|e| StorageError::from(StorageIOError::read_logs(io_err(e))))?;
-        wal.set_len(valid_len)
+        if !migrate {
+            wal.set_len(valid_len)
+                .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
+        }
+        wal.sync_all()
             .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
         let mut wal = wal;
         wal.seek(SeekFrom::End(0))
             .map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
         // A entrada de diretório do WAL recém-criado tem de ser durável também.
-        fsync_dir(&dir);
+        fsync_dir(&dir).map_err(|e| StorageError::from(StorageIOError::write_logs(io_err(e))))?;
 
         let mut inner = Inner {
             dir,
@@ -263,7 +327,7 @@ impl FileRaftLog {
         };
         // R23: se o replay consumiu Truncate/Purge, o ficheiro tem lixo morto —
         // compacta já, para que reaberturas sucessivas não acumulem para sempre.
-        if saw_compaction {
+        if saw_compaction && !migrate {
             inner.rewrite_wal()?;
         }
         Ok(Self {
@@ -277,6 +341,7 @@ impl FileRaftLog {
     #[allow(clippy::type_complexity)]
     fn replay(
         wal_path: &Path,
+        legacy: bool,
     ) -> Result<
         (
             BTreeMap<u64, Entry<TypeConfig>>,
@@ -325,15 +390,34 @@ impl FileRaftLog {
             // decodificam é bit-rot/corrupção — truncar aí descartava em
             // silêncio TODAS as entradas raft comprometidas a seguir (e
             // marcadores Truncate/Purge). Falha-se alto, como no meta.bin.
-            if file_size - pos < 4 {
+            let header_len = if legacy { 4 } else { FRAME_HEADER };
+            if file_size - pos < header_len as u64 {
                 break; // EOF limpo, ou prefixo de comprimento torn (< 4 bytes)
             }
-            let mut len_buf = [0u8; 4];
+            let mut header = vec![0u8; header_len];
             reader
-                .read_exact(&mut len_buf)
+                .read_exact(&mut header)
                 .map_err(|e| StorageError::from(StorageIOError::read_logs(io_err(e))))?;
-            let len = u32::from_le_bytes(len_buf) as usize;
-            if (len as u64) > file_size - pos - 4 {
+            let len = if legacy {
+                u32::from_le_bytes(header[..4].try_into().unwrap()) as usize
+            } else {
+                if &header[..4] != WAL_MAGIC
+                    || crc32fast::hash(&header[..8])
+                        != u32::from_le_bytes(header[8..12].try_into().unwrap())
+                {
+                    return Err(StorageError::from(StorageIOError::read_logs(io_err(
+                        format!("WAL raft header checksum mismatch at {pos}; refusing to truncate"),
+                    ))));
+                }
+                u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize
+            };
+            let trailer_len = if legacy { 0 } else { 4 };
+            if len > MAX_WAL_RECORD_BYTES {
+                return Err(StorageError::from(StorageIOError::read_logs(io_err(
+                    "raft WAL record exceeds 64 MiB; refusing to allocate or truncate",
+                ))));
+            }
+            if len as u64 + trailer_len > file_size - pos - header_len as u64 {
                 break; // registo declarado além do EOF — cauda torn genuína
             }
             // Alocação LIMITADA pelos bytes que restam no ficheiro (nunca pelo
@@ -342,8 +426,26 @@ impl FileRaftLog {
             reader
                 .read_exact(&mut payload)
                 .map_err(|e| StorageError::from(StorageIOError::read_logs(io_err(e))))?;
+            if !legacy {
+                let mut crc = [0; 4];
+                reader
+                    .read_exact(&mut crc)
+                    .map_err(|e| StorageError::from(StorageIOError::read_logs(io_err(e))))?;
+                if crc32fast::hash(&payload) != u32::from_le_bytes(crc) {
+                    return Err(StorageError::from(StorageIOError::read_logs(io_err(
+                        format!(
+                            "WAL raft payload checksum mismatch at {pos}; refusing to truncate"
+                        ),
+                    ))));
+                }
+            }
             let rec: LogRecord = match bincode::serde::decode_from_slice(&payload, BINCODE_CFG) {
-                Ok((r, _)) => r,
+                Ok((r, used)) if used == payload.len() => r,
+                Ok(_) => {
+                    return Err(StorageError::from(StorageIOError::read_logs(io_err(
+                        format!("WAL raft trailing payload bytes at {pos}"),
+                    ))))
+                }
                 Err(e) => {
                     // Payload completo que não decodifica = corrupção a meio do
                     // WAL. Recusar arrancar (o operador limpa o dir e o nó
@@ -382,7 +484,7 @@ impl FileRaftLog {
                     last_purged = Some(log_id);
                 }
             }
-            pos += 4 + len as u64;
+            pos += header_len as u64 + len as u64 + trailer_len;
             valid_len = pos;
         }
         Ok((entries, last_purged, valid_len, saw_compaction))
@@ -549,6 +651,50 @@ mod tests {
     use heraclitus_core::{Episode, EventKind};
     use openraft::{CommittedLeaderId, EntryPayload};
 
+    #[test]
+    fn decodable_payload_bitflip_and_length_corruption_preserve_wal() {
+        for at in [FRAME_HEADER + 1, 4, 8] {
+            let dir = tempfile::tempdir().unwrap();
+            let log = FileRaftLog::open(dir.path()).unwrap();
+            log.append_sync([entry(1, 1, "body"), entry(2, 1, "later")])
+                .unwrap();
+            drop(log);
+            let path = dir.path().join(WAL_NAME);
+            let mut bytes = std::fs::read(&path).unwrap();
+            bytes[at] ^= 1;
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(FileRaftLog::open(dir.path()).is_err(), "offset {at}");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn legacy_wal_migration_is_persistent_and_keeps_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("entries.wal");
+        let mut bytes = Vec::new();
+        for e in [entry(1, 1, "old"), entry(2, 1, "old-2")] {
+            let payload = bincode::serde::encode_to_vec(LogRecord::Insert(e), BINCODE_CFG).unwrap();
+            bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&payload);
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        let log = FileRaftLog::open(dir.path()).unwrap();
+        assert_eq!(log.inner.lock().unwrap().entries.len(), 2);
+        log.append_sync([entry(3, 1, "new")]).unwrap();
+        drop(log);
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        let log = FileRaftLog::open(dir.path()).unwrap();
+        assert_eq!(log.inner.lock().unwrap().entries.len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_sync_errors_are_not_suppressed() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(fsync_dir(&dir.path().join("missing")).is_err());
+    }
+
     fn entry(index: u64, term: u64, body: &str) -> Entry<TypeConfig> {
         Entry {
             log_id: LogId::new(CommittedLeaderId::new(term, 0), index),
@@ -657,10 +803,10 @@ mod tests {
         {
             let mut f = OpenOptions::new()
                 .append(true)
-                .open(dir.path().join("entries.wal"))
+                .open(dir.path().join(WAL_NAME))
                 .unwrap();
-            f.write_all(&(999u32).to_le_bytes()).unwrap();
-            f.write_all(&[1, 2, 3]).unwrap();
+            let frame = Inner::encode_record(&LogRecord::Insert(entry(3, 1, "c"))).unwrap();
+            f.write_all(&frame[..frame.len() / 2]).unwrap();
             f.sync_all().unwrap();
         }
         // O open descarta a cauda torn e recupera exatamente os 2 registos bons.
@@ -702,7 +848,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let path = dir.path().join("entries.wal");
+        let path = dir.path().join(WAL_NAME);
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[..4].copy_from_slice(&u32::MAX.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
@@ -739,7 +885,7 @@ mod tests {
                 .unwrap();
         }
         // Simula perda de prefixo sem ter havido purge: reescreve o WAL apenas com os registos 2 e 3
-        let wal_path = dir.path().join("entries.wal");
+        let wal_path = dir.path().join(WAL_NAME);
         let mut truncated_wal = std::fs::File::create(&wal_path).unwrap();
         use std::io::Write;
         for entry in [entry(2, 1, "b"), entry(3, 1, "c")] {
@@ -760,7 +906,7 @@ mod tests {
             let log = FileRaftLog::open(dir.path()).unwrap();
             log.append_sync(vec![entry(1, 1, "a")]).unwrap();
         }
-        let path = dir.path().join("entries.wal");
+        let path = dir.path().join(WAL_NAME);
         let mut bytes = std::fs::read(&path).unwrap();
         bytes.extend_from_slice(&[1, 2, 3]);
         std::fs::write(&path, &bytes).unwrap();
@@ -784,7 +930,7 @@ mod tests {
             )
             .await;
         }
-        let wal_path = dir.path().join("entries.wal");
+        let wal_path = dir.path().join(WAL_NAME);
         let before = std::fs::metadata(&wal_path).unwrap().len();
         // Corrompe o discriminante do enum do 1.º registo (primeiro byte do
         // payload, offset 4): o payload continua COMPLETO (len intacto) mas o

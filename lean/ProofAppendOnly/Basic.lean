@@ -1,8 +1,7 @@
 namespace ProofAppendOnly
 
 /-- LSN (Log Sequence Number) represented as a Natural number for simplicity in proofs. -/
-def LSN := Nat
-deriving Repr, DecidableEq, Inhabited
+abbrev LSN := Nat
 
 /-- An event in the Append-Only Log. -/
 structure Event where
@@ -19,6 +18,6 @@ deriving Repr, DecidableEq
 /-- The state of the database after replaying a log.
     For simplicity, we model the state as the sum of all hashes,
     representing a deterministic deterministic reduction over the log. -/
-def State := Nat
+abbrev State := Nat
 
 end ProofAppendOnly

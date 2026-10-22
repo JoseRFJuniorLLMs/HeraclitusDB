@@ -42,6 +42,7 @@ tokio-stream = { workspace = true, features = ["net"], optional = true }
 tonic = { workspace = true, optional = true }
 bincode = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
+crc32fast = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -304,7 +304,7 @@ impl BlockSource for MemorySource {
 
 /// Ficheiro local com leituras posicionais — o análogo do `GET` por intervalo.
 pub struct FileSource {
-    file: File,
+    file: std::sync::Mutex<File>,
     len: u64,
 }
 
@@ -312,7 +312,10 @@ impl FileSource {
     pub fn open(path: &Path) -> V6Result<Self> {
         let file = File::open(path)?;
         let len = file.metadata()?.len();
-        Ok(Self { file, len })
+        Ok(Self {
+            file: std::sync::Mutex::new(file),
+            len,
+        })
     }
 }
 
@@ -325,9 +328,12 @@ impl BlockSource for FileSource {
             return Err(corrupt("hrkl v6 source", "range past end of segment"));
         }
         let mut buf = vec![0u8; len];
-        // `&File` implementa `Read`+`Seek`, o que evita `&mut self` e permite
-        // leituras concorrentes a partir de um leitor partilhado.
-        let mut f = &self.file;
+        // Seek and read must be one critical section. &File shares the file
+        // cursor, so interleaving the two corrupts concurrent range reads.
+        let mut f = self
+            .file
+            .lock()
+            .map_err(|_| corrupt("hrkl v6 source", "file cursor lock poisoned"))?;
         f.seek(SeekFrom::Start(offset))?;
         f.read_exact(&mut buf)?;
         Ok(buf)

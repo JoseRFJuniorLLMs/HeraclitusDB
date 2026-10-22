@@ -247,7 +247,7 @@ pub struct Engine {
     hvm_lock: Mutex<()>,
     /// Estado H-VM dobrado até ao cursor (próximo LSN por ver). Ver
     /// [`Engine::hvm_state`].
-    hvm_cache: Mutex<Option<(Lsn, VmState)>>,
+    hvm_cache: Mutex<Option<(Lsn, Arc<VmState>)>>,
     /// Ponto de consistência para o checkpoint: nenhum append pode estar EM VOO
     /// (já no log, ainda por indexar) quando um snapshot é tirado.
     ///
@@ -1114,12 +1114,25 @@ impl Engine {
     /// se decifrar), rebuild e demote invalidam a cache e o próximo pedido
     /// faz o replay integral, que é a definição.
     pub fn hvm_state(&self) -> Result<VmState, HeraclitusError> {
+        Ok((*self.hvm_state_shared()?).clone())
+    }
+
+    /// Read-only callers share a stable snapshot; unchanged ledgers allocate
+    /// nothing. An update copies only if an older reader still owns the Arc.
+    pub fn hvm_state_shared(&self) -> Result<Arc<VmState>, HeraclitusError> {
         let vm = ConsistencyVirtualMachine::new(VmVersion(1));
         let mut cache = self.hvm_cache.lock().unwrap();
+        if let Some((cursor, state)) = cache.as_ref() {
+            if *cursor == self.log.head() {
+                return Ok(Arc::clone(state));
+            }
+        }
         let (from, state) = cache.take().unwrap_or_default();
         // Um erro deixa a cache vazia: o próximo pedido refaz tudo do zero.
-        let (state, next) = vm_bridge::replay_vm_from(&self.log, &vm, state, from)?;
-        *cache = Some((next, state.clone()));
+        let (state, next) =
+            vm_bridge::replay_vm_from(&self.log, &vm, Arc::unwrap_or_clone(state), from)?;
+        let state = Arc::new(state);
+        *cache = Some((next, Arc::clone(&state)));
         Ok(state)
     }
 
@@ -1222,12 +1235,18 @@ impl Engine {
     /// local (default). As credenciais de nuvem vêm do ambiente.
     #[cfg(feature = "tier")]
     fn open_cold_tier(&self) -> Result<heraclitus_tier::ColdTier, HeraclitusError> {
-        heraclitus_tier::ColdTier::open_location(&self.cold_tier_path.to_string_lossy())
+        Ok(
+            heraclitus_tier::ColdTier::open_location(&self.cold_tier_path.to_string_lossy())?
+                .with_keystore(self.keystore.clone()),
+        )
     }
 
     #[cfg(feature = "tier")]
     fn open_cold_tier_v6(&self) -> Result<heraclitus_tier::ColdTierV6, HeraclitusError> {
-        heraclitus_tier::ColdTierV6::open_location(&self.cold_tier_path.to_string_lossy())
+        Ok(
+            heraclitus_tier::ColdTierV6::open_location(&self.cold_tier_path.to_string_lossy())?
+                .with_keystore(self.keystore.clone()),
+        )
     }
 
     /// Ids dos segmentos selados — candidatos a demote para o cold tier.
@@ -1519,9 +1538,7 @@ impl Engine {
             }
             heraclitus_tier::AnyDemotionReceipt::V2(v2) => {
                 let cold = self.open_cold_tier_v6()?;
-                let (events, stats) = cold
-                    .recall_lsn_range(&v2.key()?, v2.first_lsn, v2.last_lsn)
-                    .await?;
+                let (events, stats) = cold.recall_receipt(&v2).await?;
                 self.cold_range_reads
                     .fetch_add(stats.requests, std::sync::atomic::Ordering::Relaxed);
                 self.cold_bytes_downloaded
@@ -2969,19 +2986,23 @@ impl Engine {
 
         // EventId/ts_hlc são gerados pelo destino e não participam do hash: um
         // retry legítimo cria um Episode novo antes de chegar aqui.
-        let canonical = serde_json::to_vec(&(
-            &episode.agent_id,
-            &episode.session_id,
-            &episode.kind,
-            &episode.content,
-            &episode.embedding,
-            &episode.attrs,
-            &episode.valid_from,
-            &episode.valid_to,
-            &episode.parents,
-        ))
+        let mut canonical = blake3::Hasher::new();
+        serde_json::to_writer(
+            &mut canonical,
+            &(
+                &episode.agent_id,
+                &episode.session_id,
+                &episode.kind,
+                &episode.content,
+                &episode.embedding,
+                &episode.attrs,
+                &episode.valid_from,
+                &episode.valid_to,
+                &episode.parents,
+            ),
+        )
         .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
-        let payload_hash = blake3::hash(&canonical).to_hex().to_string();
+        let payload_hash = canonical.finalize().to_hex().to_string();
 
         let _guard = self.idempotency_shard(key).lock().unwrap();
         // `.read()` e não `.write()`: `lookup` é `&self`. Tomar o lock de
@@ -3002,18 +3023,22 @@ impl Engine {
                     context: "idempotency index".into(),
                     detail: format!("LSN {lsn} ausente para a chave {key}"),
                 })?;
-            let legacy = serde_json::to_vec(&(
-                &episode.agent_id,
-                &episode.session_id,
-                &episode.kind,
-                &episode.content,
-                &episode.embedding,
-                &episode.attrs,
-                &episode.valid_from,
-                &episode.valid_to,
-            ))
+            let mut legacy = blake3::Hasher::new();
+            serde_json::to_writer(
+                &mut legacy,
+                &(
+                    &episode.agent_id,
+                    &episode.session_id,
+                    &episode.kind,
+                    &episode.content,
+                    &episode.embedding,
+                    &episode.attrs,
+                    &episode.valid_from,
+                    &episode.valid_to,
+                ),
+            )
             .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
-            let legacy_hash = blake3::hash(&legacy).to_hex().to_string();
+            let legacy_hash = legacy.finalize().to_hex().to_string();
             if existing.parents == episode.parents
                 && (existing.attrs.get(IDEMPOTENCY_HASH_ATTR) == Some(&payload_hash)
                     || existing.attrs.get(IDEMPOTENCY_HASH_ATTR) == Some(&legacy_hash))
@@ -3791,6 +3816,26 @@ impl QueryBackend for Engine {
     fn read_lsn(&self, lsn: Lsn) -> Result<Option<(Lsn, Episode)>, HeraclitusError> {
         // O(1) via o índice de offset por-LSN do log (seek directo).
         self.log.read(lsn)
+    }
+
+    /// Os vetores do HNSW são o embedding que a view recebeu de cada episódio,
+    /// sem projecção (`VectorIndex::apply`). O que não passa pela view — frames
+    /// H-VM, `AgentEvidence`, um `EventId` repetido, um append ainda entre o
+    /// log e as views — simplesmente falta na lista, e o planner lê-o do log.
+    /// Em LOG_ONLY as views não recebem nada: a lista seria toda buracos.
+    fn resident_vector_keys(
+        &self,
+        from: Lsn,
+        to: Lsn,
+        key: &dyn Fn(&ProductPoint) -> Option<f64>,
+    ) -> Result<Option<heraclitus_query::backend::ResidentVectorKeys>, HeraclitusError> {
+        if self.log_only {
+            return Ok(None);
+        }
+        let idx = self.vector.read().unwrap();
+        let mut out = Vec::with_capacity(idx.len().min(to.saturating_sub(from) as usize));
+        idx.for_each_point_in(from, to, |lsn, ponto| out.push((lsn, key(ponto))));
+        Ok(Some(out))
     }
 
     /// Range numérico (C1.6): resolvido pelo BTreeMap ordenado do índice de
@@ -6644,6 +6689,103 @@ mod tests {
             "RECALL leu {gastas} vezes para {} linhas (era 2x + 1)",
             linhas.len()
         );
+    }
+
+    /// Soak nightly de 20/10/2026: `ORDER BY DIST_HYP(...) ASC LIMIT k` sai dos
+    /// vetores residentes do HNSW em vez de descodificar o log inteiro. Contra
+    /// um oraculo calculado a mao sobre o log, com o mais proximo de todos num
+    /// `AgentEvidence`, que nunca passa pelas views.
+    #[test]
+    fn order_by_dist_hyp_sai_dos_vetores_residentes_e_ve_o_que_falta_no_indice() {
+        for formato in [
+            heraclitus_core::StorageFormat::Legacy,
+            HeraclitusConfig::default().storage_format,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = HeraclitusConfig {
+                data_dir: dir.path().to_path_buf(),
+                fsync: FsyncPolicy::Always,
+                storage_format: formato,
+                ..Default::default()
+            };
+            let engine = Engine::open(&cfg).unwrap();
+            for i in 0..300u32 {
+                let mut e =
+                    Episode::new("ag", EventKind::Observation, format!("e{i}").into_bytes());
+                if i % 11 != 0 {
+                    e.embedding = Some(heraclitus_core::ProductPoint {
+                        hyp: vec![(i % 17) as f32 / 100.0, (i % 5) as f32 / 100.0],
+                        sph: vec![],
+                        euc: vec![],
+                    });
+                }
+                engine.append(e).unwrap();
+            }
+            // Fora da grelha das observacoes (multiplos de 0,01): nenhuma pode
+            // empatar a distancia 0 com a evidencia e ganhar pelo LSN menor.
+            let mut evidencia = Episode::new(
+                "ag",
+                EventKind::Custom("AgentEvidence".into()),
+                b"evidencia".to_vec(),
+            );
+            evidencia.embedding = Some(heraclitus_core::ProductPoint {
+                hyp: vec![0.055, 0.025],
+                sph: vec![],
+                euc: vec![],
+            });
+            let lsn_evidencia = engine.append(evidencia).unwrap();
+
+            // O indice nao tem o AgentEvidence nem os episodios sem embedding.
+            let residentes = engine
+                .resident_vector_keys(0, engine.head(), &|_| Some(0.0))
+                .unwrap()
+                .unwrap();
+            assert_eq!(residentes.len(), 300 - 28, "{formato:?}");
+            assert!(residentes.iter().all(|(l, _)| *l != lsn_evidencia));
+
+            // ORACULO: a mesma distancia do planner, sobre todos os episodios
+            // do log, ordenada por (distancia, LSN), sem embedding no fim.
+            let q = [0.055f32, 0.025];
+            let k1 = ProductMetric::default().sig.k1;
+            let mut todas: Vec<(f64, Lsn)> = engine
+                .log
+                .scan_capped(0, engine.head(), usize::MAX)
+                .unwrap()
+                .into_iter()
+                .map(|(l, e)| {
+                    let d = e
+                        .embedding
+                        .as_ref()
+                        .filter(|p| p.hyp.len() == q.len())
+                        .map(|p| heraclitus_manifold::dist_hyp(&q, &p.hyp, -k1))
+                        .unwrap_or(f64::INFINITY);
+                    (d, l)
+                })
+                .collect();
+            todas.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            let esperado: Vec<u64> = todas.iter().take(5).map(|(_, l)| *l).collect();
+            assert_eq!(esperado[0], lsn_evidencia, "montagem: o mais proximo");
+
+            let antes = engine.log.leituras_efectuadas();
+            let v = heraclitus_query::execute(
+                "MATCH (n) RETURN n ORDER BY DIST_HYP([0.055, 0.025]) ASC LIMIT 5",
+                &engine,
+            )
+            .unwrap();
+            let obtido: Vec<u64> = v
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["lsn"].as_u64().unwrap())
+                .collect();
+            assert_eq!(obtido, esperado, "{formato:?}");
+
+            // O varrimento antigo nao faz leituras pontuais; o atalho faz
+            // exactamente uma por linha devolvida.
+            if let (Some(antes), Some(depois)) = (antes, engine.log.leituras_efectuadas()) {
+                assert_eq!(depois - antes, 5, "{formato:?}");
+            }
+        }
     }
 
     /// A guarda ao nivel do backend, sem passar pelo planner: um campo que o

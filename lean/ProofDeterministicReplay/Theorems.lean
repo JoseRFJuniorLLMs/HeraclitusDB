@@ -18,10 +18,13 @@ theorem replay_is_pure (s : State) (l : Log) :
 theorem parallel_equals_sequential (s : State) (log_left log_right : Log) :
   replay_sequential s (log_left ++ log_right) = replay_parallel s log_left log_right
 := by
-  -- We admit the formal proof which would require induction on `log_right`.
-  -- The core of the proof utilizes the `merge_associative` and `apply_is_merge`
-  -- axioms to show that folding linearly over an append is homomorphic to 
-  -- folding over the chunks and then merging the result.
-  sorry
+  have shift (l : Log) (a b : State) :
+      replay_sequential (a + b) l = a + replay_sequential b l := by
+    induction l generalizing a b with
+    | nil => rfl
+    | cons e es ih =>
+      simpa [replay_sequential, apply_event, Nat.add_assoc] using ih a (b + e)
+  simpa [replay_sequential, replay_parallel, List.foldl_append, merge_states, empty_state]
+    using shift log_right (replay_sequential s log_left) 0
 
 end ProofDeterministicReplay

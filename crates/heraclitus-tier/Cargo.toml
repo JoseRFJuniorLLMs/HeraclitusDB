@@ -9,6 +9,7 @@ description = "Cold tiering to object storage with cryptographic demotion receip
 [dependencies]
 heraclitus-core = { workspace = true }
 heraclitus-log = { workspace = true }
+heraclitus-crypto = { workspace = true }
 object_store = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }

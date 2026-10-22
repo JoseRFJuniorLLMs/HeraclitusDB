@@ -183,21 +183,34 @@ pub fn seal_record(key: &[u8; 32], plaintext: &[u8], ctx: &RecordContext<'_>) ->
     seal_with_magic(key, ENC_MAGIC_V2, plaintext, &ctx.aad())
 }
 
-/// Abre um envelope de qualquer versão, escolhendo a AAD pelo magic: v2
-/// autentica `ctx`; v1 (legado) autentica `legacy_aad`, a AAD com que a
-/// geração antiga selava aquele blob. Devolve `None` se o blob não for um
+/// Abre um envelope v2 autenticando `ctx`. Dados v1 exigem a política
+/// persistida de [`KeyStore::open_record`]; o magic sozinho não concede
+/// permissão de compatibilidade. Devolve `None` se o blob não for um
 /// envelope, a chave estiver errada, ou a tag falhar (adulteração, corrupção,
 /// ou blob v2 de outro evento/finalidade).
 pub fn open_record(
     key: &[u8; 32],
     blob: &[u8],
     ctx: &RecordContext<'_>,
-    legacy_aad: &[u8],
+    _legacy_aad: &[u8],
 ) -> Option<Vec<u8>> {
     match sealed_version(blob)? {
-        SealVersion::V1 => open_body(key, blob, legacy_aad),
+        SealVersion::V1 => None,
         SealVersion::V2 => open_body(key, blob, &ctx.aad()),
     }
+}
+
+/// Explicit compatibility primitive for importing trusted legacy data. Normal
+/// readers must use KeyStore::open_record, which checks the frozen inventory.
+pub fn open_legacy_record_for_migration(
+    key: &[u8; 32],
+    blob: &[u8],
+    aad: &[u8],
+) -> Option<Vec<u8>> {
+    if sealed_version(blob)? != SealVersion::V1 {
+        return None;
+    }
+    open_body(key, blob, aad)
 }
 
 /// Sela no envelope **v1 legado** (`HRKLENC1`) com a AAD crua dada.
@@ -209,11 +222,26 @@ pub fn seal_v1(key: &[u8; 32], plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
     seal_with_magic(key, ENC_MAGIC, plaintext, aad)
 }
 
+/// A permitted legacy blob is bound to its original event and purpose.
+pub fn legacy_record_binding(blob: &[u8], ctx: &RecordContext<'_>) -> Option<[u8; 32]> {
+    if sealed_version(blob)? != SealVersion::V1 {
+        return None;
+    }
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"heraclitus-legacy-binding-v1\0");
+    hash.update(&ctx.aad());
+    hash.update(blob);
+    Some(*hash.finalize().as_bytes())
+}
+
 /// Per-agent key store. One key file per agent so a single agent can be
 /// crypto-shredded by destroying exactly one file.
 pub struct KeyStore {
     dir: PathBuf,
     cache: DashMap<String, [u8; 32]>,
+    /// Exact legacy bindings imported once from the verified log. Absence
+    /// means migration has not run, never permission to accept arbitrary v1.
+    legacy_bindings: RwLock<Option<Vec<[u8; 32]>>>,
     /// Ordena o `shred` (escrita) contra `get`/`get_or_create` (leitura).
     ///
     /// A DashMap protege cada ENTRADA, nao a SEQUENCIA. O shred faz
@@ -287,19 +315,120 @@ impl KeyStore {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
         restrict_dir_perms(&dir)?;
+        let legacy_bindings = match std::fs::read(dir.join("legacy-bindings.v1")) {
+            Ok(bytes) => {
+                if bytes.len() < 40
+                    || &bytes[..8] != b"HRKLB001"
+                    || (bytes.len() - 40) % 32 != 0
+                    || blake3::hash(&bytes[..bytes.len() - 32]).as_bytes()
+                        != &bytes[bytes.len() - 32..]
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid legacy encryption policy",
+                    ));
+                }
+                let bindings: Vec<[u8; 32]> = bytes[8..bytes.len() - 32]
+                    .chunks_exact(32)
+                    .map(|b| b.try_into().unwrap())
+                    .collect();
+                if bindings.windows(2).any(|w| w[0] >= w[1]) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unsorted legacy encryption policy",
+                    ));
+                }
+                Some(bindings)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
         Ok(Arc::new(Self {
             dir,
             cache: DashMap::new(),
+            legacy_bindings: RwLock::new(legacy_bindings),
             guarda: RwLock::new(()),
             #[cfg(test)]
             ponto_shred: std::sync::Mutex::new(None),
         }))
     }
 
+    pub fn legacy_policy_initialized(&self) -> bool {
+        self.legacy_bindings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    /// Freeze the exact v1 blobs and event contexts present at upgrade. A
+    /// copied v1 ciphertext cannot acquire permission at a different event,
+    /// purpose or agent, even when it authenticates under the old agent AAD.
+    /// This inventory must come from a verified pre-upgrade log, before writes.
+    pub fn initialize_legacy_policy(&self, mut bindings: Vec<[u8; 32]>) -> io::Result<()> {
+        use std::io::Write;
+        let mut policy = self
+            .legacy_bindings
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if policy.is_some() {
+            return Ok(());
+        }
+        bindings.sort_unstable();
+        bindings.dedup();
+        let tmp = self.dir.join("legacy-bindings.v1.tmp");
+        let mut file = std::fs::File::create(&tmp)?;
+        restrict_file_perms(&tmp)?;
+        let mut digest = blake3::Hasher::new();
+        file.write_all(b"HRKLB001")?;
+        digest.update(b"HRKLB001");
+        for binding in &bindings {
+            file.write_all(binding)?;
+            digest.update(binding);
+        }
+        file.write_all(digest.finalize().as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(tmp, self.dir.join("legacy-bindings.v1"))?;
+        sync_dir(&self.dir)?;
+        *policy = Some(bindings);
+        Ok(())
+    }
+
+    pub fn open_record(
+        &self,
+        key: &[u8; 32],
+        blob: &[u8],
+        ctx: &RecordContext<'_>,
+        legacy_aad: &[u8],
+    ) -> Option<Vec<u8>> {
+        if sealed_version(blob)? == SealVersion::V1 {
+            let fingerprint = legacy_record_binding(blob, ctx)?;
+            let policy = self
+                .legacy_bindings
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if policy.as_ref()?.binary_search(&fingerprint).is_err() {
+                return None;
+            }
+            return open_legacy_record_for_migration(key, blob, legacy_aad);
+        }
+        open_record(key, blob, ctx, legacy_aad)
+    }
+
+    fn file_stem(agent_id: &str, max_legacy_bytes: usize) -> String {
+        // Preserve every legacy filename that could hold both the key and
+        // its .shredded marker (255-byte component limit). Hash longer IDs
+        // into a separate, non-hex namespace; never truncate an identity.
+        if agent_id.len() <= max_legacy_bytes {
+            agent_id.bytes().map(|b| format!("{b:02x}")).collect()
+        } else {
+            format!("h-{}", blake3::hash(agent_id.as_bytes()).to_hex())
+        }
+    }
+
     fn key_path(&self, agent_id: &str) -> PathBuf {
-        // hex-encode the agent_id so the filename is always filesystem-safe.
-        let hex: String = agent_id.bytes().map(|b| format!("{b:02x}")).collect();
-        self.dir.join(format!("{hex}.key"))
+        self.dir
+            .join(format!("{}.key", Self::file_stem(agent_id, 125)))
     }
 
     /// Marca persistente de "este agente já foi crypto-shredded".
@@ -307,8 +436,8 @@ impl KeyStore {
     /// Extensão diferente de `.key` de propósito: o `agent_count` conta só
     /// chaves vivas e a marca nunca pode ser lida como chave.
     fn shred_marker_path(&self, agent_id: &str) -> PathBuf {
-        let hex: String = agent_id.bytes().map(|b| format!("{b:02x}")).collect();
-        self.dir.join(format!("{hex}.shredded"))
+        self.dir
+            .join(format!("{}.shredded", Self::file_stem(agent_id, 123)))
     }
 
     /// `true` se alguma chave deste agente já foi destruída por [`Self::shred`].
@@ -622,6 +751,56 @@ impl KeyStore {
 mod tests {
     use super::*;
 
+    #[test]
+    fn long_unicode_ids_and_legacy_boundary_keys_survive_reopen_and_shred() {
+        let dir = tempfile::tempdir().unwrap();
+        let ids = [
+            "x".repeat(123),
+            "x".repeat(124),
+            "x".repeat(125),
+            "x".repeat(130),
+            "α/🚀".repeat(100),
+        ];
+        let ks = KeyStore::open(dir.path()).unwrap();
+        let keys: Vec<_> = ids.iter().map(|id| ks.get_or_create(id).unwrap()).collect();
+        assert_eq!(ks.key_path("ana").file_name().unwrap(), "616e61.key");
+        drop(ks);
+        let ks = KeyStore::open(dir.path()).unwrap();
+        for (id, key) in ids.iter().zip(keys) {
+            assert_eq!(ks.try_get(id).unwrap(), Some(key));
+            assert!(ks.shred(id).unwrap());
+            assert!(ks.was_shredded(id));
+            assert_eq!(ks.try_get(id).unwrap(), None);
+            assert_ne!(ks.get_or_create(id).unwrap(), key);
+        }
+    }
+
+    #[test]
+    fn persisted_legacy_policy_rejects_v1_substitution_into_v2() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = KeyStore::open(dir.path()).unwrap();
+        let key = ks.get_or_create("eva").unwrap();
+        let old = ctx("eva", 1, b"content");
+        let new = ctx("eva", 2, b"content");
+        let blob = seal_v1(&key, b"old", b"eva");
+        assert!(ks.open_record(&key, &blob, &old, b"eva").is_none());
+        ks.initialize_legacy_policy(vec![legacy_record_binding(&blob, &old).unwrap()])
+            .unwrap();
+        drop(ks);
+        let ks = KeyStore::open(dir.path()).unwrap();
+        assert_eq!(ks.open_record(&key, &blob, &old, b"eva").unwrap(), b"old");
+        assert!(ks.open_record(&key, &blob, &new, b"eva").is_none());
+        assert!(ks
+            .open_record(&key, &blob, &ctx("eva", 1, b"fields"), b"eva")
+            .is_none());
+        let v2 = seal_record(&key, b"new", &new);
+        assert_eq!(ks.open_record(&key, &v2, &new, b"eva").unwrap(), b"new");
+        // Subsequent opens/import attempts cannot extend the frozen inventory.
+        ks.initialize_legacy_policy(vec![legacy_record_binding(&blob, &new).unwrap()])
+            .unwrap();
+        assert!(ks.open_record(&key, &blob, &new, b"eva").is_none());
+    }
+
     fn ctx<'a>(agent_id: &'a str, event: u8, purpose: &'a [u8]) -> RecordContext<'a> {
         RecordContext {
             agent_id,
@@ -679,7 +858,11 @@ mod tests {
 
         // Contraprova do defeito antigo: em v1 a troca passava.
         let v1_a = seal_v1(&key, b"evento A", b"eva");
-        assert_eq!(open_record(&key, &v1_a, &b, b"eva").unwrap(), b"evento A");
+        assert!(open_record(&key, &v1_a, &b, b"eva").is_none());
+        assert_eq!(
+            open_legacy_record_for_migration(&key, &v1_a, b"eva").unwrap(),
+            b"evento A"
+        );
     }
 
     /// Reescrever o magic `HRKLENC2` -> `HRKLENC1` não abre a porta da AAD
@@ -724,9 +907,10 @@ mod tests {
         // O contexto v2 é irrelevante para um blob v1; só a AAD legada conta.
         let c = ctx("eva", 0xEE, b"content");
         assert_eq!(
-            open_record(&key, &blob, &c, b"eva").unwrap(),
+            open_legacy_record_for_migration(&key, &blob, b"eva").unwrap(),
             b"dados legados v1"
         );
+        assert!(open_record(&key, &blob, &c, b"eva").is_none());
         assert!(open_record(&key, &blob, &c, b"outro").is_none());
         // O vector é exactamente o que a geração v1 escrevia.
         assert_eq!(
