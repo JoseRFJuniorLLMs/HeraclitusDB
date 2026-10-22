@@ -6,9 +6,11 @@
 //! of the formula — no background job. Spec + error bound: docs/ACTIVATION.md.
 
 use arrayvec::ArrayVec;
-use dashmap::DashMap;
 use heraclitus_core::{Episode, EventId, Lsn};
 use heraclitus_views::View;
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, BinaryHeap, HashMap};
+use std::sync::RwLock;
 
 pub const RECENT_K: usize = 8;
 
@@ -138,12 +140,124 @@ impl ActivationRecord {
     }
 }
 
-/// Store: event id -> activation record. Hot-set in a concurrent map.
+/// Store: event id -> activation record, mais o índice que deixa o `top_k`
+/// parar cedo.
 #[derive(Default)]
 pub struct ActivationStore {
-    records: DashMap<EventId, ActivationRecord>,
+    /// Um só lock para o mapa e para o índice: o `touch` tem de mover o
+    /// registo no índice na mesma secção crítica em que o altera, e o `top_k`
+    /// lê os dois. Com o `DashMap` de antes mais um mutex para o índice, as
+    /// duas operações tomavam os locks por ordens opostas (deadlock). As
+    /// escritas já chegam serializadas pelo mutex das views do `Engine`.
+    registos: RwLock<Registos>,
     decay: f64,
     watermark: Lsn,
+}
+
+#[derive(Default)]
+struct Registos {
+    mapa: HashMap<EventId, ActivationRecord>,
+    /// `faixas[b]`: os registos com `n` em `[2^b, 2^(b+1))`, do acesso mais
+    /// recente para o mais antigo (ver [`ActivationRecord::limite`]).
+    faixas: Vec<BTreeSet<(Reverse<u64>, EventId)>>,
+}
+
+impl Registos {
+    fn indexar(&mut self, id: EventId, chave: (usize, u64)) {
+        let (faixa, t_ref) = chave;
+        if self.faixas.len() <= faixa {
+            self.faixas.resize_with(faixa + 1, BTreeSet::new);
+        }
+        self.faixas[faixa].insert((Reverse(t_ref), id));
+    }
+
+    fn desindexar(&mut self, id: EventId, chave: (usize, u64)) {
+        let (faixa, t_ref) = chave;
+        if let Some(conjunto) = self.faixas.get_mut(faixa) {
+            conjunto.remove(&(Reverse(t_ref), id));
+        }
+    }
+}
+
+impl ActivationRecord {
+    /// O instante mais recente que conta para o score: o último acesso
+    /// retido ou o primeiro de todos, o que for maior (os instantes podem
+    /// chegar fora de ordem).
+    fn t_ref(&self) -> u64 {
+        self.recent
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(self.first_access)
+            .max(self.first_access)
+    }
+
+    /// Onde o registo vive no índice do `top_k`: a faixa de `n` e o `t_ref`.
+    fn chave_de_indice(&self) -> (usize, u64) {
+        let faixa = if self.n == 0 {
+            0
+        } else {
+            63 - self.n.leading_zeros() as usize
+        };
+        (faixa, self.t_ref())
+    }
+
+    /// Limite superior do `score` em `now_secs` para QUALQUER registo da
+    /// faixa `faixa` cujo `t_ref` seja `t_ref`, com `d > 0`.
+    ///
+    /// Com `a = max(now − t_ref, 1)`: cada termo exacto da soma tem idade
+    /// `≥ a`, logo massa `≤ a^(−d)`; a cauda é `(n − k)` vezes a média de
+    /// `x^(−d)` em `[h, l]` com `h ≥ a` (o acesso retido mais antigo e o
+    /// primeiro acesso são ambos `≤ t_ref`), logo também `≤ (n − k)·a^(−d)`.
+    /// Somado, `raw_sum ≤ n·a^(−d)` e `score ≤ ln(n) − d·ln(a)`, com `n` no
+    /// máximo `2^(faixa+1) − 1`.
+    fn limite(faixa: usize, t_ref: u64, now_secs: u64, d: f64) -> f64 {
+        let n_max = if faixa >= 63 {
+            u64::MAX as f64
+        } else {
+            ((1u64 << (faixa + 1)) - 1) as f64
+        };
+        let a = (now_secs.saturating_sub(t_ref)).max(1) as f64;
+        n_max.ln() - d * a.ln()
+    }
+}
+
+/// Uma entrada do top-k. A ordem é a do resultado (score desc, id asc); no
+/// `BinaryHeap` o "maior" é o pior, para o topo do heap ser o k-ésimo.
+struct Candidato(ActivationHit);
+
+impl PartialEq for Candidato {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for Candidato {}
+
+impl Ord for Candidato {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .0
+            .score
+            .total_cmp(&self.0.score)
+            .then_with(|| self.0.id.cmp(&other.0.id))
+    }
+}
+
+impl PartialOrd for Candidato {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Folga sobre o limite: absorve o arredondamento de `raw_sum` e do `ln`
+/// (erro relativo ~1e-15 numa soma de no máximo `RECENT_K + 1` termos).
+const FOLGA_DO_LIMITE: f64 = 1e-9;
+
+#[cfg(test)]
+thread_local! {
+    /// Registos pontuados pelo último `top_k` desta thread.
+    static PONTUADOS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Debug, Clone)]
@@ -155,32 +269,135 @@ pub struct ActivationHit {
 impl ActivationStore {
     pub fn new(decay: f64) -> Self {
         Self {
-            records: DashMap::new(),
+            registos: RwLock::default(),
             decay,
             watermark: 0,
         }
     }
 
+    fn ler(&self) -> std::sync::RwLockReadGuard<'_, Registos> {
+        self.registos.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn escrever(&self) -> std::sync::RwLockWriteGuard<'_, Registos> {
+        self.registos.write().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Record an access (retrieval touch or new episode).
     pub fn touch(&self, id: EventId, now_secs: u64) {
-        self.records.entry(id).or_default().access(now_secs);
+        let mut registos = self.escrever();
+        let antes = registos
+            .mapa
+            .get(&id)
+            .map(ActivationRecord::chave_de_indice);
+        let registo = registos.mapa.entry(id).or_default();
+        registo.access(now_secs);
+        let depois = registo.chave_de_indice();
+        if antes != Some(depois) {
+            if let Some(antes) = antes {
+                registos.desindexar(id, antes);
+            }
+            registos.indexar(id, depois);
+        }
     }
 
     pub fn score(&self, id: &EventId, now_secs: u64) -> Option<f64> {
-        self.records.get(id).map(|r| r.score(now_secs, self.decay))
+        self.ler()
+            .mapa
+            .get(id)
+            .map(|r| r.score(now_secs, self.decay))
     }
 
-    /// Top-k most active items at `now_secs`.
+    /// Top-k most active items at `now_secs`: os `k` maiores scores, desempate
+    /// pelo id, exactamente como a ordenação total de todos os registos.
+    ///
+    /// Soak nightly de 20/10/2026: o recall pontuava TODOS os eventos a cada
+    /// pesquisa (a view cria um registo por episódio). Agora percorre-se o
+    /// índice por limite superior decrescente ([`ActivationRecord::limite`]) e
+    /// pára-se quando o limite do próximo, já em `f32`, fica estritamente
+    /// abaixo do k-ésimo score: nenhum dos que faltam pode entrar nem empatar.
+    /// Com um acesso por registo o limite É o score e visitam-se `k`.
+    ///
+    /// `d ≤ 0` (sem decaimento, ou configuração inválida) não tem limite útil
+    /// e cai na ordenação total.
     pub fn top_k(&self, now_secs: u64, k: usize) -> Vec<ActivationHit> {
-        let mut hits: Vec<ActivationHit> = self
-            .records
+        let registos = self.ler();
+        if k == 0 {
+            return Vec::new();
+        }
+        let d = self.decay;
+        if !(d > 0.0 && d.is_finite()) || k >= registos.mapa.len() {
+            return Self::top_k_total(&registos.mapa, now_secs, k, d);
+        }
+        // Um cursor por faixa; com no máximo 64 faixas, escolher o melhor
+        // limite por varrimento linear é mais barato do que um heap.
+        let mut cursores: Vec<_> = registos
+            .faixas
             .iter()
-            .map(|e| ActivationHit {
-                id: *e.key(),
-                score: e.value().score(now_secs, self.decay) as f32,
+            .enumerate()
+            .map(|(faixa, conjunto)| (faixa, conjunto.iter().peekable()))
+            .collect();
+        let mut melhores: BinaryHeap<Candidato> = BinaryHeap::with_capacity(k + 1);
+        #[cfg(test)]
+        PONTUADOS.with(|c| c.set(0));
+        loop {
+            let mut escolhido: Option<(usize, f64)> = None;
+            for (i, (faixa, cursor)) in cursores.iter_mut().enumerate() {
+                if let Some((Reverse(t_ref), _)) = cursor.peek() {
+                    let limite = ActivationRecord::limite(*faixa, *t_ref, now_secs, d);
+                    if escolhido.is_none_or(|(_, melhor)| limite > melhor) {
+                        escolhido = Some((i, limite));
+                    }
+                }
+            }
+            let Some((i, limite)) = escolhido else {
+                break;
+            };
+            if melhores.len() == k {
+                let k_esimo = melhores.peek().map_or(f32::NEG_INFINITY, |c| c.0.score);
+                if ((limite + FOLGA_DO_LIMITE) as f32) < k_esimo {
+                    break;
+                }
+            }
+            let Some((_, id)) = cursores[i].1.next() else {
+                continue;
+            };
+            let Some(registo) = registos.mapa.get(id) else {
+                continue;
+            };
+            #[cfg(test)]
+            PONTUADOS.with(|c| c.set(c.get() + 1));
+            melhores.push(Candidato(ActivationHit {
+                id: *id,
+                score: registo.score(now_secs, d) as f32,
+            }));
+            if melhores.len() > k {
+                melhores.pop();
+            }
+        }
+        melhores
+            .into_sorted_vec()
+            .into_iter()
+            .map(|c| c.0)
+            .collect()
+    }
+
+    /// A ordenação de todos os registos: referência do `top_k` e o caminho
+    /// quando não há limite útil.
+    fn top_k_total(
+        mapa: &HashMap<EventId, ActivationRecord>,
+        now_secs: u64,
+        k: usize,
+        decay: f64,
+    ) -> Vec<ActivationHit> {
+        let mut hits: Vec<ActivationHit> = mapa
+            .iter()
+            .map(|(id, registo)| ActivationHit {
+                id: *id,
+                score: registo.score(now_secs, decay) as f32,
             })
             .collect();
-        // Desempate por id: o DashMap itera em ordem aleatória — o conjunto
+        // Desempate por id: o mapa itera em ordem aleatória — o conjunto
         // top-k com scores empatados variava entre execuções.
         let ordem = |a: &ActivationHit, b: &ActivationHit| {
             b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id))
@@ -237,11 +454,25 @@ impl ActivationStore {
     }
 
     pub fn len(&self) -> usize {
-        self.records.len()
+        self.ler().mapa.len()
+    }
+
+    /// Bytes residentes, estimados pelas capacidades (ver
+    /// `heraclitus_core::memoria`): o mapa e o índice ordenado do `top_k`.
+    pub fn resident_bytes(&self) -> u64 {
+        use heraclitus_core::memoria::{de_btree, de_hashmap, de_vec};
+        let registos = self.ler();
+        de_hashmap::<EventId, ActivationRecord>(registos.mapa.capacity())
+            + de_vec::<BTreeSet<(Reverse<u64>, EventId)>>(registos.faixas.capacity())
+            + registos
+                .faixas
+                .iter()
+                .map(|faixa| de_btree::<(Reverse<u64>, EventId), ()>(faixa.len()))
+                .sum::<u64>()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
+        self.ler().mapa.is_empty()
     }
 }
 
@@ -262,12 +493,10 @@ impl View for ActivationStore {
 
     fn checkpoint(&self, dir: &std::path::Path) -> Result<(), heraclitus_core::HeraclitusError> {
         let records = self
-            .records
+            .ler()
+            .mapa
             .iter()
-            .map(|e| {
-                let r = e.value();
-                (*e.key(), r.recent.to_vec(), r.n, r.first_access)
-            })
+            .map(|(id, r)| (*id, r.recent.to_vec(), r.n, r.first_access))
             .collect();
         heraclitus_views::ckpt::save(
             dir,
@@ -285,7 +514,7 @@ impl View for ActivationStore {
         else {
             return Ok(false);
         };
-        self.records = snap
+        let mapa: HashMap<EventId, ActivationRecord> = snap
             .records
             .into_iter()
             .map(|(id, recent, n, first_access)| {
@@ -317,6 +546,21 @@ impl View for ActivationStore {
                 (id, rec)
             })
             .collect();
+        // O índice do `top_k` é derivado: reconstrói-se do mapa, e o formato
+        // do checkpoint não muda.
+        let mut registos = Registos {
+            mapa,
+            faixas: Vec::new(),
+        };
+        let chaves: Vec<_> = registos
+            .mapa
+            .iter()
+            .map(|(id, r)| (*id, r.chave_de_indice()))
+            .collect();
+        for (id, chave) in chaves {
+            registos.indexar(id, chave);
+        }
+        *self.registos.get_mut().unwrap_or_else(|e| e.into_inner()) = registos;
         // O decay é configuração de runtime (config.activation_decay), não
         // estado derivado: mantém o do processo atual.
         self.watermark = snap.watermark;
@@ -340,7 +584,7 @@ impl View for ActivationStore {
     }
 
     fn reset(&mut self) {
-        self.records.clear();
+        *self.registos.get_mut().unwrap_or_else(|e| e.into_inner()) = Registos::default();
         self.watermark = 0;
     }
 }
@@ -569,11 +813,12 @@ mod testes_otimizacao {
             let parcial = idx.top_k(2_000, k);
             // Referencia: ordenacao total, como era antes.
             let mut total: Vec<ActivationHit> = idx
-                .records
+                .ler()
+                .mapa
                 .iter()
-                .map(|e| ActivationHit {
-                    id: *e.key(),
-                    score: e.value().score(2_000, idx.decay) as f32,
+                .map(|(id, r)| ActivationHit {
+                    id: *id,
+                    score: r.score(2_000, idx.decay) as f32,
                 })
                 .collect();
             total.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
@@ -653,5 +898,108 @@ mod testes_otimizacao {
 
         assert!((hits[0].score - expected_shared).abs() < 1e-5);
         assert!((hits[1].score - expected_unique).abs() < 1e-5);
+    }
+}
+
+#[cfg(test)]
+mod testes_top_k_por_limite {
+    //! Soak nightly de 20/10/2026: o `top_k` deixa de pontuar todos os
+    //! registos. O contrato é dar EXACTAMENTE o que a ordenação total dá —
+    //! mesmos elementos, mesma ordem, mesmo desempate por id.
+    use super::*;
+    use proptest::prelude::*;
+    use tempfile::tempdir;
+
+    fn referencia(store: &ActivationStore, now: u64, k: usize) -> Vec<(EventId, u32)> {
+        ActivationStore::top_k_total(&store.ler().mapa, now, k, store.decay)
+            .into_iter()
+            .map(|h| (h.id, h.score.to_bits()))
+            .collect()
+    }
+
+    fn obtido(store: &ActivationStore, now: u64, k: usize) -> Vec<(EventId, u32)> {
+        store
+            .top_k(now, k)
+            .into_iter()
+            .map(|h| (h.id, h.score.to_bits()))
+            .collect()
+    }
+
+    proptest! {
+        /// Acessos aleatórios: vários por registo, instantes repetidos (empates
+        /// em f32) e fora de ordem, `now` antes de alguns acessos, decay
+        /// padrão e não padrão.
+        #[test]
+        fn top_k_por_limite_igual_a_ordenacao_total(
+            acessos in proptest::collection::vec((0usize..60, 0u64..2_000), 1..400),
+            now in 0u64..3_000,
+            k in 1usize..70,
+            decay_meio in any::<bool>(),
+        ) {
+            let store = ActivationStore::new(if decay_meio { 0.5 } else { 0.83 });
+            let mut ids: Vec<EventId> = (0..60).map(|_| EventId::new()).collect();
+            ids.sort();
+            for (i, t) in acessos {
+                store.touch(ids[i], t);
+            }
+            prop_assert_eq!(obtido(&store, now, k), referencia(&store, now, k));
+        }
+    }
+
+    /// Um acesso por registo (o que a view faz por episódio): o limite é o
+    /// próprio score, e só se pontuam os `k` primeiros.
+    #[test]
+    fn um_acesso_por_registo_pontua_so_k() {
+        let store = ActivationStore::new(0.5);
+        for i in 0..10_000u64 {
+            store.touch(EventId::new(), 1_000 + i);
+        }
+        let now = 20_000;
+        assert_eq!(obtido(&store, now, 10), referencia(&store, now, 10));
+        let pontuados = PONTUADOS.with(|c| c.get());
+        assert!(pontuados <= 11, "pontuou {pontuados} registos para k = 10");
+    }
+
+    /// Sem decaimento (`d = 0`, o `Default`) não há limite útil: ordenação
+    /// total, com o mesmo resultado.
+    #[test]
+    fn sem_decaimento_cai_na_ordenacao_total() {
+        let store = ActivationStore::default();
+        for i in 0..50u64 {
+            let id = EventId::new();
+            for _ in 0..=(i % 4) {
+                store.touch(id, i);
+            }
+        }
+        assert_eq!(obtido(&store, 100, 5), referencia(&store, 100, 5));
+    }
+
+    /// O índice é derivado: depois de um checkpoint e restore, e depois de um
+    /// reset, o `top_k` continua igual à ordenação total.
+    #[test]
+    fn restore_e_reset_reconstroem_o_indice() {
+        let dir = tempdir().unwrap();
+        let store = ActivationStore::new(0.5);
+        let ids: Vec<EventId> = (0..200).map(|_| EventId::new()).collect();
+        for (i, id) in ids.iter().enumerate() {
+            for j in 0..=(i % 12) {
+                store.touch(*id, 1_000 + (i as u64) * 7 + j as u64);
+            }
+        }
+        store.checkpoint(dir.path()).unwrap();
+
+        let mut recuperado = ActivationStore::new(0.5);
+        assert!(recuperado.restore(dir.path()).unwrap());
+        for k in [1, 9, 40] {
+            assert_eq!(obtido(&recuperado, 5_000, k), referencia(&store, 5_000, k));
+        }
+        recuperado.touch(ids[3], 4_999);
+        assert_eq!(
+            obtido(&recuperado, 5_000, 3),
+            referencia(&recuperado, 5_000, 3)
+        );
+
+        recuperado.reset();
+        assert!(recuperado.top_k(5_000, 3).is_empty());
     }
 }

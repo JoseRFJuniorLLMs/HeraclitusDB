@@ -1,0 +1,18 @@
+import ProofAppendOnly
+import ProofMerkleTree
+import ProofDeterministicReplay
+import ProofDenseMap
+import ProofHLC
+import ProofApprovalIdempotence
+import ProofToolCallIsolation
+#print axioms ProofAppendOnly.lsn_never_retrocedes
+#print axioms ProofAppendOnly.append_never_overwrites
+#print axioms ProofAppendOnly.truncate_consistent
+#print axioms ProofMerkleTree.mutation_fails_verification
+#print axioms ProofDeterministicReplay.parallel_equals_sequential
+#print axioms ProofDenseMap.insert_maintains_validity
+#print axioms ProofDenseMap.bijection_integrity
+#print axioms ProofHLC.hlc_monotonicity
+#print axioms ProofHLC.hlc_causality_preservation
+#print axioms ProofApprovalIdempotence.approval_idempotent
+#print axioms ProofToolCallIsolation.foreign_scope_unchanged

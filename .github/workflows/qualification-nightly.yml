@@ -91,6 +91,7 @@ jobs:
           jq -n '{schema_version:1,id:"soak-nightly",description:"Nightly smoke soak; far too short to satisfy the long_soak gate.",
                   duration_seconds:900,sample_interval_seconds:15,stabilization_seconds:180,concurrency:8,
                   workload_profile:"mixed",memory_growth_budget_bytes_per_hour:134217728,
+                  memory_growth_budget_bytes_per_retained_event:8192,
                   handle_growth_budget_per_hour:60,thread_growth_budget_per_hour:4,
                   latency_drift_budget_ratio:3.0,satisfies_level:"development"}' \
             > "$RUNNER_TEMP/soak/profile.json"

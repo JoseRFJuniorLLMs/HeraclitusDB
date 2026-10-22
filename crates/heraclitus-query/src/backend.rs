@@ -6,7 +6,7 @@
 use crate::ast::{SimulateOp, Value};
 use crate::fusion::{FusedHit, FusionInput, FusionWeights};
 use arc_swap::ArcSwap;
-use heraclitus_core::{Episode, EventKind, HeraclitusError, Lsn};
+use heraclitus_core::{Episode, EventKind, HeraclitusError, Lsn, ProductPoint};
 use heraclitus_index_graph::adaptive::{self, LabeledFlag, PolicyEval};
 use heraclitus_index_graph::decision::{self, DecisionPolicy};
 use heraclitus_index_graph::entity::EntityResolver;
@@ -520,6 +520,10 @@ struct AttributeIndex {
 /// dano de duplicar acções num log append-only.
 static DECIDE_LOCK: Mutex<()> = Mutex::new(());
 
+/// `(lsn, chave)` de cada vetor residente — ver
+/// [`QueryBackend::resident_vector_keys`].
+pub type ResidentVectorKeys = Vec<(Lsn, Option<f64>)>;
+
 pub trait QueryBackend {
     fn scan(&self, as_of: Option<Lsn>) -> Result<Vec<(Lsn, Episode)>, HeraclitusError>;
     fn scan_range(&self, from: Lsn, to: Lsn) -> Result<Vec<(Lsn, Episode)>, HeraclitusError>;
@@ -612,6 +616,45 @@ pub trait QueryBackend {
         _value: &str,
         _as_of: Option<Lsn>,
     ) -> Result<Option<PrunedScanResult>, HeraclitusError> {
+        Ok(None)
+    }
+    /// `WHERE <builtin> = "v"` respondido por um índice: os LSNs (ordenados,
+    /// sem hidratar) de um SUPERCONJUNTO COMPLETO dos episódios com esse
+    /// valor, abaixo de `as_of`. O planner hidrata pela ordem, pára no LIMIT e
+    /// revalida a igualdade exacta. Tem precedência sobre o
+    /// [`scan_builtin_eq`](Self::scan_builtin_eq), que lê a janela inteira
+    /// quando o valor aparece em todos os segmentos.
+    ///
+    /// "Completo" é o contrato: um LSN com o valor que falte aqui desaparece
+    /// da resposta. Na dúvida, `Ok(None)` (default) e o planner varre.
+    fn builtin_eq_lsns(
+        &self,
+        _field: &str,
+        _value: &str,
+        _as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
+        Ok(None)
+    }
+    /// Chaves de ordenação por distância calculadas sobre os vetores
+    /// RESIDENTES num índice em memória: um par `(lsn, key(ponto))` por vetor
+    /// indexado com LSN em `[from, to)`. É o que deixa `ORDER BY DIST_*(...)
+    /// LIMIT k` sair sem descodificar a janela inteira do log.
+    ///
+    /// Contrato, de que depende o top-k exacto do planner:
+    /// - o ponto de um par é o embedding que o índice recebeu do episódio com
+    ///   aquele LSN; o planner volta a medi-lo no episódio lido do log antes de
+    ///   o devolver;
+    /// - um LSN que falte na lista NÃO quer dizer "sem embedding": o planner
+    ///   lê-o do log. A lista pode ter buracos (eventos que não passam pelas
+    ///   views, escritas ainda em voo); um LSN repetido faz o planner varrer.
+    ///
+    /// Default `Ok(None)` = sem índice vetorial; o planner varre o log.
+    fn resident_vector_keys(
+        &self,
+        _from: Lsn,
+        _to: Lsn,
+        _key: &dyn Fn(&ProductPoint) -> Option<f64>,
+    ) -> Result<Option<ResidentVectorKeys>, HeraclitusError> {
         Ok(None)
     }
     fn recall(

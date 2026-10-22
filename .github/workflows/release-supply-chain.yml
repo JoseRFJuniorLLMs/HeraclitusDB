@@ -9,6 +9,11 @@ on:
         description: Version recorded in the release dossier (3.0.0 or v3.0.0)
         required: true
         type: string
+      publish_release:
+        description: Publish a draft only after every build and qualification gate passes
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -113,6 +118,26 @@ jobs:
           echo "dist=$dist" >> "$GITHUB_OUTPUT"
           echo "archive=$RUNNER_TEMP/$(basename "$dist").tar.gz" >> "$GITHUB_OUTPUT"
 
+      - name: Build native Debian and RPM packages from the same payload
+        shell: bash
+        env:
+          DIST: ${{ steps.payload.outputs.dist }}
+          VERSION: ${{ steps.payload.outputs.version }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dpkg-dev rpm cpio
+          bash packaging/build-linux-packages.sh "$DIST" "$VERSION" "$RUNNER_TEMP/native-packages"
+          mkdir -p "$RUNNER_TEMP/deb-check" "$RUNNER_TEMP/rpm-check"
+          dpkg-deb --extract "$RUNNER_TEMP/native-packages/"*.deb "$RUNNER_TEMP/deb-check"
+          rpm2cpio "$RUNNER_TEMP/native-packages/"*.rpm | (cd "$RUNNER_TEMP/rpm-check" && cpio -id --quiet --no-absolute-filenames)
+          for package in deb-check rpm-check; do
+            cmp "$DIST/bin/heraclitus-server" "$RUNNER_TEMP/$package/usr/bin/heraclitus-server"
+            cmp "$DIST/bin/heraclitus-qualifier" "$RUNNER_TEMP/$package/usr/bin/heraclitus-qualifier"
+            "$RUNNER_TEMP/$package/usr/bin/heraclitus-server" --version | grep -F "git $GITHUB_SHA clean"
+          done
+          (cd "$RUNNER_TEMP/native-packages" && sha256sum --check SHA256SUMS)
+
       - name: Qualify the extracted Linux package by killing and restarting it
         timeout-minutes: 30
         shell: bash
@@ -145,13 +170,18 @@ jobs:
             ${{ steps.payload.outputs.archive }}.sha256
             ${{ steps.payload.outputs.dist }}/sbom/bom.cdx.json
             ${{ runner.temp }}/rc-evidence/crash-report.json
+            ${{ runner.temp }}/native-packages/*.deb
+            ${{ runner.temp }}/native-packages/*.rpm
+            ${{ runner.temp }}/native-packages/SHA256SUMS
 
       - name: Preserve attestation bundle with release payload
         shell: bash
         env:
           BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
           ARCHIVE: ${{ steps.payload.outputs.archive }}
-        run: cp "$BUNDLE_PATH" "$ARCHIVE.sigstore.json"
+        run: |
+          cp "$BUNDLE_PATH" "$ARCHIVE.sigstore.json"
+          cp "$BUNDLE_PATH" "$RUNNER_TEMP/native-packages/linux-packages.sigstore.json"
 
       - name: Upload immutable workflow artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
@@ -166,6 +196,7 @@ jobs:
             ${{ steps.payload.outputs.dist }}/build-manifest.json
             ${{ runner.temp }}/rc-evidence/crash-report.json
             ${{ runner.temp }}/rc-evidence/crash-report.json.sha256
+            ${{ runner.temp }}/native-packages/
 
       - name: Preserve qualification diagnostics even on failure
         if: failure()
@@ -189,4 +220,37 @@ jobs:
           "$ARCHIVE"
           "$ARCHIVE.sha256"
           "$ARCHIVE.sigstore.json"
+          "$RUNNER_TEMP/native-packages/"*.deb
+          "$RUNNER_TEMP/native-packages/"*.rpm
+          "$RUNNER_TEMP/native-packages/SHA256SUMS"
+          "$RUNNER_TEMP/native-packages/linux-packages.sigstore.json"
           --repo "$GITHUB_REPOSITORY"
+
+      - name: Publish the qualified version and native packages
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.payload.outputs.version }}
+          ARCHIVE: ${{ steps.payload.outputs.archive }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION#v}"
+          git fetch --tags origin
+          if git rev-parse --verify "refs/tags/$tag" >/dev/null 2>&1; then
+            test "$(git rev-parse "refs/tags/$tag^{}")" = "$GITHUB_SHA"
+          fi
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $tag already exists; refusing to overwrite it" >&2
+            exit 1
+          fi
+          # Keep the release invisible until all assets have uploaded. The
+          # GITHUB_TOKEN publication does not recursively trigger this workflow.
+          gh release create "$tag" --draft --target "$GITHUB_SHA" \
+            --title "HeraclitusDB $tag" --notes-file "docs/md/RELEASE_NOTES_$tag.md" \
+            "$ARCHIVE" "$ARCHIVE.sha256" "$ARCHIVE.sigstore.json" \
+            "$RUNNER_TEMP/native-packages/"*.deb "$RUNNER_TEMP/native-packages/"*.rpm \
+            "$RUNNER_TEMP/native-packages/SHA256SUMS" \
+            "$RUNNER_TEMP/native-packages/linux-packages.sigstore.json" \
+            --repo "$GITHUB_REPOSITORY"
+          gh release edit "$tag" --draft=false --latest --repo "$GITHUB_REPOSITORY"

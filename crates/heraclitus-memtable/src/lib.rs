@@ -83,14 +83,16 @@ impl Memtable {
     /// Drop everything at or below the view watermark (it is now indexed).
     pub fn prune_below(&self, watermark: Lsn) {
         let mut entries = self.entries.write().unwrap();
-        while matches!(entries.front(), Some((l, _)) if *l <= watermark) {
-            if let Some((_, evicted)) = entries.pop_front() {
-                self.subtract_bytes(evicted.resident_bytes());
-                self.forget_adjacency(&evicted);
-            } else {
-                break;
+        // Concurrent publishers may arrive out of LSN order. A high-LSN
+        // front must not keep already indexed entries and adjacency alive.
+        entries.retain(|(lsn, episode)| {
+            if *lsn > watermark {
+                return true;
             }
-        }
+            self.subtract_bytes(episode.resident_bytes());
+            self.forget_adjacency(episode);
+            false
+        });
         if entries.is_empty() {
             self.bytes.store(0, std::sync::atomic::Ordering::Relaxed);
         }
@@ -290,6 +292,24 @@ mod tests {
         }
         mt.prune_below(4);
         assert_eq!(mt.len(), 5);
+    }
+
+    #[test]
+    fn prune_handles_out_of_order_lsn_and_releases_adjacency() {
+        let mt = Memtable::new(100);
+        let parent = EventId::new();
+        for lsn in [9, 1, 7, 2] {
+            let mut ep = ep_with_emb("out-of-order", vec![0.1]);
+            ep.parents.push(parent);
+            mt.apply(lsn, ep);
+        }
+        mt.prune_below(2);
+        assert_eq!(mt.len(), 2);
+        assert_eq!(mt.children_of(&parent).len(), 2);
+        mt.prune_below(9);
+        assert_eq!(mt.len(), 0);
+        assert_eq!(mt.resident_bytes(), 0);
+        assert!(mt.children_of(&parent).is_empty());
     }
 
     #[test]

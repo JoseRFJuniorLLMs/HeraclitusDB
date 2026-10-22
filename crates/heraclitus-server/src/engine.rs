@@ -16,10 +16,10 @@ fn validar_namespace_do_indice(
     if episode
         .attrs
         .keys()
-        .any(|k| matches!(k.as_str(), "_agent" | "_kind"))
+        .any(|k| heraclitus_index_attr::PSEUDO_CAMPOS.contains(&k.as_str()))
     {
         return Err(heraclitus_core::HeraclitusError::Query(
-            "atributos _agent e _kind são reservados ao envelope do índice".into(),
+            "atributos _agent, _kind e _agent_ev são reservados ao envelope do índice".into(),
         ));
     }
     Ok(())
@@ -62,7 +62,7 @@ pub const MAX_TOP_K: usize = 10_000;
 /// mesmo com valores SKIP_VALUES) — uma só fonte para os dois nunca divergirem
 /// (auditoria recursiva 2026-10-03, iteração 1).
 pub const IDEMPOTENCY_KEY_ATTR: &str = heraclitus_index_attr::IDEMPOTENCY_KEY_FIELD;
-pub const IDEMPOTENCY_HASH_ATTR: &str = "__heraclitus_idempotency_hash";
+pub const IDEMPOTENCY_HASH_ATTR: &str = heraclitus_index_attr::IDEMPOTENCY_HASH_FIELD;
 
 /// Recusa do append idempotente quando o índice de atributos não descreve o
 /// log inteiro (auditoria recursiva 2026-10-03, iteração 1).
@@ -185,6 +185,59 @@ fn is_audit_reserved(episode: &Episode) -> bool {
 const AUDIT_RESERVADO: &str =
     "os kinds AuditQuery/AuditAdmin e o agente heraclitus-audit são reservados à meta-auditoria";
 
+/// Uma amostra da memória residente dos índices, em bytes (estimativas pelas
+/// capacidades; ver `Engine::amostrar_memoria_dos_indices`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoriaDosIndices {
+    pub vector: u64,
+    pub text: u64,
+    pub graph: u64,
+    pub activation: u64,
+    pub attr: u64,
+    pub memtable: u64,
+    /// O `index_memory_budget_bytes` em vigor quando a amostra foi tirada.
+    pub budget: Option<u64>,
+}
+
+impl MemoriaDosIndices {
+    pub fn total(&self) -> u64 {
+        self.vector + self.text + self.graph + self.activation + self.attr + self.memtable
+    }
+
+    pub fn over_budget(&self) -> bool {
+        self.budget.is_some_and(|teto| self.total() > teto)
+    }
+
+    /// As linhas Prometheus desta amostra.
+    pub fn prometheus(&self) -> String {
+        let mut out = String::new();
+        for (indice, bytes) in [
+            ("vector", self.vector),
+            ("text", self.text),
+            ("graph", self.graph),
+            ("activation", self.activation),
+            ("attr", self.attr),
+            ("memtable", self.memtable),
+        ] {
+            out.push_str(&format!(
+                "heraclitus_index_resident_bytes{{index=\"{indice}\"}} {bytes}\n"
+            ));
+        }
+        out.push_str(&format!(
+            "heraclitus_index_resident_bytes_total {}\n",
+            self.total()
+        ));
+        if let Some(teto) = self.budget {
+            out.push_str(&format!("heraclitus_index_memory_budget_bytes {teto}\n"));
+        }
+        out.push_str(&format!(
+            "heraclitus_index_memory_over_budget {}\n",
+            u8::from(self.over_budget())
+        ));
+        out
+    }
+}
+
 pub struct Engine {
     /// Backend append-only selecionado explicitamente na configuração.
     /// `legacy` continua sendo o default; `v6` nunca é inferido nem migrado.
@@ -231,6 +284,14 @@ pub struct Engine {
     /// atributos é um componente à parte, e `view rebuild` materializa as views
     /// sem lhe tocar — logo baixar uma marca não pode baixar a outra.
     attr_nao_materializado: std::sync::atomic::AtomicBool,
+    /// Teto e política da memória dos índices (`index_memory_budget_bytes`,
+    /// `index_memory_policy`), a última amostra e se ela passou do teto. A
+    /// amostra é periódica (`amostrar_memoria_dos_indices`); as entradas de
+    /// escrita dos clientes só lêem o atómico.
+    memoria_teto: Option<u64>,
+    memoria_politica: heraclitus_core::IndexMemoryPolicy,
+    memoria_amostra: Mutex<Option<MemoriaDosIndices>>,
+    memoria_acima_do_teto: std::sync::atomic::AtomicBool,
     /// Meta-auditoria de acessos (padrão immudb): cada query GQL executada
     /// gera um evento `AuditQuery` no próprio log — quem consultou o quê é,
     /// ele próprio, evidência imutável. Liga por config (audit_queries).
@@ -247,7 +308,7 @@ pub struct Engine {
     hvm_lock: Mutex<()>,
     /// Estado H-VM dobrado até ao cursor (próximo LSN por ver). Ver
     /// [`Engine::hvm_state`].
-    hvm_cache: Mutex<Option<(Lsn, VmState)>>,
+    hvm_cache: Mutex<Option<(Lsn, Arc<VmState>)>>,
     /// Ponto de consistência para o checkpoint: nenhum append pode estar EM VOO
     /// (já no log, ainda por indexar) quando um snapshot é tirado.
     ///
@@ -754,6 +815,10 @@ impl Engine {
             keystore,
             log_only,
             attr_nao_materializado: std::sync::atomic::AtomicBool::new(skip_replay),
+            memoria_teto: config.index_memory_budget_bytes,
+            memoria_politica: config.index_memory_policy,
+            memoria_amostra: Mutex::new(None),
+            memoria_acima_do_teto: std::sync::atomic::AtomicBool::new(false),
             audit_queries: config.audit_queries,
             audit_admin: config.audit_admin,
             replication: std::sync::OnceLock::new(),
@@ -777,7 +842,71 @@ impl Engine {
             std::fs::remove_file(&privacy_rebuild_marker)?;
         }
         engine.trusted_admin.recover(engine.log.as_ref())?;
+        // A primeira amostra sai do arranque: com o teto configurado, um
+        // processo que já arranca acima dele recusa escritas desde o início.
+        engine.amostrar_memoria_dos_indices();
         Ok(engine)
+    }
+
+    /// Mede a memória residente dos índices (estimativas pelas capacidades,
+    /// calibradas em `tests/memoria_por_indice.rs`), guarda a amostra e
+    /// actualiza o estado do teto. Percorre cada índice sob o seu lock de
+    /// leitura: corre em segundo plano, nunca no caminho de um append.
+    ///
+    /// Não contabiliza o grafo temporal, as entidades nem a telemetria de
+    /// saúde, que não crescem por evento na carga medida.
+    pub fn amostrar_memoria_dos_indices(&self) -> MemoriaDosIndices {
+        let amostra = MemoriaDosIndices {
+            vector: self.vector.read().unwrap().resident_bytes(),
+            text: self.text.read().unwrap().resident_bytes(),
+            graph: self.graph.read().unwrap().resident_bytes(),
+            activation: self.activation.read().unwrap().resident_bytes(),
+            attr: self.attr.read().unwrap().resident_bytes(),
+            memtable: self.memtable.resident_bytes() as u64,
+            budget: self.memoria_teto,
+        };
+        let acima = amostra.over_budget();
+        let antes = self
+            .memoria_acima_do_teto
+            .swap(acima, std::sync::atomic::Ordering::Relaxed);
+        if acima && !antes {
+            tracing::warn!(
+                total = amostra.total(),
+                teto = ?self.memoria_teto,
+                politica = ?self.memoria_politica,
+                "memória dos índices acima do teto"
+            );
+        } else if antes && !acima {
+            tracing::info!(
+                total = amostra.total(),
+                "memória dos índices voltou abaixo do teto"
+            );
+        }
+        *self.memoria_amostra.lock().unwrap() = Some(amostra.clone());
+        amostra
+    }
+
+    /// A última amostra da memória dos índices.
+    pub fn memoria_dos_indices(&self) -> Option<MemoriaDosIndices> {
+        self.memoria_amostra.lock().unwrap().clone()
+    }
+
+    /// Chamado pelas entradas de escrita dos CLIENTES (gRPC, GQL `CREATE`,
+    /// API embarcada). Nunca pelas escritas internas nem pelo aplicador do
+    /// consenso: recusar uma entrada já comprometida partiria a replicação.
+    pub fn verificar_teto_de_memoria(&self) -> Result<(), HeraclitusError> {
+        if self.memoria_politica == heraclitus_core::IndexMemoryPolicy::RejectWrites
+            && self
+                .memoria_acima_do_teto
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(HeraclitusError::ResourceExhausted(format!(
+                "memória dos índices acima do teto de {} bytes (index_memory_policy = \
+                 reject_writes); tente de novo quando baixar",
+                self.memoria_teto.unwrap_or_default()
+            )));
+        }
+        Ok(())
     }
 
     /// Ativa a replicação: a partir daqui `append` encaminha pelo consenso.
@@ -1099,7 +1228,7 @@ impl Engine {
         let frame = heraclitus_core::vm::encode(VmVersion(1), instr);
         // : este é o ÚNICO produtor legítimo de frames hvm_isa.
         self.append_internal(Episode::new(
-            "hvm",
+            vm_bridge::HVM_AGENT,
             EventKind::Custom(vm_bridge::HVM_KIND.to_string()),
             frame,
         ))
@@ -1114,12 +1243,25 @@ impl Engine {
     /// se decifrar), rebuild e demote invalidam a cache e o próximo pedido
     /// faz o replay integral, que é a definição.
     pub fn hvm_state(&self) -> Result<VmState, HeraclitusError> {
+        Ok((*self.hvm_state_shared()?).clone())
+    }
+
+    /// Read-only callers share a stable snapshot; unchanged ledgers allocate
+    /// nothing. An update copies only if an older reader still owns the Arc.
+    pub fn hvm_state_shared(&self) -> Result<Arc<VmState>, HeraclitusError> {
         let vm = ConsistencyVirtualMachine::new(VmVersion(1));
         let mut cache = self.hvm_cache.lock().unwrap();
+        if let Some((cursor, state)) = cache.as_ref() {
+            if *cursor == self.log.head() {
+                return Ok(Arc::clone(state));
+            }
+        }
         let (from, state) = cache.take().unwrap_or_default();
         // Um erro deixa a cache vazia: o próximo pedido refaz tudo do zero.
-        let (state, next) = vm_bridge::replay_vm_from(&self.log, &vm, state, from)?;
-        *cache = Some((next, state.clone()));
+        let (state, next) =
+            vm_bridge::replay_vm_from(&self.log, &vm, Arc::unwrap_or_clone(state), from)?;
+        let state = Arc::new(state);
+        *cache = Some((next, Arc::clone(&state)));
         Ok(state)
     }
 
@@ -1222,12 +1364,18 @@ impl Engine {
     /// local (default). As credenciais de nuvem vêm do ambiente.
     #[cfg(feature = "tier")]
     fn open_cold_tier(&self) -> Result<heraclitus_tier::ColdTier, HeraclitusError> {
-        heraclitus_tier::ColdTier::open_location(&self.cold_tier_path.to_string_lossy())
+        Ok(
+            heraclitus_tier::ColdTier::open_location(&self.cold_tier_path.to_string_lossy())?
+                .with_keystore(self.keystore.clone()),
+        )
     }
 
     #[cfg(feature = "tier")]
     fn open_cold_tier_v6(&self) -> Result<heraclitus_tier::ColdTierV6, HeraclitusError> {
-        heraclitus_tier::ColdTierV6::open_location(&self.cold_tier_path.to_string_lossy())
+        Ok(
+            heraclitus_tier::ColdTierV6::open_location(&self.cold_tier_path.to_string_lossy())?
+                .with_keystore(self.keystore.clone()),
+        )
     }
 
     /// Ids dos segmentos selados — candidatos a demote para o cold tier.
@@ -1519,9 +1667,7 @@ impl Engine {
             }
             heraclitus_tier::AnyDemotionReceipt::V2(v2) => {
                 let cold = self.open_cold_tier_v6()?;
-                let (events, stats) = cold
-                    .recall_lsn_range(&v2.key()?, v2.first_lsn, v2.last_lsn)
-                    .await?;
+                let (events, stats) = cold.recall_receipt(&v2).await?;
                 self.cold_range_reads
                     .fetch_add(stats.requests, std::sync::atomic::Ordering::Relaxed);
                 self.cold_bytes_downloaded
@@ -2857,6 +3003,7 @@ impl Engine {
         episode: Episode,
         key: &str,
     ) -> Result<(Lsn, bool, String), HeraclitusError> {
+        self.verificar_teto_de_memoria()?;
         validar_namespace_do_indice(&episode)?;
         if episode.agent_id == "heraclitus-admin"
             || matches!(&episode.kind, EventKind::Custom(k) if k == "AdminIntent" || k == "AdminResult")
@@ -2969,19 +3116,23 @@ impl Engine {
 
         // EventId/ts_hlc são gerados pelo destino e não participam do hash: um
         // retry legítimo cria um Episode novo antes de chegar aqui.
-        let canonical = serde_json::to_vec(&(
-            &episode.agent_id,
-            &episode.session_id,
-            &episode.kind,
-            &episode.content,
-            &episode.embedding,
-            &episode.attrs,
-            &episode.valid_from,
-            &episode.valid_to,
-            &episode.parents,
-        ))
+        let mut canonical = blake3::Hasher::new();
+        serde_json::to_writer(
+            &mut canonical,
+            &(
+                &episode.agent_id,
+                &episode.session_id,
+                &episode.kind,
+                &episode.content,
+                &episode.embedding,
+                &episode.attrs,
+                &episode.valid_from,
+                &episode.valid_to,
+                &episode.parents,
+            ),
+        )
         .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
-        let payload_hash = blake3::hash(&canonical).to_hex().to_string();
+        let payload_hash = canonical.finalize().to_hex().to_string();
 
         let _guard = self.idempotency_shard(key).lock().unwrap();
         // `.read()` e não `.write()`: `lookup` é `&self`. Tomar o lock de
@@ -3002,18 +3153,22 @@ impl Engine {
                     context: "idempotency index".into(),
                     detail: format!("LSN {lsn} ausente para a chave {key}"),
                 })?;
-            let legacy = serde_json::to_vec(&(
-                &episode.agent_id,
-                &episode.session_id,
-                &episode.kind,
-                &episode.content,
-                &episode.embedding,
-                &episode.attrs,
-                &episode.valid_from,
-                &episode.valid_to,
-            ))
+            let mut legacy = blake3::Hasher::new();
+            serde_json::to_writer(
+                &mut legacy,
+                &(
+                    &episode.agent_id,
+                    &episode.session_id,
+                    &episode.kind,
+                    &episode.content,
+                    &episode.embedding,
+                    &episode.attrs,
+                    &episode.valid_from,
+                    &episode.valid_to,
+                ),
+            )
             .map_err(|e| HeraclitusError::Serialization(e.to_string()))?;
-            let legacy_hash = blake3::hash(&legacy).to_hex().to_string();
+            let legacy_hash = legacy.finalize().to_hex().to_string();
             if existing.parents == episode.parents
                 && (existing.attrs.get(IDEMPOTENCY_HASH_ATTR) == Some(&payload_hash)
                     || existing.attrs.get(IDEMPOTENCY_HASH_ATTR) == Some(&legacy_hash))
@@ -3183,6 +3338,7 @@ impl Engine {
             "storage_format": self.log.format().as_str(),
             "memtable": self.memtable.len(),
             "memtable_bytes_estimated": self.memtable.resident_bytes(),
+            "index_memory": self.memoria_dos_indices(),
             // Contagens: leitura pura. Com `.write()` cada uma esperava pelo
             // checkpoint em curso, e era isso que punha o `/stats` a 44 s.
             "vector_indexed": self.vector.read().unwrap().len(),
@@ -3256,7 +3412,7 @@ impl Engine {
         let cold_bytes_downloaded = self
             .cold_bytes_downloaded
             .load(std::sync::atomic::Ordering::Relaxed);
-        Ok(format!(
+        let mut texto = format!(
             concat!(
                 "hrkl_append_bytes_total {}\n",
                 "hrkl_raw_bytes {}\n",
@@ -3305,7 +3461,11 @@ impl Engine {
             m.physical_crc_failures,
             log.hlc_skew_ms(),
             u8::from(log.degradado().is_some()),
-        ))
+        );
+        if let Some(memoria) = self.memoria_dos_indices() {
+            texto.push_str(&memoria.prometheus());
+        }
+        Ok(texto)
     }
 
     pub fn verify(&self) -> Result<serde_json::Value, HeraclitusError> {
@@ -3793,6 +3953,48 @@ impl QueryBackend for Engine {
         self.log.read(lsn)
     }
 
+    /// `agent_id = x` pelo índice de atributos (v8): `_agent` cobre todos os
+    /// eventos excepto `AgentEvidence` e frames H-VM; `_agent_ev` cobre os
+    /// `AgentEvidence`. Os frames H-VM são todos do agente `hvm` e não passam
+    /// pelo índice, por isso esse valor varre. Um índice com buraco
+    /// (`attr_incompleto`) também.
+    fn builtin_eq_lsns(
+        &self,
+        field: &str,
+        value: &str,
+        as_of: Option<Lsn>,
+    ) -> Result<Option<Vec<Lsn>>, HeraclitusError> {
+        if field != "agent_id" || value == vm_bridge::HVM_AGENT || self.attr_incompleto() {
+            return Ok(None);
+        }
+        let Some(mut lsns) = self.attr.read().unwrap().lsns_do_agente(value) else {
+            return Ok(None);
+        };
+        let bound = as_of.unwrap_or_else(|| self.log.head());
+        lsns.retain(|l| *l < bound);
+        Ok(Some(lsns))
+    }
+
+    /// Os vetores do HNSW são o embedding que a view recebeu de cada episódio,
+    /// sem projecção (`VectorIndex::apply`). O que não passa pela view — frames
+    /// H-VM, `AgentEvidence`, um `EventId` repetido, um append ainda entre o
+    /// log e as views — simplesmente falta na lista, e o planner lê-o do log.
+    /// Em LOG_ONLY as views não recebem nada: a lista seria toda buracos.
+    fn resident_vector_keys(
+        &self,
+        from: Lsn,
+        to: Lsn,
+        key: &dyn Fn(&ProductPoint) -> Option<f64>,
+    ) -> Result<Option<heraclitus_query::backend::ResidentVectorKeys>, HeraclitusError> {
+        if self.log_only {
+            return Ok(None);
+        }
+        let idx = self.vector.read().unwrap();
+        let mut out = Vec::with_capacity(idx.len().min(to.saturating_sub(from) as usize));
+        idx.for_each_point_in(from, to, |lsn, ponto| out.push((lsn, key(ponto))));
+        Ok(Some(out))
+    }
+
     /// Range numérico (C1.6): resolvido pelo BTreeMap ordenado do índice de
     /// atributos — `WHERE n.valor > x AND n.valor < y` vira `range()` +
     /// hidratação O(1)/LSN, sem scan do log.
@@ -4162,6 +4364,8 @@ impl QueryBackend for Engine {
         label: Option<&str>,
         props: &[(String, GqlValue)],
     ) -> Result<Lsn, HeraclitusError> {
+        // GQL `CREATE` e `DECIDE`: escritas de cliente.
+        self.verificar_teto_de_memoria()?;
         let kind = match label {
             Some(l) if l.eq_ignore_ascii_case("action") => EventKind::Action,
             Some(l) if l.eq_ignore_ascii_case("message") => EventKind::Message,
@@ -4742,15 +4946,17 @@ mod tests {
         let engine = Engine::open(&cfg).unwrap();
         for i in 0..40 {
             let agent = if i < 20 { "alice" } else { "bob" };
-            engine
-                .append(Episode::new(agent, EventKind::Observation, vec![b'x'; 512]))
-                .unwrap();
+            let mut e = Episode::new(agent, EventKind::Observation, vec![b'x'; 512]);
+            e.session_id = format!("s-{agent}");
+            engine.append(e).unwrap();
         }
         let v6 = engine.log.v6_arc().unwrap();
         v6.seal_active().unwrap();
         v6.pack_pending(PackingProfile::Balanced).unwrap();
         v6.build_pending_hrki(
-            &IndexPolicySet::new().com("agent_id", IndexPolicy::PublicTechnical),
+            &IndexPolicySet::new()
+                .com("agent_id", IndexPolicy::PublicTechnical)
+                .com("session_id", IndexPolicy::PublicTechnical),
             None,
             0.01,
         )
@@ -4769,8 +4975,27 @@ mod tests {
             heraclitus_query::execute("MATCH (n) WHERE n.agent_id = \"alice\" RETURN n", &engine)
                 .unwrap();
         assert_eq!(rows.as_array().unwrap().len(), 20);
+        // `agent_id` passou a sair do índice de atributos (`_agent` +
+        // `_agent_ev`), que tem precedência sobre o skip-scan; o EXPLAIN mostra
+        // o caminho que a execução toma.
         let explain = heraclitus_query::execute(
             "EXPLAIN MATCH (n) WHERE n.agent_id = \"alice\" RETURN n",
+            &engine,
+        )
+        .unwrap();
+        let explain = explain.as_str().unwrap();
+        assert!(explain.contains("BuiltinIndex"), "{explain}");
+        assert!(explain.contains("candidates = 20"), "{explain}");
+        // `session_id` não tem índice: a poda HRKI continua a ser o caminho, e
+        // o EXPLAIN reporta-a.
+        let rows = heraclitus_query::execute(
+            "MATCH (n) WHERE n.session_id = \"s-alice\" RETURN n",
+            &engine,
+        )
+        .unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 20);
+        let explain = heraclitus_query::execute(
+            "EXPLAIN MATCH (n) WHERE n.session_id = \"s-alice\" RETURN n",
             &engine,
         )
         .unwrap();
@@ -6644,6 +6869,252 @@ mod tests {
             "RECALL leu {gastas} vezes para {} linhas (era 2x + 1)",
             linhas.len()
         );
+    }
+
+    /// Soak nightly de 20/10/2026: `ORDER BY DIST_HYP(...) ASC LIMIT k` sai dos
+    /// vetores residentes do HNSW em vez de descodificar o log inteiro. Contra
+    /// um oraculo calculado a mao sobre o log, com o mais proximo de todos num
+    /// `AgentEvidence`, que nunca passa pelas views.
+    #[test]
+    fn order_by_dist_hyp_sai_dos_vetores_residentes_e_ve_o_que_falta_no_indice() {
+        for formato in [
+            heraclitus_core::StorageFormat::Legacy,
+            HeraclitusConfig::default().storage_format,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = HeraclitusConfig {
+                data_dir: dir.path().to_path_buf(),
+                fsync: FsyncPolicy::Always,
+                storage_format: formato,
+                ..Default::default()
+            };
+            let engine = Engine::open(&cfg).unwrap();
+            for i in 0..300u32 {
+                let mut e =
+                    Episode::new("ag", EventKind::Observation, format!("e{i}").into_bytes());
+                if i % 11 != 0 {
+                    e.embedding = Some(heraclitus_core::ProductPoint {
+                        hyp: vec![(i % 17) as f32 / 100.0, (i % 5) as f32 / 100.0],
+                        sph: vec![],
+                        euc: vec![],
+                    });
+                }
+                engine.append(e).unwrap();
+            }
+            // Fora da grelha das observacoes (multiplos de 0,01): nenhuma pode
+            // empatar a distancia 0 com a evidencia e ganhar pelo LSN menor.
+            let mut evidencia = Episode::new(
+                "ag",
+                EventKind::Custom("AgentEvidence".into()),
+                b"evidencia".to_vec(),
+            );
+            evidencia.embedding = Some(heraclitus_core::ProductPoint {
+                hyp: vec![0.055, 0.025],
+                sph: vec![],
+                euc: vec![],
+            });
+            let lsn_evidencia = engine.append(evidencia).unwrap();
+
+            // O indice nao tem o AgentEvidence nem os episodios sem embedding.
+            let residentes = engine
+                .resident_vector_keys(0, engine.head(), &|_| Some(0.0))
+                .unwrap()
+                .unwrap();
+            assert_eq!(residentes.len(), 300 - 28, "{formato:?}");
+            assert!(residentes.iter().all(|(l, _)| *l != lsn_evidencia));
+
+            // ORACULO: a mesma distancia do planner, sobre todos os episodios
+            // do log, ordenada por (distancia, LSN), sem embedding no fim.
+            let q = [0.055f32, 0.025];
+            let k1 = ProductMetric::default().sig.k1;
+            let mut todas: Vec<(f64, Lsn)> = engine
+                .log
+                .scan_capped(0, engine.head(), usize::MAX)
+                .unwrap()
+                .into_iter()
+                .map(|(l, e)| {
+                    let d = e
+                        .embedding
+                        .as_ref()
+                        .filter(|p| p.hyp.len() == q.len())
+                        .map(|p| heraclitus_manifold::dist_hyp(&q, &p.hyp, -k1))
+                        .unwrap_or(f64::INFINITY);
+                    (d, l)
+                })
+                .collect();
+            todas.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            let esperado: Vec<u64> = todas.iter().take(5).map(|(_, l)| *l).collect();
+            assert_eq!(esperado[0], lsn_evidencia, "montagem: o mais proximo");
+
+            let antes = engine.log.leituras_efectuadas();
+            let v = heraclitus_query::execute(
+                "MATCH (n) RETURN n ORDER BY DIST_HYP([0.055, 0.025]) ASC LIMIT 5",
+                &engine,
+            )
+            .unwrap();
+            let obtido: Vec<u64> = v
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["lsn"].as_u64().unwrap())
+                .collect();
+            assert_eq!(obtido, esperado, "{formato:?}");
+
+            // O varrimento antigo nao faz leituras pontuais; o atalho faz
+            // exactamente uma por linha devolvida.
+            if let (Some(antes), Some(depois)) = (antes, engine.log.leituras_efectuadas()) {
+                assert_eq!(depois - antes, 5, "{formato:?}");
+            }
+        }
+    }
+
+    /// Teto de memoria dos indices: com `reject_writes`, as escritas de
+    /// clientes (gRPC via `append_idempotent`, GQL `CREATE`) sao recusadas com
+    /// `ResourceExhausted` enquanto a ultima amostra estiver acima do teto; as
+    /// escritas internas continuam. Com `warn`, so sinaliza.
+    #[test]
+    fn teto_de_memoria_dos_indices_recusa_so_escritas_de_clientes() {
+        let abrir = |politica| {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = HeraclitusConfig {
+                data_dir: dir.path().to_path_buf(),
+                fsync: FsyncPolicy::Always,
+                storage_format: heraclitus_core::StorageFormat::V6,
+                index_memory_budget_bytes: Some(1),
+                index_memory_policy: politica,
+                ..Default::default()
+            };
+            (Engine::open(&cfg).unwrap(), dir)
+        };
+        let episodio =
+            |i: u32| Episode::new("ag", EventKind::Observation, format!("e{i}").into_bytes());
+
+        let (engine, _dir) = abrir(heraclitus_core::IndexMemoryPolicy::RejectWrites);
+        // Escrita interna: nunca passa pelo teto.
+        engine.append(episodio(0)).unwrap();
+        let amostra = engine.amostrar_memoria_dos_indices();
+        assert!(amostra.total() > 1, "{amostra:?}");
+        assert!(amostra.over_budget());
+        assert!(matches!(
+            engine.append_idempotent(episodio(1), "chave-1"),
+            Err(HeraclitusError::ResourceExhausted(_))
+        ));
+        assert!(matches!(
+            heraclitus_query::execute("CREATE (n:Nota {texto: \"x\"})", &engine),
+            Err(HeraclitusError::ResourceExhausted(_))
+        ));
+        engine.append(episodio(2)).unwrap();
+        // Métricas e /stats publicam a amostra.
+        let prometheus = engine.prometheus_metrics().unwrap();
+        assert!(prometheus.contains("heraclitus_index_resident_bytes{index=\"vector\"}"));
+        assert!(prometheus.contains("heraclitus_index_memory_over_budget 1"));
+        assert_eq!(engine.stats()["index_memory"]["budget"], 1);
+
+        let (engine, _dir) = abrir(heraclitus_core::IndexMemoryPolicy::Warn);
+        engine.append(episodio(0)).unwrap();
+        assert!(engine.amostrar_memoria_dos_indices().over_budget());
+        engine.append_idempotent(episodio(1), "chave-1").unwrap();
+        assert!(engine.verificar_teto_de_memoria().is_ok());
+        heraclitus_query::execute("CREATE (n:Nota {texto: \"x\"})", &engine).unwrap();
+    }
+
+    /// Soak nightly de 20/10/2026: `WHERE n.agent_id = "x"` sai do indice de
+    /// atributos v8 (`_agent` + `_agent_ev`), com as evidencias desse agente
+    /// incluidas e o LIMIT empurrado para a hidratacao.
+    #[test]
+    fn agent_id_sai_do_indice_e_inclui_as_evidencias_do_agente() {
+        for formato in [
+            heraclitus_core::StorageFormat::Legacy,
+            HeraclitusConfig::default().storage_format,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = HeraclitusConfig {
+                data_dir: dir.path().to_path_buf(),
+                fsync: FsyncPolicy::Always,
+                storage_format: formato,
+                ..Default::default()
+            };
+            let engine = Engine::open(&cfg).unwrap();
+            let agentes = ["ana", "bia", "eva"];
+            for i in 0..200usize {
+                let kind = if i % 10 == 0 {
+                    EventKind::Custom("AgentEvidence".into())
+                } else {
+                    EventKind::Observation
+                };
+                engine
+                    .append(Episode::new(
+                        agentes[i % agentes.len()],
+                        kind,
+                        format!("e{i}").into_bytes(),
+                    ))
+                    .unwrap();
+            }
+
+            // ORACULO: o log inteiro, filtrado a mao.
+            let esperado: Vec<(u64, bool)> = engine
+                .log
+                .scan_capped(0, engine.head(), usize::MAX)
+                .unwrap()
+                .into_iter()
+                .filter(|(_, e)| e.agent_id == "ana")
+                .map(|(l, e)| {
+                    (
+                        l,
+                        matches!(&e.kind, EventKind::Custom(k) if k == "AgentEvidence"),
+                    )
+                })
+                .collect();
+            assert!(
+                esperado.iter().any(|(_, evidencia)| *evidencia),
+                "montagem: a ana tem evidencias"
+            );
+
+            let lsns = |gql: &str| -> Vec<u64> {
+                heraclitus_query::execute(gql, &engine)
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|r| r["lsn"].as_u64().unwrap())
+                    .collect()
+            };
+            let todos: Vec<u64> = esperado.iter().map(|(l, _)| *l).collect();
+            assert_eq!(
+                lsns("MATCH (n) WHERE n.agent_id = \"ana\" RETURN n"),
+                todos,
+                "{formato:?}"
+            );
+
+            // O skip-scan nao faz leituras pontuais; o indice faz uma por linha.
+            let antes = engine.log.leituras_efectuadas();
+            assert_eq!(
+                lsns("MATCH (n) WHERE n.agent_id = \"ana\" RETURN n LIMIT 4"),
+                todos[..4].to_vec(),
+                "{formato:?}"
+            );
+            if let (Some(antes), Some(depois)) = (antes, engine.log.leituras_efectuadas()) {
+                assert_eq!(depois - antes, 4, "{formato:?}");
+            }
+
+            // Frames H-VM nao passam pelo indice: esse agente varre.
+            assert!(engine
+                .builtin_eq_lsns("agent_id", vm_bridge::HVM_AGENT, None)
+                .unwrap()
+                .is_none());
+            assert!(engine
+                .builtin_eq_lsns("session_id", "s", None)
+                .unwrap()
+                .is_none());
+
+            // Um cliente nao pode forjar o pseudo-campo das evidencias.
+            let mut forjado = Episode::new("eva", EventKind::Observation, b"f".to_vec());
+            forjado.attrs.insert(
+                heraclitus_index_attr::AGENT_EVIDENCE_FIELD.into(),
+                "ana".into(),
+            );
+            assert!(engine.append(forjado).is_err());
+        }
     }
 
     /// A guarda ao nivel do backend, sem passar pelo planner: um campo que o

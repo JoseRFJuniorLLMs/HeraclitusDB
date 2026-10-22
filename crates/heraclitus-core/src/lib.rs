@@ -20,6 +20,7 @@ pub mod format_version;
 pub mod hlc;
 pub mod id;
 pub mod ir;
+pub mod memoria;
 pub mod numa;
 pub mod runtime;
 pub mod sandbox;
@@ -30,9 +31,9 @@ pub mod vm;
 pub use canonical::CanonicalKeyCodec;
 pub use capability::CapabilityCatalog;
 pub use config::{
-    AccessCredential, AccessRole, CursorPolicy, FsyncPolicy, HeraclitusConfig, RaftTransport,
-    ReplicationConfig, SentinelConfig, SentinelL1Config, SentinelL2Config, SentinelL3Config,
-    SentinelMode, SentinelRecoveryConfig, SentinelThreatConfig, StorageFormat,
+    AccessCredential, AccessRole, CursorPolicy, FsyncPolicy, HeraclitusConfig, IndexMemoryPolicy,
+    RaftTransport, ReplicationConfig, SentinelConfig, SentinelL1Config, SentinelL2Config,
+    SentinelL3Config, SentinelMode, SentinelRecoveryConfig, SentinelThreatConfig, StorageFormat,
 };
 pub use consistency::IsolationLevel;
 pub use error::HeraclitusError;

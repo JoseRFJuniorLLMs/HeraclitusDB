@@ -125,6 +125,34 @@ pub fn agente_indexavel(agent_id: &str) -> bool {
 /// nenhum.
 pub const IDEMPOTENCY_KEY_FIELD: &str = "__heraclitus_idempotency_key";
 
+/// O hash canónico do payload que o `Engine` grava ao lado da chave de
+/// idempotência. É lido do PRÓPRIO episódio (depois de a chave dar o LSN) e
+/// nunca procurado por valor, por isso não entra no índice: era um valor único
+/// de 64 hex por evento, com dicionário e posting próprios. Uma consulta por
+/// este campo recua para o varrimento (`conhece_campo` diz que não).
+pub const IDEMPOTENCY_HASH_FIELD: &str = "__heraclitus_idempotency_hash";
+
+/// Pseudo-campo com o `agent_id` dos `AgentEvidence`, que a SPEC-0085 mantém
+/// fora do `_agent` (e de todo o envelope genérico).
+///
+/// Sem ele, `MATCH (n) WHERE n.agent_id = "x"` não podia responder pelo índice:
+/// o `_agent` não vê as evidências desse agente e a consulta tinha de varrer o
+/// log inteiro (soak nightly de 20/10/2026: 23 → 557 ms de p50 entre 9,6 mil e
+/// 81,8 mil eventos). É UM posting por evidência, o mesmo custo da excepção
+/// que a chave de idempotência já tem — não o envelope de alta cardinalidade.
+/// Fica separado do `_agent` para o relatório do titular (LGPD) não mudar.
+pub const AGENT_EVIDENCE_FIELD: &str = "_agent_ev";
+
+/// Os pseudo-campos do envelope: nunca vêm de `event.attrs` (o `Engine`
+/// recusa-os na ingestão e o replay ignora-os em logs antigos).
+pub const PSEUDO_CAMPOS: [&str; 3] = ["_agent", "_kind", AGENT_EVIDENCE_FIELD];
+
+/// O `agent_id` aparado como o índice o guarda, se couber nele.
+fn agente_do_envelope(event: &Episode) -> Option<&str> {
+    let a = event.agent_id.trim();
+    (!a.is_empty() && a.len() <= MAX_VALUE_LEN).then_some(a)
+}
+
 /// A chave de idempotência do episódio, tal como o índice a guarda (aparada),
 /// se a tiver. Ignora só o que nunca pode ser uma chave válida (vazio ou acima
 /// de MAX_VALUE_LEN — o `Engine` recusa chaves com mais de 80 caracteres).
@@ -193,9 +221,16 @@ const FORMAT_V5_SEM_CRC: u16 = 5;
 /// adulteração deliberada fica fora deste fix.
 ///
 /// **v7**: separa os pseudo-campos do envelope dos atributos do cliente.
+/// **v8**: acrescenta `_agent_ev` (o agente dos `AgentEvidence`). Um índice
+/// v7 não tem esse posting para as evidências antigas, e o `Engine` toma
+/// `_agent ∪ _agent_ev` como o conjunto COMPLETO de candidatos de
+/// `agent_id = x`; por isso o v7 também é recusado.
+/// **v9**: deixa de indexar `__heraclitus_idempotency_hash` (ver
+/// `IDEMPOTENCY_HASH_FIELD`). Um v8 teria postings desse campo só para os
+/// eventos antigos — uma resposta parcial —, por isso também é recusado.
 /// Todos os formatos anteriores são recusados e reconstruídos do log.
 /// O log canônico permanece inalterado; há um replay no primeiro arranque.
-const FORMAT_CURRENT: u16 = 7;
+const FORMAT_CURRENT: u16 = 9;
 
 #[cfg(test)]
 mod regressions_g6 {
@@ -364,6 +399,14 @@ impl Default for StringDictionary {
 }
 
 impl StringDictionary {
+    fn resident_bytes(&self) -> u64 {
+        use heraclitus_core::memoria::{de_hashmap, de_vec};
+        de_vec::<Box<str>>(self.strings.capacity())
+            + self.strings.iter().map(|s| s.len() as u64).sum::<u64>()
+            + de_hashmap::<u64, NonZeroU32>(self.heads.capacity())
+            + de_vec::<Option<NonZeroU32>>(self.next_collision.capacity())
+    }
+
     #[inline]
     fn link(id: u32) -> NonZeroU32 {
         // `intern` never permits id == u32::MAX.
@@ -916,6 +959,33 @@ impl AttrIndex {
         self.inner.dictionary.fields.id(field).is_some()
     }
 
+    /// Bytes residentes, estimados pelas capacidades (ver
+    /// `heraclitus_core::memoria`). O(chaves): para amostragem periódica.
+    pub fn resident_bytes(&self) -> u64 {
+        use heraclitus_core::memoria::{de_btree, de_hashmap, de_vec};
+        let s = &self.inner;
+        let exactos = de_hashmap::<AttrKey, Vec<Lsn>>(s.exact.capacity())
+            + s.exact
+                .values()
+                .map(|postings| de_vec::<Lsn>(postings.capacity()))
+                .sum::<u64>();
+        let numericos = de_hashmap::<u32, BTreeMap<u64, Vec<Lsn>>>(s.numeric.capacity())
+            + s.numeric
+                .values()
+                .map(|mapa| {
+                    de_btree::<u64, Vec<Lsn>>(mapa.len())
+                        + mapa
+                            .values()
+                            .map(|postings| de_vec::<Lsn>(postings.capacity()))
+                            .sum::<u64>()
+                })
+                .sum::<u64>();
+        s.dictionary.fields.resident_bytes()
+            + s.dictionary.values.resident_bytes()
+            + exactos
+            + numericos
+    }
+
     /// LSNs (ordenados) dos eventos cujo `field == value`. Vazio se nada bate.
     pub fn lookup(&self, field: &str, value: &str) -> &[Lsn] {
         self.inner
@@ -924,6 +994,29 @@ impl AttrIndex {
             .and_then(|key| self.inner.exact.get(&key))
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Todos os LSNs cujo `agent_id`, aparado, é `agente`: o `_agent` dos
+    /// eventos gerais mais o `_agent_ev` das evidências, ordenados e sem
+    /// duplicados. Um SUPERCONJUNTO do `agent_id == agente` exacto (um
+    /// `" ana "` gravado aparece em `"ana"`); quem pergunta revalida.
+    ///
+    /// `None` quando o valor nunca podia ter sido indexado (vazio, com espaço
+    /// nas pontas, ou acima de MAX_VALUE_LEN): aí "vazio" não quereria dizer
+    /// "não há", e quem pergunta tem de varrer. Os frames H-VM (`agent_id =
+    /// "hvm"`) não passam por este índice; a decisão sobre eles é do `Engine`.
+    pub fn lsns_do_agente(&self, agente: &str) -> Option<Vec<Lsn>> {
+        if agente != agente.trim() || agente.is_empty() || agente.len() > MAX_VALUE_LEN {
+            return None;
+        }
+        let gerais = self.lookup("_agent", agente);
+        let evidencias = self.lookup(AGENT_EVIDENCE_FIELD, agente);
+        let mut lsns = Vec::with_capacity(gerais.len() + evidencias.len());
+        lsns.extend_from_slice(gerais);
+        lsns.extend_from_slice(evidencias);
+        lsns.sort_unstable();
+        lsns.dedup();
+        Some(lsns)
     }
 
     /// LSNs (ordenados, sem duplicados) dos eventos cujo valor NUMÉRICO de
@@ -1293,13 +1386,17 @@ impl View for AttrIndex {
         // gaining any application-query capability. Consume the LSN so boot
         // does not replay it forever, but create no generic postings.
         if matches!(&event.kind, EventKind::Custom(kind) if kind == "AgentEvidence") {
-            // Excepção única: a chave de idempotência. Sem ela, um `Append`
-            // idempotente de `AgentEvidence` nunca reconhecia o retry e
-            // duplicava (auditoria recursiva 2026-10-03, iteração 1). É um
-            // posting por append idempotente — não o envelope de alta
-            // cardinalidade que a SPEC-0085 quer manter fora daqui.
+            // Duas excepções, um posting cada. A chave de idempotência: sem
+            // ela, um `Append` idempotente de `AgentEvidence` nunca reconhecia
+            // o retry e duplicava (auditoria recursiva 2026-10-03, iteração 1).
+            // E o agente, sob `_agent_ev` (ver `AGENT_EVIDENCE_FIELD`). Nenhuma
+            // delas é o envelope de alta cardinalidade que a SPEC-0085 quer
+            // manter fora daqui.
             if let Some(chave) = chave_de_idempotencia(event) {
                 self.inner.upsert_exact(IDEMPOTENCY_KEY_FIELD, chave, lsn);
+            }
+            if let Some(agente) = agente_do_envelope(event) {
+                self.inner.upsert_exact(AGENT_EVIDENCE_FIELD, agente, lsn);
             }
             self.inner.watermark = self.inner.watermark.max(lsn);
             self.inner.applied = true;
@@ -1325,11 +1422,8 @@ impl View for AttrIndex {
         // O prefixo `_` evita colisão com um atributo de utilizador chamado
         // "agent": as chaves de utilizador vêm de `event.attrs`, que nunca
         // produz `_agent`.
-        {
-            let a = event.agent_id.trim();
-            if !a.is_empty() && a.len() <= MAX_VALUE_LEN {
-                self.inner.upsert_exact("_agent", a, lsn);
-            }
+        if let Some(a) = agente_do_envelope(event) {
+            self.inner.upsert_exact("_agent", a, lsn);
         }
 
         // O `kind` entra como pseudo-atributo sob a chave reservada `_kind`,
@@ -1360,7 +1454,7 @@ impl View for AttrIndex {
 
         for (field, value) in &event.attrs {
             // Também no replay: logs anteriores podem ter atributos forjados.
-            if matches!(field.as_str(), "_agent" | "_kind") {
+            if PSEUDO_CAMPOS.contains(&field.as_str()) || field == IDEMPOTENCY_HASH_FIELD {
                 continue;
             }
             let v = value.trim();
@@ -1554,14 +1648,67 @@ mod tests {
         e.attrs.insert("agent.tool".into(), "exec".into());
         idx.apply(77, &e);
         assert_eq!(idx.watermark(), 77);
+        // A única chave é o agente sob `_agent_ev` (um posting por evidência,
+        // para `agent_id = x` não varrer o log); o envelope fica de fora.
         assert_eq!(
             idx.keys(),
-            0,
+            1,
             "Agent evidence must stay out of generic AttrIndex"
         );
+        assert_eq!(idx.lookup(AGENT_EVIDENCE_FIELD, "hostile-agent"), &[77]);
         assert!(idx.lookup("agent.tool", "exec").is_empty());
+        assert!(idx
+            .lookup("agent.evidence_id", "unique-high-cardinality")
+            .is_empty());
         assert!(idx.lookup("_agent", "hostile-agent").is_empty());
         assert!(idx.lookup("_kind", "AgentEvidence").is_empty());
+    }
+
+    /// O hash de idempotência fica fora do índice (v9); a chave continua, e o
+    /// campo do hash é desconhecido — uma consulta por ele varre o log.
+    #[test]
+    fn hash_de_idempotencia_nao_entra_no_indice() {
+        let mut idx = AttrIndex::new();
+        let mut e = Episode::new("ana", EventKind::Observation, vec![]);
+        e.attrs
+            .insert(IDEMPOTENCY_KEY_FIELD.into(), "pedido-1".into());
+        e.attrs
+            .insert(IDEMPOTENCY_HASH_FIELD.into(), "ab".repeat(32));
+        e.attrs.insert("cor".into(), "azul".into());
+        idx.apply(0, &e);
+        assert_eq!(idx.lookup(IDEMPOTENCY_KEY_FIELD, "pedido-1"), &[0]);
+        assert_eq!(idx.lookup("cor", "azul"), &[0]);
+        assert!(idx
+            .lookup(IDEMPOTENCY_HASH_FIELD, &"ab".repeat(32))
+            .is_empty());
+        assert!(!idx.conhece_campo(IDEMPOTENCY_HASH_FIELD));
+    }
+
+    /// `lsns_do_agente` junta `_agent` e `_agent_ev`, ordenado e sem
+    /// duplicados, e recusa ("varre") valores que o índice nunca guardaria.
+    #[test]
+    fn lsns_do_agente_cobre_eventos_e_evidencias() {
+        let mut idx = AttrIndex::new();
+        let evidencia =
+            |agente: &str| Episode::new(agente, EventKind::Custom("AgentEvidence".into()), vec![]);
+        idx.apply(3, &Episode::new("ana", EventKind::Observation, vec![]));
+        idx.apply(1, &evidencia("ana"));
+        idx.apply(2, &Episode::new(" ana ", EventKind::Observation, vec![]));
+        idx.apply(4, &Episode::new("bia", EventKind::Observation, vec![]));
+        idx.apply(5, &evidencia("bia"));
+        // Um atributo forjado com o nome do pseudo-campo não cria posting.
+        let mut forjado = Episode::new("eva", EventKind::Observation, vec![]);
+        forjado
+            .attrs
+            .insert(AGENT_EVIDENCE_FIELD.into(), "ana".into());
+        idx.apply(6, &forjado);
+
+        assert_eq!(idx.lsns_do_agente("ana"), Some(vec![1, 2, 3]));
+        assert_eq!(idx.lsns_do_agente("bia"), Some(vec![4, 5]));
+        assert_eq!(idx.lsns_do_agente("ninguem"), Some(vec![]));
+        assert_eq!(idx.lsns_do_agente(" ana"), None);
+        assert_eq!(idx.lsns_do_agente(""), None);
+        assert_eq!(idx.lsns_do_agente(&"x".repeat(MAX_VALUE_LEN + 1)), None);
     }
 
     /// Auditoria recursiva 2026-10-03, iteração 1: a chave de idempotência é
@@ -1900,6 +2047,25 @@ mod compressao_tests {
         );
         // Mata a mutacao "gravar um CRC constante/zero".
         assert_ne!(crc_gravado, 0, "CRC de um corpo real nao e zero");
+    }
+
+    /// Um v7 íntegro não tem `_agent_ev` para as evidências antigas, e o
+    /// `Engine` toma `_agent ∪ _agent_ev` como completo: tem de ser recusado e
+    /// reconstruído do log, não aceite com o buraco.
+    #[test]
+    fn checkpoint_v7_sem_agent_ev_exige_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        indice_com(100).save(dir.path()).unwrap();
+        let caminho = dir.path().join(SNAPSHOT_FILE);
+        let mut bytes = std::fs::read(&caminho).unwrap();
+        bytes[4..6].copy_from_slice(&7u16.to_le_bytes());
+        let crc = crc32_ieee(&[&bytes[4..6], &bytes[CABECALHO_V6..]]);
+        bytes[6..10].copy_from_slice(&crc.to_le_bytes());
+        std::fs::write(&caminho, bytes).unwrap();
+
+        let (lido, status) = AttrIndex::open_reportando(dir.path());
+        assert_eq!(status, AberturaCheckpoint::Ilegivel);
+        assert!(!lido.has_applied());
     }
 
     /// Checkpoints sem o isolamento de pseudo-campos exigem replay.

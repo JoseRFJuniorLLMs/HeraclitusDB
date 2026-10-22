@@ -338,8 +338,10 @@ impl PoliticaRest {
         //    coincidir com o do principal a que o token pertence — senao o campo
         //    do utilizador seria decorativo e o registo de auditoria passaria a
         //    poder mentir sobre quem chamou.
-        if let Some(auth) = self.autenticador.as_ref().filter(|a| a.tem_papeis()) {
-            // Com papeis configurados NAO ha via aberta: ou a credencial e
+        if let Some(auth) = self.autenticador.as_ref().filter(|a| a.is_required()) {
+            // Qualquer credencial configurada, incluindo auth_token, fecha a
+            // via aberta. O token legado usa o principal `legacy-admin`.
+            // Com autenticacao configurada ou a credencial e
             // valida, ou recusa-se.
             return cabecalho
                 .and_then(basic_partes)
@@ -1791,7 +1793,7 @@ pub(crate) fn bytes_str(b: &[u8]) -> String {
 /// Chaves e valores são bytes: renderizados via [`hvm_bytes_str`] (UTF-8 legível
 /// quando possível, senão `hex:…`), mais os LSNs de consistência.
 fn hvm_state_json(engine: &Engine) -> Result<serde_json::Value, String> {
-    let state = engine.hvm_state().map_err(|e| format!("hvm: {e}"))?;
+    let state = engine.hvm_state_shared().map_err(|e| format!("hvm: {e}"))?;
     let entries: serde_json::Map<String, serde_json::Value> = state
         .memory_layers
         .iter()
@@ -3265,6 +3267,33 @@ mod rbac_tests {
     use super::*;
     use heraclitus_core::{AccessCredential, FsyncPolicy, HeraclitusConfig};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn token_legado_tambem_fecha_o_rest() {
+        let cfg = HeraclitusConfig {
+            auth_token: Some("token-de-teste".into()),
+            ..Default::default()
+        };
+        let auth = Arc::new(Authenticator::from_config(&cfg).unwrap());
+        let policy = PoliticaRest::nova(None, Some(auth.clone()));
+        assert!(auth.is_required());
+        assert!(policy.resolver(None).is_none());
+        for invalid in ["legacy-admin:wrong", "ana:token-de-teste", "legacy-admin:"] {
+            assert!(policy
+                .resolver(Some(&format!("Basic {}", b64(invalid.as_bytes()))))
+                .is_none());
+        }
+        let header = format!("Basic {}", b64(b"legacy-admin:token-de-teste"));
+        let principal = policy.resolver(Some(&header)).unwrap();
+        assert_eq!(principal.name, "legacy-admin");
+        assert!(principal.allows(AccessRole::Admin));
+        let both = PoliticaRest::nova(Some("rest:secret".into()), Some(auth));
+        assert!(both.resolver(None).is_none());
+        assert!(both.resolver(Some(&header)).is_some());
+        assert!(both
+            .resolver(Some(&format!("Basic {}", b64(b"rest:secret"))))
+            .is_some());
+    }
 
     /// O defeito que estes testes fecham: o gRPC exigia um papel em cada
     /// operacao (`auth::require`) e o REST nao tinha autorizacao NENHUMA — uma
