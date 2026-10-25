@@ -293,12 +293,22 @@ mod tests {
     use heraclitus_core::{EventKind, FsyncPolicy, HeraclitusConfig};
     use std::collections::BTreeMap;
 
-    /// Um endereço TCP livre em `127.0.0.1` (bind efémero + release). Damos os
-    /// endereços à membership ANTES de os nós religarem — a janela é mínima em
-    /// localhost.
+    /// Um endereço TCP livre em `127.0.0.1`. Damos os endereços à membership
+    /// ANTES de os nós os abrirem, por isso a porta não pode vir do `bind(0)`:
+    /// entre o release e o bind do nó, outro teste em paralelo recebia a mesma
+    /// porta efémera (`AddrInUse` no CI). As portas saem de 20000..30000, abaixo
+    /// das gamas efémeras (Linux 32768+, Windows/macOS 49152+), por um contador
+    /// do processo; o `bind` só confirma que nenhum outro processo a tem.
     fn free_addr() -> String {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().to_string()
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let offset = (std::process::id() % 500) * 20;
+        loop {
+            let port = 20_000 + (offset + NEXT.fetch_add(1, Ordering::Relaxed)) % 10_000;
+            if let Ok(l) = std::net::TcpListener::bind(("127.0.0.1", port as u16)) {
+                return l.local_addr().unwrap().to_string();
+            }
+        }
     }
 
     fn obs(agent: &str, body: &str) -> Episode {
