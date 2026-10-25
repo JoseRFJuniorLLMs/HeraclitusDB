@@ -7509,6 +7509,7 @@ mod regulatory_entrypoint_tests {
             &serde_json::to_string(&activation).unwrap(),
         );
         assert!(ok, "{message}");
+        let mut ancora_curta_ms = None;
         for (agente, kind) in [(longa, "IncidentRecord"), (curta, "ShortIncident")] {
             let context = ComplianceContext {
                 subject_id: agente.into(),
@@ -7528,11 +7529,14 @@ mod regulatory_entrypoint_tests {
                 &request.to_string(),
             );
             assert!(ok, "{decision}");
+            let decision = serde_json::from_str::<serde_json::Value>(&decision).unwrap();
             assert_eq!(
-                serde_json::from_str::<serde_json::Value>(&decision).unwrap()["decision"]
-                    ["requirements"][0]["effect"]["effect"],
+                decision["decision"]["requirements"][0]["effect"]["effect"],
                 "retain_for_seconds"
             );
+            if agente == curta {
+                ancora_curta_ms = engine.ts_ms(decision["lsn"].as_u64().unwrap());
+            }
         }
 
         let erro = engine
@@ -7540,11 +7544,40 @@ mod regulatory_entrypoint_tests {
             .expect_err("a retenção de um ano tem de bloquear o crypto-shred");
         assert!(erro.to_string().contains("retenção"), "{erro}");
 
-        std::thread::sleep(std::time::Duration::from_millis(1_200));
-        assert!(
-            engine.shred(curta).unwrap(),
-            "expirada a janela, a retenção deixa de vetar"
-        );
+        // A janela ancora no carimbo HLC da avaliação e o veto compara-o com o
+        // relógio de parede. Um sleep fixo de 1,2 s falhava ~1 vez em 20 no
+        // WSL2, onde o NTP faz o relógio recuar ~1,35 s: o carimbo ficava à
+        // frente do relógio e a janela ainda não tinha expirado (o veto estava
+        // certo; recuar o relógio só prolonga a retenção). Espera-se pelo mesmo
+        // critério da produção e tenta-se de novo se o relógio recuar entre a
+        // leitura daqui e a do shred.
+        let expira_ms = ancora_curta_ms.expect("carimbo da avaliação curta") + 1_000;
+        let agora_ms = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+        };
+        let limite = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if agora_ms() >= expira_ms {
+                match engine.shred(curta) {
+                    Ok(destruida) => {
+                        assert!(destruida, "expirada a janela, a retenção deixa de vetar");
+                        break;
+                    }
+                    Err(erro) if erro.to_string().contains("retenção") => {}
+                    Err(erro) => {
+                        panic!("expirada a janela, o shred falhou por outra razão: {erro}")
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < limite,
+                "a retenção de 1 s continuou a vetar 30 s depois da avaliação"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         assert!(
             engine.shred(longa).is_err(),
             "a retenção longa continua a vetar"
