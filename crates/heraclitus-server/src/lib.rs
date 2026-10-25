@@ -9,6 +9,7 @@ pub mod boot;
 pub mod cluster; // SPEC-015/021: wiring do consenso Raft (nó de cluster sobre o log)
 pub mod embedded;
 pub mod engine;
+pub mod external_intent;
 #[cfg(feature = "analytics")]
 pub mod flight_grpc; // SPEC-016: protocolo Arrow Flight real (gRPC, tonic 0.14)
 pub mod grpc;
