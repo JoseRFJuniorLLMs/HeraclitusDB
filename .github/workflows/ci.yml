@@ -121,9 +121,74 @@ jobs:
             echo "$fora"
             exit 1
           fi
+      - name: prove P-256 private keys stay in the dev signers
+        shell: bash
+        run: |
+          # RUSTSEC-2026-0387: operacoes do crypto-bigint 0.5.5 que deviam ser
+          # de tempo constante podem ramificar em dados secretos. Corrigido so
+          # no 0.7.6, que exige migrar o p256 0.13 -> 0.14 (PR proprio).
+          # Excecao TEMPORARIA, legitima enquanto:
+          #   1. o crypto-bigint 0.5.5 so chegar pelo p256 (verificacao de
+          #      assinaturas usa so dados publicos);
+          #   2. as unicas chaves privadas P-256 viverem no SoftKeySigner e no
+          #      LocalTsa (ambos marcados como so de desenvolvimento; producao
+          #      assina no HSM via PKCS#11) e no test_pki, atras de #[cfg(test)]
+          #      (conferido no passo do RSA acima).
+          # Quando o 0.5.5 sair do grafo este passo falha de proposito: retire
+          # a excecao e o --ignore em vez de os deixar envelhecer.
+          if ! caminho=$(cargo tree --workspace --all-features -i crypto-bigint@0.5.5 \
+                           --edges normal,build --prefix none 2>/dev/null); then
+            echo "crypto-bigint 0.5.5 saiu do grafo: retire a excecao RUSTSEC-2026-0387"
+            exit 1
+          fi
+          outros=$(echo "$caminho" | sed 's/ (\*)$//' | sort -u \
+                   | grep -v -E '^(crypto-bigint|elliptic-curve|ecdsa|primeorder|p256|heraclitus-[a-z-]+) v' || true)
+          if [ -n "$outros" ]; then
+            echo "crypto-bigint 0.5.5 chega por um caminho que nao e o p256:"
+            echo "$outros"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import pathlib, re, sys
+          # Ficheiro -> unico item onde a chave privada pode aparecer (None: cfg(test)).
+          allowed = {
+              "crates/heraclitus-compliance/src/signer.rs": "SoftKeySigner",
+              "crates/heraclitus-compliance/src/tsa.rs": "LocalTsa",
+              "crates/heraclitus-compliance/src/test_pki.rs": None,
+          }
+          curve = re.compile(r"\b(p256|p384|p521|k256|elliptic_curve|ecdsa)\b")
+          private = re.compile(r"\b(SigningKey|SecretKey|NonZeroScalar|ecdh)\b")
+          item = re.compile(
+              r"^(?:pub(?:\([^)]*\))? )?(?:(?:struct|enum|fn|mod|trait|const|static|type)\s+(\w+)"
+              r"|impl(?:<[^>]*>)?\s+(?:[\w:<>, ]+\s+for\s+)?(\w+))"
+          )
+          bad = []
+          for path in sorted(pathlib.Path("crates").rglob("*.rs")) + sorted(pathlib.Path("tools").rglob("*.rs")):
+              rel = path.as_posix()
+              text = path.read_text(encoding="utf-8").replace("\r", "")
+              if not (curve.search(text) and private.search(text)):
+                  continue
+              if rel not in allowed:
+                  bad.append(f"{rel}: chave privada de curva eliptica fora de SoftKeySigner/LocalTsa/test_pki")
+                  continue
+              owner, current = allowed[rel], None
+              if owner is None:
+                  continue
+              for number, line in enumerate(text.splitlines(), 1):
+                  found = item.match(line)
+                  if found:
+                      current = found.group(1) or found.group(2)
+                  if private.search(line) and not line.startswith("use ") and current != owner:
+                      bad.append(f"{rel}:{number}: fora de {owner}: {line.strip()}")
+          if bad:
+              print("RUSTSEC-2026-0387 passa a ser exploravel:")
+              print("\n".join(bad))
+              sys.exit(1)
+          PY
       - name: RustSec — deny every finding except documented risk acceptances
         run: >-
           cargo audit --deny warnings
+          --ignore RUSTSEC-2026-0387
           --ignore RUSTSEC-2026-0235
           --ignore RUSTSEC-2025-0141
           --ignore RUSTSEC-2024-0436
