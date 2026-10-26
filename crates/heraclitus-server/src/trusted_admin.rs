@@ -343,6 +343,27 @@ impl Default for TrustedAdminProtocol {
 }
 
 impl TrustedAdminProtocol {
+    /// Only a durable successful result is an external authorization receipt.
+    /// Scoped by the authenticated identity; incomplete writes fail closed.
+    pub(crate) fn external_value(
+        &self,
+        ctx: &AdminContext,
+        id: &str,
+    ) -> Result<Option<serde_json::Value>, HeraclitusError> {
+        let key = serde_json::to_string(&(&ctx.tenant, &ctx.principal, id)).unwrap();
+        let journal = self
+            .journal
+            .lock()
+            .map_err(|_| HeraclitusError::Config("admin journal unavailable".into()))?;
+        match journal.get(&key) {
+            None => Ok(None),
+            Some(record) if record.estado() == AdminState::Succeeded => Ok(record.result.clone()),
+            Some(_) => Err(HeraclitusError::Config(
+                "external authorization UNKNOWN or failed; reconcile administrative journal".into(),
+            )),
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             idempotency_map: Mutex::new(HashMap::new()),

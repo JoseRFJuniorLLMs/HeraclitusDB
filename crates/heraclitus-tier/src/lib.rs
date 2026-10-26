@@ -110,6 +110,7 @@ pub struct ColdTier {
     /// de backend é configuração — os paths `cold/{id}.hrkl` são relativos ao
     /// prefixo/bucket configurado.
     store: Arc<dyn ObjectStore>,
+    keystore: Option<Arc<heraclitus_crypto::KeyStore>>,
 }
 
 impl ColdTier {
@@ -121,6 +122,7 @@ impl ColdTier {
             .map_err(|e| HeraclitusError::Storage(std::io::Error::other(e)))?;
         Ok(Self {
             store: Arc::new(store),
+            keystore: None,
         })
     }
 
@@ -138,7 +140,14 @@ impl ColdTier {
     pub fn open_location(location: &str) -> Result<Self, HeraclitusError> {
         Ok(Self {
             store: Self::store_for(location)?,
+            keystore: None,
         })
+    }
+
+    /// Use the same key authority and crypto-shred semantics as the hot log.
+    pub fn with_keystore(mut self, keystore: Option<Arc<heraclitus_crypto::KeyStore>>) -> Self {
+        self.keystore = keystore;
+        self
     }
 
     /// O backend por trás de [`Self::open_location`], sem o invólucro do tier
@@ -497,12 +506,28 @@ impl ColdTier {
         visit_records(&bytes, &mut |lsn, payload, _record| {
             // O descodificador canónico vive no log e é versionado: v3 traz
             // StoragePayload; v<=2 (pré-M30) é o Episode serializado direto.
-            let ep = decode_episode_payload(version, payload)?;
+            let mut ep = decode_episode_payload(version, payload)?;
+            decrypt_cold_episode(&mut ep, self.keystore.as_deref())?;
             out.push((lsn, ep));
             Ok(())
         })?;
         Ok(out)
     }
+}
+
+pub(crate) fn decrypt_cold_episode(
+    ep: &mut Episode,
+    keystore: Option<&heraclitus_crypto::KeyStore>,
+) -> Result<(), HeraclitusError> {
+    if keystore.is_none()
+        && (heraclitus_crypto::is_encrypted(&ep.content)
+            || ep.attrs.contains_key(heraclitus_log::ENCRYPTED_FIELDS_ATTR))
+    {
+        return Err(HeraclitusError::Crypto(
+            "encrypted cold recall requires the database keystore".into(),
+        ));
+    }
+    heraclitus_log::decrypt_storage_episode_in_place(ep, keystore)
 }
 
 fn hex(bytes: &[u8; 32]) -> String {

@@ -20,6 +20,21 @@ pub enum SentinelMode {
     Autonomous,
 }
 
+/// O que o servidor faz quando a memória dos índices passa do
+/// `index_memory_budget_bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexMemoryPolicy {
+    /// Só sinaliza: métrica `heraclitus_index_memory_over_budget` a 1 e aviso
+    /// no log. As escritas continuam.
+    #[default]
+    Warn,
+    /// Recusa appends com `ResourceExhausted` (gRPC `RESOURCE_EXHAUSTED`)
+    /// enquanto a última amostra estiver acima do teto, em vez de deixar o
+    /// processo crescer até o sistema o matar. Leituras continuam.
+    RejectWrites,
+}
+
 /// Configuration for the deterministic L1 rule plane.  The path is explicit:
 /// no globbing or implicit rules are loaded by the server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -384,6 +399,15 @@ pub struct HeraclitusConfig {
     pub fsync: FsyncPolicy,
     /// Memtable holds at most this many events above the view watermark.
     pub memtable_cap: usize,
+    /// Teto, em bytes, da memória dos índices residentes (views, índice de
+    /// atributos e memtable), medida por amostragem periódica. `None` (a
+    /// omissão) não põe teto: a memória é só reportada nas métricas.
+    pub index_memory_budget_bytes: Option<u64>,
+    /// O que fazer acima do teto. Ver [`IndexMemoryPolicy`].
+    pub index_memory_policy: IndexMemoryPolicy,
+    /// Intervalo da amostragem da memória dos índices, em segundos. A
+    /// amostragem percorre os índices sob o lock de leitura de cada um.
+    pub index_memory_sample_secs: u64,
     /// CPU budget for background compaction (distill).
     pub compaction_max_cores: usize,
     /// ACT-R decay parameter `d`.
@@ -713,6 +737,9 @@ impl Default for HeraclitusConfig {
             segment_max_bytes: 8 * 1024 * 1024,
             fsync: FsyncPolicy::default(),
             memtable_cap: 100_000,
+            index_memory_budget_bytes: None,
+            index_memory_policy: IndexMemoryPolicy::default(),
+            index_memory_sample_secs: 30,
             compaction_max_cores: 1,
             activation_decay: 0.5,
             grpc_addr: "127.0.0.1:7474".to_string(),

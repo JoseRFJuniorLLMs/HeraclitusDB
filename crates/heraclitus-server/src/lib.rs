@@ -9,6 +9,7 @@ pub mod boot;
 pub mod cluster; // SPEC-015/021: wiring do consenso Raft (nó de cluster sobre o log)
 pub mod embedded;
 pub mod engine;
+pub mod external_intent;
 #[cfg(feature = "analytics")]
 pub mod flight_grpc; // SPEC-016: protocolo Arrow Flight real (gRPC, tonic 0.14)
 pub mod grpc;
@@ -477,6 +478,26 @@ async fn serve_inner(
                     }
                 })
                 .await;
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Amostragem da memória dos índices (teto `index_memory_budget_bytes`):
+    // percorre cada índice sob o lock de leitura dele, por isso fica fora do
+    // caminho de escrita, como o checkpoint. A primeira amostra saiu do boot.
+    let memoria_task = if config.index_memory_sample_secs > 0 {
+        let engine_mem = engine.clone();
+        let every = std::time::Duration::from_secs(config.index_memory_sample_secs);
+        Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let e = engine_mem.clone();
+                let _ = tokio::task::spawn_blocking(move || e.amostrar_memoria_dos_indices()).await;
             }
         }))
     } else {
@@ -1249,6 +1270,9 @@ async fn serve_inner(
         t.abort();
     }
     if let Some(t) = checkpoint_task {
+        t.abort();
+    }
+    if let Some(t) = memoria_task {
         t.abort();
     }
     if let Some(runtime) = sentinel_runtime {

@@ -9,6 +9,7 @@
 //! stabilized remainder, then comparing that slope against a budget the
 //! operator declared in advance.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,7 +21,9 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 
 use crate::evidence::{sha256_file, write_bytes_new, write_json_new};
-use crate::load::{execute_operation, latency_summary, mix, operation, LatencySummary};
+use crate::load::{
+    execute_operation, latency_summary, mix, operation, LatencySummary, OperationKind,
+};
 use crate::manifest::WorkloadProfile;
 use crate::procstat::{self, ProcessSample};
 
@@ -43,6 +46,21 @@ pub struct SoakProfile {
     /// §20 budget. Growth beyond this over the stabilized window is
     /// "unbounded", not "expected cache growth".
     pub memory_growth_budget_bytes_per_hour: f64,
+    /// Optional second memory budget: RSS bytes per event the soak itself
+    /// retained (slope of RSS against `head`).
+    ///
+    /// A workload that keeps appending grows the in-memory indexes with every
+    /// event, so bytes per hour alone cannot tell "proportional to retained
+    /// data" from "leaking" — the nightly of 2026-10-20 failed the hourly
+    /// budget at a steady ~5 KiB per event. With this set, an RSS slope over
+    /// the hourly budget still passes when BOTH the whole stabilized window and
+    /// its second half stay within it. Memory that grows with a flat `head`
+    /// has no per-event slope and stays judged by the hourly budget alone.
+    ///
+    /// The long profiles leave it unset on purpose: over days the hourly
+    /// budget is what a bounded-memory design has to meet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_growth_budget_bytes_per_retained_event: Option<f64>,
     pub handle_growth_budget_per_hour: f64,
     pub thread_growth_budget_per_hour: f64,
     /// Ratio of final-window p99 to first-window p99 above which latency has
@@ -101,6 +119,42 @@ struct GrowthGate {
     samples_in_window: usize,
     samples_in_second_half: usize,
     within_budget: Option<bool>,
+    /// Resident set only: the per-retained-event budget, when the profile has
+    /// one (see `SoakProfile::memory_growth_budget_bytes_per_retained_event`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget_bytes_per_retained_event: Option<f64>,
+    /// Threads only: how many times the series set a new maximum after
+    /// stabilization.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_maxima_after_stabilization: Option<usize>,
+    /// Why a slope over the hourly budget was accepted, when it was. Never
+    /// silent: the slopes above stay in the report either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accepted_because: Option<&'static str>,
+}
+
+/// One workload lane across the run. Diagnostic only: it never changes the
+/// verdict. The overall p99 says latency drifted; this says which lane did,
+/// and `samples[].head` beside it says whether it tracks the data volume.
+#[derive(Debug, Serialize)]
+struct OperationLatency {
+    first_window: LatencySummary,
+    final_window: LatencySummary,
+    p99_drift_ratio: Option<f64>,
+    /// Aligned with `latency_windows`; a window without this lane has count 0.
+    windows: Vec<LatencySummary>,
+}
+
+/// Memory against the data the soak itself wrote. Diagnostic only. A workload
+/// that keeps appending grows in-memory indexes with every event, so bytes per
+/// hour alone cannot tell "proportional to retained data" from "leaking".
+#[derive(Debug, Serialize)]
+struct MemoryPerEvent {
+    /// Slope of RSS against `head` over the stabilized window.
+    resident_set_bytes_per_appended_event: Option<f64>,
+    /// The same slope over the final half of that window.
+    resident_set_bytes_per_appended_event_second_half: Option<f64>,
+    events_appended_in_window: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,7 +184,9 @@ struct SoakReport {
     latency_final_window: LatencySummary,
     latency_drift_ratio: Option<f64>,
     latency_within_budget: Option<bool>,
+    latency_by_operation: BTreeMap<&'static str, OperationLatency>,
     gates: Vec<GrowthGate>,
+    memory_per_event: MemoryPerEvent,
     integrity_ok: bool,
     integrity_message: String,
     samples: Vec<Sample>,
@@ -275,6 +331,169 @@ fn gate(
         samples_in_window,
         samples_in_second_half,
         within_budget,
+        budget_bytes_per_retained_event: None,
+        new_maxima_after_stabilization: None,
+        accepted_because: None,
+    }
+}
+
+/// The per-retained-event budget for the resident set (see
+/// `SoakProfile::memory_growth_budget_bytes_per_retained_event`). Only ever
+/// turns a failing verdict into a pass, and only with both halves measured.
+fn accept_rss_per_retained_event(
+    gate: &mut GrowthGate,
+    memory: &MemoryPerEvent,
+    budget: Option<f64>,
+) {
+    let Some(budget) = budget else {
+        return;
+    };
+    gate.budget_bytes_per_retained_event = Some(budget);
+    if gate.within_budget != Some(false) {
+        return;
+    }
+    if let (Some(whole), Some(tail)) = (
+        memory.resident_set_bytes_per_appended_event,
+        memory.resident_set_bytes_per_appended_event_second_half,
+    ) {
+        if whole <= budget && tail <= budget {
+            gate.within_budget = Some(true);
+            gate.accepted_because = Some(
+                "resident set grows no faster than the per-retained-event budget in either half",
+            );
+        }
+    }
+}
+
+/// §20 forbids continuous growth. The step rule in [`gate`] already lets a
+/// series that grew once and went flat pass — unless the step lands in the
+/// second half of the window, as the single 16→17 thread step of the
+/// 2026-10-20 nightly did. Counting new maxima tells one step from a trend
+/// wherever it falls. The step must also be small next to the stabilized
+/// level (at most a quarter of it, or 2): a single jump to hundreds of
+/// threads is not a pool settling.
+fn accept_single_small_step(
+    gate: &mut GrowthGate,
+    samples: &[Sample],
+    stabilization_seconds: f64,
+    extract: impl Fn(&ProcessSample) -> Option<u64>,
+) {
+    let mut values = samples
+        .iter()
+        .filter(|sample| sample.elapsed_seconds >= stabilization_seconds)
+        .filter_map(|sample| extract(&sample.process));
+    let Some(baseline) = values.next() else {
+        return;
+    };
+    let mut maximum = baseline;
+    let mut new_maxima = 0usize;
+    for value in values {
+        if value > maximum {
+            maximum = value;
+            new_maxima += 1;
+        }
+    }
+    gate.new_maxima_after_stabilization = Some(new_maxima);
+    let small = maximum - baseline <= (baseline / 4).max(2);
+    if gate.within_budget == Some(false) && new_maxima <= 1 && small {
+        gate.within_budget = Some(true);
+        gate.accepted_because = Some("a single small step after stabilization, then flat");
+    }
+}
+
+/// Summarise one drained window per lane.
+fn summarise_by_operation(
+    window: &[(OperationKind, u64)],
+) -> BTreeMap<OperationKind, LatencySummary> {
+    let mut lanes: BTreeMap<OperationKind, Vec<u64>> = BTreeMap::new();
+    for (kind, micros) in window {
+        lanes.entry(*kind).or_default().push(*micros);
+    }
+    lanes
+        .into_iter()
+        .map(|(kind, micros)| (kind, latency_summary(&micros)))
+        .collect()
+}
+
+/// Turn the per-window lane summaries into one aligned series per lane, with
+/// the same first/final-window choice the drift gate makes.
+fn latency_by_operation(
+    windows: &[BTreeMap<OperationKind, LatencySummary>],
+) -> BTreeMap<&'static str, OperationLatency> {
+    let kinds: std::collections::BTreeSet<OperationKind> = windows
+        .iter()
+        .flat_map(|window| window.keys().copied())
+        .collect();
+    kinds
+        .into_iter()
+        .map(|kind| {
+            let series: Vec<LatencySummary> = windows
+                .iter()
+                .map(|window| {
+                    window
+                        .get(&kind)
+                        .cloned()
+                        .unwrap_or_else(|| latency_summary(&[]))
+                })
+                .collect();
+            let empty = || latency_summary(&[]);
+            let first_window = series.first().cloned().unwrap_or_else(empty);
+            let final_window = series.last().cloned().unwrap_or_else(empty);
+            let p99_drift_ratio = (first_window.p99_ms > 0.0 && final_window.count > 0)
+                .then(|| final_window.p99_ms / first_window.p99_ms);
+            (
+                kind.as_str(),
+                OperationLatency {
+                    first_window,
+                    final_window,
+                    p99_drift_ratio,
+                    windows: series,
+                },
+            )
+        })
+        .collect()
+}
+
+/// RSS slope against `head` from `from_seconds` on, in bytes per event.
+fn rss_per_event(samples: &[Sample], from_seconds: f64) -> Option<f64> {
+    let (heads, rss): (Vec<f64>, Vec<f64>) = samples
+        .iter()
+        .filter(|sample| sample.elapsed_seconds >= from_seconds)
+        .filter_map(|sample| {
+            sample
+                .process
+                .rss_bytes
+                .map(|rss| (sample.head as f64, rss as f64))
+        })
+        .unzip();
+    // A flat head has no slope to fit: dividing memory by zero new events
+    // would print infinity where the honest answer is "not measurable".
+    let spread = heads.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+        - heads.iter().copied().fold(f64::INFINITY, f64::min);
+    if spread.is_nan() || spread <= 0.0 {
+        return None;
+    }
+    procstat::slope_per_second(&heads, &rss)
+}
+
+fn memory_per_event(samples: &[Sample], stabilization_seconds: f64) -> MemoryPerEvent {
+    let last_elapsed = samples
+        .last()
+        .map(|sample| sample.elapsed_seconds)
+        .unwrap_or(stabilization_seconds);
+    let midpoint = stabilization_seconds + (last_elapsed - stabilization_seconds) / 2.0;
+    let in_window = samples
+        .iter()
+        .filter(|sample| sample.elapsed_seconds >= stabilization_seconds);
+    let first_head = in_window.clone().map(|sample| sample.head).min();
+    let last_head = in_window.map(|sample| sample.head).max();
+    MemoryPerEvent {
+        resident_set_bytes_per_appended_event: rss_per_event(samples, stabilization_seconds),
+        resident_set_bytes_per_appended_event_second_half: rss_per_event(samples, midpoint),
+        events_appended_in_window: match (first_head, last_head) {
+            (Some(first), Some(last)) => last.saturating_sub(first),
+            _ => 0,
+        },
     }
 }
 
@@ -285,7 +504,8 @@ struct SoakLedger {
     stop: Arc<AtomicBool>,
     completed: Arc<AtomicU64>,
     errors: Arc<AtomicU64>,
-    latencies: Arc<Mutex<Vec<u64>>>,
+    /// Lane and latency in microseconds, drained once per sample window.
+    latencies: Arc<Mutex<Vec<(OperationKind, u64)>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -313,7 +533,10 @@ async fn worker(mut client: Client, spec: SoakWorkerSpec, ledger: SoakLedger) {
         )
         .await
         .is_ok();
-        local.push(started.elapsed().as_micros().min(u64::MAX as u128) as u64);
+        local.push((
+            kind,
+            started.elapsed().as_micros().min(u64::MAX as u128) as u64,
+        ));
         if outcome {
             ledger.completed.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -392,16 +615,21 @@ async fn run_async(config: &SoakConfig) -> Result<SoakSummary> {
     // Latency is summarised per sample window so drift is measurable; an
     // overall p99 hides a system that got three times slower halfway through.
     let mut window_summaries: Vec<LatencySummary> = Vec::new();
+    let mut window_lanes: Vec<BTreeMap<OperationKind, LatencySummary>> = Vec::new();
     let mut reservoir = LatencyReservoir::new();
+    let mut drain = |window: Vec<(OperationKind, u64)>| {
+        let micros: Vec<u64> = window.iter().map(|(_, micros)| *micros).collect();
+        reservoir.extend(&micros);
+        window_summaries.push(latency_summary(&micros));
+        window_lanes.push(summarise_by_operation(&window));
+    };
     while Instant::now() < deadline {
         tokio::time::sleep(interval).await;
         let head = control.snapshot().await.unwrap_or(0);
-        {
-            // Drain, do not accumulate: the ledger must not grow with the soak.
-            let window = std::mem::take(&mut *latencies.lock().expect("latency ledger poisoned"));
-            reservoir.extend(&window);
-            window_summaries.push(latency_summary(&window));
-        }
+        // Drain, do not accumulate: the ledger must not grow with the soak.
+        drain(std::mem::take(
+            &mut *latencies.lock().expect("latency ledger poisoned"),
+        ));
         samples.push(Sample {
             elapsed_seconds: started.elapsed().as_secs_f64(),
             head,
@@ -421,8 +649,7 @@ async fn run_async(config: &SoakConfig) -> Result<SoakSummary> {
     {
         let tail = std::mem::take(&mut *latencies.lock().expect("latency ledger poisoned"));
         if !tail.is_empty() {
-            reservoir.extend(&tail);
-            window_summaries.push(latency_summary(&tail));
+            drain(tail);
         }
     }
     let final_head = control.snapshot().await.unwrap_or(0);
@@ -432,14 +659,31 @@ async fn run_async(config: &SoakConfig) -> Result<SoakSummary> {
     };
 
     let stabilization = config.profile.stabilization_seconds as f64;
+    let memory_per_event = memory_per_event(&samples, stabilization);
+    let mut rss_gate = gate(
+        "resident_set_bytes",
+        &samples,
+        stabilization,
+        config.profile.memory_growth_budget_bytes_per_hour,
+        |process| process.rss_bytes,
+    );
+    accept_rss_per_retained_event(
+        &mut rss_gate,
+        &memory_per_event,
+        config.profile.memory_growth_budget_bytes_per_retained_event,
+    );
+    let mut threads_gate = gate(
+        "threads",
+        &samples,
+        stabilization,
+        config.profile.thread_growth_budget_per_hour,
+        |process| process.threads,
+    );
+    accept_single_small_step(&mut threads_gate, &samples, stabilization, |process| {
+        process.threads
+    });
     let gates = vec![
-        gate(
-            "resident_set_bytes",
-            &samples,
-            stabilization,
-            config.profile.memory_growth_budget_bytes_per_hour,
-            |process| process.rss_bytes,
-        ),
+        rss_gate,
         gate(
             "open_handles",
             &samples,
@@ -447,13 +691,7 @@ async fn run_async(config: &SoakConfig) -> Result<SoakSummary> {
             config.profile.handle_growth_budget_per_hour,
             |process| process.handles,
         ),
-        gate(
-            "threads",
-            &samples,
-            stabilization,
-            config.profile.thread_growth_budget_per_hour,
-            |process| process.threads,
-        ),
+        threads_gate,
     ];
 
     let latency_first_window = window_summaries
@@ -569,7 +807,9 @@ async fn run_async(config: &SoakConfig) -> Result<SoakSummary> {
         latency_final_window,
         latency_drift_ratio,
         latency_within_budget,
+        latency_by_operation: latency_by_operation(&window_lanes),
         gates,
+        memory_per_event,
         integrity_ok,
         integrity_message,
         samples,
@@ -649,6 +889,205 @@ mod tests {
                 threads: Some(8),
                 handles: Some(32),
             },
+        }
+    }
+
+    #[test]
+    fn lane_series_stay_aligned_and_name_the_lane_that_drifted() {
+        use OperationKind::{AttributeQuery, Ingest, VectorRetrieval};
+        // Ingest stays flat; the vector lane gets ten times slower; the
+        // attribute lane is absent from the middle window.
+        let windows = vec![
+            summarise_by_operation(&[
+                (Ingest, 1_000),
+                (VectorRetrieval, 10_000),
+                (AttributeQuery, 2_000),
+            ]),
+            summarise_by_operation(&[(Ingest, 1_000), (VectorRetrieval, 50_000)]),
+            summarise_by_operation(&[
+                (Ingest, 1_000),
+                (VectorRetrieval, 100_000),
+                (AttributeQuery, 2_000),
+            ]),
+        ];
+        let lanes = latency_by_operation(&windows);
+        assert_eq!(
+            lanes.keys().copied().collect::<Vec<_>>(),
+            vec!["attribute_query", "ingest", "vector_retrieval"]
+        );
+        for lane in lanes.values() {
+            assert_eq!(lane.windows.len(), windows.len());
+        }
+        assert_eq!(lanes["attribute_query"].windows[1].count, 0);
+        assert_eq!(lanes["ingest"].p99_drift_ratio, Some(1.0));
+        assert_eq!(lanes["vector_retrieval"].p99_drift_ratio, Some(10.0));
+    }
+
+    #[test]
+    fn a_lane_missing_from_the_final_window_reports_no_drift_ratio() {
+        let windows = vec![
+            summarise_by_operation(&[(OperationKind::TextRetrieval, 5_000)]),
+            summarise_by_operation(&[(OperationKind::Ingest, 1_000)]),
+        ];
+        let lanes = latency_by_operation(&windows);
+        assert_eq!(lanes["text_retrieval"].p99_drift_ratio, None);
+    }
+
+    #[test]
+    fn memory_is_also_reported_per_appended_event() {
+        // 4 KiB per event, at a head that grows by 1 000 events per sample.
+        let samples: Vec<Sample> = (0..8)
+            .map(|i| Sample {
+                head: i * 1_000,
+                ..sample(i as f64 * 60.0, Some(100_000_000 + i * 4_096_000))
+            })
+            .collect();
+        let memory = memory_per_event(&samples, 120.0);
+        let per_event = memory.resident_set_bytes_per_appended_event.unwrap();
+        assert!((per_event - 4_096.0).abs() < 1e-6, "{per_event}");
+        assert!(memory
+            .resident_set_bytes_per_appended_event_second_half
+            .is_some());
+        assert_eq!(memory.events_appended_in_window, 5_000);
+
+        // A head that never moves has no per-event slope, not an infinite one.
+        let flat: Vec<Sample> = (0..4).map(|i| sample(i as f64 * 60.0, Some(1))).collect();
+        assert_eq!(
+            memory_per_event(&flat, 0.0).resident_set_bytes_per_appended_event,
+            None
+        );
+    }
+
+    /// RSS growing at 4 KiB per appended event, far over an hourly budget.
+    fn rss_proportional_to_head() -> Vec<Sample> {
+        (0..8)
+            .map(|i| Sample {
+                head: i * 1_000,
+                ..sample(i as f64 * 60.0, Some(100_000_000 + i * 4_096_000))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rss_proportional_to_retained_events_passes_the_per_event_budget() {
+        let samples = rss_proportional_to_head();
+        let memory = memory_per_event(&samples, 120.0);
+        let hourly = |p: &ProcessSample| p.rss_bytes;
+
+        let mut gate_rss = gate("resident_set_bytes", &samples, 120.0, 1_000_000.0, hourly);
+        assert_eq!(
+            gate_rss.within_budget,
+            Some(false),
+            "montagem: hourly fails"
+        );
+        accept_rss_per_retained_event(&mut gate_rss, &memory, Some(8_192.0));
+        assert_eq!(gate_rss.within_budget, Some(true));
+        assert!(gate_rss.accepted_because.is_some());
+        assert_eq!(gate_rss.budget_bytes_per_retained_event, Some(8_192.0));
+
+        // Tighter than the observed 4 KiB: still a failure.
+        let mut gate_rss = gate("resident_set_bytes", &samples, 120.0, 1_000_000.0, hourly);
+        accept_rss_per_retained_event(&mut gate_rss, &memory, Some(2_048.0));
+        assert_eq!(gate_rss.within_budget, Some(false));
+        assert!(gate_rss.accepted_because.is_none());
+
+        // No per-event budget in the profile: the hourly verdict stands.
+        let mut gate_rss = gate("resident_set_bytes", &samples, 120.0, 1_000_000.0, hourly);
+        accept_rss_per_retained_event(&mut gate_rss, &memory, None);
+        assert_eq!(gate_rss.within_budget, Some(false));
+    }
+
+    /// Memory that grows while nothing is appended is the leak the hourly
+    /// budget exists for; the per-event budget cannot excuse it.
+    #[test]
+    fn rss_growing_with_a_flat_head_is_never_excused_per_event() {
+        let samples: Vec<Sample> = (0..8)
+            .map(|i| Sample {
+                head: 5_000,
+                ..sample(i as f64 * 60.0, Some(100_000_000 + i * 4_096_000))
+            })
+            .collect();
+        let memory = memory_per_event(&samples, 120.0);
+        let mut gate_rss = gate("resident_set_bytes", &samples, 120.0, 1_000_000.0, |p| {
+            p.rss_bytes
+        });
+        accept_rss_per_retained_event(&mut gate_rss, &memory, Some(1e12));
+        assert_eq!(gate_rss.within_budget, Some(false));
+    }
+
+    fn threads_series(values: &[u64]) -> Vec<Sample> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, threads)| Sample {
+                process: ProcessSample {
+                    threads: Some(*threads),
+                    ..sample(0.0, Some(1)).process
+                },
+                ..sample(i as f64 * 60.0, Some(1))
+            })
+            .collect()
+    }
+
+    /// The 2026-10-20 nightly: one 16→17 step right after the midpoint of the
+    /// stabilized window failed the step rule. One small new maximum is a
+    /// pool settling, wherever it lands.
+    #[test]
+    fn a_single_small_thread_step_in_the_second_half_is_not_a_leak() {
+        let samples = threads_series(&[16, 16, 16, 16, 16, 16, 17, 17, 17]);
+        let threads = |p: &ProcessSample| p.threads;
+        let mut gate_threads = gate("threads", &samples, 60.0, 0.5, threads);
+        assert_eq!(gate_threads.within_budget, Some(false), "montagem");
+        accept_single_small_step(&mut gate_threads, &samples, 60.0, threads);
+        assert_eq!(gate_threads.new_maxima_after_stabilization, Some(1));
+        assert_eq!(gate_threads.within_budget, Some(true));
+        assert!(gate_threads.accepted_because.is_some());
+    }
+
+    #[test]
+    fn repeated_or_large_thread_steps_still_fail() {
+        let threads = |p: &ProcessSample| p.threads;
+        // Two new maxima: growing, not settled.
+        let samples = threads_series(&[16, 16, 16, 16, 17, 17, 17, 18, 18]);
+        let mut gate_threads = gate("threads", &samples, 60.0, 0.5, threads);
+        accept_single_small_step(&mut gate_threads, &samples, 60.0, threads);
+        assert_eq!(gate_threads.new_maxima_after_stabilization, Some(2));
+        assert_eq!(gate_threads.within_budget, Some(false));
+
+        // One step, but to far more threads than a pool settling adds.
+        let samples = threads_series(&[16, 16, 16, 16, 16, 16, 200, 200, 200]);
+        let mut gate_threads = gate("threads", &samples, 60.0, 0.5, threads);
+        accept_single_small_step(&mut gate_threads, &samples, 60.0, threads);
+        assert_eq!(gate_threads.within_budget, Some(false));
+    }
+
+    /// The nightly profile with the per-event budget parses; the shipped long
+    /// profiles stay without it (hourly budget only).
+    #[test]
+    fn per_event_budget_is_optional_in_profiles() {
+        let nightly: SoakProfile = serde_json::from_value(serde_json::json!({
+            "schema_version": 1, "id": "soak-nightly", "description": "x",
+            "duration_seconds": 900, "sample_interval_seconds": 15,
+            "stabilization_seconds": 180, "concurrency": 8, "workload_profile": "mixed",
+            "memory_growth_budget_bytes_per_hour": 134217728.0,
+            "memory_growth_budget_bytes_per_retained_event": 8192.0,
+            "handle_growth_budget_per_hour": 60.0, "thread_growth_budget_per_hour": 4.0,
+            "latency_drift_budget_ratio": 3.0, "satisfies_level": "development"
+        }))
+        .unwrap();
+        assert_eq!(
+            nightly.memory_growth_budget_bytes_per_retained_event,
+            Some(8192.0)
+        );
+        for name in ["6h", "24h", "72h", "168h"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../qa/qualification/soak")
+                .join(format!("{name}.json"));
+            let profile = load_profile(&path).unwrap();
+            assert_eq!(
+                profile.memory_growth_budget_bytes_per_retained_event, None,
+                "{name}"
+            );
         }
     }
 

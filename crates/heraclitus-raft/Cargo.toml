@@ -30,6 +30,7 @@ replication = [
     "dep:tonic",
     "dep:tokio-stream",
     "dep:heraclitus-proto",
+    "dep:tempfile",
 ]
 
 [dependencies]
@@ -37,11 +38,14 @@ heraclitus-core = { workspace = true }
 heraclitus-log = { workspace = true }
 heraclitus-proto = { workspace = true, optional = true }
 openraft = { version = "0.9", features = ["serde", "storage-v2"], optional = true }
-tokio = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["fs"] }
 tokio-stream = { workspace = true, features = ["net"], optional = true }
 tonic = { workspace = true, optional = true }
 bincode = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
+crc32fast = { workspace = true }
+# Directório dos snapshots da máquina em memória (sem `sm_dir`).
+tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

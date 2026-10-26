@@ -487,6 +487,29 @@ fn bm25_upper(idf: f32, max_tf: u32, min_doc_len: u32, avgdl: f32) -> f64 {
 }
 
 impl TextIndex {
+    /// Bytes residentes, estimados pelas capacidades (ver
+    /// `heraclitus_core::memoria`). O(termos): para amostragem periódica.
+    pub fn resident_bytes(&self) -> u64 {
+        use heraclitus_core::memoria::{de_hashmap, de_vec};
+        let mut total = de_hashmap::<String, TermId>(self.terms.capacity())
+            + self
+                .terms
+                .keys()
+                .map(|termo| termo.capacity() as u64)
+                .sum::<u64>()
+            + de_vec::<PostingList>(self.postings.capacity())
+            + de_vec::<u32>(self.doc_len.capacity())
+            + de_vec::<EventId>(self.ids.capacity())
+            + de_vec::<Lsn>(self.lsns.capacity())
+            + de_hashmap::<EventId, u32>(self.by_event.capacity());
+        for lista in &self.postings {
+            total += de_vec::<u8>(lista.doc_bytes.capacity())
+                + de_vec::<u8>(lista.tf_bytes.capacity())
+                + de_vec::<PostingBlock>(lista.blocks.capacity());
+        }
+        total
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

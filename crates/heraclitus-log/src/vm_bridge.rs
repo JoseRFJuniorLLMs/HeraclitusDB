@@ -21,6 +21,10 @@ use heraclitus_core::{Episode, EventKind, HeraclitusError, Lsn};
 /// The `EventKind::Custom` tag that marks a log record as an H-VM ISA frame.
 pub const HVM_KIND: &str = "hvm_isa";
 
+/// The `agent_id` of every H-VM ISA frame. Frames skip the views and the
+/// attribute index, so an index can never answer `agent_id = HVM_AGENT`.
+pub const HVM_AGENT: &str = "hvm";
+
 /// Is this episode an H-VM instruction frame (vs. an ordinary event)?
 pub fn is_hvm(ep: &Episode) -> bool {
     matches!(&ep.kind, EventKind::Custom(k) if k == HVM_KIND)
@@ -35,7 +39,7 @@ pub fn append_instruction<L: EpisodeLog + ?Sized>(
 ) -> Result<Lsn, HeraclitusError> {
     let frame = encode(version, instr);
     log.append(Episode::new(
-        "hvm",
+        HVM_AGENT,
         EventKind::Custom(HVM_KIND.to_string()),
         frame,
     ))

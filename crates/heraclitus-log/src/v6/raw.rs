@@ -336,6 +336,15 @@ impl RawSegmentWriter {
         self.offsets.get(indice).copied()
     }
 
+    /// Os offsets de todos os registos, a partir do primeiro LSN, para quem
+    /// sela poder continuar a ler o segmento selado em O(1) até ao pack
+    /// (auditoria 2026-10-16, O8). `None` com LSNs não contíguos, a mesma
+    /// condição do [`offset_of`](Self::offset_of).
+    pub fn offsets_contiguos(&self) -> Option<(Lsn, Vec<u64>)> {
+        self.contiguous
+            .then(|| (self.header.first_lsn, self.offsets.clone()))
+    }
+
     /// Acrescenta um registo. `canonical_record_hash` é o hash lógico já
     /// calculado pelo chamador (que tem o `Episode` em mãos).
     pub fn append(

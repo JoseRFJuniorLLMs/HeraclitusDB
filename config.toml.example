@@ -27,6 +27,13 @@ rest_addr = "127.0.0.1:7475"
 # ── Durabilidade / desempenho ────────────────────────────────────────────────
 # segment_max_bytes = 268435456          # 256 MB
 # memtable_cap = 100000
+# Teto da memória dos índices residentes (views, atributos, memtable), em bytes.
+# Sem ele a memória só é reportada (/metrics, /stats). Com "reject_writes",
+# os appends de clientes recebem RESOURCE_EXHAUSTED enquanto a última amostra
+# estiver acima do teto; com "warn" (omissão) só se sinaliza.
+# index_memory_budget_bytes = 8589934592   # 8 GiB
+# index_memory_policy = "warn"              # ou "reject_writes"
+# index_memory_sample_secs = 30
 # compaction_max_cores = 1
 # activation_decay = 0.5
 # Env: HERACLITUS_FSYNC=always | group_commit:5

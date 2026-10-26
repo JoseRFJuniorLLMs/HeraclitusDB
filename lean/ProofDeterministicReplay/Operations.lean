@@ -3,7 +3,7 @@ import ProofDeterministicReplay.Basic
 namespace ProofDeterministicReplay
 
 /-- The Log is a chronological sequence of events. -/
-def Log := List Event
+abbrev Log := List Event
 
 /-- Sequential Replay: folds over the log applying events strictly one by one.
     This simulates a single-threaded CPU processing events in exact physical order. -/

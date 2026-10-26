@@ -2,7 +2,7 @@ import Lake
 open Lake DSL
 
 package «proof_append_only» {
-  -- add package configuration options here
+  moreLeanArgs := #["-DwarningAsError=true"]
 }
 
 @[default_target]
@@ -29,3 +29,9 @@ lean_lib «ProofDenseMap» {
 lean_lib «ProofHLC» {
   -- add library configuration options here
 }
+
+@[default_target]
+lean_lib «ProofApprovalIdempotence» {}
+
+@[default_target]
+lean_lib «ProofToolCallIsolation» {}

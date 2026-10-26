@@ -41,6 +41,9 @@ fn status_do_append(e: heraclitus_core::HeraclitusError) -> Status {
             Status::already_exists(e.to_string())
         }
         heraclitus_core::HeraclitusError::Query(_) => Status::invalid_argument(e.to_string()),
+        heraclitus_core::HeraclitusError::ResourceExhausted(_) => {
+            Status::resource_exhausted(e.to_string())
+        }
         _ => internal(e),
     }
 }
@@ -520,6 +523,11 @@ impl pb::heraclitus_server::Heraclitus for Service {
                 .collect(),
         );
         let (ok, message) = tokio::task::spawn_blocking(move || {
+            if matches!(r.op.as_str(), "external-intent-v1" | "external-status-v1" | "external-result-v1") {
+                let result = engine.external_rpc(&admin_ctx, &r.op, &r.arg);
+                engine.audit_admin(&operation, result.is_ok(), &audit_principal);
+                return match result { Ok(value) => (true, value), Err(error) => (false, error.to_string()) };
+            }
             let dispatch = |token: Option<&crate::trusted_admin::AdminExecutionToken>| {
                 match r.op.as_str() {
                     "admin-operation-state" => {

@@ -1,0 +1,28 @@
+name: Formal reference models
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify-models:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: leanprover/lean-action@24581d74d674803a25a81b10b059c5c0cdd344c6 # v1
+        with:
+          lake-package-directory: lean
+          auto-config: "false"
+          build: "true"
+          use-github-cache: "false"
+          test: "false"
+          lint: "false"
+      - name: Check proof dependency closures and record scope
+        run: python3 scripts/check-formal.py --out proof-status.json
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: formal-reference-models
+          path: proof-status.json
+          if-no-files-found: error

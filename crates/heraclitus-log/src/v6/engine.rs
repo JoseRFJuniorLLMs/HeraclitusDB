@@ -65,6 +65,48 @@ const RAW_GENERATION: u32 = 0;
 /// HRKI nunca pode produzir. [`V6Log::build_pending_hrki`] recusa, por isso,
 /// publicar tal sidecar no manifest.
 const BUILTINS_PODADOS_EM_CLARO: [&str; 2] = ["agent_id", "session_id"];
+type SharedPackedReader = Arc<super::packed::PackedSegmentReader<super::packed::FileSource>>;
+
+/// Offsets dos registos de cada RAW selado, guardados no seal até ao pack.
+///
+/// Auditoria 2026-10-16, O8: uma leitura pontual num RAW selado ainda não
+/// empacotado percorria o ficheiro desde o cabeçalho — O(posição) — porque os
+/// offsets só existiam no writer da cauda activa. O writer já os tem no seal;
+/// guardá-los torna a leitura um `seek` até o pack publicar a geração PACKED.
+/// Limitado a [`OFFSETS_RAW_SELADOS_MAX`] segmentos (FIFO): com o packing
+/// atrasado não cresce sem fim, e o que sai cai no percurso completo, que é a
+/// definição. Depois de um restart também: os offsets não são persistidos.
+#[derive(Default)]
+struct OffsetsRawSelados {
+    por_caminho: std::collections::HashMap<PathBuf, (Lsn, Arc<Vec<u64>>)>,
+    ordem: std::collections::VecDeque<PathBuf>,
+}
+
+const OFFSETS_RAW_SELADOS_MAX: usize = 64;
+
+impl OffsetsRawSelados {
+    fn guardar(&mut self, caminho: PathBuf, primeiro: Lsn, offsets: Vec<u64>) {
+        if self
+            .por_caminho
+            .insert(caminho.clone(), (primeiro, Arc::new(offsets)))
+            .is_none()
+        {
+            self.ordem.push_back(caminho);
+        }
+        while self.ordem.len() > OFFSETS_RAW_SELADOS_MAX {
+            if let Some(velho) = self.ordem.pop_front() {
+                self.por_caminho.remove(&velho);
+            }
+        }
+    }
+
+    fn offset(&self, caminho: &Path, lsn: Lsn) -> Option<u64> {
+        let (primeiro, offsets) = self.por_caminho.get(caminho)?;
+        offsets
+            .get(usize::try_from(lsn.checked_sub(*primeiro)?).ok()?)
+            .copied()
+    }
+}
 
 /// Escritor/reader v6 com manifesto `.hrkm` persistente.
 ///
@@ -115,6 +157,8 @@ pub struct V6Log {
     /// invalidação: uma geração recolhida pelo GC simplesmente deixa de estar
     /// no manifesto e a sua entrada fica órfã, o que custa bytes e não erros.
     blocos_por_geracao: Mutex<std::collections::HashMap<PathBuf, u64>>,
+    packed_readers: Mutex<std::collections::HashMap<PathBuf, SharedPackedReader>>,
+    offsets_raw_selados: Mutex<OffsetsRawSelados>,
     hlc: Arc<Hlc>,
     fsync: FsyncPolicy,
     segment_max_bytes: u64,
@@ -310,7 +354,8 @@ impl CandidatoVarredura {
 /// cauda para um segmento que o catálogo já capturado não continha — a
 /// varredura devolvia `Ok` com um buraco no meio. Um instante só fecha a
 /// janela.
-struct InstantaneoVarredura {
+struct InstantaneoVarredura<'a> {
+    _pins: Vec<super::gc::PinGuard<'a>>,
     candidatos: Vec<CandidatoVarredura>,
     /// Caminho e primeiro LSN da cauda activa, no mesmo instante.
     cauda: Option<(PathBuf, Lsn)>,
@@ -595,7 +640,7 @@ impl V6Log {
                 (Some(stop), Some(worker))
             }
         };
-        Ok(Self {
+        let mut log = Self {
             root,
             segments_dir,
             manifest_store,
@@ -605,14 +650,21 @@ impl V6Log {
             packing_lock: Mutex::new(()),
             sidecar_lock: Mutex::new(()),
             blocos_por_geracao: Mutex::new(std::collections::HashMap::new()),
+            packed_readers: Mutex::new(std::collections::HashMap::new()),
+            offsets_raw_selados: Mutex::new(OffsetsRawSelados::default()),
             hlc,
             fsync,
             segment_max_bytes,
-            keystore,
+            keystore: None,
             tail_tx,
             metrics: V6Metrics::default(),
             pins: super::gc::PinRegistry::new(),
-        })
+        };
+        crate::initialize_legacy_policy_from_log(keystore.as_deref(), log.head(), |from, to| {
+            log.scan(from, to)
+        })?;
+        log.keystore = keystore;
+        Ok(log)
     }
 
     /// Apensa um episódio e devolve o LSN. O HLC é carimbado dentro da secção
@@ -652,7 +704,9 @@ impl V6Log {
         let head = self.head();
         if lsn < head {
             return match self.read(lsn)? {
-                Some((_, existing)) if existing.id == episode.id => Ok(lsn),
+                Some((_, existing)) if crate::same_replicated_episode(&existing, &episode)? => {
+                    Ok(lsn)
+                }
                 _ => Err(HeraclitusError::CasConflict {
                     expected: lsn,
                     head,
@@ -881,7 +935,7 @@ impl V6Log {
     }
 
     fn tentar_ler(&self, lsn: Lsn) -> Result<Option<(Lsn, Episode)>, TentativaFalhou> {
-        let (source, head) = {
+        let (source, head, _pin) = {
             let state = self.lock_state()?;
             let head = state.next_lsn;
             if lsn >= head {
@@ -895,6 +949,7 @@ impl V6Log {
                 .active
                 .as_ref()
                 .filter(|active| lsn >= active.writer.header().first_lsn);
+            let mut pin = None;
             let source = if let Some(active) = activo {
                 ReadSource::Active(active.path.clone(), active.writer.offset_of(lsn))
             } else {
@@ -908,12 +963,13 @@ impl V6Log {
                     context: "hrkl v6 read".into(),
                     detail: format!("segmento {} sem geração ativa", desc.segment_id),
                 })?;
+                pin = Some(self.pins.pin(desc.segment_id, generation.generation));
                 ReadSource::Sealed(
                     resolve_location(&self.root, &generation.location)?,
                     generation.layout,
                 )
             };
-            (source, head)
+            (source, head, pin)
         };
 
         // Auditoria 2026-10-16, B2: daqui para baixo `lsn < head`, isto é, o
@@ -959,18 +1015,42 @@ impl V6Log {
                 Err(e) => return Err(TentativaFalhou::Erro(e)),
             },
             ReadSource::Sealed(path, PhysicalLayout::Raw) => {
-                let achado = find_raw_record(&path, lsn)?;
-                match achado.record {
+                // O8: com os offsets guardados no seal, um `seek`. O
+                // `read_raw_record_at` confere o LSN no offset; se não conferir,
+                // ou se não houver offsets (restart, cache cheia), o percurso
+                // completo, que é a definição.
+                let offset = self
+                    .offsets_raw_selados
+                    .lock()
+                    .ok()
+                    .and_then(|cache| cache.offset(&path, lsn));
+                let directo = match offset {
+                    Some(o) => super::raw::read_raw_record_at(&path, o, lsn)?,
+                    None => None,
+                };
+                match directo {
                     Some(r) => (r.lsn, r.payload),
                     None => {
-                        return Err(
-                            lsn_em_falta(lsn, head, &path, &achado.percurso.descrever()).into()
-                        )
+                        #[cfg(test)]
+                        PERCURSOS_RAW_SELADO.with(|c| c.set(c.get() + 1));
+                        let achado = find_raw_record(&path, lsn)?;
+                        match achado.record {
+                            Some(r) => (r.lsn, r.payload),
+                            None => {
+                                return Err(lsn_em_falta(
+                                    lsn,
+                                    head,
+                                    &path,
+                                    &achado.percurso.descrever(),
+                                )
+                                .into())
+                            }
+                        }
                     }
                 }
             }
             ReadSource::Sealed(path, PhysicalLayout::Packed) => {
-                let reader = open_packed(&path, HARD_MAX_BLOCK_BYTES)?;
+                let reader = self.packed_reader(&path)?;
                 let mut counters = ScanCounters::default();
                 match reader.get(lsn, &mut counters)? {
                     Some((_, payload)) => (lsn, payload),
@@ -995,6 +1075,24 @@ impl V6Log {
 
     pub fn scan(&self, from: Lsn, to: Lsn) -> Result<Vec<(Lsn, Episode)>, HeraclitusError> {
         self.scan_capped(from, to, usize::MAX)
+    }
+
+    fn packed_reader(&self, path: &Path) -> V6Result<SharedPackedReader> {
+        let mut cache = self
+            .packed_readers
+            .lock()
+            .map_err(|_| corrupt("hrkl v6 reader cache", "lock poisoned"))?;
+        if let Some(reader) = cache.get(path) {
+            return Ok(Arc::clone(reader));
+        }
+        let reader = Arc::new(open_packed(path, HARD_MAX_BLOCK_BYTES)?);
+        // Metadata and open descriptors have an explicit bound. Generations
+        // are immutable; a read pins its selected generation independently.
+        if cache.len() >= 32 {
+            cache.clear();
+        }
+        cache.insert(path.to_path_buf(), Arc::clone(&reader));
+        Ok(reader)
     }
 
     /// Captura, num **único** locking, tudo o que uma varredura de `[from, to)`
@@ -1023,7 +1121,7 @@ impl V6Log {
         &self,
         from: Lsn,
         to: Lsn,
-    ) -> Result<InstantaneoVarredura, HeraclitusError> {
+    ) -> Result<InstantaneoVarredura<'_>, HeraclitusError> {
         let state = self.lock_state()?;
         let head = state.next_lsn;
         let end = to.min(head);
@@ -1049,11 +1147,15 @@ impl V6Log {
             }
         }
         let mut candidatos = Vec::new();
+        let mut pins = Vec::new();
         if from < end {
             for desc in state
                 .manifest
                 .segments_for_lsn_range(from, end.saturating_sub(1))
             {
+                if let Some(generation) = desc.active() {
+                    pins.push(self.pins.pin(desc.segment_id, generation.generation));
+                }
                 candidatos.push(CandidatoVarredura {
                     segment_id: desc.segment_id,
                     geracao: desc.active().map(|generation| GeracaoCandidata {
@@ -1086,6 +1188,7 @@ impl V6Log {
                 .offset_of(from.max(active.writer.header().first_lsn))
         });
         Ok(InstantaneoVarredura {
+            _pins: pins,
             candidatos,
             cauda,
             offset_cauda,
@@ -1578,46 +1681,67 @@ impl V6Log {
                     return Err(TentativaFalhou::Rolou);
                 }
             }
-            if let Some(active) = state.active.as_ref() {
+            let tail = state.active.as_ref().map(|active| {
                 let first = active.writer.header().first_lsn;
-                if first < end && state.next_lsn > from {
+                (
+                    active.path.clone(),
+                    first,
+                    active.writer.offset_of(from.max(first)),
+                )
+            });
+            drop(state);
+            if let Some((path, first, offset)) = tail {
+                if first < end && instantaneo.head > from {
                     stats.segments_total += 1;
                     stats.segments_candidate += 1;
                     stats.segments_read += 1;
                     stats.blocks_candidate += 1;
                     stats.blocks_read += 1;
-                    let active_bytes = std::fs::metadata(&active.path)
-                        .map_err(|e| TentativaFalhou::Erro(HeraclitusError::from(e)))?
-                        .len();
-                    stats.bytes_candidate += active_bytes;
-                    stats.bytes_physical_read += active_bytes;
-                    let scan = scan_raw_segment(&active.path)?;
-                    // Auditoria 2026-10-16, B2: lida sob o mutex do writer, a
-                    // cauda tem de chegar ao `head` — não há append a meio.
-                    let alcancado = first.saturating_add(scan.records.len() as u64);
-                    if alcancado < state.next_lsn
-                        || scan
-                            .records
-                            .iter()
-                            .enumerate()
-                            .any(|(i, r)| r.lsn != first.saturating_add(i as u64))
-                    {
-                        return Err(corrupt(
-                            "hrkl v6 pruned scan",
-                            format!(
-                                "active tail {} stops at LSN {alcancado} (offset {}) below head {}",
-                                active.path.display(),
-                                scan.torn_at.unwrap_or(0),
-                                state.next_lsn
-                            ),
+                    // Capture the committed ceiling under the writer lock,
+                    // then stream only that window outside it. Concurrent
+                    // appends cannot extend this query into an unfinished row.
+                    let mut reached = from.max(first);
+                    let result = percorrer_raw_segmento_desde(&path, offset, |lsn, _, payload| {
+                        if lsn < from {
+                            return Ok(ControloVarredura::Continuar);
+                        }
+                        if lsn >= end {
+                            return Ok(ControloVarredura::Parar);
+                        }
+                        if lsn != reached {
+                            return Err(corrupt(
+                                "hrkl v6 pruned scan",
+                                "non-contiguous committed tail",
+                            ));
+                        }
+                        reached = lsn.saturating_add(1);
+                        self.collect_builtin_matches(
+                            std::iter::once((lsn, payload)),
+                            &criterio,
+                            &mut out,
+                        )?;
+                        Ok(if reached >= end || out.len() >= max {
+                            ControloVarredura::Parar
+                        } else {
+                            ControloVarredura::Continuar
+                        })
+                    });
+                    let traversal = match result {
+                        Ok(value) => value,
+                        Err(_) if !path.exists() => return Err(TentativaFalhou::Rolou),
+                        Err(error) => return Err(error.into()),
+                    };
+                    stats.bytes_candidate += traversal.bytes;
+                    stats.bytes_physical_read += traversal.bytes;
+                    if out.len() < max && reached < end {
+                        return Err(lsn_em_falta(
+                            reached,
+                            instantaneo.head,
+                            &path,
+                            &traversal.descrever(),
                         )
                         .into());
                     }
-                    self.collect_builtin_matches(
-                        scan.records.iter().map(|r| (r.lsn, r.payload.as_slice())),
-                        &criterio,
-                        &mut out,
-                    )?;
                 }
             }
         }
@@ -2384,17 +2508,21 @@ impl V6Log {
 
     /// O registo de pins de §92.
     ///
-    /// **Nenhum leitor interno pina hoje**, e vale dizer porquê em vez de
-    /// deixar isso implícito. O que §92 protege é remover uma geração que
-    /// alguém está a ler, e o `commit_gc` já é seguro nos dois sistemas onde
-    /// isto corre: em Unix o `unlink` de um ficheiro aberto deixa o descritor
-    /// válido, e em Windows o `remove_file` falha com sharing violation e a
-    /// geração é reportada como `orphaned` — nunca como removida — para uma
-    /// passagem posterior. O invariante que impede perda de dados é o §91, que
-    /// é verificado por `assert_gc_invariant` e não por pins.
+    /// Desde a v3.0.4 a leitura pontual (`tentar_ler`) e a varredura
+    /// (`instantaneo_varredura`) pinam a geração selada que escolheram, sob o
+    /// mesmo lock em que a escolheram, até acabarem de a ler. A cauda activa
+    /// não é pinada: se rolar a meio, a varredura detecta-o e recomeça.
     ///
-    /// O registo existe e é honrado pelo plano: quem tiver um leitor de longa
-    /// duração (um recall frio, uma exportação) deve pinar por aqui.
+    /// Os pins não substituem o invariante que impede perda de dados, que é o
+    /// §91, verificado por `assert_gc_invariant`. Em Unix o `unlink` de um
+    /// ficheiro aberto deixa o descritor válido; em Windows o `remove_file`
+    /// pode falhar com sharing violation e a geração fica `orphaned` para uma
+    /// passagem posterior. A cache de leitores PACKED (`packed_readers`) guarda
+    /// descritores sem pinar: em Unix, uma geração recolhida pode reter o seu
+    /// espaço até a entrada da cache sair (no máximo 32 leitores).
+    ///
+    /// Quem tiver um leitor de longa duração (um recall frio, uma exportação)
+    /// deve pinar por aqui.
     pub fn pins(&self) -> &super::gc::PinRegistry {
         &self.pins
     }
@@ -2767,6 +2895,8 @@ impl V6Log {
         state: &mut V6State,
         active: ActiveSegment,
     ) -> Result<(), HeraclitusError> {
+        // Antes do `seal`, que consome o writer (O8).
+        let offsets = active.writer.offsets_contiguos();
         let footer = active.writer.seal()?;
         // Ja verificado acima, antes de o estado ser tocado; aqui fica so como
         // rede, porque entre as duas verificacoes nada mais cria este nome.
@@ -2805,6 +2935,11 @@ impl V6Log {
         if let Err(err) = self.manifest_store.commit(&mut state.manifest) {
             state.manifest = before;
             return Err(err);
+        }
+        if let Some((primeiro, offsets)) = offsets {
+            if let Ok(mut cache) = self.offsets_raw_selados.lock() {
+                cache.guardar(final_path, primeiro, offsets);
+            }
         }
         Ok(())
     }
@@ -3048,6 +3183,12 @@ enum ReadSource {
     /// Caminho do activo e, se o writer o souber, o offset do registo.
     Active(PathBuf, Option<u64>),
     Sealed(PathBuf, PhysicalLayout),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Leituras pontuais em RAW selado que caíram no percurso completo (O8).
+    static PERCURSOS_RAW_SELADO: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -3806,6 +3947,66 @@ mod tests {
             EventKind::Observation,
             format!("payload-{i}").into_bytes(),
         )
+    }
+
+    /// Auditoria 2026-10-16, O8: entre o seal e o pack, a leitura pontual num
+    /// RAW selado usa os offsets que o writer tinha — nenhum percurso
+    /// completo. Depois de reabrir (os offsets não são persistidos) recua para
+    /// o percurso e devolve o mesmo.
+    #[test]
+    fn leitura_pontual_em_raw_selado_usa_os_offsets_do_seal() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
+        for i in 0..200 {
+            log.append(event(i)).unwrap();
+        }
+        log.seal_active().unwrap();
+        log.append(event(200)).unwrap();
+        let ler = |log: &V6Log, lsn: Lsn| {
+            let (lido, e) = log.read(lsn).unwrap().unwrap();
+            assert_eq!(lido, lsn);
+            assert_eq!(e.content, format!("payload-{lsn}").into_bytes());
+        };
+
+        PERCURSOS_RAW_SELADO.with(|c| c.set(0));
+        for lsn in [0, 1, 99, 198, 199] {
+            ler(&log, lsn);
+        }
+        assert_eq!(PERCURSOS_RAW_SELADO.with(|c| c.get()), 0);
+        drop(log);
+
+        let reaberto = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
+        PERCURSOS_RAW_SELADO.with(|c| c.set(0));
+        ler(&reaberto, 199);
+        assert_eq!(PERCURSOS_RAW_SELADO.with(|c| c.get()), 1);
+    }
+
+    /// Um offset que não confere (cache de outro ficheiro, por exemplo) nunca
+    /// devolve o registo errado: `read_raw_record_at` confere o LSN e a
+    /// leitura recua para o percurso.
+    #[test]
+    fn offset_que_nao_confere_recua_para_o_percurso() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = V6Log::open(dir.path(), 1 << 20, FsyncPolicy::Always).unwrap();
+        for i in 0..50 {
+            log.append(event(i)).unwrap();
+        }
+        log.seal_active().unwrap();
+        {
+            let mut cache = log.offsets_raw_selados.lock().unwrap();
+            let caminho = cache.ordem.front().unwrap().clone();
+            // Todos os offsets a apontar para o registo do LSN 0.
+            let (primeiro, offsets) = cache.por_caminho.get(&caminho).unwrap().clone();
+            let errados = vec![offsets[0]; offsets.len()];
+            cache
+                .por_caminho
+                .insert(caminho, (primeiro, Arc::new(errados)));
+        }
+        PERCURSOS_RAW_SELADO.with(|c| c.set(0));
+        let (lsn, e) = log.read(37).unwrap().unwrap();
+        assert_eq!(lsn, 37);
+        assert_eq!(e.content, b"payload-37".to_vec());
+        assert_eq!(PERCURSOS_RAW_SELADO.with(|c| c.get()), 1);
     }
 
     #[test]
