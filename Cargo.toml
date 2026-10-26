@@ -53,7 +53,7 @@ members = [
 exclude = ["sdk/python-embedded", "fuzz"]
 
 [workspace.package]
-version = "3.0.5"
+version = "3.0.6"
 edition = "2021"
 license = "GPL-2.0-only"
 repository = "https://github.com/JoseRFJuniorLLMs/HeraclitusDB"
