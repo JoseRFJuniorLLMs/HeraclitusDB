@@ -24,7 +24,7 @@ jobs:
           cp sdk/python/heraclitusdb/heraclitus_pb2_grpc.py dist/heraclitusdb/
           cp sdk/python/heraclitusdb/__init__.py dist/heraclitusdb/ || true
           git rev-parse HEAD > dist/COMMIT
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: heraclitus-grpc-python-client
           path: dist/
